@@ -39,7 +39,7 @@ async def main(
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine. 
-    await engine.start_listening_to_data_parallel_coordinator( 
+    engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=port, launch_inference_coordinator=True
     )
     # if you want to use your own inference coordinator - 
@@ -51,7 +51,7 @@ async def main(
     # 5. look at InferenceClient to see how we create requests with headers. 
     if dist.get_rank() == 0: 
         client = InferenceClient(port) # submits requests to the inference coordinator
-        await client.start()
+        client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
             request.time_arrival = request.time_offset + base_arrival_time

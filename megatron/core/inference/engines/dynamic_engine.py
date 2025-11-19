@@ -46,6 +46,7 @@ except:
 
 try:
     import zmq
+    import zmq.asyncio
 
     HAVE_ZMQ = True
 except:
@@ -289,12 +290,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
-    async def start_listening_to_data_parallel_coordinator(
+    def start_listening_to_data_parallel_coordinator(
         self,
         inference_coordinator_port: int,
         launch_inference_coordinator: bool = True,
         *,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        microbatch_timeout: float = 0.001,
+        steps_before_microbatch: int = 8,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -335,8 +338,19 @@ class DynamicInferenceEngine(AbstractEngine):
             "please install the messagepack library to use InferenceCoordinator\n"
             "pip install msgpack"
         )
+        loop = get_asyncio_loop(loop)
+        self.use_coordinator = True
+        self.launch_inference_coordinator = launch_inference_coordinator
+        self.microbatch_timeout = microbatch_timeout
+        self.steps_before_microbatch = steps_before_microbatch
 
-        self.zmq_context = zmq.Context().instance()
+        self.pending_microbatch = deque()
+        self.microbatch_processing_event = asyncio.Event()
+        self.microbatch_not_empty = asyncio.Event()
+        self.coord_recv_lock = asyncio.Lock()
+        self._send_awaitables = asyncio.Queue()
+
+        self.zmq_context = zmq.asyncio.Context().instance()
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
         # Get world info.
@@ -363,11 +377,11 @@ class DynamicInferenceEngine(AbstractEngine):
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
-            coordinator_ready_event = spawn_context.Event()
+            self.coordinator_ready_event = spawn_context.Event()
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(
-                    coordinator_ready_event,
+                    self.coordinator_ready_event,
                     inference_coordinator_port,
                     parallel_state.get_data_parallel_world_size(),
                 ),
@@ -403,17 +417,14 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.connect(dp_addr[0])
 
             # send empty string. this is used to register with the coordinator.
-            self.socket_for_receiving_requests.send(b"")
+            self._isend(self.socket_for_receiving_requests, Headers.CONNECT, b"")
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
             self.model_parallel_publisher_socket = mp_req_sock
 
-            # 3. Create another publisher socket to broadcast the number of messages to receive.
-            self.model_parallel_num_msgs_publisher_socket = mp_len_sock
             self.zmq_sockets += [
                 self.socket_for_receiving_requests,
-                self.model_parallel_num_msgs_publisher_socket,
                 self.model_parallel_publisher_socket,
             ]
         # All MP ranks subscribe to the two publisher sockets
@@ -421,23 +432,17 @@ class DynamicInferenceEngine(AbstractEngine):
         self.model_parallel_subscriber_socket.connect(mp_req_addr[0])
         self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-        self.model_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.model_parallel_num_msgs_subscriber_socket.connect(mp_len_addr[0])
-        self.model_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.zmq_sockets += [self.model_parallel_subscriber_socket]
 
-        self.zmq_sockets += [
-            self.model_parallel_subscriber_socket,
-            self.model_parallel_num_msgs_subscriber_socket,
-        ]
-
+        print(f"[{self.rank}] Barriering after ZMQ setup...")
         torch.distributed.barrier(mp_group)
+        print(f"[{self.rank}] ZMQ setup complete!")
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
             logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
-        loop = get_asyncio_loop(loop)
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
     @trace_async_exceptions
@@ -955,7 +960,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_requests_list
 
-    def schedule_requests(self) -> int:
+    async def schedule_requests(self):
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
         This method is a collective and synchronous operation that must be called
@@ -984,44 +989,33 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             int: The number of messages that were received and processed in this batch.
         """
+        # If the engine has active requests and is not at (step % N) == 0, return early.
+        count_trigger = (self.step_count % self.steps_before_microbatch) == 0
+        if self.engine.has_unfinished_requests() and (not count_trigger):
+            return
 
-        torch.cuda.nvtx.range_push("drain_zmq_socket")
-        all_messages = []
+        # Sleep for a small amount of time to allow communication to occur.
         if self.is_mp_coordinator:
-            while True:
-                try:
-                    # Receive messages in a non-blocking way.
-                    all_messages.append(self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK))
-                except zmq.Again:
-                    # This exception is hit as soon as the socket is empty.
-                    break
-            messages_to_dequeue = len(all_messages)
-            # First publish the number of messages to dequeue.
-            # This is important because we want all tensor parallel ranks
-            # to dequeue the same number of messages.
-            self.model_parallel_num_msgs_publisher_socket.send(
-                struct.pack('!i', messages_to_dequeue)
-            )
-            # Now publish the actual messages to all model parallel ranks
-            for message in all_messages:
-                self.model_parallel_publisher_socket.send(message)
-        else:
-            # First, receive the number of messages to dequeue from mp-rank 0
-            messages_to_dequeue = struct.unpack(
-                '!i', self.model_parallel_num_msgs_subscriber_socket.recv()
-            )[0]
-            # Now, dequeue the same number of messages from the subscriber socket.
-            # Note that these receives are blocking, because the messages
-            # are guaranteed to be available after the tp-rank 0 has sent them.
-            for _ in range(messages_to_dequeue):
-                all_messages.append(self.model_parallel_subscriber_socket.recv())
+            await asyncio.sleep(self.microbatch_timeout)
 
-        torch.cuda.nvtx.range_pop()
-        for message in all_messages:
-            data = msgpack.unpackb(message, raw=False)
-            header = Headers(data[0])
+            # If there is no new data, stop stepping. Await new data.
+            if not self.pending_microbatch and not self.engine.has_unfinished_requests():
+                await self.microbatch_not_empty.wait()
+
+        # MP coordinator sends a sync signal to all MP ranks.
+        if self.is_mp_coordinator:
+            async with self.coord_recv_lock:
+                self._isend(self.model_parallel_publisher_socket, Headers.MICROBATCH_SYNC)
+                # Reset the "new data" event; need to do this inside the lock.
+                self.microbatch_not_empty.clear()
+
+        # Await the receipt of the sync signal.
+        await self.microbatch_processing_event.wait()
+
+        while self.pending_microbatch:
+            header, message = self.pending_microbatch.popleft()
             if header == Headers.SUBMIT_REQUEST:
-                request_id, prompt, sampling_params = data[1:]
+                request_id, prompt, sampling_params = message
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 self.add_request(request_id, prompt, sampling_params)
             elif header == Headers.PAUSE:
@@ -1031,7 +1025,103 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.UNPAUSE:
                 self.paused = False
 
-        return len(all_messages)
+        self.microbatch_processing_event.clear()
+
+    @trace_async_exceptions
+    async def _mp_coord_recv_task(self):
+        """Listen for requests from the inference coordinator and forward them to the ranks."""
+        while True:
+            try:
+                async with self.coord_recv_lock:
+                    # Receive messages in a non-blocking way.
+                    _, header, data = await self._irecv(
+                        self.socket_for_receiving_requests, deserialize=False
+                    )
+                    # Now publish the actual messages to all tensor parallel ranks
+                    self._isend(self.model_parallel_publisher_socket, header, data, serialize=False)
+                    self.microbatch_not_empty.set()
+            except asyncio.CancelledError:
+                break
+
+    @trace_async_exceptions
+    async def _mp_rank_recv_task(self):
+        """Listen for requests from the mp coordinator"""
+        while True:
+            try:
+                _, header, message = await self._irecv(self.model_parallel_subscriber_socket)
+                if header == Headers.MICROBATCH_SYNC:
+                    # Set the microbatch processing signal.
+                    self.microbatch_processing_event.set()
+                else:
+                    self.pending_microbatch.append((header, message))
+            except asyncio.CancelledError:
+                break
+
+    @trace_async_exceptions
+    async def _send_task(self):
+        """Pop futures of sends out of a queue and await them.
+
+        For explanation why this works, refer to the documentation for zmq.asyncio:
+            'Returns a Future that resolves when sending is complete.'
+        """
+        while True:
+            await (await self._send_awaitables.get())
+            self._send_awaitables.task_done()
+
+    def _isend(
+        self,
+        socket: zmq.asyncio.Socket,
+        header: Headers,
+        data: Optional[List] = None,
+        serialize: bool = True,
+    ) -> asyncio.Future:
+        """
+        Asynchronously send a signal to the inference coordinator.
+
+        Args:
+            socket (zmq.asyncio.Socket): The ZMQ socket to send the signal on.
+            header (Headers): The signal header to send.
+            data (Optional[List]): The data payload to send.
+            serialize (bool): Whether to serialize the data using msgpack.
+        """
+        to_send = [header.value.to_bytes()]
+        if data is not None:
+            if serialize:
+                data = msgpack.packb(data, use_bin_type=True)
+            to_send.append(data)
+        send_awaitable = socket.send_multipart(to_send)
+        self._send_awaitables.put_nowait(send_awaitable)
+
+    async def _irecv(
+        self,
+        socket: zmq.asyncio.Socket,
+        socket_uses_identity: bool = False,
+        deserialize: bool = True,
+    ) -> Tuple[Optional[bytes], Headers, List | bytes | None]:
+        """
+        Asynchronously receive a signal from the inference coordinator.
+
+        Returns:
+            identity (Optional[bytes]): The source of the signal.
+            header (Headers): The signal header received.
+            data (List | bytes | None): The data payload received.
+        """
+        raw = await socket.recv_multipart()
+        if socket_uses_identity:
+            identity, header, *rest = raw
+        else:
+            header, *rest = raw
+            identity = None
+
+        header = Headers(int.from_bytes(header))
+        data = rest[0] if rest else None
+
+        if deserialize:
+            message = msgpack.unpackb(data, raw=False) if data is not None else None
+        else:
+            message = data
+
+        return identity, header, message
 
     def stop(self):
         """
@@ -1042,6 +1132,10 @@ class DynamicInferenceEngine(AbstractEngine):
         model parallelism.
         """
 
+        self.send_task.cancel()
+        self.mp_rank_recv_task.cancel()
+        if self.is_mp_coordinator:
+            self.mp_coord_recv_task.cancel()
         if hasattr(self, "inference_coordinator_process"):
             self.inference_coordinator_process.terminate()
         for socket in self.zmq_sockets:
@@ -1072,35 +1166,24 @@ class DynamicInferenceEngine(AbstractEngine):
     ):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
+        self.send_task = loop.create_task(self._send_task())
+        self.mp_rank_recv_task = loop.create_task(self._mp_rank_recv_task())
+
+        if self.is_mp_coordinator:
+            self.mp_coord_recv_task = loop.create_task(self._mp_coord_recv_task())
+
+        if self.launch_inference_coordinator and self.is_dp_coordinator:
+            print(f"[{self.rank}] Waiting for co-ordinator to be ready...")
+            logging.info("Inference co-ordinator is ready to receive requests!")
+            print(f"[{self.rank}] Co-ordinator is ready!")
+            await await_process_event(self.coordinator_ready_event, self.inference_coordinator_process)
+
         try:
             while True:
-                self.schedule_requests()
+                await self.schedule_requests()
                 if self.stopped:
                     self.stop()
                     return
-
-                # for the cases below (engine is paused or no active requests),
-                # do not use asyncio.sleep(0)
-                # as tp-rank=0 will flood the num_messages publisher
-                # with "0" repeatedly. This causes some packets to drop.
-                # Instead be nice, and sleep
-                # for a short time.
-                # The minimum sleep time needed is ~100us i.e. the time
-                # needed to send one message on an IPC socket. However
-                # just to be safe, we use 20ms here.
-
-                # todo [Siddharth]: Can this hardcoded sleep be avoided
-                # with asyncio zmq sockets?
-                if self.paused:
-                    await asyncio.sleep(0.02)
-                    continue
-
-                if (
-                    self.context.get_active_request_count() == 0
-                    and len(self.waiting_request_ids) == 0
-                ):
-                    await asyncio.sleep(0.02)
-                    continue
 
                 engine_output = await self.async_step(verbose=verbose)
 
@@ -1109,14 +1192,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     and engine_output is not None
                     and engine_output["finished_requests"]
                 ):
-                    payload = msgpack.packb(
-                        [
-                            Headers.ENGINE_REPLY.value,
-                            [r.serializable() for r in engine_output["finished_requests"]],
-                        ],
-                        use_bin_type=True,
+                    self._isend(
+                        self.socket_for_receiving_requests,
+                        Headers.ENGINE_REPLY,
+                        [r.serializable() for r in engine_output["finished_requests"]],
                     )
-                    self.socket_for_receiving_requests.send(payload)
 
         except asyncio.CancelledError:
             pass

@@ -10,8 +10,9 @@ class Headers(Enum):
 
     CONNECT = 0
     ACK = 1
-    SUBMIT_REQUEST = 2
-    ENGINE_REPLY = 3
-    PAUSE = 4
-    UNPAUSE = 5
-    STOP = 6
+    MICROBATCH_SYNC = 2
+    SUBMIT_REQUEST = 3
+    ENGINE_REPLY = 4
+    PAUSE = 5
+    UNPAUSE = 6
+    STOP = 7

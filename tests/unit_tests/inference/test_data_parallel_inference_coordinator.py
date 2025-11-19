@@ -177,7 +177,7 @@ class TestCoordinator:
 
         # Connect each engine to their respective processes.
         env.timing_data["start_time"] = time.time()
-        await env.engine.start_listening_to_data_parallel_coordinator(
+        env.engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=test_config.port,
             launch_inference_coordinator=test_config.launch_inference_coordinator,
         )
@@ -187,7 +187,7 @@ class TestCoordinator:
         try:
             if dist.get_rank() == 0:
                 client = InferenceClient(test_config.port)
-                await client.start()
+                client.start()
                 env.timing_data["init_time"] = time.time()
 
                 all_results = []
