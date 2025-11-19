@@ -925,6 +925,12 @@ class MambaMixer(MegatronModule):
             x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
             if not self.rmsnorm:
                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+
+            # Upcast the batch_indices to prevent integer overflow errors in the case of
+            # large max request counts.
+            if batch_indices is not None:
+                batch_indices = batch_indices.to(torch.int64)
+
             y = selective_state_update(
                 ssm_state,
                 x_reshaped,
