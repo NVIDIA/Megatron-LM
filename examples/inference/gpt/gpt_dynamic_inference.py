@@ -327,6 +327,8 @@ def run_inference(
                 request.state = "finished"
                 request.request_id = finished_request.request_id
                 if finished_request.sampling_params.return_log_probs:
+                    if not finished_request.prompt_log_probs:
+                        finished_request.prompt_log_probs = []
                     request.log_probs = (
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
@@ -380,6 +382,7 @@ def main():
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
+        skip_prompt_log_probs=args.skip_prompt_log_probs,
         return_log_probs=args.return_log_probs,
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,

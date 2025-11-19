@@ -709,20 +709,31 @@ class TextGenerationController:
 
         active_request_count = context.total_request_count - context.paused_request_count
 
-        to_check = self.return_log_probs_cuda[:active_request_count]
+        # Create a copy to avoid modifying the original tensor with in-place operations
+        to_check = self.return_log_probs_cuda[:active_request_count].clone()
         to_check &= ~self.skip_prompt_log_probs_cuda[:active_request_count]
 
         assert not (
             to_check.any() and materialize_only_last_token_logits
-        ), "Prompt log probs cannot be calculated if only last token logits are materialized."
+        ), "Prompt log probs cannot be calculated if only last token logits are materialized. Set materialize_only_last_token_logits to False in DynamicInferenceContext or skip_prompt_log_probs to True in SamplingParams."
 
         return self.return_log_probs_cuda[:active_request_count].any()
 
     def _dynamic_step_top_n_logprobs_bookkeeping(self) -> bool:
         """Perform bookkeeping necessary to compute top-n log probs for dynamic batching."""
         context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
         active_request_count = context.total_request_count - context.paused_request_count
+
+        # Check if any request wants prompt top-n logprobs (top_n > 0 AND return_prompt_top_n = True)
+        # Create a copy to avoid modifying the original tensor with in-place operations
+        to_check = (self.top_n_logprobs_cuda[:active_request_count] > 0).clone()
+        to_check &= self.return_prompt_top_n_logprobs_cuda[:active_request_count]
+
+        assert not (
+            to_check.any() and materialize_only_last_token_logits
+        ), "Prompt top-n logprobs cannot be calculated if only last token logits are materialized. Set materialize_only_last_token_logits to False in DynamicInferenceContext or set return_prompt_top_n_logprobs to False in SamplingParams."
 
         # Check if any request has top_n_logprobs > 0
         return (self.top_n_logprobs_cuda[:active_request_count] > 0).any()
@@ -756,6 +767,11 @@ class TextGenerationController:
             A dictionary mapping request_idx to list of (top_n_logprobs, top_n_indices) tuples.
             Each tuple in the list represents one token position.
         """
+        assert log_probs_tensor is not None, (
+            "log_probs_tensor must be provided. This should be guaranteed by the calling code "
+            "computing log_probs when return_top_n_logprobs is True."
+        )
+
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
@@ -882,9 +898,6 @@ class TextGenerationController:
                 cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
         context = self.inference_wrapped_model.inference_context
-        materialize_only_last_token_logits = context.materialize_only_last_token_logits
-
-        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
 
         # No tokens?
         if context.active_token_count == 0:
@@ -913,21 +926,21 @@ class TextGenerationController:
         return_log_probs = self._dynamic_step_log_probs_bookkeeping()
         return_top_n_logprobs = self._dynamic_step_top_n_logprobs_bookkeeping()
 
-        # Therefore, we can assert this constraint and always reuse log_probs_tensor for top_n calculation.
-        if return_top_n_logprobs:
-            assert return_log_probs, (
-                "top_n_logprobs requires return_log_probs to be True. "
-                "This constraint should be enforced in dynamic_engine.py"
-            )
-
+        # Calculate log probs if needed for return or for top-n calculation.
+        # Per the constraint in dynamic_engine.py, any request with top_n_logprobs > 0
+        # must also have return_log_probs=True. However, during prefill with skip_prompt_log_probs,
+        # we might not store prompt log probs but still need them for top-n calculation.
         log_probs = None
         log_probs_tensor = None
-        if return_log_probs:
-            log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
+        if return_log_probs or return_top_n_logprobs:
+            log_probs_list, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
+            # Only return log_probs if explicitly requested
+            if return_log_probs:
+                log_probs = log_probs_list
 
         if return_top_n_logprobs:
-            # Since return_log_probs is guaranteed to be True (per assertion above),
-            # log_probs_tensor is always available, avoiding redundant softmax computation.
+            # log_probs_tensor is guaranteed to be available since we computed it above,
+            # avoiding redundant softmax computation.
             top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(logits, log_probs_tensor)
         else:
             top_n_logprobs = None

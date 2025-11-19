@@ -97,6 +97,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Model provider",
     )
     group.add_argument(
+        "--skip-prompt-log-probs",
+        action='store_true',
+        default=False,
+        help='Skip prompt log probs.',
+    )
+    group.add_argument(
         "--output-path",
         type=str,
         default=None,
