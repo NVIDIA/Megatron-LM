@@ -62,7 +62,6 @@ class GPTFIMDataset(GPTDataset):
     ) -> None:
         super().__init__(indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config)
 
-        self.indexed_dataset = indexed_dataset
         self.np_rng = np.random.RandomState(seed=self.config.random_seed)
         logger.info(f"Initialized FIM RNG with seed = {self.config.random_seed}")
         # get FIM params
@@ -111,7 +110,7 @@ class GPTFIMDataset(GPTDataset):
 
             # Add the entire sample
             sample_parts.append(
-                self.indexed_dataset.get(
+                self.dataset.get(
                     self.document_index[doc_index_beg],
                     offset=doc_index_beg_offset,
                     length=doc_index_end_offset - doc_index_beg_offset + 1,
@@ -127,7 +126,7 @@ class GPTFIMDataset(GPTDataset):
                 # Add the sample part
                 offset = 0 if i > doc_index_beg else doc_index_beg_offset
                 length = None if i < doc_index_end else doc_index_end_offset + 1
-                sample_parts.append(self.indexed_dataset.get(self.document_index[i], offset=offset, length=length))
+                sample_parts.append(self.dataset.get(self.document_index[i], offset=offset, length=length))
 
         sample = np.concatenate(sample_parts)
 
