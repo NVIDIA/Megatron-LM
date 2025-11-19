@@ -1923,10 +1923,9 @@ def _add_regularization_args(parser):
                        help='Weight decay increment function.')
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
-                       'None (default): param no weight decay if and only if it is 1D; or it is bias; '
-                       'or it is embedding and embedding_init_method_std is not None. '
-                       '"apply_wd_to_qk_layernorm": In addition to the default rules, '
-                       'apply weight decay to qk layernorm as a special case.')
+                       'None (default): apply weight decay to 1D weights and biases.'
+                       '"apply_wd_to_qk_layernorm": additionally apply weight decay to '
+                       'qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
