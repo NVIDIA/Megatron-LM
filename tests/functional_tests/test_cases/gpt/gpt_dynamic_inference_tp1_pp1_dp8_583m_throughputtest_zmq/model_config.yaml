@@ -1,0 +1,59 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+TEST_TYPE: frozen-start
+MODE: inference
+MODEL_ARGS:
+  --tiktoken-pattern: v2
+  --use-mcore-models: true
+  --tokenizer-type: TikTokenizer
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --auto-detect-ckpt-format: true
+  --max-tokens-to-oom: 3600000
+  --inference-max-seq-length: 4096
+  --attention-backend: flash
+  --use-checkpoint-args: true
+  --micro-batch-size: 1
+  --no-load-optim: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --timing-log-level: 0
+  --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/
+  --distributed-backend: nccl
+  --log-interval: 1
+  --transformer-impl: transformer_engine
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --ckpt-format: torch_dist
+  --bf16: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --num-layers: 24
+  --hidden-size: 1152
+  --num-attention-heads: 16
+  --max-position-embeddings: 1024
+  --seq-length: 1024
+  --temperature: 1.0
+  --top_k: 1
+  --seed: 42
+  --return-log-probs: true
+  --num-tokens-from-file: true
+  --inference-dynamic-batching-active-buffer-size-gb: 20
+  --cuda-graph-impl: local
+  --cuda-graph-scope: full
+  --disable-chunked-prefill: true
+  --dist-ckpt-strictness: log_unexpected
+  --inference-ckpt-non-strict: true # To handle the extra_state errors
+  --output-path: ${TENSORBOARD_PATH}
+  --output-every-n-results: 32
+  --prompt-file: ${DATA_PATH}/text/sharegpt-vicuna/filtered/processed.jsonl
+  --prompt-file-num-truncate: 1024
+  --incoming-requests-per-step: 128
+  --use-flashinfer-fused-rope: true
+  --throughput-check-only: true
+METRICS:
+  - "generated_tokens"
+  - "logprobs"
