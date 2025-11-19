@@ -65,6 +65,8 @@ from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyS
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
+
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -613,6 +615,11 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+
+    if getattr(args, "batch_invariant_mode", False):
+        print_rank_0("Enabling batch invariant mode globally",flush=True)
+        enable_batch_invariant_mode()
+
 
     if args.log_progress:
         append_to_progress_log("Starting job")
