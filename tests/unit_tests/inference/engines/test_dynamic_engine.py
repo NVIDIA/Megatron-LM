@@ -338,6 +338,7 @@ class TestDynamicInferenceEngine:
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 cuda_graph_scope=test_config.cuda_graph_scope,
+                is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
             # Mamba model.
@@ -535,11 +536,11 @@ class TestDynamicInferenceEngine:
         ]
 
         mamba_expected_generated_tokens = [
-            [74, 72, 83, 59],
+            [74, 72, 9, 59],
             [25, 54, 1, 70],
-            [28, 14, 15, 89],
-            [87, 27, 30, 52],
-            [44, 13, 82, 70],
+            [42, 14, 5, 89],
+            [51, 27, 30, 52],
+            [60, 92, 82, 70],
             [28, 74, 64, 16],
             [8, 4, 83, 5],
             [],
