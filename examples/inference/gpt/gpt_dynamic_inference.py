@@ -93,7 +93,16 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "`suspend_resume_interval` steps. This is used to tet the suspend/resume "
         "system.",
     )
-    group.add_argument('--inference-repeat-n', type=int, default=1, help="Repeat inference iterations N times for benchmarking.")
+    group.add_argument(
+        "--inference-repeat-n", type=int, default=1,
+        help="Repeat inference iterations N times for benchmarking."
+    )
+    group.add_argument(
+        "--throughput-check-only",
+        action='store_true',
+        default=False,
+        help="If true, only run throughput check without verifying outputs."
+    )
 
     return parser
 
@@ -163,7 +172,7 @@ def get_inference_context(
     # Inference context.
     context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
-        num_layers=args.num_layers,
+        num_layers=args.num_layers // args.pipeline_model_parallel_size,
         kv_channels=args.kv_channels,
         num_attention_heads=(
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
@@ -175,7 +184,7 @@ def get_inference_context(
             else None
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
-        active_buffer_size_gb=args.inference_dynamic_batching_active_buffer_size_gb,
+        buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,

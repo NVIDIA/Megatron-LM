@@ -4,11 +4,13 @@ import asyncio
 import logging
 import multiprocessing
 import os
+import socket
 import struct
 import time
 import warnings
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
@@ -92,6 +94,14 @@ def format_mem_bytes(mem_bytes):
         if mem_bytes >= suffix_bytes:
             return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
     return "%d bytes" % mem_bytes
+
+
+@dataclass(kw_only=True)
+class RequestEntry:
+    """Entry in the engine's `self.requests` dict."""
+
+    record: DynamicInferenceRequestRecord
+    future: asyncio.Future
 
 
 # pylint: disable=line-too-long
@@ -214,8 +224,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.waiting_request_ids = deque()
         self.failed_request_ids = []  # deque()
         self.request_counter = Counter()
-        self.request_records: Dict[int, DynamicInferenceRequestRecord] = {}
-        self.request_completion_futures: Dict[int, asyncio.Future] = {}
+        self.requests: Dict[int, RequestEntry] = {}
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
@@ -338,6 +347,7 @@ class DynamicInferenceEngine(AbstractEngine):
     async def start_listening_to_data_parallel_coordinator(
         self,
         inference_coordinator_port: int,
+        inference_mp_coordinator_port: int = 20000,
         launch_inference_coordinator: bool = True,
         verbose: bool = False,
         *,
@@ -351,15 +361,15 @@ class DynamicInferenceEngine(AbstractEngine):
         based on the rank's role within the distributed topology.
 
         The setup involves two primary roles within each data-parallel group:
-        1.  **TP Coordinator (TP_rank=0, PP_rank=0)**: This rank connects directly
+        1.  **MP Coordinator (TP_rank=0, PP_rank=0)**: This rank connects directly
             to the central coordinator via a ZMQ `DEALER` socket. It receives
             requests and uses a ZMQ `PUB` (publisher) socket to broadcast them
-            to all other ranks within its tensor-parallel (TP) group.
-        2.  **TP Workers (all other ranks)**: These ranks use ZMQ `SUB` (subscriber)
-            sockets to listen for requests broadcast by their local TP Coordinator.
+            to all other ranks within its model-parallel (MP) group.
+        2.  **MP Workers (all other ranks)**: These ranks use ZMQ `SUB` (subscriber)
+            sockets to listen for requests broadcast by their local MP Coordinator.
 
-        This architecture uses fast Inter-Process Communication (`ipc`) sockets for
-        intra-node broadcasts within a TP group.
+        This architecture uses TCP sockets for both inter-node and intra-node broadcasts
+        within an MP group.
 
         Finally, after setting up the communication channels and ensuring all ranks
         are synchronized, this method starts the main engine processing loop
@@ -368,16 +378,13 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             inference_coordinator_port (int): The network port where the central
                 `InferenceCoordinator` is or will be listening.
+            inference_mp_coordinator_port (int): The base network port where each model parallel
+                coordinator will broadcast messages from. Each MP group will compute an independent
+                port offset from this base port.
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
             verbose (bool): Whether to run in verbose mode.
-
-        Note:
-            The current implementation uses `ipc` sockets for broadcasting requests
-            within a Tensor Parallel group, which limits each TP group to a single
-            physical node. For example, if you have 8 GPUs per node, then this will only
-            work with TP=[1,2,4,8]
         """
 
         assert HAVE_ZMQ, (
@@ -404,8 +411,31 @@ class DynamicInferenceEngine(AbstractEngine):
         # Todo [Siddharth]: can we move this code to another file?
         self.zmq_context = zmq.Context()
         self.zmq_sockets = []  # keep track of all sockets created by this engine
+
+        # We need to broadcast the hostname of the (TP=0, PP=0) rank
+        # to all other ranks in the same model parallel group.
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+
+        hostname_list = [None]
+        if tp_rank == 0 and pp_rank == 0:
+            hostname_list[0] = socket.gethostname()
+
+        # Find the global rank of the (TP=0, PP=0) rank in our MP group
+        src_global_rank = parallel_state.get_model_parallel_src_rank()
+
+        torch.distributed.broadcast_object_list(
+            hostname_list, src=src_global_rank, group=parallel_state.get_model_parallel_group()
+        )
+        bcast_hostname = hostname_list[0]
+
+        # We need unique ports for each MP group, so we compute an offset using the DP rank.
+        dp_rank = parallel_state.get_data_parallel_rank()
+        req_port = inference_mp_coordinator_port + (dp_rank * 2)
+        len_port = inference_mp_coordinator_port + (dp_rank * 2) + 1
+
         ip_address_of_dp_coordinator = os.getenv('MASTER_ADDR', '127.0.0.1')
-        identity = f'tp-coord-{parallel_state.get_data_parallel_rank()}'
+        identity = f'mp-coord-{parallel_state.get_data_parallel_rank()}'
         if (
             parallel_state.get_tensor_model_parallel_rank() == 0
             and parallel_state.get_pipeline_model_parallel_rank() == 0
@@ -423,37 +453,33 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.send(b"")
 
             # 2. Create a publisher socket. This is used to publish or broadcast
-            #    requests within the tensor parallel group
-            self.tensor_parallel_publisher_socket = self.zmq_context.socket(zmq.PUB)
-            self.tensor_parallel_publisher_socket.bind(f"ipc:///tmp/{identity}-tp-bcast-socket-req")
+            #    requests within the model parallel group
+            self.model_parallel_publisher_socket = self.zmq_context.socket(zmq.PUB)
+            self.model_parallel_publisher_socket.bind(f"tcp://*:{req_port}")
 
             # 3. Create another publisher socket to broadcast the number of messages to receive.
-            self.tensor_parallel_num_msgs_publisher_socket = self.zmq_context.socket(zmq.PUB)
-            self.tensor_parallel_num_msgs_publisher_socket.bind(
-                f"ipc:///tmp/{identity}-tp-bcast-socket-len"
-            )
+            self.model_parallel_num_msgs_publisher_socket = self.zmq_context.socket(zmq.PUB)
+            self.model_parallel_num_msgs_publisher_socket.bind(f"tcp://*:{len_port}")
             self.zmq_sockets += [
                 self.socket_for_receiving_requests,
-                self.tensor_parallel_num_msgs_publisher_socket,
-                self.tensor_parallel_publisher_socket,
+                self.model_parallel_num_msgs_publisher_socket,
+                self.model_parallel_publisher_socket,
             ]
-        # All TP ranks subscribe to the two publisher sockets
-        self.tensor_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.tensor_parallel_subscriber_socket.connect(f"ipc:///tmp/{identity}-tp-bcast-socket-req")
-        self.tensor_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        # All MP ranks subscribe to the two publisher sockets
+        self.model_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
+        self.model_parallel_subscriber_socket.connect(f"tcp://{bcast_hostname}:{req_port}")
+        self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-        self.tensor_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.tensor_parallel_num_msgs_subscriber_socket.connect(
-            f"ipc:///tmp/{identity}-tp-bcast-socket-len"
-        )
-        self.tensor_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.model_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
+        self.model_parallel_num_msgs_subscriber_socket.connect(f"tcp://{bcast_hostname}:{len_port}")
+        self.model_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
         self.zmq_sockets += [
-            self.tensor_parallel_subscriber_socket,
-            self.tensor_parallel_num_msgs_subscriber_socket,
+            self.model_parallel_subscriber_socket,
+            self.model_parallel_num_msgs_subscriber_socket,
         ]
 
-        torch.distributed.barrier(parallel_state.get_tensor_model_parallel_group())
+        torch.distributed.barrier(parallel_state.get_model_parallel_group())
 
         if launch_inference_coordinator and torch.distributed.get_rank() == 0:
             await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
@@ -549,13 +575,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Maintain references to requests before reset.
         waiting_request_ids = list(self.waiting_request_ids)
-        active_request_ids = set(self.request_records.keys()) - set(waiting_request_ids)
+        active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         self.resume_request_ids = [*active_request_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.request_records[request_id].suspend(self.controller.tokenizer)
+            self.requests[request_id].record.suspend(self.controller.tokenizer)
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -632,7 +658,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             (DynamicInferenceRequest) The most recent request in the record.
         """
-        return self.request_records[request_id][-1]
+        return self.requests[request_id].record[-1]
 
     def _add_request(
         self, request: DynamicInferenceRequest
@@ -640,10 +666,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         request_id = request.request_id
 
-        # Add request to self.request_records. If the engine has previously been
+        # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.
-        if request_id not in self.request_records:
-            self.request_records[request_id] = DynamicInferenceRequestRecord.from_request(request)
+        if request_id not in self.requests:
+            self.requests[request_id] = RequestEntry(
+                record=DynamicInferenceRequestRecord.from_request(request),
+                future=self._loop.create_future(),
+            )
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -686,13 +715,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
 
-        # Create a new asyncio Future to notify the user when the request has
-        # completed. If the engine has previously been suspended, then the future
-        # may already exist.
-        if request_id not in self.request_completion_futures:
-            self.request_completion_futures[request_id] = self._loop.create_future()
-
-        return self.request_completion_futures[request_id]
+        return self.requests[request_id].future
 
     def add_request(
         self,
@@ -813,8 +836,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
-                    finished_request_record = self.request_records.pop(request_id)
-                    finished_request = finished_request_record[-1]
+                    finished_entry = self.requests.pop(request_id)
+                    finished_request = finished_entry.record[-1]
                     if finished_request.prompt is None:
                         finished_request.prompt = self.controller.tokenizer.detokenize(
                             finished_request.prompt_tokens.tolist()
@@ -823,8 +846,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_request.generated_text = self.controller.tokenizer.detokenize(
                         finished_request.generated_tokens
                     )
-                    finished_request_records.append(finished_request_record)
-                    self.request_completion_futures[request_id].set_result(finished_request_record)
+                    finished_request_records.append(finished_entry.record)
+                    finished_entry.future.set_result(finished_entry.record)
                 else:
                     active_request_ids.append(request_id)
             else:
@@ -1007,12 +1030,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Failed requests.
         for failed_request_id in self.failed_request_ids:
-            failed_request_record = self.request_records.pop(failed_request_id)
-            failed_request = failed_request_record[-1]
+            failed_entry = self.requests.pop(failed_request_id)
+            failed_request = failed_entry.record[-1]
             failed_request.status = Status.FAILED
             failed_request.add_event_fail()
-            finished_request_records.append(failed_request_record)
-            self.request_completion_futures[failed_request_id].set_result(failed_request_record)
+            finished_request_records.append(failed_entry.record)
+            failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
 
         # Log KV cache utilization stats to W&B
@@ -1154,16 +1177,16 @@ class DynamicInferenceEngine(AbstractEngine):
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
         This method is a collective and synchronous operation that must be called
-        by all ranks in a Tensor Parallel (TP) group at the same time. It ensures
+        by all ranks in a Model Parallel (MP) group at the same time. It ensures
         that all ranks process the exact same batch of incoming requests and
         control signals.
 
         The synchronization works as follows:
-        1.  The TP rank 0 drains all pending messages from its subscriber socket
+        1.  The MP rank 0 drains all pending messages from its subscriber socket
             in a non-blocking manner.
-        2.  TP rank 0 then broadcasts the number of messages it received to all other
-            ranks in its TP group using a dedicated publisher socket.
-        3.  The other TP ranks wait to receive this count, and then receive exactly
+        2.  MP rank 0 then broadcasts the number of messages it received to all other
+            ranks in its MP group using a dedicated publisher socket.
+        3.  The other MP ranks wait to receive this count, and then receive exactly
             that many messages from their subscriber sockets.
 
         Once all ranks have the same batch of messages, they are unpacked and
@@ -1173,7 +1196,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Note:
             This function is synchronous and must be called collectively by all
-            ranks in a TP group. It should not be launched in a separate coroutine
+            ranks in a MP group. It should not be launched in a separate coroutine
             to ensure all ranks execute it in lockstep before proceeding to the
             next engine step.
 
@@ -1181,10 +1204,11 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
-        rank = parallel_state.get_tensor_model_parallel_rank()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         torch.cuda.nvtx.range_push("drain_zmq_socket")
         all_messages = []
-        if rank == 0:
+        if tp_rank == 0 and pp_rank == 0:
             while True:
                 try:
                     # Receive messages in a non-blocking way.
@@ -1196,22 +1220,22 @@ class DynamicInferenceEngine(AbstractEngine):
             # First publish the number of messages to dequeue.
             # This is important because we want all tensor parallel ranks
             # to dequeue the same number of messages.
-            self.tensor_parallel_num_msgs_publisher_socket.send(
+            self.model_parallel_num_msgs_publisher_socket.send(
                 struct.pack('!i', messages_to_dequeue)
             )
-            # Now publish the actual messages to all tensor parallel ranks
+            # Now publish the actual messages to all model parallel ranks
             for message in all_messages:
-                self.tensor_parallel_publisher_socket.send(message)
+                self.model_parallel_publisher_socket.send(message)
         else:
-            # First, receive the number of messages to dequeue from tp-rank 0
+            # First, receive the number of messages to dequeue from mp-rank 0
             messages_to_dequeue = struct.unpack(
-                '!i', self.tensor_parallel_num_msgs_subscriber_socket.recv()
+                '!i', self.model_parallel_num_msgs_subscriber_socket.recv()
             )[0]
             # Now, dequeue the same number of messages from the subscriber socket.
             # Note that these receives are blocking, because the messages
             # are guaranteed to be available after the tp-rank 0 has sent them.
             for _ in range(messages_to_dequeue):
-                all_messages.append(self.tensor_parallel_subscriber_socket.recv())
+                all_messages.append(self.model_parallel_subscriber_socket.recv())
 
         torch.cuda.nvtx.range_pop()
         for message in all_messages:
