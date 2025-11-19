@@ -8,10 +8,6 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.rl.rl_utils import selective_log_softmax
 
 
-CUDA_AVAILABLE = torch.cuda.is_available()
-pytestmark = pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
-
-
 def test_selective_log_softmax_batch_invariant_matches_f_log_softmax():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
