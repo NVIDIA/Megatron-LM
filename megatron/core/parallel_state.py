@@ -11,7 +11,7 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
-from .utils import GlobalMemoryBuffer, is_torch_min_version
+from .utils import GlobalMemoryBuffer, GlobalSymmetricMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,9 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
+
+# Global symmetric memory buffer for inference
+_GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
 # List of all process groups
 # Used for updating the timeout for all process groups
@@ -1284,6 +1287,9 @@ def initialize_model_parallel(
     # we could stick it there
     _set_global_memory_buffer()
 
+    # initialize global symmetric memory buffer
+    _set_global_symmetric_memory_buffer()
+
 
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
@@ -1925,12 +1931,25 @@ def _set_global_memory_buffer():
     assert _GLOBAL_MEMORY_BUFFER is None, "global memory buffer is already initialized"
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
+def _set_global_symmetric_memory_buffer():
+    """Initialize global buffer."""
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is None, "global memory buffer is already initialized"
+
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = GlobalSymmetricMemoryBuffer(
+        size_in_mb=256, #todo: set from an argument? 
+        process_group=get_tensor_model_parallel_group()
+    )
 
 def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""
     assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
     return _GLOBAL_MEMORY_BUFFER
 
+def get_global_symmetric_memory_buffer():
+    """Return the global GlobalSymmetricMemoryBuffer object"""
+    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is not None, "global symmetric memory buffer is not initialized"
+    return _GLOBAL_SYMMETRIC_MEMORY_BUFFER
 
 def destroy_global_memory_buffer():
     """Sets the global memory buffer to None"""
