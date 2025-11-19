@@ -28,6 +28,11 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Type, 
 
 import numpy
 import torch
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+    HAVE_TORCH_SYMM_MEM = True
+except ImportError:
+    HAVE_TORCH_SYMM_MEM = False
 
 from megatron.core import config
 from megatron.core.package_info import __version__ as mcore_version
@@ -615,6 +620,42 @@ class GlobalMemoryBuffer:
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
 
+
+class GlobalSymmetricMemoryBuffer:
+    """
+    Global symmetric memory buffer used in inference.
+    This buffer is used by mcore-inference's low-latency 
+    NVLS all-gather and reduce-scatter collectives.
+    """
+
+    def __init__(self, size_in_mb, process_group):
+        assert HAVE_TORCH_SYMM_MEM, "PyTorch symmetric memory module not found."
+        numel = int(size_in_mb * 1024 * 1024)  # size in bytes
+        try:
+            symm_mem.enable_symm_mem_for_group(process_group.group_name)
+            self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
+            self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
+        except RuntimeError as e:
+            # If symmetric memory initialization fails, set buffer and handle to None
+            # This can happen if the process group is not contained within NVlink
+            self.symm_buffer = None
+            self.symm_mem_hdl = None
+
+    def maybe_get_tensor(self, tensor_shape, dtype) -> Dict[str, Optional[Union[torch.Tensor, symm_mem.SymmMemHandle]]]:
+        """
+        Returns (potentially) a sub-tensor from the self.symm_buffer for the given shape.
+        If enough symmetric memory is not available, returns None.
+        """
+        if self.symm_mem_hdl is None:
+            return {"buffer": None, "handle": None}
+        size_of_dtype = torch.tensor([], dtype=dtype).element_size()
+        required_len = reduce(operator.mul, tensor_shape, 1) * size_of_dtype
+        if required_len <= self.symm_buffer.numel():
+            # Note that we always return subtensors starting from index 0 for easy 
+            # cuda-graphability. 
+            return {"buffer":self.symm_buffer[0:required_len].view(dtype).view(*tensor_shape), 
+                    "handle": self.symm_mem_hdl}
+        return {"buffer": None, "handle": None}
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
     """Make a viewless tensor.
