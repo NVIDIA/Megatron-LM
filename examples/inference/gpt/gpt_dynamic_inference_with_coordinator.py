@@ -1,38 +1,42 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from megatron.core.inference.inference_client import InferenceClient
-from examples.inference.gpt.utils import add_common_inference_args
 import asyncio
 import json
-import os 
+import os
 import time
 import torch
 import torch.distributed as dist
 from collections import defaultdict
 from tqdm import tqdm
 from typing import List
+import warnings
+import logging
 
 from examples.inference.gpt.gpt_dynamic_inference import (
-    get_model,
+    add_dynamic_inference_args,
     get_inference_context,
     get_inference_controller,
-    add_dynamic_inference_args,
+    get_model,
 )
 from examples.inference.gpt.utils import (
-    add_common_inference_args,
+    Request, 
+    build_dynamic_engine_setup_prefix, 
     build_requests,
-    build_dynamic_engine_setup_prefix,
-    Request,
+    add_common_inference_args
 )
+
 from megatron.core import parallel_state
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+from megatron.core.utils import get_attr_wrapped_model
+
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.arguments import parse_args
 
-import logging
+# pylint: disable=line-too-long
 
 logging.basicConfig(level=logging.INFO, force=True)
 
@@ -40,6 +44,7 @@ async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],
     port: int,
+    mp_port: int,
     sampling_params: SamplingParams | None = None,
 ):
     if sampling_params is not None:
@@ -50,19 +55,22 @@ async def main(
         )
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
-    # and processing them in an asyncio coroutine. 
-    await engine.start_listening_to_data_parallel_coordinator( 
+    # and processing them in an asyncio coroutine.
+    
+    await engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=port,
+        inference_mp_coordinator_port=mp_port,
         launch_inference_coordinator=True,
         verbose=True,
     )
-    # if you want to use your own inference coordinator - 
+
+    # if you want to use your own inference coordinator -
     # 1. set launch_inference_coordinator to False
     # 2. setup a router socket at tcp://MASTER_ADDR:PORT
     # 3. wait for data parallel groups to establish connection (BasicInferenceCoordinator.__init__)
     # 4. look at InferenceCoordinator.start() to see how we can route requests from users <-> data parallel groups
-    #   based on headers. 
-    # 5. look at InferenceClient to see how we create requests with headers. 
+    #   based on headers.
+    # 5. look at InferenceClient to see how we create requests with headers.
 
     args = get_args()
 
@@ -85,8 +93,8 @@ async def main(
         resume_idxs = set()
 
     # Create client and run example.
-    if dist.get_rank() == 0: 
-        client = InferenceClient(port) # submits requests to the inference coordinator
+    if dist.get_rank() == 0:
+        client = InferenceClient(port)  # submits requests to the inference coordinator
         await client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
@@ -94,6 +102,7 @@ async def main(
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
+        
         while True:
             current_time = time.time_ns() / 10**9
             if args.incoming_requests_per_step is None:
@@ -133,8 +142,9 @@ async def main(
 
             if num_requests_added == num_requests_total:
                 break
-            # Relinquish control since there are no more requests to add at the moment. This allows the engine to run. 
+            # Relinquish control since there are no more requests to add at the moment. This allows the engine to run.
             await asyncio.sleep(0)
+        
         # While we wait for the requests to complete, the engine runs in the background.
         results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
 
@@ -150,7 +160,7 @@ async def main(
                     "input_prompt": req.prompt,
                     "generated_text": req.generated_text.replace("\n", "\\n"),
                     "generated_tokens": req.generated_tokens,
-                    "latency": req.latency, #InferenceClient populates this field in the returned future.
+                    "latency": req.latency,  # InferenceClient populates this field in the returned future.
                 }
                 if req.sampling_params["return_log_probs"]:
                     result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
@@ -176,16 +186,17 @@ async def main(
                     len(reqs),
                     reqs[0].generated_text.replace("\n", "\\n"),
                 ))
- 
+
         # kill the engines and suspend the client
         client.stop_engines()
         client.stop()
-        
+
     # once the stop signal eventually makes its way to each GPU, the engines will stop.
     await asyncio.gather(engine.engine_loop_task)
 
+
 if __name__ == "__main__":
-    # enable inference mode in the very beginning as some fp-8 optimizations 
+    # enable inference mode in the very beginning as some fp-8 optimizations
     # check for it.
     with torch.inference_mode():
         initialize_megatron(
@@ -207,17 +218,37 @@ if __name__ == "__main__":
             top_p=args.top_p,
             return_log_probs=args.return_log_probs,
             num_tokens_to_generate=args.num_tokens_to_generate,
-            termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
+            termination_id=(
+                args.termination_id if args.termination_id is not None else tokenizer.eod
+            ),
         )
 
         # Requests, context, conroller.
         model = get_model()
-        requests = build_requests(args, tokenizer, sampling_params) if dist.get_rank() == 0 else None
+        requests = (
+            build_requests(args, tokenizer, sampling_params) if dist.get_rank() == 0 else None
+        )
 
-        context = get_inference_context(None, 
-                                        None,
-                                        calculate_max_sequence_length_from_requests=False)
-        
+        # Layer type list for hybrid models
+        decoder = get_attr_wrapped_model(model, "decoder")
+        layer_type_list = getattr(decoder, "layer_type_list", None)
+        if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+                decoder.mamba_state_shapes_per_request()
+            )
+        else:
+            mamba_conv_states_shape = None
+            mamba_ssm_states_shape = None
+
+        context = get_inference_context(
+            None,
+            None,
+            calculate_max_sequence_length_from_requests=False,
+            layer_type_list=layer_type_list,
+            mamba_conv_states_shape=mamba_conv_states_shape,
+            mamba_ssm_states_shape=mamba_ssm_states_shape,
+        )
+
         controller = get_inference_controller(model, context)
 
         # Inference engine.
@@ -226,17 +257,20 @@ if __name__ == "__main__":
             context,
             enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
-            enable_chunked_prefill=not args.disable_chunked_prefill
+            enable_chunked_prefill=not args.disable_chunked_prefill,
         )
 
-        
         if dist.get_rank() == 0:
             setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
             print("~~~")
             print(setup_prefix)
             print("~~~")
-        
-        asyncio.run(main(engine, 
-                        requests,
-                        args.inference_coordinator_port))
 
+        asyncio.run(
+            main(
+                engine,
+                requests,
+                args.inference_coordinator_port,
+                args.inference_mp_coordinator_port
+            )
+        )
