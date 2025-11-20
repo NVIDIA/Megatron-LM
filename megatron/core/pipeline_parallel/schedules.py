@@ -591,8 +591,8 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
-    if not forward_only and config.packed_moe_expert_offloading:
-        packed_moe_expert_offloading_reset()
+    if not forward_only:
+        packed_moe_expert_offloading_reset(enabled=config.packed_moe_expert_offloading)
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
