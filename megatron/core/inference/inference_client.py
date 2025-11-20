@@ -201,7 +201,6 @@ class InferenceClient:
             Awaitable: An awaitable that resolves when all engines have paused.
         """
         self._send_signal_to_engines(Headers.PAUSE)
-        self.running.clear()
         return self.paused.wait()
 
     def unpause_engines(self) -> None:

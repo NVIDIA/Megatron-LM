@@ -231,8 +231,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.running = asyncio.Event()
         self.paused = asyncio.Event()
         self.stopped = asyncio.Event()
-        self.microbatch_pause: bool = False
-        self.microbatch_stop: bool = False
+        self.received_pause: bool = False
+        self.received_stop: bool = False
         self.suspend_signal = False
         self.is_suspended = False
         self.resume_request_ids = None
@@ -1317,18 +1317,10 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
 
-            if self.microbatch_pause:
-                assert header == Headers.PAUSE_ACK, (
-                    "Engine is waiting for PAUSE_ACK. No other messages allowed."
-                )
-            if self.microbatch_stop:
+            if self.received_stop:
                 assert header == Headers.STOP_ACK, (
                     "Engine is shutting down. No other messages allowed except STOP_ACK."
                 )
-            if self.paused.is_set():
-                assert (
-                    header == Headers.UNPAUSE
-                ), "Engine is paused. No other messages allowed except UNPAUSE."
 
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
@@ -1336,25 +1328,23 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.add_request(request_id, prompt, sampling_params)
             elif header == Headers.PAUSE:
                 # Pause thyself.
-                self.microbatch_pause = True
+                self.received_pause = True
                 self.running.clear()
                 # Send PAUSE_ACK back to coordinator.
                 if self.is_mp_coordinator:
                     payload = msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)
                     self.socket_for_receiving_requests.send(payload)
-                break
             elif header == Headers.STOP:
                 # Stop thyself.
-                self.microbatch_stop = True
+                self.received_stop = True
                 self.running.clear()
                 # Send STOP_ACK back to coordinator.
                 if self.is_mp_coordinator:
                     payload = msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)
                     self.socket_for_receiving_requests.send(payload)
-                break
             elif header == Headers.PAUSE_ACK:
                 self.paused.set()
-                self.microbatch_pause = False
+                self.received_pause = False
             elif header == Headers.STOP_ACK:
                 self.stopped.set()
                 self.stop()
@@ -1436,7 +1426,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
-                if self.microbatch_pause or self.microbatch_stop:
+                if self.paused.is_set() or self.received_pause or self.received_stop:
                     await asyncio.sleep(0.02)
                     continue
 
