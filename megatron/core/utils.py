@@ -37,7 +37,7 @@ except ImportError:
     HAVE_TORCH_SYMM_MEM = False
 
 try:
-    import triton
+    import triton  # pylint: disable=unused-import
 
     HAVE_TRITON = True
 except ImportError:
