@@ -98,6 +98,68 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches
 )
 
+# Hook handlers for NaN detection
+_nan_detection_hooks = []
+
+
+def create_nan_detection_hook(module_name):
+    """Create a forward hook to detect NaN in module outputs."""
+    def nan_detection_hook(module, input, output):
+        """Hook function to detect NaN in module output."""
+        if isinstance(output, torch.Tensor):
+            if torch.isnan(output).any():
+                print_rank_0(f"[NaN Detection] Found NaN in module: {module_name}")
+                print_rank_0(f"[NaN Detection] Output shape: {output.shape}, dtype: {output.dtype}")
+                print_rank_0(f"[NaN Detection] NaN count: {torch.isnan(output).sum().item()}")
+                # Optionally raise an exception or set a flag
+                # raise RuntimeError(f"NaN detected in {module_name}")
+        elif isinstance(output, (tuple, list)):
+            for idx, out in enumerate(output):
+                if isinstance(out, torch.Tensor) and torch.isnan(out).any():
+                    print_rank_0(f"[NaN Detection] Found NaN in module: {module_name}, output index: {idx}")
+                    print_rank_0(f"[NaN Detection] Output shape: {out.shape}, dtype: {out.dtype}")
+                    print_rank_0(f"[NaN Detection] NaN count: {torch.isnan(out).sum().item()}")
+        return output
+    return nan_detection_hook
+
+
+def register_nan_detection_hooks(model, module_filter=None):
+    """
+    Register forward hooks on model modules to detect NaN.
+    
+    Args:
+        model: The model (can be a list of model chunks for pipeline parallelism)
+        module_filter: Optional function to filter which modules to hook.
+                       If None, hooks all modules.
+    """
+    global _nan_detection_hooks
+    # Clear existing hooks
+    remove_nan_detection_hooks()
+    
+    if isinstance(model, list):
+        model_chunks = model
+    else:
+        model_chunks = [model]
+    
+    for chunk_idx, model_chunk in enumerate(model_chunks):
+        for name, module in model_chunk.named_modules():
+            # Skip if module filter is provided and module doesn't match
+            if module_filter is not None and not module_filter(name, module):
+                continue
+            
+            # Create hook with full module path
+            full_name = f"chunk_{chunk_idx}.{name}" if len(model_chunks) > 1 else name
+            hook = module.register_forward_hook(create_nan_detection_hook(full_name))
+            _nan_detection_hooks.append(hook)
+
+
+def remove_nan_detection_hooks():
+    """Remove all registered NaN detection hooks."""
+    global _nan_detection_hooks
+    for hook in _nan_detection_hooks:
+        hook.remove()
+    _nan_detection_hooks = []
+
 from .async_utils import maybe_finalize_async_save
 from .utils import (
     append_to_progress_log,
@@ -661,18 +723,18 @@ def pretrain(
     )
     print_rank_0(f"model: {model}")
     # check state_dict
-    state_dict = model[0].state_dict()
-    for key, value in state_dict.items():
-        if torch.isnan(value).any():
-            print_rank_0(f"nan in {key}")
-            import pdb;pdb.set_trace()
-        if torch.isinf(value).any():
-            print_rank_0(f"inf in {key}")
-            import pdb;pdb.set_trace()
-        if value.dtype != torch.float32:
-            print_rank_0(f"dtype not float32 in {key}")
-            import pdb;pdb.set_trace()
-    import pdb;pdb.set_trace()
+    # state_dict = model[0].state_dict()
+    # for key, value in state_dict.items():
+    #     if torch.isnan(value).any():
+    #         print_rank_0(f"nan in {key}")
+    #         import pdb;pdb.set_trace()
+    #     if torch.isinf(value).any():
+    #         print_rank_0(f"inf in {key}")
+    #         import pdb;pdb.set_trace()
+    #     if value.dtype != torch.float32:
+    #         print_rank_0(f"dtype not float32 in {key}")
+    #         import pdb;pdb.set_trace()
+    # import pdb;pdb.set_trace()
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -2245,6 +2307,14 @@ def train(
                 train_data_iterator = buffered_rollouts
 
         ft_integration.on_training_step_start()
+        
+        # Register NaN detection hooks before forward pass
+        args = get_args()
+        if getattr(args, 'enable_nan_detection_hooks', False):
+            # Optional: filter specific modules to hook (e.g., only attention layers)
+            # module_filter = lambda name, mod: 'attention' in name.lower()
+            register_nan_detection_hooks(model, module_filter=None)
+        
         (
             loss_dict,
             skipped_iter,
@@ -2256,6 +2326,11 @@ def train(
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
+        
+        # Remove NaN detection hooks after forward pass
+        if getattr(args, 'enable_nan_detection_hooks', False):
+            remove_nan_detection_hooks()
+        
         ft_integration.on_training_step_end()
         
         # Check if tensor collection is completed and set should_exit if needed
