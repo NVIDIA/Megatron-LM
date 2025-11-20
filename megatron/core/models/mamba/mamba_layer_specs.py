@@ -6,13 +6,16 @@ from megatron.core.extensions.transformer_engine import (
     TENorm,
     TERowParallelLinear,
 )
-from megatron.core.tensor_parallel import InferenceLayerNormColumnParallelLinear, InferenceRowParallelLinear
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
+from megatron.core.tensor_parallel import (
+    InferenceLayerNormColumnParallelLinear,
+    InferenceRowParallelLinear,
+)
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -84,7 +87,7 @@ mamba_stack_spec = ModuleSpec(
     ),
 )
 
-mamba_inference_stack_spec =  ModuleSpec(
+mamba_inference_stack_spec = ModuleSpec(
     module=MambaStack,
     submodules=MambaStackSubmodules(
         mamba_layer=ModuleSpec(
@@ -93,7 +96,8 @@ mamba_inference_stack_spec =  ModuleSpec(
                 mixer=ModuleSpec(
                     module=MambaMixer,
                     submodules=MambaMixerSubmodules(
-                        in_proj=InferenceLayerNormColumnParallelLinear, out_proj=InferenceRowParallelLinear
+                        in_proj=InferenceLayerNormColumnParallelLinear,
+                        out_proj=InferenceRowParallelLinear,
                     ),
                 ),
                 mamba_bda=get_bias_dropout_add,
@@ -126,7 +130,8 @@ mamba_inference_stack_spec =  ModuleSpec(
                 mlp=ModuleSpec(
                     module=MLP,
                     submodules=MLPSubmodules(
-                        linear_fc1=InferenceLayerNormColumnParallelLinear, linear_fc2=InferenceRowParallelLinear
+                        linear_fc1=InferenceLayerNormColumnParallelLinear,
+                        linear_fc2=InferenceRowParallelLinear,
                     ),
                 ),
                 mlp_bda=get_bias_dropout_add,
