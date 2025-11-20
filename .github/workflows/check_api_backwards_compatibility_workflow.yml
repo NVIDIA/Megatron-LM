@@ -13,13 +13,27 @@ on:
   workflow_dispatch:
     inputs:
       baseline:
-        description: 'Baseline git reference (tag/branch)'
+        description: 'Baseline git reference (tag/branch/commit)'
         required: true
 
 jobs:
   check-compatibility:
     name: Check API Backward Compatibility
     runs-on: ubuntu-latest
+    
+    # ============================================================================
+    # Configuration Parameters (modify here)
+    # ============================================================================
+    env:
+      # Default baseline for automatic PR checks
+      # Can be: branch name (e.g., 'main'), commit hash, or tag
+      # Will be resolved to commit hash during execution
+      DEFAULT_BASELINE: '712dff880cdf88e51289ad71e47d92f46d25a2d3'
+      # Tag pattern for auto-detection (e.g., 'core_r*', 'core_v*')
+      TAG_PATTERN: 'core_v*'
+      # Tag regex filter (e.g., '^core_v[0-9]+\.[0-9]+\.[0-9]+$' for stable versions only)
+      TAG_REGEX_FILTER: '^core_v[0-9]+\.[0-9]+\.[0-9]+$'
+    # ============================================================================
     
     steps:
       - name: Checkout code
@@ -44,21 +58,25 @@ jobs:
         id: baseline
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # Use manually specified baseline
-            BASELINE="${{ github.event.inputs.baseline }}"
+            # Use manually specified baseline (branch, tag, or commit hash)
+            BASELINE_REF="${{ github.event.inputs.baseline }}"
           else
-            # Auto-detect latest core release tag (stable versions only, no rc)
-            BASELINE=$(git tag -l 'core_v*' | grep -E '^core_v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            # Use the configured default baseline
+            BASELINE_REF="${{ env.DEFAULT_BASELINE }}"
             
-            # Error out if no tags found
-            if [ -z "$BASELINE" ]; then
-              echo "Error: No core_v* release tags found. Cannot determine baseline." >&2
-              exit 1
-            fi
+            # Uncomment below to auto-detect from tags instead:
+            # BASELINE_REF=$(git tag -l '${{ env.TAG_PATTERN }}' | grep -E '${{ env.TAG_REGEX_FILTER }}' | sort -V | tail -1)
+            # if [ -z "$BASELINE_REF" ]; then
+            #   echo "Warning: No tags matching pattern found. Using default: ${{ env.DEFAULT_BASELINE }}" >&2
+            #   BASELINE_REF="${{ env.DEFAULT_BASELINE }}"
+            # fi
           fi
           
-          echo "baseline=$BASELINE" >> $GITHUB_OUTPUT
-          echo "Using baseline: $BASELINE"
+          # Resolve baseline to commit hash (works for branches, tags, or commit hashes)
+          BASELINE_HASH=$(git rev-parse "$BASELINE_REF")
+          
+          echo "baseline=$BASELINE_HASH" >> $GITHUB_OUTPUT
+          echo "Using baseline: $BASELINE_REF (resolved to commit: $BASELINE_HASH)"
       
       - name: Run compatibility check
         id: compat_check
@@ -77,7 +95,6 @@ jobs:
       - name: Fail job if breaking changes detected
         if: steps.compat_check.outcome == 'failure'
         run: |
-          echo "::group::❌ API Backward Compatibility Check Failed"
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "🔍 WHAT IS THIS CHECK?"
@@ -143,7 +160,6 @@ jobs:
           echo "🔧 Checker script: scripts/check_api_backwards_compatibility.py"
           echo "❓ Questions? Check the docs or ask in #megatron-core"
           echo ""
-          echo "::endgroup::"
           
           echo "::error::Breaking API changes detected. Please review the output above and choose a resolution strategy."
           exit 1
