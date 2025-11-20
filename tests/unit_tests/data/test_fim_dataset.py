@@ -47,11 +47,11 @@ def test_fim_gpt_dataset(spm_rate, split_sample):
         reset_position_ids=True,
         reset_attention_mask=True,
         eod_mask_loss=True,
-        extra_tokens=extra_tokens,
-        rate=rate,
-        spm_rate=spm_rate,
-        fragment_rate=fragment_rate,
-        split_sample=split_sample,
+        fim_extra_tokens=extra_tokens,
+        fim_rate=rate,
+        fim_spm_rate=spm_rate,
+        fim_fragment_rate=fragment_rate,
+        fim_split_sample=split_sample,
     )
 
     datasets = BlendedMegatronDatasetBuilder(

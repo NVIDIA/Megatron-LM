@@ -16,22 +16,22 @@ logger = logging.getLogger(__name__)
 class GPTFIMDatasetConfig(GPTDatasetConfig):
     """Configuration object for Megatron Core GPT FIM datasets"""
 
-    rate: float = None
+    fim_rate: float = None
     """Probability to convert a training sample into a FIM format"""
 
-    spm_rate: float = None
+    fim_spm_rate: float = None
     """Probability that the a FIM sample uses the SPM format over the PSM format"""
 
-    extra_tokens: Dict = None
+    fim_extra_tokens: Dict = None
     """FIM extra tokens. Should consist of prefix, middle, suffix, PAD, and EOD tokens."""
 
-    split_sample: Optional[str] = None
+    fim_split_sample: Optional[str] = None
     """String around which to split the sample for FIM"""
 
-    fragment_rate: Optional[float] = None
+    fim_fragment_rate: Optional[float] = None
     """Rate of FIM on each fragment when split_sample is not None"""
 
-    no_prefix: Optional[str] = None
+    fim_no_prefix: Optional[str] = None
     """Do not apply FIM to fragments that start with this prefix"""
 
 
@@ -67,13 +67,13 @@ class GPTFIMDataset(GPTDataset):
         self.np_rng = np.random.RandomState(seed=self.config.random_seed)
         logger.info(f"Initialized FIM RNG with seed = {self.config.random_seed}")
         # get FIM params
-        self.fim_rate = self.config.rate
-        self.fim_spm_rate = self.config.spm_rate
-        self.fragment_fim_rate = self.config.fragment_rate
-        split_sample = self.config.split_sample
-        self.no_fim_prefix = self.config.no_prefix
-        if split_sample:
-            fim_split_sample_ids = self.config.tokenizer._tokenizer.tokens_to_ids(split_sample)
+        self.fim_rate = self.config.fim_rate
+        self.fim_spm_rate = self.config.fim_spm_rate
+        self.fragment_fim_rate = self.config.fim_fragment_rate
+        fim_split_sample = self.config.fim_split_sample
+        self.no_fim_prefix = self.config.fim_no_prefix
+        if fim_split_sample:
+            fim_split_sample_ids = self.config.tokenizer._tokenizer.tokens_to_ids(fim_split_sample)
             assert isinstance(fim_split_sample_ids, int) or len(fim_split_sample_ids) == 1
             self.fim_split_sample = (
                 fim_split_sample_ids

@@ -205,12 +205,12 @@ def core_gpt_dataset_config_from_args(args):
         }
         data_args.update(
             {
-                "rate": args.fim_rate,
-                "spm_rate": args.fim_spm_rate,
-                "extra_tokens": extra_tokens,
-                "split_sample": args.fim_split_sample,
-                "fragment_rate": args.fim_fragment_rate,
-                "no_prefix": args.fim_no_prefix,
+                "fim_rate": args.fim_rate,
+                "fim_spm_rate": args.fim_spm_rate,
+                "fim_extra_tokens": extra_tokens,
+                "fim_split_sample": args.fim_split_sample,
+                "fim_fragment_rate": args.fim_fragment_rate,
+                "fim_no_prefix": args.fim_no_prefix,
             }
         )
         return GPTFIMDatasetConfig(**data_args)
