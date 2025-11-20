@@ -84,7 +84,7 @@ class GPTFIMDataset(GPTDataset):
             self.fim_split_sample = None
 
         # get extra tokens ids
-        fim_tokens = self.config.extra_tokens
+        fim_tokens = self.config.fim_extra_tokens
         fim_tokens = [
             fim_tokens["prefix"],
             fim_tokens["middle"],
