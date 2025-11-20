@@ -7,6 +7,7 @@ Usage: python hifp8_underflow_analysis.py --layer 1,8,15,16
 """
 
 import re
+import json
 import torch
 import numpy as np
 import argparse
@@ -14,9 +15,53 @@ from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
 
-# HiFP8 range
-HIFP8_MIN_DENORMAL = 2.384186e-07  # HiFP8 minimum denormal value (2^-22)
-
+# Define numerical format ranges based on research and specifications
+DATA_TYPE_RANGES = {
+    'bf16': {
+        'min_normal': 6.103516e-05,     # BFloat16 minimum normal value
+        'max_normal': 6.550400e+04,     # BFloat16 maximum normal value
+        'min_denormal': 5.960464e-08,   # BFloat16 minimum denormal value
+        'max_denormal': 6.097555e-05,   # BFloat16 maximum denormal value
+        'min': -6.550400e+04,           # Effective minimum (negative max normal)
+        'max': 6.550400e+04,            # Effective maximum (positive max normal)
+        'supports_infinity': True,
+        'supports_nan': True,
+        'description': 'Brain Float 16-bit'
+    },
+    'hifp8': {
+        'min_normal': 3.051758e-05,     # HiFP8 minimum normal value (2^-15)
+        'max_normal': 3.276800e+04,     # HiFP8 maximum normal value (2^15)
+        'min_denormal': 2.384186e-07,   # HiFP8 minimum denormal value (2^-22)
+        'max_denormal': 1.525879e-05,   # HiFP8 maximum denormal value (approx 2^-16)
+        'min': -3.276800e+04,           # Effective minimum (negative max normal)
+        'max': 3.276800e+04,            # Effective maximum (positive max normal)
+        'supports_infinity': True,
+        'supports_nan': True,
+        'description': 'Huawei HiFP8 E4M3 format'
+    },
+    'mxfp8': {
+        'min_normal': 1.562500e-02,     # MX FP8 minimum normal value (0.015625)
+        'max_normal': 4.480000e+02,     # MX FP8 maximum normal value (448.0)
+        'min_denormal': 1.953125e-03,   # MX FP8 minimum denormal value (2^-9)
+        'max_denormal': 1.367188e-02,   # MX FP8 maximum denormal value (7*2^-9)
+        'min': -4.480000e+02,           # Effective minimum (negative max normal)
+        'max': 4.480000e+02,            # Effective maximum (positive max normal)
+        'supports_infinity': False,
+        'supports_nan': True,
+        'description': 'Microsoft MX FP8 E4M3 format'
+    },
+    'mxfp4': {
+        'min_normal': 1.000000e+00,     # MX FP4 minimum normal value
+        'max_normal': 6.000000e+00,     # MX FP4 maximum normal value
+        'min_denormal': 5.000000e-01,   # MX FP4 minimum denormal value (2^-1)
+        'max_denormal': 5.000000e-01,   # MX FP4 maximum denormal value (only one denormal: 0.5)
+        'min': -6.000000e+00,           # Effective minimum (negative max normal)
+        'max': 6.000000e+00,            # Effective maximum (positive max normal)
+        'supports_infinity': False,
+        'supports_nan': False,
+        'description': 'Microsoft MX FP4 E2M1 format'
+    }
+}
 
 def parse_layers(layer_str: str) -> list:
     """Parse layer argument: '1,8,15,16' -> [1, 8, 15, 16]"""
@@ -25,7 +70,6 @@ def parse_layers(layer_str: str) -> list:
 
 def get_layer_and_pass(filename: str) -> tuple:
     """Extract layer number and pass type (forward/backward) from filename."""
-    # Extract layer: _L14_ -> 14
     layer_match = re.search(r'_L(\d+)_', filename)
     if not layer_match:
         return None, None
@@ -43,7 +87,7 @@ def get_layer_and_pass(filename: str) -> tuple:
     return layer, pass_type
 
 
-def analyze_tensor(file_path: Path) -> dict:
+def analyze_tensor(file_path: Path,elem_format: str) -> dict:
     """Analyze tensor for HiFP8 underflow."""
     # Load tensor
     tensor = torch.load(file_path, map_location='cpu', weights_only=False)
@@ -72,7 +116,16 @@ def analyze_tensor(file_path: Path) -> dict:
     # Calculate underflow: non-zero values < min_denormal
     abs_vals = torch.abs(flat)
     non_zero = flat != 0.0
-    underflow = non_zero & (abs_vals < HIFP8_MIN_DENORMAL)
+    if elem_format == 'hifp8':
+        min_denormal = DATA_TYPE_RANGES['hifp8']['min_denormal']
+    elif elem_format == 'mxfp8':
+        min_denormal = DATA_TYPE_RANGES['mxfp8']['min_denormal']
+    elif elem_format == 'mxfp4':
+        min_denormal = DATA_TYPE_RANGES['mxfp4']['min_denormal']
+    else:
+        raise ValueError(f"Unsupported element format: {elem_format}")
+    
+    underflow = non_zero & (abs_vals < min_denormal)
     underflow_count = torch.sum(underflow).item()
     underflow_pct = (underflow_count / total) * 100.0
     
@@ -94,6 +147,7 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze HiFP8 underflow for BF16 tensors')
     parser.add_argument('--layer', required=True, help='Layer numbers: 1,8,15,16')
     parser.add_argument('--base-dir', default='enhanced_tensor_logs', help='Base directory')
+    parser.add_argument('--elem-format', default='hifp8', choices=['hifp8', 'mxfp8', 'mxfp4'], help='Element format: hifp8, mxfp8, mxfp4')
     args = parser.parse_args()
     
     # Parse layers
@@ -120,13 +174,20 @@ def main():
     print(f"Found {len(matching_files)} matching files to analyze")
     
     for file_path in tqdm(matching_files, desc="Processing tensors", unit="file"):
-        result = analyze_tensor(file_path)
+        result = analyze_tensor(file_path,args.elem_format)
         if result:
             results[result['layer']][result['pass_type']].append(result)
     
-    # Print report
+    # Prepare data for JSON output
+    json_data = {
+        'elem_format': args.elem_format,
+        'layers': sorted(results.keys()),
+        'results': []
+    }
+    
+    # Print report and collect data
     print("\n" + "=" * 60)
-    print("HiFP8 UNDERFLOW ANALYSIS")
+    print(f"{args.elem_format.upper()} UNDERFLOW ANALYSIS")
     print("=" * 60)
     
     for layer in sorted(results.keys()):
@@ -142,6 +203,23 @@ def main():
             
             print(f"  {pass_type.upper()}: {underflow_pct:.4f}% underflow "
                   f"({total_underflow:,}/{total_elements:,} elements, {len(pass_results)} tensors)")
+            
+            # Add to JSON data
+            json_data['results'].append({
+                'layer': layer,
+                'pass_type': pass_type,
+                'total_elements': int(total_elements),
+                'total_underflow': int(total_underflow),
+                'underflow_percentage': float(underflow_pct),
+                'num_tensors': len(pass_results)
+            })
+    
+    # Save to JSON file
+    json_filename = f"{args.elem_format}_underflow.json"
+    json_path = base_dir / json_filename
+    with open(json_path, 'w') as f:
+        json.dump(json_data, f, indent=2)
+    print(f"\nResults saved to: {json_path}")
     
     return 0
 
