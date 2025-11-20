@@ -34,15 +34,14 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 
 # Fixed model and training parameters for DeepSeek2-Lite
-# DeepSeek2-Lite is a 1.3B parameter model with similar architecture to LLaMA
 TP_SIZE=8
 CP_SIZE=1     
 PP_SIZE=1     
 MICRO_BATCH_SIZE=1  # default 1
 GLOBAL_BATCH_SIZE=64 # default 128
-NUM_LAYERS=27 
-# DTYPE="bf16"
-DTYPE=${5:-"fp8"}
+NUM_LAYERS=16 
+DTYPE="bf16"
+# DTYPE=${5:-"fp8"}
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=163840
 
@@ -88,7 +87,7 @@ MODEL_ARGS=" \
     --qk-layernorm \
     --qk-pos-emb-head-dim 64 \
     --num-experts 64 \
-    --moe-layer-freq ([0]+[1]*26) \
+    --moe-layer-freq ([0]+[1]*($NUM_LAYERS-1)) \
     --moe-ffn-hidden-size 1408 \
     --moe-grouped-gemm \
     --moe-router-score-function softmax \
