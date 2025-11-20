@@ -660,7 +660,7 @@ def pretrain(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
     print_rank_0(f"model: {model}")
-    import pdb;pdb.set_trace()
+    # import pdb;pdb.set_trace()
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -2265,6 +2265,7 @@ def train(
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
             )
+        import pdb;pdb.set_trace()
         if should_exit:
             print("exit from log in line 2312")
             import pdb;pdb.set_trace()
