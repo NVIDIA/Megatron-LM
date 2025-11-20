@@ -271,7 +271,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         unified_memory_level: Optional[int] = 1,
         metrics_writer: Optional['WandbModule'] = None,
         num_request_metadata: Optional[int] = None,
-        max_cuda_graph_token_count: int = 512
+        max_cuda_graph_token_count: int = 512,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -417,7 +417,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Cuda graph token-counts (i.e., token counts used by cuda-graph steps, both decode and non-decode).
         self.cuda_graph_token_counts = None
-        self.max_cuda_graph_token_count = max_cuda_graph_token_count 
+        self.max_cuda_graph_token_count = max_cuda_graph_token_count
         if num_cuda_graphs is not None:
 
             # Ensure valid num_cuda_graphs.
