@@ -10,8 +10,6 @@ from megatron.core.inference.inference_request import DynamicInferenceRequestRec
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
-import torch.distributed as dist
-
 from .headers import Headers
 
 try:
@@ -101,7 +99,6 @@ class InferenceClient:
             `DynamicInferenceRequestRecord` object containing the completed result.
         """
         request_id = self.next_request_id
-        logging.info(f"Adding request {request_id}")
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
@@ -129,7 +126,6 @@ class InferenceClient:
                     request_id
                 )
                 completion_future = self.completion_futures.pop(request_id)
-                logging.info(f"Received reply for request {request_id}")
                 completion_future.set_result(DynamicInferenceRequestRecord.deserialize(reply))
             except zmq.Again:
                 await asyncio.sleep(0.005)
