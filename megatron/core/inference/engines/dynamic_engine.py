@@ -441,11 +441,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Broadcast addresses to respective ranks.
         torch.distributed.broadcast_object_list(
-            [mp_req_addr, mp_len_addr] src=mp_src, group=mp_group
+            [mp_req_addr, mp_len_addr], src=mp_src, group=mp_group
         )
 
         ip_address_of_dp_coordinator = os.getenv('MASTER_ADDR', '127.0.0.1')
-        dp_addr = [f"tcp://{ip_address_of_dp_coordinator}:{inference_coordinator_port}"]
+        dp_addr = f"tcp://{ip_address_of_dp_coordinator}:{inference_coordinator_port}"
         identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
@@ -453,7 +453,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests = self.zmq_context.socket(zmq.DEALER)
 
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
-            self.socket_for_receiving_requests.connect(dp_addr[0])
+            self.socket_for_receiving_requests.connect(dp_addr)
 
             # send empty string. this is used to register with the coordinator.
             self.socket_for_receiving_requests.send(b"")
@@ -471,11 +471,11 @@ class DynamicInferenceEngine(AbstractEngine):
             ]
         # All MP ranks subscribe to the two publisher sockets
         self.model_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.model_parallel_subscriber_socket.connect(mp_req_addr[0])
+        self.model_parallel_subscriber_socket.connect(mp_req_addr)
         self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
         self.model_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.model_parallel_num_msgs_subscriber_socket.connect(mp_len_addr[0])
+        self.model_parallel_num_msgs_subscriber_socket.connect(mp_len_addr)
         self.model_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
         self.zmq_sockets += [

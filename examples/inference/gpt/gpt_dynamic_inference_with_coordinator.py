@@ -43,7 +43,6 @@ async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],
     port: int,
-    mp_port: int,
     sampling_params: SamplingParams | None = None,
 ):
     if sampling_params is not None:
