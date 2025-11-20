@@ -12,6 +12,7 @@ import numpy as np
 import argparse
 from pathlib import Path
 from collections import defaultdict
+from tqdm import tqdm
 
 # HiFP8 range
 HIFP8_MIN_DENORMAL = 2.384186e-07  # HiFP8 minimum denormal value (2^-22)
@@ -107,13 +108,21 @@ def main():
     # Find and analyze files
     results = defaultdict(lambda: defaultdict(list))
     
-    print(f"Analyzing layers: {layers}")
-    for file_path in bf16_dir.glob("*.pt"):
+    # Collect all matching files first
+    all_files = list(bf16_dir.glob("*.pt"))
+    matching_files = []
+    for file_path in all_files:
         layer, pass_type = get_layer_and_pass(file_path.name)
         if layer in layers and pass_type:
-            result = analyze_tensor(file_path)
-            if result:
-                results[layer][pass_type].append(result)
+            matching_files.append(file_path)
+    
+    print(f"Analyzing layers: {layers}")
+    print(f"Found {len(matching_files)} matching files to analyze")
+    
+    for file_path in tqdm(matching_files, desc="Processing tensors", unit="file"):
+        result = analyze_tensor(file_path)
+        if result:
+            results[result['layer']][result['pass_type']].append(result)
     
     # Print report
     print("\n" + "=" * 60)
