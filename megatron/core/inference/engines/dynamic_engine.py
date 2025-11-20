@@ -231,7 +231,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.running = asyncio.Event()
         self.paused = asyncio.Event()
         self.stopped = asyncio.Event()
-        self.pending_microbatch = deque()
         self.microbatch_pause: bool = False
         self.microbatch_stop: bool = False
         self.suspend_signal = False
@@ -1281,17 +1280,16 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         torch.cuda.nvtx.range_push("drain_zmq_socket")
+        all_messages = []
         if self.is_mp_coordinator:
             while True:
                 try:
                     # Receive messages in a non-blocking way.
-                    self.pending_microbatch.append(
-                        self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK)
-                    )
+                    all_messages.append(self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK))
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
-            messages_to_dequeue = len(self.pending_microbatch)
+            messages_to_dequeue = len(all_messages)
             # First publish the number of messages to dequeue.
             # This is important because we want all tensor parallel ranks
             # to dequeue the same number of messages.
@@ -1300,7 +1298,7 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             # Now publish the actual messages to all model parallel ranks
             if messages_to_dequeue > 0:
-                self.model_parallel_publisher_socket.send_multipart(list(self.pending_microbatch))
+                self.model_parallel_publisher_socket.send_multipart(all_messages)
         else:
             # First, receive the number of messages to dequeue from mp-rank 0
             messages_to_dequeue = struct.unpack(
@@ -1310,15 +1308,12 @@ class DynamicInferenceEngine(AbstractEngine):
             # Note that these receives are blocking, because the messages
             # are guaranteed to be available after the tp-rank 0 has sent them.
             if messages_to_dequeue > 0:
-                self.pending_microbatch.extend(self.model_parallel_subscriber_socket.recv_multipart())
+                all_messages = self.model_parallel_subscriber_socket.recv_multipart()
             else:
                 all_messages = []
 
         torch.cuda.nvtx.range_pop()
-        cnt = 0
-        while len(self.pending_microbatch) > 0:
-            cnt += 1
-            message = self.pending_microbatch.popleft()
+        for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
 
@@ -1375,7 +1370,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 raise UnknownHeaderError(header)
 
-        return cnt
+        return len(all_messages)
 
     def stop(self):
         """
