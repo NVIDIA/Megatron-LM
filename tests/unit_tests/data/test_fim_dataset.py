@@ -27,7 +27,7 @@ def test_fim_gpt_dataset(spm_rate, split_sample):
         additional_special_tokens=["<prefix>", "<middle>", "<suffix>", "<pad>", "<eod>"],
         include_special_tokens=True,
     )
-    blend = get_blend_from_list(["/home/data/fim/fim_text_document"])
+    blend = get_blend_from_list(["/opt/data/datasets/fim/fim_text_document"])
     extra_tokens = {
         "prefix": "<prefix>",
         "middle": "<middle>",

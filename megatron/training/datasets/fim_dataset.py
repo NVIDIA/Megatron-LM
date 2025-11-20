@@ -60,7 +60,9 @@ class GPTFIMDataset(GPTDataset):
         index_split: Split,
         config: GPTFIMDatasetConfig,
     ) -> None:
-        super().__init__(indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config)
+        super().__init__(
+            indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
+        )
 
         self.np_rng = np.random.RandomState(seed=self.config.random_seed)
         logger.info(f"Initialized FIM RNG with seed = {self.config.random_seed}")
@@ -69,12 +71,27 @@ class GPTFIMDataset(GPTDataset):
         self.fim_spm_rate = self.config.spm_rate
         self.fragment_fim_rate = self.config.fragment_rate
         split_sample = self.config.split_sample
-        self.fim_split_sample = self.config.tokenizer._tokenizer.tokens_to_ids(split_sample) if split_sample else None
         self.no_fim_prefix = self.config.no_prefix
+        if split_sample:
+            fim_split_sample_ids = self.config.tokenizer._tokenizer.tokens_to_ids(split_sample)
+            assert isinstance(fim_split_sample_ids, int) or len(fim_split_sample_ids) == 1
+            self.fim_split_sample = (
+                fim_split_sample_ids
+                if isinstance(fim_split_sample_ids, int)
+                else fim_split_sample_ids[0]
+            )
+        else:
+            self.fim_split_sample = None
 
         # get extra tokens ids
         fim_tokens = self.config.extra_tokens
-        fim_tokens = [fim_tokens["prefix"], fim_tokens["middle"], fim_tokens["suffix"], fim_tokens["pad"], fim_tokens["eod"]]
+        fim_tokens = [
+            fim_tokens["prefix"],
+            fim_tokens["middle"],
+            fim_tokens["suffix"],
+            fim_tokens["pad"],
+            fim_tokens["eod"],
+        ]
         fim_tokens_ids = self.config.tokenizer._tokenizer.tokens_to_ids(fim_tokens)
         (
             self.prefix_tok_id,
@@ -126,7 +143,9 @@ class GPTFIMDataset(GPTDataset):
                 # Add the sample part
                 offset = 0 if i > doc_index_beg else doc_index_beg_offset
                 length = None if i < doc_index_end else doc_index_end_offset + 1
-                sample_parts.append(self.dataset.get(self.document_index[i], offset=offset, length=length))
+                sample_parts.append(
+                    self.dataset.get(self.document_index[i], offset=offset, length=length)
+                )
 
         sample = np.concatenate(sample_parts)
 
@@ -160,10 +179,7 @@ class GPTFIMDataset(GPTDataset):
 
         assert sample.shape[0] == sample_len
 
-        return (
-            np.array(sample, dtype=np.int64),
-            np.array(document_ids, dtype=np.int64),
-        )
+        return (np.array(sample, dtype=np.int64), np.array(document_ids, dtype=np.int64))
 
     def _fim_permute_sequence(self, sequence, rate):
         return self._permute(
@@ -207,7 +223,9 @@ class GPTFIMDataset(GPTDataset):
                 new_samples += [permuted, [self.fim_split_sample]]
             curr_start_position = loc + 1  # Jump over the split token
         # Permute the segment after the last split token
-        permuted = self._fim_permute_sequence(sequence[curr_start_position:], self.fragment_fim_rate)
+        permuted = self._fim_permute_sequence(
+            sequence[curr_start_position:], self.fragment_fim_rate
+        )
         new_samples.append(permuted)
 
         return np.concatenate(new_samples)
@@ -274,7 +292,9 @@ class GPTFIMDataset(GPTDataset):
 
             if self.np_rng.binomial(1, fim_spm_rate):
                 # SPM (variant 2 from FIM paper)
-                new_sample = np.concatenate([[prefix_tok_id, suffix_tok_id], suffix, [middle_tok_id], prefix, middle])
+                new_sample = np.concatenate(
+                    [[prefix_tok_id, suffix_tok_id], suffix, [middle_tok_id], prefix, middle]
+                )
             else:
                 # PSM
                 new_sample = np.concatenate(
