@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Trigger MBridge Tests (POC)
+name: Trigger MBridge Tests
 
-# POC: Remote testing of MBridge from MCore
+# Remote testing of MBridge from MCore
 # This workflow triggers MBridge's CI tests with the current MCore commit
 # to verify backward compatibility before merging MCore changes.
 
