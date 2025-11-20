@@ -84,6 +84,7 @@ GPT_ARGS=(
     --use-mcore-models 
     --tokenizer-type HuggingFaceTokenizer 
     --make-vocab-size-divisible-by 3200 
+    --transformer-impl local
 )
 
 # Multi-Latent Attention (MLA) arguments
