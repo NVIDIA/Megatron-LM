@@ -1,9 +1,25 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from unittest.mock import MagicMock
+
 import torch
-import triton
-import triton.language as tl
-from torch._C._distributed_c10d import _SymmetricMemory
+
+from megatron.core.utils import null_decorator
+
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    triton = MagicMock()
+    triton.jit = null_decorator
+    tl = MagicMock()
+    HAVE_TRITON = False
+try:
+    from torch._C._distributed_c10d import _SymmetricMemory
+except ImportError:
+    _SymmetricMemory = MagicMock()
 
 from .asm_utils import ld_128, multimem_ld_reduce_128, multimem_st_128, st_128
 from .triton_barrier import blockwise_barrier
@@ -59,6 +75,7 @@ def multimem_all_reduce(tensor: torch.Tensor, symm_mem_hdl: _SymmetricMemory) ->
     Returns:
         torch.Tensor - all-reduced tensor
     """
+    assert HAVE_TRITON, "Triton is required for multimem all-reduce."
     WARP_SIZE = 32
     MAX_NUM_BLOCKS = 4
     MAX_BLOCK_SIZE = 1024
@@ -154,6 +171,8 @@ def multimem_all_gather(
     Returns:
         torch.Tensor - all-gathered tensor, which is output_tensor
     """
+    assert HAVE_TRITON, "Triton is required for multimem all-gather."
+
     WARP_SIZE = 32
     MAX_NUM_BLOCKS = 4
     MAX_BLOCK_SIZE = 1024
@@ -249,6 +268,9 @@ def multimem_reduce_scatter(
     Returns:
         torch.Tensor - reduce-scattered tensor, which is output_tensor
     """
+
+    assert HAVE_TRITON, "Triton is required for multimem reduce-scatter."
+
     WARP_SIZE = 32
     MAX_NUM_BLOCKS = 4
     MAX_BLOCK_SIZE = 1024

@@ -1,8 +1,15 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from unittest.mock import MagicMock
 
-import triton
-import triton.language as tl
+from megatron.core.utils import null_decorator
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = MagicMock()
+    tl = MagicMock()
+    triton.jit = null_decorator
 from .triton_utils import get_flat_bid, get_flat_tid
 
 

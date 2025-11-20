@@ -1,7 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from megatron.core.utils import null_decorator
 
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = MagicMock()
+    tl = MagicMock()
+    triton.jit = null_decorator
 
 
 @triton.jit
