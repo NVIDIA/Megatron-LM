@@ -61,7 +61,7 @@ DISTRIBUTED_ARGS=(
 
 # Model architecture parameters for DeepSeek2-Lite (1.3B parameters)
 # Based on typical configurations for models of this size
-TOKENIZER_MODEL="deepseek-ai/DeepSeek-V2-Lite"
+# TOKENIZER_MODEL="deepseek-ai/DeepSeek-V2-Lite"
 
 # Base GPT model arguments
 GPT_ARGS=(
@@ -99,7 +99,7 @@ MLA_ARGS=(
 # Mixture of Experts (MoE) arguments
 MOE_ARGS=(
     --num-experts 64 
-    --moe-layer-freq ([0]+[1]*$MOE_LAYERS) 
+    --moe-layer-freq "([0]+[1]*$MOE_LAYERS)" 
     --moe-ffn-hidden-size 1408 
     --moe-grouped-gemm 
     --moe-router-score-function softmax 
@@ -219,7 +219,7 @@ EVAL_AND_LOGGING_ARGS=(
     --ckpt-format torch_dist 
     --distributed-timeout-minutes 120
     --save "$CHECKPOINT_PATH"
-    --load "$CHECKPOINT_PATH" 
+    # --load "$CHECKPOINT_PATH" 
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
 )
 
