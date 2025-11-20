@@ -2513,7 +2513,7 @@ def train(
 
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
-        cuda_graph_helper.destroy_cudagraphs()
+        cuda_graph_helper.delete_cuda_graphs()
 
     one_logger_utils.track_e2e_metrics()
 

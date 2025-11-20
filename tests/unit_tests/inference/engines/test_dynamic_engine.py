@@ -106,7 +106,9 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
-    cuda_graph_scope: List[CudaGraphScope] = None
+    cuda_graph_scope: List[CudaGraphScope] = field(
+        default_factory=lambda: [CudaGraphScope.full_iteration]
+    )
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     # If False, do not build cuda graphs in the tests, even if
@@ -129,9 +131,6 @@ class DynamicEngineTestConfig:
         else:
             assert self.num_tokens_total is not None
             self.max_sequence_length = self.num_tokens_total
-
-        if self.cuda_graph_scope is None:
-            self.cuda_graph_scope = [CudaGraphScope.full_iteration]
 
 
 @dataclass

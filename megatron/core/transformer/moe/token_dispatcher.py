@@ -37,8 +37,6 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-logger = logging.getLogger(__name__)
-
 """ We use the following notation throughout this file:
      H: hidden size
      B: micro batch size
@@ -1369,6 +1367,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"

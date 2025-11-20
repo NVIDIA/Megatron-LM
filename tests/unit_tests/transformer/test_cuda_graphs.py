@@ -558,7 +558,7 @@ class TestPartialCudaGraph:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
-            self.cuda_graph_helper.destroy_cudagraphs()
+            self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
         gc.collect()
 
@@ -742,7 +742,7 @@ class TestPartialCudaGraph:
             loss_list.append(loss.item())
 
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
-            self.cuda_graph_helper.destroy_cudagraphs()
+            self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
 
         return torch.tensor(loss_list)

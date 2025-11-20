@@ -1731,25 +1731,25 @@ class TECudaGraphHelper:
             for layer in layers:
                 layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
 
-    def destroy_cudagraphs(self):
+    def delete_cuda_graphs(self):
         """
         Destroy CUDA Graphs.
         """
         assert self._graphs_created, "CUDA Graphs have not been created."
-        graphs_destroyed, graphs_not_destroyed = 0, 0
+        graphs_deleted, graphs_not_deleted = 0, 0
         for _, layers in enumerate(self.callables_per_chunk):
             for layer in layers:
                 for graph in layer.cuda_graphs:
                     if is_te_min_version("2.10.0"):
                         graph.reset()
-                        graphs_destroyed += 1
+                        graphs_deleted += 1
                     else:
-                        graphs_not_destroyed += 1
+                        graphs_not_deleted += 1
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
         log_single_rank(
             logger,
             logging.INFO,
-            f'{graphs_destroyed} graphs destroyed, {graphs_not_destroyed} graphs not destroyed.',
+            f'{graphs_deleted} graphs deleted, {graphs_not_deleted} graphs not deleted.',
         )
         self._graphs_created = False
