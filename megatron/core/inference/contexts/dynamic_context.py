@@ -42,8 +42,6 @@ try:
 except ImportError:
     triton_append_key_value_cache = None
 
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
-
 try:
     from packaging.version import Version as PkgVersion
 
@@ -1196,9 +1194,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         # if in recording mode, add dummy requests for cuda graph capture
         if construct_graph_dimensions is not None:
-            nvtx_range_push("add_dummy_requests_for_cudagraph_capture")
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
-            nvtx_range_pop("add_dummy_requests_for_cudagraph_capture")
 
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,

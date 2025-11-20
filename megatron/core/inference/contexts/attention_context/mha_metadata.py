@@ -148,8 +148,8 @@ class GraphedMHAMetadata(MHAMetadata):
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        batch_dimensions,
-        padded_batch_dimensions,
+        batch_dimensions: InferenceBatchDimensions,
+        padded_batch_dimensions: InferenceBatchDimensions,
     ):
         """
         Args:

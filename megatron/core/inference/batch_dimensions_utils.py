@@ -37,7 +37,9 @@ class InferenceBatchDimensions:
         """
         return f"[{self.token_count}]: {self.prefill_req_count} P + {self.decode_req_count} D"
 
-    def is_applicable_for_batch_dim(self, real_batch_dim, strict=False) -> bool:
+    def is_applicable_for_batch_dim(
+        self, real_batch_dim: "InferenceBatchDimensions", strict: bool = False
+    ) -> bool:
         """
         Checks if this batch dimension is applicable for the given real batch dimension.
         Applicable batch dimensions are those that have enough tokens and
@@ -98,10 +100,11 @@ class InferenceBatchDimensions:
     def __hash__(self):
         """
         Returns a hash of the batch dimension.
+        In cuda graph quick matching, the batch dimension is used as a key in a dictionary.
         """
         return hash((self.token_count, self.prefill_req_count, self.decode_req_count))
 
-    def __eq__(self, other):
+    def __eq__(self, other: "InferenceBatchDimensions") -> bool:
         """
         Checks if this batch dimension is equal to another batch dimension.
         """
