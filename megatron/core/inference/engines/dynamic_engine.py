@@ -348,7 +348,6 @@ class DynamicInferenceEngine(AbstractEngine):
     async def start_listening_to_data_parallel_coordinator(
         self,
         inference_coordinator_port: int,
-        inference_mp_coordinator_port: int = 20000,
         launch_inference_coordinator: bool = True,
         verbose: bool = False,
         *,
@@ -381,9 +380,6 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             inference_coordinator_port (int): The network port where the central
                 `InferenceCoordinator` is or will be listening.
-            inference_mp_coordinator_port (int): The base network port where each model parallel
-                coordinator will broadcast messages from. Each MP group will compute an independent
-                port offset from this base port.
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.

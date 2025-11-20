@@ -188,7 +188,6 @@ class TestCoordinator:
         env.timing_data["start_time"] = time.time()
         await env.engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=test_config.port,
-            inference_mp_coordinator_port=test_config.mp_port,
             launch_inference_coordinator=test_config.launch_inference_coordinator,
         )
 
