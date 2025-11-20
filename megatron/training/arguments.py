@@ -1324,6 +1324,10 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['use_kitchen'] = True
         kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
 
+    if args.te_precision_config_file:
+        assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
+        # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
+        kw_args['quant_recipe'] = load_quantization_recipe(args.te_precision_config_file)
 
     # Return config.
     return config_class(**kw_args)
@@ -1374,7 +1378,7 @@ def _add_transformer_engine_args(parser):
                        help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
     group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
                        help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
-    
+
     # FP4 related arguments
     group.add_argument('--fp4-format', default=None,
                        choices=['e2m1'],
@@ -1397,6 +1401,8 @@ def _add_transformer_engine_args(parser):
                             'Required for CUDA graphs support.')
     group.add_argument('--inference-rng-tracker', action='store_true', default=False,
                        help='Use a random number generator configured for inference.')
+    group.add_argument('--te-precision-config-file', default=None,
+                       help='Configuration file to select per-module precision overrides.')
     return parser
 
 def _add_inference_args(parser):
