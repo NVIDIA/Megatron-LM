@@ -22,14 +22,16 @@ on:
   # Manual trigger only for POC
   workflow_dispatch:
     inputs:
-      mbridge_workflow:
-        description: 'Which MBridge workflow to trigger'
-        required: true
-        type: choice
-        options:
-          - 'cicd-main.yml'
-          - 'install-test.yml'
-        default: 'install-test.yml'
+      run_cicd_main:
+        description: 'Run cicd-main.yml (full CI/CD)'
+        required: false
+        type: boolean
+        default: true
+      run_install_test:
+        description: 'Run install-test.yml (quick install check)'
+        required: false
+        type: boolean
+        default: true
       test_suite:
         description: 'Test suite to run (for cicd-main)'
         required: false
@@ -38,7 +40,7 @@ on:
           - 'all'
           - 'unit-only'
           - 'functional-only'
-        default: 'unit-only'
+        default: 'all'
 
 jobs:
   trigger-mbridge:
@@ -68,15 +70,15 @@ jobs:
             echo "🔀 PR: #$MCORE_PR_NUMBER"
           fi
       
-      - name: Trigger MBridge workflow
+      - name: Trigger MBridge install-test.yml
+        if: ${{ inputs.run_install_test }}
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          echo "🚀 Triggering MBridge workflow: ${{ inputs.mbridge_workflow }}"
-          echo "🧪 Test suite: ${{ inputs.test_suite }}"
+          echo "🚀 Triggering MBridge workflow: install-test.yml"
           echo "📌 MCore commit: ${{ steps.mcore_info.outputs.sha }}"
           
-          gh workflow run ${{ inputs.mbridge_workflow }} \
+          gh workflow run install-test.yml \
             --repo NVIDIA/Megatron-Bridge \
             --ref main \
             --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
@@ -84,10 +86,38 @@ jobs:
             --field test_suite=${{ inputs.test_suite }} \
             --field triggered_by=mcore-ci
           
-          echo "✅ Workflow triggered successfully!"
+          echo "✅ install-test.yml triggered successfully!"
+      
+      - name: Trigger MBridge cicd-main.yml
+        if: ${{ inputs.run_cicd_main }}
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          echo "🚀 Triggering MBridge workflow: cicd-main.yml"
+          echo "🧪 Test suite: ${{ inputs.test_suite }}"
+          echo "📌 MCore commit: ${{ steps.mcore_info.outputs.sha }}"
+          
+          gh workflow run cicd-main.yml \
+            --repo NVIDIA/Megatron-Bridge \
+            --ref main \
+            --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
+            --field mcore_branch=${{ steps.mcore_info.outputs.branch }} \
+            --field test_suite=${{ inputs.test_suite }} \
+            --field triggered_by=mcore-ci
+          
+          echo "✅ cicd-main.yml triggered successfully!"
+      
+      - name: Workflows triggered
+        run: |
+          echo "✅ All selected workflows triggered successfully!"
           echo ""
           echo "📊 View MBridge workflow runs:"
-          echo "https://github.com/NVIDIA/Megatron-Bridge/actions/workflows/${{ inputs.mbridge_workflow }}"
+          if [ "${{ inputs.run_install_test }}" == "true" ]; then
+            echo "  - install-test: https://github.com/NVIDIA/Megatron-Bridge/actions/workflows/install-test.yml"
+          fi
+          if [ "${{ inputs.run_cicd_main }}" == "true" ]; then
+            echo "  - cicd-main: https://github.com/NVIDIA/Megatron-Bridge/actions/workflows/cicd-main.yml"
+          fi
           echo ""
           echo "⏳ The test results will appear in MBridge's Actions tab"
           echo "💡 Look for runs triggered by: mcore-ci"
@@ -98,19 +128,36 @@ jobs:
           ## 🔄 MBridge Test Trigger Summary
           
           **MCore Commit:** \`${{ steps.mcore_info.outputs.short_sha }}\`  
-          **Workflow:** \`${{ inputs.mbridge_workflow }}\`  
           **Test Suite:** \`${{ inputs.test_suite }}\`  
+          
+          ### 🚀 Triggered Workflows
+          
+          EOF
+          
+          if [ "${{ inputs.run_install_test }}" == "true" ]; then
+            cat >> $GITHUB_STEP_SUMMARY <<EOF
+          - ✅ [install-test.yml](https://github.com/NVIDIA/Megatron-Bridge/actions/workflows/install-test.yml) - Quick install check (~5-10 min)
+          EOF
+          fi
+          
+          if [ "${{ inputs.run_cicd_main }}" == "true" ]; then
+            cat >> $GITHUB_STEP_SUMMARY <<EOF
+          - ✅ [cicd-main.yml](https://github.com/NVIDIA/Megatron-Bridge/actions/workflows/cicd-main.yml) - Full CI/CD with test suite: ${{ inputs.test_suite }} (~60-90 min)
+          EOF
+          fi
+          
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
           
           ### 📊 Next Steps
           
-          1. View the triggered workflow in [MBridge Actions](https://github.com/NVIDIA/Megatron-Bridge/actions)
-          2. Filter by "triggered by: mcore-ci" to find your run
-          3. Wait for test completion (~30-60 minutes for full suite)
+          1. View the triggered workflows in [MBridge Actions](https://github.com/NVIDIA/Megatron-Bridge/actions)
+          2. Filter by "triggered by: mcore-ci" to find your runs
+          3. Wait for test completion
           4. Review results for any breaking changes
           
           ### 🔗 Useful Links
           
           - [MBridge Repository](https://github.com/NVIDIA/Megatron-Bridge)
-          - [MBridge Workflows](https://github.com/NVIDIA/Megatron-Bridge/actions/workflows/${{ inputs.mbridge_workflow }})
+          - [MBridge Actions](https://github.com/NVIDIA/Megatron-Bridge/actions)
           EOF
 
