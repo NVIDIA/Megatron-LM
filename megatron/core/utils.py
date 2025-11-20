@@ -2087,14 +2087,18 @@ def maybe_cat(a, b, dim=0, *, required=False):
         return None
     return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
 
+_ASYNC_IO_LOOP : asyncio.AbstractEventLoop | None = None
 
 def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
     """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
+    global _ASYNC_IO_LOOP
     if loop is None:
+        if _ASYNC_IO_LOOP is not None:
+            return _ASYNC_IO_LOOP
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError as e:
-            loop = asyncio.new_event_loop()
+            _ASYNC_IO_LOOP = loop =asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
     return loop
 
@@ -2130,7 +2134,6 @@ def trace_async_exceptions(
             try:
                 return await fn(*args, **kwargs)
             except Exception as e:
-                logger.error(f"Exception in async function {fn.__name__}: {e}")
                 traceback.print_exc()
                 sys.exit(1)
             finally:

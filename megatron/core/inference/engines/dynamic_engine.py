@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
+from megatron.core.utils import log_single_rank
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
@@ -488,6 +489,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
+        logging.info(f"Creating engine loop task on loop {id(loop)} on rank {torch.distributed.get_rank()}")
         self.engine_loop_task = loop.create_task(
             self.run_engine_with_coordinator(loop=loop, verbose=verbose)
         )
@@ -1246,6 +1248,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 self.add_request(request_id, prompt, sampling_params)
+                logging.info(f"Added request {request_id} on rank {torch.distributed.get_rank()}")
             elif header == Headers.PAUSE:
                 self.paused = True
             elif header == Headers.UNPAUSE:
@@ -1258,6 +1261,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.stopped = True
             else:
                 raise UnknownHeaderError(header)
+
+        if len(all_messages) > 0:
+            logging.info(f"Drained {len(all_messages)} messages from coordinator on rank {torch.distributed.get_rank()}")
 
         return len(all_messages)
 
@@ -1308,6 +1314,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
         try:
+            logging.info(f"Running engine with coordinator on rank {torch.distributed.get_rank()}")
             while True:
                 self.schedule_requests()
                 if self.stopped:
@@ -1327,6 +1334,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
                 if self.paused:
+                    logging.info(f"Suspending engine on rank {torch.distributed.get_rank()}")
                     await asyncio.sleep(0.02)
                     continue
 
@@ -1344,11 +1352,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.get_active_request_count() == 0
                     and len(self.waiting_request_ids) == 0
                 ):
+                    logging.info(f"No requests to process on rank {torch.distributed.get_rank()}")
                     await asyncio.sleep(0.02)
                     continue
 
-                # Step.
-                engine_output = await self.async_step(verbose=verbose)
+                logging.info(f"Processing requests on rank {torch.distributed.get_rank()}")
+                logging.info(f"Active requests: {self.context.get_active_request_count()}")
+                logging.info(f"Waiting requests: {len(self.waiting_request_ids)}")
+                engine_output = await self.async_step(verbose=True)
 
                 # Send finished requests.
                 is_tp0_and_pp0 = (

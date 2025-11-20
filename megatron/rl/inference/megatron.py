@@ -177,6 +177,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         assert self._client is not None, "Client is not initialized"
 
         tokenizer = get_tokenizer()
+        print(f"Adding request to client on rank {dist.get_rank()}")
 
         sampling_params = SamplingParams(
             num_tokens_to_generate=None,
@@ -193,6 +194,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)
             for prompt in request.prompt
         ]
+        print(f"Waiting for responses on rank {dist.get_rank()}")
         responses = await asyncio.gather(
             *requests
         )
