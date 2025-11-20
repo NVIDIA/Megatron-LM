@@ -26,6 +26,38 @@ def debug_print(message):
     if torch.distributed.get_rank() in DEBUG_RANK:
         print(f'{torch.distributed.get_rank()}: {message}')
 
+def set_ideal_affinity_for_current_gpu():
+    """Set CPU affinity for the current GPU to optimize host-device transfers."""
+    import uuid
+
+    try:
+        import cuda.bindings.driver as cuda_driver
+        import cuda.bindings.runtime as cuda_runtime
+    except ImportError:
+        try:
+            import cuda.cuda as cuda_driver
+            import cuda.cudart as cuda_runtime
+        except ImportError:
+            # print("cuda-python may not be installed, skipping GPU affinity setting")
+            warnings.warn("cuda-python may not be installed, skipping GPU affinity setting")
+            return
+    try:
+        import pynvml
+    except ImportError:
+        warnings.warn("pynvml is not installed, skipping GPU affinity setting")
+        return
+
+    # Get current CUDA device ID
+    err, device_id = cuda_runtime.cudaGetDevice()
+    assert err == cuda_runtime.cudaError_t.cudaSuccess
+    # Get device UUID
+    err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id)
+    assert err == cuda_driver.CUresult.CUDA_SUCCESS
+    # Set CPU affinity based on GPU's NUMA node
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
+    pynvml.nvmlDeviceSetCpuAffinity(handle)
+
 GLOBAL_BLOCK_SIZE = 1024
 @triton.jit
 def _stash_copy_kernel(
@@ -197,9 +229,14 @@ class StashBuffer:
     """
     A class to represent a stash buffer.
     """
-    
+
     def __init__(self, size, device, overflow, dtype):
-        self.buffer = torch.empty(size, dtype=dtype, device=device)
+
+        self.buffer = None
+        if os.getenv('PACKED_OFFLOAD_CPU', '0') == '1':
+            self.buffer = torch.empty(size, dtype=dtype, device='cpu', pin_memory=True)
+        else:
+            self.buffer = torch.empty(size, dtype=dtype, device=device)
         self.overflow = overflow # GPU flag
         self.device = device
         self.free_offset = torch.zeros(1, dtype=torch.int64, device=device) # start offset of free space
@@ -726,12 +763,14 @@ def packed_moe_expert_offloading_reset(enabled=True):
             torch.cuda.memory._record_memory_history()
             print(f'packed_moe_expert_offloading_reset record_memory_history')
         if offload_manager.iteration == 10 and torch.distributed.get_rank() == 0:
-            torch.cuda.memory._dump_snapshot("packed_offloading_cg.pkl")
+            torch.cuda.memory._dump_snapshot("packed_cpu_offloading_cg.pkl")
             torch.cuda.memory._record_memory_history(enabled=None)
             print(f'packed_moe_expert_offloading_reset dump_snapshot')
 
     if not enabled:
         return
+
+    set_ideal_affinity_for_current_gpu() # Set the ideal affinity for the current GPU
     if offload_manager.status == 'begin':
         offload_manager.status = 'capture'
     elif offload_manager.status == 'capture':
