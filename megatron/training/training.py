@@ -660,6 +660,18 @@ def pretrain(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
     print_rank_0(f"model: {model}")
+    # check state_dict
+    state_dict = model[0].state_dict()
+    for key, value in state_dict.items():
+        if torch.isnan(value).any():
+            print_rank_0(f"nan in {key}")
+            import pdb;pdb.set_trace()
+        if torch.isinf(value).any():
+            print_rank_0(f"inf in {key}")
+            import pdb;pdb.set_trace()
+        if value.dtype != torch.float32:
+            print_rank_0(f"dtype not float32 in {key}")
+            import pdb;pdb.set_trace()
     import pdb;pdb.set_trace()
 
     timers('model-and-optimizer-setup').stop()
