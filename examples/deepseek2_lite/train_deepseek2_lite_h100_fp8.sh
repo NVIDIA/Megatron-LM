@@ -39,12 +39,12 @@ TP_SIZE=4
 CP_SIZE=1     
 PP_SIZE=1     
 MICRO_BATCH_SIZE=1  # default 1
-GLOBAL_BATCH_SIZE=128 # default 128
+GLOBAL_BATCH_SIZE=64 # default 128
 NUM_LAYERS=16  
 # DTYPE="bf16"
 DTYPE=${5:-"fp8"}
-SEQ_LENGTH=8192
-MAX_POSITION_EMBEDDINGS=8192
+SEQ_LENGTH=4096
+MAX_POSITION_EMBEDDINGS=163840
 
 # Data cache path (useful for both mock and real data)
 DATA_CACHE_PATH="${PWD}/benchmark_cache_deepseek2_lite_fp8"
@@ -76,7 +76,7 @@ MODEL_ARGS=" \
     --normalization RMSNorm \
     --norm-epsilon 1e-6 \
     --swiglu \
-    --num-layers 27 \
+    --num-layers $NUM_LAYERS \
     --hidden-size 2048 \
     --ffn-hidden-size 10944 \
     --num-attention-heads 16 \
@@ -100,8 +100,8 @@ MODEL_ARGS=" \
     --moe-token-dispatcher-type alltoall \
     --moe-token-drop-policy probs \
     --moe-router-load-balancing-type seq_aux_loss \
-    --seq-length 1024 \
-    --max-position-embeddings 1024 \
+    --seq-length $SEQ_LENGTH \
+    --max-position-embeddings $MAX_POSITION_EMBEDDINGS \
     --tokenizer-type HuggingFaceTokenizer \
     --make-vocab-size-divisible-by 3200 \
     --attention-softmax-in-fp32 \
