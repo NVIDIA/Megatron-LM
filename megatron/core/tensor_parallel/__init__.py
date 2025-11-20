@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from .cross_entropy import vocab_parallel_cross_entropy
 from .data import broadcast_data
+from .inference_layers import InferenceLayerNormColumnParallelLinear, InferenceRowParallelLinear
 from .layers import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -11,8 +12,6 @@ from .layers import (
     set_defaults_if_not_set_tensor_model_parallel_attributes,
     set_tensor_model_parallel_attributes,
 )
-from .inference_layers import InferenceLayerNormColumnParallelLinear, InferenceRowParallelLinear
-
 from .mappings import (
     all_gather_last_dim_from_tensor_parallel_region,
     all_to_all,
