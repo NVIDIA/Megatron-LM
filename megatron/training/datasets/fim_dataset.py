@@ -285,7 +285,7 @@ class GPTFIMDataset(GPTDataset):
                     if (
                         suffix.shape[0] <= diff
                     ):  # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
-                        return sample, self.np_rng
+                        return sample
                     suffix = suffix[: suffix.shape[0] - diff]
                 elif diff < 0:  # too short
                     suffix = np.concatenate([suffix, np.full((-1 * diff), pad_tok_id)])
