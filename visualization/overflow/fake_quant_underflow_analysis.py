@@ -14,6 +14,8 @@ import argparse
 from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
+import sys,os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # Define numerical format ranges based on research and specifications
 DATA_TYPE_RANGES = {
