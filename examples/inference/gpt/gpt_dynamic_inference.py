@@ -30,7 +30,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
 )
-from megatron.core.inference.context.attention_context.mamba_metadata import (
+from megatron.core.inference.contexts.attention_context.mamba_metadata import (
     MambaInferenceStateConfig,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine, EngineSuspendedError
