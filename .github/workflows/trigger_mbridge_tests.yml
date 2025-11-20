@@ -1,0 +1,116 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Trigger MBridge Tests (POC)
+
+# POC: Remote testing of MBridge from MCore
+# This workflow triggers MBridge's CI tests with the current MCore commit
+# to verify backward compatibility before merging MCore changes.
+
+on:
+  # Manual trigger only for POC
+  workflow_dispatch:
+    inputs:
+      mbridge_workflow:
+        description: 'Which MBridge workflow to trigger'
+        required: true
+        type: choice
+        options:
+          - 'cicd-main.yml'
+          - 'install-test.yml'
+        default: 'install-test.yml'
+      test_suite:
+        description: 'Test suite to run (for cicd-main)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'unit-only'
+          - 'functional-only'
+        default: 'unit-only'
+
+jobs:
+  trigger-mbridge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout MCore
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Get MCore commit info
+        id: mcore_info
+        run: |
+          MCORE_SHA=$(git rev-parse HEAD)
+          MCORE_SHORT_SHA=$(git rev-parse --short HEAD)
+          MCORE_BRANCH=${GITHUB_REF#refs/heads/}
+          MCORE_PR_NUMBER=${{ github.event.pull_request.number }}
+          
+          echo "sha=$MCORE_SHA" >> $GITHUB_OUTPUT
+          echo "short_sha=$MCORE_SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "branch=$MCORE_BRANCH" >> $GITHUB_OUTPUT
+          echo "pr_number=$MCORE_PR_NUMBER" >> $GITHUB_OUTPUT
+          
+          echo "📦 MCore commit: $MCORE_SHORT_SHA"
+          echo "🌿 Branch: $MCORE_BRANCH"
+          if [ -n "$MCORE_PR_NUMBER" ]; then
+            echo "🔀 PR: #$MCORE_PR_NUMBER"
+          fi
+      
+      - name: Trigger MBridge workflow
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          echo "🚀 Triggering MBridge workflow: ${{ inputs.mbridge_workflow }}"
+          echo "🧪 Test suite: ${{ inputs.test_suite }}"
+          echo "📌 MCore commit: ${{ steps.mcore_info.outputs.sha }}"
+          
+          gh workflow run ${{ inputs.mbridge_workflow }} \
+            --repo NVIDIA/Megatron-Bridge \
+            --ref main \
+            --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
+            --field mcore_branch=${{ steps.mcore_info.outputs.branch }} \
+            --field test_suite=${{ inputs.test_suite }} \
+            --field triggered_by=mcore-ci
+          
+          echo "✅ Workflow triggered successfully!"
+          echo ""
+          echo "📊 View MBridge workflow runs:"
+          echo "https://github.com/NVIDIA/Megatron-Bridge/actions/workflows/${{ inputs.mbridge_workflow }}"
+          echo ""
+          echo "⏳ The test results will appear in MBridge's Actions tab"
+          echo "💡 Look for runs triggered by: mcore-ci"
+      
+      - name: Summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## 🔄 MBridge Test Trigger Summary
+          
+          **MCore Commit:** \`${{ steps.mcore_info.outputs.short_sha }}\`  
+          **Workflow:** \`${{ inputs.mbridge_workflow }}\`  
+          **Test Suite:** \`${{ inputs.test_suite }}\`  
+          
+          ### 📊 Next Steps
+          
+          1. View the triggered workflow in [MBridge Actions](https://github.com/NVIDIA/Megatron-Bridge/actions)
+          2. Filter by "triggered by: mcore-ci" to find your run
+          3. Wait for test completion (~30-60 minutes for full suite)
+          4. Review results for any breaking changes
+          
+          ### 🔗 Useful Links
+          
+          - [MBridge Repository](https://github.com/NVIDIA/Megatron-Bridge)
+          - [MBridge Workflows](https://github.com/NVIDIA/Megatron-Bridge/actions/workflows/${{ inputs.mbridge_workflow }})
+          EOF
+
