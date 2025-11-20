@@ -583,8 +583,8 @@ def forward_backward_no_pipelining(
 
     if not forward_only and config.fine_grained_activation_offloading:
         fine_grained_offloading_reset()
-    if not forward_only and config.packed_moe_expert_offloading:
-        packed_moe_expert_offloading_reset()
+    if not forward_only:
+        packed_moe_expert_offloading_reset(enabled=config.packed_moe_expert_offloading)
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
