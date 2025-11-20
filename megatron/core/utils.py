@@ -629,33 +629,50 @@ class GlobalSymmetricMemoryBuffer:
     """
 
     def __init__(self, size_in_mb, process_group):
-        assert HAVE_TORCH_SYMM_MEM, "PyTorch symmetric memory module not found."
-        numel = int(size_in_mb * 1024 * 1024)  # size in bytes
-        try:
-            symm_mem.enable_symm_mem_for_group(process_group.group_name)
-            self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
-            self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
-        except RuntimeError as e:
-            # If symmetric memory initialization fails, set buffer and handle to None
-            # This can happen if the process group is not contained within NVlink
+        if not HAVE_TORCH_SYMM_MEM:
+            # This should be hit if the user is running an older 
+            # version of torch.
             self.symm_buffer = None
             self.symm_mem_hdl = None
+        else:
+            numel = int(size_in_mb * 1024 * 1024)  # size in bytes
+            try:
+                symm_mem.enable_symm_mem_for_group(process_group.group_name)
+                self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
+                self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
+            except RuntimeError as e:
+                # If symmetric memory initialization fails, set buffer and handle to None
+                # This should happen if the process group is not contained within NVlink
+                self.symm_buffer = None
+                self.symm_mem_hdl = None
 
-    def maybe_get_tensor(self, tensor_shape, dtype) -> Dict[str, Optional[Union[torch.Tensor, symm_mem.SymmMemHandle]]]:
+    def can_allocate(self, numel, dtype) -> bool:
+        """
+        Returns whether enough symmetric memory is available
+        for the given tensor shape and dtype.
+        """
+        if self.symm_mem_hdl is None:
+            return False
+        size_of_dtype = torch.tensor([], dtype=dtype).element_size()
+        required_len = numel * size_of_dtype
+        return required_len <= self.symm_buffer.numel()
+
+    def allocate(self, numel, dtype) -> torch.Tensor: 
+        required_bytes = numel * torch.tensor([], dtype=dtype).element_size()
+        return self.symm_buffer[0:required_bytes].view(dtype).view(numel)
+
+    def maybe_get_tensor(self, tensor_shape, dtype):
         """
         Returns (potentially) a sub-tensor from the self.symm_buffer for the given shape.
         If enough symmetric memory is not available, returns None.
         """
         if self.symm_mem_hdl is None:
-            return {"buffer": None, "handle": None}
-        size_of_dtype = torch.tensor([], dtype=dtype).element_size()
-        required_len = reduce(operator.mul, tensor_shape, 1) * size_of_dtype
-        if required_len <= self.symm_buffer.numel():
-            # Note that we always return subtensors starting from index 0 for easy 
-            # cuda-graphability. 
-            return {"buffer":self.symm_buffer[0:required_len].view(dtype).view(*tensor_shape), 
-                    "handle": self.symm_mem_hdl}
-        return {"buffer": None, "handle": None}
+            return {"tensor": None, "handle": None}
+        numel = reduce(operator.mul, tensor_shape, 1)
+        if not self.can_allocate(numel, dtype):
+            return {"tensor": None, "handle": None}
+        return {"tensor":self.allocate(numel, dtype).view(*tensor_shape), 
+                "handle": self.symm_mem_hdl}
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
     """Make a viewless tensor.
