@@ -555,7 +555,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=256,
-            active_buffer_size_gb=0.02,
+            buffer_size_gb=0.02,
             block_size_tokens=4,
             max_tokens=1_000_000,
         )
