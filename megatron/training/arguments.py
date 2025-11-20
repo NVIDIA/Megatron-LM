@@ -1461,8 +1461,7 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-num-cuda-graphs',
                        type=int, default=16,
                        help='Maximum number of cuda graphs to capture, where the '
-                       'cuda graph batch sizes range from 1 to '
-                       '--inference-dynamic-batching-max-cuda-graph-token-count'
+                       'cuda graph batch sizes range from 1 to `max_requests`. '
                        '(See `dynamic_context.py` for details on how '
                        '`max_requests` is computed). Due to rounding, the actual '
                        'number of cuda graphs may not equal this argument.')
