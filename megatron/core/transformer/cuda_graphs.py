@@ -1733,7 +1733,7 @@ class TECudaGraphHelper:
 
     def delete_cuda_graphs(self):
         """
-        Destroy CUDA Graphs.
+        Delete all CUDA graphs.
         """
         assert self._graphs_created, "CUDA Graphs have not been created."
         graphs_deleted, graphs_not_deleted = 0, 0

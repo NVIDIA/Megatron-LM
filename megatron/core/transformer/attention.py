@@ -23,7 +23,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -41,7 +40,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType
+from .enums import AttnMaskType, CudaGraphScope
 from .transformer_config import TransformerConfig
 
 try:

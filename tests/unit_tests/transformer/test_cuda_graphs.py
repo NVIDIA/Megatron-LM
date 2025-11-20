@@ -769,7 +769,7 @@ class TestPartialCudaGraph:
             if not is_deep_ep_available():
                 pytest.skip("Deep EP is not available")
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
-            extra_kwargs["moe_enable_deepep"] = True
+            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
         elif moe_dispatcher_type == "hybridep":
             if not is_hybrid_ep_available():
                 pytest.skip("Hybrid EP is not available")
