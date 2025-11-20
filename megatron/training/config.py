@@ -73,7 +73,7 @@ class TrainingConfig:
     which mitigates the impact of CPU-associated jitters. When the manual gc is enabled, garbage
     collection is performed only at the start and the end of the validation routine by default."""
 
-    manual_gc_interval: Optional[int] = None
+    manual_gc_interval: int = 0
     """Training step interval to trigger manual garbage collection. Values > 0 will trigger garbage
     collections between training steps.
     """
