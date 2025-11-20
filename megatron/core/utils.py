@@ -36,6 +36,13 @@ try:
 except ImportError:
     HAVE_TORCH_SYMM_MEM = False
 
+try:
+    import triton
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
 from megatron.core import config
 from megatron.core.package_info import __version__ as mcore_version
 
@@ -631,9 +638,10 @@ class GlobalSymmetricMemoryBuffer:
     """
 
     def __init__(self, size_in_mb, process_group):
-        if not HAVE_TORCH_SYMM_MEM:
+        if not HAVE_TORCH_SYMM_MEM or not HAVE_TRITON:
             # This should be hit if the user is running an older
-            # version of torch.
+            # version of torch, or if they do not have triton
+            # installed.
             self.symm_buffer = None
             self.symm_mem_hdl = None
         else:
