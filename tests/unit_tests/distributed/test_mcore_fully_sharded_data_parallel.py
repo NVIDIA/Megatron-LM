@@ -20,6 +20,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 # Test model for testing FSDP
+@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 class TestModel(torch.nn.Module):
     def __init__(self, input_dim, output_dim):
@@ -36,6 +37,7 @@ class TestModel(torch.nn.Module):
 
 
 # Test model with uniform shaped weights for testing FSDP
+@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 class TestModelUniform(torch.nn.Module):
     def __init__(self, hidden_dim):
@@ -67,6 +69,7 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
 
 
+@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 class TestFullyShardedDataParallel:
     @classmethod
