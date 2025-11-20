@@ -11,6 +11,8 @@ from .layers import (
     set_defaults_if_not_set_tensor_model_parallel_attributes,
     set_tensor_model_parallel_attributes,
 )
+from .inference_layers import InferenceLayerNormColumnParallelLinear, InferenceRowParallelLinear
+
 from .mappings import (
     all_gather_last_dim_from_tensor_parallel_region,
     all_to_all,

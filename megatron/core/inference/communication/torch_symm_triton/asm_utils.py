@@ -1,13 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import triton
-import triton.language as tl 
+import triton.language as tl
+
 
 @triton.jit
 def multimem_ld_reduce_128(multicast_ptrs, mask):
     """
     Multicast load and reduce 128 bits (4 x bf16) from all peers over nvlink
-    Outputs are returned as 4 tl.uint32 registers, each containing 2 bf16 values 
+    Outputs are returned as 4 tl.uint32 registers, each containing 2 bf16 values
     """
     return tl.inline_asm_elementwise(
         """
@@ -49,6 +50,7 @@ def multimem_st_128(multicast_ptrs, x, y, z, w, mask):
         pack=1,
     )
 
+
 @triton.jit
 def ld_128(ptr, mask):
     """
@@ -75,6 +77,11 @@ def ld_128(ptr, mask):
 
 @triton.jit
 def st_128(ptr, x, y, z, w, mask):
+    """
+    Store 128 bits (8 x bf16) to ptr
+    each of x, y, z, w is a tl.uint32 register
+    containing 2 bf16 values
+    """
     return tl.inline_asm_elementwise(
         """
         {
@@ -92,10 +99,17 @@ def st_128(ptr, x, y, z, w, mask):
         pack=1,
     )
 
+
 @triton.jit
 def add_v8_bf16_from_u32(
-    a0, a1, a2, a3,  # First vector of 8 bf16s, packed in 4 uint32s
-    b0, b1, b2, b3,  # Second vector of 8 bf16s, packed in 4 uint32s
+    a0,
+    a1,
+    a2,
+    a3,  # First vector of 8 bf16s, packed in 4 uint32s
+    b0,
+    b1,
+    b2,
+    b3,  # Second vector of 8 bf16s, packed in 4 uint32s
 ):
     """
     Adds two vectors of 8 bfloat16 numbers.
@@ -118,23 +132,3 @@ def add_v8_bf16_from_u32(
         is_pure=True,
         pack=1,
     )
-
-@triton.jit 
-def asm_rsqrt(x, eps):
-    """
-    Computes the reciprocal square root of a float32 number using inline assembly.
-    """
-    return tl.inline_asm_elementwise(
-        """
-        {
-            add.f32 $1, $1, $2;
-            rsqrt.approx.f32 $0, $1;
-        }
-        """,
-        "=f, f, f",
-        args=[x, eps],
-        dtype=(tl.float32),
-        is_pure=True,
-        pack=1,
-    )
-

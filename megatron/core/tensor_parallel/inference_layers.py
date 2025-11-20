@@ -10,11 +10,14 @@ from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
+from megatron.core.inference.communication.torch_symm_triton import (
+    multimem_all_gather,
+    multimem_reduce_scatter,
+)
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.parallel_state import get_global_symmetric_memory_buffer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
-from megatron.core.parallel_state import get_global_symmetric_memory_buffer
-from megatron.core.inference.communication.torch_symm_triton import multimem_all_gather, multimem_reduce_scatter
 
 try:
     import transformer_engine.pytorch.cpp_extensions as tex
@@ -27,7 +30,7 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
-    
+
 
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     x_shape = x.shape
@@ -87,7 +90,6 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
                 config.sequence_parallel
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
-
     def _all_gather(self, x: torch.Tensor) -> None:
         """
         Attempt a NVLS all-gather into symmetric memory. If not possible,
@@ -107,20 +109,18 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             symm_mem_buffer_dims, dtype=x.dtype
         )
         has_enough_symmetric_memory = symm_mem_buffer["handle"] is not None
-        can_use_custom_nvls_collectives = is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
-        
-        if can_use_custom_nvls_collectives: 
-            # do multimem all gather 
-            multimem_all_gather(symm_mem_buffer["tensor"], 
-                                 x, 
-                                 symm_mem_buffer["handle"])
+        can_use_custom_nvls_collectives = (
+            is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
+        )
+
+        if can_use_custom_nvls_collectives:
+            # do multimem all gather
+            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
             return symm_mem_buffer["tensor"]
         else:
             # revert to torch dist (NCCL) all gather
-            x, _ = gather_along_first_dim(x, process_group=self.tp_group)   
+            x, _ = gather_along_first_dim(x, process_group=self.tp_group)
             return x
-
-
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -185,7 +185,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         # 1. check if bf16
         is_bf16 = x.dtype == torch.bfloat16
-        # 2. check if hopper 
+        # 2. check if hopper
         is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
         # 3. attempt to ask for symmetric memory
         symm_mem_buffer_dims = list(x.size())
@@ -194,14 +194,16 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             symm_mem_buffer_dims, dtype=x.dtype
         )
         has_enough_symmetric_memory = symm_mem_buffer["handle"] is not None
-        can_use_custom_nvls_collectives = is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
-        if can_use_custom_nvls_collectives: 
+        can_use_custom_nvls_collectives = (
+            is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
+        )
+        if can_use_custom_nvls_collectives:
             # Write output of matmul directly onto the symmetric memory buffer
             torch.matmul(x, self.weight.t(), out=symm_mem_buffer["tensor"])
             x = symm_mem_buffer["tensor"]
             # perform nvls reduce-scatter
             output_dims = list(x.size())
-            output_dims[0] = x.size(0) // self.tp_size 
+            output_dims[0] = x.size(0) // self.tp_size
             output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
             multimem_reduce_scatter(output, x, symm_mem_buffer["handle"])
             return output

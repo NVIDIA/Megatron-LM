@@ -1125,6 +1125,7 @@ def initialize_model_parallel(
     for ranks in expert_decoder_rank_generator.get_ranks('ep'):
         group = create_group(
             ranks,
+            timeout=timeout,
             pg_options=get_nccl_options("ep", nccl_comm_cfgs),
             group_desc="EXPERT_MODEL_PARALLEL_GROUP",
         )
@@ -1931,25 +1932,31 @@ def _set_global_memory_buffer():
     assert _GLOBAL_MEMORY_BUFFER is None, "global memory buffer is already initialized"
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
+
 def _set_global_symmetric_memory_buffer():
     """Initialize global buffer."""
     global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
     assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is None, "global memory buffer is already initialized"
 
     _GLOBAL_SYMMETRIC_MEMORY_BUFFER = GlobalSymmetricMemoryBuffer(
-        size_in_mb=256, #todo: set from an argument? 
-        process_group=get_tensor_model_parallel_group()
+        size_in_mb=256,  # todo: set from an argument?
+        process_group=get_tensor_model_parallel_group(),
     )
+
 
 def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""
     assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
     return _GLOBAL_MEMORY_BUFFER
 
+
 def get_global_symmetric_memory_buffer():
     """Return the global GlobalSymmetricMemoryBuffer object"""
-    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is not None, "global symmetric memory buffer is not initialized"
+    assert (
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER is not None
+    ), "global symmetric memory buffer is not initialized"
     return _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+
 
 def destroy_global_memory_buffer():
     """Sets the global memory buffer to None"""

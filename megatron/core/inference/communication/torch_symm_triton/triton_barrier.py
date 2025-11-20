@@ -7,7 +7,7 @@ from .triton_utils import get_flat_bid, get_flat_tid
 
 
 @triton.jit
-def send_signal(addrs, sem: tl.constexpr):
+def _send_signal(addrs, sem: tl.constexpr):
     if sem == "relaxed":
         tl.inline_asm_elementwise(
             """
@@ -51,7 +51,7 @@ def send_signal(addrs, sem: tl.constexpr):
 
 
 @triton.jit
-def wait_signal(addrs, sem: tl.constexpr):
+def _wait_signal(addrs, sem: tl.constexpr):
     if sem == "relaxed":
         tl.inline_asm_elementwise(
             """
@@ -96,11 +96,7 @@ def wait_signal(addrs, sem: tl.constexpr):
 
 @triton.jit
 def blockwise_barrier(
-    signal_pad_ptrs,
-    block_id,
-    rank: tl.constexpr,
-    world_size: tl.constexpr,
-    sem: tl.constexpr,
+    signal_pad_ptrs, block_id, rank: tl.constexpr, world_size: tl.constexpr, sem: tl.constexpr
 ):
     """
     Synchronizes blocks with matching block_id across participating devices.
@@ -140,20 +136,12 @@ def blockwise_barrier(
 
     remote_ranks = tl.arange(0, world_size)
     signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
-    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(
-        tl.pointer_type(tl.uint32)
-    )
+    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(tl.pointer_type(tl.uint32))
     send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
 
-    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(
-        tl.pointer_type(tl.uint32)
-    )
+    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
     wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
 
     if flat_tid < world_size:
-        send_signal(send_addrs, sem)
-        wait_signal(wait_addrs, sem)
-
-
-
-
+        _send_signal(send_addrs, sem)
+        _wait_signal(wait_addrs, sem)
