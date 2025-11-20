@@ -45,7 +45,7 @@ DATA_TYPE_INFO = {
         'color': '#ff7f0e',  # Orange
         'representable_values': None  # Generate programmatically
     },
-    'mxfp8': {
+    'mxfp8e4m3': {
         'min_normal': 1.562500e-02,     # MX FP8 minimum normal value (0.015625)
         'max_normal': 4.480000e+02,     # MX FP8 maximum normal value (448.0)
         'min_denormal': 1.953125e-03,   # MX FP8 minimum denormal value (2^-9)
@@ -54,9 +54,18 @@ DATA_TYPE_INFO = {
         'max': 4.480000e+02,            # Effective maximum (positive max normal)
         'supports_infinity': False,
         'supports_nan': True,
-        'description': 'Microsoft MX FP8 E4M3',
-        'color': '#2ca02c',  # Green
-        'representable_values': None  # Generate programmatically
+        'description': 'Microsoft MX FP8 E4M3 format'
+    },
+    'mxfp8e5m2': {
+        'min_normal': 6.103516e-05,     # MX FP8 E5M2 minimum normal value (2^-14)
+        'max_normal': 5.734400e+04,     # MX FP8 E5M2 maximum normal value (57344.0)
+        'min_denormal': 1.525879e-05,   # MX FP8 E5M2 minimum denormal value (2^-16)
+        'max_denormal': 4.577637e-05,   # MX FP8 E5M2 maximum denormal value (3*2^-16)
+        'min': -5.734400e+04,           # Effective minimum (negative max normal)
+        'max': 5.734400e+04,            # Effective maximum (positive max normal)
+        'supports_infinity': True,
+        'supports_nan': True,
+        'description': 'Microsoft MX FP8 E5M2 format'
     },
     'mxfp4': {
         'min_normal': 1.000000e+00,     # MX FP4 minimum normal value
@@ -127,7 +136,7 @@ def generate_fp8_representable_values(format_name):
                     values.add(value)
                     values.add(-value)
                 
-    elif format_name == 'mxfp8':
+    elif format_name == 'mxfp8e4m3':
         # MX FP8 E4M3 format: 4 exponent bits, 3 mantissa bits
         # Based on mxfp.py: ebits=4, mbits=5 (total), emax=8, bias=7
         # Special handling: max_norm = 2^emax * 1.75 = 448.0
@@ -155,12 +164,40 @@ def generate_fp8_representable_values(format_name):
                     
                 values.add(value)
                 values.add(-value)
+    
+    elif format_name == 'mxfp8e5m2':
+        ebits, mbits_frac =5, 2  # 3 fractional mantissa bits
+        bias = 2**(ebits-1) - 1  # 7
+        emin = 1 - bias  # -6
+        emax = 8  # From mxfp.py code
+        
+        # Generate denormal values (exponent = emin, mantissa != 0)
+        for mantissa in range(1, 2**mbits_frac):  # 1 to 7
+            value = mantissa * (2**(emin - mbits_frac))  # mantissa * 2^(-9)
+            values.add(value)
+            values.add(-value)
+        
+        # Generate normal values
+        for exp in range(emin, emax + 1):  # -6 to 8
+            for mantissa in range(2**mbits_frac):  # 0 to 7
+                value = (1 + mantissa / (2**mbits_frac)) * (2**exp)
+                
+                # Special handling for MXFP8: max representable is 448.0
+                # This corresponds to exp=8, mantissa=6: (1 + 6/8) * 2^8 = 448.0
+                # Skip exp=8, mantissa=7 which would give 480.0
+                if exp == emax and mantissa >= 7:  # Skip only mantissa=7 at exp=8
+                    continue
+                    
+                values.add(value)
+                values.add(-value)
+
                 
     return sorted(list(values))
 
 # Generate representable values for FP8 formats
 DATA_TYPE_INFO['hifp8']['representable_values'] = generate_fp8_representable_values('hifp8')
-DATA_TYPE_INFO['mxfp8']['representable_values'] = generate_fp8_representable_values('mxfp8')
+DATA_TYPE_INFO['mxfp8e4m3']['representable_values'] = generate_fp8_representable_values('mxfp8e4m3')
+DATA_TYPE_INFO['mxfp8e5m2']['representable_values'] = generate_fp8_representable_values('mxfp8e5m2')
 
 def find_matching_files(base_dir, layer, rank, tensor_type, data_format=None):
     """
