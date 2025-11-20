@@ -37,7 +37,7 @@ PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 # DeepSeek2-Lite is a 1.3B parameter model with similar architecture to LLaMA
 TP_SIZE=8
 CP_SIZE=1     
-PP_SIZE=1     
+PP_SIZE=2     
 MICRO_BATCH_SIZE=1  # default 1
 GLOBAL_BATCH_SIZE=64 # default 128
 NUM_LAYERS=27 

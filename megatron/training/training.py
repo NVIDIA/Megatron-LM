@@ -1975,7 +1975,7 @@ def train(
 
     # Turn on training mode which enables dropout.
     # import pdb;pdb.set_trace()
-    print(f"model:{model}")
+    # print(f"model:{model}")
     for model_module in model:
         model_module.train()
 

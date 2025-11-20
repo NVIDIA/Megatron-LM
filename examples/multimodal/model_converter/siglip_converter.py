@@ -13,7 +13,7 @@ def convert(output_path, tensor_parallel_size, use_te):
 
     model = model.to(device)
 
-    print(model.config)
+    # print(model.config)
     for name, tensor in model.state_dict().items():
         if "vision_model" not in name:
             continue
