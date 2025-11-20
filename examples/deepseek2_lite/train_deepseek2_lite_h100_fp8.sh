@@ -40,9 +40,10 @@ PP_SIZE=1
 MICRO_BATCH_SIZE=1  # default 1
 GLOBAL_BATCH_SIZE=64 # default 128
 NUM_LAYERS=16 
+MOE_LAYERS=$(($NUM_LAYERS-1))
 DTYPE="bf16"
 # DTYPE=${5:-"fp8"}
-SEQ_LENGTH=1024
+SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=163840
 
 # Data cache path (useful for both mock and real data)
@@ -87,7 +88,7 @@ MODEL_ARGS=" \
     --qk-layernorm \
     --qk-pos-emb-head-dim 64 \
     --num-experts 64 \
-    --moe-layer-freq ([0]+[1]*($NUM_LAYERS-1)) \
+    --moe-layer-freq ([0]+[1]*$MOE_LAYERS) \
     --moe-ffn-hidden-size 1408 \
     --moe-grouped-gemm \
     --moe-router-score-function softmax \
