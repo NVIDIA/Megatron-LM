@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
@@ -2102,9 +2102,7 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
 
 
-def trace_async_exceptions(
-    func: Optional[Callable[..., Coroutine]], *, verbose: bool = False
-) -> Callable[..., Coroutine]:
+def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = False):
     """Decorator to be applied to every coroutine that runs in a separate task.
 
     This is needed because asyncio tasks do not propagate exceptions.
@@ -2119,36 +2117,57 @@ def trace_async_exceptions(
     ```
     """
 
-    def _decorate(fn):
-        if not asyncio.iscoroutinefunction(fn):
-            raise TypeError("trace_async_exceptions can only be used with async functions")
+    def _log_verbose(name: str, start: float) -> None:
+        elapsed = (time.perf_counter() - start) * 1000.0
+        cnt, tot = _ASYNC_TASK_STATS[name]
+        _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
+        avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
 
-        @functools.wraps(fn)
-        async def wrapper(*args, **kwargs):
-            if verbose:
-                start = time.perf_counter()
-            try:
-                return await fn(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"Exception in async function {fn.__name__}: {e}")
-                traceback.print_exc()
-                sys.exit(1)
-            finally:
+        log10 = numpy.log10(max(cnt, 1))
+        if numpy.isclose(log10, round(log10)):
+            logger.info(
+                f"{name} completed in {elapsed:.3f} ms, "
+                f"lifetime avg: {avg:.3f} ms, "
+                f"lifetime cnt: {cnt + 1}"
+            )
+
+    def _decorate(fn: Callable):
+        if asyncio.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
                 if verbose:
-                    elapsed = (time.perf_counter() - start) * 1000.0
-                    name = fn.__qualname__
-                    cnt, tot = _ASYNC_TASK_STATS[name]
-                    _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
-                    avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
+                    start = time.perf_counter()
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"Exception in async function {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
 
-                    log10 = numpy.log10(max(cnt, 1))
-                    if numpy.isclose(log10, round(log10)):
-                        logger.info(
-                            f"{name} completed in {elapsed:.3f} ms, "
-                            f"lifetime avg: {avg:.3f} ms, "
-                            f"lifetime cnt: {cnt + 1}"
-                        )
+        elif inspect.isasyncgenfunction(fn):
 
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                if verbose:
+                    start = time.perf_counter()
+                agen = fn(*args, **kwargs)
+                try:
+                    async for item in agen:
+                        yield item
+                except Exception as e:
+                    logger.error(f"Exception in async generator {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
+
+        else:
+            raise TypeError("trace_async_exceptions must be used on async functions or generators")
         return wrapper
 
     return _decorate if func is None else _decorate(func)
