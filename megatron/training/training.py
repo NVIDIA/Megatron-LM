@@ -106,6 +106,18 @@ def create_nan_detection_hook(module_name):
     """Create a forward hook to detect NaN in module outputs."""
     def nan_detection_hook(module, input, output):
         """Hook function to detect NaN in module output."""
+        print_rank_0(f"reach: {module_name}")
+        if isinstance(input, torch.Tensor):
+            if torch.isnan(input).any():
+                print_rank_0(f"[NaN Detection] Found NaN in module: {module_name}")
+                print_rank_0(f"[NaN Detection] Input shape: {input.shape}, dtype: {input.dtype}")
+                print_rank_0(f"[NaN Detection] NaN count: {torch.isnan(input).sum().item()}")
+        elif isinstance(input, (tuple, list)):
+            for idx, inp in enumerate(input):
+                if isinstance(inp, torch.Tensor) and torch.isnan(inp).any():
+                    print_rank_0(f"[NaN Detection] Found NaN in module: {module_name}, input index: {idx}")
+                    print_rank_0(f"[NaN Detection] Input shape: {inp.shape}, dtype: {inp.dtype}")
+                    print_rank_0(f"[NaN Detection] NaN count: {torch.isnan(inp).sum().item()}")
         if isinstance(output, torch.Tensor):
             if torch.isnan(output).any():
                 print_rank_0(f"[NaN Detection] Found NaN in module: {module_name}")
