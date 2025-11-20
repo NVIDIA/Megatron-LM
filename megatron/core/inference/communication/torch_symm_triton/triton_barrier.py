@@ -10,6 +10,7 @@ except ImportError:
     triton = MagicMock()
     tl = MagicMock()
     triton.jit = null_decorator
+
 from .triton_utils import get_flat_bid, get_flat_tid
 
 
