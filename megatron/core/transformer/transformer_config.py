@@ -856,7 +856,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.linear_attention_type is not None:
-            supported_la_types = ["gated_delta_net", "mamba"]
+            supported_la_types = ["gated_delta_net"]
             assert self.linear_attention_type in supported_la_types, (
                 f"linear_attention_type ({self.linear_attention_type}) only support"
                 f" one of {supported_la_types}."
@@ -900,8 +900,6 @@ class TransformerConfig(ModelParallelConfig):
                     f"Gated delta net does not support context parallel for now,"
                     f" but got {self.context_parallel_size=}."
                 )
-            elif self.linear_attention_type == "mamba":
-                raise NotImplementedError("Mamba is not supported yet.")
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
