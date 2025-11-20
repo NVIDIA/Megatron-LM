@@ -1255,15 +1255,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
         
         # Mark tensor collection as completed if tensor saving is enabled
-        try:
-            from megatron.core.tensor_saver import get_tensor_saver
-            tensor_saver = get_tensor_saver()
-            if tensor_saver.enabled and tensor_saver.tensor_collected_in_warmup and not tensor_saver.collection_completed:
-                tensor_saver.mark_collection_completed()
-        except Exception as e:
-            pass  # Silently ignore tensor saver errors
+        # try:
+        #     from megatron.core.tensor_saver import get_tensor_saver
+        #     tensor_saver = get_tensor_saver()
+        #     if tensor_saver.enabled and tensor_saver.tensor_collected_in_warmup and not tensor_saver.collection_completed:
+        #         tensor_saver.mark_collection_completed()
+        # except Exception as e:
+        #     pass  # Silently ignore tensor saver errors
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
+        # ({}, True, False, True, 16, None, None)
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
 
     # Empty unused memory.

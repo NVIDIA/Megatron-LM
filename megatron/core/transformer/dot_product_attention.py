@@ -168,7 +168,7 @@ class DotProductAttention(MegatronModule):
         from quant.bf16_operators import bf16_baddbmm
         # 从环境变量获取量化类型，默认为hifp8
         import os
-        custom_quant_type = 'hifp8'
+        custom_quant_type = 'bf16'
         
         # 支持time-resume自适应量化
         try:

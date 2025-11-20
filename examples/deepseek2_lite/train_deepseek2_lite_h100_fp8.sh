@@ -19,6 +19,7 @@ DATA_ARG=${4:-"dataset/wikitext_processed/wikitext_processed_text_document"}    
 
 
 # Create directories if they don't exist
+rm -rf "$CHECKPOINT_PATH"
 mkdir -p "$(dirname "$CHECKPOINT_PATH")"
 mkdir -p "$(dirname "$TENSORBOARD_LOGS_PATH")"
 

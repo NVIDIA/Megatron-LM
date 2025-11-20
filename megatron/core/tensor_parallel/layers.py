@@ -784,7 +784,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         import inspect
         
         # 获取量化类型（支持time-resume自适应量化）
-        custom_quant_type = 'hifp8'
+        custom_quant_type = 'bf16'
         if hasattr(ctx, '_adaptive_quantization_manager'):
             custom_quant_type = ctx._adaptive_quantization_manager.get_current_quantization_type()
         
@@ -925,7 +925,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             from megatron.core.tensor_saver import save_linear_tensors
             import os
             import inspect
-            custom_quant_type = 'hifp8'
+            custom_quant_type = 'bf16'
             
             # 尝试从调用栈获取layer_idx（与forward阶段保持一致）
             layer_idx = getattr(ctx, 'layer_idx', None)
@@ -965,7 +965,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         
         from quant.mxfp import mxfp_matmul
         from quant.hifp import hifp_matmul
-        custom_quant_type = 'hifp8'
+        custom_quant_type = 'bf16'
         if custom_quant_type == 'mxfp4':
             grad_input = mxfp_matmul(grad_output,weight,'fp4_e2m1').to(torch.bfloat16)
         elif custom_quant_type == 'mxfp8':
