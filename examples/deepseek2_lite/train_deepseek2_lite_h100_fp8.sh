@@ -23,7 +23,7 @@ mkdir -p "$(dirname "$CHECKPOINT_PATH")"
 mkdir -p "$(dirname "$TENSORBOARD_LOGS_PATH")"
 
 # Distributed training setup
-GPUS_PER_NODE=16
+GPUS_PER_NODE=8
 NUM_NODES=1
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
@@ -35,8 +35,8 @@ PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 
 # Fixed model and training parameters for DeepSeek2-Lite
 # DeepSeek2-Lite is a 1.3B parameter model with similar architecture to LLaMA
-TP_SIZE=8
-CP_SIZE=2     
+TP_SIZE=16
+CP_SIZE=1     
 PP_SIZE=1     
 MICRO_BATCH_SIZE=1  # default 1
 GLOBAL_BATCH_SIZE=64 # default 128
