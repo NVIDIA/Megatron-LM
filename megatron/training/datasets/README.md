@@ -11,7 +11,7 @@ It probabilistically converts samples into FIM format using configurable rates, 
 **Attributes**
 
 - `rate`: Probability of converting a sample into a FIM example. A value of `1.0` means FIM is always applied. a value of `0.0` means FIM is never applied.
-- `spm_rate`: Probability of using the SPM FIM pattern (vs PSM).
+- `spm_rate`: Probability of using the SPM FIM pattern (vs PSM). The remaining probability (`1 - spm_rate`) selects the PSM (prefix-suffix-middle) pattern instead. For example, if `spm_rate = 0.3`: 30% SPM, 70% PSM.
 - `extra_tokens`: Dictionary containing the FIM special tokens: {"prefix", "middle", "suffix", "pad", "eod"}.
 - `split_sample`: Optional token around which samples are split before applying FIM.
 - `fragment_rate`: Probability of applying FIM to each fragment when split_sample is used.
