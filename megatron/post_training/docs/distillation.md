@@ -75,7 +75,7 @@ Model Optimizer modifies the model using the loss criterion present in the disti
 defines a loss function between two module attribute names of the teacher and student model, respectively.
 
 Default loss function used between logits is a KL-Divergence Loss and loss used among intermediate tensors is Cosine-Similarity,
-both defined in `modelopt.torch.distill.plugins.megatron`.
+both defined in `megatron/inference/algos/distillation.py`.
 
 ## Restrictions
 
