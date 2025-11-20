@@ -1226,8 +1226,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 struct.pack('!i', messages_to_dequeue)
             )
             # Now publish the actual messages to all model parallel ranks
-            for message in all_messages:
-                self.model_parallel_publisher_socket.send(message)
+            if messages_to_dequeue > 0:
+                self.model_parallel_publisher_socket.send_multipart(all_messages)
         else:
             # First, receive the number of messages to dequeue from mp-rank 0
             messages_to_dequeue = struct.unpack(
@@ -1236,8 +1236,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # Now, dequeue the same number of messages from the subscriber socket.
             # Note that these receives are blocking, because the messages
             # are guaranteed to be available after the tp-rank 0 has sent them.
-            for _ in range(messages_to_dequeue):
-                all_messages.append(self.model_parallel_subscriber_socket.recv())
+            if messages_to_dequeue > 0:
+                all_messages = self.model_parallel_subscriber_socket.recv_multipart()
+            else:
+                all_messages = []
 
         torch.cuda.nvtx.range_pop()
         for message in all_messages:
