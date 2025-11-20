@@ -426,7 +426,7 @@ class TestDynamicContext:
             kv_channels=16,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.01,
+            buffer_size_gb=0.01,
             block_size_tokens=4,
             max_tokens=None,
         )
@@ -525,7 +525,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=8,
             max_tokens=None,
             is_hybrid_model=True,
