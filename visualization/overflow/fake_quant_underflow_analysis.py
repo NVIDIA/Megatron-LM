@@ -144,11 +144,11 @@ def analyze_tensor(file_path: Path,elem_format: str) -> dict:
     abs_vals = torch.abs(flat)
     non_zero = flat != 0.0
     if elem_format in DATA_TYPE_RANGES:
-        min_denormal = DATA_TYPE_RANGES[elem_format]['min_denormal']
+        min_normal = DATA_TYPE_RANGES[elem_format]['min_normal']
     else:
         raise ValueError(f"Unsupported element format: {elem_format}")
     
-    underflow = non_zero & (abs_vals < min_denormal)
+    underflow = non_zero & (abs_vals < min_normal)
     underflow_count = torch.sum(underflow).item()
     underflow_pct = (underflow_count / total) * 100.0
     
