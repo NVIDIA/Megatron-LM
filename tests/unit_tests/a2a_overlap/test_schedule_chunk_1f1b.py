@@ -96,7 +96,7 @@ class TestA2AOverlap:
         # create TransformerConfig
         extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         if dispatcher_type == "flex":
-            extra_kwargs["moe_enable_deepep"] = True
+            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
             extra_kwargs["moe_router_dtype"] = "fp32"
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]

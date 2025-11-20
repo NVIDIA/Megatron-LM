@@ -368,9 +368,26 @@ def create_cudagraphs():
 def delete_cuda_graphs():
     """Delete all CUDA graphs."""
 
+    # Reset runners.
+    for record in [
+        *_CudagraphGlobalRecord.cudagraph_record,
+        *_CudagraphGlobalRecord.cudagraph_inference_record,
+    ]:
+        runner = record[0]
+        assert isinstance(runner, _CudaGraphRunner)
+
+        runner.cudagraph_created = False
+        runner.fwd_graph_recorded = False
+        runner.bwd_graph_recorded = False
+        runner.fwd_graph = None
+        runner.bwd_graph = None
+        runner.fwd_mempool = None
+        runner.bwd_mempool = None
+
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
+    _CudagraphGlobalRecord.cudagraph_inference_record = []
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -1182,7 +1199,11 @@ class CudaGraphManager(torch.nn.Module):
 
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
-                    assert False
+                    assert False, (
+                        f"`cudagraph_created` is set to True but no matching cudagraph "
+                        f"runners were found. This module has {len(self.cudagraph_runners)} "
+                        f"existing runners. Use `get_mismatch_errors` to debug mismatches."
+                    )
                 else:
                     runner = _CudaGraphRunner(
                         megatron_module,

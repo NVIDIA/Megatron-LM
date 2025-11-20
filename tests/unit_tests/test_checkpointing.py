@@ -9,6 +9,8 @@ import pytest
 import torch
 import torch.distributed.checkpoint
 
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
@@ -50,6 +52,9 @@ class MockState:
         self._state_dict = state_dict
         self.is_stub_optimizer = False
         self._called_metadata = []
+
+        # Optimizers are expected to have this attribute for checkpointing.
+        self.param_groups = []
 
     def state_dict(self, is_loading=False):
         return self._state_dict
@@ -111,6 +116,8 @@ def create_args():
     args.retro_add_retriever = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
+    args.swiglu = True
+    args.num_experts = 1
 
     yield args
 
@@ -191,7 +198,7 @@ def test_load_base_checkpoint(
     assert ckpt_type == expected_ckpt_type
 
 
-@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp"])
+@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])
 def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format):
     """Test save_checkpoint."""
     args = create_args
@@ -207,6 +214,15 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
     config = TransformerConfig(num_layers=1, kv_channels=1)
     model = MockModel(config)
     optimizer = MockState({"optimizer": "optimizer_state"})
+    if ckpt_format == "fsdp_dtensor":
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_distributed_optimizer=True, use_megatron_fsdp=True
+            ),
+            module=model,
+        )
+        optimizer = MockState({"state": {}})
     opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
     num_floating_point_operations_so_far = 456
 
@@ -226,7 +242,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
         expected_ckpt_path = None
         if ckpt_format == "torch":
             expected_ckpt_path = ckpt_dir / "mp_rank_00" / "model_optim_rng.pt"
-        elif ckpt_format == "torch_dcp":
+        elif ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)

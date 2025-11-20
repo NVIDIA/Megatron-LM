@@ -78,7 +78,7 @@ runs:
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         pip install --no-cache-dir uv
-        uv sync --only-group test 
+        uv sync --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           --scope unit-tests \
           --model unit-tests \
@@ -90,7 +90,7 @@ runs:
 
         RUN_TEST_EOF
         )
-        echo "$cmd" | tee "job.sh"        
+        echo "$cmd" | tee "job.sh"
         echo "::endgroup::"
 
     - name: Get PR info
@@ -133,13 +133,14 @@ runs:
           else
             ARGS=(
               --scope mr-slim
+              --enable-lightweight-mode
             )
           fi
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         pip install --no-cache-dir uv
-        uv sync --only-group test 
+        uv sync --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           ${ARGS[@]} \
           --model ${{ inputs.model }} \
@@ -151,7 +152,7 @@ runs:
 
         RUN_TEST_EOF
         )
-        echo "$cmd" | tee "job.sh"        
+        echo "$cmd" | tee "job.sh"
         echo "::endgroup::"
 
     - name: Set timeout
