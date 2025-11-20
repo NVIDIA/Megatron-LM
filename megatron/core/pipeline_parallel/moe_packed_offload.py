@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from typing import Any
 import os
 import torch
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 try:
     import triton
     import triton.language as tl
@@ -221,19 +222,19 @@ class PackedTensor:
     """
     A class to represent a packed tensor.
     """
-    def __init__(self, tensor, num_tokens_tensor=None, vp_stage=None):
+    def __init__(self, tensor, num_tokens_tensor=None, vp_stage=None, layer_name=None):
         self._tensor = tensor
         self._original_tensor = None
         assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor) and num_tokens_tensor.numel() == 1, f"num_tokens_tensor {num_tokens_tensor} is not a scalar tensor"
         self.num_tokens_tensor = num_tokens_tensor.clone()
         self.vp_stage = vp_stage
-
+        self.layer_name = layer_name
         # Original tensor information
         self.original_shape = list(tensor.shape)
         self.num_elements = tensor.numel()
         self.element_size = tensor.element_size()
         self.hidden_size = self.num_elements // self.original_shape[0]
-        self.dtype = tensor.dtype
+        self.dtype = tensor.dtype if not isinstance(tensor, MXFP8Tensor) else tensor._columnwise_data.dtype
         self.device = tensor.device
 
         self.stash_buffer_offset = None
@@ -270,7 +271,7 @@ class PackedTensor:
             self.num_tokens_tensor = self.num_tokens_tensor.reshape(1)
         num_elements_tensor = self.num_tokens_tensor.mul(self.hidden_size)
         # Flatten the tensor to get total number of elements
-        flat_tensor = self._tensor.flatten()
+        flat_tensor = self._tensor.flatten() if not isinstance(self._tensor, MXFP8Tensor) else self._tensor._columnwise_data.flatten()
         
         # Determine grid size with cap on max blocks
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
@@ -281,7 +282,7 @@ class PackedTensor:
         num_blocks = min(total_blocks_needed, max_blocks)
         num_iterations = triton.cdiv(total_blocks_needed, num_blocks)
         if DEBUG:
-            debug_print (f"offload_to_stash {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} num_elements {num_elements_tensor.item()} max_blocks {max_blocks} total_blocks_needed {total_blocks_needed} num_blocks {num_blocks} num_iterations {num_iterations} oveflow {stash_buffer.overflow.item()}")
+            debug_print (f"offload_to_stash ({self.layer_name}) {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} num_elements {num_elements_tensor.item()} max_blocks {max_blocks} total_blocks_needed {total_blocks_needed} num_blocks {num_blocks} num_iterations {num_iterations} oveflow {stash_buffer.overflow.item()}")
         #
         grid = (num_blocks,)
         self.stash_buffer_offset = stash_buffer.free_offset.clone()
@@ -315,8 +316,22 @@ class PackedTensor:
         """Reload the packed tensor from the stash."""
         if not HAVE_TRITON:
             raise RuntimeError("Triton is required for PackedTensor.reload_from_stash(). Please install triton.")
-        self._tensor = torch.zeros(self.original_shape, dtype=self.dtype, device=self.device)
-        flat_tensor = self._tensor.flatten()
+        if isinstance(self._original_tensor, MXFP8Tensor):
+            columnwise_data = torch.zeros(self.original_shape, dtype=self.dtype, device=self.device)
+            self._tensor = MXFP8Tensor(
+                shape=self._original_tensor.shape,
+                dtype=self._original_tensor.dtype,
+                fp8_dtype=self._original_tensor._fp8_dtype,
+                rowwise_data=self._original_tensor._rowwise_data,
+                rowwise_scale_inv=self._original_tensor._rowwise_scale_inv,
+                columnwise_data=columnwise_data,
+                columnwise_scale_inv=self._original_tensor._columnwise_scale_inv,
+                quantizer=self._original_tensor._quantizer,
+            )
+            flat_tensor = self._tensor._columnwise_data.flatten()
+        else:
+            self._tensor = torch.zeros(self.original_shape, dtype=self.dtype, device=self.device)
+            flat_tensor = self._tensor.flatten()
 
         num_elements_tensor = self.num_tokens_tensor.mul(self.hidden_size)
                 
@@ -380,7 +395,10 @@ class PP_ScheduleFunction(torch.autograd.Function):
             while len(offload_manager.packed_tensors_offload_in_progress) > 0:
                 packed_tensor = offload_manager.packed_tensors_offload_in_progress.pop(0)
                 if not DEBUG:
-                    packed_tensor._original_tensor = None
+                    if isinstance(packed_tensor._original_tensor, MXFP8Tensor):
+                        packed_tensor._original_tensor._columnwise_data = None
+                    else:
+                        packed_tensor._original_tensor = None
 
         if offload_manager.status == 'captured':
             current_schedule_layer = (ctx.vp_stage+1)*100 + ctx.layer_no*10 + ctx.microbatch_no
@@ -550,7 +568,8 @@ class PackedOffloadManager:
             for dtype in self.max_pages_per_vp_stage[vp_stage]:
                 self.max_pages_per_vp_stage[vp_stage][dtype] = int(self.max_pages_per_vp_stage[vp_stage][dtype] * stash_buffer_size_factor)
                 self.stash_buffers[vp_stage][dtype] = StashBuffer(self.max_pages_per_vp_stage[vp_stage][dtype]*GLOBAL_BLOCK_SIZE, self.device, self.overflow, dtype)
-                debug_print(f'allocated stash buffer {vp_stage} {dtype} {self.stash_buffers[vp_stage][dtype]}')
+                if torch.distributed.get_rank() == 0:
+                    print(f'allocated stash buffer {vp_stage} {dtype} {self.stash_buffers[vp_stage][dtype]}')
 
     def update_pp_schedule(self, vp_stage, layer_no=None, microbatch_no=None):
         """Update the pp schedule."""
@@ -592,22 +611,26 @@ class PackedOffloadManager:
 
         if self.max_num_tokens is None or tensor.size(0) != self.max_num_tokens:
             return tensor.detach()
+        if isinstance(tensor, MXFP8Tensor):
+            debug_print(f'on_save_for_backward MXFP8Tensor ({self._current_layer_name}) {tensor.shape} {tensor.dtype} rowwise {tensor._rowwise_data is not None} columnwise {(tensor._columnwise_data.shape, tensor._columnwise_data.dtype) if tensor._columnwise_data is not None else None}-scale_inv {tensor._columnwise_scale_inv.shape} {tensor._columnwise_scale_inv.dtype}')
+            assert tensor._rowwise_data is None, f"rowwise_data is not None; Only columnwise data is supported for packed offloading"
+
         #if tensor.size(1) in [7168, 4096, 1] and DEBUG:
         #    return tensor.detach()
-
         if self.status == 'capture':
 
             self.num_tokens = self.num_tokens_tensor.item()
             num_elements = tensor.numel() * self.num_tokens // self.max_num_tokens
             num_pages = (num_elements + self.page_size - 1) // self.page_size
 
-            if tensor.dtype not in self.temp_pages_per_vp_stage[self.current_vp_stage]:
-                self.temp_pages_per_vp_stage[self.current_vp_stage][tensor.dtype] = 0
-                self.max_pages_per_vp_stage[self.current_vp_stage][tensor.dtype] = 0
-            self.temp_pages_per_vp_stage[self.current_vp_stage][tensor.dtype] += num_pages
-            self.max_pages_per_vp_stage[self.current_vp_stage][tensor.dtype] = max(self.max_pages_per_vp_stage[self.current_vp_stage][tensor.dtype], self.temp_pages_per_vp_stage[self.current_vp_stage][tensor.dtype])
+            dtype = tensor.dtype if not isinstance(tensor, MXFP8Tensor) else tensor._columnwise_data.dtype
+            if dtype not in self.temp_pages_per_vp_stage[self.current_vp_stage]:
+                self.temp_pages_per_vp_stage[self.current_vp_stage][dtype] = 0
+                self.max_pages_per_vp_stage[self.current_vp_stage][dtype] = 0
+            self.temp_pages_per_vp_stage[self.current_vp_stage][dtype] += num_pages
+            self.max_pages_per_vp_stage[self.current_vp_stage][dtype] = max(self.max_pages_per_vp_stage[self.current_vp_stage][dtype], self.temp_pages_per_vp_stage[self.current_vp_stage][dtype])
         
-        packed_tensor = PackedTensor(tensor.detach(), num_tokens_tensor=self.num_tokens_tensor, vp_stage=self.current_vp_stage)
+        packed_tensor = PackedTensor(tensor, num_tokens_tensor=self.num_tokens_tensor, vp_stage=self.current_vp_stage, layer_name=self._current_layer_name)
         if self.status == 'captured':
             self.add_packed_tensor_to_offload(packed_tensor)
         return packed_tensor
@@ -628,9 +651,10 @@ class PackedOffloadManager:
             if saved_state._tensor is not None:
                 if self.status == 'captured' and DEBUG:
                     #debug_print(f"on_get_saved_tensor {saved_state._original_tensor.shape} {saved_state.num_tokens_tensor.item()}")
-                    if saved_state._original_tensor is not None:
-                        original_flat = saved_state._original_tensor.flatten()
-                        tensor_flat = saved_state._tensor.flatten()
+                    original_tensor = saved_state._original_tensor if not isinstance(saved_state._original_tensor, MXFP8Tensor) else saved_state._original_tensor._columnwise_data
+                    if original_tensor is not None:
+                        original_flat = original_tensor.flatten() if not isinstance(original_tensor, MXFP8Tensor) else original_tensor._columnwise_data.flatten()
+                        tensor_flat = saved_state._tensor.flatten() if not isinstance(saved_state._tensor, MXFP8Tensor) else saved_state._tensor._columnwise_data.flatten()
                         num_elements = saved_state.num_tokens_tensor.item() * saved_state.hidden_size
                         original_flat_sub = original_flat[:num_elements]
                         tensor_flat_sub = tensor_flat[:num_elements]
@@ -639,10 +663,8 @@ class PackedOffloadManager:
                         idx_not_equal = (original_flat_sub != tensor_flat_sub).nonzero()
                         debug_print(f"on_get_saved_tensor original: {saved_state._original_tensor.shape} tensor: {saved_state._tensor.shape} equal tensors {equal} num_not_equal {num_not_equal}/{num_elements} idx_not_equal {idx_not_equal} original_tensor {original_flat_sub[idx_not_equal]} tensor {tensor_flat_sub[idx_not_equal]}")
                         #debug_print(f"on_get_saved_tensor equal tensors {torch.equal(saved_state._original_tensor, saved_state._tensor)} original_tensor {original_flat[-100:]} tensor {tensor_flat[-100:]}")
-                debug_print(f"on_get_saved_tensor return _tensor")
                 return saved_state._tensor
             else:
-                debug_print(f"on_get_saved_tensor return _original_tensor")
                 return saved_state._original_tensor
         
         return saved_state
@@ -693,7 +715,7 @@ def packed_moe_expert_offloading_set_last_layer(is_last_layer=False):
     offload_manager = PackedOffloadManager.get_instance()
     offload_manager._last_layer = is_last_layer
 
-def packed_moe_expert_offloading_reset():
+def packed_moe_expert_offloading_reset(enabled=True):
     """Reset the chunk handler, called at the start of a training iteration."""
     offload_manager = PackedOffloadManager.get_instance()
     offload_manager.iteration += 1
@@ -708,6 +730,8 @@ def packed_moe_expert_offloading_reset():
             torch.cuda.memory._record_memory_history(enabled=None)
             print(f'packed_moe_expert_offloading_reset dump_snapshot')
 
+    if not enabled:
+        return
     if offload_manager.status == 'begin':
         offload_manager.status = 'capture'
     elif offload_manager.status == 'capture':
