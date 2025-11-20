@@ -45,10 +45,13 @@ friendly a way as possible.
 
 import fnmatch
 import logging
+import os
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,19 @@ try:
     HAVE_YAML = True
 except ImportError:
     HAVE_YAML = False
+
+
+def _safe_get_rank() -> int:
+    """Internal function that safely checks and returns the rank of the caller."""
+
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+
+    # If torch.distributed is not initialized, try to read environment variables.
+    try:
+        return int(os.environ.get("RANK", 0))
+    except (ValueError, TypeError):
+        return 0
 
 
 @dataclass
@@ -194,9 +210,13 @@ class RecipeConfig:
         for matcher in self.matchers:
             config_key = matcher.match(operator_context)
             if config_key is not None:
-                logger.info(f'Context ({operator_context}) matched to quant config "{config_key}"')
+                if _safe_get_rank() == 0:
+                    logger.info(
+                        f'Context ({operator_context}) matched to quant config "{config_key}"'
+                    )
                 return config_key
-        logger.info(f"No config key match found for Context ({operator_context})")
+        if _safe_get_rank() == 0:
+            logger.info(f"No config key match found for Context ({operator_context})")
         return None
 
     def match(self, operator_context: MatchContext) -> QuantizationConfig | None:
