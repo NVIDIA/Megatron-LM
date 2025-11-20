@@ -51,6 +51,6 @@ MODEL_ARGS:
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
   --fim-data: true
-  --fim-rate: 0.2
-  --fim-spm-rate: 0.2
+  --fim-rate: 0.5
+  --fim-spm-rate: 0.5
 TEST_TYPE: regular
