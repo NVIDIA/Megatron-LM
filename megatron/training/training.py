@@ -2322,10 +2322,10 @@ def train(
         
         # Register NaN detection hooks before forward pass
         args = get_args()
-        if getattr(args, 'enable_nan_detection_hooks', False):
+        # if getattr(args, 'enable_nan_detection_hooks', False):
             # Optional: filter specific modules to hook (e.g., only attention layers)
             # module_filter = lambda name, mod: 'attention' in name.lower()
-            register_nan_detection_hooks(model, module_filter=None)
+        register_nan_detection_hooks(model, module_filter=None)
         
         (
             loss_dict,
@@ -2340,8 +2340,8 @@ def train(
         )
         
         # Remove NaN detection hooks after forward pass
-        if getattr(args, 'enable_nan_detection_hooks', False):
-            remove_nan_detection_hooks()
+        # if getattr(args, 'enable_nan_detection_hooks', False):
+        remove_nan_detection_hooks()
         
         ft_integration.on_training_step_end()
         
