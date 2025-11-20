@@ -303,6 +303,7 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
         model = mtd.convert(model, mode=[("kd_loss", kd_config)])
 
         # Additional tweaks needed for MCore.
+        # (accounts for sharded state, pipeline parallel, and potentially skipping LM loss)
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
 
     return model
