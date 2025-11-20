@@ -1466,10 +1466,6 @@ def _add_inference_args(parser):
                        '(See `dynamic_context.py` for details on how '
                        '`max_requests` is computed). Due to rounding, the actual '
                        'number of cuda graphs may not equal this argument.')
-    group.add_argument('--inference-dynamic-batching-max-cuda-graph-token-count',
-                       type=int, default=512,
-                       help='Maximum number of tokens in to capture in a cuda-graph.'
-                       'Inference batches with more tokens will not use cuda-graphs.')
     group.add_argument('--inference-dynamic-batching-track-paused-request-events',
                        action='store_true',
                        help='Track paused request ids by adding \'paused\' events '

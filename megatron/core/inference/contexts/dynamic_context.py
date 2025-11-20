@@ -271,7 +271,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         unified_memory_level: Optional[int] = 1,
         metrics_writer: Optional['WandbModule'] = None,
         num_request_metadata: Optional[int] = None,
-        max_cuda_graph_token_count: int = 512,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -417,15 +416,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Cuda graph token-counts (i.e., token counts used by cuda-graph steps, both decode and non-decode).
         self.cuda_graph_token_counts = None
-        self.max_cuda_graph_token_count = max_cuda_graph_token_count
         if num_cuda_graphs is not None:
 
             # Ensure valid num_cuda_graphs.
-            num_cuda_graphs = min(max(num_cuda_graphs, 1), self.max_cuda_graph_token_count)
+            num_cuda_graphs = min(max(num_cuda_graphs, 1), self.max_active_requests)
 
             # Cuda graph step size.
             cuda_graph_rounder = 8
-            self.cuda_graph_step_size = self.max_cuda_graph_token_count / num_cuda_graphs
+            self.cuda_graph_step_size = self.max_active_requests / num_cuda_graphs
             self.cuda_graph_step_size = (
                 math.ceil(self.cuda_graph_step_size / cuda_graph_rounder) * cuda_graph_rounder
             )
@@ -434,22 +432,22 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Cuda graph token counts.
             if num_cuda_graphs == 1:
-                self.cuda_graph_token_counts = [self.max_cuda_graph_token_count]
+                self.cuda_graph_token_counts = [self.max_active_requests]
             else:
                 self.cuda_graph_token_counts = list(
                     range(
                         self.cuda_graph_step_size,
-                        self.max_cuda_graph_token_count,
+                        self.max_active_requests,
                         self.cuda_graph_step_size,
                     )
                 )
-                if self.cuda_graph_token_counts[-1] != self.max_cuda_graph_token_count:
-                    self.cuda_graph_token_counts.append(self.max_cuda_graph_token_count)
+                if self.cuda_graph_token_counts[-1] != self.max_active_requests:
+                    self.cuda_graph_token_counts.append(self.max_active_requests)
                 self.cuda_graph_token_counts.reverse()
 
             # Set used for validating active cuda graph token count.
             self.cuda_graph_token_counts_set = set(self.cuda_graph_token_counts)
-            # self.max_cuda_graph_token_count = max(self.cuda_graph_token_counts)
+            self.max_cuda_graph_token_count = max(self.cuda_graph_token_counts)
 
         # for backwards compatibility with legacy unit tests, we are keeping
         # self.cuda_graph_request_counts around.

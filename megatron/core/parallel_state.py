@@ -1964,6 +1964,12 @@ def destroy_global_memory_buffer():
     _GLOBAL_MEMORY_BUFFER = None
 
 
+def destroy_global_symmetric_memory_buffer():
+    """Sets the global symmetric memory buffer to None"""
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
+
+
 def get_all_ranks():
     """Get caller's rank in tensor-model-parallel, data-parallel, context-parallel,
     pipeline-model-parallel and expert-model-parallel groups."""
@@ -2038,6 +2044,9 @@ def destroy_model_parallel():
 
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
+
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
     global _DATA_PARALLEL_GROUP_GLOO
     if (

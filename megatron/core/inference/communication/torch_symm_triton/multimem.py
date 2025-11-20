@@ -192,11 +192,11 @@ def multimem_all_gather(
         block_size = 1
         while block_size < num_threads:
             block_size *= 2
-        num_warps = block_size // WARP_SIZE
+        num_warps = max(block_size // WARP_SIZE, 1)
         num_blocks = 1
     else:
         block_size = MAX_BLOCK_SIZE
-        num_warps = MAX_BLOCK_SIZE // WARP_SIZE
+        num_warps = max(MAX_BLOCK_SIZE // WARP_SIZE, 1)
         num_blocks = min(triton.cdiv(num_threads, MAX_BLOCK_SIZE), MAX_NUM_BLOCKS)
 
     _multimem_all_gather_kernel[(num_blocks, 1, 1)](
@@ -290,11 +290,11 @@ def multimem_reduce_scatter(
         block_size = 1
         while block_size < num_threads:
             block_size *= 2
-        num_warps = block_size // WARP_SIZE
+        num_warps = max(block_size // WARP_SIZE, 1)
         num_blocks = 1
     else:
         block_size = MAX_BLOCK_SIZE
-        num_warps = MAX_BLOCK_SIZE // WARP_SIZE
+        num_warps = max(MAX_BLOCK_SIZE // WARP_SIZE, 1)
         num_blocks = min(triton.cdiv(num_threads, MAX_BLOCK_SIZE), MAX_NUM_BLOCKS)
 
     _multimem_reduce_scatter_kernel[(num_blocks, 1, 1)](
