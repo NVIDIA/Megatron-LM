@@ -63,57 +63,66 @@ DISTRIBUTED_ARGS=(
 # Based on typical configurations for models of this size
 TOKENIZER_MODEL="deepseek-ai/DeepSeek-V2-Lite"
 
-MODEL_ARGS=" \
-    --save-interval 100000 \
-    --attention-dropout 0.0 \
-    --hidden-dropout 0.0 \
-    --micro-batch-size 1 \
-    --bf16 \
-    --no-masked-softmax-fusion \
-    --disable-bias-linear \
-    --untie-embeddings-and-output-weights \
-    --position-embedding-type rope \
-    --no-rope-fusion \
-    --normalization RMSNorm \
-    --norm-epsilon 1e-6 \
-    --swiglu \
-    --num-layers $NUM_LAYERS \
-    --hidden-size 2048 \
-    --ffn-hidden-size 10944 \
-    --num-attention-heads 16 \
-    --kv-channels 16 \
-    --multi-latent-attention \
-    --kv-lora-rank 512 \
-    --v-head-dim 128 \
-    --qk-head-dim 128 \
-    --qk-layernorm \
-    --qk-pos-emb-head-dim 64 \
-    --num-experts 64 \
-    --moe-layer-freq ([0]+[1]*$MOE_LAYERS) \
-    --moe-ffn-hidden-size 1408 \
-    --moe-grouped-gemm \
-    --moe-router-score-function softmax \
-    --moe-router-topk 6 \
-    --moe-router-topk-scaling-factor 1.0 \
-    --moe-router-pre-softmax \
-    --moe-shared-expert-intermediate-size 2816 \
-    --moe-aux-loss-coeff 1e-3 \
-    --moe-token-dispatcher-type alltoall \
-    --moe-token-drop-policy probs \
-    --moe-router-load-balancing-type seq_aux_loss \
-    --seq-length $SEQ_LENGTH \
-    --max-position-embeddings $MAX_POSITION_EMBEDDINGS \
-    --tokenizer-type HuggingFaceTokenizer \
-    --make-vocab-size-divisible-by 3200 \
-    --attention-softmax-in-fp32 \
-    --use-mcore-models \
-    --rotary-percent 1.0 \
-    --rotary-base 10000 \
-    --rotary-scaling-factor 40 \
-    --mscale 0.707 \
-    --mscale-all-dim 0.707 \
-    --sequence-parallel \
-"
+# Base GPT model arguments
+GPT_ARGS=(
+    --num-layers $NUM_LAYERS 
+    --hidden-size 2048 
+    --ffn-hidden-size 10944 
+    --num-attention-heads 16 
+    --kv-channels 16 
+    --seq-length $SEQ_LENGTH 
+    --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
+    --attention-dropout 0.0 
+    --hidden-dropout 0.0 
+    --disable-bias-linear 
+    --untie-embeddings-and-output-weights 
+    --normalization RMSNorm 
+    --norm-epsilon 1e-6 
+    --swiglu 
+    --no-masked-softmax-fusion 
+    --attention-softmax-in-fp32 
+    --use-mcore-models 
+    --tokenizer-type HuggingFaceTokenizer 
+    --make-vocab-size-divisible-by 3200 
+)
+
+# Multi-Latent Attention (MLA) arguments
+MLA_ARGS=(
+    --multi-latent-attention 
+    --kv-lora-rank 512 
+    --v-head-dim 128 
+    --qk-head-dim 128 
+    --qk-layernorm 
+    --qk-pos-emb-head-dim 64 
+)
+
+# Mixture of Experts (MoE) arguments
+MOE_ARGS=(
+    --num-experts 64 
+    --moe-layer-freq ([0]+[1]*$MOE_LAYERS) 
+    --moe-ffn-hidden-size 1408 
+    --moe-grouped-gemm 
+    --moe-router-score-function softmax 
+    --moe-router-topk 6 
+    --moe-router-topk-scaling-factor 1.0 
+    --moe-router-pre-softmax 
+    --moe-shared-expert-intermediate-size 2816 
+    --moe-aux-loss-coeff 1e-3 
+    --moe-token-dispatcher-type alltoall 
+    --moe-token-drop-policy probs 
+    --moe-router-load-balancing-type seq_aux_loss 
+)
+
+# Rotary Position Embedding (RoPE) arguments
+ROPE_ARGS=(
+    --position-embedding-type rope 
+    --no-rope-fusion 
+    --rotary-percent 1.0 
+    --rotary-base 10000 
+    --rotary-scaling-factor 40 
+    --mscale 0.707 
+    --mscale-all-dim 0.707 
+)
 
 TRAINING_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
@@ -154,8 +163,8 @@ fi
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size $TP_SIZE
     --context-parallel-size $CP_SIZE
-    --pipeline-model-parallel-size $PP_SIZE # Not explicitly set in llama script options, assume 1 if not multi-node PP
-    --sequence-parallel  # Always enable sequence parallelism with TP_SIZE=4
+    --pipeline-model-parallel-size $PP_SIZE
+    --sequence-parallel
 )
 
 # Distributed Data Parallel (DDP) arguments
@@ -224,7 +233,10 @@ fi
 # Run the training command
 torchrun ${DISTRIBUTED_ARGS[@]} \
     "$PRETRAIN_SCRIPT_PATH" \
-    ${MODEL_ARGS[@]} \
+    ${GPT_ARGS[@]} \
+    ${MLA_ARGS[@]} \
+    ${ROPE_ARGS[@]} \
+    ${MOE_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${DTYPE_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
