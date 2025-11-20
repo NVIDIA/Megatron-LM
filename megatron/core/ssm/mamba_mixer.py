@@ -153,6 +153,7 @@ class MambaMixer(MegatronModule):
         headdim=None,
         ngroups=None,
         pg_collection: ProcessGroupCollection = None,
+        pp_layer_offset: int = 0,
     ):
         if not HAVE_MAMBA_SSM:
             raise ImportError(
@@ -174,6 +175,7 @@ class MambaMixer(MegatronModule):
         self.norm_before_gate = norm_before_gate
         self.chunk_size = chunk_size
         self.layer_number = layer_number
+        self.pp_layer_offset = pp_layer_offset
         self.cached_batch_size = None
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
@@ -291,6 +293,8 @@ class MambaMixer(MegatronModule):
 
             if self.conv_init is not None:
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+            else:
+                nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
 
         self.activation = "silu"
         self.act = nn.SiLU()
@@ -309,13 +313,6 @@ class MambaMixer(MegatronModule):
             # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             self.dt_bias = nn.Parameter(inv_dt)
-            # Our initialization would set all Linear.bias to zero,
-            # need to mark this one as _no_reinit
-            self.dt_bias._no_reinit = True
-            # Just to be explicit. Without this we already don't
-            # put wd on dt_bias because of the check
-            # name.endswith("bias") in param_grouping.py
-            self.dt_bias._no_weight_decay = True
             setattr(self.dt_bias, "tensor_model_parallel", True)
 
             # A parameter
@@ -325,7 +322,6 @@ class MambaMixer(MegatronModule):
             ).uniform_(*A_init_range)
             A_log = torch.log(A)  # Keep A_log in fp32
             self.A_log = nn.Parameter(A_log)
-            self.A_log._no_weight_decay = True
             setattr(self.A_log, "tensor_model_parallel", True)
 
         # D "skip" parameter
@@ -335,7 +331,6 @@ class MambaMixer(MegatronModule):
                 device=torch.cuda.current_device(),
             )
         )  # Keep in fp32
-        self.D._no_weight_decay = True
         setattr(self.D, "tensor_model_parallel", True)
 
         if self.rmsnorm:
@@ -348,6 +343,7 @@ class MambaMixer(MegatronModule):
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+            setattr(self.norm.weight, "tensor_model_parallel", True)
 
         # Assume sequence parallelism: input is partitioned along d_inner and
         # output is partitioned along the sequence dimension
@@ -440,7 +436,7 @@ class MambaMixer(MegatronModule):
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
-        conv_state, ssm_state = context.mamba_states_cache(self.layer_number)
+        conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
 
         # Fast path: decode-only
         if context.is_decode_only():
@@ -923,6 +919,12 @@ class MambaMixer(MegatronModule):
             x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
             if not self.rmsnorm:
                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+
+            # Upcast the batch_indices to prevent integer overflow errors in the case of
+            # large max request counts.
+            if batch_indices is not None:
+                batch_indices = batch_indices.to(torch.int64)
+
             y = selective_state_update(
                 ssm_state,
                 x_reshaped,
