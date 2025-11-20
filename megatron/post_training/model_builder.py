@@ -297,8 +297,8 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
 
         kd_config = {
             "teacher_model": (_teacher_provider, [teacher_config, model_kwargs], {}),
-            "criterion": distill_cfg["criterion"],
-            "loss_balancer": distill_cfg["loss_balancer"],
+            "criterion": distill_cfg.criterion,
+            "loss_balancer": distill_cfg.loss_balancer,
         }
         model = mtd.convert(model, mode=[("kd_loss", kd_config)])
 
