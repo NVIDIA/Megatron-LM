@@ -892,9 +892,7 @@ class TestSparseAttentionTensorParallel:
 
                 # All weights should be identical across all GPUs
                 for i in range(1, world_size):
-                    assert torch.equal(
-                        param_list[0], param_list[i]
-                    ), f"Indexer parameter {name} differs between rank 0 and rank {i} (world)"
+                    torch.testing.assert_close(param_list[0], param_list[i], rtol=0, atol=0)
 
         Utils.destroy_model_parallel()
 
@@ -964,7 +962,7 @@ class TestSparseAttentionTensorParallel:
 
         # Save gradients from TP=1
         indexer_tp1_grads = {
-            name: param.grad.clone().cpu()
+            name: param.grad.clone()
             for name, param in sparse_attention_tp1.indexer.named_parameters()
             if param.grad is not None
         }
@@ -986,6 +984,25 @@ class TestSparseAttentionTensorParallel:
         )
         pg_collection_tpn = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         sparse_attention_tpn = self._create_sparse_attention(config_tpn, pg_collection_tpn).cuda()
+
+        # Create one common input (all ranks create same input with same seed)
+        query_input = torch.randn(
+            seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+        ).cuda()
+        key_input = torch.randn(
+            seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+        ).cuda()
+        value_input = torch.randn(
+            seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+        ).cuda()
+        x_input = torch.randn(
+            seq_len, batch_size, config_tp1.hidden_size, dtype=torch.bfloat16
+        ).cuda()
+        qr_input = torch.randn(
+            seq_len, batch_size, config_tp1.q_lora_rank, dtype=torch.bfloat16
+        ).cuda()
+        attention_mask = torch.ones(batch_size, 1, seq_len, seq_len, dtype=torch.bool).cuda()
+        attention_mask = torch.tril(attention_mask)
 
         # Prepare input: split along seqlen if SP is enabled
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -1040,9 +1057,9 @@ class TestSparseAttentionTensorParallel:
         # 1. Indexer gradients should be identical
         for name, param in sparse_attention_tpn.indexer.named_parameters():
             if param.grad is not None and name in indexer_tp1_grads:
-                assert torch.allclose(
-                    param.grad.cpu(), indexer_tp1_grads[name], rtol=1e-3, atol=1e-3
-                ), f"Indexer gradient {name} mismatch between TP=1 and TP={tensor_model_parallel_size}"
+                torch.testing.assert_close(
+                    param.grad, indexer_tp1_grads[name], rtol=1e-5, atol=1e-5
+                )
 
         # 2. Query/Key/Value gradients need to be gathered along num_heads dim (dim 2) if SP is enabled
         # Flatten last two dims: [seq_len, batch, num_heads, head_dim] -> [seq_len, batch, num_heads * head_dim]
