@@ -293,6 +293,8 @@ class MambaMixer(MegatronModule):
 
             if self.conv_init is not None:
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+            else:
+                nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
 
         self.activation = "silu"
         self.act = nn.SiLU()
@@ -311,13 +313,6 @@ class MambaMixer(MegatronModule):
             # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             self.dt_bias = nn.Parameter(inv_dt)
-            # Our initialization would set all Linear.bias to zero,
-            # need to mark this one as _no_reinit
-            self.dt_bias._no_reinit = True
-            # Just to be explicit. Without this we already don't
-            # put wd on dt_bias because of the check
-            # name.endswith("bias") in param_grouping.py
-            self.dt_bias._no_weight_decay = True
             setattr(self.dt_bias, "tensor_model_parallel", True)
 
             # A parameter
@@ -327,7 +322,6 @@ class MambaMixer(MegatronModule):
             ).uniform_(*A_init_range)
             A_log = torch.log(A)  # Keep A_log in fp32
             self.A_log = nn.Parameter(A_log)
-            self.A_log._no_weight_decay = True
             setattr(self.A_log, "tensor_model_parallel", True)
 
         # D "skip" parameter
@@ -337,7 +331,6 @@ class MambaMixer(MegatronModule):
                 device=torch.cuda.current_device(),
             )
         )  # Keep in fp32
-        self.D._no_weight_decay = True
         setattr(self.D, "tensor_model_parallel", True)
 
         if self.rmsnorm:
@@ -350,6 +343,7 @@ class MambaMixer(MegatronModule):
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+            setattr(self.norm.weight, "tensor_model_parallel", True)
 
         # Assume sequence parallelism: input is partitioned along d_inner and
         # output is partitioned along the sequence dimension
