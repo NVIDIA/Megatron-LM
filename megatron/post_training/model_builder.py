@@ -7,6 +7,7 @@ from argparse import Namespace
 from typing import Any, Dict
 
 import modelopt.torch.distill as mtd
+import modelopt.torch.quantization as mtq
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
@@ -22,6 +23,8 @@ from megatron.post_training.algos import distillation
 from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_modelopt_state
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+
+from megatron.post_training.utils import print_distributed_quant_summary
 
 
 def count_parameters_in_layer(model, layer_name):
@@ -263,6 +266,9 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
     # modelopt_state (which transforms the model to have additional parameters) before returning.
     if args.load is not None:
         load_modelopt_state(model=model)
+        # TODO check if this is necessary still, or how to fix bug
+        # Temporary fix for bug introduced by removing quant_config from modelopt state.
+        mtq.disable_quantizer(model, "*output_layer*")
 
     _add_load_convert_hooks(model)
 
@@ -306,5 +312,6 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
         # NOTE: Distillation state manually removed in this function.
         # ModelOpt state restoration above will not return a `mtd.DistillationModel` for simplicity reasons.
         distillation.adjust_distillation_model_for_mcore(model, distill_cfg)
-
+    
+     print_distributed_quant_summary(model)
     return model
