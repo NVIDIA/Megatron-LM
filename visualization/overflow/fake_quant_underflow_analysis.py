@@ -39,7 +39,7 @@ DATA_TYPE_RANGES = {
         'supports_nan': True,
         'description': 'Huawei HiFP8 E4M3 format'
     },
-    'mxfp8': {
+    'mxfp8e4m3': {
         'min_normal': 1.562500e-02,     # MX FP8 minimum normal value (0.015625)
         'max_normal': 4.480000e+02,     # MX FP8 maximum normal value (448.0)
         'min_denormal': 1.953125e-03,   # MX FP8 minimum denormal value (2^-9)
@@ -49,6 +49,17 @@ DATA_TYPE_RANGES = {
         'supports_infinity': False,
         'supports_nan': True,
         'description': 'Microsoft MX FP8 E4M3 format'
+    },
+    'mxfp8e5m2': {
+        'min_normal': 6.103516e-05,     # MX FP8 E5M2 minimum normal value (2^-14)
+        'max_normal': 5.734400e+04,     # MX FP8 E5M2 maximum normal value (57344.0)
+        'min_denormal': 1.525879e-05,   # MX FP8 E5M2 minimum denormal value (2^-16)
+        'max_denormal': 4.577637e-05,   # MX FP8 E5M2 maximum denormal value (3*2^-16)
+        'min': -5.734400e+04,           # Effective minimum (negative max normal)
+        'max': 5.734400e+04,            # Effective maximum (positive max normal)
+        'supports_infinity': True,
+        'supports_nan': True,
+        'description': 'Microsoft MX FP8 E5M2 format'
     },
     'mxfp4': {
         'min_normal': 1.000000e+00,     # MX FP4 minimum normal value
@@ -86,6 +97,18 @@ def get_layer_and_pass(filename: str) -> tuple:
     
     return layer, pass_type
 
+def remove_scaling(tensor: torch.Tensor,elem_format: str) -> torch.Tensor:
+    from quant.mxfp_scaling_test import remove_scaling
+    if elem_format == 'hifp8':
+        return tensor
+    elif elem_format == 'mxfp8e4m3':
+        return remove_scaling(tensor,"fp8_e4m3")
+    elif elem_format == 'mxfp8e5m2':
+        return remove_scaling(tensor,"fp8_e5m2")
+    elif elem_format == 'mxfp4':
+        return remove_scaling(tensor,"fp4_e2m1")
+    else:
+        raise ValueError(f"Unsupported element format: {elem_format}")
 
 def analyze_tensor(file_path: Path,elem_format: str) -> dict:
     """Analyze tensor for HiFP8 underflow."""
@@ -106,6 +129,8 @@ def analyze_tensor(file_path: Path,elem_format: str) -> dict:
         tensor = tensor.float()
     else:
         tensor = tensor.float()
+
+    tensor = remove_scaling(tensor,elem_format)
     
     # Flatten and analyze
     flat = tensor.flatten()
@@ -116,12 +141,8 @@ def analyze_tensor(file_path: Path,elem_format: str) -> dict:
     # Calculate underflow: non-zero values < min_denormal
     abs_vals = torch.abs(flat)
     non_zero = flat != 0.0
-    if elem_format == 'hifp8':
-        min_denormal = DATA_TYPE_RANGES['hifp8']['min_denormal']
-    elif elem_format == 'mxfp8':
-        min_denormal = DATA_TYPE_RANGES['mxfp8']['min_denormal']
-    elif elem_format == 'mxfp4':
-        min_denormal = DATA_TYPE_RANGES['mxfp4']['min_denormal']
+    if elem_format in DATA_TYPE_RANGES:
+        min_denormal = DATA_TYPE_RANGES[elem_format]['min_denormal']
     else:
         raise ValueError(f"Unsupported element format: {elem_format}")
     
@@ -147,7 +168,7 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze HiFP8 underflow for BF16 tensors')
     parser.add_argument('--layer', required=True, help='Layer numbers: 1,8,15,16')
     parser.add_argument('--base-dir', default='enhanced_tensor_logs', help='Base directory')
-    parser.add_argument('--elem-format', default='hifp8', choices=['hifp8', 'mxfp8', 'mxfp4'], help='Element format: hifp8, mxfp8, mxfp4')
+    parser.add_argument('--elem-format', default='hifp8', choices=['hifp8', 'mxfp8e4m3', 'mxfp8e5m2', 'mxfp4'], help='Element format: hifp8, mxfp8e4m3, mxfp8e5m2, mxfp4')
     args = parser.parse_args()
     
     # Parse layers

@@ -1,0 +1,75 @@
+{
+    "elem_format": "hifp8",
+    "layers": [
+        1,
+        8,
+        15,
+        16
+    ],
+    "results": [
+        {
+            "layer": 1,
+            "pass_type": "forward",
+            "total_elements": 4674551808,
+            "total_underflow": 4757,
+            "underflow_percentage": 0.00010176376678206664,
+            "num_tensors": 40
+        },
+        {
+            "layer": 1,
+            "pass_type": "backward",
+            "total_elements": 2409627648,
+            "total_underflow": 1172632,
+            "underflow_percentage": 0.04866444825918598,
+            "num_tensors": 28
+        },
+        {
+            "layer": 8,
+            "pass_type": "forward",
+            "total_elements": 4674551808,
+            "total_underflow": 2875,
+            "underflow_percentage": 6.150322251386202e-05,
+            "num_tensors": 40
+        },
+        {
+            "layer": 8,
+            "pass_type": "backward",
+            "total_elements": 2409627648,
+            "total_underflow": 24328957,
+            "underflow_percentage": 1.0096562852851199,
+            "num_tensors": 28
+        },
+        {
+            "layer": 15,
+            "pass_type": "forward",
+            "total_elements": 4674551808,
+            "total_underflow": 2915,
+            "underflow_percentage": 6.235891952275053e-05,
+            "num_tensors": 40
+        },
+        {
+            "layer": 15,
+            "pass_type": "backward",
+            "total_elements": 2409627648,
+            "total_underflow": 37484166,
+            "underflow_percentage": 1.5555999297697303,
+            "num_tensors": 28
+        },
+        {
+            "layer": 16,
+            "pass_type": "forward",
+            "total_elements": 4674551808,
+            "total_underflow": 2810,
+            "underflow_percentage": 6.011271487441818e-05,
+            "num_tensors": 40
+        },
+        {
+            "layer": 16,
+            "pass_type": "backward",
+            "total_elements": 2409627648,
+            "total_underflow": 39404146,
+            "underflow_percentage": 1.63527946040566,
+            "num_tensors": 28
+        }
+    ]
+}

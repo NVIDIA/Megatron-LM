@@ -17,7 +17,7 @@ from datetime import datetime
 # Add the parent directory to path to import mxfp module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from quant.mxfp import _quantize_mx, _get_format_params, ElemFormat
+from quant.mxfp import _quantize_mx, _get_format_params, ElemFormat,_remove_scaling_mx
 
 def setup_logging(output_dir, tensor_name, elem_format):
     """
@@ -906,6 +906,18 @@ def save_results_to_file(results, output_path):
     # This will be logged by the caller
     pass
 
+def remove_scaling(A,elem_format):
+    return _remove_scaling_mx(A=A,
+                scale_bits=8,
+                elem_format=elem_format,
+                shared_exp_method="max",
+                axes=-1,
+                block_size=32,
+                round="nearest",
+                flush_fp32_subnorms=False,
+                scaling_control="max",
+            )  
+            
 def process_single_tensor(input_path, args, logger=None):
     """Process a single tensor file."""
     

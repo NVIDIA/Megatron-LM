@@ -571,7 +571,6 @@ def _quantize_mx(
 
     return A
 
-
 import torch
 from torch.autograd import Function
 from typing import Optional, Dict, Any
@@ -1046,6 +1045,65 @@ def mxfp_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,
     else:
         # 否则使用原始调用方式
         return MXFPBAddBmm.apply(input, batch1, batch2, beta, alpha, elem_format, block_size, None, None, "forward", "pre", "attention", None, None, scaling_control)
+
+def _remove_scaling_mx(
+    A,
+    scale_bits,
+    elem_format,    # can be None for no quantization
+    shared_exp_method="max",
+    axes=None,
+    block_size=0,
+    round="nearest",
+    flush_fp32_subnorms=False,
+    scaling_control="max",
+):
+    """Function used for MX* quantization
+    """
+    # Shortcut for no quantization
+    if elem_format == None:
+        return A
+
+    assert(scale_bits > 0)
+
+    # Make sure axes is a list of non-negative numbers
+    if axes is None:
+        axes = []
+    else:
+        axes = [axes] if type(axes) == int else axes
+        axes = [x + A.ndim if x < 0 else x for x in axes]
+
+    ebits, mbits, emax, max_norm, _ = _get_format_params(elem_format)
+
+    # Perform tiling to the hardware vector size
+    if block_size > 0:
+        A, axes, orig_shape, padded_shape = _reshape_to_blocks(
+            A, axes, block_size
+        )
+
+    ####################
+    # Quantize
+    ####################
+    shared_exp_axes = [x + 1 for x in axes] if block_size > 0 else axes
+
+    # Get shared exponents
+    shared_exp = _shared_exponents(
+        A, method=shared_exp_method, axes=shared_exp_axes, ebits=0, scaling_control=scaling_control,
+    )
+
+    # Flush subnormal FP32 inputs to zero
+    if flush_fp32_subnorms:
+        A = A * (shared_exp > -FP32_EXPONENT_BIAS).type(A.dtype)
+
+    # Offset the max exponent by the largest representable exponent
+    # in the element data format
+    shared_exp = shared_exp - emax
+
+    scale_emax = 2**(scale_bits-1) - 1
+    shared_exp[shared_exp > scale_emax] = float("NaN")
+    shared_exp[shared_exp < -scale_emax] = -scale_emax
+
+    A = A / (2**shared_exp)
+    return A
 
 if __name__ == '__main__':
     A = torch.load("grad_output.pt", map_location='cpu').cuda()
