@@ -337,7 +337,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
             self.block_size_bytes = (
                 dtype_size_bytes
-                * num_attention_layers
+                * self.num_attention_layers
                 * self.block_size_tokens
                 * self.kv_reduced_dim
             )
@@ -603,32 +603,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
-
-        # `*_cudagraph_only` tensors are for use with cuda graphs to maintain
-        # consistent input shapes, which is required to use cuda graphs.
-        # During these steps, the `*_cudagraph_only`
-        # tensors are used, otherwise their same-name but un-suffixed
-        # corresponding tensors are used.
-
-        self.query_seq_lengths_cudagraph_only = torch.full(
-            (self.max_total_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self.cu_query_seq_lengths_cudagraph_only = torch.full(
-            (self.max_total_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self.kv_seq_lengths_cudagraph_only = torch.full(
-            (self.max_total_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self.cu_kv_seq_lengths_cudagraph_only = torch.full(
-            (self.max_total_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-
-        self.request_to_kv_block_ids_cudagraph_only = torch.full(
-            (self.max_total_requests, self.max_kv_block_count),
-            0,
-            dtype=torch.int,
-            device=torch.cuda.current_device(),
-        )
 
         # Optional state tensors for hybrid models
         def allocate_mamba_states():
@@ -1494,10 +1468,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Newly paused request IDs.
         """
-
-        # If tensor state is deallocated, do not add request.
-        if not self.is_tensor_state_allocated:
-            raise TensorStateDeallocatedError(req.request_id)
 
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
