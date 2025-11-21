@@ -7,6 +7,7 @@ from typing import Optional, Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.metrics import collector
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
@@ -103,8 +104,10 @@ class MoELayer(BaseMoELayer):
         submodules: Optional[MoESubmodules] = None,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
     ):
         self.submodules = submodules
+        self._metric_collector = metric_collector
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Initialize process groups with the global parallel_state.
         if pg_collection is None:
@@ -176,6 +179,7 @@ class MoELayer(BaseMoELayer):
         """
         residual = hidden_states
         probs, routing_map = self.router(hidden_states)
+        self._metric_collector.collect(self, routing_map=routing_map)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )

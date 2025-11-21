@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.metrics import collector
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
@@ -148,6 +149,7 @@ class Attention(MegatronModule, ABC):
         attention_type: str,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
+        metric_collector: collector.MetricCollector = (collector.NoopMetricCollector()),
     ):
         super().__init__(config=config)
 
@@ -156,6 +158,7 @@ class Attention(MegatronModule, ABC):
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        self._metric_collector = metric_collector
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -964,6 +967,8 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
+
+        self._metric_collector.collect(self, output=output)
 
         return output, bias
 

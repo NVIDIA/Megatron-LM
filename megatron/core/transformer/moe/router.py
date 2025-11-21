@@ -6,6 +6,7 @@ from typing import Optional
 import torch
 
 from megatron.core.jit import jit_fuser
+from megatron.core.metrics import collector
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -144,7 +145,10 @@ class TopKRouter(Router):
     """
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
     ) -> None:
         """Initialize the zero token dropping router.
 
@@ -157,6 +161,7 @@ class TopKRouter(Router):
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
+        self._metric_collector = metric_collector
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
         if self.enable_expert_bias:
@@ -578,6 +583,8 @@ class TopKRouter(Router):
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
+
+        self._metric_collector.collect(self, logits=logits)
 
         probs, routing_map = self.routing(logits)
 
