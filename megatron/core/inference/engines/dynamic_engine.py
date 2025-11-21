@@ -1318,9 +1318,9 @@ class DynamicInferenceEngine(AbstractEngine):
             header = Headers(data[0])
 
             if self.received_stop:
-                assert header == Headers.STOP_ACK, (
-                    "Engine is shutting down. No other messages allowed except STOP_ACK."
-                )
+                assert (
+                    header == Headers.STOP_ACK
+                ), "Engine is shutting down. No other messages allowed except STOP_ACK."
 
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]

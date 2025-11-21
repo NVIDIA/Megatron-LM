@@ -139,9 +139,7 @@ class InferenceClient:
                     )
                     completion_future = self.completion_futures.pop(request_id)
                     if completion_future.done():
-                        logging.warning(
-                            f"Client: The future for {request_id} has been cancelled!"
-                        )
+                        logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
                     completion_future.set_result(DynamicInferenceRequestRecord.deserialize(reply))
                 elif header == Headers.PAUSE_ACK:

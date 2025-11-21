@@ -20,6 +20,7 @@ class Headers(Enum):
     STOP = auto()
     STOP_ACK = auto()
 
+
 class UnknownHeaderError(Exception):
     """A signal with an unrecognized header was received by the coordinator."""
 
