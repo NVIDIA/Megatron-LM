@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
@@ -2102,9 +2102,7 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
 
 
-def trace_async_exceptions(
-    func: Optional[Callable[..., Coroutine]], *, verbose: bool = False
-) -> Callable[..., Coroutine]:
+def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = False):
     """Decorator to be applied to every coroutine that runs in a separate task.
 
     This is needed because asyncio tasks do not propagate exceptions.
@@ -2119,36 +2117,179 @@ def trace_async_exceptions(
     ```
     """
 
-    def _decorate(fn):
-        if not asyncio.iscoroutinefunction(fn):
-            raise TypeError("trace_async_exceptions can only be used with async functions")
+    def _log_verbose(name: str, start: float) -> None:
+        elapsed = (time.perf_counter() - start) * 1000.0
+        cnt, tot = _ASYNC_TASK_STATS[name]
+        _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
+        avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
 
-        @functools.wraps(fn)
-        async def wrapper(*args, **kwargs):
-            if verbose:
-                start = time.perf_counter()
-            try:
-                return await fn(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"Exception in async function {fn.__name__}: {e}")
-                traceback.print_exc()
-                sys.exit(1)
-            finally:
+        log10 = numpy.log10(max(cnt, 1))
+        if numpy.isclose(log10, round(log10)):
+            logger.info(
+                f"{name} completed in {elapsed:.3f} ms, "
+                f"lifetime avg: {avg:.3f} ms, "
+                f"lifetime cnt: {cnt + 1}"
+            )
+
+    def _decorate(fn: Callable):
+        if asyncio.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
                 if verbose:
-                    elapsed = (time.perf_counter() - start) * 1000.0
-                    name = fn.__qualname__
-                    cnt, tot = _ASYNC_TASK_STATS[name]
-                    _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
-                    avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
+                    start = time.perf_counter()
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"Exception in async function {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
 
-                    log10 = numpy.log10(max(cnt, 1))
-                    if numpy.isclose(log10, round(log10)):
-                        logger.info(
-                            f"{name} completed in {elapsed:.3f} ms, "
-                            f"lifetime avg: {avg:.3f} ms, "
-                            f"lifetime cnt: {cnt + 1}"
-                        )
+        elif inspect.isasyncgenfunction(fn):
 
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                if verbose:
+                    start = time.perf_counter()
+                agen = fn(*args, **kwargs)
+                try:
+                    async for item in agen:
+                        yield item
+                except Exception as e:
+                    logger.error(f"Exception in async generator {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
+
+        else:
+            raise TypeError("trace_async_exceptions must be used on async functions or generators")
         return wrapper
 
     return _decorate if func is None else _decorate(func)
+
+
+def get_mamba_inference_state_config_from_model(model) -> Optional["MambaInferenceStateConfig"]:
+    """Returns Mamba inference state config from the model if it is a hybrid model."""
+    from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+        MambaInferenceStateConfig,
+    )
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+        return MambaInferenceStateConfig(
+            layer_type_list=layer_type_list,
+            mamba_conv_states_shape=mamba_conv_states_shape,
+            mamba_ssm_states_shape=mamba_ssm_states_shape,
+        )
+    return None
+
+
+# ============================================================================
+# Backward Compatibility Decorators
+# ============================================================================
+
+
+def deprecated(
+    version: str,
+    removal_version: Optional[str] = None,
+    alternative: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Callable:
+    """
+    Mark a function as deprecated.
+
+    This decorator:
+    1. Adds deprecation metadata to the function
+    2. Issues a DeprecationWarning when the function is called
+    3. Allows the compatibility checker to track deprecation lifecycle
+
+    Args:
+        version: Version where deprecation starts (e.g., "1.0.0")
+        removal_version: Version where function will be removed (e.g., "2.0.0")
+        alternative: Name of the recommended replacement function
+        reason: Optional explanation for the deprecation
+
+    Returns:
+        Decorator function
+
+    Example:
+        @deprecated(
+            version="1.0.0",
+            removal_version="2.0.0",
+            alternative="new_train_model",
+            reason="Improved performance and cleaner API"
+        )
+        def old_train_model(config):
+            pass
+    """
+
+    def decorator(func: Callable) -> Callable:
+        # Add metadata
+        func._deprecated = True
+        func._deprecated_version = version
+        func._removal_version = removal_version
+        func._alternative = alternative
+        func._deprecation_reason = reason
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Build warning message
+            msg_parts = [f"{func.__name__} is deprecated since version {version}."]
+
+            if alternative:
+                msg_parts.append(f"Use {alternative} instead.")
+
+            if removal_version:
+                msg_parts.append(f"Will be removed in version {removal_version}.")
+
+            if reason:
+                msg_parts.append(f"Reason: {reason}")
+
+            warnings.warn(" ".join(msg_parts), DeprecationWarning, stacklevel=2)
+
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def internal_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as internal API (not for external use).
+
+    Use this decorator for:
+    - Internal APIs not intended for public consumption
+    - Experimental features that may change without notice
+    - Implementation details that are not part of the stable API
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks.
+
+    Args:
+        func: The function or class to mark as internal
+
+    Returns:
+        The original function/class with an internal API marker
+
+    Example:
+        @internal_api
+        def _internal_helper():
+            '''For internal use only'''
+            pass
+
+        @internal_api
+        class ExperimentalFeature:
+            '''This API may change without notice'''
+            pass
+    """
+    func._internal_api = True
+    return func
