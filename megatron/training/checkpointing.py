@@ -281,7 +281,7 @@ def read_metadata(tracker_filename):
                     tracker_filename))
                 sys.exit()
             else:
-                # Set iteration to 0 for release checkpoints to preserve the existing behavior
+                # Set iteration to 0 for release checkpoints
                 iteration = 0
     assert iteration > -1 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
