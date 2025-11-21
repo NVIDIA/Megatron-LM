@@ -7,7 +7,7 @@ from megatron.core.metrics import collector, metrics, reporter
 
 
 @final
-class TestReporter(collector.MetricCollector, reporter.MetricReporter):
+class SimpleReporter(collector.MetricCollector, reporter.MetricReporter):
     """Unit test collector/reporter that stores collected metrics in a list."""
 
     def __init__(self):
@@ -46,7 +46,7 @@ class DummyModule(torch.nn.Module):
 
 
 def test_reporter_reports_empty_metrics():
-    reporter_instance = TestReporter()
+    reporter_instance = SimpleReporter()
 
     assert (
         reporter_instance.report(prefix='model/') == {}
@@ -54,7 +54,7 @@ def test_reporter_reports_empty_metrics():
 
 
 def test_reporter_reports_metrics():
-    reporter_instance = TestReporter()
+    reporter_instance = SimpleReporter()
     module = DummyModule(metric_collector=reporter_instance)
 
     input_tensor = torch.tensor([1.0, 2.0, 3.0])
@@ -68,7 +68,7 @@ def test_reporter_reports_metrics():
 
 
 def test_reporter_clears_metrics():
-    reporter_instance = TestReporter()
+    reporter_instance = SimpleReporter()
     module = DummyModule(metric_collector=reporter_instance)
 
     module(torch.tensor([1.0, 2.0, 3.0]))
@@ -82,7 +82,7 @@ def test_reporter_clears_metrics():
 
 
 def test_reporter_merges_metrics():
-    reporter_instance = TestReporter()
+    reporter_instance = SimpleReporter()
     module = DummyModule(metric_collector=reporter_instance)
 
     module(torch.tensor([1.0, 2.0, 3.0]))

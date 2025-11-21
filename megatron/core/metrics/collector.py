@@ -11,7 +11,8 @@ class MetricCollector(abc.ABC):
     def collect(self, module: torch.nn.Module, **params: torch.Tensor) -> None:
         """Report metrics from a module.
 
-        This method should be called at most once per module per forward pass.
+        This method should be called at most once per module per forward pass. Parameters should
+        *not* be modified in-place by any subclasses.
 
         Args:
             module: The module reporting the metrics.
