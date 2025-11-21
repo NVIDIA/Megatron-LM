@@ -2474,8 +2474,9 @@ class ParamAndGradBuffer:
                 item_id, only_shard=sharded_optimizer_state
             )
             if group.main_weight_buffer is not None:
-                # Convert the gradient to the main weight buffer dtype.
-                optimizer_grad = optimizer_grad.to(param.dtype)
+                if getattr(self, "use_precision_aware_optimizer", False):
+                    # Convert the gradient to the main weight buffer dtype.
+                    optimizer_grad = optimizer_grad.to(param.dtype)
 
             if name not in self.dist_main_grad:
                 # Register the gradient as a distributed tensor.
@@ -2500,7 +2501,7 @@ class ParamAndGradBuffer:
 
             # The presence of main_grad_buffer but no main_weight_buffer may imply
             # that a precision-aware optimizer is used.
-            if getattr(self, "use_precision_aware_optimizer", False):
+            if getattr(self, "use_precision_aware_optimizer", True):
                 setattr(param, "decoupled_grad", grad)
             else:
                 # Attach the gradient to the optimizer parameter.
