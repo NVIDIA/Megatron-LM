@@ -302,8 +302,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert (
                 mamba_ssm_states_shape is not None
             ), "`mamba_ssm_states_shape` must be specified for hybrid models"
-            assert (
-                not use_cuda_graphs_for_non_decode_steps
+            assert not (
+                num_cuda_graphs is not None and use_cuda_graphs_for_non_decode_steps
             ), "Non-decode CUDA graphs not yet supported for hybrid models"
 
             # For hybrid models, the layer map converts the global layer index to the
@@ -1427,6 +1427,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
 
+    def get_index_of_chunked_prefill_request(self) -> int:
+        """Get the index of the chunked prefill request in the context.
+
+        Return:
+            (int) Index of the chunked prefill request, or -1 if none exists.
+        """
+        return torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
+
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
         """Update context state after calling engine.step().
@@ -1583,8 +1591,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if self.chunked_prefill_request_id != -1:
                 # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-                pos = torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
-                active_requests_requiring_new_block[pos] = 0  # chunked prefill should not be paused
+                active_requests_requiring_new_block[self.get_index_of_chunked_prefill_request()] = (
+                    0  # chunked prefill should not be paused
+                )
 
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()
@@ -1651,11 +1660,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count += resume_request_count
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
-        # finally, swap the chunked prefill to the end of the active requests to obey the invariant
+        # finally, swap the chunked prefill to the end of the active requests to obey the invariance
         if self.chunked_prefill_request_id != -1:
-            pos = torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
             self._swap_book_keeping_tensors(
-                src_idxs=torch.tensor([pos]),
+                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
                 dst_idxs=torch.tensor([active_request_count + self.paused_request_count - 1]),
                 next_tokens=next_tokens,
             )
