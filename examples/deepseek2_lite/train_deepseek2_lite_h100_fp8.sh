@@ -84,7 +84,7 @@ GPT_ARGS=(
     --use-mcore-models 
     --tokenizer-type HuggingFaceTokenizer 
     --make-vocab-size-divisible-by 3200 
-    --transformer-impl local
+    # --transformer-impl local
 )
 
 # Multi-Latent Attention (MLA) arguments
@@ -166,7 +166,7 @@ MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size $TP_SIZE
     --context-parallel-size $CP_SIZE
     --pipeline-model-parallel-size $PP_SIZE
-    # --sequence-parallel
+    --sequence-parallel
 )
 
 # Distributed Data Parallel (DDP) arguments
