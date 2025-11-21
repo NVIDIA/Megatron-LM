@@ -305,8 +305,10 @@ def test_grpo_loss_truncation():
     torch.testing.assert_close(truncated_from_below, torch.tensor([[False, True], [False, False]]))
 
 
-def test_prepare_data_for_update():
+@patch('megatron.rl.rl_utils.mpu')
+def test_prepare_data_for_update(mock_mpu):
     """Test that getting logprobs at least does not crash."""
+    mock_mpu.get_expert_data_parallel_world_size.return_value = 0
     # We use args inside of get_logprobs, we need to initialize them.
 
     args = arguments.parse_args(ignore_unknown_args=True)
