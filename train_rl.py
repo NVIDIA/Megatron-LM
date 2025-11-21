@@ -20,8 +20,6 @@ from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
 
 stimer = StragglerDetector()
-import logging
-logging.basicConfig(level=logging.INFO, force=True)
 
 
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
