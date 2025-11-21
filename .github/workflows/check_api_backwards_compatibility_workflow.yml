@@ -35,13 +35,8 @@ jobs:
           fi
           
           # Check if any relevant files changed
-          # Get the base branch to compare against
-          BASE_SHA="${{ github.event.before }}"
-          
-          if [ "$BASE_SHA" == "0000000000000000000000000000000000000000" ]; then
-            # First push to branch, compare to main
-            BASE_SHA="origin/main"
-          fi
+          # Compare against dev branch (target for pull-request/* branches)
+          BASE_SHA="origin/dev"
           
           # Check for changes in megatron/core Python files (excluding tests and legacy)
           CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD -- 'megatron/core/**/*.py' ':!megatron/core/tests/**' ':!megatron/legacy/**' || echo "")
