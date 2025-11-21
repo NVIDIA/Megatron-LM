@@ -440,9 +440,9 @@ class DynamicInferenceEngine(AbstractEngine):
             mp_len_addr = None
 
         # Broadcast addresses to respective ranks.
-        torch.distributed.broadcast_object_list(
-            [mp_req_addr, mp_len_addr], src=mp_src, group=mp_group
-        )
+        bcast = [mp_req_addr, mp_len_addr]
+        torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
+        [mp_req_addr, mp_len_addr] = bcast
 
         ip_address_of_dp_coordinator = os.getenv('MASTER_ADDR', '127.0.0.1')
         dp_addr = f"tcp://{ip_address_of_dp_coordinator}:{inference_coordinator_port}"

@@ -231,7 +231,8 @@ class TestCoordinator:
             env.responses = all_results
             if test_config.verify_results:
                 for batch in all_results:
-                    for request in batch:
+                    for record in batch:
+                        request = record[-1]
                         assert request.status == Status.COMPLETED
 
         return env
