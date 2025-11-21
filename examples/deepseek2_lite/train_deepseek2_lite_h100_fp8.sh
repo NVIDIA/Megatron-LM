@@ -83,7 +83,8 @@ GPT_ARGS=(
     --hidden-dropout 0.0 
     --disable-bias-linear 
     --untie-embeddings-and-output-weights 
-    --normalization LayerNorm 
+    # --normalization LayerNorm 
+    --normalization RMSNorm
     --norm-epsilon 1e-6 
     --swiglu 
     --no-masked-softmax-fusion 
@@ -91,7 +92,7 @@ GPT_ARGS=(
     --use-mcore-models 
     --tokenizer-type HuggingFaceTokenizer 
     --make-vocab-size-divisible-by 3200 
-    --transformer-impl local  # Use local implementation (MCore). For FP8, must use transformer_engine
+    # --transformer-impl local  # Use local implementation (MCore). For FP8, must use transformer_engine
     --attention-backend auto  # auto/flash/fused/unfused/local - auto lets system decide
     --init-method-std 0.02  # Reference script uses 0.02
 )
