@@ -992,6 +992,7 @@ class SelfAttention(Attention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
+        metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
     ):
         super().__init__(
             config=config,
@@ -1001,6 +1002,7 @@ class SelfAttention(Attention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            metric_collector=metric_collector,
         )
 
         self.linear_qkv = build_module(
