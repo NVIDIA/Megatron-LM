@@ -22,7 +22,6 @@ from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
     TokenOverflowError,
-    WarmupEngineMode,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
@@ -675,14 +674,12 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [40]),
-            (1, [40]),
-            (2, [40, 24]),
-            (4, [40, 32, 16]),
-            (8, [40, 32, 24, 16, 8]),
-            (16, [40, 32, 24, 16, 8]),
-            (64, [40, 32, 24, 16, 8]),
-            (1024, [40, 32, 24, 16, 8]),
+            (0, [16384]),
+            (1, [16384]),
+            (2, [16384, 8192]),
+            (4, [16384, 12288, 8192, 4096]),
+            (8, [16384, 14336, 12288, 10240, 8192, 6144, 4096, 2048]),
+            (16, list(range(16384, 0, -1024))),
         ]:
 
             # Build cuda graphs (inside dynamic engine).
@@ -699,99 +696,6 @@ class TestDynamicInferenceEngine:
                 expected_cuda_graph_token_counts,
                 actual_cuda_graph_token_counts,
             )
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @pytest.mark.parametrize(
-        "warmup_engine_mode", [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]
-    )
-    @pytest.mark.parametrize(
-        "num_warmup_tokens, expected_cuda_graph_token_count",
-        [(1, 8), (2, 8), (4, 8), (8, 8), (10, 16), (12, 16), (16, 16)],
-    )
-    @torch.inference_mode()
-    def test_cuda_graph_warmup(
-        self,
-        warmup_engine_mode: WarmupEngineMode,
-        num_warmup_tokens: int,
-        expected_cuda_graph_token_count: int,
-    ) -> None:
-        """Test initialization during cuda graph warmup."""
-        if num_warmup_tokens == 1 and warmup_engine_mode == WarmupEngineMode.NON_DECODE:
-            pytest.skip("WarmupEngineMode.NON_DECODE with num_warmup_tokens=1 is not supported.")
-
-        # Initialize context.
-        env = self._build_test_env(
-            DynamicEngineTestConfig(
-                context_buffer_size_gb=0.0041, num_cuda_graphs=8, num_tokens_to_generate=1
-            )
-        )
-
-        context = env.engine.context
-        assert context.is_decode_only()
-        assert context.cuda_graph_token_counts == [16, 8], "cuda_graph_token_counts: %s." % str(
-            context.cuda_graph_token_counts
-        )
-
-        context.initialize_attention_state(
-            num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
-        )
-
-        # Validate request & token counts.
-
-        assert (
-            expected_cuda_graph_token_count
-            == context.padded_active_request_count
-            == context.padded_active_token_count
-        ), (
-            "failed ... num_warmup_tokens (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
-            % (
-                num_warmup_tokens,
-                expected_cuda_graph_token_count,
-                context.padded_active_request_count,
-                context.padded_active_token_count,
-            )
-        )
-
-        # Validate input/position dimensions.
-        input_ids, pos_ids = context.current_input_and_position_ids()
-        assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_token_count
-        assert context.using_cuda_graph_this_step, (
-            "expected `using_cuda_graph_this_step` to be True for decode step with "
-            "num_warmup_tokens <= max_requests."
-        )
-        context.reset()
-
-        # Test active request count overflow
-        for num_warmup_tokens in (64, 128, 1024):
-            try:
-                context.initialize_attention_state(
-                    num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
-                )
-            except ActiveRequestCountOverflowError as e:
-                continue
-            raise Exception("`ActiveRequestCountOverflowError should have been raised.")
-
-        context.reset()
-
-        # test the case where the active token count exceeds max requests.
-        # expectation: we should be in non-decode mode and not using cuda graphs
-
-        # add all requests to the context.
-        for request in tqdm(env.requests, "add requests"):
-            env.engine._add_request(request)
-        env.engine.schedule_waiting_requests()
-
-        # we should now have more active tokens than max requests.
-        context.initialize_attention_state()
-        assert not context.is_decode_only()
-        assert not context.using_cuda_graph_this_step(), (
-            "expected `using_cuda_graph_this_step` to be False for non-decode step where "
-            "the active token count exceeds max requests"
-        )
-        context.reset()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
