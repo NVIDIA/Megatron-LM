@@ -35,8 +35,11 @@ jobs:
           fi
           
           # Check if any relevant files changed
-          # Compare against dev branch (target for pull-request/* branches)
-          BASE_SHA="origin/dev"
+          # Use merge-base to find common ancestor with dev
+          # This ensures we only detect changes actually made in this PR branch,
+          # not changes that happened in dev after the branch was created
+          BASE_SHA=$(git merge-base origin/dev HEAD)
+          echo "Comparing against merge-base: $BASE_SHA"
           
           # Check for changes in megatron/core Python files (excluding tests and legacy)
           CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD -- 'megatron/core/**/*.py' ':!megatron/core/tests/**' ':!megatron/legacy/**' || echo "")
