@@ -65,3 +65,15 @@ class AttnBackend(enum.Enum):
     unfused = 3
     local = 4
     auto = 5
+
+
+class CudaGraphScope(enum.Enum):
+    """Cuda Graph Scope"""
+
+    full_iteration = 1
+    attn = 2
+    mlp = 3
+    moe = 4  # only used for MoeLayer
+    moe_router = 5  # only used for MoeLayer
+    moe_preprocess = 6  # only used for MoeLayer
+    mamba = 7  # only used for MambaLayer

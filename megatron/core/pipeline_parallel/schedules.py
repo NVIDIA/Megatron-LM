@@ -21,6 +21,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -656,7 +657,7 @@ def forward_backward_no_pipelining(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and "full_iteration" not in config.cuda_graph_scope
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
 
@@ -1923,7 +1924,7 @@ def forward_backward_pipelining_with_interleaving(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and "full_iteration" not in config.cuda_graph_scope
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
@@ -2310,7 +2311,7 @@ def forward_backward_pipelining_without_interleaving(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and "full_iteration" not in config.cuda_graph_scope
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
 
