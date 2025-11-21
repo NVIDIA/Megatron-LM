@@ -208,7 +208,6 @@ class MambaModel(LanguageModule):
 
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations
-            # TODO(ksanthanam): Add unit test once dynamic engine supports hybrid models
             if (
                 in_inference_mode
                 and inference_context.is_dynamic_batching()

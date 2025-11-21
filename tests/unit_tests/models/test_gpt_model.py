@@ -356,9 +356,9 @@ class TestGPTWithDynamicInference:
         model_parallel_cuda_manual_seed(123)
 
         transformer_config = TransformerConfig(
-            num_layers=8,
-            hidden_size=16,
-            num_attention_heads=4,
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
             use_cpu_initialization=True,
             params_dtype=torch.bfloat16,
             bf16=True,
@@ -398,8 +398,7 @@ class TestGPTWithDynamicInference:
             num_attention_heads=config.num_attention_heads,
             max_sequence_length=self.gpt_model.module.max_sequence_length,
             buffer_size_gb=1.0,
-            chunk_size_tokens=256,
-            buffer_guaranteed_fraction=0.0,
+            block_size_tokens=256,
             materialize_only_last_token_logits=False,
         )
 
