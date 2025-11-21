@@ -190,6 +190,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "inference/*", step_metric="inference/inference_step"
                 )
                 # Initialize inference step offset by querying existing run history
+                self.inference_step_offset = 0
                 if wandb.run is not None:
                     api_run = wandb.Api().run(
                         f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.id}"
