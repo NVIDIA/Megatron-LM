@@ -46,7 +46,11 @@ _mod = None  # must remain global until process exit.
 
 @contextmanager
 def _compile_timeout(timeout_s: int):
-    """Context manager to timeout compilation."""
+    """Context manager to timeout compilation.
+
+    Args:
+        timeout_s (int): Timeout in seconds.
+    """
 
     def _handler(signum, frame):
         raise UnifiedMemoryCompileTimeoutError(
@@ -132,7 +136,7 @@ def compile_allocator():
     }
     """
 
-    # Define a timeout for how long the build is allowed to run.
+    # Define a timeout of 30s for how long the build is allowed to run.
     timeout_s = 30
 
     # Build the .so upon import; this avoids issues.
