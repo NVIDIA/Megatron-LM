@@ -222,8 +222,8 @@ def get_test_config(num_layers=1, num_moe_experts=8, extra_kwargs={}, moe_groupe
 
 def get_valid_token_dispatcher_types():
     try:
-        from deep_ep import Buffer  # type: ignore
-        from deep_ep.utils import EventHandle, EventOverlap  # type: ignore
+        from deep_ep import Buffer
+        from deep_ep.utils import EventHandle, EventOverlap
 
         return ["alltoall", "flex"]
     except ImportError:
@@ -237,14 +237,7 @@ def get_valid_fp8_flags():
     recipes = []
     valid_flags = []
     if is_te_min_version("2.3.0.dev0"):
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        compute_capability = (props.major, props.minor)
-        if (
-            compute_capability >= (9, 0)
-            and compute_capability < (10, 0)
-            and float(torch.version.cuda) >= 12.9
-        ):
-            recipes.append(Fp8Recipe.blockwise)
+        recipes.append(Fp8Recipe.blockwise)
         recipes.append(Fp8Recipe.tensorwise)
 
     for fp8_type in fp8_types:

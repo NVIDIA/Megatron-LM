@@ -247,15 +247,6 @@ class MambaModel(LanguageModule):
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             hidden_states = hidden_states[-1, :, :].unsqueeze(0)
 
-        # Restore sequence parallel execution to the output layer if necessary.
-        if sequence_parallel_override:
-            assert (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.materialize_only_last_token_logits
-            )
-            self.output_layer.sequence_parallel = True
-
         if labels is None:
             logits, _ = self.output_layer(
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
