@@ -166,7 +166,7 @@ MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size $TP_SIZE
     --context-parallel-size $CP_SIZE
     --pipeline-model-parallel-size $PP_SIZE
-    --sequence-parallel
+    # --sequence-parallel
 )
 
 # Distributed Data Parallel (DDP) arguments
