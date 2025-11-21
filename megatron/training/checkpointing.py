@@ -280,6 +280,9 @@ def read_metadata(tracker_filename):
                 print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
                     tracker_filename))
                 sys.exit()
+            else:
+                # Set iteration to 1 for release checkpoints to preserve the existing behavior
+                iteration = 1
     assert iteration > -1 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
 

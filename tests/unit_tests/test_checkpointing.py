@@ -25,6 +25,7 @@ from megatron.training.checkpointing import (
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
     load_checkpoint,
+    read_metadata,
     save_checkpoint,
 )
 from megatron.training.global_vars import set_args
@@ -353,3 +354,68 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             first_job_mock_metadata,
             second_job_mock_metadata,
         ]
+
+
+@pytest.mark.parametrize(
+    "metadata_content,expected_iter,expected_release",
+    [
+        ("123", 123, False),  # Normal iteration
+        ("release", 1, True),  # Release checkpoint should return iteration=1
+        ("42", 42, False),  # Another normal iteration
+    ],
+)
+def test_read_metadata_distributed(
+    init_model_parallel, tmp_path_dist_ckpt, metadata_content, expected_iter, expected_release
+):
+    """Test read_metadata with torch.distributed initialized."""
+    with TempNamedDir(tmp_path_dist_ckpt / "test_read_metadata_distributed", sync=True) as test_dir:
+        tracker_file = test_dir / "latest_checkpointed_iteration.txt"
+        with open(tracker_file, "w") as f:
+            f.write(metadata_content)
+
+        # Test with distributed initialized (already done by init_model_parallel fixture)
+        max_iter, release = read_metadata(tracker_file)
+
+        assert max_iter == expected_iter, f"Expected iteration {expected_iter}, got {max_iter}"
+        assert release == expected_release, f"Expected release={expected_release}, got {release}"
+
+
+@pytest.mark.parametrize(
+    "metadata_content,expected_iter,expected_release",
+    [
+        ("456", 456, False),  # Normal iteration
+        ("release", 1, True),  # Release checkpoint should return iteration=1
+    ],
+)
+def test_read_metadata_non_distributed(tmp_path, metadata_content, expected_iter, expected_release):
+    """Test read_metadata without torch.distributed initialized."""
+    test_dir = tmp_path / "test_read_metadata_non_distributed"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    tracker_file = test_dir / "latest_checkpointed_iteration.txt"
+
+    with open(tracker_file, "w") as f:
+        f.write(metadata_content)
+
+    # Mock torch.distributed.is_initialized to return False
+    with mock.patch('torch.distributed.is_initialized', return_value=False):
+        max_iter, release = read_metadata(str(tracker_file))
+
+    assert max_iter == expected_iter, f"Expected iteration {expected_iter}, got {max_iter}"
+    assert release == expected_release, f"Expected release={expected_release}, got {release}"
+
+
+def test_read_metadata_invalid(tmp_path):
+    """Test read_metadata with invalid metadata content."""
+    test_dir = tmp_path / "test_read_metadata_invalid"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    tracker_file = test_dir / "latest_checkpointed_iteration.txt"
+
+    with open(tracker_file, "w") as f:
+        f.write("invalid_content")
+
+    # Mock torch.distributed.is_initialized to return False
+    # Mock sys.exit to avoid actually exiting
+    with mock.patch('torch.distributed.is_initialized', return_value=False):
+        with mock.patch('sys.exit') as mock_exit:
+            read_metadata(str(tracker_file))
+            mock_exit.assert_called_once()
