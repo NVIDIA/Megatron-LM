@@ -301,6 +301,7 @@ def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: st
     optim = get_megatron_optimizer(optimizer_config, [model])
 
     model_sharded_state_dict = model.sharded_state_dict()
+    metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
     if precision == 'bf16' or use_distributed_optimizer:
         sharded_state_dict = optim.sharded_state_dict(model_sharded_state_dict, metadata=metadata, is_loading=True)
     else:
