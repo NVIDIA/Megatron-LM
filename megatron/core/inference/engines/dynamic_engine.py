@@ -199,7 +199,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         val = row.get("inference/inference_step")
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
-                    self.wandb_inference_step_offset = int(max_step)
+                    self.inference_step_offset = int(max_step)
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -223,7 +223,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
-        self.wandb_inference_step_offset = 0
+        self.inference_step_offset = 0
 
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
@@ -1104,7 +1104,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
-                'inference/inference_step': int(self.wandb_inference_step_offset + int(step_count)),
+                'inference/inference_step': int(self.inference_step_offset + int(step_count)),
                 'inference/step_time_s': float(step_time),
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
