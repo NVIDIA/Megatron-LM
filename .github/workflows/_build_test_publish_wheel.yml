@@ -129,6 +129,7 @@ jobs:
   publish-wheels:
     needs: [build-and-test-wheels]
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
     environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'main' || 'public' }}
     strategy:
       fail-fast: false
