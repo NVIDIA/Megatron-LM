@@ -193,9 +193,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)
             for prompt in request.prompt
         ]
-        responses = await asyncio.gather(
+        records = await asyncio.gather(
             *requests
         )
+        responses = [record[-1] for record in records]
         return [
             InferenceResponse(
                 response=r.generated_text,
