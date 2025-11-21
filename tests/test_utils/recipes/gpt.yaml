@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}_{platforms}"
+  name: '{test_case}_{environment}_{platforms}'
   model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
@@ -337,6 +337,11 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_mcore_te_tp2_pp1_gdn]
+    products:
+      - environment: [dev]
+        scope: [mr-broken, mr-github-broken]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_mla]
     products:
       - environment: [dev]
