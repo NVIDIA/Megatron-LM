@@ -1,10 +1,11 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 import functools
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
-
 
 
 def register_backward_hook(module, custom_backward_handler):
@@ -41,12 +42,12 @@ def register_backward_hook(module, custom_backward_handler):
     return module.register_forward_hook(forward_hook)
 
 
-
 def register_post_backward_hook(module, post_backward_hook: callable):
     """
     Register a pre-forward hook that attaches a post-backward hook to the module.
     The post-backward hook will be called after the backward pass of the module.
     """
+
     def _post_backward_hook(
         post_backward_hook: callable,
         module: nn.Module,
@@ -99,8 +100,7 @@ def register_post_backward_hook(module, post_backward_hook: callable):
         return args, kwargs
 
     return module.register_forward_pre_hook(
-        functools.partial(_post_backward_hook, post_backward_hook),
-        with_kwargs=True,
+        functools.partial(_post_backward_hook, post_backward_hook), with_kwargs=True
     )
 
 

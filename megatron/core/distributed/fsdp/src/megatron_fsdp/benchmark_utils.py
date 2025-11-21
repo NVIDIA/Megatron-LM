@@ -1,22 +1,25 @@
-import torch
-import functools
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import functools
+import itertools
+
+from .fsdp_hook_utils import register_backward_hook, register_post_backward_hook
 from .megatron_fsdp import MegatronFSDP
 from .utils import is_submodule
-from .fsdp_hook_utils import register_backward_hook, register_post_backward_hook
 
 
 def disable_megatron_fsdp_communication(module: MegatronFSDP, fill_buckets: bool = True):
+    """Disable Megatron-FSDP communication by allocating and deallocating
+    parameter buckets around forward and backward passes. This is useful for benchmarking
+    the overhead of Megatron-FSDP communication."""
     ddp_config = module.ddp_config
     assert ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
 
     module._root_pre_backward_hook_handle.remove()
-    for handle in list(
-        module.backward_pre_hooks.values()
-    ) + list(
-        module.forward_pre_hooks.values()
-    ) + list(
-        module.forward_hooks.values()
+    for handle in itertools.chain(
+        module.backward_pre_hooks.values(),
+        module.forward_pre_hooks.values(),
+        module.forward_hooks.values(),
     ):
         handle.remove()
 
@@ -51,7 +54,7 @@ def disable_megatron_fsdp_communication(module: MegatronFSDP, fill_buckets: bool
         param_and_grad_buffer = module.param_and_grad_buffer
         fsdp_unit_modules = module.fsdp_unit_modules
         fsdp_modules = []
-        for _, m in root_module.named_modules():
+        for m in root_module.modules():
             # Skip if the module is already registered in fsdp_modules.
             if any(is_submodule(m, fsdp_module) for fsdp_module in fsdp_modules):
                 continue

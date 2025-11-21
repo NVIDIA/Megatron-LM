@@ -1,9 +1,9 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+import logging
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
-import logging
 
 import torch
 from torch.autograd.variable import Variable

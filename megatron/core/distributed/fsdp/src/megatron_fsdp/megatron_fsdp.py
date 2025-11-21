@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.import functools
 
-import functools
 import importlib
 import logging
 from contextlib import contextmanager
@@ -21,10 +20,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
+from .fsdp_hook_utils import register_backward_hook, register_post_backward_hook
 from .utils import FSDPDistributedIndex
-from .fsdp_hook_utils import register_post_backward_hook, register_backward_hook
 
 logger = logging.getLogger(__name__)
 
@@ -802,9 +800,7 @@ class MegatronFSDP(torch.nn.Module):
             self.backward_pre_hooks[f"{name} _root_pre_backward"] = register_backward_hook(
                 module, _root_pre_backward
             )
-        self._root_pre_backward_hook_handle = register_backward_hook(
-            module, _root_pre_backward
-        )
+        self._root_pre_backward_hook_handle = register_backward_hook(module, _root_pre_backward)
 
         # Register post load state_dict hook to ensure that the module parameters
         # are properly updated.

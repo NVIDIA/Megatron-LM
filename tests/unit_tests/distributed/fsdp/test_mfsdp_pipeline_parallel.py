@@ -1,9 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 from contextlib import contextmanager
 from functools import partial
+
 import numpy as np
 import pytest
-
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -86,18 +86,10 @@ class MockDataset(Dataset):
 
 
 def get_gpt_data_iterator(
-    dp_group,
-    num_samples=1000,
-    vocab_size=50257,
-    sequence_length=128,
-    batch_size=8,
-    seed=42,
+    dp_group, num_samples=1000, vocab_size=50257, sequence_length=128, batch_size=8, seed=42
 ):
     dataset = MockDataset(
-        num_samples=num_samples,
-        sequence_length=sequence_length,
-        vocab_size=vocab_size,
-        seed=seed,
+        num_samples=num_samples, sequence_length=sequence_length, vocab_size=vocab_size, seed=seed
     )
     sampler = DistributedSampler(dataset, num_replicas=dp_group.size(), rank=dp_group.rank())
     dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
@@ -185,7 +177,10 @@ class Test_MFSDP_PipelineParallel:
     @pytest.mark.parametrize(
         "mfsdp_sharding_strategy", ["optim", "optim_grads", "optim_grads_params"]
     )
-    @pytest.mark.parametrize("tp_pp_ep", [{"tp": 1, "pp": 2, "ep": 1}, {"tp": 2, "pp": 1, "ep": 1}])
+    @pytest.mark.parametrize(
+        "tp_pp_ep",
+        [{"tp": 2, "pp": 2, "ep": 1}, {"tp": 1, "pp": 2, "ep": 1}, {"tp": 2, "pp": 1, "ep": 1}],
+    )
     def test_gpt_model(self, mtp_layers, mfsdp_sharding_strategy, tp_pp_ep):
         with megatron_model_parallel(**tp_pp_ep) as _, deterministic_mode() as _:
             # create TransformerConfig
