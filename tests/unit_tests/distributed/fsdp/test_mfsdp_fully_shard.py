@@ -1,5 +1,6 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import shutil
-from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 
@@ -277,7 +278,10 @@ class TestMegatronFsdpFullyShard:
             dp_outer_dim=DP_OUTER if dp_outer_strategy is not None else None,
             tp_dim=TP,
             hybrid_fsdp_group=(
-                device_mesh[HSDP].get_group() if dp_outer_strategy is not None else None
+                # Only need this fully-flattened group if you are using HFSDP.
+                device_mesh[HSDP].get_group()
+                if dp_outer_strategy == OPTIM
+                else None
             ),
             fsdp_unit_modules=fsdp_unit_modules,
             zero_dp_strategy=dp_shard_strategy,
@@ -327,9 +331,7 @@ class TestMegatronFsdpFullyShard:
                 # to verify if any gradients exist or not at this step of training.
                 grads_exist_gathered = [None] * sharding_group.size()
                 torch.distributed.all_gather_object(
-                    object_list=grads_exist_gathered,
-                    obj=grads_exist,
-                    group=sharding_group,
+                    object_list=grads_exist_gathered, obj=grads_exist, group=sharding_group
                 )
                 # Gradients exist on at least one of the optimizer sharding ranks.
                 grads_exist = any(grads_exist_gathered)
@@ -409,7 +411,10 @@ class TestMegatronFsdpFullyShard:
             dp_shard_dim=DP_SHARD_CP,
             dp_outer_dim=DP_OUTER,
             tp_dim=TP,
-            hybrid_fsdp_group=device_mesh[HSDP].get_group(),
+            # Only need this fully-flattened group if you are using HFSDP.
+            hybrid_fsdp_group=(
+                device_mesh[HSDP].get_group() if outer_shard_strategy == OPTIM else None
+            ),
             fsdp_unit_modules=fsdp_unit_modules,
             zero_dp_strategy=shard_strategy,
             outer_dp_sharding_strategy=outer_shard_strategy,
@@ -490,7 +495,10 @@ class TestMegatronFsdpFullyShard:
             dp_shard_dim=DP_SHARD_CP,
             dp_outer_dim=DP_OUTER,
             tp_dim=TP,
-            hybrid_fsdp_group=device_mesh[HSDP].get_group(),
+            # Only need this fully-flattened group if you are using HFSDP.
+            hybrid_fsdp_group=(
+                device_mesh[HSDP].get_group() if outer_shard_strategy == OPTIM else None
+            ),
             fsdp_unit_modules=fsdp_unit_modules,
             zero_dp_strategy=shard_strategy,
             outer_dp_sharding_strategy=outer_shard_strategy,
