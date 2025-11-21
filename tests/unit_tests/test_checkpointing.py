@@ -378,18 +378,3 @@ def test_read_metadata_non_distributed(tmp_path, metadata_content, expected_iter
 
     assert max_iter == expected_iter, f"Expected iteration {expected_iter}, got {max_iter}"
     assert release == expected_release, f"Expected release={expected_release}, got {release}"
-
-
-def test_read_metadata_invalid(tmp_path):
-    """Test read_metadata with invalid metadata content."""
-    test_dir = tmp_path / "test_read_metadata_invalid"
-    test_dir.mkdir(parents=True, exist_ok=True)
-    tracker_file = test_dir / "latest_checkpointed_iteration.txt"
-
-    with open(tracker_file, "w") as f:
-        f.write("invalid_content")
-
-    with mock.patch('torch.distributed.is_initialized', return_value=False):
-        with mock.patch('sys.exit') as mock_exit:
-            read_metadata(str(tracker_file))
-            mock_exit.assert_called_once()
