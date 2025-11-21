@@ -8,6 +8,7 @@ from typing import Any, Dict
 
 import modelopt.torch.distill as mtd
 import modelopt.torch.distill.plugins.megatron as mtd_mcore
+import modelopt.torch.opt as mto
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
@@ -305,5 +306,7 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
         # Additional tweaks needed for MCore.
         # (accounts for sharded state, pipeline parallel, and potentially skipping LM loss)
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
+        # Also remove KD mode state to prevent issues with re-conversion after restore.
+        mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
 
     return model
