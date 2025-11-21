@@ -2230,7 +2230,7 @@ def calculate_grpo_loss(
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
-    cuda_graph_impl: str | None,
+    cuda_graph_impl: str,
     reset_cuda_graphs: bool,
     offload_optimizer_during_inference: bool,
     offload_kv_cache_during_training: bool,
@@ -2255,9 +2255,6 @@ def megatron_rl_inference_mode(
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
-    # We only enable CUDA graphs for local implementation currently.
-    enable_cuda_graph = cuda_graph_impl == "local"
-
     print(f"[{dist.get_rank()}:DP] Entering inference mode")
 
     # If we get a lower precision wrapper, we go one object deeper.
@@ -2278,8 +2275,9 @@ def megatron_rl_inference_mode(
             with nvtx_range("offload-optimizer-before-inference"):
                 optimizer.offload_to_cpu()
 
-        if enable_cuda_graph:
-            toggle_cuda_graphs(lang_module, 'local', reset_cuda_graphs=reset_cuda_graphs)
+        # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
+        if cuda_graph_impl != "none":
+            toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
 
         inference_interface = get_inference_interface(args, loop, model)
 
@@ -2297,7 +2295,9 @@ def megatron_rl_inference_mode(
                 if inference_interface._inference_engine.context.memory_buffer is None:
                     inference_interface._inference_engine.context.build_memory_buffer()
 
-        if enable_cuda_graph and len(_CudagraphGlobalRecord.cudagraph_inference_record) == 0:
+        # TODO: Improve this if statement once a change is made to CUDA graph handling.
+        cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
+        if cuda_graph_impl != "none" and not cuda_graph_exists:
             with nvtx_range("wait-for-decode-only"):
                 while not inference_interface._inference_engine.context.is_decode_only():
                     active_requests, finished_requests, step_time = loop.run_until_complete(
@@ -2324,7 +2324,8 @@ def megatron_rl_inference_mode(
             elif remove_kv_cache_during_training:
                 inference_interface._inference_engine.context.memory_buffer = None
 
-        if enable_cuda_graph:
+        # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
+        if cuda_graph_impl != "none":
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
 
         if offload_optimizer_during_inference:
