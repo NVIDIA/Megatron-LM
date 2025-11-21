@@ -93,7 +93,7 @@ GPT_ARGS=(
     --tokenizer-type HuggingFaceTokenizer 
     --make-vocab-size-divisible-by 3200 
     # --transformer-impl local  # Use local implementation (MCore). For FP8, must use transformer_engine
-    --attention-backend auto  # auto/flash/fused/unfused/local - auto lets system decide
+    --attention-backend local  # auto/flash/fused/unfused/local - auto lets system decide
     --init-method-std 0.02  # Reference script uses 0.02
 )
 
