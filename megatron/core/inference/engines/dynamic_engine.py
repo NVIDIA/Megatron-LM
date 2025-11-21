@@ -42,7 +42,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.utils import Counter, await_process_event
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
+from megatron.core.utils import get_asyncio_loop, internal_api, trace_async_exceptions
 
 try:
     from tqdm import tqdm
@@ -345,6 +345,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
+    @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
         inference_coordinator_port: int,
