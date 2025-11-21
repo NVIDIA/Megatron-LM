@@ -354,23 +354,6 @@ class CheckpointType(Enum):
     TORCH_DCP = auto()
     FSDP_DTENSOR = auto()
 
-def _clean_metadata_for_serialization(metadata: dict) -> dict:
-    """Create a clean copy of metadata for serialization by removing non-serializable objects.
-
-    Args:
-        metadata: Original metadata dict
-
-    Returns:
-        Clean metadata dict suitable for serialization
-    """
-    if metadata is None:
-        return None
-
-    clean_metadata = metadata.copy()
-    # Remove dp_cp_group as it's not serializable
-    clean_metadata.pop('dp_cp_group', None)
-    return clean_metadata
-
 
 def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None) -> dict:
     """Builds metadata used for sharded_state_dict versioning.
@@ -513,7 +496,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         ensure_directory_exists(optim_checkpoint_name)
         if not optimizer.is_stub_optimizer:
             optimizer.save_parameter_state(optim_checkpoint_name)
-
+    
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
     if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
