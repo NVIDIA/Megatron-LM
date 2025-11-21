@@ -7,6 +7,8 @@ from argparse import Namespace
 from typing import Any, Dict
 
 import modelopt.torch.distill as mtd
+import modelopt.torch.distill.plugins.megatron as mtd_mcore
+import modelopt.torch.opt as mto
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
@@ -18,7 +20,6 @@ from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelop
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
-from megatron.post_training.algos import distillation
 from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_modelopt_state
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
@@ -285,7 +286,7 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
             ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
         teacher_config = _load_teacher_model_config(args.export_kd_teacher_load)
-        distill_cfg = distillation.load_distillation_config(
+        distill_cfg = mtd_mcore.setup_distillation_config(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=core_transformer_config_from_args(teacher_config)
         )
         if "hybrid_override_pattern" in teacher_config and args.is_hybrid_model:
@@ -297,14 +298,15 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
 
         kd_config = {
             "teacher_model": (_teacher_provider, [teacher_config, model_kwargs], {}),
-            "criterion": distill_cfg["criterion"],
-            "loss_balancer": distill_cfg["loss_balancer"],
+            "criterion": distill_cfg.criterion,
+            "loss_balancer": distill_cfg.loss_balancer,
         }
         model = mtd.convert(model, mode=[("kd_loss", kd_config)])
 
-        # Additional tweaks needed for MCore/Nemo.
-        # NOTE: Distillation state manually removed in this function.
-        # ModelOpt state restoration above will not return a `mtd.DistillationModel` for simplicity reasons.
-        distillation.adjust_distillation_model_for_mcore(model, distill_cfg)
+        # Additional tweaks needed for MCore.
+        # (accounts for sharded state, pipeline parallel, and potentially skipping LM loss)
+        mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
+        # Also remove KD mode state to prevent issues with re-conversion after restore.
+        mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
 
     return model
