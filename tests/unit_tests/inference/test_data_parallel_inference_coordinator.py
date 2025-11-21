@@ -60,8 +60,8 @@ class DummyEngine(DynamicInferenceEngine):
         self.paused = asyncio.Event()
         self.stopped = asyncio.Event()
         self.pending_microbatch = deque()
-        self.microbatch_pause: bool = False
-        self.microbatch_stop: bool = False
+        self.received_pause: bool = False
+        self.received_stop: bool = False
 
     def add_request(
         self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
@@ -331,15 +331,21 @@ class TestCoordinator:
                 except asyncio.TimeoutError:
                     pytest.fail("Simple pause did not succeed.")
 
-                ### TEST 2: Ensure that requests cannot be added while paused.
-                with pytest.raises(RuntimeError):
-                    prompt, sampling_params, _ = env.requests[2]
-                    await client.add_request(prompt=prompt, sampling_params=sampling_params)
+                ### TEST 2: Ensure that requests can be added while paused.
+                prompt, sampling_params, _ = env.requests[2]
+                paused_fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(paused_fut, timeout=0.1)
 
-                ### TEST 3: Resume after pause.
+                ### TEST 3: Resume after pause and drain the queued requests.
                 client.unpause_engines()
+                # TODO: The system should not be incorrectly raising a cancelled error here.
+                with pytest.raises(asyncio.CancelledError):
+                    await paused_fut
+
+                ### TEST 4: Add new requests after resume.
                 futures = []
-                for i, request in enumerate(env.requests[2:4]):
+                for i, request in enumerate(env.requests[3:4]):
                     prompt, sampling_params, _ = request
                     fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
                     futures.append(fut)
@@ -351,7 +357,7 @@ class TestCoordinator:
                 except asyncio.TimeoutError:
                     pytest.fail("Simple resume did not succeed.")
 
-                ### TEST 4: Pause while requests are being processed.
+                ### TEST 5: Pause while requests are being processed.
                 ### Note: this situation cannot occur in a synchronous system.
                 if False:
                     for request in env.engine.requests[4:6]:
