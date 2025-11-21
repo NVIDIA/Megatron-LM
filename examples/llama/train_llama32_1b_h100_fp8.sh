@@ -80,6 +80,7 @@ MODEL_ARGS=(
     --apply-layernorm-1p 
     --untie-embeddings-and-output-weights
     --disable-bias-linear 
+    --no_persist_layer_norm
     --transformer-impl local
 )
 

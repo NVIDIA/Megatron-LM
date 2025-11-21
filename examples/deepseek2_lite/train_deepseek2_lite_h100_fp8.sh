@@ -44,8 +44,8 @@ NUM_LAYERS=16
 MOE_LAYERS=$(($NUM_LAYERS-1))
 DTYPE="bf16"
 # DTYPE=${5:-"fp8"}
-SEQ_LENGTH=1024 
-MAX_POSITION_EMBEDDINGS=1024 
+SEQ_LENGTH=1024
+MAX_POSITION_EMBEDDINGS=1024
 
 # Data cache path (useful for both mock and real data)
 DATA_CACHE_PATH="${PWD}/benchmark_cache_deepseek2_lite_fp8"
