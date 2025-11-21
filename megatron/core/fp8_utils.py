@@ -2,14 +2,21 @@
 
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
+import importlib
 import weakref
 from contextlib import nullcontext
 from functools import wraps
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 
-from megatron.core.enums import Fp8Recipe
+from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.tensor_parallel import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    gather_from_sequence_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_te_version, is_te_min_version
 
@@ -104,12 +111,80 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.from_float8()
 
 
+def _resolve_callable_from_python_import_path(dotted_path: str):
+    """Resolve a Python import path like 'pkg.mod.func' to a callable.
+
+    Raises ValueError with clear message on failure.
+    """
+    if not isinstance(dotted_path, str) or not dotted_path:
+        raise ValueError(
+            "fp8_quantizer_factory must be a non-empty string with format 'pkg.mod.func'."
+        )
+
+    parts = dotted_path.rsplit(".", 1)
+    if len(parts) == 1:
+        raise ValueError(f"Invalid fp8_quantizer_factory '{dotted_path}'. Expected 'pkg.mod.func'.")
+    module_path, attr = parts[0], parts[1]
+
+    try:
+        mod = importlib.import_module(module_path)
+    except Exception as exc:
+        raise ValueError(
+            f"Failed to import module '{module_path}' for fp8_quantizer_factory: {exc}"
+        ) from exc
+
+    fn = getattr(mod, attr, None)
+    if fn is None:
+        raise ValueError(
+            f"Attribute '{attr}' not found in module '{module_path}' for fp8_quantizer_factory."
+        )
+    if not callable(fn):
+        raise ValueError(
+            f"Resolved attribute '{module_path}.{attr}' is not callable for fp8_quantizer_factory."
+        )
+    return fn
+
+
+def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, Fp4Recipe]:
+    quantizer_factory = _resolve_callable_from_python_import_path(quantizer_factory_python_path)
+    try:
+        custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
+    except AttributeError:
+        raise ValueError(
+            """CustomRecipe recipe is not available in this version of 
+            Transformer Engine. Please make sure you are using TE version 
+            >= 2.9.0.dev0."""
+        )
+    return custom_recipe
+
+
 def get_fp8_align_size(fp8_recipe: Fp8Recipe) -> int:
     """Get the alignment size required for fp8 GEMM."""
     if fp8_recipe == Fp8Recipe.mxfp8:
         return 32
     else:
         return 16
+
+
+def is_column_parallel_linear(module):
+    """Returns whether the given module is a ColumnParallelLinear layer."""
+    if HAVE_TE and (
+        isinstance(module, TEColumnParallelLinear)
+        or isinstance(module, TELayerNormColumnParallelLinear)
+    ):
+        return True
+    elif isinstance(module, ColumnParallelLinear):
+        return True
+    return False
+
+
+def is_row_parallel_linear(module):
+    """Returns whether the given module is a RowParallelLinear layer."""
+    if HAVE_TE and isinstance(module, TERowParallelLinear):
+        return True
+    elif isinstance(module, RowParallelLinear):
+        return True
+    return False
 
 
 """
@@ -466,6 +541,8 @@ if HAVE_TE:
                 fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
                     fp8_format=fp8_format
                 )
+            elif config.fp8_recipe == Fp8Recipe.custom:
+                fp8_recipe = _get_custom_recipe(config.fp8_quantizer_factory)
             else:
                 raise ValueError(
                     "Float8CurrentScaling, MXFP8BlockScaling, Float8BlockwiseScaling and "
@@ -587,6 +664,18 @@ if HAVE_TE:
             if not FP8GlobalStateManager.is_fp8_enabled():
                 return original_forward(input_tensor, *args, **kwargs)
 
+            # With sequence parallelism we need to all-gather before padding
+            # and reduce-scatter after unpadding
+            if is_sequence_parallel := getattr(module, "sequence_parallel", False):
+                if is_column_parallel_linear(module):
+                    input_tensor = gather_from_sequence_parallel_region(
+                        input_tensor, group=module.tp_group
+                    )
+
+                # Disable sequence parallelism on the module because we are handling the
+                # all-gather and reduce-scatter externally
+                module.sequence_parallel = False
+
             seq_len, batch_size, hidden_size = input_tensor.shape
             # Reshape to (S, B*H) to pad sequence dimension
             input_2d = input_tensor.reshape(seq_len, -1)
@@ -611,6 +700,16 @@ if HAVE_TE:
             output_2d = output_tensor.reshape(padded_seq_len, -1)
             unpadded_output_2d = _unpad_func(output_2d, [seq_len])
             unpadded_output = unpadded_output_2d.reshape(seq_len, batch_size, output_hidden_size)
+
+            if is_sequence_parallel:
+                # Reduce-scatter after unpadding
+                if is_row_parallel_linear(module):
+                    unpadded_output = reduce_scatter_to_sequence_parallel_region(
+                        unpadded_output, group=module.tp_group
+                    )
+
+                # Reset sequence parallelism flag on the module
+                module.sequence_parallel = True
 
             if other_outputs:
                 return (unpadded_output,) + other_outputs
