@@ -223,7 +223,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
-        self.inference_step_offset = 0
 
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
