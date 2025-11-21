@@ -1490,13 +1490,7 @@ def _add_inference_args(parser):
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
-                       help='Disable chunked prefill (chunked prefill is enabled by default).')  
-    group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
-                       type=int, default=1024,
-                       help='Maximum number of tokens to capture in a cuda graph.')
-    group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
-                       type=int, default=16,
-                       help='Number of mixed prefill requests to capture in a cuda graph.')
+                       help='Disable chunked prefill (chunked prefill is enabled by default).')
     group.add_argument('--inference-wandb-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics to wandb. '
                             'Default to 0 to disable inference wandb logging.')
