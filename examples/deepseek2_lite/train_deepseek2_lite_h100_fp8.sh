@@ -83,7 +83,7 @@ GPT_ARGS=(
     --hidden-dropout 0.0 
     --disable-bias-linear 
     --untie-embeddings-and-output-weights 
-    --normalization FusedLayerNorm 
+    --normalization LayerNorm 
     --norm-epsilon 1e-6 
     --swiglu 
     --no-masked-softmax-fusion 
