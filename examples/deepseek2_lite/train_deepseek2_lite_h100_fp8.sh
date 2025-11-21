@@ -147,6 +147,7 @@ TRAINING_ARGS=(
     --manual-gc 
     --empty-unused-memory-level 1 
     --exit-duration-in-mins 235000000 # default 235 
+    --no_persist_layer_norm
 )
 
 # Conditional arguments based on DTYPE (FP8)
