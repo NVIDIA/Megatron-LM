@@ -42,6 +42,8 @@ MICRO_BATCH_SIZE=1  # default 1
 GLOBAL_BATCH_SIZE=64 # default 128
 NUM_LAYERS=16 
 MOE_LAYERS=$(($NUM_LAYERS-1))
+# Data type: "bf16" for transformer-impl local, "fp8" requires transformer_engine
+# Note: FP8 is NOT supported with transformer-impl local. If using FP8, must set --transformer-impl transformer_engine
 DTYPE="bf16"
 # DTYPE=${5:-"fp8"}
 SEQ_LENGTH=1024
@@ -84,7 +86,8 @@ GPT_ARGS=(
     --use-mcore-models 
     --tokenizer-type HuggingFaceTokenizer 
     --make-vocab-size-divisible-by 3200 
-    # --transformer-impl local
+    --transformer-impl local  # Use local implementation (MCore). For FP8, must use transformer_engine
+    # --attention-backend local  # Optional: explicitly set attention backend (local/unfused/flash/fused/auto)
 )
 
 # Multi-Latent Attention (MLA) arguments
@@ -151,8 +154,16 @@ TRAINING_ARGS=(
 )
 
 # Conditional arguments based on DTYPE (FP8)
+# WARNING: FP8 requires --transformer-impl transformer_engine, NOT local!
+# If DTYPE="fp8", you must also change --transformer-impl to transformer_engine in GPT_ARGS above
 DTYPE_ARGS=()
 if [[ "$DTYPE" == "fp8" ]]; then
+    # Verify transformer-impl is set to transformer_engine
+    if grep -q "transformer-impl local" <<< "${GPT_ARGS[@]}"; then
+        echo "ERROR: FP8 requires --transformer-impl transformer_engine, but local is set!"
+        echo "Please change --transformer-impl local to --transformer-impl transformer_engine in GPT_ARGS"
+        exit 1
+    fi
     DTYPE_ARGS+=(
         "--fp8-format hybrid"
         "--fp8-amax-history-len 1024"
