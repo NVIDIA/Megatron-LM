@@ -128,6 +128,22 @@ def compile_allocator():
             warnings.warn(f"Failed to create unified memory mempool: '{e}'.")
             _compilation_state = CompilationState.FAILURE
 
+        # Synchronize failure state across ranks. (For currently unknown reasons,
+        # one rank can show as FAILURE while the remaining ranks show as SUCCESS.)
+        import torch
+
+        local_state = torch.tensor(
+            [_compilation_state.value], dtype=torch.uint8, device=torch.cuda.current_device()
+        )
+        world_states = [
+            torch.empty(1, dtype=torch.uint8, device=torch.cuda.current_device())
+            for _ in range(torch.distributed.get_world_size())
+        ]
+        torch.distributed.all_gather(world_states, local_state)
+        world_states = set(s.item() for s in world_states)
+        if CompilationState.FAILURE.value in world_states:
+            _compilation_state = CompilationState.FAILURE
+
 
 def create_unified_mempool() -> "MemPool":
     """Create a unified memory mempool using CUDA managed memory.

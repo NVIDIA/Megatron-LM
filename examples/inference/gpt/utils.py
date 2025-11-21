@@ -124,12 +124,6 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         'will be used, in order.',
     )
     group.add_argument(
-        "--inference-coordinator-port",
-        type=int,
-        help="This port will be used to setup the inference co-ordinator on node-0",
-        default=12346
-    )
-    group.add_argument(
         "--use-flashinfer-fused-rope",
         action='store_true',
         default=False,
@@ -386,7 +380,9 @@ def build_dynamic_engine_setup_prefix(
     # CUDA graph config
     if args.cuda_graph_impl == "local":
         cg_str = (
-            f"graphs {context.cuda_graph_token_counts[0]}:"
+            "graphs "
+            f"[{len(context.cuda_graph_token_counts)}] "
+            f"{context.cuda_graph_token_counts[0]}:"
             f"{context.cuda_graph_token_counts[-1]}"
         )
     else:
@@ -414,7 +410,7 @@ def build_dynamic_engine_setup_prefix(
 
     # Buffer limits config
     buffer_limits_str = (
-        f"bf: {get_mem_size_str(args.inference_dynamic_batching_active_buffer_size_gb*1024**3)}, "
+        f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
         f"{context.block_allocator.active_count} chunks "
         f"[r {context.max_active_requests}, t {context.max_tokens}]"
     )

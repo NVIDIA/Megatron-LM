@@ -41,7 +41,7 @@ MODEL_ARGS:
   --seed: 42
   --return-log-probs: true
   --num-tokens-from-file: true
-  --inference-dynamic-batching-active-buffer-size-gb: 20
+  --inference-dynamic-batching-buffer-size-gb: 20
   --cuda-graph-impl: local
   --cuda-graph-scope: full
   --disable-chunked-prefill: true
