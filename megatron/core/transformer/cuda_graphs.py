@@ -1178,13 +1178,14 @@ class CudaGraphManager(torch.nn.Module):
         if self.reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
             if is_inference_mode:
-                batch_size = kwargs['hidden_states'].shape[0]
-                is_decode_only = kwargs["inference_context"].is_decode_only()
-                # Attempt to retrieve the corresponding runner from the lookup table.
-                # The table is keyed on (batch_size, is_decode_only).
-                # It returns None if no match is found, in which case a new runner is created
-                # and cached in the lookup table.
-                runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+                is_static_batching = kwargs['inference_context'].is_static_batching()
+                if is_static_batching:
+                    batch_size = kwargs['hidden_states'].shape[0]
+                    is_decode_only = kwargs["inference_context"].is_decode_only()
+                    runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+                else:
+                    padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
+                    runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 runner = next(
@@ -1216,9 +1217,12 @@ class CudaGraphManager(torch.nn.Module):
                     self.cudagraph_runners.append(runner)
                     if is_inference_mode:
                         # Cache the newly created runner in the inference lookup table.
-                        self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
-                            runner
-                        )
+                        if is_static_batching:
+                            self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
+                                runner
+                            )
+                        else:
+                            self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
