@@ -473,6 +473,35 @@ def _get_megatron_optimizer_based_on_param_groups(
     return optimizer
 
 
+def _finalize_optimizer_chain(
+    optimizers: List[MegatronOptimizer],
+    pg_collection: Optional[ProcessGroupCollection],
+) -> MegatronOptimizer:
+    """Collapse the optimizer list and attach the tensor-parallel group.
+
+    Each Megatron optimizer instance needs the tensor-parallel group reference so
+    duplicate parameter safety checks can avoid legacy global state. This helper
+    makes that behavior explicit and keeps the construction path consistent.
+    """
+    if not optimizers:
+        raise RuntimeError("Cannot finalize optimizer chain with an empty optimizer list.")
+
+    final_optimizer = optimizers[0] if len(optimizers) == 1 else ChainedOptimizer(optimizers)
+
+    tp_group = (
+        pg_collection.tp
+        if pg_collection is not None
+        else parallel_state.get_tensor_model_parallel_group()
+    )
+    if isinstance(final_optimizer, ChainedOptimizer):
+        for opt in final_optimizer.chained_optimizers:
+            setattr(opt, 'tp_group', tp_group)
+    else:
+        setattr(final_optimizer, 'tp_group', tp_group)
+
+    return final_optimizer
+
+
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -577,20 +606,7 @@ def get_megatron_optimizer(
             )
             model_chunk_offset += 1
 
-        # Build final optimizer (single or chained)
-        result_optimizer = optimizers[0] if len(optimizers) == 1 else ChainedOptimizer(optimizers)
-
-        tp_group = (
-            pg_collection.tp
-            if pg_collection is not None
-            else parallel_state.get_tensor_model_parallel_group()
-        )
-        if isinstance(result_optimizer, ChainedOptimizer):
-            for opt in result_optimizer.chained_optimizers:
-                setattr(opt, 'tp_group', tp_group)
-        else:
-            setattr(result_optimizer, 'tp_group', tp_group)
-        return result_optimizer
+        return _finalize_optimizer_chain(optimizers, pg_collection)
 
     if dump_param_to_param_group_map is not None:
         param_to_param_group = {}
@@ -681,14 +697,4 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
-    # Build final optimizer (always chained in this branch, possibly with 1 element)
-    result_optimizer = ChainedOptimizer(optimizers)
-    # Attach TP group so duplicate-checks don't rely on legacy globals.
-    tp_group = (
-        pg_collection.tp
-        if pg_collection is not None
-        else parallel_state.get_tensor_model_parallel_group()
-    )
-    for opt in result_optimizer.chained_optimizers:
-        setattr(opt, 'tp_group', tp_group)
-    return result_optimizer
+    return _finalize_optimizer_chain(optimizers, pg_collection)

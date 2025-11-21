@@ -56,12 +56,12 @@ class DistributedDataParallel(_BaseDataParallel):
         # ring-reduce implementations are large enough to remain bandwidth-bound rather than
         # latency-bound.
         # Setup process groups using DDP-specific helper method (handles both None and provided pg_collection)
-        process_groups = ProcessGroupCollection.setup_process_groups_for_ddp(
+        process_group_dict = ProcessGroupCollection.setup_process_groups_for_ddp(
             pg_collection, config, ddp_config
         )
 
         # If bucket_size is not provided as an input, use sane default based on dp_group size.
-        dp_group = process_groups['dp_group']
+        dp_group = process_group_dict['dp_group']
         if ddp_config.bucket_size is None:
             ddp_config.bucket_size = max(40000000, 1000000 * dp_group.size())
         # Set bucket_size to infinity if overlap_grad_reduce is False.
@@ -76,18 +76,18 @@ class DistributedDataParallel(_BaseDataParallel):
         )
 
         # Assign all required process groups
-        self.dp_group = process_groups['dp_group']
-        self.dp_cp_group = process_groups['dp_cp_group']
-        self.intra_dp_cp_group = process_groups['intra_dp_cp_group']
-        self.expt_dp_group = process_groups['expt_dp_group']
-        self.intra_expt_dp_group = process_groups['intra_expt_dp_group']
-        self.tp_group = process_groups['tp_group']
-        self.pp_group = process_groups['pp_group']
-        self.ep_group = process_groups['ep_group']
+        self.dp_group = process_group_dict['dp_group']
+        self.dp_cp_group = process_group_dict['dp_cp_group']
+        self.intra_dp_cp_group = process_group_dict['intra_dp_cp_group']
+        self.expt_dp_group = process_group_dict['expt_dp_group']
+        self.intra_expt_dp_group = process_group_dict['intra_expt_dp_group']
+        self.tp_group = process_group_dict['tp_group']
+        self.pp_group = process_group_dict['pp_group']
+        self.ep_group = process_group_dict['ep_group']
 
         # Set inter_dist_opt_group if multiple optimizer instances
         if self.ddp_config.num_distributed_optimizer_instances > 1:
-            self.inter_dist_opt_group = process_groups['inter_dist_opt_group']
+            self.inter_dist_opt_group = process_group_dict['inter_dist_opt_group']
 
         # Turn off bucketing if we are on a pipeline stage that is not the first (since
         # data-parallel communication on these stages is not on the critical path), or if
