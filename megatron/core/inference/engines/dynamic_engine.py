@@ -211,7 +211,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Request state.
         self.request_counter = Counter()
-        self.step_count = 0
         self.finished_request_count = 0
 
         self.requests: Dict[int, RequestEntry] = {}
@@ -219,13 +218,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self.failed_request_ids = []
 
         # Timing and logging variables.
+        self.rank = torch.distributed.get_rank()
+        self.step_count = 0
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
         self.wandb_inference_step_offset = 0
 
         # Runtime state.
-        self.rank = torch.distributed.get_rank()
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
         self.paused = False
@@ -1354,6 +1354,7 @@ class DynamicInferenceEngine(AbstractEngine):
     ):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
+        self.use_coordinator = False
         try:
             while True:
                 # Wait until there are active requests before proceeding.
