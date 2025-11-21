@@ -12,7 +12,9 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 CHECKPOINT_PATH=${1:-"checkpoints/deepseek2_lite_fp8"}
 TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/deepseek2_lite_fp8"}
 # TOKENIZER_ARG=${3:-"MOCK"} # Path to tokenizer model, or "MOCK"
-TOKENIZER_ARG=${3:-"model/deepseek2_lite"} # Path to tokenizer model, or "MOCK"
+# TOKENIZER_ARG=${3:-"model/deepseek2_lite"} # Path to tokenizer model, or "MOCK"
+TOKENIZER_ARG="deepseek-ai/DeepSeek-V2-Lite"
+
 # DATA_ARG=${4:-"MOCK"}     # Data prefix, or "MOCK"
 # DATA_ARG=${4:-"dataset/wikipedia_processed/wikipedia_processed_text_document"}     # Data prefix, or "MOCK"
 DATA_ARG=${4:-"dataset/wikitext_processed/wikitext_processed_text_document"}     # Data prefix, or "MOCK"
