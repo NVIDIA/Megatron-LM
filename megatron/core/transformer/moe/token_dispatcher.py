@@ -1078,8 +1078,9 @@ class _HybridEPManager(_DispatchManager):
         )
         # Release the used handle/num_permuted_tokens which could change in each iteration
         self.handle = None
-        self.num_permuted_tokens = None
-        self.num_dispatched_tokens = None
+        if not self.drop_and_pad:
+            self.num_permuted_tokens = None
+            self.num_dispatched_tokens = None
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:

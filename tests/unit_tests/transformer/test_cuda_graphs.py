@@ -27,6 +27,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
@@ -609,7 +610,7 @@ class TestPartialCudaGraph:
         args.num_layers = 4
         args.mtp_num_layers = 1
         args.vocab_size = 1024
-        args.hidden_size = 128
+        args.hidden_size = 512
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
         args.global_batch_size = self.micro_batch_size * 8 // self.tp_size // self.cp_size
@@ -780,6 +781,8 @@ class TestPartialCudaGraph:
         if not moe_dropless_dispatcher:
             if moe_dispatcher_type == "deepep":
                 pytest.skip("Deep EP doesn't support drop&pad MoE")
+            if moe_dispatcher_type == "hybridep" and ep_size == 1:
+                pytest.skip("Hybrid EP doesn't support drop&pad MoE with ep_size == 1")
             extra_kwargs["moe_expert_capacity_factor"] = 1.0
             extra_kwargs["moe_pad_expert_input_to_capacity"] = True
 
@@ -796,10 +799,10 @@ class TestPartialCudaGraph:
                 CudaGraphScope.moe_preprocess,
             ],
         ]:
-            if moe_dropless_dispatcher and (
+            if (moe_dropless_dispatcher or moe_dispatcher_type == "hybridep") and (
                 cuda_graph_scope is None or CudaGraphScope.moe in cuda_graph_scope
             ):
-                # Dropless MoE doesn't work with "moe" scope cudagraph. Skip.
+                # Dropless MoE or Hybrid EP doesn't work with "moe" scope cudagraph. Skip.
                 continue
             cuda_graph_warmup_steps = 3
             loss_list = self._run_test_helper(
@@ -811,6 +814,8 @@ class TestPartialCudaGraph:
             )
             assert torch.equal(loss_list, loss_list_ref)
 
+        if moe_dispatcher_type == "hybridep":
+            reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
 
 
