@@ -212,7 +212,7 @@ class DataParallelInferenceCoordinator:
                     )
                 if header == Headers.UNPAUSE:
                     self.data_parallel_pause_acks = set()
-            elif header in [Headers.PAUSE_ACK]:
+            elif header == Headers.PAUSE_ACK:
                 # control signal ack from the engine
                 assert sender_identity in self.identities_of_data_parallel_ranks
                 assert sender_identity not in self.data_parallel_pause_acks
@@ -227,7 +227,7 @@ class DataParallelInferenceCoordinator:
                         self.router_socket.send_multipart(
                             [data_parallel_rank_id, msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)]
                         )
-            elif header in [Headers.STOP_ACK]:
+            elif header == Headers.STOP_ACK:
                 # control signal ack from the engine
                 assert sender_identity in self.identities_of_data_parallel_ranks
                 assert sender_identity not in self.data_parallel_stop_acks
