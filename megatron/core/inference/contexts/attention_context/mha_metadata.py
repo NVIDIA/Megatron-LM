@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-import torch
 
-from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from typing import Optional
+
+import torch
 
 from .metadata_base import MetadataBase
 
@@ -39,21 +40,23 @@ class MHAMetadata(MetadataBase):
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        batch_dimensions: InferenceBatchDimensions,
-        padded_batch_dimensions: InferenceBatchDimensions,
+        padded_active_token_count: int,
+        real_batch_size: int,
+        padded_active_request_count: Optional[int] = None,
+        decode_only: bool = False,
     ):
         """
         Args:
             request_query_lengths: (>real_batch_size,)
             request_kv_length_offsets: (>real_batch_size,)
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
-            batch_dimensions: Configuration object containing real batch settings
-            padded_batch_dimensions: Configuration object containing padded batch settings
+            padded_active_token_count: int
+            real_batch_size: int
+            padded_active_request_count: Optional[int]
+            decode_only: bool
         """
-        # Extract values from configs
-        real_batch_size = batch_dimensions.req_count
-        padded_active_token_count = padded_batch_dimensions.token_count
-        padded_active_request_count = padded_batch_dimensions.req_count
+        if padded_active_request_count is None:
+            padded_active_request_count = real_batch_size
 
         assert real_batch_size <= padded_active_request_count <= self.max_bs
         assert request_query_lengths.shape[0] == real_batch_size
@@ -98,12 +101,10 @@ class MHAMetadata(MetadataBase):
             is_cumulative_tensor=True,
         )
 
-        if padded_batch_dimensions.prefill_req_count == 0:
+        if decode_only:
             self._max_seqlen_q = 1
         else:
-            # Make sure we will launch the prefill kernel for prefill graphs
-            self._max_seqlen_q = max(2, padded_batch_dimensions.token_count)
-
+            self._max_seqlen_q = max(2, padded_active_token_count)
         self._max_seqlen_k = self.max_seqlen
 
         self.state_data = {
@@ -148,23 +149,29 @@ class GraphedMHAMetadata(MHAMetadata):
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        batch_dimensions: InferenceBatchDimensions,
-        padded_batch_dimensions: InferenceBatchDimensions,
+        padded_active_token_count: int,
+        real_batch_size: int,
+        padded_active_request_count: Optional[int] = None,
+        decode_only: bool = False,
     ):
         """
         Args:
             request_query_lengths: (>real_batch_size,)
             request_kv_length_offsets: (>real_batch_size,)
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
-            batch_dimensions: Configuration object containing real batch settings
-            padded_batch_dimensions: Configuration object containing padded batch settings
+            padded_active_token_count: int
+            real_batch_size: int
+            padded_active_request_count: Optional[int]
+            decode_only: bool
         """
         super().update(
             request_query_lengths,
             request_kv_length_offsets,
             request_to_kv_block_ids,
-            batch_dimensions,
-            padded_batch_dimensions,
+            padded_active_token_count,
+            real_batch_size,
+            padded_active_request_count,
+            decode_only,
         )
 
     def reset(self):
@@ -181,23 +188,29 @@ class NonGraphedMHAMetadata(MHAMetadata):
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        batch_dimensions: InferenceBatchDimensions,
-        padded_batch_dimensions: InferenceBatchDimensions,
+        padded_active_token_count: int,
+        real_batch_size: int,
+        padded_active_request_count: Optional[int] = None,
+        decode_only: bool = False,
     ):
         """
         Args:
             request_query_lengths: (>real_batch_size,)
             request_kv_length_offsets: (>real_batch_size,)
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
-            batch_dimensions: Configuration object containing real batch settings
-            padded_batch_dimensions: Configuration object containing padded batch settings
+            padded_active_token_count: int
+            real_batch_size: int
+            padded_active_request_count: Optional[int]
+            decode_only: bool
         """
         super().update(
             request_query_lengths,
             request_kv_length_offsets,
             request_to_kv_block_ids,
-            batch_dimensions,
-            padded_batch_dimensions,
+            padded_active_token_count,
+            real_batch_size,
+            padded_active_request_count,
+            decode_only,
         )
         if len(self.state_data["query_lengths"]) > 0:
             self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
