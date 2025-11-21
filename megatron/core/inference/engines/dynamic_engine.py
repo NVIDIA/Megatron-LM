@@ -160,17 +160,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 controller.inference_wrapped_model.model.config.enable_cuda_graph
             )
 
-        # Lower level of the abstraction stack.
+        # Initialization options.
         self.controller = controller
         self.context = context
-
-        # Initialization options.
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
         self.enable_chunked_prefill = enable_chunked_prefill
         self.inference_logging_step_interval = inference_logging_step_interval
         self.unified_memory_level = context.unified_memory_level
-        self._loop = None
 
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
@@ -229,7 +226,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Runtime state.
         self.rank = torch.distributed.get_rank()
-        self._loop = get_asyncio_loop(self._loop)
+        self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
         self.paused = False
         self.stopped = False
