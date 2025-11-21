@@ -3,7 +3,7 @@ from typing import cast, final, override
 import pytest
 import torch
 
-from megatron.core.metrics import collector, metrics, reporter
+from megatron.core.metrics import collector, every_n_reporter, metrics, reporter
 
 
 @final
@@ -99,3 +99,39 @@ def test_noop_reporter_does_nothing():
     assert (
         reporter_instance.report(prefix='model/') == {}
     ), "NoopReporter should always report empty metrics."
+
+
+def test_every_n_reporter_reports_every_n_calls():
+    inner_reporter = SimpleReporter()
+    module = DummyModule(metric_collector=inner_reporter)
+    every_3_reporter = every_n_reporter.EveryNReporter(inner_reporter, n=3)
+
+    module(torch.tensor([1.0]))
+    assert (
+        every_3_reporter.report(prefix='model/') == {}
+    ), "EveryNReporter should not report on the 1st call."
+
+    module(torch.tensor([2.0]))
+    assert (
+        every_3_reporter.report(prefix='model/') == {}
+    ), "EveryNReporter should not report on the 2nd call."
+
+    module(torch.tensor([3.0]))
+    assert every_3_reporter.report(prefix='model/') == {
+        "model/dummy_metric": pytest.approx(6.0)
+    }, "EveryNReporter should report on the 3rd call."
+
+    module(torch.tensor([4.0]))
+    assert (
+        every_3_reporter.report(prefix='model/') == {}
+    ), "EveryNReporter should not report on the 4th call."
+
+    module(torch.tensor([5.0]))
+    assert (
+        every_3_reporter.report(prefix='model/') == {}
+    ), "EveryNReporter should not report on the 5th call."
+
+    module(torch.tensor([6.0]))
+    assert every_3_reporter.report(prefix='model/') == {
+        "model/dummy_metric": pytest.approx(15.0)
+    }, "EveryNReporter should report on the 6th call."
