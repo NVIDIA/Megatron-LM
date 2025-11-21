@@ -37,9 +37,11 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 
 # Fixed model and training parameters for DeepSeek2-Lite
+# Reference: examples/mcore/deepseek2_lite/pretrain_deepseek2_lite_16b_ptd_8p.sh (MindSpeed-LLM)
 TP_SIZE=8
 CP_SIZE=1     
 PP_SIZE=1     
+EP_SIZE=1     # Expert parallel size (for MoE)
 MICRO_BATCH_SIZE=1  # default 1
 GLOBAL_BATCH_SIZE=64 # default 128
 NUM_LAYERS=16 
@@ -48,8 +50,8 @@ MOE_LAYERS=$(($NUM_LAYERS-1))
 # Note: FP8 is NOT supported with transformer-impl local. If using FP8, must set --transformer-impl transformer_engine
 DTYPE="bf16"
 # DTYPE=${5:-"fp8"}
-SEQ_LENGTH=1024
-MAX_POSITION_EMBEDDINGS=1024
+SEQ_LENGTH=4096  # Reference script uses 4096
+MAX_POSITION_EMBEDDINGS=4096  # For YaRN RoPE scaling
 
 # Data cache path (useful for both mock and real data)
 DATA_CACHE_PATH="${PWD}/benchmark_cache_deepseek2_lite_fp8"
@@ -68,6 +70,7 @@ DISTRIBUTED_ARGS=(
 # TOKENIZER_MODEL="deepseek-ai/DeepSeek-V2-Lite"
 
 # Base GPT model arguments
+# Reference: Based on MindSpeed-LLM script, adapted for Megatron-LM
 GPT_ARGS=(
     --num-layers $NUM_LAYERS 
     --hidden-size 2048 
@@ -89,45 +92,59 @@ GPT_ARGS=(
     --tokenizer-type HuggingFaceTokenizer 
     --make-vocab-size-divisible-by 3200 
     --transformer-impl local  # Use local implementation (MCore). For FP8, must use transformer_engine
-    # --attention-backend local  # Optional: explicitly set attention backend (local/unfused/flash/fused/auto)
+    --attention-backend auto  # auto/flash/fused/unfused/local - auto lets system decide
+    --init-method-std 0.02  # Reference script uses 0.02
 )
 
 # Multi-Latent Attention (MLA) arguments
+# Reference: MindSpeed uses --multi-head-latent-attention, Megatron-LM uses --multi-latent-attention
+# Note: Reference script uses --qk-rope-head-dim and --qk-nope-head-dim, but Megatron-LM uses --qk-pos-emb-head-dim
 MLA_ARGS=(
     --multi-latent-attention 
     --kv-lora-rank 512 
     --v-head-dim 128 
     --qk-head-dim 128 
     --qk-layernorm 
-    --qk-pos-emb-head-dim 64 
+    --qk-pos-emb-head-dim 64  # qk_head_dim = qk-head-dim + qk-pos-emb-head-dim = 128 + 64 = 192
 )
 
 # Mixture of Experts (MoE) arguments
+# Reference: MindSpeed script uses --moe-intermediate-size, Megatron-LM uses --moe-ffn-hidden-size
+# Reference: MindSpeed uses --n-shared-experts 2, Megatron-LM uses --moe-shared-expert-intermediate-size
+# Reference: MindSpeed uses --first-k-dense-replace 1 (first layer is dense), we use --moe-layer-freq pattern
+# Reference: MindSpeed uses --moe-layer-freq 1 (all layers MoE), but we keep first layer dense: ([0]+[1]*26)
 MOE_ARGS=(
     --num-experts 64 
-    --moe-layer-freq "([0]+[1]*$MOE_LAYERS)" 
-    --moe-ffn-hidden-size 1408 
+    --moe-layer-freq "([0]+[1]*$MOE_LAYERS)"  # First layer dense, rest are MoE (matches --first-k-dense-replace 1)
+    --moe-ffn-hidden-size 1408  # Reference uses --moe-intermediate-size 1408
     --moe-grouped-gemm 
     --moe-router-score-function softmax 
     --moe-router-topk 6 
-    --moe-router-topk-scaling-factor 1.0 
+    --moe-router-topk-scaling-factor 1.0  # Reference uses --routed-scaling-factor 1.0
     --moe-router-pre-softmax 
-    --moe-shared-expert-intermediate-size 2816 
-    --moe-aux-loss-coeff 1e-3 
+    --moe-shared-expert-intermediate-size 2816  # Reference uses --n-shared-experts 2, this is 2 * 1408
+    --moe-aux-loss-coeff 0.01  # Reference uses 0.01 (was 1e-3)
     --moe-token-dispatcher-type alltoall 
     --moe-token-drop-policy probs 
-    --moe-router-load-balancing-type seq_aux_loss 
+    --moe-router-load-balancing-type seq_aux_loss  # Reference uses --seq-aux, this is equivalent
+    # Note: Reference script uses --moe-alltoall-overlap-comm, --moe-permutation-async-comm,
+    #       --use-fused-moe-token-permute-and-unpermute - these are MindSpeed-specific and not in Megatron-LM
 )
 
-# Rotary Position Embedding (RoPE) arguments
+# Rotary Position Embedding (RoPE) arguments - YaRN RoPE scaling
+# Reference: MindSpeed uses --rope-scaling-* parameters, Megatron-LM uses different names
+# Note: Megatron-LM's MLA implementation uses YaRN RoPE by default when --multi-latent-attention is set
 ROPE_ARGS=(
     --position-embedding-type rope 
     --no-rope-fusion 
     --rotary-percent 1.0 
     --rotary-base 10000 
-    --rotary-scaling-factor 40 
-    --mscale 0.707 
-    --mscale-all-dim 0.707 
+    --rotary-scaling-factor 40  # Reference: --rope-scaling-factor 40
+    --mscale 0.707  # Reference: --rope-scaling-mscale 0.707
+    --mscale-all-dim 0.707  # Reference: --rope-scaling-mscale-all-dim 0.707
+    # Note: YaRN beta-fast and beta-slow are set in MLATransformerConfig defaults (32 and 1)
+    #       original_max_position_embeddings is also set in config (4096)
+    #       These are not directly exposed as CLI args in Megatron-LM but can be set via config
 )
 
 TRAINING_ARGS=(
@@ -179,6 +196,7 @@ MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size $TP_SIZE
     --context-parallel-size $CP_SIZE
     --pipeline-model-parallel-size $PP_SIZE
+    --expert-model-parallel-size $EP_SIZE  # For MoE expert parallelism
     --sequence-parallel
 )
 
@@ -216,7 +234,7 @@ else
         "--split '99,1,0'"
         "--no-create-attention-mask-in-dataloader"
         # "--no-mmap-bin-files"
-        "--num-workers 1"
+        "--num-workers 8"  # Reference script uses 8 workers
         # Note: --vocab-size might be inferred by HuggingFaceTokenizer or might need to be explicit.
         "--vocab-size 128256"
     )
