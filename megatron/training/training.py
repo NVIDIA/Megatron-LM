@@ -614,6 +614,10 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    if args.repeat_te_gemms_check:
+        from megatron.core.extensions.gemm_patch import patch_te_gemms
+        patch_te_gemms()
+
     if args.log_progress:
         append_to_progress_log("Starting job")
 
