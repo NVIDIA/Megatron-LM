@@ -268,20 +268,21 @@ def apply_rotary_pos_emb(
     if config.apply_rope_fusion:
         if cu_seqlens is None:
             # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
+            use_unfused = False
             if config.mrope_section is not None and freqs.shape[1] > 1:
                 # TODO: Add a check in TransformerConfig and remove this unfused implementation.
                 warnings.warn(
                     "apply_rope_fusion does not support mRoPE in bshd format when bs > 1. "
                     "Please set apply_rope_fusion to false. This will become an error in v0.16."
                 )
-                return _apply_rotary_pos_emb_bshd(
-                    t,
-                    freqs,
-                    rotary_interleaved=config.rotary_interleaved,
-                    multi_latent_attention=config.multi_latent_attention,
-                    mscale=mscale,
+                use_unfused = True
+            if mscale != 1.0:
+                warnings.warn(
+                    f"mscale={mscale} is not supported by TE's fused RoPE. "
+                    "Using unfused implementation."
                 )
-            else:
+                use_unfused = True
+            if not use_unfused:
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
@@ -289,25 +290,25 @@ def apply_rotary_pos_emb(
             return fused_apply_rotary_pos_emb_thd(
                 t, cu_seqlens, freqs, cp_size=cp_group.size(), cp_rank=cp_group.rank()
             )
+    # use unfused implementation
+    if cu_seqlens is None:
+        return _apply_rotary_pos_emb_bshd(
+            t,
+            freqs,
+            rotary_interleaved=config.rotary_interleaved,
+            multi_latent_attention=config.multi_latent_attention,
+            mscale=mscale,
+        )
     else:
-        if cu_seqlens is None:
-            return _apply_rotary_pos_emb_bshd(
-                t,
-                freqs,
-                rotary_interleaved=config.rotary_interleaved,
-                multi_latent_attention=config.multi_latent_attention,
-                mscale=mscale,
-            )
-        else:
-            return _apply_rotary_pos_emb_thd(
-                t,
-                cu_seqlens,
-                freqs,
-                rotary_interleaved=config.rotary_interleaved,
-                multi_latent_attention=config.multi_latent_attention,
-                mscale=mscale,
-                cp_group=cp_group,
-            )
+        return _apply_rotary_pos_emb_thd(
+            t,
+            cu_seqlens,
+            freqs,
+            rotary_interleaved=config.rotary_interleaved,
+            multi_latent_attention=config.multi_latent_attention,
+            mscale=mscale,
+            cp_group=cp_group,
+        )
 
 
 def apply_rotary_pos_emb_with_cos_sin(
