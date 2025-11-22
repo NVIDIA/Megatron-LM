@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Utilities for exchanging data between ranks."""
 
@@ -62,10 +62,7 @@ class ShardDistribution(NamedTuple):
 
 def _shard_size(sh_ten: ShardedTensor):
     """Returns size in bytes of a given sharded tensor."""
-    if sh_ten.flattened_range is None:
-        numel = np.product(sh_ten.local_shape)
-    else:
-        numel = sh_ten.flattened_range.stop - sh_ten.flattened_range.start
+    numel = np.product(sh_ten.local_shape)
     return numel * torch._utils._element_size(sh_ten.dtype)
 
 
