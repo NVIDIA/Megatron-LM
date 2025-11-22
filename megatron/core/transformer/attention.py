@@ -33,7 +33,6 @@ from megatron.core.utils import (
     get_pg_size,
     is_fa_min_version,
     is_te_min_version,
-    is_using_quantization_scales,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -950,11 +949,6 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
-                # Clear the outputs for padding tokens when using quantization scales
-                # to avoid corrupting amax calculations
-                if is_using_quantization_scales(self.config):
-                    core_attn_out[inference_context.padding_slice] = 0.0
-
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -966,6 +960,7 @@ class Attention(MegatronModule, ABC):
         # =================
         # Output. [sq, b, h]
         # =================
+
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
