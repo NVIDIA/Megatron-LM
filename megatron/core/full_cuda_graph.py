@@ -192,6 +192,14 @@ class FullCudaGraphWrapper:
                 packed_moe_expert_offloading_reset(enabled=self.packed_moe_expert_offloading)
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
 
+        # Check if there is any overflow in the receiving buffer
+        # TODO: Hacky for now. Will improve this after moving the budget check logic into HybridEP
+        for model_chunk in model:
+            for layer in model_chunk.module.module.decoder.layers:
+                mlp = layer.mlp
+                if hasattr(mlp, 'token_dispatcher'):
+                    if not mlp.token_dispatcher.under_budget.item():
+                        raise Exception(f"Rank {torch.distributed.get_rank()} overbudget")
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
 
