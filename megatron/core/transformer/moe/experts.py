@@ -613,8 +613,6 @@ class TEGroupedMLP(MegatronModule):
         self.packed_offload_moe_act = self.config.packed_moe_expert_offloading and "moe_act" in self.config.offload_modules
         self.packed_offload_expert_fc2 = self.config.packed_moe_expert_offloading and "expert_fc2" in self.config.offload_modules
 
-        if torch.distributed.get_rank() == 0:
-            print(f'packed_offload_expert_fc1 {self.packed_offload_expert_fc1}, packed_offload_moe_act {self.packed_offload_moe_act}, packed_offload_expert_fc2 {self.packed_offload_expert_fc2}')
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
