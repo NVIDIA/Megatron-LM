@@ -66,7 +66,7 @@ jobs:
       # Default baseline for automatic PR checks
       # Can be: branch name (e.g., 'main'), commit hash, or tag
       # Will be resolved to commit hash during execution
-      DEFAULT_BASELINE: 'f7fb5ecbe218672719053fa304d91767ce30ffa1'
+      DEFAULT_BASELINE: '29a810e644d079a91955c0ab98afb0798b10ab52'
       # Tag pattern for auto-detection (e.g., 'core_r*', 'core_v*')
       TAG_PATTERN: 'core_v*'
       # Tag regex filter (e.g., '^core_v[0-9]+\.[0-9]+\.[0-9]+$' for stable versions only)
