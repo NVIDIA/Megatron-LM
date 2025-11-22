@@ -269,6 +269,10 @@ class MoELayer(BaseMoELayer):
         """
         output = self.token_dispatcher.token_combine(output)
         output = self.token_dispatcher.combine_postprocess(output)
+        # Project the output back from latent dimension to hidden dimension after combine
+        # in latent dimension.
+        if self.config.moe_latent_size:
+            output, _ = self.fc2_latent_proj(output)
         if shared_expert_output is not None:
             output = output + shared_expert_output
         return output
@@ -313,10 +317,6 @@ class MoELayer(BaseMoELayer):
                 output = output + mlp_bias
                 mlp_bias = None
             output = self.combine(output, shared_expert_output)
-            # Project the output back from latent dimension to hidden dimension after combine
-            # in latent dimension.
-            if self.config.moe_latent_size:
-                output, _ = self.fc2_latent_proj(output)
 
             return output, mlp_bias
 
