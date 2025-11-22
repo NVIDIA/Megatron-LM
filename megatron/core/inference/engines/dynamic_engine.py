@@ -168,6 +168,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = enable_chunked_prefill
         self.inference_logging_step_interval = inference_logging_step_interval
         self.unified_memory_level = context.unified_memory_level
+        self.capture_stats = None  # pass CI
 
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
