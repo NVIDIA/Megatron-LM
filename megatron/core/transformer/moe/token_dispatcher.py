@@ -33,6 +33,7 @@ from megatron.core.transformer.moe.moe_utils import (
     permute,
     sort_chunks_by_idxs,
     unpermute,
+    drop_routing_map_triton,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1376,6 +1377,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             )
         self.packed_offloading_capacity_factor = self.config.moe_expert_capacity_factor_for_packed_offloading
         self.budget_local_gpu = None
+        self.under_budget = torch.ones(1, dtype=torch.bool, device='cuda')
 
     def set_shared_experts(self, shared_experts):
         raise NotImplementedError(
@@ -1417,7 +1419,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self.budget_local_gpu = None
         return routing_map, probs
 
-    @jit_fuser
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
@@ -1444,9 +1445,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         budget_local = None
         if self.packed_offloading_capacity_factor is not None:
             budget_local = int(routing_map.shape[0] * self.config.moe_router_topk  * self.packed_offloading_capacity_factor)
+            routing_map, under_budget = self.budget_check(routing_map, budget_local)
+            self.under_budget &= under_budget
 #            if self.ep_rank == 0:
 #                print (f'budget_local {budget_local} = {routing_map.shape[0]} x {self.config.moe_router_topk} x {self.packed_offloading_capacity_factor}')
         self._comm_manager.setup_metadata(routing_map, probs, budget_local)
+        
         return hidden_states, self._comm_manager.token_probs
 
     def token_dispatch(
@@ -1540,3 +1544,25 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             The final MoE layer output reshaped to its original dimensions.
         """
         return hidden_states.view(self.hidden_shape)
+
+    def budget_check(self, routing_map, budget):
+        # TODO: the check should be done in hybridep
+        num_experts =  self.config.num_moe_experts
+        num_expert_per_ep_rank = num_experts // self.ep_size
+        num_tokens_per_expert = routing_map.sum(dim=0)
+        num_tokens_per_expert = (
+            gather_from_sequence_parallel_region(
+                num_tokens_per_expert, group=self.tp_ep_group
+            )
+            .reshape(self.ep_size, self.tp_size, num_experts)
+            .transpose(0, 1)
+        )
+
+        num_global_tokens_per_expert =num_tokens_per_expert.sum(dim=1)
+        if self.config.fp8:
+            pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+            num_global_tokens_per_expert += -num_global_tokens_per_expert % pad_multiple
+        num_tokens_per_ep_rank = num_global_tokens_per_expert.view(num_global_tokens_per_expert.shape[0], self.ep_size, -1).sum(dim=-1)
+        
+        routing_map_maybe_dropped, under_budget = drop_routing_map_triton(routing_map, budget, num_tokens_per_ep_rank)
+        return routing_map_maybe_dropped, under_budget
