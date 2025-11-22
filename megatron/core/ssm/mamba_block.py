@@ -27,6 +27,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -289,6 +290,18 @@ class MambaStack(MegatronModule):
                     # MoE layer
                     with quantization_context:
                         qtype_debug_log(f"[{layer_no}] moe layer")
+
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                        )
+                elif isinstance(layer, TransformerLayer) and isinstance(layer.mlp, MLP):
+                    # MLP layer
+                    with quantization_context:
+                        qtype_debug_log(f"[{layer_no}] mlp layer")
 
                         hidden_states = layer(
                             hidden_states=hidden_states,
