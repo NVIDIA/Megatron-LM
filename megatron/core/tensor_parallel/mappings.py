@@ -441,6 +441,8 @@ class _AllToAll(torch.autograd.Function):
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
+        rank = torch.distributed.get_rank(group)
+        print(f"{rank}: starting all to all")
         torch.distributed.all_to_all_single(
             output,
             input,
@@ -448,6 +450,7 @@ class _AllToAll(torch.autograd.Function):
             input_split_sizes=input_split_sizes,
             group=group,
         )
+        print(f"{rank}: finished all to all")
         return output
 
     @staticmethod

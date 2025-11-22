@@ -261,3 +261,6 @@ if __name__ == "__main__":
                 args.inference_mp_coordinator_port
             )
         )
+
+        if os.environ.get("NSIGHT_PREFIX"):
+            torch.cuda.cudart().cudaProfilerStop()

@@ -63,6 +63,7 @@ except ImportError:
 if TYPE_CHECKING:
     import wandb as WandbModule
 
+RUN_ALL_IN_CUDA_GRAPHED_MODE = True
 
 class ContextOverflowError(Exception):
     """Base exception for when a new request does not fit.
@@ -1013,6 +1014,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         return has_cuda_graphs and can_use_cuda_graphs and token_count_fits_cuda_graph
 
+    def adjust_active_token_count_for_expert_parallelism(self, active_token_count: int) -> int:
+        """Adjust active token count to be divisible by expert parallelism size.
+
+        Args:
+            active_token_count (int): Current active token count.
+
+        Return:
+            (int) Adjusted active token count.
+        """
+        ep_size = parallel_state.get_expert_model_parallel_world_size()
+        if ep_size <= 1:
+            return active_token_count
+
+        expert_model_parallel_group = parallel_state.get_expert_model_parallel_group_gloo()
+            # all reduce local work across expert model parallel group
+
+        active_token_count_tensor = torch.tensor(
+            [active_token_count], device='cpu'
+        )
+        torch.distributed.all_reduce(
+            active_token_count_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=expert_model_parallel_group,
+        )
+        print(f"Rank: {torch.distributed.get_rank()} : Adjusted active token count from {active_token_count} to {active_token_count_tensor.item()}")
+        return active_token_count_tensor.item()
+
     def initialize_attention_state(
         self,
         *,
@@ -1059,6 +1087,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_token_count = (
             self.active_token_count if num_warmup_tokens is None else num_warmup_tokens
         )
+
+        # adjust active token count for expert parallelism
+        active_token_count = self.adjust_active_token_count_for_expert_parallelism(active_token_count)
 
         if self.using_cuda_graph_this_step():
             self.padded_active_token_count = (

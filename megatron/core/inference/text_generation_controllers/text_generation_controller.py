@@ -515,12 +515,12 @@ class TextGenerationController:
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
-            assert warmup_engine_mode is not WarmupEngineMode.NON_DECODE
-            if context.is_decode_only():
-                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
-                set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
-            else:
-                set_decode_expert_padding(unwrapped_model, False)
+            #assert warmup_engine_mode is not WarmupEngineMode.NON_DECODE
+            #if context.is_decode_only():
+            capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
+            set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
+           #else:
+            #    set_decode_expert_padding(unwrapped_model, False)
 
         if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
             if context.is_decode_only():
@@ -831,6 +831,12 @@ class TextGenerationController:
         }
         ret.update(request_bookkeeping)
         return ret
+
+    def dummy_forward(self):
+        rank = torch.distributed.get_rank()
+        print(f"Rank {rank} dummy forward called")
+        return self.inference_wrapped_model.dummy_forward()
+        
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
@@ -1472,3 +1478,5 @@ class TextGenerationController:
             output_log_probs,
         )
         list(ret)
+
+        
