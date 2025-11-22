@@ -1,0 +1,99 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Trigger MBridge Tests
+# Remote testing of MBridge from MCore
+# Triggers MBridge CI tests with current MCore commit to verify backward compatibility
+
+on:
+  # Manual trigger only for POC
+  workflow_dispatch:
+    inputs:
+      run_cicd_main:
+        description: 'Run cicd-main.yml (full CI/CD)'
+        required: false
+        type: boolean
+        default: true
+      run_install_test:
+        description: 'Run install-test.yml (quick install check)'
+        required: false
+        type: boolean
+        default: true
+      test_suite:
+        description: 'Test suite to run (for cicd-main)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'unit-only'
+          - 'functional-only'
+        default: 'all'
+
+jobs:
+  trigger-mbridge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout MCore
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Get MCore commit info
+        id: mcore_info
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "branch=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
+          echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+
+          echo "📦 MCore commit: $(git rev-parse --short HEAD)"
+          echo "🌿 Branch: ${GITHUB_REF#refs/heads/}"
+      
+      - name: Trigger MBridge install-test.yml
+        if: ${{ inputs.run_install_test }}
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          echo "🚀 Triggering MBridge workflow: install-test.yml"
+          echo "📌 MCore commit: ${{ steps.mcore_info.outputs.sha }}"
+          
+          gh workflow run install-test.yml \
+            --repo NVIDIA/Megatron-Bridge --ref main \
+            --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
+            --field mcore_branch=${{ steps.mcore_info.outputs.branch }} \
+            --field test_suite=${{ inputs.test_suite }} \
+            --field triggered_by=mcore-ci
+      
+      - name: Trigger MBridge cicd-main.yml
+        if: ${{ inputs.run_cicd_main }}
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          echo "🚀 Triggering MBridge workflow: cicd-main.yml"
+          echo "📌 MCore commit: ${{ steps.mcore_info.outputs.sha }}"
+          
+          gh workflow run cicd-main.yml \
+            --repo NVIDIA/Megatron-Bridge --ref main \
+            --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
+            --field mcore_branch=${{ steps.mcore_info.outputs.branch }} \
+            --field test_suite=${{ inputs.test_suite }} \
+            --field triggered_by=mcore-ci
+      
+      - name: Workflows triggered
+        run: |
+          echo "✅ MBridge workflows triggered. View results at:"
+          echo "   https://github.com/NVIDIA/Megatron-Bridge/actions"
+          echo "   Filter by 'triggered by: mcore-ci'"
+      
+      - name: Summary
+        run: |
+          {
+            echo "## 🔄 MBridge Tests Triggered"
+            echo ""
+            echo "**MCore Commit:** \`${{ steps.mcore_info.outputs.short_sha }}\` | **Test Suite:** \`${{ inputs.test_suite }}\`"
+            echo ""
+            [ "${{ inputs.run_install_test }}" == "true" ] && echo "- ✅ [install-test.yml](https://github.com/NVIDIA/Megatron-Bridge/actions/workflows/install-test.yml)"
+            [ "${{ inputs.run_cicd_main }}" == "true" ] && echo "- ✅ [cicd-main.yml](https://github.com/NVIDIA/Megatron-Bridge/actions/workflows/cicd-main.yml)"
+            echo ""
+            echo "🔍 [View all runs](https://github.com/NVIDIA/Megatron-Bridge/actions) (filter: *mcore-ci*)"
+          } >> $GITHUB_STEP_SUMMARY
