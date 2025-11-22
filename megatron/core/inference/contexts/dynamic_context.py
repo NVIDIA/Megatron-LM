@@ -578,14 +578,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             """Allocate the memory buffer. This function is called below within
             `with ctx_manager:`."""
             if self.cache_mla_latent:
-                self.memory_buffer = torch.full(
+                self.memory_buffer = torch.empty(
                     (
                         self.num_attention_layers,
                         self.block_allocator.total_count,
                         self.block_size_tokens,
                         self.kv_reduced_dim,
                     ),
-                    -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
