@@ -88,7 +88,6 @@ class TEQuantizationRecipe:
     fp4_quantization_recipe: Optional[Fp4Recipe] = None
     custom_recipe_factory: Optional[str] = None
     fp8_format: str = "e4m3"
-    align_size: int = 16
     override_quantized_autocast: bool = True
     override_nonquantized_autocast: bool = False
     tp_only_amax_red: bool = False
@@ -219,22 +218,6 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
-def _get_quantization_padding_override_for_quant_recipe(
-    qrecipe: TEQuantizationRecipe, is_context_quantized: bool
-):
-    if is_context_quantized:
-        if not qrecipe.override_quantized_autocast:
-            return is_context_quantized, None
-    else:
-        if not qrecipe.override_nonquantized_autocast:
-            return is_context_quantized, None
-    if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
-        # Force BF16 for this layer and override autocast
-        return False, None
-    else:
-        return True, qrecipe.align_size
-
-
 def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
     if qparams is None:
         return nullcontext()
@@ -244,17 +227,33 @@ def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, tra
         return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
 
 
-def _get_quantization_alignment_padding(
+def _get_should_context_be_quantized_recipe(
+    qrecipe: TEQuantizationRecipe, is_original_context_quantized: bool
+):
+    if is_context_quantized:
+        if not qrecipe.override_quantized_autocast:
+            return is_context_quantized
+    else:
+        if not qrecipe.override_nonquantized_autocast:
+            return is_context_quantized
+    if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
+        # Force BF16 for this layer and override autocast
+        return False
+    else:
+        return True
+
+
+def _get_should_context_be_quantized_params(
     qparams: TEQuantizationParams | None, training: bool, is_context_quantized: bool
 ):
     if qparams is None:
-        return is_context_quantized, None
+        return is_context_quantized
     elif not training and qparams.inference_recipe is not None:
-        return _get_quantization_padding_override_for_quant_recipe(
+        return _get_should_context_be_quantized_recipe(
             qparams.inference_recipe, is_context_quantized
         )
     else:
-        return _get_quantization_padding_override_for_quant_recipe(
+        return _get_should_context_be_quantized_recipe(
             qparams.training_recipe, is_context_quantized
         )
 
@@ -621,11 +620,11 @@ class TELinear(te.pytorch.Linear):
         else:
             self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
 
-    def get_is_quantized_and_alignment_padding(
+    def will_execute_quantized(
         self, is_context_quantized: bool
-    ) -> Tuple[bool, int]:
-        """Returns whether the module is configured to execute quantized and the alignment."""
-        return _get_quantization_alignment_padding(
+    ) -> bool:
+        """Returns whether the module is configured to execute quantized."""
+        return _get_should_context_be_quantized_params(
             self.te_quant_params, self.training, is_context_quantized
         )
 
@@ -828,11 +827,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         else:
             self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
 
-    def get_is_quantized_and_alignment_padding(
+    def will_execute_quantized(
         self, is_context_quantized: bool
-    ) -> Tuple[bool, int]:
-        """Returns whether the module is configured to execute quantized and the alignment."""
-        return _get_quantization_alignment_padding(
+    ) -> bool:
+        """Returns whether the module is configured to execute quantized."""
+        return _get_should_context_be_quantized_params(
             self.te_quant_params, self.training, is_context_quantized
         )
 
@@ -1501,11 +1500,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             else:
                 self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
 
-        def get_is_quantized_and_alignment_padding(
+        def will_execute_quantized(
             self, is_context_quantized: bool
-        ) -> Tuple[bool, int]:
-            """Returns whether the module is configured to execute quantized and the alignment."""
-            return _get_quantization_alignment_padding(
+        ) -> bool:
+            """Returns whether the module is configured to execute quantized."""
+            return _get_should_context_be_quantized_params(
                 self.te_quant_params, self.training, is_context_quantized
             )
 
