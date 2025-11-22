@@ -70,6 +70,7 @@ def _stash_copy_kernel(
     overflow_ptr,
     BLOCK_SIZE: tl.constexpr,
     num_iterations: tl.constexpr,
+    max_tokens: tl.constexpr,
 ):
     """Triton kernel to copy tensor data to stash buffer.
     
@@ -97,7 +98,6 @@ def _stash_copy_kernel(
     alloc_offset = tl.load(alloc_offset_ptr)
     free_offset = tl.load(free_offset_ptr)
     capacity = tl.load(capacity_ptr)
-    
     # Only the first thread checks capacity
     # Do this BEFORE the loop so it always happens
     overflow = False
@@ -107,7 +107,7 @@ def _stash_copy_kernel(
         avail_space = -avail_space
     else:
         avail_space = capacity - avail_space
-    if avail_space < size:
+    if avail_space < size or max_tokens < size:
         overflow = True
     if pid == 0 and overflow:
         tl.store(overflow_ptr, 1)
@@ -341,7 +341,7 @@ class PackedTensor:
             stash_buffer.overflow,  # Read+Write: Over capacity flag updated by kernel
             BLOCK_SIZE=BLOCK_SIZE,
             num_iterations=num_iterations,
-#            max_tokens=self.max_tokens,
+            max_tokens=self.max_tokens*self.hidden_size,
         )
 
         # save reference to original tensor to avoid deallocation before offload is complete
@@ -803,7 +803,8 @@ def packed_moe_expert_offloading_reset(enabled=True):
         offload_manager.status = 'capture'
     elif offload_manager.status == 'capture':
         offload_manager.status = 'captured'
-        offload_manager.allocate_offload_pages(stash_buffer_size_factor=1.10) # 10% extra to account for overhead
+        stash_buffer_size_factor = float(os.getenv('STASH_BUFFER_SIZE_FACTOR', '1.10'))
+        offload_manager.allocate_offload_pages(stash_buffer_size_factor=stash_buffer_size_factor)
         debug_print(f'packed_moe_expert_offloading_reset captured schedule: {offload_manager._pp_schedule}')
         debug_print(f'packed_moe_expert_offloading_reset max_pages_per_vp_stage: {offload_manager.max_pages_per_vp_stage}')
     elif offload_manager.status == 'captured':
@@ -812,11 +813,14 @@ def packed_moe_expert_offloading_reset(enabled=True):
         debug_print(f'packed_moe_expert_offloading_reset unknown status: {offload_manager.status}')
 
     if offload_manager.status == 'captured':
-        offload_manager.overflow.zero_()
+        if not torch.cuda.is_current_stream_capturing():
+            overflow = offload_manager.overflow.item()
+            assert overflow == 0, f"PackedOffloadManager overflow!!!"
+
         for vp_buffers in offload_manager.stash_buffers:
             for dtype in vp_buffers.keys():
                 vp_buffers[dtype].reset()
-                
+        offload_manager.overflow.zero_()
         offload_manager.current_layer = [1 for _ in range(offload_manager.vp_size)]
         offload_manager.current_microbatch = [1 for _ in range(offload_manager.vp_size)]
         assert len(offload_manager.packed_tensors_to_offload) == 0, f"packed_tensors_to_offload is not empty {offload_manager.packed_tensors_to_offload}"
