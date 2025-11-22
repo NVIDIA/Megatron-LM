@@ -331,7 +331,7 @@ class TestRouterAuxLoss:
         not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
         reason="CUDA or TE fused router ops not available",
     )
-    @pytest.mark.parametrize("aux_type", ["aux_loss", "seq_aux_loss"])
+    @pytest.mark.parametrize("aux_type", ["aux_loss", "seq_aux_loss", "global_aux_loss"])
     def test_aux_loss_fusion_equivalence(self, aux_type):
         # Compare fused vs unfused aux loss path to ensure numerical equivalence
         router_ref = self.new_router(
@@ -350,6 +350,7 @@ class TestRouterAuxLoss:
         loss_name_map = {
             "aux_loss": "load_balancing_loss",
             "seq_aux_loss": "seq_load_balancing_loss",
+            "global_aux_loss": "global_load_balancing_loss",
         }
         loss_name = loss_name_map[aux_type]
 
