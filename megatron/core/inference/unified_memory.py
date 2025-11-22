@@ -1,7 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import os
+import signal
 import warnings
+from contextlib import contextmanager
 from enum import Enum, auto
 from pathlib import Path
 
@@ -28,16 +30,45 @@ class CompilationState(Enum):
     SUCCESS = auto()  # Compilation attempted, and succeeded.
 
 
+class UnifiedMemoryUnsupportedError(Exception):
+    """Unified memory is not supported on this system."""
+
+
+class UnifiedMemoryCompileTimeoutError(UnifiedMemoryUnsupportedError):
+    """Unified memory compilation timed out."""
+
+
 # Compilation vars.
 _compilation_state = CompilationState.UNATTEMPTED
 _alloc = None  # must remain global until process exit.
 _mod = None  # must remain global until process exit.
 
 
-class UnifiedMemoryUnsupportedError(Exception):
-    """Unified memory is not supported on this system."""
+@contextmanager
+def _compile_timeout(timeout_s: int):
+    """Context manager to timeout compilation.
 
-    pass
+    Args:
+        timeout_s (int): Timeout in seconds.
+    """
+
+    def _handler(signum, frame):
+        raise UnifiedMemoryCompileTimeoutError(
+            "Unified memory compilation has been forcefully timed out. "
+            "This is almost certainly due to stale lock files associated with your Unix user. "
+            "The official PyTorch advice is to resolve this issue with the following command:\n"
+            "`rm -rf /tmp/torch_extensions/`\n"
+            "Alternately, the TORCH_EXTENSIONS_DIR env var may be set to a different path. "
+            "Please clean up your stale cache and try again."
+        )
+
+    curr_handler = signal.signal(signal.SIGALRM, _handler)
+    try:
+        signal.alarm(timeout_s)
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, curr_handler)
 
 
 def compile_allocator():
@@ -105,6 +136,9 @@ def compile_allocator():
     }
     """
 
+    # Define a timeout of 30s for how long the build is allowed to run.
+    timeout_s = 30
+
     # Build the .so upon import; this avoids issues.
     if _has_mem_pool:
         _extra_ldflags = ["-lcudart"]
@@ -113,18 +147,20 @@ def compile_allocator():
             if os.path.isdir(_cuda_lib):
                 _extra_ldflags = [f"-L{_cuda_lib}", "-lcudart"]
         try:
-            _mod = load_inline(
-                name="managed_alloc_runtime",
-                cpp_sources=[_mempool_c_src],
-                functions=[],
-                with_cuda=True,
-                extra_ldflags=_extra_ldflags,
-                verbose=True,
-            )
-            _so_path = Path(_mod.__file__).as_posix()
-            _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
-            _compilation_state = CompilationState.SUCCESS
-        except (RuntimeError, ImportError, OSError) as e:
+            with _compile_timeout(timeout_s):
+                _mod = load_inline(
+                    name="managed_alloc_runtime",
+                    cpp_sources=[_mempool_c_src],
+                    functions=[],
+                    with_cuda=True,
+                    extra_ldflags=_extra_ldflags,
+                    verbose=True,
+                )
+                _so_path = Path(_mod.__file__).as_posix()
+                _cpa = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free")
+                _alloc = _cpa.allocator()
+                _compilation_state = CompilationState.SUCCESS
+        except (RuntimeError, ImportError, OSError, UnifiedMemoryCompileTimeoutError) as e:
             warnings.warn(f"Failed to create unified memory mempool: '{e}'.")
             _compilation_state = CompilationState.FAILURE
 
