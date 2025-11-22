@@ -142,12 +142,16 @@ def fully_shard_model(
             "zero_dp_strategy to use FSDP ('optim_grads_params', 3), because "
             "outer sharding is dependent on inner sharding."
         )
-    if (dp_outer_dim is None) ^ (hybrid_fsdp_group is None):
-        # XOR - HSDP requires both or neither of dp_outer_dim and hybrid_fsdp_group
-        # to be specified, so if XOR then raise an error.
+    if _outer_fsdp_sharding and hybrid_fsdp_group is None:
+        # If fully-sharding the optimizer state on DP-Outer, you must provide the
+        # completely flattened HFSDP group for logical rank assignment to the
+        # optimizer state full-sharding ranks.
         raise ValueError(
-            f"dp_outer_dim={dp_outer_dim} and hybrid_fsdp_group={hybrid_fsdp_group} must be "
-            "specified together for Hybrid FSDP (HSDP), or both set to None (for FSDP)."
+            "[HFSDP] Fully-sharding the optimizer on DP-Outer "
+            f"(outer_dp_sharding_strategy={outer_dp_sharding_strategy}) "
+            f"requires a fully-flattened hybrid_fsdp_group={hybrid_fsdp_group} "
+            "for rank assignment to the optimizer state. You can flatten your DeviceMesh "
+            f"via `DeviceMesh[(DP-Outer, DP-Shard)]._flatten()` & `DeviceMesh.get_group()`."
         )
     if init_model_with_meta_device and zero_dp_strategy == "no_shard":
         raise ValueError(

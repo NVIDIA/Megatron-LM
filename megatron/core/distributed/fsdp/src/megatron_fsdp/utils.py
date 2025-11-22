@@ -167,13 +167,10 @@ def get_mesh_names(device_mesh: Optional[DeviceMesh] = None) -> list[str]:
         submesh_dim_name
         for child_mesh, root_mesh in _mesh_resources.child_to_root_mapping.items()
         for submesh_dim_name in (child_mesh.mesh_dim_names or [])
-        if root_mesh == device_mesh
+        # Add flattened or other unaccounted for children of the root mesh.
+        if root_mesh == device_mesh and submesh_dim_name not in mesh_dim_names
     ]
-    # Combine without duplicate dimensions.
-    for dim_name in submesh_dim_names:
-        if dim_name not in mesh_dim_names:
-            mesh_dim_names.append(dim_name)
-    return mesh_dim_names
+    return mesh_dim_names + submesh_dim_names
 
 
 def contains_submesh(
@@ -787,16 +784,17 @@ class FSDPDistributedIndex:
         if self.use_hybrid_fsdp:
             if self.outer_fsdp_group is None:
                 raise ValueError(
-                    "[FSDPDistributedIndex][use_hybrid_fsdp=True] Hybrid FSDP requires "
-                    "an outer-DP process group (dp_outer_dim, outer_fsdp_group)."
+                    "[FSDPDistributedIndex] Hybrid-Sharded Data Parallelism (HSDP) requires a "
+                    "DP-Outer ProcessGroup for model replication or optimizer full-sharding. "
+                    f"Check that {self.device_mesh} contains an outer DP sub-mesh.\n"
+                    f"dp_outer_dim={self.dp_outer_dim} / outer_fsdp_group={self.outer_fsdp_group}"
                 )
-            if self.hybrid_fsdp_group is None:
+            if self.hsdp_outer_dp_shard and self.hybrid_fsdp_group is None:
                 raise ValueError(
-                    "[FSDPDistributedIndex][use_hybrid_fsdp=True] Hybrid FSDP requires "
-                    "a hybrid FSDP process group (hybrid_fsdp_group). "
-                    "This group can be manufactured by flattening the outer-DP "
+                    "[FSDPDistributedIndex] Hybrid FSDP (HFSDP) requires a fully-flattened hybrid "
+                    "FSDP process group (hybrid_fsdp_group). Created by flattening the outer-DP "
                     "(dp_outer_dim, outer_fsdp_group) and FSDP (dp_shard_dim, fsdp_group) "
-                    "process groups or sub-meshes."
+                    "ProcessGroup(s) or sub-meshes."
                 )
 
     def get_submesh(

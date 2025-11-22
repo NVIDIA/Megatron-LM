@@ -311,12 +311,21 @@ class MegatronFSDP(torch.nn.Module):
         else:
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
+                # Utilized to re-scale expert gradients to DP.
+                # (edp_size/dp_size) * (1/edp_size) = 1/dp_size
+                # FIXME(@cspades): Currently not used gradient_reduce_preprocessing()?
                 expert_gradient_scaling_factor = (
                     self.dist_index.get_dp_group(is_expert_parallel=True).size()
-                    / self.dist_index.get_dp_group().size()
+                    / self.dist_index.get_fsdp_group().size()
                 )
+                if self.dist_index.use_hybrid_fsdp:
+                    # Also divide the DP-Outer size in the conversion factor.
+                    expert_gradient_scaling_factor /= self.dist_index.get_outer_fsdp_group().size()
             else:
-                data_parallel_world_size = self.dist_index.get_dp_group().size()
+                data_parallel_world_size = self.dist_index.get_fsdp_group().size()
+                if self.dist_index.use_hybrid_fsdp:
+                    # Also multiply the DP-Outer size in the DP size.
+                    data_parallel_world_size *= self.dist_index.get_outer_fsdp_group().size()
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
