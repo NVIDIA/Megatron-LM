@@ -9,14 +9,16 @@ class Headers(Enum):
     """
 
     CONNECT = auto()
-    ACK = auto()
+    CONNECT_ACK = auto()
     SUBMIT_REQUEST = auto()
     ENGINE_REPLY = auto()
     PAUSE = auto()
+    PAUSE_ACK = auto()
     UNPAUSE = auto()
     SUSPEND = auto()
     RESUME = auto()
     STOP = auto()
+    STOP_ACK = auto()
 
 
 class UnknownHeaderError(Exception):

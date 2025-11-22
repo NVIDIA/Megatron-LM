@@ -253,12 +253,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def suspend(self):
         if dist.get_rank() == 0:
-            self._client.pause_engines()
-        #await self._inference_engine.paused.wait()
+            await self._client.pause_engines()
+        await self._inference_engine.paused.wait()
 
     async def resume(self):
         if dist.get_rank() == 0:
             self._client.unpause_engines()
-        #await self._inference_engine.running.wait()
+        await self._inference_engine.running.wait()
 
 class MegatronChatLocal(ChatInferenceInterface, MegatronLocal): ...

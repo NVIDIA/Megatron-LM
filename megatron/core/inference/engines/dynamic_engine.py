@@ -168,7 +168,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = enable_chunked_prefill
         self.inference_logging_step_interval = inference_logging_step_interval
         self.unified_memory_level = context.unified_memory_level
-        self.capture_stats = None  # pass CI
 
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
@@ -229,8 +228,11 @@ class DynamicInferenceEngine(AbstractEngine):
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
-        self.paused = False
-        self.stopped = False
+        self.running = asyncio.Event()
+        self.paused = asyncio.Event()
+        self.stopped = asyncio.Event()
+        self.received_pause: bool = False
+        self.received_stop: bool = False
         self.suspend_signal = False
         self.is_suspended = False
         self.resume_request_ids = None
@@ -1314,14 +1316,41 @@ class DynamicInferenceEngine(AbstractEngine):
         for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
+
+            if self.received_stop:
+                assert (
+                    header == Headers.STOP_ACK
+                ), "Engine is shutting down. No other messages allowed except STOP_ACK."
+
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 self.add_request(request_id, prompt, sampling_params)
             elif header == Headers.PAUSE:
-                self.paused = True
+                # Pause thyself.
+                self.received_pause = True
+                self.running.clear()
+                # Send PAUSE_ACK back to coordinator.
+                if self.is_mp_coordinator:
+                    payload = msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)
+                    self.socket_for_receiving_requests.send(payload)
+            elif header == Headers.STOP:
+                # Stop thyself.
+                self.received_stop = True
+                self.running.clear()
+                # Send STOP_ACK back to coordinator.
+                if self.is_mp_coordinator:
+                    payload = msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)
+                    self.socket_for_receiving_requests.send(payload)
+            elif header == Headers.PAUSE_ACK:
+                self.paused.set()
+                self.received_pause = False
+            elif header == Headers.STOP_ACK:
+                self.stopped.set()
+                self.stop()
             elif header == Headers.UNPAUSE:
-                self.paused = False
+                self.paused.clear()
+                self.running.set()
             elif header == Headers.SUSPEND:
                 self.suspend_signal = True
             elif header == Headers.RESUME:
@@ -1382,11 +1411,10 @@ class DynamicInferenceEngine(AbstractEngine):
         try:
             while True:
                 self.schedule_requests()
-                if self.stopped:
-                    self.stop()
-                    return
+                if self.stopped.is_set():
+                    break
 
-                # for the cases below (engine is paused or no active requests),
+                # for the cases below (no active requests, or undergoing a state-change)
                 # do not use asyncio.sleep(0)
                 # as tp-rank=0 will flood the num_messages publisher
                 # with "0" repeatedly. This causes some packets to drop.
@@ -1398,7 +1426,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
-                if self.paused:
+                if self.paused.is_set() or self.received_pause or self.received_stop:
                     await asyncio.sleep(0.02)
                     continue
 
