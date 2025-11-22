@@ -1006,8 +1006,6 @@ class _HybridEPManager(_DispatchManager):
         num_tokens = routing_map.shape[0]
         self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
-        #if torch.distributed.get_rank() == 0:
-        #    print (f'setup_metadata budget_local {budget_local}')
         if budget_local is not None:
             self.num_dispatched_tokens = budget_local
             self.num_permuted_tokens = budget_local
