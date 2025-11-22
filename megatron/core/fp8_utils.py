@@ -690,8 +690,8 @@ if HAVE_TE:
         @wraps(original_forward)
         def padded_forward(input_tensor, *args, **kwargs):
             is_context_quantized = FP8GlobalStateManager.is_fp8_enabled()
-            if hasattr(module, "get_is_quantized_and_alignment_padding"):
-                module_uses_quant, _ = module.get_is_quantized_and_alignment_padding(
+            if hasattr(module, "will_execute_quantized"):
+                module_uses_quant = module.will_execute_quantized(
                     is_context_quantized
                 )
             else:
