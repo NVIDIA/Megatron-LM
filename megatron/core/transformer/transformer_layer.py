@@ -434,9 +434,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 if not self.is_moe_layer:
                     self.cudagraph_manager = CudaGraphManager(config, num_warmup_steps=self.config.cuda_graph_warmup_steps)
                 else:
-                    params = \
-                        list(self.pre_mlp_layernorm.parameters()) \
-                        + list(self.mlp.shared_experts.parameters())
+                    params = list(self.pre_mlp_layernorm.parameters())
+                    if self.mlp.shared_experts is not None:
+                        params += list(self.mlp.shared_experts.parameters())
                     if config.moe_latent_size is not None:
                         params += list(self.mlp.fc1_latent_proj.parameters())
                     params += list(self.mlp.router.parameters())
