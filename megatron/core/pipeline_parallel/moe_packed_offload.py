@@ -271,7 +271,7 @@ class PackedTensor:
         self.original_shape = list(tensor.shape)
         self.num_elements = tensor.numel()
         self.element_size = tensor.element_size()
-        self.hidden_size = self.num_elements // self.original_shape[0]
+        self.hidden_size = self.original_shape[1]
         self.dtype = tensor.dtype if not isinstance(tensor, MXFP8Tensor) else tensor._columnwise_data.dtype
         self.device = tensor.device
 
@@ -329,7 +329,6 @@ class PackedTensor:
         # Launch Triton kernel to copy data
         # self.offload_stream.wait_stream(torch.cuda.current_stream())
         # with torch.cuda.stream(self.offload_stream):
-
         # TODO: make this async. Something unexpected with TE on deallocate the tensor
         _stash_copy_kernel[grid](
             flat_tensor,
@@ -343,7 +342,6 @@ class PackedTensor:
             num_iterations=num_iterations,
             max_tokens=self.max_tokens*self.hidden_size,
         )
-
         # save reference to original tensor to avoid deallocation before offload is complete
         self._original_tensor = self._tensor
         # set tensor to None. This will be replaced by reload_from_stash.
@@ -357,7 +355,7 @@ class PackedTensor:
         if not HAVE_TRITON:
             raise RuntimeError("Triton is required for PackedTensor.reload_from_stash(). Please install triton.")
         if isinstance(self._original_tensor, MXFP8Tensor):
-            columnwise_data = torch.zeros(self.original_shape, dtype=self.dtype, device=self.device)
+            columnwise_data = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
             self._tensor = MXFP8Tensor(
                 shape=self._original_tensor.shape,
                 dtype=self._original_tensor.dtype,
@@ -370,7 +368,7 @@ class PackedTensor:
             )
             flat_tensor = self._tensor._columnwise_data.flatten()
         else:
-            self._tensor = torch.zeros(self.original_shape, dtype=self.dtype, device=self.device)
+            self._tensor = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
             flat_tensor = self._tensor.flatten()
 
         num_elements_tensor = self.num_tokens_tensor.mul(self.hidden_size)
