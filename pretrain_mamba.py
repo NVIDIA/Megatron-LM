@@ -131,7 +131,7 @@ def forward_step(data_iterator, model: MambaModel):
 
     with stimer:
         output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels)
+                              labels=labels, loss_mask=loss_mask)
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)

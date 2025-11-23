@@ -6,6 +6,7 @@ from megatron.core.extensions.transformer_engine import (
     TENorm,
     TERowParallelLinear,
 )
+from typing import Optional
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
@@ -17,6 +18,15 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlockSubmodules
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlockSubmodules,
+    get_mtp_layer_offset,
+    get_mtp_layer_spec_for_backend,
+    get_mtp_num_layers_to_build,
+)
+from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 
 moe = get_moe_module_spec(
     use_te=True,
@@ -24,6 +34,22 @@ moe = get_moe_module_spec(
     moe_grouped_gemm=True,
     moe_use_legacy_grouped_gemm=False,
 )
+
+try:
+    from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+
+try:
+    from megatron.core.extensions.kitchen import KitchenSpecProvider
+
+    HAVE_KITCHEN = True
+except ImportError:
+    HAVE_KITCHEN = False
 
 mamba_stack_spec = ModuleSpec(
     module=MambaStack,
@@ -82,3 +108,58 @@ mamba_stack_spec = ModuleSpec(
         ),
     ),
 )
+
+
+def get_mamba_mtp_block_spec(
+    config: TransformerConfig,
+    spec: ModuleSpec,
+    use_transformer_engine: bool, 
+    vp_stage: Optional[int] = None,
+) -> MultiTokenPredictionBlockSubmodules:
+    """Mamba Multi-Token Prediction (MTP) block spec."""
+    if use_transformer_engine:
+        backend: BackendSpecProvider = (
+            KitchenSpecProvider(fallback=TESpecProvider())
+            if config.use_kitchen
+            else TESpecProvider()
+        )
+    else:
+        backend = (
+            KitchenSpecProvider(fallback=LocalSpecProvider())
+            if config.use_kitchen
+            else LocalSpecProvider()
+        )
+    return get_mamba_mtp_block_spec_for_backend(
+        config=config, spec=spec, backend=backend, vp_stage=vp_stage
+    )
+    
+def get_mamba_mtp_block_spec_for_backend(
+    config: TransformerConfig,
+    spec: ModuleSpec, 
+    backend: BackendSpecProvider,
+    vp_stage: Optional[int] = None,
+) -> MultiTokenPredictionBlockSubmodules:
+    """Mamba Multi-Token Prediction (MTP) block spec."""
+    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage)
+    if num_layers_to_build == 0:
+        return None
+
+    mtp_layer_spec = get_mtp_layer_spec_for_backend(
+        mtp_model_layer_spec=spec, backend=backend
+    )
+    mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
+    mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
+
+    offset = get_mtp_layer_offset(config)
+    # split the mtp layer specs to only include the layers that are built in this pipeline stage.
+    mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
+    if len(mtp_layer_specs) > 0:
+        assert (
+            len(mtp_layer_specs) == config.mtp_num_layers
+        ), +f"currently all of the mtp layers must stage in the same pipeline stage."
+        mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
+    else:
+        mtp_block_spec = None
+
+    return mtp_block_spec
+

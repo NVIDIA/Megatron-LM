@@ -91,7 +91,7 @@ class TestMultiTokenPredictionLayer:
             assert mtp.layers[i].hnorm.weight.shape[0] == config.hidden_size
             assert mtp.layers[i].eh_proj.weight.shape[0] == config.hidden_size / tp
             assert mtp.layers[i].eh_proj.weight.shape[1] == config.hidden_size * 2
-            assert mtp.layers[i].transformer_layer is not None
+            assert mtp.layers[i].mtp_model_layer is not None
         num_weights = sum([p.numel() for p in mtp.parameters()])
         if tp == 1:
             assert num_weights == 58560 * config.mtp_num_layers
@@ -117,7 +117,7 @@ class TestMultiTokenPredictionLayer:
             assert mtp.layers[i].hnorm.weight.shape[0] == config.hidden_size
             assert mtp.layers[i].eh_proj.weight.shape[0] == config.hidden_size / tp
             assert mtp.layers[i].eh_proj.weight.shape[1] == config.hidden_size * 2
-            assert mtp.layers[i].transformer_layer is not None
+            assert mtp.layers[i].mtp_model_layer is not None
         num_weights = sum([p.numel() for p in mtp.parameters()])
         if tp == 1:
             assert num_weights == 58560 * config.mtp_num_layers
