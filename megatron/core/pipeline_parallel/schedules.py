@@ -193,7 +193,7 @@ def set_current_microbatch(model, microbatch_id):
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
             for layer in model_with_decoder.mtp.layers:
-                layer.transformer_layer.current_microbatch = microbatch_id
+                layer.mtp_model_layer.current_microbatch = microbatch_id
 
 
 def forward_step_calc_loss(
@@ -384,7 +384,7 @@ def forward_step(
 
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
-    if current_microbatch is not None:
+    if config.external_cuda_graph and current_microbatch is not None:
         set_current_microbatch(model, current_microbatch)
 
     unwrap_output_tensor = False
