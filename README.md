@@ -13,6 +13,8 @@ Megatron-LM & Megatron Core
 
 ## ⚡ Quick Start
 
+test
+
 ```bash
 # 1. Install Megatron Core with required dependencies
 pip install --no-build-isolation megatron-core[mlm,dev]
