@@ -1,8 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentError
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Optional, Union
 
 import pytest
 
@@ -397,7 +397,7 @@ class ConfigWithArgparseMeta:
 
 
 @dataclass
-class ConfigWithUnsupportedTypes:
+class ConfigWithUnsupportedCallables:
     """Config with argparse_meta metadata for testing overrides."""
 
     unsupported_type: Optional[Callable] = None
@@ -409,6 +409,19 @@ class ConfigWithUnsupportedTypes:
     """This argument should be 0, 1, or 2. The appropriate
     Callable will be set by some other logic.
     """
+
+
+@dataclass
+class ConfigWithUnsupportedUnions:
+    """Config with argparse_meta metadata for testing overrides."""
+
+    unsupported_type: Union[int, str] = 0
+    """Cannot infer type of a Union"""
+
+    unsupported_with_metadata: Union[int, str] = field(
+        default=0, metadata={"argparse_meta": {"type": str, "choices": ("foo", "bar")}}
+    )
+    """Metadata should take precedence over the exception caused by Union"""
 
 
 class TestArgumentGroupFactoryArgparseMeta:
@@ -558,22 +571,45 @@ class TestArgumentGroupFactoryArgparseMeta:
                 assert kwargs['type'] == int
                 break
 
-    def test_unhandled_unsupported_type(self):
+    def test_unhandled_unsupported_callables(self):
         """Test that an unsupported type produces a TypInferenceError."""
         parser = ArgumentParser()
         factory = ArgumentGroupFactory(
-            ConfigWithUnsupportedTypes, exclude=["unsupported_with_metadata"]
+            ConfigWithUnsupportedCallables, exclude=["unsupported_with_metadata"]
         )
 
         with pytest.raises(TypeInferenceError, match="Unsupported type"):
             factory.build_group(parser, title="Test Group")
 
-    def test_handled_unsupported_type(self):
+    def test_handled_unsupported_callables(self):
         """Test an attribute with an unsupported type that has type info in the metadata."""
         parser = ArgumentParser()
-        factory = ArgumentGroupFactory(ConfigWithUnsupportedTypes, exclude=["unsupported_type"])
+        factory = ArgumentGroupFactory(ConfigWithUnsupportedCallables, exclude=["unsupported_type"])
 
         factory.build_group(parser, title="Test Group")
 
         args = parser.parse_args(['--unsupported-with-metadata', '0'])
         assert args.unsupported_with_metadata == 0
+
+    def test_unhandled_unsupported_unions(self):
+        """Test that an unsupported type produces a TypInferenceError."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(
+            ConfigWithUnsupportedUnions, exclude=["unsupported_with_metadata"]
+        )
+
+        with pytest.raises(TypeInferenceError, match="Unions not supported by argparse"):
+            factory.build_group(parser, title="Test Group")
+
+    def test_handled_unsupported_unions(self):
+        """Test an attribute with an unsupported type that has type info in the metadata."""
+        parser = ArgumentParser(exit_on_error=False)
+        factory = ArgumentGroupFactory(ConfigWithUnsupportedUnions, exclude=["unsupported_type"])
+
+        factory.build_group(parser, title="Test Group")
+
+        args = parser.parse_args(['--unsupported-with-metadata', 'foo'])
+        assert args.unsupported_with_metadata == 'foo'
+
+        with pytest.raises(ArgumentError, match="invalid choice"):
+            args = parser.parse_args(['--unsupported-with-metadata', 'baz'])
