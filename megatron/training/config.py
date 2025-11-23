@@ -1,22 +1,22 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass, field
 import signal
-from typing import Optional, Literal
+from typing import Literal
 
 @dataclass(kw_only=True)
 class TrainingConfig:
     """Configuration settings related to the training loop."""
 
-    micro_batch_size: Optional[int] = None
+    micro_batch_size: int | None = None
     """Batch size per model instance (local batch size). Global batch size is local batch size times
     data parallel size times number of micro batches."""
 
-    global_batch_size: Optional[int] = None
+    global_batch_size: int | None = None
     """Training batch size. If set, it should be a multiple of micro-batch-size times
     data-parallel-size. If this value is None, then use micro-batch-size * data-parallel-size
     as the global batch size. This choice will result in 1 for number of micro-batches."""
 
-    rampup_batch_size: Optional[list[int]] = field(default=None, metadata={"argparse_meta": {"nargs": 3}})
+    rampup_batch_size: list[int] | None = field(default=None, metadata={"argparse_meta": {"nargs": 3}})
     """Batch size ramp up with the following values: <start batch size>, <batch size increment>,
     <ramp-up samples>
     For example:
@@ -37,25 +37,25 @@ class TrainingConfig:
     0=off, 1=moderate, 2=aggressive.
     """
 
-    check_weight_hash_across_dp_replicas_interval: Optional[int] = None
+    check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 
-    train_sync_interval: Optional[int] = None
+    train_sync_interval: int | None = None
     """Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU."""
 
-    train_iters: Optional[int] = None
+    train_iters: int | None = None
     """Total number of iterations to train over all training runs.
     Note that either train_iters or train_samples should be provided.
     """
 
-    train_samples: Optional[int] = None
+    train_samples: int | None = None
     """Total number of samples to train over all training runs.
     Note that either train_iters or train_samples should be provided."""
 
-    exit_interval: Optional[int] = None
+    exit_interval: int | None = None
     """Exit the program after the iteration is divisible by this value."""
 
-    exit_duration_in_mins: Optional[int] = None
+    exit_duration_in_mins: int | None = None
     """Exit the program after this many minutes."""
 
     exit_signal_handler: bool = False
@@ -91,11 +91,11 @@ class TrainingConfig:
 class ValidationConfig:
     """Configuration settings related to validation during or after model training."""
 
-    eval_iters: Optional[int] = 100
+    eval_iters: int | None = 100
     """Number of iterations to run for evaluation. Used for both validation and test. If not set,
     evaluation will not run."""
 
-    eval_interval: Optional[int] = None
+    eval_interval: int | None = None
     """Interval between running evaluation on validation set. If not set, evaluation will not run
     during training.
     """
