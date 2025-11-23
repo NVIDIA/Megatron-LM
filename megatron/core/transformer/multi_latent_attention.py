@@ -177,12 +177,17 @@ class MultiLatentAttention(Attention):
 
         if (
             HAVE_TE
-            and self.config.fp8
-            and self.config.fp8_recipe != 'delayed'
-            and is_te_min_version("2.6.0dev0")
             and isinstance(self.linear_proj, TELinear)
+            and (
+                (
+                    self.config.fp8
+                    and self.config.fp8_recipe != 'delayed'
+                    and is_te_min_version("2.6.0dev0")
+                )
+                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
+            )
         ):
-            # For fp8 training, the output of the fused core_attn is saved by itself, and
+            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
             # linear_proj also saves the quantized tensor of this output. Here we set the
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
@@ -781,7 +786,8 @@ class MLASelfAttention(MultiLatentAttention):
             return query, key, value
 
         if self.recompute_up_proj:
-            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=self.config.fp8)
+            quantization = self.config.fp8 or self.config.fp4
+            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             query, key, value = self.qkv_up_checkpoint.checkpoint(
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )
@@ -911,7 +917,7 @@ class MLASelfAttention(MultiLatentAttention):
         self.linear_proj.backward_dw()
 
     def set_for_recompute_input_layernorm(self):
-        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
         if self.config.q_lora_rank is not None:

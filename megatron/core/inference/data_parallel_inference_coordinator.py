@@ -9,7 +9,7 @@ from multiprocessing import Event
 
 import torch
 
-from megatron.core.inference.headers import Headers
+from megatron.core.inference.headers import Headers, UnknownHeaderError
 
 try:
     import zmq
@@ -193,7 +193,13 @@ class DataParallelInferenceCoordinator:
                         ),
                     ]
                 )
-            elif header in [Headers.PAUSE, Headers.UNPAUSE, Headers.STOP]:
+            elif header in [
+                Headers.PAUSE,
+                Headers.UNPAUSE,
+                Headers.SUSPEND,
+                Headers.RESUME,
+                Headers.STOP,
+            ]:
                 # control signals for the engine
                 # broadcast to all data parallel ranks
                 if sender_identity not in known_clients:
@@ -205,10 +211,10 @@ class DataParallelInferenceCoordinator:
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
-                finished_requests = deserialized_payload[1]
+                finished_request_records = deserialized_payload[1]
 
-                for finished_request in finished_requests:
-                    fid = finished_request["request_id"]
+                for finished_request_record in finished_request_records:
+                    fid = finished_request_record["requests"][0]["request_id"]
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]
@@ -218,10 +224,14 @@ class DataParallelInferenceCoordinator:
                         [
                             client_identity,
                             msgpack.packb(
-                                [client_request_identity, finished_request], use_bin_type=True
+                                [client_request_identity, finished_request_record],
+                                use_bin_type=True,
                             ),
                         ]
                     )
+
+            else:
+                raise UnknownHeaderError(header)
 
     @classmethod
     def entrypoint(

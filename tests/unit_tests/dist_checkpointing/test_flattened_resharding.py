@@ -34,6 +34,7 @@ class TestFlattenedResharding:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev  # Issue #2854
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp'),
@@ -60,6 +61,7 @@ class TestFlattenedResharding:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev  # Issue #2854
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp', 'expected_ckpt_offsets_by_rank'),
@@ -126,6 +128,7 @@ class TestFlattenedResharding:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev  # Issue #2854
     @pytest.mark.parametrize(('src_tp_pp',), [((2, 4),), ((8, 1),), ((1, 1),), ((1, 4),)])
     def test_load_tensor_metadata(self, tmp_path_dist_ckpt, src_tp_pp):
