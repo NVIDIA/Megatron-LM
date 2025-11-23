@@ -31,6 +31,10 @@ from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
 )
 
+from megatron.core.transformer.multi_token_prediction import (
+    tie_output_layer_state_dict,
+    tie_word_embeddings_state_dict,
+)
 
 class LanguageModule(MegatronModule):
     """Base language module that has common helper functions used across GPT, BERT etc.
@@ -250,12 +254,20 @@ class LanguageModule(MegatronModule):
             LanguageModule.embedding_warning_printed = True
 
     def shared_embedding_or_output_weight(self) -> Tensor:
-        """Gets the emedding weight or output logit weights when share embedding and output weights set to True.
+        """Gets the emedding weight or output logit weights when share embedding and output weights set to True
+          or when use Multi-Token Prediction (MTP).
 
         Returns:
-            Tensor: During pre processing it returns the input embeddings weight while during post processing it returns the final output layers weight
+            Tensor: During pre processing or MTP process it returns the input embeddings weight while during post processing it returns the final output layers weight
         """
-        if self.pre_process:
+        if self.pre_process or self.mtp_process:
+            # Multi-Token Prediction (MTP) need both embedding layer and output layer.
+            # So there will be both embedding layer and output layer in the mtp process stage.
+            # In this case, if share_embeddings_and_output_weights is True, the shared weights
+            # will be stored in embedding layer, and output layer will not have any weight.
+            assert hasattr(
+                self, 'embedding'
+            ), f"embedding is needed in this pipeline stage, but it is not initialized."
             return self.embedding.word_embeddings.weight
         elif self.post_process:
             return self.output_layer.weight
@@ -288,6 +300,25 @@ class LanguageModule(MegatronModule):
         output_layer_weight_key = f'{prefix}output_layer.weight'
         output_layer_bias_key = f'{prefix}output_layer.bias'
 
+        # Multi-Token Prediction (MTP) need both embedding layer and output layer in
+        # mtp process stage.
+        # If MTP is not placed in the pre processing stage, we need to maintain a copy of
+        # embedding layer in the mtp process stage and tie it to the embedding in the pre
+        # processing stage.
+        # Also, if MTP is not placed in the post processing stage, we need to maintain a copy
+        # of output layer in the mtp process stage and tie it to the output layer in the post
+        # processing stage.
+        if self.mtp_process and not self.pre_process:
+            emb_weight = self.embedding.word_embeddings.weight
+            tie_word_embeddings_state_dict(sharded_state_dict, emb_weight, first_stage_word_emb_key)
+
+        if self.mtp_process and not self.post_process:
+            # We only need to tie the output layer weight if share_embeddings_and_output_weights
+            # is False. Because if share_embeddings_and_output_weights is True, the shared weight
+            # will be stored in embedding layer, and output layer will not have any weight.
+            if not self.share_embeddings_and_output_weights:
+                output_layer_weight = self.output_layer.weight
+                tie_output_layer_state_dict(sharded_state_dict, output_layer_weight, output_layer_weight_key)
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
                 sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key, metadata

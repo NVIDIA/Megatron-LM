@@ -529,6 +529,9 @@ def validate_args(args, defaults={}):
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
 
+    if args.mtp_hybrid_override_pattern is not None:
+        assert args.mtp_spec is not None, "--mtp-spec must be set for mtp hybrid MTP models"
+    
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -600,6 +603,18 @@ def validate_args(args, defaults={}):
                 assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
                     'Number of layers should be divisible by the pipeline-model-parallel size'
 
+    # Validate MTP hybrid pattern segment count
+    if args.mtp_hybrid_override_pattern is not None:
+        mtp_segments = len(args.mtp_hybrid_override_pattern.split('|'))
+        expected_segments = args.pipeline_model_parallel_size * (
+            args.virtual_pipeline_model_parallel_size or 1
+        )
+        assert mtp_segments == expected_segments, (
+            f'MTP hybrid pattern has {mtp_segments} segments but expected {expected_segments} '
+            f'(PP={args.pipeline_model_parallel_size} * VP={args.virtual_pipeline_model_parallel_size or 1}). '
+            f'Use: {"|||" * (expected_segments - 1)}*E'
+        )
+    
     if args.virtual_pipeline_model_parallel_size is not None:
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
@@ -3369,6 +3384,19 @@ def _add_experimental_args(parser):
                             'hybrid ratio arguments, then the number of each type'
                             'of layer in the override pattern must match number in'
                             'the overidden pattern')
+    group.add_argument("--mtp-hybrid-override-pattern", type=str, default=None,
+                       help='Force a specific hybrid layer pattern for MTP layers. '
+                       'If a value greater than 0.0 is supplied to any of the hybrid ratio '
+                       'arguments, then the number of each type of layer in the '
+                       'override pattern must match number in the overidden '
+                       'pattern')
+    group.add_argument('--mtp-spec', type=str, default=None, nargs='*',
+                       help='Specify the <module_location function_name> pair '
+                       'that returns a spec for mtp layer to customize a model,' 
+                       'transformer block, or transformer layer, depending on '
+                       'the use case. To use local spec specify local as the argument.'
+                       'For more details, see the model class, '
+                       'TransformerBlock class, or TransformerLayer class.')
     group.add_argument('--mamba-state-dim', type=int, default=128,
                        help='State dimension for Mamba layers.')
     group.add_argument('--mamba-head-dim', type=int, default=64,
