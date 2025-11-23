@@ -570,6 +570,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             fp8_context = nullcontext()
             transformer_layer_fp8_context = nullcontext()
 
+        # TODO: currently ignoring FP4 in MTP layers because we need more numerical validation
+
         with rng_context:
             with fp8_context:
                 hidden_states = self._concat_embeddings(hidden_states, decoder_input)
