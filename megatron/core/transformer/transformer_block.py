@@ -777,6 +777,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 )
             non_homogeneous_layers = True
 
+        # Set heterogeneity of current checkpoint
+        from megatron.training.global_vars import get_args
+        args = get_args()
+        if (
+            args.ckpt_convert_heterogeneity is not None
+            and hasattr(args, 'ckpt_current_heterogeneity')
+        ):
+            non_homogeneous_layers = args.ckpt_current_heterogeneity
+
         sharded_state_dict = {}
 
         layer_prefix = f'{prefix}layers.'
