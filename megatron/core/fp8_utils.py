@@ -660,8 +660,15 @@ if HAVE_TE:
 
         @wraps(original_forward)
         def padded_forward(input_tensor, *args, **kwargs):
-            # Only do padding for fp8 if we are in fp8 context
-            if not FP8GlobalStateManager.is_fp8_enabled():
+            is_context_quantized = FP8GlobalStateManager.is_fp8_enabled()
+            if hasattr(module, "will_execute_quantized"):
+                module_uses_quant = module.will_execute_quantized(
+                    is_context_quantized
+                )
+            else:
+                module_uses_quant = is_context_quantized
+            # Only do padding for fp8 if we are in fp8 or fp4 context
+            if not module_uses_quant:
                 return original_forward(input_tensor, *args, **kwargs)
 
             # With sequence parallelism we need to all-gather before padding
