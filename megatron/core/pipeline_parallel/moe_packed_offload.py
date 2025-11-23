@@ -59,6 +59,172 @@ def set_ideal_affinity_for_current_gpu():
     pynvml.nvmlDeviceSetCpuAffinity(handle)
 
 GLOBAL_BLOCK_SIZE = 1024
+
+@triton.jit
+def _stash_copy_kernel_2d(
+    src_ptr,
+    dst_ptr,
+    num_tokens_ptr,  # Number of tokens to copy
+    alloc_offset_ptr,  # In tokens (read-only)
+    free_offset_ptr,   # In tokens (read-only)
+    capacity_ptr,      # In tokens (read-only)
+    overflow_ptr,
+    new_free_offset_ptr,  # Output: new free_offset value (written by kernel)
+    HIDDEN_SIZE: tl.constexpr,  # Hidden dimension (compile-time constant)
+    BLOCK_SIZE: tl.constexpr,   # Threads per block (for hidden dimension)
+    tokens_per_block: tl.constexpr,  # Number of tokens each block handles
+):
+    """2D Triton kernel to copy tensor data to stash buffer.
+    
+    Grid: (num_blocks,) - fixed number of blocks
+    Each block handles multiple tokens (tokens_per_block) using a while loop.
+    Works directly with contiguous 2D tensors [tokens, hidden_size].
+    Offsets are tracked in tokens, not elements.
+    """
+    pid = tl.program_id(axis=0)
+    
+    # Load parameters (in tokens, not elements)
+    num_tokens = tl.load(num_tokens_ptr)
+    alloc_offset = tl.load(alloc_offset_ptr)
+    free_offset = tl.load(free_offset_ptr)
+    capacity = tl.load(capacity_ptr)
+    
+    # All blocks check for overflow (same computation, avoids race condition)
+    if free_offset >= alloc_offset:
+        # No wraparound: available space is from free_offset to capacity, then 0 to alloc_offset
+        avail_space = capacity - (free_offset - alloc_offset)
+    else:
+        # Wraparound: available space is from free_offset to alloc_offset
+        avail_space = alloc_offset - free_offset
+    overflow_detected = avail_space < num_tokens
+    
+    # Only block 0 writes the overflow flag
+    if pid == 0 and overflow_detected:
+        tl.store(overflow_ptr, 1)
+    
+    # All blocks return early if overflow detected
+    if overflow_detected:
+        return
+    
+    # Each block handles multiple tokens
+    token_start = pid * tokens_per_block
+    token_end = min(token_start + tokens_per_block, num_tokens)
+    
+    # Process tokens assigned to this block
+    token_idx = token_start
+    while token_idx < token_end:
+        # Calculate destination token index with wraparound
+        dst_token_idx = free_offset + token_idx
+        if dst_token_idx >= capacity:
+            dst_token_idx = dst_token_idx - capacity
+        
+        # Each thread handles elements of the hidden dimension
+        elements_per_thread = HIDDEN_SIZE // BLOCK_SIZE
+        
+        # Check if we need masking (only if HIDDEN_SIZE not divisible by BLOCK_SIZE)
+        need_mask = (HIDDEN_SIZE % BLOCK_SIZE) != 0
+        num_iters = elements_per_thread + (1 if need_mask else 0)
+        
+        # 2D indexing: base + token_idx * HIDDEN_SIZE + hidden_offsets
+        src_base = src_ptr + token_idx * HIDDEN_SIZE
+        dst_base = dst_ptr + dst_token_idx * HIDDEN_SIZE
+        
+        if need_mask:
+            # Use mask for all iterations when HIDDEN_SIZE not divisible by BLOCK_SIZE
+            for iter in range(num_iters):
+                hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
+                hidden_mask = hidden_offsets < HIDDEN_SIZE
+                data = tl.load(src_base + hidden_offsets, mask=hidden_mask, other=0)
+                tl.store(dst_base + hidden_offsets, data, mask=hidden_mask)
+        else:
+            # No mask needed - HIDDEN_SIZE is multiple of BLOCK_SIZE
+            for iter in range(elements_per_thread):
+                hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
+                data = tl.load(src_base + hidden_offsets)
+                tl.store(dst_base + hidden_offsets, data)
+        
+        token_idx += 1
+    
+    # Update new_free_offset (only first block writes it)
+    if pid == 0:
+        new_free_offset = free_offset + num_tokens
+        if new_free_offset >= capacity:
+            new_free_offset = new_free_offset - capacity
+        tl.store(new_free_offset_ptr, new_free_offset)
+
+@triton.jit
+def _stash_pop_kernel_2d(
+    src_ptr,
+    dst_ptr,
+    num_tokens_ptr,    # Number of tokens to reload
+    tensor_offset_ptr,  # In tokens - where data was stashed (read-only)
+    alloc_offset_ptr,   # In tokens (read-only, not used in pop)
+    free_offset_ptr,    # In tokens (write: updated directly by kernel)
+    capacity_ptr,       # In tokens (read-only)
+    HIDDEN_SIZE: tl.constexpr,  # Hidden dimension (compile-time constant)
+    BLOCK_SIZE: tl.constexpr,   # Threads per block (for hidden dimension)
+    tokens_per_block: tl.constexpr,  # Number of tokens each block handles
+):
+    """2D Triton kernel to reload tensor data from stash buffer.
+    
+    Grid: (num_blocks,) - fixed number of blocks
+    Each block handles multiple tokens (tokens_per_block) using a while loop.
+    Works directly with contiguous 2D tensors [tokens, hidden_size].
+    Offsets are tracked in tokens, not elements.
+    Uses LIFO (stack) semantics - moves free_offset backward after popping.
+    """
+    pid = tl.program_id(axis=0)
+    
+    # Load parameters (in tokens, not elements)
+    num_tokens = tl.load(num_tokens_ptr)
+    tensor_offset = tl.load(tensor_offset_ptr)  # Where data was stashed
+    capacity = tl.load(capacity_ptr)
+    
+    # Each block handles multiple tokens
+    token_start = pid * tokens_per_block
+    token_end = min(token_start + tokens_per_block, num_tokens)
+    
+    # Process tokens assigned to this block
+    token_idx = token_start
+    while token_idx < token_end:
+        # Calculate source token index with wraparound
+        src_token_idx = tensor_offset + token_idx
+        if src_token_idx >= capacity:
+            src_token_idx = src_token_idx - capacity
+        
+        # Each thread handles elements of the hidden dimension
+        elements_per_thread = HIDDEN_SIZE // BLOCK_SIZE
+        
+        # Check if we need masking
+        need_mask = (HIDDEN_SIZE % BLOCK_SIZE) != 0
+        num_iters = elements_per_thread + (1 if need_mask else 0)
+        
+        # 2D indexing
+        src_base = src_ptr + src_token_idx * HIDDEN_SIZE
+        dst_base = dst_ptr + token_idx * HIDDEN_SIZE
+        
+        if need_mask:
+            # Use mask for all iterations when HIDDEN_SIZE not divisible by BLOCK_SIZE
+            for iter in range(num_iters):
+                hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
+                hidden_mask = hidden_offsets < HIDDEN_SIZE
+                data = tl.load(src_base + hidden_offsets, mask=hidden_mask, other=0)
+                tl.store(dst_base + hidden_offsets, data, mask=hidden_mask)
+        else:
+            # No mask needed
+            for iter in range(elements_per_thread):
+                hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
+                data = tl.load(src_base + hidden_offsets)
+                tl.store(dst_base + hidden_offsets, data)
+        
+        token_idx += 1
+    
+    # For LIFO (stack) behavior: move free_offset backward
+    # After popping, free_offset should be at tensor_offset (freeing the space we just read)
+    if pid == 0:
+        # The data was stashed at tensor_offset, so after popping, free_offset moves back to tensor_offset
+        tl.store(free_offset_ptr, tensor_offset)
+
 @triton.jit
 def _stash_copy_kernel(
     src_ptr,
@@ -227,32 +393,48 @@ def _stash_pop_kernel(
 
 class StashBuffer:
     """
-    A class to represent a stash buffer.
+    A class to represent a 2D stash buffer.
+    
+    The buffer is organized as [num_tokens, hidden_size].
+    Offsets (free_offset, alloc_offset) are tracked in tokens, not elements.
     """
 
-    def __init__(self, size, device, overflow, dtype):
-
+    def __init__(self, num_tokens, hidden_size, device, overflow, dtype):
+        """
+        Args:
+            num_tokens: Maximum number of tokens the buffer can hold
+            hidden_size: Hidden dimension size
+            device: Device for the buffer
+            overflow: Overflow flag tensor (shared across all buffers)
+            dtype: Data type
+        """
         self.buffer = None
+        self.hidden_size = hidden_size
+        self.num_tokens_capacity = num_tokens
+        
+        # Create 2D buffer [num_tokens, hidden_size]
         if os.getenv('PACKED_OFFLOAD_CPU', '0') == '1':
-            self.buffer = torch.empty(size, dtype=dtype, device='cpu', pin_memory=True)
+            self.buffer = torch.empty((num_tokens, hidden_size), dtype=dtype, device='cpu', pin_memory=True)
         else:
-            self.buffer = torch.empty(size, dtype=dtype, device=device)
-        self.overflow = overflow # GPU flag
+            self.buffer = torch.empty((num_tokens, hidden_size), dtype=dtype, device=device)
+            
+        self.overflow = overflow # GPU flag (shared)
         self.device = device
-        self.free_offset = torch.zeros(1, dtype=torch.int64, device=device) # start offset of free space
-        self.alloc_offset = torch.zeros(1, dtype=torch.int64, device=device) # start offset of allocations
+        
+        # Offsets are in TOKENS
+        self.free_offset = torch.zeros(1, dtype=torch.int64, device=device) # tail (write pointer)
+        self.alloc_offset = torch.zeros(1, dtype=torch.int64, device=device) # head (read pointer)
         self.capacity = torch.zeros(1, dtype=torch.int64, device=device)
-        self.capacity.fill_(size)
+        self.capacity.fill_(num_tokens)  # Capacity in tokens
         self.dtype = dtype
+        
     def reset(self):
-        """Reset the stash buffer."""
-        #assert self.alloc_offset.item() == self.free_offset.item(), f"alloc_offset {self.alloc_offset.item()} != free_offset {self.free_offset.item()}"
-        #print 
+        """Reset the stash buffer offsets."""
         self.free_offset.zero_()
         self.alloc_offset.zero_()
 
     def __repr__(self):
-        return f"StashBuffer(capacity={self.capacity}, device={self.device})"
+        return f"StashBuffer(capacity={self.num_tokens_capacity} tokens, hidden_size={self.hidden_size}, device={self.device}, dtype={self.dtype})"
 
 
 class PackedTensor:
@@ -269,7 +451,7 @@ class PackedTensor:
         self.max_tokens = max_tokens
         # Original tensor information
         self.original_shape = list(tensor.shape)
-        self.num_elements = tensor.numel()
+        self.max_num_tokens = self.original_shape[0]
         self.element_size = tensor.element_size()
         self.hidden_size = self.original_shape[1]
         self.dtype = tensor.dtype if not isinstance(tensor, MXFP8Tensor) else tensor._columnwise_data.dtype
@@ -307,41 +489,51 @@ class PackedTensor:
         self._tensor = self._tensor.contiguous()
         if self.num_tokens_tensor.dim() == 0:
             self.num_tokens_tensor = self.num_tokens_tensor.reshape(1)
-        num_elements_tensor = self.num_tokens_tensor.mul(self.hidden_size)
-        # Flatten the tensor to get total number of elements
-        flat_tensor = self._tensor.flatten() if not isinstance(self._tensor, MXFP8Tensor) else self._tensor._columnwise_data.flatten()
+        
+        # Get 2D tensor (no flattening)
+        if isinstance(self._tensor, MXFP8Tensor):
+            tensor_to_copy = self._tensor._columnwise_data
+        else:
+            tensor_to_copy = self._tensor
         
         # Determine grid size with cap on max blocks
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
-        max_size = flat_tensor.numel()
-        total_blocks_needed = triton.cdiv(max_size, BLOCK_SIZE)
+        total_blocks_needed = self.max_num_tokens  # Ideally 1 block per token
         
-        # Cap the number of blocks and calculate iterations per block
+        # Cap the number of blocks and calculate tokens per block
         num_blocks = min(total_blocks_needed, max_blocks)
-        num_iterations = triton.cdiv(total_blocks_needed, num_blocks)
+        tokens_per_block = triton.cdiv(self.max_num_tokens, num_blocks)
 
         if DEBUG:
-            debug_print (f"offload_to_stash ({self.layer_name}) {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} num_elements {num_elements_tensor.item()} max_blocks {max_blocks} total_blocks_needed {total_blocks_needed} num_blocks {num_blocks} num_iterations {num_iterations} oveflow {stash_buffer.overflow.item()}")
+            debug_print (f"offload_to_stash ({self.layer_name}) {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} hidden_size {self.hidden_size} max_blocks {max_blocks} num_blocks {num_blocks} tokens_per_block {tokens_per_block} overflow {stash_buffer.overflow.item()}")
         #
         grid = (num_blocks,)
         self.stash_buffer_offset = stash_buffer.free_offset.clone()
         
-        # Launch Triton kernel to copy data
+        # Create temporary tensor for new offset (kernel will write to this)
+        new_free_offset_tensor = torch.empty(1, dtype=torch.int64, device=self.device)
+        
+        # Launch Triton kernel to copy data (2D version)
         # self.offload_stream.wait_stream(torch.cuda.current_stream())
         # with torch.cuda.stream(self.offload_stream):
         # TODO: make this async. Something unexpected with TE on deallocate the tensor
-        _stash_copy_kernel[grid](
-            flat_tensor,
+        _stash_copy_kernel_2d[grid](
+            tensor_to_copy,
             stash_buffer.buffer,
-            num_elements_tensor,
-            stash_buffer.alloc_offset,  # Read-only: Write boundary
-            stash_buffer.free_offset,  # Read+Write: Start offset for next offload
-            stash_buffer.capacity,  # Read-only: Capacity of the buffer
-            stash_buffer.overflow,  # Read+Write: Over capacity flag updated by kernel
+            self.num_tokens_tensor,  # Use stored num_tokens (not from shape)
+            stash_buffer.alloc_offset,  # Read-only: Write boundary (in tokens)
+            stash_buffer.free_offset,  # Read-only: Current offset
+            stash_buffer.capacity,  # Read-only: Capacity of the buffer (in tokens)
+            stash_buffer.overflow,  # Read+Write: Over capacity flag
+            new_free_offset_tensor,  # Write: New free_offset computed by kernel
+            HIDDEN_SIZE=self.hidden_size,
             BLOCK_SIZE=BLOCK_SIZE,
-            num_iterations=num_iterations,
-            max_tokens=self.max_tokens*self.hidden_size,
+            tokens_per_block=tokens_per_block,
         )
+        
+        # Copy new offset value after kernel completes (stream-ordered)
+        stash_buffer.free_offset.copy_(new_free_offset_tensor)
+        
         # save reference to original tensor to avoid deallocation before offload is complete
         self._original_tensor = self._tensor
         # set tensor to None. This will be replaced by reload_from_stash.
@@ -366,44 +558,45 @@ class PackedTensor:
                 columnwise_scale_inv=self._original_tensor._columnwise_scale_inv,
                 quantizer=self._original_tensor._quantizer,
             )
-            flat_tensor = self._tensor._columnwise_data.flatten()
+            tensor_to_reload = self._tensor._columnwise_data
         else:
             self._tensor = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
-            flat_tensor = self._tensor.flatten()
-
-        num_elements_tensor = self.num_tokens_tensor.mul(self.hidden_size)
+            tensor_to_reload = self._tensor
+        
                 
         # Determine grid size with cap on max blocks
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
-        max_size = self.num_elements
-        total_blocks_needed = triton.cdiv(max_size, BLOCK_SIZE)
+        total_blocks_needed = self.max_num_tokens  # Ideally 1 block per token
         
-        # Cap the number of blocks and calculate iterations per block
+        # Cap the number of blocks and calculate tokens per block
         num_blocks = min(total_blocks_needed, max_blocks)
-        num_iterations = triton.cdiv(total_blocks_needed, num_blocks)
+        tokens_per_block = triton.cdiv(self.max_num_tokens, num_blocks)
         
         if DEBUG:
-            debug_print (f"reload_from_stash {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} num_elements {num_elements_tensor.item()} max_blocks {max_blocks} total_blocks_needed {total_blocks_needed} num_blocks {num_blocks} num_iterations {num_iterations}")
+            debug_print (f"reload_from_stash {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} hidden_size {self.hidden_size} max_blocks {max_blocks} num_blocks {num_blocks} tokens_per_block {tokens_per_block}")
         #
         grid = (num_blocks,)
         
         
-        # Launch Triton kernel to copy data
+        # Launch Triton kernel to copy data (2D version)
         # self.offload_stream.wait_stream(torch.cuda.current_stream())
         # with torch.cuda.stream(self.offload_stream):
 
         # TODO: make this async. Something unexpected with TE on deallocate the tensor
-        _stash_pop_kernel[grid](
+        # Note: free_offset is directly updated by the kernel (LIFO stack behavior)
+        _stash_pop_kernel_2d[grid](
             stash_buffer.buffer,
-            flat_tensor,
-            num_elements_tensor,
-            self.stash_buffer_offset,  # Read-only: Start offset for reload
-            stash_buffer.alloc_offset,  # Read+write: Free stash buffer for model chunk
-            stash_buffer.free_offset,  # Read: Start offset for offload
-            stash_buffer.capacity,  # Read-only: Capacity of the buffer
+            tensor_to_reload,
+            self.num_tokens_tensor,  # Use stored num_tokens (not from shape)
+            self.stash_buffer_offset,  # Read-only: Start offset for reload (in tokens)
+            stash_buffer.alloc_offset,  # Read-only: Not used in pop kernel
+            stash_buffer.free_offset,  # Write: Moved backward by kernel (LIFO)
+            stash_buffer.capacity,  # Read-only: Capacity of the buffer (in tokens)
+            HIDDEN_SIZE=self.hidden_size,
             BLOCK_SIZE=BLOCK_SIZE,
-            num_iterations=num_iterations,
+            tokens_per_block=tokens_per_block,
         )
+        
         #torch.cuda.synchronize()
         if DEBUG:
             debug_print (f"After reload_from_stash reload_offset {self.stash_buffer_offset.item()} alloc_offset {stash_buffer.alloc_offset.item()} free_offset {stash_buffer.free_offset.item()} capacity {stash_buffer.capacity.item()}")
@@ -511,9 +704,9 @@ class PackedOffloadManager:
         self.current_microbatch = None
         self.current_schedule_index = None
                
-        self.page_size = GLOBAL_BLOCK_SIZE
-        self.max_pages_per_vp_stage = None
-        self.temp_pages_per_vp_stage = None
+        # Track max tokens needed per vp_stage, dtype, and hidden_size
+        self.max_tokens_per_vp_stage = None
+        self.temp_tokens_per_vp_stage = None
         self.num_tokens_tensor = None
         self.max_num_tokens = None
         self.stash_buffers = None
@@ -568,7 +761,8 @@ class PackedOffloadManager:
                 
                 while len(self.packed_tensors_to_offload) > 0:
                     packed_tensor = self.packed_tensors_to_offload.pop(0)
-                    packed_tensor.offload_to_stash(self.stash_buffers[packed_tensor.vp_stage][packed_tensor.dtype])
+                    stash_buffer = self.stash_buffers[packed_tensor.vp_stage][packed_tensor.dtype][packed_tensor.hidden_size]
+                    packed_tensor.offload_to_stash(stash_buffer)
                     self.packed_tensors_to_reload[pp_schedule_layer].append(packed_tensor)
                     self.packed_tensors_offload_in_progress.append(packed_tensor)
             else:
@@ -591,23 +785,33 @@ class PackedOffloadManager:
                 debug_print(f"reload_packed_tensors {count}")
                 while len(self.packed_tensors_to_reload[pp_schedule_layer]) > 0:
                     packed_tensor = self.packed_tensors_to_reload[pp_schedule_layer].pop(0)
-                    packed_tensor.reload_from_stash(self.stash_buffers[packed_tensor.vp_stage][packed_tensor.dtype])
+                    stash_buffer = self.stash_buffers[packed_tensor.vp_stage][packed_tensor.dtype][packed_tensor.hidden_size]
+                    packed_tensor.reload_from_stash(stash_buffer)
             else:
                 pass
             assert len(self.packed_tensors_to_reload[pp_schedule_layer]) == 0, f"packed_tensors_to_reload {pp_schedule_layer} is not empty {self.packed_tensors_to_reload[pp_schedule_layer]}"
 
     
-    def allocate_offload_pages(self, stash_buffer_size_factor=1.10):
-        """Allocate offload pages for each vp stage."""
+    def allocate_offload_buffers(self, stash_buffer_size_factor=1.10):
+        """Allocate offload buffers for each vp stage, organized by [vp_stage][dtype][hidden_size]."""
         self.stash_buffers = []
         self.overflow = torch.zeros(1, dtype=torch.int64, device=self.device)
+        
         for vp_stage in range(self.vp_size):
             self.stash_buffers.append({})
-            for dtype in self.max_pages_per_vp_stage[vp_stage]:
-                self.max_pages_per_vp_stage[vp_stage][dtype] = int(self.max_pages_per_vp_stage[vp_stage][dtype] * stash_buffer_size_factor)
-                self.stash_buffers[vp_stage][dtype] = StashBuffer(self.max_pages_per_vp_stage[vp_stage][dtype]*GLOBAL_BLOCK_SIZE, self.device, self.overflow, dtype)
-                if torch.distributed.get_rank() == 0:
-                    print(f'allocated stash buffer {vp_stage} {dtype} {self.stash_buffers[vp_stage][dtype]}')
+            for dtype in self.max_tokens_per_vp_stage[vp_stage]:
+                self.stash_buffers[vp_stage][dtype] = {}
+                for hidden_size in self.max_tokens_per_vp_stage[vp_stage][dtype]:
+                    # Calculate number of tokens we can store (with safety factor)
+                    num_tokens = int(self.max_tokens_per_vp_stage[vp_stage][dtype][hidden_size] * stash_buffer_size_factor)
+                    
+                    # Create 2D buffer
+                    self.stash_buffers[vp_stage][dtype][hidden_size] = StashBuffer(
+                        num_tokens, hidden_size, self.device, self.overflow, dtype
+                    )
+                    
+                    if torch.distributed.get_rank() == 0:
+                        print(f'allocated stash buffer vp_stage={vp_stage} dtype={dtype} hidden_size={hidden_size}: {self.stash_buffers[vp_stage][dtype][hidden_size]}')
 
     def update_pp_schedule(self, vp_stage, layer_no=None, microbatch_no=None):
         """Update the pp schedule."""
@@ -658,15 +862,26 @@ class PackedOffloadManager:
         if self.status == 'capture':
 
             self.num_tokens = self.num_tokens_tensor.item()
-            num_elements = tensor.numel() * self.num_tokens // self.max_num_tokens
-            num_pages = (num_elements + self.page_size - 1) // self.page_size
 
             dtype = tensor.dtype if not isinstance(tensor, MXFP8Tensor) else tensor._columnwise_data.dtype
-            if dtype not in self.temp_pages_per_vp_stage[self.current_vp_stage]:
-                self.temp_pages_per_vp_stage[self.current_vp_stage][dtype] = 0
-                self.max_pages_per_vp_stage[self.current_vp_stage][dtype] = 0
-            self.temp_pages_per_vp_stage[self.current_vp_stage][dtype] += num_pages
-            self.max_pages_per_vp_stage[self.current_vp_stage][dtype] = max(self.max_pages_per_vp_stage[self.current_vp_stage][dtype], self.temp_pages_per_vp_stage[self.current_vp_stage][dtype])
+            # Get hidden_size from tensor shape
+            if isinstance(tensor, MXFP8Tensor):
+                hidden_size = tensor._columnwise_data.shape[1] if tensor._columnwise_data.ndim > 1 else tensor._columnwise_data.numel()
+            else:
+                hidden_size = tensor.shape[1] if tensor.ndim > 1 else tensor.numel()
+                
+            if dtype not in self.temp_tokens_per_vp_stage[self.current_vp_stage]:
+                self.temp_tokens_per_vp_stage[self.current_vp_stage][dtype] = {}
+                self.max_tokens_per_vp_stage[self.current_vp_stage][dtype] = {}
+            if hidden_size not in self.temp_tokens_per_vp_stage[self.current_vp_stage][dtype]:
+                self.temp_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size] = 0
+                self.max_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size] = 0
+                
+            self.temp_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size] += self.num_tokens
+            self.max_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size] = max(
+                self.max_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size],
+                self.temp_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size]
+            )
 
             # Since capture stage does not use CUDA graph, we can truncate the saved tensor to actual num_tokens
             # Truncate the tensor to the actual number of tokens
@@ -694,9 +909,7 @@ class PackedOffloadManager:
         if isinstance(saved_state, PackedTensor):
             if self.status == 'capture':
                 num_tokens = saved_state.num_tokens_tensor.item()
-                num_elements = saved_state.num_elements * num_tokens // self.max_num_tokens
-                num_pages = (num_elements + self.page_size - 1) // self.page_size
-                self.temp_pages_per_vp_stage[saved_state.vp_stage][saved_state.dtype] -= num_pages
+                self.temp_tokens_per_vp_stage[saved_state.vp_stage][saved_state.dtype][saved_state.hidden_size] -= num_tokens
 
                 # Pad the tensor to the max number of tokens
                 npad = self.max_num_tokens - num_tokens
@@ -743,7 +956,6 @@ def get_packed_moe_expert_offloading_context(name=None, max_num_tokens=None, num
     offload_manager = PackedOffloadManager.get_instance()
     offload_manager.max_num_tokens = max_num_tokens
     assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor)
-
     offload_manager.num_tokens_tensor = num_tokens_tensor
     offload_manager.set_current_layer_name(name) if name is not None else None
     pack_unpack_context = torch.autograd.graph.saved_tensors_hooks(offload_manager.on_save_for_backward, offload_manager.on_get_saved_tensor)
@@ -767,9 +979,9 @@ def packed_moe_expert_offloading_init_chunk_handler(vp_size, vp_stage):
         offload_manager.vp_size = vp_size
     else:
         offload_manager.vp_size = 1
-    if offload_manager.max_pages_per_vp_stage is None:
-        offload_manager.max_pages_per_vp_stage = [{} for _ in range(offload_manager.vp_size)]
-        offload_manager.temp_pages_per_vp_stage = [{} for _ in range(offload_manager.vp_size)]
+    if offload_manager.max_tokens_per_vp_stage is None:
+        offload_manager.max_tokens_per_vp_stage = [{} for _ in range(offload_manager.vp_size)]
+        offload_manager.temp_tokens_per_vp_stage = [{} for _ in range(offload_manager.vp_size)]
 
 def packed_moe_expert_offloading_set_last_layer(is_last_layer=False):
     """Set the last layer flag."""
@@ -802,9 +1014,9 @@ def packed_moe_expert_offloading_reset(enabled=True):
     elif offload_manager.status == 'capture':
         offload_manager.status = 'captured'
         stash_buffer_size_factor = float(os.getenv('STASH_BUFFER_SIZE_FACTOR', '1.10'))
-        offload_manager.allocate_offload_pages(stash_buffer_size_factor=stash_buffer_size_factor)
+        offload_manager.allocate_offload_buffers(stash_buffer_size_factor=stash_buffer_size_factor)
         debug_print(f'packed_moe_expert_offloading_reset captured schedule: {offload_manager._pp_schedule}')
-        debug_print(f'packed_moe_expert_offloading_reset max_pages_per_vp_stage: {offload_manager.max_pages_per_vp_stage}')
+        debug_print(f'packed_moe_expert_offloading_reset max_tokens_per_vp_stage: {offload_manager.max_tokens_per_vp_stage}')
     elif offload_manager.status == 'captured':
         pass
     else:
@@ -817,7 +1029,8 @@ def packed_moe_expert_offloading_reset(enabled=True):
 
         for vp_buffers in offload_manager.stash_buffers:
             for dtype in vp_buffers.keys():
-                vp_buffers[dtype].reset()
+                for hidden_size in vp_buffers[dtype].keys():
+                    vp_buffers[dtype][hidden_size].reset()
         offload_manager.overflow.zero_()
         offload_manager.current_layer = [1 for _ in range(offload_manager.vp_size)]
         offload_manager.current_microbatch = [1 for _ in range(offload_manager.vp_size)]
