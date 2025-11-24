@@ -1402,7 +1402,8 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--inference-rng-tracker', action='store_true', default=False,
                        help='Use a random number generator configured for inference.')
     group.add_argument('--te-precision-config-file', default=None,
-                       help='Configuration file to select per-module precision overrides.')
+                       help='Configuration file to select per-module precision overrides. '
+                       'See TransformerEngineMixedPrecision.md')
     return parser
 
 def _add_inference_args(parser):
