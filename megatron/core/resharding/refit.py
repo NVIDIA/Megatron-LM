@@ -8,6 +8,7 @@ import torch.distributed as dist
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core import parallel_state
 from . import build_centralized_reshard_plan, execute_reshard_plan
+from .copy_services.nccl_copy_service import NCCLCopyService
 
 
 def _unwrap_module(module: LanguageModule) -> Any:
@@ -56,6 +57,6 @@ def nccl_model_swap(src_model: LanguageModule, target_model: LanguageModule):
         setattr(tgt_core, "_cached_reshard_plan", plan)
     else:
         plan = cached_plan
-    execute_reshard_plan(plan, src_core, tgt_core)
+    execute_reshard_plan(plan, src_core, tgt_core, service=NCCLCopyService())
 
 

@@ -7,7 +7,6 @@ import torch
 import torch.distributed as dist
 
 from .utils import ReshardPlan
-from .copy_services.nccl_copy_service import NCCLCopyService
 
 
 logger = logging.getLogger(__name__)
@@ -17,9 +16,13 @@ def execute_reshard_plan(
     plan: ReshardPlan,
     src_module: torch.nn.Module,
     dst_module: torch.nn.Module,
+    service: object,
 ) -> None:
-    """Execute a reshard plan (from centralized controller)."""
-    service = NCCLCopyService()
+    """
+    Execute a reshard plan (from centralized controller).
+    A communication service must be provided to abstract transport.
+    Expected service API: submit_send(tensor, dest_rank), submit_recv(tensor, src_rank), run().
+    """
 
     src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
     dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
