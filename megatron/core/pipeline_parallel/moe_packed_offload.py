@@ -945,6 +945,36 @@ class PackedOffloadManager:
         
         return saved_state
     
+class PackedOffloadContext:
+    """Wrapper context manager that adds custom enter/exit behavior around saved_tensors_hooks."""
+    
+    def __init__(self, offload_manager):
+        self.offload_manager = offload_manager
+        self.saved_tensors_context = torch.autograd.graph.saved_tensors_hooks(
+            offload_manager.on_save_for_backward, 
+            offload_manager.on_get_saved_tensor
+        )
+    
+    def __enter__(self):
+        from megatron.core.extensions.transformer_engine import cpu_offload
+
+        if cpu_offload is not None:
+            cpu_offload.CPUOffloadEnabled = True
+        # Call the underlying context manager's __enter__
+        result = self.saved_tensors_context.__enter__()
+        
+        # Add more custom logic after entering if needed
+        return result
+    
+    def __exit__(self, *args: Any):
+        # Call the underlying context manager's __exit__
+        result = self.saved_tensors_context.__exit__(*args)
+        from megatron.core.extensions.transformer_engine import cpu_offload
+
+        if cpu_offload is not None:
+            cpu_offload.CPUOffloadEnabled = False
+        return result
+
 def packed_moe_expert_offloading_group_start(tensor, name=None):
     """Mark the start of a layer group and prepare for offload/reload."""
     rank = torch.distributed.get_rank()
@@ -958,7 +988,7 @@ def get_packed_moe_expert_offloading_context(name=None, max_num_tokens=None, num
     assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor)
     offload_manager.num_tokens_tensor = num_tokens_tensor
     offload_manager.set_current_layer_name(name) if name is not None else None
-    pack_unpack_context = torch.autograd.graph.saved_tensors_hooks(offload_manager.on_save_for_backward, offload_manager.on_get_saved_tensor)
+    pack_unpack_context = PackedOffloadContext(offload_manager)
     return pack_unpack_context
 
 def packed_moe_expert_offloading_group_commit(tensor, name=None):
