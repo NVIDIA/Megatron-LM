@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -8,6 +8,7 @@ import torch.distributed as dist
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core import parallel_state
 from . import build_centralized_reshard_plan, execute_reshard_plan
+from .copy_services.base import CopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
 
 
@@ -21,14 +22,32 @@ def _unwrap_module(module: LanguageModule) -> Any:
     )
 
 
-def swap_model_weights(src_model: LanguageModule, target_model: LanguageModule, refit_method: str):
-    if refit_method == "nccl":
-        nccl_model_swap(src_model, target_model)
+def swap_model_weights(
+    src_model: LanguageModule,
+    target_model: LanguageModule,
+    refit_method: Union[str, CopyService],
+):
+    """
+    Orchestrate weight swap/refit.
+    - refit_method can be a string backend name ('nccl') or a CopyService instance.
+    """
+    if isinstance(refit_method, CopyService):
+        service = refit_method
+    elif isinstance(refit_method, str):
+        if refit_method == "nccl":
+            service = NCCLCopyService()
+        else:
+            raise ValueError(f"Unknown refit_method '{refit_method}'")
     else:
-        raise ValueError(f"Invalid refit method: {refit_method}")
+        raise TypeError("refit_method must be a str backend name or a CopyService instance")
+    nccl_model_swap(src_model, target_model, service=service)
 
 
-def nccl_model_swap(src_model: LanguageModule, target_model: LanguageModule):
+def nccl_model_swap(
+    src_model: LanguageModule,
+    target_model: LanguageModule,
+    service: CopyService,
+):
     # Handle list-wrapped modules used throughout training utils
     src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
     tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
@@ -51,12 +70,13 @@ def nccl_model_swap(src_model: LanguageModule, target_model: LanguageModule):
         src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
 
     # caching plan for reuse
+    # TODO(Peter): Is there a better place to cache this?
     cached_plan: Optional[Any] = getattr(tgt_core, "_cached_reshard_plan", None)
     if cached_plan is None:
         plan = build_centralized_reshard_plan(src_core, tgt_core, num_experts=num_experts)
         setattr(tgt_core, "_cached_reshard_plan", plan)
     else:
         plan = cached_plan
-    execute_reshard_plan(plan, src_core, tgt_core, service=NCCLCopyService())
+    execute_reshard_plan(plan, src_core, tgt_core, service=service)
 
 

@@ -7,6 +7,7 @@ from typing import List
 import torch
 import torch.distributed as dist
 
+from .base import CopyService
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ class RecvOp:
     src_rank: int
 
 
-class NCCLCopyService:
+class NCCLCopyService(CopyService):
     """
     Thin wrapper around torch.distributed batch_isend_irecv to submit and execute
     a batch of point-to-point sends and recvs.

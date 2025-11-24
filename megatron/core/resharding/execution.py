@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 
 from .utils import ReshardPlan
+from .copy_services.base import CopyService
 
 
 logger = logging.getLogger(__name__)
@@ -16,7 +17,7 @@ def execute_reshard_plan(
     plan: ReshardPlan,
     src_module: torch.nn.Module,
     dst_module: torch.nn.Module,
-    service: object,
+    service: CopyService,
 ) -> None:
     """
     Execute a reshard plan (from centralized controller).
