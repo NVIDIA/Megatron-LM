@@ -8,7 +8,6 @@ from typing import Any, Callable, List, Literal, Optional
 import torch
 from torch.optim.optimizer import ParamsT
 
-from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank
