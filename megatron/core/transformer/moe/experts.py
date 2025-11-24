@@ -824,7 +824,6 @@ class TEGroupedMLP(MegatronModule):
         if bias_parallel is None:
             return intermediate_parallel
         shape = intermediate_parallel.shape
-
         return (
             torch.cat(
                 [
