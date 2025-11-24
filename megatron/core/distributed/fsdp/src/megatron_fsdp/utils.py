@@ -784,17 +784,16 @@ class FSDPDistributedIndex:
         if self.use_hybrid_fsdp:
             if self.outer_fsdp_group is None:
                 raise ValueError(
-                    "[FSDPDistributedIndex] Hybrid-Sharded Data Parallelism (HSDP) requires a "
-                    "DP-Outer ProcessGroup for model replication or optimizer full-sharding. "
-                    f"Check that {self.device_mesh} contains an outer DP sub-mesh.\n"
-                    f"dp_outer_dim={self.dp_outer_dim} / outer_fsdp_group={self.outer_fsdp_group}"
+                    "[FSDPDistributedIndex][use_hybrid_fsdp=True] Hybrid FSDP requires "
+                    "an outer-DP process group (dp_outer_dim, outer_fsdp_group)."
                 )
-            if self.hsdp_outer_dp_shard and self.hybrid_fsdp_group is None:
+            if self.hybrid_fsdp_group is None:
                 raise ValueError(
-                    "[FSDPDistributedIndex] Hybrid FSDP (HFSDP) requires a fully-flattened hybrid "
-                    "FSDP process group (hybrid_fsdp_group). Created by flattening the outer-DP "
+                    "[FSDPDistributedIndex][use_hybrid_fsdp=True] Hybrid FSDP requires "
+                    "a hybrid FSDP process group (hybrid_fsdp_group). "
+                    "This group can be manufactured by flattening the outer-DP "
                     "(dp_outer_dim, outer_fsdp_group) and FSDP (dp_shard_dim, fsdp_group) "
-                    "ProcessGroup(s) or sub-meshes."
+                    "process groups or sub-meshes."
                 )
 
     def get_submesh(

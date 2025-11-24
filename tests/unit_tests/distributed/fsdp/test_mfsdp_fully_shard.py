@@ -278,10 +278,7 @@ class TestMegatronFsdpFullyShard:
             dp_outer_dim=DP_OUTER if dp_outer_strategy is not None else None,
             tp_dim=TP,
             hybrid_fsdp_group=(
-                # Only need this fully-flattened group if you are using HFSDP.
-                device_mesh[HSDP].get_group()
-                if dp_outer_strategy == OPTIM
-                else None
+                device_mesh[HSDP].get_group() if dp_outer_strategy is not None else None
             ),
             fsdp_unit_modules=fsdp_unit_modules,
             zero_dp_strategy=dp_shard_strategy,
@@ -411,10 +408,7 @@ class TestMegatronFsdpFullyShard:
             dp_shard_dim=DP_SHARD_CP,
             dp_outer_dim=DP_OUTER,
             tp_dim=TP,
-            # Only need this fully-flattened group if you are using HFSDP.
-            hybrid_fsdp_group=(
-                device_mesh[HSDP].get_group() if outer_shard_strategy == OPTIM else None
-            ),
+            hybrid_fsdp_group=device_mesh[HSDP].get_group(),
             fsdp_unit_modules=fsdp_unit_modules,
             zero_dp_strategy=shard_strategy,
             outer_dp_sharding_strategy=outer_shard_strategy,
@@ -495,10 +489,7 @@ class TestMegatronFsdpFullyShard:
             dp_shard_dim=DP_SHARD_CP,
             dp_outer_dim=DP_OUTER,
             tp_dim=TP,
-            # Only need this fully-flattened group if you are using HFSDP.
-            hybrid_fsdp_group=(
-                device_mesh[HSDP].get_group() if outer_shard_strategy == OPTIM else None
-            ),
+            hybrid_fsdp_group=device_mesh[HSDP].get_group(),
             fsdp_unit_modules=fsdp_unit_modules,
             zero_dp_strategy=shard_strategy,
             outer_dp_sharding_strategy=outer_shard_strategy,
