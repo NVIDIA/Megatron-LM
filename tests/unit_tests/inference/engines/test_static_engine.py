@@ -12,7 +12,11 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import StaticInferenceEngine
-from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequestRecord,
+    InferenceRequest,
+    Status,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -188,12 +192,19 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
                 prompts = ["" for i in range(batch_size)]
             else:
                 prompts = ["sample" * (i + 1) for i in range(batch_size)]
-            results: List[InferenceRequest] = self.static_engine.generate(
-                prompts, sampling_params=SamplingParams(num_tokens_to_generate=10)
+            results: List[Union[InferenceRequest, DynamicInferenceRequestRecord]] = (
+                self.static_engine.generate(
+                    prompts, sampling_params=SamplingParams(num_tokens_to_generate=10)
+                )
             )
 
             assert len(results) == batch_size
             for result in results:
+                if isinstance(result, DynamicInferenceRequestRecord):
+                    result = result.merge(self.static_engine.controller.tokenizer)
+                assert isinstance(result, InferenceRequest), (
+                    "expected <InferenceRequest>; found <%s>." % type(result).__name__
+                )
                 assert (
                     result.status == Status.COMPLETED
                 ), f"Status should be completed but its {result.status}"

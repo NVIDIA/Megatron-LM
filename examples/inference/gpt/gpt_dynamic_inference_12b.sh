@@ -23,12 +23,10 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 : ${INCOMING_REQUESTS_PER_SEC=100.}
 
 # Dynamic context.
-: ${ACTIVE_BUFFER_SIZE_GB=50.}
+: ${BUFFER_SIZE_GB=50.}
 
 # Cuda graphs.
-: ${CUDA_GRAPH_IMPL=local}
 : ${NUM_CUDA_GRAPHS=16}
-: ${CUDA_GRAPH_SHARE_IO_BUFFERS=1}
 
 # Miscellaneous.
 : ${USE_COORDINATOR=0}
@@ -76,7 +74,7 @@ ARGS=" \
     --inference-rng-tracker \
     \
     --inference-dynamic-batching \
-    --inference-dynamic-batching-active-buffer-size-gb ${ACTIVE_BUFFER_SIZE_GB} \
+    --inference-dynamic-batching-buffer-size-gb ${BUFFER_SIZE_GB} \
     \
     ${EXTRA_ARGS} \
 "
@@ -86,6 +84,10 @@ if [ "${NUM_CUDA_GRAPHS}" != "0" ]; then
     ARGS+=" \
         --cuda-graph-impl local \
         --inference-dynamic-batching-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
+    "
+else
+    ARGS+=" \
+        --cuda-graph-impl none \
     "
 fi
 

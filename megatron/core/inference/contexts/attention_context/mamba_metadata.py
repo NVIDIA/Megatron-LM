@@ -1,6 +1,26 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
 import torch
+
+
+@dataclass
+class MambaInferenceStateConfig:
+    """Config for initializing Mamba model inference state tensors."""
+
+    layer_type_list: List[str]
+    """
+    A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
+    See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list of symbols.
+    """
+
+    mamba_conv_states_shape: Tuple[int]
+    """Mamba conv states shape per request."""
+
+    mamba_ssm_states_shape: Tuple[int]
+    """Mamba ssm states shape per request."""
 
 
 class MambaMetadata:
@@ -64,7 +84,7 @@ class MambaMetadata:
         """
         self.request_to_mamba_state_idx_cudagraph_only[0:num_active_requests] = active_mamba_indices
 
-    def allocate_slot(self) -> int:
+    def allocate_slot(self) -> Optional[int]:
         """
         Allocates a new slot for a request in the Mamba state buffers.
 

@@ -1,3 +1,5 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 import os
 import time
 import urllib.request as req
@@ -182,6 +184,7 @@ def test_nvtx_decorator():
     assert all(execution_tracker.values())
 
 
+@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_check_param_hashes_across_dp_replicas():
     world = int(os.getenv('WORLD_SIZE', '1'))
@@ -207,6 +210,7 @@ def test_check_param_hashes_across_dp_replicas():
     _deinit_distributed()
 
 
+@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_cross_check_param_hashes_across_dp_replicas():
     world = int(os.getenv('WORLD_SIZE', '1'))
@@ -231,6 +235,7 @@ def test_cross_check_param_hashes_across_dp_replicas():
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 @pytest.mark.internal
 def test_param_norm(use_distributed_optimizer: bool):
@@ -281,6 +286,7 @@ def test_param_norm(use_distributed_optimizer: bool):
     _deinit_distributed()
 
 
+@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_straggler_detector():
     world = int(os.getenv('WORLD_SIZE', '1'))

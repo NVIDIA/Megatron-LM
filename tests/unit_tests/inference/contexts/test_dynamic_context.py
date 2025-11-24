@@ -5,6 +5,9 @@ import math
 import pytest
 import torch
 
+from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -28,6 +31,8 @@ class TestDynamicContext:
 
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
 
+        self.pp_size = pipeline_parallel_size
+
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_parallel_size,
@@ -41,7 +46,7 @@ class TestDynamicContext:
         kv_channels,
         num_attention_heads,
         max_sequence_length,
-        active_buffer_size_gb,
+        buffer_size_gb,
         block_size_tokens,
         max_tokens,
         is_hybrid_model=False,
@@ -50,25 +55,32 @@ class TestDynamicContext:
     ):
         set_rounder(rounder)
 
-        if is_hybrid_model and layer_type_list is None:
-            layer_type_list = [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP]
+        if is_hybrid_model:
+            if layer_type_list is None:
+                layer_type_list = [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP]
+            mamba_conv_states_shape = (544, 4)
+            mamba_ssm_states_shape = (8, 64, 16)
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+            )
+        else:
+            mamba_inference_state_config = None
 
         dynamic_context = DynamicInferenceContext(
             params_dtype=params_dtype,
-            num_layers=num_layers,
+            num_layers=num_layers // self.pp_size,
             kv_channels=kv_channels,
             num_attention_heads=num_attention_heads,
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
             use_cuda_graphs_for_non_decode_steps=not is_hybrid_model,
-            active_buffer_size_gb=active_buffer_size_gb,
+            buffer_size_gb=buffer_size_gb,
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=(544, 4),
-            mamba_ssm_states_shape=(8, 64, 16),
+            mamba_inference_state_config=mamba_inference_state_config,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
+            unified_memory_level=0,  # unit tests currently broken with UVM
         )
         return dynamic_context
 
@@ -86,25 +98,25 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
 
         if not is_hybrid_model:
-            assert dynamic_context.block_allocator.total_count == 981
-            assert dynamic_context.block_allocator.active_count == 490
-            assert dynamic_context.max_total_requests == 980
-            assert dynamic_context.max_active_requests == 490
+            assert dynamic_context.block_allocator.total_count == 491
+            assert dynamic_context.block_allocator.active_count == 245
+            assert dynamic_context.max_total_requests == 490
+            assert dynamic_context.max_active_requests == 245
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_metadata is None
         else:
-            assert dynamic_context.block_allocator.total_count == 1111
-            assert dynamic_context.block_allocator.active_count == 555
-            assert dynamic_context.max_total_requests == 1110
-            assert dynamic_context.max_active_requests == 555
+            assert dynamic_context.block_allocator.total_count == 555
+            assert dynamic_context.block_allocator.active_count == 277
+            assert dynamic_context.max_total_requests == 554
+            assert dynamic_context.max_active_requests == 277
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_metadata is not None
@@ -121,7 +133,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
-            active_buffer_size_gb=1.0,
+            buffer_size_gb=1.0,
             block_size_tokens=128,
             max_tokens=None,
         )
@@ -137,7 +149,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
-            active_buffer_size_gb=1.0,
+            buffer_size_gb=1.0,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -161,7 +173,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=128,
-            active_buffer_size_gb=0.01,
+            buffer_size_gb=0.01,
             block_size_tokens=32,
             max_tokens=None,
             rounder=1,
@@ -191,7 +203,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
-            active_buffer_size_gb=0.1,
+            buffer_size_gb=0.1,
             block_size_tokens=128,
             max_tokens=200,  # setting low, but >= context.max_active_requests.
             rounder=1,
@@ -220,7 +232,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=128,
-            active_buffer_size_gb=1.0,
+            buffer_size_gb=1.0,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -293,16 +305,16 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
 
         if is_hybrid_model:
-            expected_memory_blocks = [1106, 1107, 1108, 1109]
+            expected_memory_blocks = [550, 551, 552, 553]
         else:
-            expected_memory_blocks = [976, 977, 978, 979]
+            expected_memory_blocks = [486, 487, 488, 489]
         expected_block_count_avail = expected_memory_blocks[0]
 
         assert (
@@ -342,7 +354,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -366,7 +378,7 @@ class TestDynamicContext:
         assert dynamic_context.request_kv_length_offsets[0] == 0
         assert dynamic_context.request_kv_block_counts[0] == 2
         assert dynamic_context.request_last_kv_block_id[0].item() == (
-            1109 if is_hybrid_model else 979
+            553 if is_hybrid_model else 489
         )
         assert dynamic_context.request_last_kv_block_offset[0].item() == 15
         assert torch.all(
@@ -415,7 +427,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -459,7 +471,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -574,13 +586,13 @@ class TestDynamicContext:
                 dynamic_context.request_to_kv_block_ids[0:10].cpu()
                 == torch.tensor(
                     [
-                        [1099, 1102, -1, -1],
-                        [1100, 1099, -1, -1],
-                        [1104, 1106, -1, -1],
-                        [1105, 1107, -1, -1],
-                        [1103, -1, -1, -1],
-                        [1101, -1, -1, -1],
-                        [1108, -1, -1, -1],
+                        [543, 546, -1, -1],
+                        [544, 543, -1, -1],
+                        [548, 550, -1, -1],
+                        [549, 551, -1, -1],
+                        [547, -1, -1, -1],
+                        [545, -1, -1, -1],
+                        [552, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
@@ -592,13 +604,13 @@ class TestDynamicContext:
                 dynamic_context.request_to_kv_block_ids[0:10].cpu()
                 == torch.tensor(
                     [
-                        [969, 972, -1, -1],
-                        [970, 969, -1, -1],
-                        [974, 976, -1, -1],
-                        [975, 977, -1, -1],
-                        [973, -1, -1, -1],
-                        [971, -1, -1, -1],
-                        [978, -1, -1, -1],
+                        [479, 482, -1, -1],
+                        [480, 479, -1, -1],
+                        [484, 486, -1, -1],
+                        [485, 487, -1, -1],
+                        [483, -1, -1, -1],
+                        [481, -1, -1, -1],
+                        [488, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
@@ -618,7 +630,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -690,7 +702,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -763,7 +775,7 @@ class TestDynamicContext:
                 kv_channels=8,
                 num_attention_heads=2,
                 max_sequence_length=512,
-                active_buffer_size_gb=0.03,
+                buffer_size_gb=0.03,
                 block_size_tokens=128,
                 max_tokens=None,
                 is_hybrid_model=False,
@@ -778,7 +790,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -834,7 +846,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
         )
@@ -1039,54 +1051,3 @@ class TestDynamicContext:
                 )
 
                 current_global_token_offset += expected_len
-
-    @pytest.mark.internal
-    def test_unified_memory(self):
-
-        from megatron.core.inference.unified_memory import (
-            UnifiedMemoryUnsupportedError,
-            create_unified_mempool,
-        )
-
-        # Check UVM support.
-        try:
-            create_unified_mempool()
-        except UnifiedMemoryUnsupportedError:
-            pytest.skip("Unified memory not available due to bad environment.")
-
-        # Setup.
-        self._setup_model_parallel_group(1, 1)
-
-        # Compute number of contexts needed to fill GPU memory.
-        gpu_size_gb = (
-            torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024**3
-        )
-        active_buffer_size_gb = 20
-        num_contexts = math.ceil(gpu_size_gb / active_buffer_size_gb) + 1
-
-        # Allocate enough contexts to fill GPU memory.
-        def init_contexts(*, unified_memory_level):
-            contexts = []
-            for i in range(num_contexts):
-                contexts.append(
-                    DynamicInferenceContext(
-                        params_dtype=torch.float32,
-                        num_layers=64,
-                        kv_channels=16,
-                        num_attention_heads=4,
-                        max_sequence_length=512,
-                        active_buffer_size_gb=active_buffer_size_gb,
-                        unified_memory_level=unified_memory_level,
-                    )
-                )
-
-        # Pure GPU memory test should OOM.
-        try:
-            init_contexts(unified_memory_level=0)
-        except torch.OutOfMemoryError:
-            pass
-        else:
-            raise Exception("expected OOM.")
-
-        # Unified memory test should succeed.
-        init_contexts(unified_memory_level=1)

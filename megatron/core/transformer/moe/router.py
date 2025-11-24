@@ -1,10 +1,11 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
 
+from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -468,6 +469,16 @@ class TopKRouter(Router):
         else:
             return input
 
+    @jit_fuser
+    def _apply_expert_bias(self, routing_map: torch.Tensor):
+        """
+        Update expert bias and tokens_per_expert
+        Prevent extra local tokens accumulation on evaluation or activation recomputation
+        """
+        if self.enable_expert_bias and torch.is_grad_enabled():
+            with torch.no_grad():
+                self.local_tokens_per_expert += routing_map.sum(dim=0)
+
     def routing(self, logits: torch.Tensor):
         """Top-k routing function
 
@@ -526,11 +537,8 @@ class TopKRouter(Router):
                 probs, scores_for_aux_loss, routing_map_for_aux_loss
             )
 
-        # Update expert bias and tokens_per_expert
-        # Prevent extra local tokens accumulation on evaluation or activation recomputation
-        if self.enable_expert_bias and torch.is_grad_enabled():
-            with torch.no_grad():
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+        # Optionally apply expert bias
+        self._apply_expert_bias(routing_map)
 
         return probs, routing_map
 
