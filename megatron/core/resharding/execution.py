@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import logging
+from typing import List, Tuple
+
+import torch
+import torch.distributed as dist
+
+from .utils import ReshardPlan
+from .copy_services.nccl_copy_service import NCCLCopyService
+
+
+logger = logging.getLogger(__name__)
+
+
+def execute_reshard_plan(
+    plan: ReshardPlan,
+    src_module: torch.nn.Module,
+    dst_module: torch.nn.Module,
+) -> None:
+    """Execute a reshard plan (from centralized controller)."""
+    service = NCCLCopyService()
+
+    src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
+    dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
+
+    #TODO(Peter) do this on like a separate stream?
+    # Execute local copies
+    for param_name, src_param, dst_param, src_slice, dst_slice in plan.local_copy_ops:
+        if src_param is None:
+            src_param = src_params.get(param_name)
+        if dst_param is None:
+            dst_param = dst_params.get(param_name)
+        if src_param is not None and dst_param is not None:
+            with torch.no_grad():
+                src_view = src_param.data[src_slice]
+                dst_view = dst_param.data[dst_slice]
+                dst_view.copy_(src_view)
+
+    # Submit sends
+    for op in plan.send_ops:
+        src_param = src_params.get(op.param_name)
+        if src_param is not None:
+            src_view = src_param.data[op.my_slice].contiguous()
+            service.submit_send(src_view, op.peer_rank)
+
+    # Submit recvs
+    recv_writebacks: List[Tuple[torch.Tensor, torch.nn.Parameter, tuple[slice, ...]]] = []
+    for op in plan.recv_ops:
+        dst_param = dst_params.get(op.param_name)
+        if dst_param is not None:
+            dst_slice_view = dst_param.data[op.my_slice]
+            recv_buffer = torch.empty_like(dst_slice_view.contiguous())
+            service.submit_recv(recv_buffer, op.peer_rank)
+            recv_writebacks.append((recv_buffer, dst_param, op.my_slice))
+
+    # Execute
+    logger.info(f"Executing {len(plan.send_ops)} sends + {len(plan.recv_ops)} recvs")
+    service.run()
+    #TODO(Peter) remove this eventually?
+    dist.barrier()
+    torch.cuda.synchronize()
+
+    # Write back received buffers into their destination parameter slices
+    for recv_buffer, dst_param, dst_slice in recv_writebacks:
+        with torch.no_grad():
+            dst_param.data[dst_slice].copy_(recv_buffer)
+
+    logger.info("Reshard complete")
+
+
