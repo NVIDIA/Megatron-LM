@@ -170,7 +170,7 @@ class RealQuantTransformerLayer(TransformerLayer):
     """Real quantization transformer layer base class.
 
     This base class iniitialize the default TransformerLayer and immediately
-    perform weight-only real quantization via TensorRT Model Optimizer.
+    perform weight-only real quantization via Model Optimizer.
     All linear weights (Linear, ColumnParallelLinear, RowParallelLinear) picked
     up will be replaced with low-bit data type (default torch.uint8). If sub-byte
     real_quant_cfg is used, the weight shape will further be half.

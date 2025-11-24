@@ -1,8 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Example script for pruning a GPT / Mamba model using TensorRT Model Optimizer (ModelOpt).
+"""Example script for pruning a GPT / Mamba model using Model Optimizer (ModelOpt).
 
-Read more about ModelOpt pruning at https://github.com/NVIDIA/TensorRT-Model-Optimizer/tree/main/examples/pruning
+Read more about ModelOpt pruning at https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning
 """
 
 import functools
