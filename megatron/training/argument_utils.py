@@ -2,6 +2,7 @@
 
 import dataclasses
 import typing
+import types
 from typing import Any, Optional
 from argparse import ArgumentParser, _ArgumentGroup
 import inspect
@@ -93,7 +94,7 @@ class ArgumentGroupFactory:
         if origin is None:
             return {"type": config_type}
 
-        if origin is typing.Union:
+        if origin in [types.UnionType, typing.Union]:
             # Handle Optional and Union
             if type_tuple[1] == type(None): # Optional type. First element is value inside Optional[]
                 return self._extract_type(type_tuple[0])

@@ -42,6 +42,12 @@ class ConfigWithOptional:
     optional_str: Optional[str] = "default"
     """An optional string with default"""
 
+    int_new_form: int | None = None
+    """Optional using new syntax"""
+
+    str_new_form: str | None = "default"
+    """Optional string using new syntax"""
+
 
 @dataclass
 class ConfigWithList:
