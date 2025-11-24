@@ -1,9 +1,11 @@
 from __future__ import annotations
+"""
+High-level refit/reshard orchestration:
+- swap_model_weights: public API; accepts a backend name or CopyService and delegates.
+- reshard_model_weights: transport-agnostic core; builds/caches plan and executes.
+"""
 
 from typing import Any, Optional, Union
-
-import torch
-import torch.distributed as dist
 
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core import parallel_state
@@ -33,17 +35,19 @@ def swap_model_weights(
     """
     if isinstance(refit_method, CopyService):
         service = refit_method
+        reshard_model_weights(src_model, target_model, service=service)
     elif isinstance(refit_method, str):
         if refit_method == "nccl":
             service = NCCLCopyService()
+            reshard_model_weights(src_model, target_model, service=service)
         else:
             raise ValueError(f"Unknown refit_method '{refit_method}'")
     else:
         raise TypeError("refit_method must be a str backend name or a CopyService instance")
-    nccl_model_swap(src_model, target_model, service=service)
+    
 
 
-def nccl_model_swap(
+def reshard_model_weights(
     src_model: LanguageModule,
     target_model: LanguageModule,
     service: CopyService,
@@ -70,7 +74,7 @@ def nccl_model_swap(
         src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
 
     # caching plan for reuse
-    # TODO(Peter): Is there a better place to cache this?
+    # TODO(Peter): Find a better place to cache this.
     cached_plan: Optional[Any] = getattr(tgt_core, "_cached_reshard_plan", None)
     if cached_plan is None:
         plan = build_centralized_reshard_plan(src_core, tgt_core, num_experts=num_experts)

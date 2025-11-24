@@ -63,7 +63,6 @@ def execute_reshard_plan(
     service.run()
     #TODO(Peter) remove this eventually?
     dist.barrier()
-    torch.cuda.synchronize()
 
     # Write back received buffers into their destination parameter slices
     for recv_buffer, dst_param, dst_slice in recv_writebacks:

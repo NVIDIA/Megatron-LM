@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import logging
 import math
-import sys
-import traceback
 from typing import Optional
 
 import torch
@@ -212,7 +210,6 @@ def build_centralized_reshard_plan(
     src_module: torch.nn.Module,
     dst_module: torch.nn.Module,
     num_experts: int = None,
-    validate_config: bool = True,
 ) -> ReshardPlan:
     """
     Centralized planning: Rank 0 builds complete plan for all ranks, then scatters.
@@ -228,19 +225,16 @@ def build_centralized_reshard_plan(
     if not hasattr(src_pg, 'dp'):
         raise ValueError("src_pg must have dp process group")
 
-    src_num_experts = num_experts
-    dst_num_experts = num_experts
-
     # Gather param metadata from all ranks
     my_src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
     my_dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
 
     my_src_metadata = [
-        extract_param_metadata(p, name, my_global_rank, src_pg, num_experts=src_num_experts)
+        extract_param_metadata(p, name, my_global_rank, src_pg, num_experts=num_experts)
         for name, p in my_src_params.items()
     ]
     my_dst_metadata = [
-        extract_param_metadata(p, name, my_global_rank, dst_pg, num_experts=dst_num_experts)
+        extract_param_metadata(p, name, my_global_rank, dst_pg, num_experts=num_experts)
         for name, p in my_dst_params.items()
     ]
 
