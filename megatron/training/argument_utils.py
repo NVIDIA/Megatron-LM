@@ -19,7 +19,35 @@ class TypeInferenceError(Exception):
 class ArgumentGroupFactory:
     """Utility that adds an argument group to an ArgumentParser based on the attributes of a dataclass.
 
-    This class can be overriden as needed to support dataclasses
+    This utility uses dataclass metadata including type annotations and docstrings to automatically
+        infer the type, default, and other argparse keyword arguments.
+
+    You can override or supplement the automatically inferred argparse kwargs for any 
+        dataclass field by providing an "argparse_meta" key in the field's metadata dict.
+        The value should be a dict of kwargs that will be passed to ArgumentParser.add_argument().
+        These metadata kwargs take precedence over the automatically inferred values.
+
+        Example:
+            @dataclass
+            class YourConfig:
+                your_attribute: int | str | None = field(
+                    default=None,
+                    metadata={
+                        "argparse_meta": {
+                            "arg_names": ["--your-arg-name1", "--your-arg-name2"],
+                            "type": str,
+                            "nargs": "+",
+                            "default": "foo",
+                        }
+                    },
+                )
+
+        In this example, inferring the type automatically would fail, as Unions are
+        not supported. However the metadata is present, so that takes precedence.
+        Any keyword arguments to `ArgumentParser.add_argument()` can be included in
+        the "argparse_meta" dict, as well as "arg_names" for the argument flag name.
+
+    This class can also be used as a base class and extended as needed to support dataclasses
         that require some customized or additional handling.
 
     Args:
