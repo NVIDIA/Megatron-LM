@@ -200,8 +200,6 @@ def get_megatron_muon_optimizer(
     # before this function receive properly created collection
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
