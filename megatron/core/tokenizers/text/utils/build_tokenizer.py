@@ -21,6 +21,10 @@ def build_tokenizer(args):
             kwargs = special_tokens
         kwargs['vocab_file'] = args.vocab_file
         kwargs['merges_file'] = args.merge_file
+        kwargs['additional_special_tokens'] = args.special_tokens
+        kwargs['use_fast'] = args.hf_use_fast
+        kwargs['trust_remote_code'] = args.trust_remote_code
+        kwargs['include_special_tokens'] = args.hf_include_special_tokens
     elif args.tokenizer_type in SP_TOKENIZERS:
         tokenizer_library = 'sentencepiece'
         tokenizer_path = args.tokenizer_model
