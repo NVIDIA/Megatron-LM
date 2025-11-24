@@ -74,6 +74,10 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
+# >>>
+from lutil import pax
+# <<<
+
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -289,6 +293,10 @@ def run_inference(
         """
         nonlocal num_requests_added
         _request = requests[num_requests_added]
+        # >>>
+        # if num_requests_added == 2 and _request.output_text is not None:
+        #     pax("_request")
+        # <<<
         engine.add_request(
             num_requests_added,
             _request.prompt_text,
@@ -373,13 +381,13 @@ def run_inference(
                 finished_request = finished_request_record.merge()
                 # >>>
                 # if finished_request.prompt == "The inventor of the GPU is":
-                if finished_request.request_id == 2:
-                    print("................................. request 2.")
-                    # from lutil import pax
+                if True or finished_request.request_id == 2:
+                    print(f"................................. request {finished_request.request_id}.")
                     # pax("finished_request", {
                     #     "prompt" : finished_request.prompt,
                     #     "generated_text" : finished_request.generated_text,
                     #     "generated text'" : engine.controller.tokenizer.detokenize(finished_request.generated_tokens),
+                    #     "request" : requests[finished_request.request_id],
                     # })
                 # <<<
 
@@ -390,7 +398,7 @@ def run_inference(
                 request.request_id = finished_request.request_id
 
                 # Update prompt, in case engine has been suspended and resumed.
-                request.prompt_tokens = finished_request.prompt_tokens
+                request.prompt_tokens = finished_request.prompt_tokens.tolist()
                 request.prompt_text = finished_request.prompt
 
                 # Get output tokens and text.
@@ -400,7 +408,6 @@ def run_inference(
 
                 # >>>
                 # if request.prompt_text == "The inventor of the GPU is":
-                #     from lutil import pax
                 #     pax("finished_request, request")
                 # <<<
 
@@ -417,7 +424,7 @@ def run_inference(
             break
 
     # >>>
-    print({"requests / 2": requests[2]})
+    # pax({"requests / 2": requests[2]})
     # <<<
 
     return {
@@ -503,10 +510,30 @@ def main():
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
     for _ in range(args.inference_repeat_n):
+        # >>>
+        # Reset requests for correct output when using inference_repeat_n > 1.
+        # [ r.reset() for r in requests ]
+        for request in requests:
+            if request.output_text is not None:
+                pax({"sampling_params": request.sampling_params})
+            # request.prompt_text     = 'The inventor of the GPU is'.
+            # request.prompt_tokens   = list([9376]; [464, 33475, 286, 262, 11362, 318]).
+            # request.sampling_params = SamplingParams([0384]; SamplingParams(temperature=1.0, top_k=1, top_p=0.0, return_log_probs=True,  ... 50256, top_n_logprobs=0, return_prompt_top_n_logprobs=False, add_BOS=False)).
+            # request.time_offset     = 0.0034695290311770443
+
+
+
+            request.output_text     = None
+            request.output_tokens   = []
+            request.state           = 'not-started'
+            request.time_arrival    = None
+            request.time_end        = None
+            request.time_start      = None
+        # <<<
         t = get_curr_time()
         result = run_inference(requests, engine)
         # >>>
-        print({"requests / 2": requests[2]})
+        # pax({"requests / 2": requests[2]})
         # <<<
         step_times = result["step_times"]
         add_times = result["add_times"]
@@ -517,6 +544,9 @@ def main():
         stats = torch.cuda.memory_stats()
         throughput = total_output_tokens / total_time
         throughputs.append(throughput)
+    # >>>
+    pax({"requests / 2": requests[2]})
+    # <<<
 
     # Validate all requests finished.
     for request in requests:
@@ -537,7 +567,6 @@ def main():
         for request_idx, request in enumerate(requests):
             # >>>
             if request.prompt_text == "The inventor of the GPU is":
-                from lutil import pax
                 pax("request")
             # <<<
             unique_prompt_map[request.prompt_text].append(request_idx)
