@@ -191,17 +191,22 @@ class FullCudaGraphWrapper:
             if training_str == 'training':
                 packed_moe_expert_offloading_reset(enabled=self.packed_moe_expert_offloading)
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
-
-        # Check if there is any overflow in the receiving buffer
-        # TODO: Hacky for now. Will improve this after moving the budget check logic into HybridEP
-        for model_chunk in model:
-            for layer in model_chunk.module.module.decoder.layers:
-                mlp = layer.mlp
-                if hasattr(mlp, 'token_dispatcher'):
-                    if not mlp.token_dispatcher.under_budget.item():
-                        raise Exception(f"Rank {torch.distributed.get_rank()} overbudget")
+        self.speculative_cuda_graph_check(model)
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
+
+    def speculative_cuda_graph_check(self, model):
+        ''' check speculative execution modules '''
+        if self.packed_moe_expert_offloading:
+            # Check if there is any overflow in the receiving buffer
+            over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+            for model_chunk in model:
+                for layer in model_chunk.module.module.decoder.layers:
+                    mlp = layer.mlp
+                    if hasattr(mlp, 'token_dispatcher') and hasattr(mlp.token_dispatcher, 'check_over_budget'):
+                        over_budget |= mlp.token_dispatcher.check_over_budget()
+            if over_budget.item():
+                raise Exception(f"Rank {torch.distributed.get_rank()} overbudget")
 
     def curr_iter(self, stage):
         """Return current training/validation iteration."""
