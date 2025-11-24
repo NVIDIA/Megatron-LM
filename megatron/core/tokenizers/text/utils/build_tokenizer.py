@@ -24,6 +24,8 @@ def build_tokenizer(args):
     elif args.tokenizer_type in SP_TOKENIZERS:
         tokenizer_library = 'sentencepiece'
         tokenizer_path = args.tokenizer_model
+        kwargs['legacy'] = args.sentencepiece_legacy
+        kwargs['special_tokens'] = args.special_tokens
     elif args.tokenizer_type == 'TikTokenizer':
         tokenizer_library = 'tiktoken'
         tokenizer_path = args.tokenizer_model
@@ -38,6 +40,9 @@ def build_tokenizer(args):
         tokenizer_path = args.tokenizer_model
         kwargs['vocab_file'] = args.vocab_file
         kwargs['merges_file'] = args.merge_file
+        kwargs['additional_special_tokens'] = args.special_tokens
+        kwargs['use_fast'] = args.huggingface_use_fast
+        kwargs['trust_remote_code'] = args.trust_remote_code
     elif args.tokenizer_type == 'NullTokenizer':
         tokenizer_library = 'null'
         metadata = {'library': tokenizer_library}
