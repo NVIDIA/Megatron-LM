@@ -76,7 +76,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}',
             )
             size = [grad.size(-2), grad.size(-1)]
-            if partition_dim:
+            if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
             orth_grad = newton_schulz_tp(
                 grad,
@@ -130,8 +130,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             tp_group = None
         partition_dim = None if self.mode == "blockwise" else getattr(p, "partition_dim", None)
         if partition_dim == -1:
-            # llm-shower use different default value for partition_dim than TE.
-            # Because -1 is a valid index for ndarray, we decided to not overload it.
+            # emerging-optimizers use None instead of -1 to indicate no tensor parallel
             partition_dim = None
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
