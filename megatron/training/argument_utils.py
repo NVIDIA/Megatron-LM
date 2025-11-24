@@ -9,6 +9,7 @@ import inspect
 import itertools
 import builtins
 import ast
+import enum
 from dataclasses import Field, fields
 
 # TODO: support arg renames
@@ -81,6 +82,17 @@ class ArgumentGroupFactory:
         arg_name = "--" + arg_name.replace("_", "-")
         return arg_name
 
+    def _get_enum_kwargs(self, config_type: enum.EnumMeta) -> dict[str, Any]:
+        """Build kwargs for Enums.
+
+        With these settings, the user must provide a valid enum value, e.g.
+            'flash', for `AttnBackend.flash`.
+        """
+        def enum_type_handler(cli_arg):
+            return config_type[cli_arg]
+
+        return {"type": enum_type_handler, "choices": list(config_type)}
+
     def _extract_type(self, config_type: type) -> dict[str, Any]:
         """Determine the type, nargs, and choices settings for this argument.
 
@@ -89,6 +101,9 @@ class ArgumentGroupFactory:
         """
         origin = typing.get_origin(config_type)
         type_tuple = typing.get_args(config_type)
+
+        if isinstance(config_type, type) and issubclass(config_type, enum.Enum):
+            return self._get_enum_kwargs(config_type)
 
         # Primitive type
         if origin is None:

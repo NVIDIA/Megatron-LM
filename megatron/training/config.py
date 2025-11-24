@@ -61,7 +61,7 @@ class TrainingConfig:
     exit_signal_handler: bool = False
     """Dynamically save the checkpoint and shutdown the training if SIGTERM is received"""
 
-    exit_signal: int = int(signal.SIGTERM)
+    exit_signal: signal.Signals = signal.SIGTERM
     """Signal for the signal handler to detect."""
 
     exit_signal_handler_for_dataloader: bool = False

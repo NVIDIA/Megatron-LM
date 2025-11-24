@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import signal
 from argparse import ArgumentError, ArgumentParser
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional, Union
@@ -27,6 +28,9 @@ class DummyConfig:
 
     disabled_feature: bool = True
     """Feature that is disabled by default"""
+
+    enum_setting: signal.Signals = signal.SIGTERM
+    """Setting with enum type to test enum handling"""
 
 
 @dataclass
@@ -179,6 +183,24 @@ class TestArgumentGroupFactoryBasic:
         assert factory.field_docstrings['name'] == "Name of the configuration"
         assert factory.field_docstrings['count'] == "Number of items"
         assert factory.field_docstrings['learning_rate'] == "Learning rate for training"
+
+    def test_enum_handling(self):
+        """Test that enum types are handled correctly."""
+        parser = ArgumentParser(exit_on_error=False)
+        factory = ArgumentGroupFactory(DummyConfig)
+
+        factory.build_group(parser, title="Test Group")
+
+        args = parser.parse_args([])
+        assert args.enum_setting == signal.SIGTERM
+
+        # test a different valid enum value
+        args = parser.parse_args(["--enum-setting", "SIGINT"])
+        assert args.enum_setting == signal.SIGINT
+
+        # test an invalid enum value
+        with pytest.raises(KeyError, match="sigbar"):
+            parser.parse_args(["--enum-setting", "sigbar"])
 
 
 class TestArgumentGroupFactoryExclusion:
