@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import gc
 import os
 import random
 import sys
@@ -651,6 +652,7 @@ class TestCaptureFreezeGC:
         return engine.capture_stats
 
     @pytest.mark.flaky_in_dev  # Issue #2855
+    @pytest.mark.flaky
     @pytest.mark.experimental
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -763,6 +765,7 @@ class TestPartialCudaGraph:
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        gc.collect()
 
     def model_provider(
         self,

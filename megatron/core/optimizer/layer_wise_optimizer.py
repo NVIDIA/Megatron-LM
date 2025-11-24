@@ -1,12 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from typing import Callable, List, Optional
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size
 
@@ -18,6 +19,8 @@ from .optimizer import (
     MegatronOptimizer,
 )
 from .optimizer_config import OptimizerConfig
+
+logger = logging.getLogger(__name__)
 
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
@@ -225,6 +228,23 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         return update_successful, grad_norm, num_zeros_in_grad
 
+    # TODO(deyuf): need to improve dist checkpointing design to properly handle this
+    # fp32_from_fp16_params is list, each sub list could be empty if group is empty
+    # this breaks dist checkpointing assumption since extract_sharded_base drop list structure
+    # for now, we convert it to dict with index as key and convert back in load_state_dict
+    def load_state_dict(self, state_dict):
+        if len(self.chained_optimizers) == 1:
+            wrapped_state_dict = {1: state_dict}
+        else:
+            wrapped_state_dict = state_dict
+        for sd in wrapped_state_dict.values():
+            if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
+                logger.info('[layerwise] converting fp32_from_fp16_params from dict to list')
+                sd['fp32_from_fp16_params'] = [
+                    v for k, v in sorted(sd['fp32_from_fp16_params'].items())
+                ]
+        super().load_state_dict(state_dict)
+
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
@@ -246,25 +266,49 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     0 if isinstance(sh_base.replica_id, int) else (*sh_base.replica_id[:2], 0)
                 )
 
+        # later code assume list but chained optimizer fallback to non-list if there's only one
         if len(self.chained_optimizers) == 1:
             wrapped_sharded_state_dict = {1: sharded_state_dict}
         else:
             wrapped_sharded_state_dict = sharded_state_dict
-        # Adjust dict due to possible empty rank 0 which output common_dict
+
+        # Adjust dict rank 0 output correct global metadata into common_dict
         for sd in wrapped_sharded_state_dict.values():
-            # Drop empty group state to avoid save in common dict (non-empty rank still save)
+            # wrap empty containers into LocalNonpersistentObject so it won't be saved/loaded
+            # params is already wrapped, we only need to handle fp32_from_fp16_params and state
+            # more details in load_state_dict comment
             if 'fp32_from_fp16_params' in sd:
                 sd['fp32_from_fp16_params'][:] = [
-                    group for group in sd['fp32_from_fp16_params'] if group
+                    group if group else LocalNonpersistentObject(group)
+                    for group in sd['fp32_from_fp16_params']
                 ]
-            # TODO(deyuf): 'common_step' code path is broken and 'step' is saved in 'param_groups'
-            # Find next 'step' if present. note this still break if rank0 adam is fully empty
-            step = next(
-                (group['step'] for group in sd['optimizer']['param_groups'] if 'step' in group),
-                None,
-            )
-            if step is not None:
-                for group in sd['optimizer']['param_groups']:
-                    group['step'] = step
-
+                sd['fp32_from_fp16_params'] = {
+                    i: v for i, v in enumerate(sd['fp32_from_fp16_params'])
+                }
+            # state is a single dict and will be empty if optimizer is fully empty
+            if not sd['optimizer']['state']:
+                sd['optimizer']['state'] = LocalNonpersistentObject(sd['optimizer']['state'])
+            # group keys(e.g. 'step') might be missing or not updated
+            for i, group in enumerate(sd['optimizer']['param_groups']):
+                # keep local param tensor so we only gather metadata
+                local_params = group.pop('params')
+                # save whether this group is empty, so we can use non-empty rank for metadata
+                group['params'] = bool(local_params.unwrap())
+                all_rank_groups = [None for _ in range(torch.distributed.get_world_size())]
+                torch.distributed.all_gather_object(all_rank_groups, group)
+                # find first non-empty group if it exists
+                nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
+                nonempty_rank_group['params'] = local_params
+                sd['optimizer']['param_groups'][i] = nonempty_rank_group
         return sharded_state_dict
+
+    def save_state_dict_to_file(self, filename: str) -> None:
+        """Save the parameter state of the optimizer. For torch format only.
+        Args:
+            filename: The filename to save the parameter state.
+        """
+        torch.save(super().state_dict(), filename)
+
+    def load_state_dict_from_file(self, filename: str) -> None:
+        """Load the parameter state of the optimizer. For torch format only."""
+        super().load_state_dict(torch.load(filename))
