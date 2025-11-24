@@ -6,7 +6,7 @@ name: Trigger MBridge Tests
 # Triggers MBridge CI tests with current MCore commit to verify backward compatibility
 
 on:
-  # Manual trigger only for POC
+  # Manual trigger only
   workflow_dispatch:
     inputs:
       run_cicd_main:
