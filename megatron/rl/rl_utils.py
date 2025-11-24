@@ -12,7 +12,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -701,7 +701,7 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, vocab_size=None):
+def get_logprobs(model, tokens, position_ids, attention_mask, no_grad: bool = False, vocab_size: Optional[int] = None):
     """Get sequence logprobs from their token ids.
 
     Args:

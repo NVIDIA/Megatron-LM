@@ -69,9 +69,11 @@ def test_get_logprobs():
     assert logprobs.shape == (BATCH, SEQ - 1)
     # As we return ones as logits, all logprobs should be the same.
     assert torch.all(logprobs == logprobs[0, 0]).item()
- 
+
     # Check that providing vocabulary size works.
-    chopped_logprobs = rl_utils.get_logprobs(MockModel(), tokens, position_ids=None, attention_mask=None, vocab_size=2)
+    chopped_logprobs = rl_utils.get_logprobs(
+        MockModel(), tokens, position_ids=None, attention_mask=None, vocab_size=2
+    )
     assert chopped_logprobs.shape[-1] == 2
 
 
