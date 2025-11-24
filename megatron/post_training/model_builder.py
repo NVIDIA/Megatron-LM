@@ -8,6 +8,7 @@ from typing import Any, Dict
 
 import modelopt.torch.distill as mtd
 import modelopt.torch.distill.plugins.megatron as mtd_mcore
+import modelopt.torch.opt as mto
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
@@ -297,13 +298,15 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
 
         kd_config = {
             "teacher_model": (_teacher_provider, [teacher_config, model_kwargs], {}),
-            "criterion": distill_cfg["criterion"],
-            "loss_balancer": distill_cfg["loss_balancer"],
+            "criterion": distill_cfg.criterion,
+            "loss_balancer": distill_cfg.loss_balancer,
         }
         model = mtd.convert(model, mode=[("kd_loss", kd_config)])
 
         # Additional tweaks needed for MCore.
         # (accounts for sharded state, pipeline parallel, and potentially skipping LM loss)
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
+        # Also remove KD mode state to prevent issues with re-conversion after restore.
+        mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
 
     return model
