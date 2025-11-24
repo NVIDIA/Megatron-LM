@@ -57,7 +57,6 @@ MODEL_ARGS:
   --save-interval: 10000
   --eval-interval: 1000
   --ckpt-format: torch_dist
-  --dist-ckpt-save-pre-mcore-014: true
   --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
