@@ -550,23 +550,23 @@ def get_megatron_optimizer(
         overlap_param_gather_with_optimizer_step_flags = [False]
 
     # Setup process groups using helper method
-    process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+    process_groups_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(
         pg_collection, model_chunks, use_gloo_process_groups
     )
 
-    dp_cp_group = process_groups['dp_cp_group']
-    intra_dp_cp_group = process_groups['intra_dp_cp_group']
-    intra_expt_dp_group = process_groups['intra_expt_dp_group']
-    mp_group = process_groups['mp_group']
-    expt_tp_pp_group = process_groups['expt_tp_pp_group']
-    intra_dp_cp_group_gloo = process_groups['intra_dp_cp_group_gloo']
-    intra_expt_dp_group_gloo = process_groups['intra_expt_dp_group_gloo']
-    intra_dist_opt_group = process_groups['intra_dist_opt_group']
+    dp_cp_group = process_groups_dict['dp_cp_group']
+    intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
+    intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
+    mp_group = process_groups_dict['mp_group']
+    expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
+    intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
+    intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
+    intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
     model_parallel_rank = get_pg_rank(mp_group)
 
     if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
-        inter_dist_opt_group = process_groups['inter_dist_opt_group']
+        inter_dist_opt_group = process_groups_dict['inter_dist_opt_group']
         distributed_optimizer_instance_id = get_pg_rank(inter_dist_opt_group)
     else:
         distributed_optimizer_instance_id = 0
