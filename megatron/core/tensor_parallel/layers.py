@@ -666,8 +666,8 @@ def linear_with_grad_accumulation_and_async_allreduce(
             accumulation fusion, requires the custom CUDA extension
             fused_weight_gradient_mlp_cuda module. To use
             gradient_accumulation_fusion you must install APEX with
-            --cpp_ext and --cuda_ext. For example: "pip install
-            --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext .\"
+            \"--cpp_ext\" and \"--cuda_ext\". For example: "pip install
+            --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext\" .
             " Note that the extension requires CUDA>=11. Otherwise, you
             must turn off gradient accumulation fusion."
 
@@ -918,9 +918,9 @@ class ColumnParallelLinear(torch.nn.Module):
                 "ColumnParallelLinear was called with gradient_accumulation_fusion set "
                 "to True but the custom CUDA extension fused_weight_gradient_mlp_cuda "
                 "module is not found. To use gradient_accumulation_fusion you must "
-                "install APEX with --cpp_ext and --cuda_ext. For example: "
-                'pip install --global-option="--cpp_ext" --global-option="--cuda_ext ." '
-                "Note that the extension requires CUDA>=11. Otherwise, you must turn off "
+                "install APEX with --cpp_ext and --cuda_ext. For example: \'"
+                'pip install --global-option="--cpp_ext" --global-option="--cuda_ext" . '
+                "\'. Note that the extension requires CUDA>=11. Otherwise, you must turn off "
                 "gradient accumulation fusion."
             )
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
