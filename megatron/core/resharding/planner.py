@@ -265,77 +265,51 @@ def build_centralized_reshard_plan(
                 src_param_metadata[key] = []
             src_param_metadata[key].append(metadata)
 
-    # Build the plan on global rank 0 and broadcast to all ranks with error propagation
+    # Build the plan on global rank 0 and broadcast to all ranks
     if my_global_rank == 0:
-        error_box = [None]
         plans_for_all_ranks = {r: ReshardPlan([], [], []) for r in range(world_size)}
-        try:
-            for dst_rank in range(world_size):
-                dst_rank_params = dst_param_metadata_by_rank.get(dst_rank, {})
-                for resolved_name, dst_metadata in dst_rank_params.items():
-                    src_meta_list = src_param_metadata.get(resolved_name)
-                    if not src_meta_list:
-                        raise RuntimeError(
-                            f"Destination parameter '{resolved_name}' on rank {dst_rank} not found in source model."
-                        )
-                    # Choose a representative source metadata with DP round-robin balancing
-                    src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
-                    sources = _determine_source_ranks_for_dst_param(
-                        resolved_name, src_metadata, dst_metadata, dst_rank
+        for dst_rank in range(world_size):
+            dst_rank_params = dst_param_metadata_by_rank.get(dst_rank, {})
+            for resolved_name, dst_metadata in dst_rank_params.items():
+                src_meta_list = src_param_metadata.get(resolved_name)
+                if not src_meta_list:
+                    raise RuntimeError(
+                        f"Destination parameter '{resolved_name}' on rank {dst_rank} not found in source model."
                     )
-                    for src_rank, src_slice, dst_slice in sources:
-                        if src_rank == dst_rank and src_metadata.name == dst_metadata.name:
-                            plans_for_all_ranks[dst_rank].local_copy_ops.append(
-                                (dst_metadata.name, None, None, src_slice, dst_slice)
+                # Choose a representative source metadata with DP round-robin balancing
+                src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
+                sources = _determine_source_ranks_for_dst_param(
+                    resolved_name, src_metadata, dst_metadata, dst_rank
+                )
+                for src_rank, src_slice, dst_slice in sources:
+                    if src_rank == dst_rank and src_metadata.name == dst_metadata.name:
+                        plans_for_all_ranks[dst_rank].local_copy_ops.append(
+                            (dst_metadata.name, None, None, src_slice, dst_slice)
+                        )
+                    else:
+                        plans_for_all_ranks[dst_rank].recv_ops.append(
+                            TransferOp(
+                                param_name=dst_metadata.name,
+                                peer_rank=src_rank,
+                                is_send=False,
+                                my_slice=dst_slice,
+                                peer_slice=src_slice,
                             )
-                        else:
-                            plans_for_all_ranks[dst_rank].recv_ops.append(
-                                TransferOp(
-                                    param_name=dst_metadata.name,
-                                    peer_rank=src_rank,
-                                    is_send=False,
-                                    my_slice=dst_slice,
-                                    peer_slice=src_slice,
-                                )
+                        )
+                        plans_for_all_ranks[src_rank].send_ops.append(
+                            TransferOp(
+                                param_name=src_metadata.name,
+                                peer_rank=dst_rank,
+                                is_send=True,
+                                my_slice=src_slice,
+                                peer_slice=dst_slice,
                             )
-                            plans_for_all_ranks[src_rank].send_ops.append(
-                                TransferOp(
-                                    param_name=src_metadata.name,
-                                    peer_rank=dst_rank,
-                                    is_send=True,
-                                    my_slice=src_slice,
-                                    peer_slice=dst_slice,
-                                )
-                            )
-            plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
-        except Exception as e:
-            tb = traceback.format_exc()
-            error_box[0] = {
-                "rank": my_global_rank,
-                "param": resolved_name if 'resolved_name' in locals() else None,
-                "type": type(e).__name__,
-                "msg": str(e),
-                "traceback": tb,
-            }
-            plans_list = [None] * world_size
-        dist.broadcast_object_list(error_box, src=0)
+                        )
+        plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
     else:
-        error_box = [None]
         plans_list = [None] * world_size
-        dist.broadcast_object_list(error_box, src=0)
-    if error_box[0] is not None:
-        err = error_box[0]
-        print(
-            f"[Reshard Planner] Aborting due to error on rank {err['rank']} while planning {err['param']}: "
-            f"{err['type']}: {err['msg']}"
-        )
-        print(err["traceback"])
-        sys.stdout.flush()
-        raise RuntimeError(f"Reshard plan failed on rank {err['rank']} for {err['param']}: {err['msg']}")
-    torch.distributed.barrier()
     torch.distributed.broadcast_object_list(plans_list, src=0)
     my_plan = plans_list[my_global_rank]
-    torch.distributed.barrier()
 
     # Fill in actual parameter references for local copies
     for i, (param_name, _, _, src_slice, dst_slice) in enumerate(my_plan.local_copy_ops):
