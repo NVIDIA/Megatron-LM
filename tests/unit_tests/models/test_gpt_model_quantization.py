@@ -379,12 +379,12 @@ class TestGPTModelTEQuantizationConfig:
                     assert module.te_quant_params.training_recipe.fp4_quantization_recipe is None
                     assert not module.te_quant_params.training_recipe.override_nonquantized_autocast
                     assert module.te_quant_params.training_recipe.override_quantized_autocast
-                    assert module.te_quant_params.inference_recipe is None
+                    assert module.te_quant_params.evaluation_recipe is None
                 else:  # fp8_cs
                     assert (
                         module.te_quant_params.training_recipe.fp8_quantization_recipe
                         == Fp8Recipe.tensorwise
                     )
                     assert module.te_quant_params.training_recipe.fp4_quantization_recipe is None
-                    assert module.te_quant_params.inference_recipe is None
+                    assert module.te_quant_params.evaluation_recipe is None
         assert visited_keys == set(expected_types.keys())

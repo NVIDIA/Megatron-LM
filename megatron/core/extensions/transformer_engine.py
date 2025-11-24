@@ -85,12 +85,36 @@ class TEQuantizationRecipe:
     """Class to capture options for opening an autocast context in forward"""
 
     fp8_quantization_recipe: Optional[Fp8Recipe] = None
+    """
+    An FP8 quantization override if the module should use FP8.
+    If no FP8 or FP4 quantization is configured, the recipe is execution
+    in high-precision (BF16).
+    """
     fp4_quantization_recipe: Optional[Fp4Recipe] = None
+    """
+    An FP4 quantization override if the module should use FP4.
+    If no FP8 or FP4 quantization is configured, the recipe is execution
+    in high-precision (BF16).
+    """
     custom_recipe_factory: Optional[str] = None
+    """The path to a custom recipe factory if a custom Fp4 or Fp8 recipe is configured"""
     fp8_format: str = "e4m3"
+    """A format to select from an FP8Recipe"""
     override_quantized_autocast: bool = True
+    """
+    If the quantization autocast context for a targeted module is enabled,
+    whether to override it and change (or disable) the quantization recipe.
+    """
     override_nonquantized_autocast: bool = False
+    """
+    If the quantization autocast context for a targeted module is not enabled,
+    whether to override it and enable a quantization recipe.
+    """
     tp_only_amax_red: bool = False
+    """
+    If an amax reduction is applicable, such as in per-tensor quantization recipe,
+    whether to reduce only along TP groups.
+    """
 
     @classmethod
     def parse_from_config(cls, quant_config: Dict[Any, Any]) -> "TEQuantizationRecipe":
@@ -132,7 +156,12 @@ class TEQuantizationParams:
     """Class to capture precision options for training and evaluation."""
 
     training_recipe: TEQuantizationRecipe
-    inference_recipe: Optional[TEQuantizationRecipe]
+    """Precision override for when self.training is True"""
+    evaluation_recipe: Optional[TEQuantizationRecipe]
+    """
+    Precision override for when self.training is False.
+    If None, training_recipe is used.
+    """
 
     @staticmethod
     def parse_from_config(quant_config: QuantizationConfig) -> "TEQuantizationParams":
@@ -153,16 +182,16 @@ class TEQuantizationParams:
                     "TransformerEngine config dictionary must have 'training_recipe' key"
                 )
             training_recipe = TEQuantizationRecipe.parse_from_config(config['training_recipe'])
-            if 'inference_recipe' not in config.keys():
-                inference_recipe = None
+            if 'evaluation_recipe' not in config.keys():
+                evaluation_recipe = None
                 assert len(config.keys()) == 2
             else:
-                inference_recipe = TEQuantizationRecipe.parse_from_config(
-                    config['inference_recipe']
+                evaluation_recipe = TEQuantizationRecipe.parse_from_config(
+                    config['evaluation_recipe']
                 )
                 assert len(config.keys()) == 3
             return TEQuantizationParams(
-                training_recipe=training_recipe, inference_recipe=inference_recipe
+                training_recipe=training_recipe, evaluation_recipe=evaluation_recipe
             )
         else:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
@@ -221,8 +250,8 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
 def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
     if qparams is None:
         return nullcontext()
-    elif not training and qparams.inference_recipe is not None:
-        return _get_fp8_autocast_for_quant_recipe(qparams.inference_recipe)
+    elif not training and qparams.evaluation_recipe is not None:
+        return _get_fp8_autocast_for_quant_recipe(qparams.evaluation_recipe)
     else:
         return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
 
@@ -248,9 +277,9 @@ def _get_should_context_be_quantized_params(
 ):
     if qparams is None:
         return is_context_quantized
-    elif not training and qparams.inference_recipe is not None:
+    elif not training and qparams.evaluation_recipe is not None:
         return _get_should_context_be_quantized_recipe(
-            qparams.inference_recipe, is_context_quantized
+            qparams.evaluation_recipe, is_context_quantized
         )
     else:
         return _get_should_context_be_quantized_recipe(
