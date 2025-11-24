@@ -93,9 +93,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          echo "🚀 Triggering MBridge workflow: ${{ matrix.workflow }}"
-          echo "📌 MCore commit: ${{ needs.get-mcore-info.outputs.sha }}"
-          echo "🌿 MBridge ref: ${{ inputs.mbridge_ref }}"
+          echo "🚀 Triggering ${{ matrix.workflow }} | MCore: ${{ needs.get-mcore-info.outputs.sha }} | MBridge: ${{ inputs.mbridge_ref }}"
           
           gh workflow run ${{ matrix.workflow }} \
             --repo NVIDIA-NeMo/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
@@ -124,15 +122,14 @@ jobs:
           echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
           echo "📋 Run ID: ${RUN_ID}"
           
-          echo "## 🔄 ${{ matrix.name }} Triggered" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**MCore Commit:** \`${{ needs.get-mcore-info.outputs.short_sha }}\` | **MBridge Ref:** \`${{ inputs.mbridge_ref }}\` | **Test Suite:** \`${{ inputs.test_suite }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- 🔄 [${{ matrix.workflow }}](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID}) - Running..." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⏳ Monitoring test results (polling every 5 minutes until completion or GHA timeout)..." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> **Note:** If tests exceed GitHub Actions' job timeout limit, monitoring will stop gracefully." >> $GITHUB_STEP_SUMMARY
+          printf "## 🔄 %s Triggered\n\n**MCore:** \`%s\` | **MBridge:** \`%s\` | **Suite:** \`%s\`\n\n- 🔄 [%s](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/%s) - Running...\n- ⏳ Polling every 5 minutes until completion or GHA timeout\n\n> **Note:** If tests exceed GitHub Actions' timeout, monitoring stops gracefully.\n" \
+            "${{ matrix.name }}" \
+            "${{ needs.get-mcore-info.outputs.short_sha }}" \
+            "${{ inputs.mbridge_ref }}" \
+            "${{ inputs.test_suite }}" \
+            "${{ matrix.workflow }}" \
+            "${RUN_ID}" \
+            >> $GITHUB_STEP_SUMMARY
 
       - name: Monitor workflow  
         if: steps.should_run.outputs.run == 'true'
@@ -159,7 +156,7 @@ jobs:
               
               if (run.status === 'completed') {
                 core.exportVariable('workflow_status', run.conclusion);
-                console.log(`✅ Completed with status: ${run.conclusion}`);
+                console.log(`✅ ${{ matrix.name }} completed with status: ${run.conclusion}`);
                 return run.conclusion;
               }
               
@@ -173,40 +170,30 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
           RUN_ID="${{ steps.get_run_id.outputs.run_id }}"
+          CONCLUSION=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion --jq -r .conclusion 2>/dev/null || echo "unknown")
           
-          echo "## 📊 ${{ matrix.name }} Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          case "$CONCLUSION" in
+            "success") ICON="✅" ;;
+            "failure") ICON="❌" ;;
+            "cancelled") ICON="🚫" ;;
+            *) ICON="⏳" ;;
+          esac
           
-          if [ -n "${RUN_ID}" ]; then
-            STATUS=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion,status,headBranch,createdAt,updatedAt --jq .)
-            CONCLUSION=$(echo "$STATUS" | jq -r .conclusion)
-            
-            case "$CONCLUSION" in
-              "success") ICON="✅" ;;
-              "failure") ICON="❌" ;;
-              "cancelled") ICON="🚫" ;;
-              *) ICON="⏳" ;;
-            esac
-            
-            echo "### ${ICON} ${{ matrix.workflow }}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Status:** \`${CONCLUSION}\`" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "[View full results →](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID})" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
+          printf "## 📊 %s Results\n\n### %s %s\n**Status:** \`%s\`\n\n[View full results →](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/%s)\n\n---\n*Triggered from MCore commit \`%s\`*\n" \
+            "${{ matrix.name }}" \
+            "${ICON}" \
+            "${{ matrix.workflow }}" \
+            "${CONCLUSION}" \
+            "${RUN_ID}" \
+            "${{ needs.get-mcore-info.outputs.short_sha }}" \
+            >> $GITHUB_STEP_SUMMARY
           
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "*Triggered from MCore commit \`${{ needs.get-mcore-info.outputs.short_sha }}\`*" >> $GITHUB_STEP_SUMMARY
-          
-          # Report status but don't fail workflow (continue-on-error handles this)
-          WORKFLOW_STATUS="${{ env.workflow_status || 'unknown' }}"
-          if [ "$WORKFLOW_STATUS" == "failure" ]; then
-            echo "❌ ${{ matrix.name }} failed - check link above for details"
+          # Report status to console
+          if [ "$CONCLUSION" == "failure" ]; then
+            echo "❌ ${{ matrix.name }} failed - check link above"
             exit 1
-          elif [ "$WORKFLOW_STATUS" == "success" ]; then
+          elif [ "$CONCLUSION" == "success" ]; then
             echo "✅ ${{ matrix.name }} passed"
           else
-            echo "⏳ ${{ matrix.name }} still running or monitoring timed out"
-            echo "💡 This is expected for long-running tests - check the link in the summary above"
+            echo "⏳ ${{ matrix.name }} still running or monitoring timed out. Check the link in the summary above."
           fi
