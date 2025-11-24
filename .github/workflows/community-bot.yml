@@ -27,4 +27,3 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM'
     secrets:
       GH_TOKEN: ${{ secrets.PAT }}
-      environment: main
