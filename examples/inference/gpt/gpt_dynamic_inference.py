@@ -371,6 +371,17 @@ def run_inference(
             for finished_request_record in finished_request_records:
 
                 finished_request = finished_request_record.merge()
+                # >>>
+                # if finished_request.prompt == "The inventor of the GPU is":
+                if finished_request.request_id == 2:
+                    print("................................. request 2.")
+                    # from lutil import pax
+                    # pax("finished_request", {
+                    #     "prompt" : finished_request.prompt,
+                    #     "generated_text" : finished_request.generated_text,
+                    #     "generated text'" : engine.controller.tokenizer.detokenize(finished_request.generated_tokens),
+                    # })
+                # <<<
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
@@ -387,6 +398,12 @@ def run_inference(
                 request.output_text = finished_request.generated_text
                 total_output_tokens += len(request.output_tokens)
 
+                # >>>
+                # if request.prompt_text == "The inventor of the GPU is":
+                #     from lutil import pax
+                #     pax("finished_request, request")
+                # <<<
+
                 # Log probs.
                 if finished_request.sampling_params.return_log_probs:
                     request.log_probs = (
@@ -398,6 +415,10 @@ def run_inference(
         # Check if all requests are finished.
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
+
+    # >>>
+    print({"requests / 2": requests[2]})
+    # <<<
 
     return {
         "step_times" : step_times,
@@ -484,6 +505,9 @@ def main():
     for _ in range(args.inference_repeat_n):
         t = get_curr_time()
         result = run_inference(requests, engine)
+        # >>>
+        print({"requests / 2": requests[2]})
+        # <<<
         step_times = result["step_times"]
         add_times = result["add_times"]
         output_times = result["output_times"]
@@ -511,6 +535,11 @@ def main():
         # Map requests by their prompt.
         unique_prompt_map = defaultdict(list)
         for request_idx, request in enumerate(requests):
+            # >>>
+            if request.prompt_text == "The inventor of the GPU is":
+                from lutil import pax
+                pax("request")
+            # <<<
             unique_prompt_map[request.prompt_text].append(request_idx)
 
         # Print unique prompts + outputs.
