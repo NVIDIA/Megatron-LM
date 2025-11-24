@@ -1593,7 +1593,7 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
 @triton.jit
 def _drop_routing_map_kernel(
     routing_map_ptr,
-    under_budget_ptr,
+    over_budget_ptr,
     routing_map_dropped_ptr,
     num_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -1602,7 +1602,7 @@ def _drop_routing_map_kernel(
     
     Args:
         routing_map_ptr: Pointer to the input routing_map tensor
-        under_budget_ptr: Pointer to the boolean tensor indicating if all EP ranks are under budget
+        over_budget_ptr: Pointer to the boolean tensor indicating if any EP rank is over budget
         routing_map_dropped_ptr: Pointer to the output routing_map tensor
         num_elements: Total number of elements to process
         BLOCK_SIZE: Block size for Triton kernel
@@ -1610,8 +1610,8 @@ def _drop_routing_map_kernel(
     # Get the program ID
     pid = tl.program_id(axis=0)
     
-    # Read the under_budget value (scalar tensor with single element)
-    under_budget_val = tl.load(under_budget_ptr)
+    # Read the over_budget value (scalar tensor with single element)
+    over_budget_val = tl.load(over_budget_ptr)
     
     # Calculate the offset for this program
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -1620,8 +1620,8 @@ def _drop_routing_map_kernel(
     mask = offset < num_elements
     routing_map_val = tl.load(routing_map_ptr + offset, mask=mask, other=0.0)
     
-    # Multiply routing_map by under_budget: if under_budget is 0 (False), output is 0; if 1 (True), output is routing_map_val
-    output_val = routing_map_val * under_budget_val
+    # If over_budget is 1 (True), output is 0 (drop); if over_budget is 0 (False), output is routing_map_val (keep)
+    output_val = routing_map_val * (1 - over_budget_val)
     
     # Store the result
     tl.store(routing_map_dropped_ptr + offset, output_val, mask=mask)
@@ -1644,11 +1644,11 @@ def drop_routing_map_triton(
         exceeds budget, otherwise returns the original routing_map.
     """
     
-    # Calculate boolean tensor: under_budget is True only if ALL EP ranks are under budget
-    under_budget = (num_tokens_per_ep_rank <= budget).all()
+    # Calculate boolean tensor: over_budget is True if ANY EP rank exceeds budget
+    over_budget = (num_tokens_per_ep_rank > budget).any()
     
     # Convert boolean to int8 
-    under_budget_int = under_budget.to(torch.int8)
+    over_budget_int = over_budget.to(torch.int8)
     
     # Convert routing_map to numeric type if it's boolean
     if routing_map.dtype == torch.bool:
@@ -1667,10 +1667,10 @@ def drop_routing_map_triton(
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
     
-    # Launch kernel with under_budget tensor pointer (as int8)
+    # Launch kernel with over_budget tensor pointer (as int8)
     _drop_routing_map_kernel[grid](
         routing_map_flat,
-        under_budget_int,
+        over_budget_int,
         routing_map_dropped.flatten(),
         num_elements,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -1680,4 +1680,4 @@ def drop_routing_map_triton(
     if routing_map.dtype == torch.bool:
         routing_map_dropped = routing_map_dropped.to(torch.bool)
     
-    return routing_map_dropped, under_budget.to(torch.bool)
+    return routing_map_dropped, over_budget.to(torch.bool)
