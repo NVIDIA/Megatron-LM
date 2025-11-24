@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from argparse import ArgumentParser, ArgumentError
+from argparse import ArgumentError, ArgumentParser
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional, Union
 
