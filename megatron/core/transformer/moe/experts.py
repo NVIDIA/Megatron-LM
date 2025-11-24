@@ -824,6 +824,7 @@ class TEGroupedMLP(MegatronModule):
         if bias_parallel is None:
             return intermediate_parallel
         shape = intermediate_parallel.shape
+
         return (
             torch.cat(
                 [
@@ -857,8 +858,11 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert = tokens_per_expert.tolist()
+
+        actual_tokens_per_expert = tokens_per_expert
+        acutal_permuted_probs = permuted_probs.unsqueeze(-1)
+
         if self.config.fp8 or self.config.fp4:
-            actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
@@ -977,7 +981,7 @@ class TEGroupedMLP(MegatronModule):
         if self.config.fp8 or self.config.fp4:
             output = self.quantization_unpadding(output, actual_tokens_per_expert)
 
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+        output = self._apply_bias(output, output_bias, actual_tokens_per_expert, acutal_permuted_probs)
         output_bias = None
 
         return output, output_bias

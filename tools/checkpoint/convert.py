@@ -107,7 +107,6 @@ def load_plugin(plugin_type, name):
     return plugin
 
 def main():
-    import argparse
     parser = argparse.ArgumentParser(description="Megatron Checkpoint Converter Arguments",
                                      allow_abbrev=False, conflict_handler='resolve')
 
