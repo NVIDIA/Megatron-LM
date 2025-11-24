@@ -2831,8 +2831,10 @@ def _add_tokenizer_args(parser):
                        help='Number of special tokens in tiktoken tokenizer')
     group.add_argument('--sentencepiece-legacy', action='store_true', default=False,
                        help='SentencePiece tokenizer legacy behavior. Allows special tokens usage.')
-    group.add_argument('--huggingface-use-fast', action='store_true', default=False,
+    group.add_argument('--hf-use-fast', action='store_true', default=False,
                        help='Whether to use fast HuggingFace tokenizer.')
+    group.add_argument('--hf-include-special-tokens', action='store_true', default=False,
+                       help='Converting text to ids will include special for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
     return parser

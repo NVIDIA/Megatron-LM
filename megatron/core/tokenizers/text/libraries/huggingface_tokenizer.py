@@ -36,7 +36,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         additional_special_tokens: Optional[List] = [],
         use_fast: Optional[bool] = False,
         trust_remote_code: Optional[bool] = False,
-        include_special_tokens: bool = True,
+        include_special_tokens: bool = False,
         chat_template: str = None,
     ):
         """

@@ -41,8 +41,9 @@ def build_tokenizer(args):
         kwargs['vocab_file'] = args.vocab_file
         kwargs['merges_file'] = args.merge_file
         kwargs['additional_special_tokens'] = args.special_tokens
-        kwargs['use_fast'] = args.huggingface_use_fast
+        kwargs['use_fast'] = args.hf_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
+        kwargs['hf_include_special_tokens'] = args.hf_include_special_tokens
     elif args.tokenizer_type == 'NullTokenizer':
         tokenizer_library = 'null'
         metadata = {'library': tokenizer_library}
