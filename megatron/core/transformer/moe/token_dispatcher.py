@@ -1003,13 +1003,43 @@ class _HybridEPManager(_DispatchManager):
                 "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
             )
 
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor, budget_local: int = None):
+        self.packed_offloading_capacity_factor = self.config.moe_expert_capacity_factor_for_packed_offloading
+        self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+
+    def budget_check(self, routing_map, budget):
+        # TODO: the check should be done in hybridep to avoid the AG below
+        # routing_map: [num_local_tokens, world_size, num_local_experts]
+        num_local_tokens_per_expert = routing_map.sum(dim=0).flatten()
+        num_tokens_per_expert = torch.empty(
+            self.group.size(),
+            self.num_experts,
+            device=num_local_tokens_per_expert.device,
+            dtype=num_local_tokens_per_expert.dtype,
+        )
+        torch.distributed.all_gather_into_tensor(
+            num_tokens_per_expert, num_local_tokens_per_expert, self.group
+        )
+        
+        num_global_tokens_per_expert =num_tokens_per_expert.sum(dim=0)
+        if self.config.fp8:
+            pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+            num_global_tokens_per_expert += -num_global_tokens_per_expert % pad_multiple
+        num_tokens_per_ep_rank = num_global_tokens_per_expert.view(routing_map.shape[1], routing_map.shape[2]).sum(dim=-1)
+        routing_map_maybe_dropped, over_budget = drop_routing_map_triton(routing_map, budget, num_tokens_per_ep_rank)
+        return routing_map_maybe_dropped, over_budget
+
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
         self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
-        if budget_local is not None:
-            self.num_dispatched_tokens = budget_local
-            self.num_permuted_tokens = budget_local
+
+        if self.packed_offloading_capacity_factor is not None:
+            budget = int(routing_map.shape[0] * self.config.moe_router_topk  * self.packed_offloading_capacity_factor)
+            routing_map_maybe_dropped, over_budget = self.budget_check(routing_map, budget)
+            self.over_budget |= over_budget
+            self.num_dispatched_tokens = budget
+            self.num_permuted_tokens = budget
+            self.routing_map = routing_map_maybe_dropped.reshape(num_tokens, self.num_experts)
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
             num_out_tokens = num_tokens * self.config.moe_router_topk
@@ -1375,9 +1405,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 "Please set --moe-flex-dispatcher-backend=deepep or "
                 "--moe-flex-dispatcher-backend=hybridep"
             )
-        self.packed_offloading_capacity_factor = self.config.moe_expert_capacity_factor_for_packed_offloading
-        self.budget_local_gpu = None
-        self.under_budget = torch.ones(1, dtype=torch.bool, device='cuda')
 
     def set_shared_experts(self, shared_experts):
         raise NotImplementedError(
@@ -1410,13 +1437,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             .reshape(num_local_tokens, world_size, self.num_local_experts)
         ).contiguous()
 
-        if self.packed_offloading_capacity_factor is not None:
-            budget_local = int(routing_map.shape[0] * self.config.moe_router_topk  * self.packed_offloading_capacity_factor)
-            #if self.ep_rank == 0:
-            #    print (f'budget_local {budget_local} = {routing_map.shape[0]} x {self.config.moe_router_topk} x {self.packed_offloading_capacity_factor}')
-            self.budget_local_gpu = torch.full((1,), budget_local, device='cuda')
-        else:
-            self.budget_local_gpu = None
         return routing_map, probs
 
     def dispatch_preprocess(
@@ -1442,14 +1462,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # Initialize metadata
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
-        budget_local = None
-        if self.packed_offloading_capacity_factor is not None:
-            budget_local = int(routing_map.shape[0] * self.config.moe_router_topk  * self.packed_offloading_capacity_factor)
-            routing_map, under_budget = self.budget_check(routing_map, budget_local)
-            self.under_budget &= under_budget
-#            if self.ep_rank == 0:
-#                print (f'budget_local {budget_local} = {routing_map.shape[0]} x {self.config.moe_router_topk} x {self.packed_offloading_capacity_factor}')
-        self._comm_manager.setup_metadata(routing_map, probs, budget_local)
+        self._comm_manager.setup_metadata(routing_map, probs)
         
         return hidden_states, self._comm_manager.token_probs
 
@@ -1545,24 +1558,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         return hidden_states.view(self.hidden_shape)
 
-    def budget_check(self, routing_map, budget):
-        # TODO: the check should be done in hybridep
-        num_experts =  self.config.num_moe_experts
-        num_expert_per_ep_rank = num_experts // self.ep_size
-        num_tokens_per_expert = routing_map.sum(dim=0)
-        num_tokens_per_expert = (
-            gather_from_sequence_parallel_region(
-                num_tokens_per_expert, group=self.tp_ep_group
-            )
-            .reshape(self.ep_size, self.tp_size, num_experts)
-            .transpose(0, 1)
-        )
-
-        num_global_tokens_per_expert =num_tokens_per_expert.sum(dim=1)
-        if self.config.fp8:
-            pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
-            num_global_tokens_per_expert += -num_global_tokens_per_expert % pad_multiple
-        num_tokens_per_ep_rank = num_global_tokens_per_expert.view(num_global_tokens_per_expert.shape[0], self.ep_size, -1).sum(dim=-1)
-        
-        routing_map_maybe_dropped, under_budget = drop_routing_map_triton(routing_map, budget, num_tokens_per_ep_rank)
-        return routing_map_maybe_dropped, under_budget
+    def check_over_budget(self):
+        if hasattr(self._comm_manager, 'over_budget'):
+            return self._comm_manager.over_budget
+        else:
+            return None
