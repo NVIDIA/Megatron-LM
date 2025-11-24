@@ -68,7 +68,7 @@ jobs:
           echo "🌿 MBridge ref: ${{ inputs.mbridge_ref }}"
           
           gh workflow run install-test.yml \
-            --repo NVIDIA/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
+            --repo NVIDIA-NeMo/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
             --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
             --field mcore_branch=${{ steps.mcore_info.outputs.branch }} \
             --field test_suite=${{ inputs.test_suite }} \
@@ -84,7 +84,7 @@ jobs:
           echo "🌿 MBridge ref: ${{ inputs.mbridge_ref }}"
           
           gh workflow run cicd-main.yml \
-            --repo NVIDIA/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
+            --repo NVIDIA-NeMo/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
             --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
             --field mcore_branch=${{ steps.mcore_info.outputs.branch }} \
             --field test_suite=${{ inputs.test_suite }} \
@@ -104,7 +104,7 @@ jobs:
           if [ "${{ inputs.run_install_test }}" == "true" ]; then
             echo "🔍 Looking for install-test.yml run..."
             INSTALL_RUN_ID=$(gh run list \
-              --repo NVIDIA/Megatron-Bridge \
+              --repo NVIDIA-NeMo/Megatron-Bridge \
               --workflow=install-test.yml \
               --limit 5 \
               --json databaseId,headSha,createdAt \
@@ -118,7 +118,7 @@ jobs:
           if [ "${{ inputs.run_cicd_main }}" == "true" ]; then
             echo "🔍 Looking for cicd-main.yml run..."
             CICD_RUN_ID=$(gh run list \
-              --repo NVIDIA/Megatron-Bridge \
+              --repo NVIDIA-NeMo/Megatron-Bridge \
               --workflow=cicd-main.yml \
               --limit 5 \
               --json databaseId,headSha,createdAt \
@@ -136,10 +136,10 @@ jobs:
             echo "**MCore Commit:** \`${{ steps.mcore_info.outputs.short_sha }}\` | **MBridge Ref:** \`${{ inputs.mbridge_ref }}\` | **Test Suite:** \`${{ inputs.test_suite }}\`"
             echo ""
             if [ "${{ inputs.run_install_test }}" == "true" ]; then
-              echo "- 🔄 [install-test.yml](https://github.com/NVIDIA/Megatron-Bridge/actions/runs/${{ steps.wait_for_runs.outputs.install_test_run_id }}) - Running..."
+              echo "- 🔄 [install-test.yml](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${{ steps.wait_for_runs.outputs.install_test_run_id }}) - Running..."
             fi
             if [ "${{ inputs.run_cicd_main }}" == "true" ]; then
-              echo "- 🔄 [cicd-main.yml](https://github.com/NVIDIA/Megatron-Bridge/actions/runs/${{ steps.wait_for_runs.outputs.cicd_main_run_id }}) - Running..."
+              echo "- 🔄 [cicd-main.yml](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${{ steps.wait_for_runs.outputs.cicd_main_run_id }}) - Running..."
             fi
             echo ""
             echo "⏳ Monitoring test results (polling every 5 minutes until completion or GHA timeout)..."
@@ -166,7 +166,7 @@ jobs:
           POLL_COUNT=0
           
           while [ $POLL_COUNT -lt $MAX_POLLS ]; do
-            STATUS_JSON=$(gh run view ${RUN_ID} --repo NVIDIA/Megatron-Bridge --json status,conclusion)
+            STATUS_JSON=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json status,conclusion)
             STATUS=$(echo "$STATUS_JSON" | jq -r .status)
             CONCLUSION=$(echo "$STATUS_JSON" | jq -r .conclusion)
             
@@ -205,7 +205,7 @@ jobs:
           POLL_COUNT=0
           
           while [ $POLL_COUNT -lt $MAX_POLLS ]; do
-            STATUS_JSON=$(gh run view ${RUN_ID} --repo NVIDIA/Megatron-Bridge --json status,conclusion)
+            STATUS_JSON=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json status,conclusion)
             STATUS=$(echo "$STATUS_JSON" | jq -r .status)
             CONCLUSION=$(echo "$STATUS_JSON" | jq -r .conclusion)
             
@@ -242,7 +242,7 @@ jobs:
           # Install test results
           if [ "${{ inputs.run_install_test }}" == "true" ] && [ -n "${{ needs.trigger-mbridge.outputs.install_test_run_id }}" ]; then
             RUN_ID="${{ needs.trigger-mbridge.outputs.install_test_run_id }}"
-            STATUS=$(gh run view ${RUN_ID} --repo NVIDIA/Megatron-Bridge --json conclusion,status,headBranch,createdAt,updatedAt --jq .)
+            STATUS=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion,status,headBranch,createdAt,updatedAt --jq .)
             CONCLUSION=$(echo "$STATUS" | jq -r .conclusion)
             
             case "$CONCLUSION" in
@@ -256,14 +256,14 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Status:** \`${CONCLUSION}\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "[View full results →](https://github.com/NVIDIA/Megatron-Bridge/actions/runs/${RUN_ID})" >> $GITHUB_STEP_SUMMARY
+            echo "[View full results →](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID})" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
           
           # CICD main results
           if [ "${{ inputs.run_cicd_main }}" == "true" ] && [ -n "${{ needs.trigger-mbridge.outputs.cicd_main_run_id }}" ]; then
             RUN_ID="${{ needs.trigger-mbridge.outputs.cicd_main_run_id }}"
-            STATUS=$(gh run view ${RUN_ID} --repo NVIDIA/Megatron-Bridge --json conclusion,status,headBranch,createdAt,updatedAt --jq .)
+            STATUS=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion,status,headBranch,createdAt,updatedAt --jq .)
             CONCLUSION=$(echo "$STATUS" | jq -r .conclusion)
             
             case "$CONCLUSION" in
@@ -277,7 +277,7 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Status:** \`${CONCLUSION}\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "[View full results →](https://github.com/NVIDIA/Megatron-Bridge/actions/runs/${RUN_ID})" >> $GITHUB_STEP_SUMMARY
+            echo "[View full results →](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID})" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
           
