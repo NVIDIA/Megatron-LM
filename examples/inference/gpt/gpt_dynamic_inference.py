@@ -370,7 +370,7 @@ def run_inference(
             output_start = get_curr_time()
             for finished_request_record in finished_request_records:
 
-                finished_request = finished_request_record.merge(engine.controller.tokenizer)
+                finished_request = finished_request_record.merge()
 
                 # Update local request object.
                 request = requests[finished_request.request_id]

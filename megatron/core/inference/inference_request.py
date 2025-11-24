@@ -445,11 +445,8 @@ class DynamicInferenceRequestRecord:
         )
         self.requests.append(new_request)
 
-    def merge(self, tokenizer: MegatronTokenizer) -> DynamicInferenceRequest:
+    def merge(self) -> DynamicInferenceRequest:
         """Merge requests into a single suspend-agnostic request object.
-
-        Args:
-            tokenizer (MegatronTokenizer): The tokenizer.
 
         Returns:
             (DynamicInferenceRequest) Merged request.
@@ -462,16 +459,18 @@ class DynamicInferenceRequestRecord:
                 return [v for r in self.requests for v in getattr(r, key)]
 
         prompt_tokens = self.requests[0].prompt_tokens
+        prompt_text = self.requests[0].prompt
         generated_tokens = merge_lists("generated_tokens")
+        generated_text = "".join(r.generated_text for r in self.requests)
 
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
-            prompt=tokenizer.detokenize(prompt_tokens.tolist()),
+            prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
-            generated_text=tokenizer.detokenize(generated_tokens),
+            generated_text=generated_text,
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
             generated_log_probs=merge_lists("generated_log_probs"),
