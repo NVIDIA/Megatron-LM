@@ -280,6 +280,9 @@ def read_metadata(tracker_filename):
                 print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
                     tracker_filename))
                 sys.exit()
+            else:
+                # Set iteration to 0 for release checkpoints
+                iteration = 0
     assert iteration > -1 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
 
@@ -862,7 +865,7 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
             )
             state_dict["model"] = model_state_dict
     if args.num_experts:
-        state_dict["model"] = handle_experts_in_state_dict(state_dict["model"])
+        state_dict["model"] = handle_experts_in_state_dict(state_dict["model"], args.num_experts)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
