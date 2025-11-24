@@ -662,6 +662,10 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
+        # We do not want to sample tokens beyond vocabulary size.
+        # padded_vocab_size does not reflect the actual vocab size and can change
+        # with different parallelism setup.
+        logits[:, :, self.tokenizer.vocab_size:] = -torch.inf
         # Last token logits.
         if materialize_only_last_token_logits:
             # When materialize_only_last_token_logits is true, last_token_logits is

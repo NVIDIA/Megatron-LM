@@ -15,7 +15,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
 from megatron.rl.rl_utils import calculate_grpo_loss, get_logprobs, get_rl_runtime_state
-from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
 
@@ -179,6 +179,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     """
 
     args = get_args()
+    vocab_size = get_tokenizer().vocab_size
     timers = get_timers()
 
     timers('batch-generator', log_level=2).start()
@@ -279,7 +280,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
         current_logprobs = get_logprobs(
-            model_to_use, tokens, position_ids, attention_mask, no_grad=False
+            model_to_use, tokens, position_ids, attention_mask, no_grad=False, vocab_size=vocab_size,
         )
 
         # Calculate loss using unified function

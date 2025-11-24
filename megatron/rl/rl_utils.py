@@ -701,7 +701,7 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
+def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, vocab_size=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -709,6 +709,7 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
         tokens: inputs for which we want to get logprobs.
         position_ids: position ids that come with tokens.
         attention_mask: attention mask that comes with tokens.
+        vocab_size: vocabulary size, logits have the shape of padded_vocabulary_size, we do not care about the padded vocabulary part. If None, return logprobs for all token positions.
 
     Returns:
         Logprobs of input sequences.
@@ -735,7 +736,9 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
             model.config.flash_decode = flash_decode
             # We do not need logprobs for the n+1 token.
         with nvtx_range("log-softmax", time=False):
-            logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+            if not vocab_size:
+                vocab_size = logits.shape[-1]
+            logprobs = selective_log_softmax(logits[:, :-1, :vocab_size], tokens[:, 1:])
 
     return logprobs
 
@@ -1616,7 +1619,8 @@ def prepare_data_for_update(
                 compute_position_ids = original_position_ids
                 compute_attention_mask = original_attention_mask
                 use_packed_computation = False
-
+ 
+        vocab_size = tokenizer.vocab_size
         with nvtx_range("create-logprobs-dataloader"):
             data_iter = DataLoader(
                 TensorDataset(compute_trajs, compute_position_ids), batch_size=args.micro_batch_size
@@ -1636,7 +1640,7 @@ def prepare_data_for_update(
                     b_attn_mask = None
 
                 logprobs = get_logprobs(
-                    model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask, no_grad=True
+                    model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask, no_grad=True, vocab_size=vocab_size
                 )
                 old_logprobs.append(logprobs.detach().cpu())
 
@@ -1717,7 +1721,7 @@ def prepare_data_for_update(
                     b_attn_mask = None
 
                 logprobs = get_logprobs(
-                    model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask, no_grad=True
+                    model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask, no_grad=True, vocab_size=vocab_size
                 )
                 ref_logprobs.append(logprobs.detach().cpu())
 
