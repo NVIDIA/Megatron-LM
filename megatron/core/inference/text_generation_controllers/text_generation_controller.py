@@ -926,14 +926,14 @@ class TextGenerationController:
         return_log_probs = self._dynamic_step_log_probs_bookkeeping()
         return_top_n_logprobs = self._dynamic_step_top_n_logprobs_bookkeeping()
 
+        log_probs = None
+        top_n_logprobs = None
         if return_log_probs or return_top_n_logprobs:
             log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
             if return_top_n_logprobs:
                 top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                     logits, log_probs_tensor
                 )
-            else:
-                top_n_logprobs = None
 
         if skip_bookkeeping:
             request_bookkeeping = {}
