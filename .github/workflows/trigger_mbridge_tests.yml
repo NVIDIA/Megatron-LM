@@ -9,11 +9,6 @@ on:
   # Manual trigger only
   workflow_dispatch:
     inputs:
-      mbridge_ref:
-        description: 'MBridge branch/ref to trigger'
-        required: false
-        type: string
-        default: 'main'
       run_cicd_main:
         description: 'Run cicd-main.yml (full CI/CD)'
         required: false
@@ -65,10 +60,9 @@ jobs:
         run: |
           echo "🚀 Triggering MBridge workflow: install-test.yml"
           echo "📌 MCore commit: ${{ steps.mcore_info.outputs.sha }}"
-          echo "🌿 MBridge ref: ${{ inputs.mbridge_ref }}"
           
           gh workflow run install-test.yml \
-            --repo NVIDIA/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
+            --repo NVIDIA/Megatron-Bridge --ref main \
             --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
             --field mcore_branch=${{ steps.mcore_info.outputs.branch }} \
             --field test_suite=${{ inputs.test_suite }} \
@@ -81,10 +75,9 @@ jobs:
         run: |
           echo "🚀 Triggering MBridge workflow: cicd-main.yml"
           echo "📌 MCore commit: ${{ steps.mcore_info.outputs.sha }}"
-          echo "🌿 MBridge ref: ${{ inputs.mbridge_ref }}"
           
           gh workflow run cicd-main.yml \
-            --repo NVIDIA/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
+            --repo NVIDIA/Megatron-Bridge --ref main \
             --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
             --field mcore_branch=${{ steps.mcore_info.outputs.branch }} \
             --field test_suite=${{ inputs.test_suite }} \
@@ -133,7 +126,7 @@ jobs:
           {
             echo "## 🔄 MBridge Tests Triggered"
             echo ""
-            echo "**MCore Commit:** \`${{ steps.mcore_info.outputs.short_sha }}\` | **MBridge Ref:** \`${{ inputs.mbridge_ref }}\` | **Test Suite:** \`${{ inputs.test_suite }}\`"
+            echo "**MCore Commit:** \`${{ steps.mcore_info.outputs.short_sha }}\` | **Test Suite:** \`${{ inputs.test_suite }}\`"
             echo ""
             if [ "${{ inputs.run_install_test }}" == "true" ]; then
               echo "- 🔄 [install-test.yml](https://github.com/NVIDIA/Megatron-Bridge/actions/runs/${{ steps.wait_for_runs.outputs.install_test_run_id }}) - Running..."
