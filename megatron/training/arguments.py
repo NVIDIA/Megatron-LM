@@ -1033,8 +1033,6 @@ def validate_args(args, defaults={}):
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
-        # from remote_pdb import set_trace
-        # set_trace()
         assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
         assert args.num_experts % args.expert_model_parallel_size == 0, \
             "Number of experts should be a multiple of expert model parallel_size."
@@ -1297,8 +1295,6 @@ def core_transformer_config_from_args(args, config_class=None):
         # Pop 'rope_type' to let the config class use the default value.
         kw_args.pop('rope_type', None)
     else:
-        # from remote_pdb import set_trace
-        # set_trace()
         # GptOSS defaults to yarn, but it possible to use many others and yarn has already been supported in Mcore
         assert (not args.multi_latent_attention or args.rope_type != 'yarn'), (
             f'If using MLA attention (sft deepseek V3), rope_type is expected to be "yarn", but got {args.rope_type}.'

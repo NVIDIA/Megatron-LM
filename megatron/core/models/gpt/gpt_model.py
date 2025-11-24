@@ -105,9 +105,6 @@ class GPTModel(LanguageModule):
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
-        # from remote_pdb import set_trace
-        # set_trace()
-
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
