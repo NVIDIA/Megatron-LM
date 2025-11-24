@@ -74,10 +74,6 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
-# >>>
-from lutil import pax
-# <<<
-
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -486,32 +482,8 @@ def main():
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
     for _ in range(args.inference_repeat_n):
-        # >>>
-        # Reset requests for correct output when using inference_repeat_n > 1.
-        # [ r.reset() for r in requests ]
-        # for request in requests:
-        #     # request.prompt_text     = 'The inventor of the GPU is'.
-        #     # request.prompt_tokens   = list([9376]; [464, 33475, 286, 262, 11362, 318]).
-        #     # request.sampling_params = SamplingParams([0384]; SamplingParams(temperature=1.0, top_k=1, top_p=0.0, return_log_probs=True,  ... 50256, top_n_logprobs=0, return_prompt_top_n_logprobs=False, add_BOS=False)).
-        #     # request.time_offset     = 0.0034695290311770443
-
-
-
-        #     request.output_text     = None
-        #     request.output_tokens   = []
-        #     request.state           = 'not-started'
-        #     request.time_arrival    = None
-        #     request.time_end        = None
-        #     request.time_start      = None
-        # <<<
-        # >>>
-        # engine.reset()
-        # <<<
         t = get_curr_time()
         result = run_inference(requests, engine)
-        # >>>
-        # pax({"requests / 2": requests[2]})
-        # <<<
         step_times = result["step_times"]
         add_times = result["add_times"]
         output_times = result["output_times"]
