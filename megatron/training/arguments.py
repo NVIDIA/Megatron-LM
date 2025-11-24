@@ -1067,6 +1067,20 @@ def validate_args(args, defaults={}):
            any([args.train_data_path, args.valid_data_path, args.test_data_path]) \
            <= 1, "A single data source must be provided in training mode, else None"
 
+    if args.fim_data:
+        extra_tokens = [
+            args.fim_prefix_token,
+            args.fim_middle_token,
+            args.fim_suffix_token,
+            args.fim_pad_token,
+            args.fim_eod_token,
+        ]
+        assert not args.mock_data, "Mock dataset is not supported with FIM dataset."
+        assert not args.legacy_tokenizer, "FIM dataset is not supported with legacy tokenizers."
+        assert args.fim_rate, "--fim-rate should be specified."
+        assert args.fim_spm_rate, "--fim-spm-rate should be specified."
+        assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
+
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
@@ -1134,7 +1148,7 @@ def validate_args(args, defaults={}):
         ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
 
     if args.inference_dynamic_batching:
-        assert args.inference_dynamic_batching_active_buffer_size_gb is not None
+        assert args.inference_dynamic_batching_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
     # MoE upcycling check
@@ -1440,12 +1454,17 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
-    group.add_argument('--inference-dynamic-batching-active-buffer-size-gb',
+    group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
-                       help='Buffer size (GB) allocated for the active (on-GPU) '
-                       'portion of the chunked KV memory. The total buffer size '
-                       'is 2x this value, which includes the same-size on-CPU '
-                       'paused buffer.')
+                       help='Amount of on-GPU memory allocated for the KV cache. '
+                       'The total amount of memory allocated for the KV cache '
+                       '(CPU + GPU memory) depends on the value set for the '
+                       'unified virtual memory (UVM) level (via '
+                       '`--inference-dynamic-batching-unified-memory-level`).'
+                       'If the UVM level is 0, then only GPU memory is used and '
+                       'the total memory equals `buffer_size_gb`. If the UVM '
+                       'level is 1, then additional memory is utilized on the '
+                       'CPU and the total memory equals `2 * buffer_size_gb`.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
@@ -1491,8 +1510,6 @@ def _add_inference_args(parser):
                             'Default to 0 to disable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int, default=12346,
                        help="This port will be used to setup the inference coordinator on node-0")
-    group.add_argument("--inference-mp-coordinator-port", type=int, default=20000,
-                       help="This port will be used to setup the inference model parallel coordinators")
     return parser
 
 
@@ -2910,6 +2927,27 @@ def _add_data_args(parser):
                        'If instead this argument is set, the training flow will treat all tokens '
                        'that share the same id as the pad token as true pad tokens, potentially '
                        'causing severe training instability.')
+    group.add_argument('--fim-data', action='store_true', help='Whether to use the FIM dataset.')
+    group.add_argument('--fim-rate', type=float, default=0.5,
+                       help='Probability to convert a training sample into a FIM format.')
+    group.add_argument('--fim-spm-rate', type=float, default=0.5,
+                       help='Probability that the a FIM sample uses the SPM format over the PSM format.')
+    group.add_argument('--fim-split-sample', type=str, default=None,
+                       help='String around which to split the sample for FIM.')
+    group.add_argument('--fim-fragment-rate', type=float, default=None,
+                       help='Rate of FIM on each fragment when --fim-split-sample is not None.')
+    group.add_argument('--fim-no-prefix', type=str, default=None,
+                       help='Do not apply FIM to fragments that start with this prefix')
+    group.add_argument('--fim-prefix-token', type=str, default='<fim_prefix>',
+                       help='FIM prefix token')
+    group.add_argument('--fim-middle-token', type=str, default='<fim_middle>',
+                       help='FIM middle token')
+    group.add_argument('--fim-suffix-token', type=str, default='<fim_suffix>',
+                       help='FIM suffix token')
+    group.add_argument('--fim-pad-token', type=str, default='<fim_pad>',
+                       help='FIM PAD token')
+    group.add_argument('--fim-eod-token', type=str, default='<|endoftext|>',
+                       help='FIM EOD token')
     return parser
 
 

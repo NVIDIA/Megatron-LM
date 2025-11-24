@@ -23,7 +23,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 : ${INCOMING_REQUESTS_PER_SEC=100.}
 
 # Dynamic context.
-: ${ACTIVE_BUFFER_SIZE_GB=50.}
+: ${BUFFER_SIZE_GB=50.}
 
 # Cuda graphs.
 : ${NUM_CUDA_GRAPHS=16}
@@ -74,7 +74,7 @@ ARGS=" \
     --inference-rng-tracker \
     \
     --inference-dynamic-batching \
-    --inference-dynamic-batching-active-buffer-size-gb ${ACTIVE_BUFFER_SIZE_GB} \
+    --inference-dynamic-batching-buffer-size-gb ${BUFFER_SIZE_GB} \
     \
     ${EXTRA_ARGS} \
 "

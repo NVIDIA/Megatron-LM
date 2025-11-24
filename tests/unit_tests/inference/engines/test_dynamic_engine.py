@@ -13,6 +13,9 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
@@ -46,7 +49,7 @@ from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGl
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     check_mamba_sequence_packing_support,
-    get_attr_wrapped_model,
+    get_mamba_inference_state_config_from_model,
     is_fa_min_version,
     is_te_min_version,
 )
@@ -86,7 +89,7 @@ class DynamicEngineTestConfig:
 
     num_gap_steps: int = 2
 
-    context_active_buffer_size_gb: float = 0.1  # enough room for all tokens.
+    context_buffer_size_gb: float = 0.1  # enough room for all tokens.
     context_block_size_tokens: int = 256
     context_max_tokens: Optional[int] = None
     tensor_model_parallel_size: int = 1
@@ -205,9 +208,7 @@ class TestDynamicInferenceEngine:
         test_config: DynamicEngineTestConfig,
         transformer_config: TransformerConfig,
         requests: List[DynamicInferenceRequest],
-        layer_type_list: Optional[List[str]] = None,
-        mamba_conv_states_shape: Optional[Tuple[int]] = None,
-        mamba_ssm_states_shape: Optional[Tuple[int]] = None,
+        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
     ):
         """The inference context manages the KV cache and other inference state."""
 
@@ -221,13 +222,11 @@ class TestDynamicInferenceEngine:
             max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
             use_cuda_graphs_for_non_decode_steps=not test_config.model_provider == "mamba",
-            active_buffer_size_gb=test_config.context_active_buffer_size_gb,
+            buffer_size_gb=test_config.context_buffer_size_gb,
             block_size_tokens=test_config.context_block_size_tokens,
             max_tokens=test_config.context_max_tokens,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=mamba_conv_states_shape,
-            mamba_ssm_states_shape=mamba_ssm_states_shape,
+            mamba_inference_state_config=mamba_inference_state_config,
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
@@ -348,6 +347,7 @@ class TestDynamicInferenceEngine:
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 cuda_graph_scope=test_config.cuda_graph_scope,
+                is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
             # Mamba model.
@@ -370,22 +370,7 @@ class TestDynamicInferenceEngine:
 
         model.eval()
 
-        # Layer type list for hybrid models
-        decoder = get_attr_wrapped_model(model, "decoder")
-        layer_type_list = getattr(decoder, "layer_type_list", None)
-        if test_config.model_provider == "mamba":
-            mamba_states_shapes = decoder.mamba_state_shapes_per_request()
-            if mamba_states_shapes is not None:
-                (mamba_conv_states_shape, mamba_ssm_states_shape) = mamba_states_shapes
-            else:
-                # A `MambaBlock` can only not have a `MambaLayer` if using pipeline parallelism
-                # and a particular pipeline stage was not assigned a `MambaLayer`.
-                assert test_config.pipeline_model_parallel_size > 1
-                mamba_conv_states_shape = None
-                mamba_ssm_states_shape = None
-        else:
-            mamba_conv_states_shape = None
-            mamba_ssm_states_shape = None
+        mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
         # Inference config.
         inference_config = InferenceWrapperConfig(
@@ -402,9 +387,7 @@ class TestDynamicInferenceEngine:
             test_config=test_config,
             transformer_config=transformer_config,
             requests=requests,
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=mamba_conv_states_shape,
-            mamba_ssm_states_shape=mamba_ssm_states_shape,
+            mamba_inference_state_config=mamba_inference_state_config,
         )
 
         # Inference model wrapper.
@@ -575,13 +558,13 @@ class TestDynamicInferenceEngine:
         ]
 
         mamba_expected_generated_tokens = [
-            [74, 72, 83, 59, 1, 70, 15, 89, 30, 52, 82, 70, 64, 16, 83, 5],
-            [25, 54, 42, 57, 33, 64, 60, 13, 28, 74, 8, 4, 56, 68, 87, 82],
-            [31, 55, 77, 25, 96, 13, 32, 49, 40, 54, 73, 10, 50, 2, 64, 96],
-            [72, 80, 35, 72, 77, 85, 98, 36, 4, 97, 37, 46, 79, 95, 83, 85],
-            [8, 80, 56, 4, 87, 1, 15, 98, 85, 7, 31, 38, 91, 28, 18, 80],
-            [9, 94, 48, 60, 87, 57, 25, 76, 91, 34, 69, 86, 73, 24, 63, 97],
-            [17, 5, 62, 66, 15, 52, 32, 75, 66, 18, 69, 5, 67, 37, 94, 51],
+            [74, 72, 9, 59, 1, 70, 15, 89, 30, 52, 82, 70, 64, 16, 83, 5],
+            [25, 54, 28, 14, 87, 27, 60, 92, 28, 74, 8, 63, 60, 68, 87, 82],
+            [31, 21, 87, 25, 96, 13, 32, 49, 40, 54, 55, 68, 73, 2, 64, 96],
+            [72, 80, 35, 72, 77, 85, 98, 36, 4, 97, 37, 46, 79, 95, 83, 25],
+            [8, 80, 56, 4, 87, 1, 43, 98, 85, 7, 50, 38, 24, 28, 18, 80],
+            [9, 94, 36, 16, 87, 57, 25, 76, 64, 92, 47, 86, 73, 72, 71, 97],
+            [17, 5, 62, 66, 15, 52, 32, 75, 66, 18, 90, 14, 67, 37, 94, 33],
             [],
         ]
 
@@ -655,9 +638,9 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(DynamicEngineTestConfig(model_provider=model_provider))
         context = env.engine.context
         block_size_bytes = context.block_size_bytes
-        active_buffer_size_gb = (block_size_bytes + 1) / 1024**3
+        buffer_size_gb = (block_size_bytes + 1) / 1024**3
         test_config = DynamicEngineTestConfig(
-            context_active_buffer_size_gb=active_buffer_size_gb, model_provider=model_provider
+            context_buffer_size_gb=buffer_size_gb, model_provider=model_provider
         )
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
@@ -692,20 +675,20 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [80]),
-            (1, [80]),
-            (2, [80, 40]),
-            (4, [80, 72, 48, 24]),
-            (8, [80, 64, 48, 32, 16]),
-            (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-            (64, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-            (1024, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (0, [40]),
+            (1, [40]),
+            (2, [40, 24]),
+            (4, [40, 32, 16]),
+            (8, [40, 32, 24, 16, 8]),
+            (16, [40, 32, 24, 16, 8]),
+            (64, [40, 32, 24, 16, 8]),
+            (1024, [40, 32, 24, 16, 8]),
         ]:
 
             # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
                 DynamicEngineTestConfig(
-                    context_active_buffer_size_gb=0.01, num_cuda_graphs=num_cuda_graphs
+                    context_buffer_size_gb=0.01, num_cuda_graphs=num_cuda_graphs
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
@@ -726,19 +709,7 @@ class TestDynamicInferenceEngine:
     )
     @pytest.mark.parametrize(
         "num_warmup_tokens, expected_cuda_graph_token_count",
-        [
-            (1, 8),
-            (2, 8),
-            (4, 8),
-            (8, 8),
-            (10, 16),
-            (12, 16),
-            (16, 16),
-            (20, 24),
-            (24, 24),
-            (28, 32),
-            (32, 32),
-        ],
+        [(1, 8), (2, 8), (4, 8), (8, 8), (10, 16), (12, 16), (16, 16)],
     )
     @torch.inference_mode()
     def test_cuda_graph_warmup(
@@ -754,18 +725,15 @@ class TestDynamicInferenceEngine:
         # Initialize context.
         env = self._build_test_env(
             DynamicEngineTestConfig(
-                context_active_buffer_size_gb=0.0041, num_cuda_graphs=8, num_tokens_to_generate=1
+                context_buffer_size_gb=0.0041, num_cuda_graphs=8, num_tokens_to_generate=1
             )
         )
 
         context = env.engine.context
         assert context.is_decode_only()
-        assert context.cuda_graph_token_counts == [
-            32,
-            24,
-            16,
-            8,
-        ], "cuda_graph_token_counts: %s." % str(context.cuda_graph_token_counts)
+        assert context.cuda_graph_token_counts == [16, 8], "cuda_graph_token_counts: %s." % str(
+            context.cuda_graph_token_counts
+        )
 
         context.initialize_attention_state(
             num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
@@ -1060,7 +1028,7 @@ class TestDynamicInferenceEngine:
             num_requests=16,
             max_prompt_length=10,
             num_tokens_to_generate=32,
-            context_active_buffer_size_gb=0.001,  # 0.001, # 8 blocks
+            context_buffer_size_gb=0.001,  # 0.001, # 8 blocks
             context_max_tokens=8,
             num_gap_steps=1,
         )
