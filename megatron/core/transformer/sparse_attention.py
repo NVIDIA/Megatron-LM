@@ -219,7 +219,11 @@ class Indexer(MegatronModule):
         super().__init__(config=config)
         self.hidden_size = self.config.hidden_size
         self.qk_pos_emb_head_dim = self.config.qk_pos_emb_head_dim
-        self.q_lora_rank = self.config.q_lora_rank
+        self.q_lora_rank = (
+            self.config.q_lora_rank
+            if self.config.q_lora_rank is not None
+            else self.config.hidden_size
+        )
         self.index_n_heads = self.config.index_n_heads
         self.index_head_dim = self.config.index_head_dim
         self.index_topk = self.config.index_topk
