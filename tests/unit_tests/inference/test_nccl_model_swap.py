@@ -129,6 +129,7 @@ def _set_pg_collection(module, tp_group, dp_group):
         (1, 1, 2, 1, 1, 4, 4),     # EP2 -> EP4
         (1, 1, 2, 1, 1, 1, 4),
         (1, 1, 1, 1, 1, 2, 4),
+        (1, 1, 2, 1, 2, 2, 4),
     ],
 )
 def test_nccl_swap_gpt_parametrized(
