@@ -293,10 +293,6 @@ def run_inference(
         """
         nonlocal num_requests_added
         _request = requests[num_requests_added]
-        # >>>
-        # if num_requests_added == 2 and _request.output_text is not None:
-        #     pax("_request")
-        # <<<
         engine.add_request(
             num_requests_added,
             _request.prompt_text,
@@ -379,17 +375,6 @@ def run_inference(
             for finished_request_record in finished_request_records:
 
                 finished_request = finished_request_record.merge()
-                # >>>
-                # if finished_request.prompt == "The inventor of the GPU is":
-                if True or finished_request.request_id == 2:
-                    print(f"................................. request {finished_request.request_id}.")
-                    # pax("finished_request", {
-                    #     "prompt" : finished_request.prompt,
-                    #     "generated_text" : finished_request.generated_text,
-                    #     "generated text'" : engine.controller.tokenizer.detokenize(finished_request.generated_tokens),
-                    #     "request" : requests[finished_request.request_id],
-                    # })
-                # <<<
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
@@ -406,11 +391,6 @@ def run_inference(
                 request.output_text = finished_request.generated_text
                 total_output_tokens += len(request.output_tokens)
 
-                # >>>
-                # if request.prompt_text == "The inventor of the GPU is":
-                #     pax("finished_request, request")
-                # <<<
-
                 # Log probs.
                 if finished_request.sampling_params.return_log_probs:
                     request.log_probs = (
@@ -422,10 +402,6 @@ def run_inference(
         # Check if all requests are finished.
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
-
-    # >>>
-    # pax({"requests / 2": requests[2]})
-    # <<<
 
     return {
         "step_times" : step_times,
@@ -513,22 +489,23 @@ def main():
         # >>>
         # Reset requests for correct output when using inference_repeat_n > 1.
         # [ r.reset() for r in requests ]
-        for request in requests:
-            if request.output_text is not None:
-                pax({"sampling_params": request.sampling_params})
-            # request.prompt_text     = 'The inventor of the GPU is'.
-            # request.prompt_tokens   = list([9376]; [464, 33475, 286, 262, 11362, 318]).
-            # request.sampling_params = SamplingParams([0384]; SamplingParams(temperature=1.0, top_k=1, top_p=0.0, return_log_probs=True,  ... 50256, top_n_logprobs=0, return_prompt_top_n_logprobs=False, add_BOS=False)).
-            # request.time_offset     = 0.0034695290311770443
+        # for request in requests:
+        #     # request.prompt_text     = 'The inventor of the GPU is'.
+        #     # request.prompt_tokens   = list([9376]; [464, 33475, 286, 262, 11362, 318]).
+        #     # request.sampling_params = SamplingParams([0384]; SamplingParams(temperature=1.0, top_k=1, top_p=0.0, return_log_probs=True,  ... 50256, top_n_logprobs=0, return_prompt_top_n_logprobs=False, add_BOS=False)).
+        #     # request.time_offset     = 0.0034695290311770443
 
 
 
-            request.output_text     = None
-            request.output_tokens   = []
-            request.state           = 'not-started'
-            request.time_arrival    = None
-            request.time_end        = None
-            request.time_start      = None
+        #     request.output_text     = None
+        #     request.output_tokens   = []
+        #     request.state           = 'not-started'
+        #     request.time_arrival    = None
+        #     request.time_end        = None
+        #     request.time_start      = None
+        # <<<
+        # >>>
+        # engine.reset()
         # <<<
         t = get_curr_time()
         result = run_inference(requests, engine)
@@ -544,9 +521,6 @@ def main():
         stats = torch.cuda.memory_stats()
         throughput = total_output_tokens / total_time
         throughputs.append(throughput)
-    # >>>
-    pax({"requests / 2": requests[2]})
-    # <<<
 
     # Validate all requests finished.
     for request in requests:
@@ -565,10 +539,6 @@ def main():
         # Map requests by their prompt.
         unique_prompt_map = defaultdict(list)
         for request_idx, request in enumerate(requests):
-            # >>>
-            if request.prompt_text == "The inventor of the GPU is":
-                pax("request")
-            # <<<
             unique_prompt_map[request.prompt_text].append(request_idx)
 
         # Print unique prompts + outputs.
