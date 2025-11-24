@@ -8,7 +8,7 @@ import os
 import pytest
 
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.model_refitting import swap_model_weights
+from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig

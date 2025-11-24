@@ -32,6 +32,7 @@ from megatron.core.parallel_state import get_tensor_model_parallel_src_rank
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.resharding.refit import swap_model_weights
 from megatron.rl.agent.api import (
     EvaluationRequest,
     EvaluationResponse,
@@ -2398,5 +2399,4 @@ def swap_train_to_inference_model(train_model: LanguageModule, inference_model: 
         train_model: The train model to swap to the inference model.
         inference_model: The inference model to swap to the train model.
     """
-    from megatron.core.model_refitting import swap_model_weights
     swap_model_weights(train_model, inference_model, refit_method)

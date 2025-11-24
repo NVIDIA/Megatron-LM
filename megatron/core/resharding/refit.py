@@ -1,21 +1,31 @@
-from megatron.core.models.common.language_module.language_module import LanguageModule
-import torch
-import torch.distributed as dist
-from typing import Any
-from megatron.core import parallel_state
-from megatron.core.resharding import build_centralized_reshard_plan, execute_reshard_plan
+from __future__ import annotations
+
 from typing import Any, Optional
 
+import torch
+import torch.distributed as dist
+
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core import parallel_state
+from . import build_centralized_reshard_plan, execute_reshard_plan
 
 
 def _unwrap_module(module: LanguageModule) -> Any:
-    return module.module.module if hasattr(module, 'module') and hasattr(module.module, 'module') else module.module if hasattr(module, 'module') else module
+    return (
+        module.module.module
+        if hasattr(module, 'module') and hasattr(module.module, 'module')
+        else module.module
+        if hasattr(module, 'module')
+        else module
+    )
+
 
 def swap_model_weights(src_model: LanguageModule, target_model: LanguageModule, refit_method: str):
-    if  refit_method == "nccl":
+    if refit_method == "nccl":
         nccl_model_swap(src_model, target_model)
     else:
         raise ValueError(f"Invalid refit method: {refit_method}")
+
 
 def nccl_model_swap(src_model: LanguageModule, target_model: LanguageModule):
     # Handle list-wrapped modules used throughout training utils
@@ -38,6 +48,7 @@ def nccl_model_swap(src_model: LanguageModule, target_model: LanguageModule):
     # Fill missing DP group on the source using Megatron's parallel state if not provided
     if getattr(src_core.pg_collection, "dp", None) is None:
         src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
+
     # caching plan for reuse
     cached_plan: Optional[Any] = getattr(tgt_core, "_cached_reshard_plan", None)
     if cached_plan is None:
@@ -46,3 +57,5 @@ def nccl_model_swap(src_model: LanguageModule, target_model: LanguageModule):
     else:
         plan = cached_plan
     execute_reshard_plan(plan, src_core, tgt_core)
+
+
