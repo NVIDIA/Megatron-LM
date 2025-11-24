@@ -587,7 +587,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.requests[request_id].record.suspend(self.controller.tokenizer)
+            self.requests[request_id].record.suspend()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -1087,7 +1087,6 @@ class DynamicInferenceEngine(AbstractEngine):
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         # Detokenize all finished requests (critical for InferenceClient, which
         # doesn't necessarily have the tokenizer).
         for record in finished_request_records:
@@ -1099,7 +1098,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.generated_text = self.controller.tokenizer.detokenize(
                     request.generated_tokens
                 )
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:

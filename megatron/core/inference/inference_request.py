@@ -407,13 +407,9 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
-    def suspend(self, tokenizer: MegatronTokenizer):
+    def suspend(self):
         """Suspend request by storing references to previous prompt, generations,
-        and sampling params.
-
-        Args:
-            tokenizer (MegatronTokenizer): The tokenizer.
-        """
+        and sampling params."""
 
         old_request = self[-1]
 
@@ -429,7 +425,6 @@ class DynamicInferenceRequestRecord:
             ),
             dim=0,
         )
-        new_prompt_str = tokenizer.detokenize(new_prompt_tokens.tolist())
 
         # New sampling params.
         new_sampling_params = SamplingParams(
@@ -445,7 +440,6 @@ class DynamicInferenceRequestRecord:
         # New request.
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
-            prompt=new_prompt_str,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
         )
