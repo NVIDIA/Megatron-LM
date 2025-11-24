@@ -1510,8 +1510,6 @@ def _add_inference_args(parser):
                             'Default to 0 to disable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int, default=12346,
                        help="This port will be used to setup the inference coordinator on node-0")
-    group.add_argument("--inference-mp-coordinator-port", type=int, default=20000,
-                       help="This port will be used to setup the inference model parallel coordinators")
     return parser
 
 

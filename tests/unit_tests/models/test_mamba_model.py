@@ -1,29 +1,18 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import os
 from datetime import timedelta
 
 import pytest
 import torch
-from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.inference.inference_request import DynamicInferenceRequest
-from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import (
-    divide,
-    get_mamba_inference_state_config_from_model,
-    is_fa_min_version,
-    is_torch_min_version,
-)
+from megatron.core.utils import divide, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -229,115 +218,3 @@ class TestMambaModel:
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == divide(model.vocab_size, tp_size)
-
-
-class TestMambaWithDynamicInference:
-    """Tests MambaModel with dynamic inference."""
-
-    @torch.inference_mode()
-    def setup_method(self, method):
-        fp8_available, reason_for_no_fp8 = check_fp8_support()
-        if not fp8_available:
-            pytest.skip(reason_for_no_fp8)
-
-        Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
-
-        transformer_config = TransformerConfig(
-            num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
-            hidden_size=256,
-            mamba_num_heads=16,
-            num_attention_heads=16,
-            use_cpu_initialization=True,
-            params_dtype=torch.bfloat16,
-            bf16=True,
-            fp8="hybrid",
-            fp8_recipe="tensorwise",
-        )
-
-        self.mamba_model = MambaModel(
-            config=transformer_config,
-            mamba_stack_spec=mamba_stack_spec,
-            vocab_size=128,
-            max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
-            hybrid_attention_ratio=0.3,
-            hybrid_mlp_ratio=0.3,
-            parallel_output=True,
-        )
-        self.mamba_model = Float16Module(self.mamba_model.config, self.mamba_model)
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @torch.inference_mode()
-    def test_dynamic_inference_padding_with_fp8(self):
-        """
-        Tests that logits for padded tokens are zeroed out for fp8 inference.
-        """
-        self.mamba_model.cuda()
-        self.mamba_model.eval()
-        config = self.mamba_model.config
-
-        # Mamba specific: Retrieve inference state config
-        mamba_inference_state_config = get_mamba_inference_state_config_from_model(
-            self.mamba_model.module
-        )
-
-        inference_context = DynamicInferenceContext(
-            params_dtype=config.params_dtype,
-            num_layers=config.num_layers,
-            kv_channels=config.hidden_size // config.num_attention_heads,
-            num_attention_heads=config.num_attention_heads,
-            max_sequence_length=self.mamba_model.module.max_sequence_length,
-            buffer_size_gb=1.0,
-            block_size_tokens=256,
-            materialize_only_last_token_logits=False,
-            mamba_inference_state_config=mamba_inference_state_config,
-            use_cuda_graphs_for_non_decode_steps=False,
-        )
-
-        # Add a request with 10 tokens. Since 10 is not a multiple of the rounder,
-        # this will create padding up to the padded length.
-        active_token_count = 10
-        request = DynamicInferenceRequest(
-            request_id=0,
-            prompt_tokens=torch.arange(0, active_token_count, dtype=torch.long, device='cuda'),
-            sampling_params=SamplingParams(num_tokens_to_generate=1),
-        )
-        inference_context.add_request(request)
-
-        # Prepares the context, including calculating the padded token count.
-        inference_context.initialize_attention_state()
-
-        assert inference_context.active_token_count == active_token_count
-        assert inference_context.padded_active_token_count == DynamicInferenceContext.TOKEN_ROUNDER
-
-        # Prepare inputs for the forward pass.
-        padded_token_count = inference_context.padded_active_token_count
-        input_ids, position_ids = inference_context.current_input_and_position_ids()
-
-        # Run the forward pass with inference parameters.
-        logits = self.mamba_model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=None,
-            inference_context=inference_context,
-            runtime_gather_output=True,
-        )
-
-        # Verify the output shape.
-        assert logits.shape[0] == 1
-        assert logits.shape[1] == padded_token_count
-        assert logits.shape[2] == self.mamba_model.module.vocab_size
-
-        # Extract the logits corresponding to the padding tokens.
-        padding_start_idx = inference_context.active_token_count
-        padding_end_idx = inference_context.padded_active_token_count
-        padding_logits = logits[0, padding_start_idx:padding_end_idx, :]
-
-        # Assert that all padding logits are zero.
-        assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
