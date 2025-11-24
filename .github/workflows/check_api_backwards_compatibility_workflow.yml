@@ -1,0 +1,239 @@
+name: API Compatibility Check
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'Baseline git reference (tag/branch/commit)'
+        required: true
+
+jobs:
+  pre-flight:
+    name: Pre-flight check
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.check_files.outputs.should_skip }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check if relevant files changed
+        id: check_files
+        run: |
+          # For manual triggers, never skip
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "should_skip=false" >> $GITHUB_OUTPUT
+            echo "Manual trigger - will run compatibility check"
+            exit 0
+          fi
+          
+          # Check if any relevant files changed
+          # Use merge-base to find common ancestor with dev
+          # This ensures we only detect changes actually made in this PR branch,
+          # not changes that happened in dev after the branch was created
+          BASE_SHA=$(git merge-base origin/dev HEAD)
+          echo "Comparing against merge-base: $BASE_SHA"
+          
+          # Check for changes in megatron/core Python files (excluding tests and legacy)
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD -- 'megatron/core/**/*.py' ':!megatron/core/tests/**' ':!megatron/legacy/**' || echo "")
+          
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "should_skip=true" >> $GITHUB_OUTPUT
+            echo "No relevant megatron/core files changed - will skip compatibility check"
+          else
+            echo "should_skip=false" >> $GITHUB_OUTPUT
+            echo "Relevant files changed:"
+            echo "$CHANGED_FILES"
+          fi
+
+  check-compatibility:
+    needs: [pre-flight]
+    if: needs.pre-flight.outputs.should_skip != 'true'
+    name: Check API Backward Compatibility
+    runs-on: ubuntu-latest
+    
+    # ============================================================================
+    # Configuration Parameters (modify here)
+    # ============================================================================
+    env:
+      # Default baseline for automatic PR checks
+      # Can be: branch name (e.g., 'main'), commit hash, or tag
+      # Will be resolved to commit hash during execution
+      DEFAULT_BASELINE: 'c6f277a7f869274c19aace594582d9938b06abac'
+      # Tag pattern for auto-detection (e.g., 'core_r*', 'core_v*')
+      TAG_PATTERN: 'core_v*'
+      # Tag regex filter (e.g., '^core_v[0-9]+\.[0-9]+\.[0-9]+$' for stable versions only)
+      TAG_REGEX_FILTER: '^core_v[0-9]+\.[0-9]+\.[0-9]+$'
+    # ============================================================================
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to access baseline ref
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install griffe
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install griffe
+          python -c "import griffe; print('Griffe installed successfully')"
+          python -c "from griffe import Object; print('Object import successful')" || echo "Object import from griffe failed"
+          python -c "from griffe.dataclasses import Object; print('Object import from dataclasses successful')" || echo "Object import from dataclasses failed"
+      
+      - name: Determine baseline reference
+        id: baseline
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # Use manually specified baseline (branch, tag, or commit hash)
+            BASELINE_REF="${{ github.event.inputs.baseline }}"
+          else
+            # Use the configured default baseline
+            BASELINE_REF="${{ env.DEFAULT_BASELINE }}"
+            
+            # Uncomment below to auto-detect from tags instead:
+            # BASELINE_REF=$(git tag -l '${{ env.TAG_PATTERN }}' | grep -E '${{ env.TAG_REGEX_FILTER }}' | sort -V | tail -1)
+            # if [ -z "$BASELINE_REF" ]; then
+            #   echo "Warning: No tags matching pattern found. Using default: ${{ env.DEFAULT_BASELINE }}" >&2
+            #   BASELINE_REF="${{ env.DEFAULT_BASELINE }}"
+            # fi
+          fi
+          
+          # Resolve baseline to commit hash (works for branches, tags, or commit hashes)
+          BASELINE_HASH=$(git rev-parse "$BASELINE_REF")
+          
+          echo "baseline=$BASELINE_HASH" >> $GITHUB_OUTPUT
+          echo "Using baseline: $BASELINE_REF (resolved to commit: $BASELINE_HASH)"
+      
+      - name: Run compatibility check
+        id: compat_check
+        run: |
+          # Save output to file for later display
+          python scripts/check_api_backwards_compatibility.py \
+            --baseline ${{ steps.baseline.outputs.baseline }} \
+            --verbose 2>&1 | tee compat_check_output.txt
+          
+          # Capture exit code
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          exit $EXIT_CODE
+        continue-on-error: true
+      
+      - name: Fail job if breaking changes detected
+        if: steps.compat_check.outcome == 'failure'
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔍 WHAT IS THIS CHECK?"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "This check ensures that changes to Megatron Core's public API do not"
+          echo "break backward compatibility for users. It compares your PR against"
+          echo "the latest stable release to detect breaking changes in:"
+          echo ""
+          echo "  • Function signatures (parameters, order, types)"
+          echo "  • Class structures and methods"
+          echo "  • Return types and public interfaces"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🛠️  HOW TO FIX THIS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Choose ONE of these resolution strategies:"
+          echo ""
+          echo "1️⃣  REVERT THE BREAKING CHANGE (Recommended)"
+          echo "   → Modify your code to preserve backward compatibility"
+          echo "   → Add new parameters as optional (with defaults)"
+          echo "   → Keep existing parameters in the same order"
+          echo ""
+          echo "2️⃣  MARK AS INTERNAL API (If this is internal code)"
+          echo "   → Add @internal_api decorator from megatron.core.utils"
+          echo ""
+          echo "   Example (for classes):"
+          echo "      from megatron.core.utils import internal_api"
+          echo ""
+          echo "      @internal_api"
+          echo "      class ExperimentalFeature:"
+          echo "          pass"
+          echo ""
+          echo "   Example (for functions):"
+          echo "      from megatron.core.utils import internal_api"
+          echo ""
+          echo "      @internal_api"
+          echo "      def internal_helper_function():"
+          echo "          pass"
+          echo ""
+          echo "3️⃣  USE DEPRECATION (For gradual API changes)"
+          echo "   → Add @deprecated decorator for transition period"
+          echo "   → Example:"
+          echo "      from megatron.core.utils import deprecated"
+          echo ""
+          echo "      @deprecated(version='1.0', removal_version='2.0',"
+          echo "                  alternative='new_function')"
+          echo "      def old_function():"
+          echo "          pass"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📋 BREAKING CHANGES DETECTED"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          cat compat_check_output.txt
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📚 MORE INFORMATION"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "📖 Full documentation: docs/api-backwards-compatibility-check.md"
+          echo "🔧 Checker script: scripts/check_api_backwards_compatibility.py"
+          echo "❓ Questions? Check the docs or ask in #megatron-core"
+          echo ""
+          
+          echo "::error::Breaking API changes detected. Please review the output above and choose a resolution strategy."
+          exit 1
+      
+      - name: Success message
+        if: steps.compat_check.outcome == 'success'
+        run: |
+          echo "::notice::✅ No breaking API changes detected!"
+
+  api-backward-compatibility-summary:
+    needs: [pre-flight, check-compatibility]
+    runs-on: ubuntu-latest
+    name: API Backward Compatibility Check Summary
+    if: always() && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate workflow result
+        shell: bash -x -e -u -o pipefail {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.should_skip == 'true' }}
+        run: |
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and .name != "API Backward Compatibility Check Summary")] | length') || echo 0
+
+          if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
+              if [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
+                  echo "✅ Compatibility check was skipped (no relevant files changed)"
+              else
+                  echo "✅ All checks passed successfully"
+              fi
+              exit 0
+          else
+              echo "❌ Found $FAILED_JOBS failed job(s)"
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success" and .name != "API Backward Compatibility Check Summary") | .name'
+              exit 1
+          fi
+
