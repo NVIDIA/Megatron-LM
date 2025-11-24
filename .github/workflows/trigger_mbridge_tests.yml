@@ -35,12 +35,13 @@ on:
         default: 'all'
 
 jobs:
-  trigger-mbridge:
+  # First job: Get MCore commit info (shared by all matrix jobs)
+  get-mcore-info:
     runs-on: ubuntu-latest
     outputs:
-      install_test_run_id: ${{ steps.wait_for_runs.outputs.install_test_run_id }}
-      cicd_main_run_id: ${{ steps.wait_for_runs.outputs.cicd_main_run_id }}
-      mcore_commit: ${{ steps.mcore_info.outputs.short_sha }}
+      sha: ${{ steps.mcore_info.outputs.sha }}
+      short_sha: ${{ steps.mcore_info.outputs.short_sha }}
+      branch: ${{ steps.mcore_info.outputs.branch }}
     steps:
       - name: Checkout MCore
         uses: actions/checkout@v4
@@ -53,195 +54,130 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "branch=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
-          echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
 
           echo "📦 MCore commit: $(git rev-parse --short HEAD)"
           echo "🌿 Branch: ${GITHUB_REF#refs/heads/}"
-      
-      - name: Trigger MBridge install-test.yml
-        if: ${{ inputs.run_install_test }}
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          echo "🚀 Triggering MBridge workflow: install-test.yml"
-          echo "📌 MCore commit: ${{ steps.mcore_info.outputs.sha }}"
-          echo "🌿 MBridge ref: ${{ inputs.mbridge_ref }}"
-          
-          gh workflow run install-test.yml \
-            --repo NVIDIA-NeMo/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
-            --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
-            --field mcore_branch=${{ steps.mcore_info.outputs.branch }} \
-            --field test_suite=${{ inputs.test_suite }} \
-            --field triggered_by=mcore-ci
-      
-      - name: Trigger MBridge cicd-main.yml
-        if: ${{ inputs.run_cicd_main }}
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          echo "🚀 Triggering MBridge workflow: cicd-main.yml"
-          echo "📌 MCore commit: ${{ steps.mcore_info.outputs.sha }}"
-          echo "🌿 MBridge ref: ${{ inputs.mbridge_ref }}"
-          
-          gh workflow run cicd-main.yml \
-            --repo NVIDIA-NeMo/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
-            --field mcore_commit=${{ steps.mcore_info.outputs.sha }} \
-            --field mcore_branch=${{ steps.mcore_info.outputs.branch }} \
-            --field test_suite=${{ inputs.test_suite }} \
-            --field triggered_by=mcore-ci
-      
-      - name: Wait for workflows to start and capture run IDs
-        id: wait_for_runs
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          echo "⏳ Waiting for triggered workflows to appear..."
-          sleep 10
-          
-          MCORE_SHA="${{ steps.mcore_info.outputs.sha }}"
-          
-          # Get install-test run ID
-          if [ "${{ inputs.run_install_test }}" == "true" ]; then
-            echo "🔍 Looking for install-test.yml run..."
-            INSTALL_RUN_ID=$(gh run list \
-              --repo NVIDIA-NeMo/Megatron-Bridge \
-              --workflow=install-test.yml \
-              --limit 5 \
-              --json databaseId,headSha,createdAt \
-              --jq "sort_by(.createdAt) | reverse | .[0] | .databaseId")
-            
-            echo "install_test_run_id=${INSTALL_RUN_ID}" >> $GITHUB_OUTPUT
-            echo "📋 Install test run ID: ${INSTALL_RUN_ID}"
-          fi
-          
-          # Get cicd-main run ID
-          if [ "${{ inputs.run_cicd_main }}" == "true" ]; then
-            echo "🔍 Looking for cicd-main.yml run..."
-            CICD_RUN_ID=$(gh run list \
-              --repo NVIDIA-NeMo/Megatron-Bridge \
-              --workflow=cicd-main.yml \
-              --limit 5 \
-              --json databaseId,headSha,createdAt \
-              --jq "sort_by(.createdAt) | reverse | .[0] | .databaseId")
-            
-            echo "cicd_main_run_id=${CICD_RUN_ID}" >> $GITHUB_OUTPUT
-            echo "📋 CICD main run ID: ${CICD_RUN_ID}"
-          fi
-      
-      - name: Initial Summary
-        run: |
-          {
-            echo "## 🔄 MBridge Tests Triggered"
-            echo ""
-            echo "**MCore Commit:** \`${{ steps.mcore_info.outputs.short_sha }}\` | **MBridge Ref:** \`${{ inputs.mbridge_ref }}\` | **Test Suite:** \`${{ inputs.test_suite }}\`"
-            echo ""
-            if [ "${{ inputs.run_install_test }}" == "true" ]; then
-              echo "- 🔄 [install-test.yml](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${{ steps.wait_for_runs.outputs.install_test_run_id }}) - Running..."
-            fi
-            if [ "${{ inputs.run_cicd_main }}" == "true" ]; then
-              echo "- 🔄 [cicd-main.yml](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${{ steps.wait_for_runs.outputs.cicd_main_run_id }}) - Running..."
-            fi
-            echo ""
-            echo "⏳ Monitoring test results (polling every 5 minutes until completion or GHA timeout)..."
-            echo ""
-            echo "> **Note:** If tests exceed GitHub Actions' job timeout limit, monitoring will stop gracefully. Click the links above to see final results anytime."
-          } >> $GITHUB_STEP_SUMMARY
 
-  monitor-results:
-    needs: [trigger-mbridge]
+  # Matrix job: Trigger and monitor MBridge workflows in parallel
+  trigger-and-monitor:
+    needs: [get-mcore-info]
     runs-on: ubuntu-latest
     continue-on-error: true  # Don't fail workflow if monitoring times out
-    if: always()
+    strategy:
+      fail-fast: false  # Continue other matrix jobs even if one fails
+      matrix:
+        include:
+          - workflow: install-test.yml
+            name: Install Test
+          - workflow: cicd-main.yml
+            name: CI/CD Main
+    
+    name: ${{ matrix.name }}
+    
     steps:
-      - name: Monitor install-test workflow (polling)
-        if: ${{ inputs.run_install_test && needs.trigger-mbridge.outputs.install_test_run_id != '' }}
+      - name: Check if workflow should run
+        id: should_run
+        run: |
+          if [[ "${{ matrix.workflow }}" == "install-test.yml" && "${{ inputs.run_install_test }}" == "true" ]]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ matrix.workflow }}" == "cicd-main.yml" && "${{ inputs.run_cicd_main }}" == "true" ]]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Skipping ${{ matrix.workflow }} (not enabled)"
+          fi
+      
+      - name: Trigger MBridge ${{ matrix.workflow }}
+        if: steps.should_run.outputs.run == 'true'
+        id: trigger
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          RUN_ID="${{ needs.trigger-mbridge.outputs.install_test_run_id }}"
-          echo "📊 Monitoring install-test.yml (Run ID: ${RUN_ID})"
+          echo "🚀 Triggering MBridge workflow: ${{ matrix.workflow }}"
+          echo "📌 MCore commit: ${{ needs.get-mcore-info.outputs.sha }}"
+          echo "🌿 MBridge ref: ${{ inputs.mbridge_ref }}"
           
-          POLL_INTERVAL=300  # Poll every 5 minutes
-          MAX_POLLS=999999   # Effectively unlimited - let GHA timeout naturally
-          POLL_COUNT=0
-          
-          while [ $POLL_COUNT -lt $MAX_POLLS ]; do
-            STATUS_JSON=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json status,conclusion)
-            STATUS=$(echo "$STATUS_JSON" | jq -r .status)
-            CONCLUSION=$(echo "$STATUS_JSON" | jq -r .conclusion)
-            
-            echo "[$POLL_COUNT] Status: $STATUS, Conclusion: $CONCLUSION"
-            
-            # Check if workflow completed
-            if [ "$STATUS" == "completed" ]; then
-              echo "install_test_status=${CONCLUSION}" >> $GITHUB_ENV
-              echo "✅ Install test completed with status: ${CONCLUSION}"
-              break
-            fi
-            
-            # Still running, wait before next poll
-            POLL_COUNT=$((POLL_COUNT + 1))
-            if [ $POLL_COUNT -lt $MAX_POLLS ]; then
-              echo "⏳ Still running... next check in ${POLL_INTERVAL}s (${POLL_COUNT}/${MAX_POLLS})"
-              sleep $POLL_INTERVAL
-            fi
-          done
-          
-          # If we exhausted all polls
-          if [ $POLL_COUNT -eq $MAX_POLLS ]; then
-            echo "⏱️ Monitoring timeout reached - tests still running"
-          fi
-
-      - name: Monitor cicd-main workflow (polling)
-        if: ${{ inputs.run_cicd_main && needs.trigger-mbridge.outputs.cicd_main_run_id != '' }}
+          gh workflow run ${{ matrix.workflow }} \
+            --repo NVIDIA-NeMo/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
+            --field mcore_commit=${{ needs.get-mcore-info.outputs.sha }} \
+            --field mcore_branch=${{ needs.get-mcore-info.outputs.branch }} \
+            --field test_suite=${{ inputs.test_suite }} \
+            --field triggered_by=mcore-ci
+      
+      - name: Wait for workflow to start and capture run ID
+        if: steps.should_run.outputs.run == 'true'
+        id: get_run_id
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          RUN_ID="${{ needs.trigger-mbridge.outputs.cicd_main_run_id }}"
-          echo "📊 Monitoring cicd-main.yml (Run ID: ${RUN_ID})"
+          echo "⏳ Waiting for triggered workflow to appear..."
+          sleep 10
           
-          POLL_INTERVAL=300  # Poll every 5 minutes
-          MAX_POLLS=999999   # Effectively unlimited - let GHA timeout naturally
-          POLL_COUNT=0
+          echo "🔍 Looking for ${{ matrix.workflow }} run..."
+          RUN_ID=$(gh run list \
+            --repo NVIDIA-NeMo/Megatron-Bridge \
+            --workflow=${{ matrix.workflow }} \
+            --limit 5 \
+            --json databaseId,headSha,createdAt \
+            --jq "sort_by(.createdAt) | reverse | .[0] | .databaseId")
           
-          while [ $POLL_COUNT -lt $MAX_POLLS ]; do
-            STATUS_JSON=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json status,conclusion)
-            STATUS=$(echo "$STATUS_JSON" | jq -r .status)
-            CONCLUSION=$(echo "$STATUS_JSON" | jq -r .conclusion)
-            
-            echo "[$POLL_COUNT] Status: $STATUS, Conclusion: $CONCLUSION"
-            
-            # Check if workflow completed
-            if [ "$STATUS" == "completed" ]; then
-              echo "cicd_main_status=${CONCLUSION}" >> $GITHUB_ENV
-              echo "✅ CICD main completed with status: ${CONCLUSION}"
-              break
-            fi
-            
-            # Still running, wait before next poll
-            POLL_COUNT=$((POLL_COUNT + 1))
-            if [ $POLL_COUNT -lt $MAX_POLLS ]; then
-              echo "⏳ Still running... next check in ${POLL_INTERVAL}s (${POLL_COUNT}/${MAX_POLLS})"
-              sleep $POLL_INTERVAL
-            fi
-          done
+          echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
+          echo "📋 Run ID: ${RUN_ID}"
           
-          # If we exhausted all polls
-          if [ $POLL_COUNT -eq $MAX_POLLS ]; then
-            echo "⏱️ Monitoring timeout reached - tests still running"
-          fi
+          echo "## 🔄 ${{ matrix.name }} Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**MCore Commit:** \`${{ needs.get-mcore-info.outputs.short_sha }}\` | **MBridge Ref:** \`${{ inputs.mbridge_ref }}\` | **Test Suite:** \`${{ inputs.test_suite }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔄 [${{ matrix.workflow }}](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID}) - Running..." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⏳ Monitoring test results (polling every 5 minutes until completion or GHA timeout)..." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Note:** If tests exceed GitHub Actions' job timeout limit, monitoring will stop gracefully." >> $GITHUB_STEP_SUMMARY
 
-      - name: Get detailed test results
+      - name: Monitor workflow  
+        if: steps.should_run.outputs.run == 'true'
+        id: monitor
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            const runId = ${{ steps.get_run_id.outputs.run_id }};
+            const checkInterval = 300000; // 5 minutes
+            
+            console.log(`📊 Monitoring ${{ matrix.workflow }} (Run ID: ${runId})`);
+            
+            // Poll until completion or GitHub Actions timeout
+            while (true) {
+              const { data: run } = await github.rest.actions.getWorkflowRun({
+                owner: 'NVIDIA-NeMo',
+                repo: 'Megatron-Bridge',
+                run_id: runId,
+              });
+              
+              console.log(`Status: ${run.status}, Conclusion: ${run.conclusion}`);
+              
+              if (run.status === 'completed') {
+                core.exportVariable('workflow_status', run.conclusion);
+                console.log(`✅ Completed with status: ${run.conclusion}`);
+                return run.conclusion;
+              }
+              
+              console.log(`⏳ Still running... next check in ${checkInterval / 1000}s`);
+              await new Promise(resolve => setTimeout(resolve, checkInterval));
+            }
+
+      - name: Report results
         if: always()
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          echo "## 📊 MBridge Test Results" >> $GITHUB_STEP_SUMMARY
+          RUN_ID="${{ steps.get_run_id.outputs.run_id }}"
+          
+          echo "## 📊 ${{ matrix.name }} Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Install test results
-          if [ "${{ inputs.run_install_test }}" == "true" ] && [ -n "${{ needs.trigger-mbridge.outputs.install_test_run_id }}" ]; then
-            RUN_ID="${{ needs.trigger-mbridge.outputs.install_test_run_id }}"
+          if [ -n "${RUN_ID}" ]; then
             STATUS=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion,status,headBranch,createdAt,updatedAt --jq .)
             CONCLUSION=$(echo "$STATUS" | jq -r .conclusion)
             
@@ -252,28 +188,7 @@ jobs:
               *) ICON="⏳" ;;
             esac
             
-            echo "### ${ICON} install-test.yml" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Status:** \`${CONCLUSION}\`" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "[View full results →](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID})" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          # CICD main results
-          if [ "${{ inputs.run_cicd_main }}" == "true" ] && [ -n "${{ needs.trigger-mbridge.outputs.cicd_main_run_id }}" ]; then
-            RUN_ID="${{ needs.trigger-mbridge.outputs.cicd_main_run_id }}"
-            STATUS=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion,status,headBranch,createdAt,updatedAt --jq .)
-            CONCLUSION=$(echo "$STATUS" | jq -r .conclusion)
-            
-            case "$CONCLUSION" in
-              "success") ICON="✅" ;;
-              "failure") ICON="❌" ;;
-              "cancelled") ICON="🚫" ;;
-              *) ICON="⏳" ;;
-            esac
-            
-            echo "### ${ICON} cicd-main.yml" >> $GITHUB_STEP_SUMMARY
+            echo "### ${ICON} ${{ matrix.workflow }}" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Status:** \`${CONCLUSION}\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -282,25 +197,16 @@ jobs:
           fi
           
           echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "*Triggered from MCore commit \`${{ needs.trigger-mbridge.outputs.mcore_commit }}\`*" >> $GITHUB_STEP_SUMMARY
-
-      - name: Report final status
-        if: always()
-        env:
-          INSTALL_STATUS: ${{ env.install_test_status }}
-          CICD_STATUS: ${{ env.cicd_main_status }}
-        run: |
-          echo "📋 Final Status Summary:"
-          [ -n "$INSTALL_STATUS" ] && echo "  - install-test: $INSTALL_STATUS"
-          [ -n "$CICD_STATUS" ] && echo "  - cicd-main: $CICD_STATUS"
+          echo "*Triggered from MCore commit \`${{ needs.get-mcore-info.outputs.short_sha }}\`*" >> $GITHUB_STEP_SUMMARY
           
           # Report status but don't fail workflow (continue-on-error handles this)
-          if [ "$INSTALL_STATUS" == "failure" ] || [ "$CICD_STATUS" == "failure" ]; then
-            echo "❌ One or more MBridge tests failed - check links above for details"
+          WORKFLOW_STATUS="${{ env.workflow_status || 'unknown' }}"
+          if [ "$WORKFLOW_STATUS" == "failure" ]; then
+            echo "❌ ${{ matrix.name }} failed - check link above for details"
             exit 1
-          elif [ "$INSTALL_STATUS" == "success" ] || [ "$CICD_STATUS" == "success" ]; then
-            echo "✅ All triggered MBridge tests passed"
+          elif [ "$WORKFLOW_STATUS" == "success" ]; then
+            echo "✅ ${{ matrix.name }} passed"
           else
-            echo "⏳ MBridge tests still running or monitoring timed out"
-            echo "💡 This is expected for long-running tests - check the links in the summary above"
+            echo "⏳ ${{ matrix.name }} still running or monitoring timed out"
+            echo "💡 This is expected for long-running tests - check the link in the summary above"
           fi
