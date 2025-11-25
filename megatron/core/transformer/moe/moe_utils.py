@@ -9,6 +9,7 @@ from megatron.core import parallel_state
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
@@ -916,12 +917,16 @@ class RandomSTE(torch.autograd.Function):
     """
 
     generator = None
+    random_logits = None
 
     @staticmethod
     def forward(ctx, logits):
         """
         Forward pass returns random logits with rank-specific seed.
         """
+        if is_graph_capturing() and RandomSTE.random_logits is not None:
+            return RandomSTE.random_logits
+
         if RandomSTE.generator is None:
             global_rank = torch.distributed.get_rank()
             base_seed = 42
@@ -929,8 +934,8 @@ class RandomSTE(torch.autograd.Function):
             RandomSTE.generator = torch.Generator(device=logits.device)
             RandomSTE.generator.manual_seed(seed)
 
-        random_logits = logits.clone().normal_(generator=RandomSTE.generator)
-        return random_logits
+        RandomSTE.random_logits = logits.clone().normal_(generator=RandomSTE.generator)
+        return RandomSTE.random_logits
 
     @staticmethod
     def backward(ctx, grad_output):
