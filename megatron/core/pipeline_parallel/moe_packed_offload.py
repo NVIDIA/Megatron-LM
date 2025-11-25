@@ -114,9 +114,7 @@ def _stash_copy_kernel_2d(
     token_idx = token_start
     while token_idx < token_end:
         # Calculate destination token index with wraparound
-        dst_token_idx = free_offset + token_idx
-        if dst_token_idx >= capacity:
-            dst_token_idx = dst_token_idx - capacity
+        dst_token_idx = (free_offset + token_idx) % capacity
         
         # Each thread handles elements of the hidden dimension
         elements_per_thread = HIDDEN_SIZE // BLOCK_SIZE
@@ -147,9 +145,7 @@ def _stash_copy_kernel_2d(
     
     # Update new_free_offset (only first block writes it)
     if pid == 0:
-        new_free_offset = free_offset + num_tokens
-        if new_free_offset >= capacity:
-            new_free_offset = new_free_offset - capacity
+        new_free_offset = (free_offset + num_tokens) % capacity
         tl.store(new_free_offset_ptr, new_free_offset)
 
 @triton.jit
@@ -188,9 +184,7 @@ def _stash_pop_kernel_2d(
     token_idx = token_start
     while token_idx < token_end:
         # Calculate source token index with wraparound
-        src_token_idx = tensor_offset + token_idx
-        if src_token_idx >= capacity:
-            src_token_idx = src_token_idx - capacity
+        src_token_idx = (tensor_offset + token_idx) % capacity
         
         # Each thread handles elements of the hidden dimension
         elements_per_thread = HIDDEN_SIZE // BLOCK_SIZE
@@ -225,171 +219,6 @@ def _stash_pop_kernel_2d(
         # The data was stashed at tensor_offset, so after popping, free_offset moves back to tensor_offset
         tl.store(free_offset_ptr, tensor_offset)
 
-@triton.jit
-def _stash_copy_kernel(
-    src_ptr,
-    dst_ptr,
-    size_ptr,
-    alloc_offset_ptr,
-    free_offset_ptr,
-    capacity_ptr,
-    overflow_ptr,
-    BLOCK_SIZE: tl.constexpr,
-    num_iterations: tl.constexpr,
-    max_tokens: tl.constexpr,
-):
-    """Triton kernel to copy tensor data to stash buffer.
-    
-    Each block can handle multiple chunks of data (num_iterations) to limit total blocks.
-    Ignores out-of-bound writes if offset + size exceeds capacity.
-    
-    Args:
-        src_ptr: Pointer to source tensor (flattened)
-        dst_ptr: Pointer to destination buffer (stash_buffer)
-        size_ptr: Pointer to scalar tensor containing the size to copy
-        offset_original_ptr: Pointer to GPU tensor containing original offset (read-only)
-        over_capacity_ptr: Pointer to counter tensor (incremented when over capacity)
-        capacity: Total capacity of the buffer
-        BLOCK_SIZE: Block size for Triton kernel
-        num_iterations: Number of iterations each block should handle
-    """
-    # Get the program ID
-    pid = tl.program_id(axis=0)
-    num_programs = tl.num_programs(axis=0)
-    
-    # Load the size value from GPU tensor
-    size = tl.load(size_ptr)
-    
-    # Load original offset from GPU tensor (for position calculations)
-    alloc_offset = tl.load(alloc_offset_ptr)
-    free_offset = tl.load(free_offset_ptr)
-    capacity = tl.load(capacity_ptr)
-    # Only the first thread checks capacity
-    # Do this BEFORE the loop so it always happens
-    overflow = False
-    # Check if over capacity and increment counter
-    avail_space = free_offset - alloc_offset
-    if avail_space < 0:
-        avail_space = -avail_space
-    else:
-        avail_space = capacity - avail_space
-    if avail_space < size or max_tokens < size:
-        overflow = True
-    if pid == 0 and overflow:
-        tl.store(overflow_ptr, 1)
-    
-    #if pid == 1:
-    #    tl.device_print("free_offset: ", free_offset)
-    if overflow:
-        return
-
-    # Each block handles num_iterations chunks of BLOCK_SIZE elements
-    # Use while loop with early exit condition in the loop test
-    iteration = 0
-    block_start = (pid * num_iterations + iteration) * BLOCK_SIZE
-    while iteration < num_iterations and block_start < size:
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        
-        # Create mask for valid elements within source size
-        src_mask = offsets < size
-        
-        # Create mask for valid destination indices (within buffer capacity)
-        dst_indices = free_offset + offsets
-        dst_mask = dst_indices >= capacity
-        dst_indices = tl.where(dst_mask, dst_indices - capacity, dst_indices)
-        
-        # Load from source
-        src_data = tl.load(src_ptr + offsets, mask=src_mask, other=0.0)
-        
-        # Store to destination (ignores out-of-bound writes)
-        tl.store(dst_ptr + dst_indices, src_data, mask=src_mask)
-        
-        # Move to next iteration
-        iteration += 1
-        block_start = (pid * num_iterations + iteration) * BLOCK_SIZE
-
-    # Check if over capacity and increment counter
-    size_page_aligned = tl.cdiv(size, BLOCK_SIZE) * BLOCK_SIZE
-
-    free_offset = free_offset + size_page_aligned 
-    if free_offset > capacity:
-        free_offset -= capacity
-    if pid == 0:
-        tl.store(free_offset_ptr, free_offset)
-        
-@triton.jit
-def _stash_pop_kernel(
-    src_ptr,
-    dst_ptr,
-    size_ptr,
-    tensor_offset_ptr,
-    alloc_offset_ptr,
-    free_offset_ptr,
-    capacity_ptr,
-    BLOCK_SIZE: tl.constexpr,
-    num_iterations: tl.constexpr,
-):
-    """Triton kernel to copy tensor data from stash buffer.
-    
-    Each block can handle multiple chunks of data (num_iterations) to limit total blocks.
-    Ignores out-of-bound writes if offset + size exceeds capacity.
-    
-    Args:
-        src_ptr: Pointer to source tensor (flattened)
-        dst_ptr: Pointer to destination buffer (stash_buffer)
-        size_ptr: Pointer to scalar tensor containing the size to copy
-        offset_original_ptr: Pointer to GPU tensor containing original offset (read-only)
-        over_capacity_ptr: Pointer to counter tensor (incremented when over capacity)
-        capacity: Total capacity of the buffer
-        BLOCK_SIZE: Block size for Triton kernel
-        num_iterations: Number of iterations each block should handle
-    """
-    # Get the program ID
-    pid = tl.program_id(axis=0)
-    num_programs = tl.num_programs(axis=0)
-    
-    # Load the size value from GPU tensor
-    size = tl.load(size_ptr)
-    
-    # Load original offset from GPU tensor (for position calculations)
-    tensor_offset = tl.load(tensor_offset_ptr)
-    alloc_offset = tl.load(alloc_offset_ptr)
-    free_offset = tl.load(free_offset_ptr)
-    capacity = tl.load(capacity_ptr)
-    
-    # Each block handles num_iterations chunks of BLOCK_SIZE elements
-    # Use while loop with early exit condition in the loop test
-    iteration = 0
-    block_start = (pid * num_iterations + iteration) * BLOCK_SIZE
-    while iteration < num_iterations and block_start < size:
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        
-        # Create mask for valid elements within source size
-        dst_mask = offsets < size
-        
-        # Create mask for valid destination indices (within buffer capacity)
-        src_indices = tensor_offset + offsets
-        src_mask = src_indices >= capacity
-        src_indices = tl.where(src_mask, src_indices - capacity, src_indices)
-        
-        # Load from source
-        src_data = tl.load(src_ptr + src_indices, mask=dst_mask, other=0.0)
-        
-        # Store to destination (ignores out-of-bound writes)
-        tl.store(dst_ptr + offsets, src_data, mask=dst_mask)
-        
-        # Move to next iteration
-        iteration += 1
-        block_start = (pid * num_iterations + iteration) * BLOCK_SIZE
-
-    # Check if over capacity and increment counter
-    size_page_aligned = tl.cdiv(size, BLOCK_SIZE) * BLOCK_SIZE
-    tensor_offset = tensor_offset + size_page_aligned 
-    if tensor_offset > capacity:
-        tensor_offset -= capacity
-    if pid == 0:
-        mask = tensor_offset > alloc_offset
-        tl.store(alloc_offset_ptr, tensor_offset, mask=mask)
 
 class StashBuffer:
     """
@@ -435,6 +264,237 @@ class StashBuffer:
 
     def __repr__(self):
         return f"StashBuffer(capacity={self.num_tokens_capacity} tokens, hidden_size={self.hidden_size}, device={self.device}, dtype={self.dtype})"
+
+
+class PagedStashBuffer:
+    """
+    A paged stash buffer with page-level memory management.
+    
+    The buffer is organized as [num_pages, page_size, hidden_size].
+    Uses a free list (circular buffer) to track available pages.
+    """
+    
+    def __init__(self, num_tokens, hidden_size, page_size, device, overflow, dtype):
+        """
+        Args:
+            num_tokens: Maximum number of tokens the buffer can hold
+            hidden_size: Hidden dimension size
+            page_size: Number of tokens per page
+            device: Device for the buffer
+            overflow: Overflow flag tensor (shared across all buffers)
+            dtype: Data type
+        """
+        self.hidden_size = hidden_size
+        self.page_size = page_size
+        self.num_pages = (num_tokens + page_size - 1) // page_size  # Ceiling division
+        self.total_tokens = self.num_pages * page_size
+        
+        # Create 2D buffer [total_tokens, hidden_size]
+        # Organized as pages: [page_0_tokens, page_1_tokens, ...]
+        if os.getenv('PACKED_OFFLOAD_CPU', '0') == '1':
+            self.buffer = torch.empty((self.total_tokens, hidden_size), dtype=dtype, device='cpu', pin_memory=True)
+        else:
+            self.buffer = torch.empty((self.total_tokens, hidden_size), dtype=dtype, device=device)
+        
+        self.overflow = overflow  # GPU flag (shared)
+        self.device = device
+        self.dtype = dtype
+        
+        # Free list as circular buffer: stores available page IDs
+        self.free_list = torch.arange(self.num_pages, dtype=torch.int64, device=device)
+        
+        # Head and tail pointers for free_list circular buffer
+        self.free_list_head = torch.zeros(1, dtype=torch.int64, device=device)  # Read pointer (allocation)
+        self.free_list_tail = torch.tensor([self.num_pages], dtype=torch.int64, device=device)  # Write pointer (deallocation)
+        
+        # Capacity of free list
+        self.free_list_capacity = torch.tensor([self.num_pages], dtype=torch.int64, device=device)
+    
+    def reset(self):
+        """Reset the paged buffer - reinitialize free list."""
+        self.free_list = torch.arange(self.num_pages, dtype=torch.int64, device=self.device)
+        self.free_list_head.zero_()
+        self.free_list_tail.fill_(self.num_pages)
+    
+    def __repr__(self):
+        return f"PagedStashBuffer(num_pages={self.num_pages}, page_size={self.page_size}, hidden_size={self.hidden_size}, device={self.device}, dtype={self.dtype})"
+
+
+@triton.jit
+def _paged_stash_copy_kernel(
+    src_ptr,
+    dst_ptr,
+    num_tokens_ptr,
+    free_list_ptr,
+    free_list_head_ptr,  # Read-only: current head position
+    free_list_tail_ptr,  # Read-only: current tail position (for overflow check)
+    free_list_capacity_ptr,
+    page_record_ptr,  # Output: records which pages were used
+    overflow_ptr,
+    new_free_list_head_ptr,  # Output: new head position (written by kernel)
+    PAGE_SIZE: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel to copy tokens to paged stash buffer.
+    
+    Allocates pages from free list (reads from head, advances head).
+    Uses strided access pattern: block i handles tokens [i, i+num_blocks, i+2*num_blocks, ...].
+    Grid: (num_blocks,) where blocks process tokens in a strided pattern.
+    Writes new head to temporary tensor to avoid race conditions.
+    """
+    pid = tl.program_id(axis=0)
+    num_blocks = tl.num_programs(axis=0)
+    
+    # Load parameters
+    num_tokens = tl.load(num_tokens_ptr)
+    free_list_head = tl.load(free_list_head_ptr)
+    free_list_tail = tl.load(free_list_tail_ptr)
+    free_list_capacity = tl.load(free_list_capacity_ptr)
+    
+    # Check available pages (unwrapped indices: simple subtraction, no modulo needed)
+    avail_pages = free_list_tail - free_list_head
+    
+    # Calculate required pages
+    required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
+    overflow_detected = avail_pages < required_pages
+    
+    # Only block 0 writes overflow flag
+    if pid == 0 and overflow_detected:
+        tl.store(overflow_ptr, 1)
+    
+    # All blocks return early if overflow
+    if overflow_detected:
+        return
+    
+    # Strided access: block pid handles tokens [pid, pid+num_blocks, pid+2*num_blocks, ...]
+    token_idx = pid
+    while token_idx < num_tokens:
+        # Determine which page this token belongs to
+        page_slot = token_idx // PAGE_SIZE
+        token_in_page = token_idx % PAGE_SIZE
+        
+        # Read page ID from free list (with wraparound)
+        free_list_idx = (free_list_head + page_slot) % free_list_capacity
+        page_id = tl.load(free_list_ptr + free_list_idx)
+        
+        # First token in page: record the page ID (only if this block handles token 0 of the page)
+        if token_in_page == 0:
+            tl.store(page_record_ptr + page_slot, page_id)
+        
+        # Calculate destination address in paged buffer
+        dst_token_idx = page_id * PAGE_SIZE + token_in_page
+        
+        # Copy token data (2D: hidden dimension)
+        elements_per_thread = HIDDEN_SIZE // BLOCK_SIZE
+        need_mask = (HIDDEN_SIZE % BLOCK_SIZE) != 0
+        num_iters = elements_per_thread + (1 if need_mask else 0)
+        
+        src_base = src_ptr + token_idx * HIDDEN_SIZE
+        dst_base = dst_ptr + dst_token_idx * HIDDEN_SIZE
+        
+        if need_mask:
+            for iter in range(num_iters):
+                hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
+                hidden_mask = hidden_offsets < HIDDEN_SIZE
+                data = tl.load(src_base + hidden_offsets, mask=hidden_mask, other=0)
+                tl.store(dst_base + hidden_offsets, data, mask=hidden_mask)
+        else:
+            for iter in range(elements_per_thread):
+                hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
+                data = tl.load(src_base + hidden_offsets)
+                tl.store(dst_base + hidden_offsets, data)
+        
+        # Stride to next token for this block
+        token_idx += num_blocks
+    
+    # Calculate and store new free list head (only block 0)
+    # We consumed pages, so advance head forward (unwrapped: no modulo)
+    # Write to temporary tensor to avoid race conditions
+    if pid == 0:
+        new_head = free_list_head + required_pages
+        tl.store(new_free_list_head_ptr, new_head)
+
+
+@triton.jit
+def _paged_stash_pop_kernel(
+    src_ptr,
+    dst_ptr,
+    num_tokens_ptr,
+    page_record_ptr,  # Input: which pages to read
+    free_list_ptr,
+    free_list_head_ptr,  # Read-only: current head position (not used)
+    free_list_tail_ptr,  # Read-only: current tail position
+    free_list_capacity_ptr,
+    new_free_list_tail_ptr,  # Output: new tail position (written by kernel)
+    PAGE_SIZE: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel to reload tokens from paged stash buffer.
+    
+    Returns pages to free list (writes to tail, advances tail).
+    Uses strided access pattern: block i handles tokens [i, i+num_blocks, i+2*num_blocks, ...].
+    Grid: (num_blocks,) where blocks process tokens in a strided pattern.
+    Writes new tail to temporary tensor to avoid race conditions.
+    """
+    pid = tl.program_id(axis=0)
+    num_blocks = tl.num_programs(axis=0)
+    
+    # Load parameters
+    num_tokens = tl.load(num_tokens_ptr)
+    free_list_tail = tl.load(free_list_tail_ptr)
+    free_list_capacity = tl.load(free_list_capacity_ptr)
+    
+    # Strided access: block pid handles tokens [pid, pid+num_blocks, pid+2*num_blocks, ...]
+    token_idx = pid
+    while token_idx < num_tokens:
+        # Determine which page this token belongs to
+        page_slot = token_idx // PAGE_SIZE
+        token_in_page = token_idx % PAGE_SIZE
+        
+        # Read page ID from page record
+        page_id = tl.load(page_record_ptr + page_slot)
+        
+        # Calculate source address in paged buffer
+        src_token_idx = page_id * PAGE_SIZE + token_in_page
+        
+        # Copy token data (2D: hidden dimension)
+        elements_per_thread = HIDDEN_SIZE // BLOCK_SIZE
+        need_mask = (HIDDEN_SIZE % BLOCK_SIZE) != 0
+        num_iters = elements_per_thread + (1 if need_mask else 0)
+        
+        src_base = src_ptr + src_token_idx * HIDDEN_SIZE
+        dst_base = dst_ptr + token_idx * HIDDEN_SIZE
+        
+        if need_mask:
+            for iter in range(num_iters):
+                hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
+                hidden_mask = hidden_offsets < HIDDEN_SIZE
+                data = tl.load(src_base + hidden_offsets, mask=hidden_mask, other=0)
+                tl.store(dst_base + hidden_offsets, data, mask=hidden_mask)
+        else:
+            for iter in range(elements_per_thread):
+                hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
+                data = tl.load(src_base + hidden_offsets)
+                tl.store(dst_base + hidden_offsets, data)
+        
+        # First token in page: release page back to free list
+        if token_in_page == 0:
+            # Write page ID back to free list at tail position (with wraparound)
+            write_idx = (free_list_tail + page_slot) % free_list_capacity
+            tl.store(free_list_ptr + write_idx, page_id)
+        
+        # Stride to next token for this block
+        token_idx += num_blocks
+    
+    # Calculate and store new free list tail (only block 0)
+    # We returned pages, so advance tail forward (unwrapped: no modulo)
+    # Write to temporary tensor to avoid race conditions
+    if pid == 0:
+        required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
+        new_tail = free_list_tail + required_pages
+        tl.store(new_free_list_tail_ptr, new_tail)
 
 
 class PackedTensor:
@@ -502,7 +562,7 @@ class PackedTensor:
         
         # Cap the number of blocks and calculate tokens per block
         num_blocks = min(total_blocks_needed, max_blocks)
-        tokens_per_block = triton.cdiv(self.max_num_tokens, num_blocks)
+        tokens_per_block = (self.max_num_tokens + num_blocks - 1) // num_blocks  # Ceiling division
 
         if DEBUG:
             debug_print (f"offload_to_stash ({self.layer_name}) {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} hidden_size {self.hidden_size} max_blocks {max_blocks} num_blocks {num_blocks} tokens_per_block {tokens_per_block} overflow {stash_buffer.overflow.item()}")
@@ -570,7 +630,7 @@ class PackedTensor:
         
         # Cap the number of blocks and calculate tokens per block
         num_blocks = min(total_blocks_needed, max_blocks)
-        tokens_per_block = triton.cdiv(self.max_num_tokens, num_blocks)
+        tokens_per_block = (self.max_num_tokens + num_blocks - 1) // num_blocks  # Ceiling division
         
         if DEBUG:
             debug_print (f"reload_from_stash {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} hidden_size {self.hidden_size} max_blocks {max_blocks} num_blocks {num_blocks} tokens_per_block {tokens_per_block}")
@@ -602,6 +662,167 @@ class PackedTensor:
             debug_print (f"After reload_from_stash reload_offset {self.stash_buffer_offset.item()} alloc_offset {stash_buffer.alloc_offset.item()} free_offset {stash_buffer.free_offset.item()} capacity {stash_buffer.capacity.item()}")
     def __repr__(self):
         return f"PackedTensor(original_shape={self.original_shape}, num_tokens={self.num_tokens_tensor.item()}, vp_stage={self.vp_stage})"
+
+
+class PagedTensor:
+    """
+    A paged tensor that stores data in pages within a paged stash buffer.
+    Similar to PackedTensor but uses page-level memory management.
+    """
+    
+    def __init__(self, tensor, num_tokens_tensor=None, vp_stage=None, layer_name=None, max_tokens=None, page_size=64):
+        """
+        Args:
+            tensor: The tensor to store
+            num_tokens_tensor: Scalar tensor containing actual number of tokens
+            vp_stage: Virtual pipeline stage
+            layer_name: Name of the layer
+            max_tokens: Maximum number of tokens
+            page_size: Number of tokens per page
+        """
+        self._tensor = tensor
+        self._original_tensor = None
+        assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor) and num_tokens_tensor.numel() == 1
+        self.num_tokens_tensor = num_tokens_tensor.clone()
+        self.vp_stage = vp_stage
+        self.layer_name = layer_name
+        self.max_tokens = max_tokens
+        self.page_size = page_size
+        
+        # Original tensor information
+        self.original_shape = list(tensor.shape)
+        self.max_num_tokens = self.original_shape[0]
+        self.element_size = tensor.element_size()
+        self.hidden_size = self.original_shape[1]
+        self.dtype = tensor.dtype if not isinstance(tensor, MXFP8Tensor) else tensor._columnwise_data.dtype
+        self.device = tensor.device
+        
+        # Calculate number of pages needed
+        self.max_num_pages = (self.max_num_tokens + page_size - 1) // page_size  # Ceiling division
+        
+        # Page record: stores which pages are being used for this tensor
+        self.page_record = torch.zeros(self.max_num_pages, dtype=torch.int64, device=self.device)
+    
+    def offload_to_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
+        """Offload the paged tensor to paged stash buffer."""
+        if not HAVE_TRITON:
+            raise RuntimeError("Triton is required for PagedTensor.offload_to_stash(). Please install triton.")
+        
+        self._tensor = self._tensor.contiguous()
+        if self.num_tokens_tensor.dim() == 0:
+            self.num_tokens_tensor = self.num_tokens_tensor.reshape(1)
+        
+        # Get 2D tensor
+        if isinstance(self._tensor, MXFP8Tensor):
+            tensor_to_copy = self._tensor._columnwise_data
+        else:
+            tensor_to_copy = self._tensor
+        
+        # Determine grid size
+        BLOCK_SIZE = GLOBAL_BLOCK_SIZE
+        total_blocks_needed = self.max_num_tokens
+        num_blocks = min(total_blocks_needed, max_blocks)
+        
+        if DEBUG:
+            debug_print(f"PagedTensor offload ({self.layer_name}) {self._tensor.shape}-{self.dtype} page_size={self.page_size} num_tokens={self.num_tokens_tensor.item()} num_blocks={num_blocks}")
+        
+        grid = (num_blocks,)
+        
+        # Create temporary tensor for new head (kernel will write to this)
+        new_free_list_head = torch.empty(1, dtype=torch.int64, device=self.device)
+        
+        # Launch paged stash copy kernel (strided access pattern)
+        # Allocates pages from free list (reads from head, advances head)
+        _paged_stash_copy_kernel[grid](
+            tensor_to_copy,
+            paged_stash_buffer.buffer,
+            self.num_tokens_tensor,
+            paged_stash_buffer.free_list,
+            paged_stash_buffer.free_list_head,
+            paged_stash_buffer.free_list_tail,
+            paged_stash_buffer.free_list_capacity,
+            self.page_record,
+            paged_stash_buffer.overflow,
+            new_free_list_head,  # Temporary tensor for new head
+            PAGE_SIZE=self.page_size,
+            HIDDEN_SIZE=self.hidden_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        # if paged_stash_buffer.overflow.item() == 1 and torch.distributed.get_rank() == 0: import pdb; pdb.set_trace()
+        # torch.distributed.barrier()
+        
+        # Copy new head value after kernel completes (stream-ordered, avoids race condition)
+        paged_stash_buffer.free_list_head.copy_(new_free_list_head)
+        
+        # Save reference to original tensor
+        self._original_tensor = self._tensor
+        self._tensor = None
+        
+        if DEBUG:
+            debug_print(f"After PagedTensor offload page_record={self.page_record[:5]}")
+    
+    def reload_from_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
+        """Reload the paged tensor from paged stash buffer."""
+        if not HAVE_TRITON:
+            raise RuntimeError("Triton is required for PagedTensor.reload_from_stash(). Please install triton.")
+        
+        # Allocate output tensor
+        if isinstance(self._original_tensor, MXFP8Tensor):
+            columnwise_data = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
+            self._tensor = MXFP8Tensor(
+                shape=self._original_tensor.shape,
+                dtype=self._original_tensor.dtype,
+                fp8_dtype=self._original_tensor._fp8_dtype,
+                rowwise_data=self._original_tensor._rowwise_data,
+                rowwise_scale_inv=self._original_tensor._rowwise_scale_inv,
+                columnwise_data=columnwise_data,
+                columnwise_scale_inv=self._original_tensor._columnwise_scale_inv,
+                quantizer=self._original_tensor._quantizer,
+            )
+            tensor_to_reload = self._tensor._columnwise_data
+        else:
+            self._tensor = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
+            tensor_to_reload = self._tensor
+        
+        # Determine grid size
+        BLOCK_SIZE = GLOBAL_BLOCK_SIZE
+        total_blocks_needed = self.max_num_tokens
+        num_blocks = min(total_blocks_needed, max_blocks)
+        
+        if DEBUG:
+            debug_print(f"PagedTensor reload {self._tensor.shape}-{self.dtype} page_size={self.page_size} num_blocks={num_blocks}")
+        
+        grid = (num_blocks,)
+        
+        # Create temporary tensor for new tail (kernel will write to this)
+        new_free_list_tail = torch.empty(1, dtype=torch.int64, device=self.device)
+        
+        # Launch paged stash pop kernel (strided access pattern)
+        # Returns pages to free list (writes to tail, advances tail)
+        _paged_stash_pop_kernel[grid](
+            paged_stash_buffer.buffer,
+            tensor_to_reload,
+            self.num_tokens_tensor,
+            self.page_record,
+            paged_stash_buffer.free_list,
+            paged_stash_buffer.free_list_head,
+            paged_stash_buffer.free_list_tail,
+            paged_stash_buffer.free_list_capacity,
+            new_free_list_tail,  # Temporary tensor for new tail
+            PAGE_SIZE=self.page_size,
+            HIDDEN_SIZE=self.hidden_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        
+        # Copy new tail value after kernel completes (stream-ordered, avoids race condition)
+        paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
+        
+        if DEBUG:
+            debug_print(f"After PagedTensor reload")
+    
+    def __repr__(self):
+        return f"PagedTensor(original_shape={self.original_shape}, num_tokens={self.num_tokens_tensor.item()}, page_size={self.page_size}, vp_stage={self.vp_stage})"
+
 
 class PP_ScheduleFunction(torch.autograd.Function):
     """
@@ -712,6 +933,10 @@ class PackedOffloadManager:
         self.stash_buffers = None
         self.overflow = None
         self.device = None
+        
+        # Page size for paged memory management
+        self.page_size = int(os.getenv('PAGED_STASH_PAGE_SIZE', '64'))  # Default 64 tokens per page
+        self.use_paged_stash = os.getenv('USE_PAGED_STASH', '0') == '1'  # Enable via env var
 
     @property
     def pack_stream(self):
@@ -805,13 +1030,19 @@ class PackedOffloadManager:
                     # Calculate number of tokens we can store (with safety factor)
                     num_tokens = int(self.max_tokens_per_vp_stage[vp_stage][dtype][hidden_size] * stash_buffer_size_factor)
                     
-                    # Create 2D buffer
-                    self.stash_buffers[vp_stage][dtype][hidden_size] = StashBuffer(
-                        num_tokens, hidden_size, self.device, self.overflow, dtype
-                    )
+                    # Create buffer (paged or regular based on configuration)
+                    if self.use_paged_stash:
+                        self.stash_buffers[vp_stage][dtype][hidden_size] = PagedStashBuffer(
+                            num_tokens, hidden_size, self.page_size, self.device, self.overflow, dtype
+                        )
+                    else:
+                        self.stash_buffers[vp_stage][dtype][hidden_size] = StashBuffer(
+                            num_tokens, hidden_size, self.device, self.overflow, dtype
+                        )
                     
                     if torch.distributed.get_rank() == 0:
-                        print(f'allocated stash buffer vp_stage={vp_stage} dtype={dtype} hidden_size={hidden_size}: {self.stash_buffers[vp_stage][dtype][hidden_size]}')
+                        buffer_type = "paged" if self.use_paged_stash else "regular"
+                        print(f'allocated {buffer_type} stash buffer vp_stage={vp_stage} dtype={dtype} hidden_size={hidden_size}: {self.stash_buffers[vp_stage][dtype][hidden_size]}')
 
     def update_pp_schedule(self, vp_stage, layer_no=None, microbatch_no=None):
         """Update the pp schedule."""
@@ -896,7 +1127,25 @@ class PackedOffloadManager:
                 tensor_truncated.copy_(tensor[:self.num_tokens, ...])
                 tensor = tensor_truncated
 
-        packed_tensor = PackedTensor(tensor, num_tokens_tensor=self.num_tokens_tensor, vp_stage=self.current_vp_stage, layer_name=self._current_layer_name, max_tokens=self.max_num_tokens)
+        # Create tensor (paged or regular based on configuration)
+        if self.use_paged_stash:
+            packed_tensor = PagedTensor(
+                tensor, 
+                num_tokens_tensor=self.num_tokens_tensor, 
+                vp_stage=self.current_vp_stage, 
+                layer_name=self._current_layer_name, 
+                max_tokens=self.max_num_tokens,
+                page_size=self.page_size
+            )
+        else:
+            packed_tensor = PackedTensor(
+                tensor, 
+                num_tokens_tensor=self.num_tokens_tensor, 
+                vp_stage=self.current_vp_stage, 
+                layer_name=self._current_layer_name, 
+                max_tokens=self.max_num_tokens
+            )
+        
         if self.status == 'captured':
             self.add_packed_tensor_to_offload(packed_tensor)
         return packed_tensor
@@ -906,7 +1155,7 @@ class PackedOffloadManager:
         Hook called when autograd retrieves a saved tensor during backward pass.
         Returns the actual tensor (potentially reloading from CPU).
         """
-        if isinstance(saved_state, PackedTensor):
+        if isinstance(saved_state, (PackedTensor, PagedTensor)):
             if self.status == 'capture':
                 num_tokens = saved_state.num_tokens_tensor.item()
                 self.temp_tokens_per_vp_stage[saved_state.vp_stage][saved_state.dtype][saved_state.hidden_size] -= num_tokens
@@ -1027,10 +1276,10 @@ def packed_moe_expert_offloading_reset(enabled=True):
     # current layer and microbatch for each vp stage for forward pass
     offload_manager.current_schedule_index = 0
     if os.getenv('MEM_PROFILE', '0') == '1':
-        if offload_manager.iteration == 1 and torch.distributed.get_rank() == 0:
-            torch.cuda.memory._record_memory_history()
+        if offload_manager.iteration == 0 and torch.distributed.get_rank() == 0:
+            torch.cuda.memory._record_memory_history(max_entries=1000000)
             print(f'packed_moe_expert_offloading_reset record_memory_history')
-        if offload_manager.iteration == 10 and torch.distributed.get_rank() == 0:
+        if offload_manager.iteration == 5 and torch.distributed.get_rank() == 0:
             torch.cuda.memory._dump_snapshot("packed_offloading_cg.pkl")
             torch.cuda.memory._record_memory_history(enabled=None)
             print(f'packed_moe_expert_offloading_reset dump_snapshot')
