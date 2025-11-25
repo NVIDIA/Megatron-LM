@@ -494,6 +494,10 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
     if not torch.distributed.is_initialized():
         return None
 
+    # if parallel_state is not initialized, pass `tp_group` thru
+    if not parallel_state.is_initialized():
+        return tp_group
+
     if tp_group is None:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             warnings.warn(

@@ -474,8 +474,7 @@ def _get_megatron_optimizer_based_on_param_groups(
 
 
 def _finalize_optimizer_chain(
-    optimizers: List[MegatronOptimizer],
-    pg_collection: Optional[ProcessGroupCollection],
+    optimizers: List[MegatronOptimizer], pg_collection: Optional[ProcessGroupCollection]
 ) -> MegatronOptimizer:
     """Collapse the optimizer list and attach the tensor-parallel group.
 

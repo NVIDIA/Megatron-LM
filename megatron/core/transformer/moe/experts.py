@@ -754,7 +754,6 @@ class TEGroupedMLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.num_local_experts,
@@ -766,7 +765,7 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=False,
             is_expert=True,
             tp_comm_buffer_name='fc1',
-            tp_group=pg_collection.expt_tp,
+            pg_collection=pg_collection,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -774,7 +773,6 @@ class TEGroupedMLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.num_local_experts,
@@ -786,7 +784,7 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=True,
             is_expert=True,
             tp_comm_buffer_name='fc2',
-            tp_group=pg_collection.expt_tp,
+            pg_collection=pg_collection,
         )
 
         self.offload_expert_fc1 = (
