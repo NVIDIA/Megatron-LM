@@ -1484,72 +1484,157 @@ class TECudaGraphHelper:
         """
         return self._graphs_created
 
+    def _get_sample_arguments(self, order):
+        """
+        Get the sample arguments and keyword arguments for capturing.
+        """
+        assert self.num_model_chunks == max(
+            order
+        ), "num_model_chunks must match the max chunk id in order."
+        assert (
+            get_num_microbatches() == len(order) // self.num_model_chunks // 2
+        ), "num_microbatches must match the number of microbatches in order."
+
+        # Generate sample arguments and keyword arguments for capturing.
+        sample_args = [None] * (len(self.flattened_callables) * get_num_microbatches())
+        sample_kwargs = [None] * (len(self.flattened_callables) * get_num_microbatches())
+
+        rotary_pos_emb_cache = {}
+
+        def _get_layer_static_inputs(layer, chunk_of_the_layer):
+            """
+            Get the static inputs for a layer.
+            """
+            assert layer in chunk_of_the_layer.decoder.layers or any(
+                layer is mtp_layer.transformer_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+            ), "Layer is not in the chunk"
+
+            def get_rotary_pos_emb(transformer_module, transformer_input):
+                if (
+                    transformer_module.position_embedding_type == 'rope'
+                    and not self.config.multi_latent_attention
+                ):
+                    rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
+                        None, transformer_module.decoder, transformer_input, self.config, None
+                    )
+                    if rotary_seq_len not in rotary_pos_emb_cache:
+                        rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
+                            rotary_seq_len
+                        )
+                    return rotary_pos_emb_cache[rotary_seq_len]
+                else:
+                    return None
+
+            static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
+
+            from megatron.core.transformer.identity_op import IdentityOp
+            from megatron.core.transformer.transformer_layer import TransformerLayer
+
+            contains_self_attn = (
+                isinstance(layer, TransformerLayer)
+                and not isinstance(layer.self_attention, IdentityOp)
+                and (not self.config.cuda_graph_scope or 'attn' in self.config.cuda_graph_scope)
+            )
+
+            _sample_kwargs = {}
+            if is_te_min_version("1.10.0"):
+                # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
+                hidden_states = static_inputs.pop("hidden_states")
+                _sample_args = (hidden_states,)
+                if contains_self_attn:
+                    rotary_pos_emb = get_rotary_pos_emb(chunk_of_the_layer, hidden_states)
+                    if rotary_pos_emb is not None:
+                        static_inputs["rotary_pos_emb"] = rotary_pos_emb
+                _sample_kwargs = static_inputs
+            elif contains_self_attn:
+                _sample_args = (
+                    static_inputs.pop("hidden_states"),
+                    static_inputs.pop("attention_mask"),
+                )
+            else:
+                _sample_args = (static_inputs.pop("hidden_states"),)
+            return _sample_args, _sample_kwargs
+
+        # Calculate the starting index of each chunk in callables for future use.
+        prefix_num_layers = [0]
+        for m_chunk in range(self.num_model_chunks):
+            num_layers = self.num_layers_per_chunk[m_chunk]
+            prefix_num_layers.append(prefix_num_layers[-1] + num_layers)
+
+        # Reorganize args and kwargs for input tensor reuse.
+        # fwd_sample_qs is keyed by model chunk index. The value is a queue of tuples.
+        # Each tuple contains the sample key signature and its fwd_idx. When we finish a backward
+        # chunk, we pop the corresponding fwd_idx and push to the consumed_sample_q.
+        # consumed_sample_q is keyed by the sample key signature. The value is a queue of the
+        # fwd_idx whose backward has been called so that we can reuse the same static buffers.
+        # In this way, we can reuse the same static input buffers for the non-overlapping samples
+        # with the same input signature.
+        fwd_sample_qs = {}
+        consumed_sample_q = {}
+        fwd_idx = [0] * self.num_model_chunks
+        for c_id in order:
+            m_chunk = abs(c_id) - 1
+
+            if c_id > 0:
+                sample_start_idx = (prefix_num_layers[m_chunk] * get_num_microbatches()) + (
+                    fwd_idx[m_chunk] * self.num_layers_per_chunk[m_chunk]
+                )
+                fwd_sample_idx = [
+                    sample_start_idx + i for i in range(self.num_layers_per_chunk[m_chunk])
+                ]
+                if m_chunk not in fwd_sample_qs:
+                    fwd_sample_qs[m_chunk] = []
+                for per_callable_fwd_idx in fwd_sample_idx:
+                    if sample_args[per_callable_fwd_idx] is None:
+                        sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
+                            _get_layer_static_inputs(
+                                self.callables_per_chunk[m_chunk][
+                                    per_callable_fwd_idx - sample_start_idx
+                                ],
+                                self.chunks_with_decoder[m_chunk],
+                            )
+                        )
+
+                    sample_args_keys = tuple(
+                        (t.shape, t.dtype, t.layout) for t in sample_args[per_callable_fwd_idx]
+                    )
+                    sample_kwargs_keys = tuple(
+                        (k, v.shape, v.dtype, v.layout)
+                        for k, v in sorted(sample_kwargs[per_callable_fwd_idx].items())
+                    )
+                    sample_keys = sample_args_keys + sample_kwargs_keys
+
+                    fwd_sample_qs[m_chunk].append((sample_keys, per_callable_fwd_idx))
+                    if consumed_sample_q.get(sample_keys, []):
+                        reuse_fwd_idx = consumed_sample_q[sample_keys].pop(0)
+                        assert (
+                            sample_args[reuse_fwd_idx] is not None
+                            and sample_kwargs[reuse_fwd_idx] is not None
+                        ), "sample_args and sample_kwargs must not be None when reusing."
+                        sample_args[per_callable_fwd_idx] = sample_args[reuse_fwd_idx]
+                        sample_kwargs[per_callable_fwd_idx] = sample_kwargs[reuse_fwd_idx]
+                fwd_idx[m_chunk] += 1
+            else:
+                num_consumed_samples = min(
+                    len(fwd_sample_qs[m_chunk]), self.num_layers_per_chunk[m_chunk]
+                )
+                for sample_keys, per_callable_fwd_idx in fwd_sample_qs[m_chunk][
+                    :num_consumed_samples
+                ]:
+                    if sample_keys not in consumed_sample_q:
+                        consumed_sample_q[sample_keys] = []
+                    consumed_sample_q[sample_keys].append(per_callable_fwd_idx)
+                fwd_sample_qs[m_chunk] = fwd_sample_qs[m_chunk][num_consumed_samples:]
+
+        if not any(sample_kwargs):
+            sample_kwargs = None
+        return sample_args, sample_kwargs
+
     def _get_cuda_graph_input_data(self):
         """
         Create the CUDA Graph capturing input data.
         The data is organized per-chunk per-microbatch per-layer.
         """
-
-        rotary_pos_emb_cache = {}
-
-        def get_rotary_pos_emb(transformer_module, transformer_input):
-            if (
-                transformer_module.position_embedding_type == 'rope'
-                and not self.config.multi_latent_attention
-            ):
-                rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
-                    None, transformer_module.decoder, transformer_input, self.config, None
-                )
-                if rotary_seq_len not in rotary_pos_emb_cache:
-                    rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                        rotary_seq_len
-                    )
-                return rotary_pos_emb_cache[rotary_seq_len]
-            else:
-                return None
-
-        # Generate sample arguments and keyword arguments for capturing.
-        sample_args = []
-        sample_kwargs = []
-        for chunk_number, chunk_with_decoder in enumerate(self.chunks_with_decoder):
-            if chunk_with_decoder is None:
-                continue
-            layers = self.callables_per_chunk[chunk_number]
-            for _ in range(get_num_microbatches()):
-                for layer in layers:
-                    static_inputs = layer.get_layer_static_inputs(
-                        self.seq_length, self.micro_batch_size
-                    )
-
-                    from megatron.core.transformer.identity_op import IdentityOp
-                    from megatron.core.transformer.transformer_layer import TransformerLayer
-
-                    contains_self_attn = (
-                        isinstance(layer, TransformerLayer)
-                        and not isinstance(layer.self_attention, IdentityOp)
-                        and (
-                            not self.config.cuda_graph_scope
-                            or 'attn' in self.config.cuda_graph_scope
-                        )
-                    )
-                    if is_te_min_version("1.10.0"):
-                        # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
-                        hidden_states = static_inputs.pop("hidden_states")
-                        sample_args.append((hidden_states,))
-                        if contains_self_attn:
-                            rotary_pos_emb = get_rotary_pos_emb(chunk_with_decoder, hidden_states)
-                            if rotary_pos_emb is not None:
-                                static_inputs["rotary_pos_emb"] = rotary_pos_emb
-                        sample_kwargs.append(static_inputs)
-                    elif contains_self_attn:
-                        sample_args.append(
-                            (
-                                static_inputs.pop("hidden_states"),
-                                static_inputs.pop("attention_mask"),
-                            )
-                        )
-                    else:
-                        sample_args.append((static_inputs.pop("hidden_states"),))
 
         # Get the PP and VPP scheduling order.
         from megatron.core.pipeline_parallel.schedules import (
@@ -1579,6 +1664,9 @@ class TECudaGraphHelper:
             level=logging.DEBUG,
             msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
+
+        # Generate sample arguments and keyword arguments for capturing.
+        sample_args, sample_kwargs = self._get_sample_arguments(order)
 
         def get_make_graphed_callables_kwargs():
             kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
