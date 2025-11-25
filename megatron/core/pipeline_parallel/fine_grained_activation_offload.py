@@ -562,9 +562,6 @@ class ChunkOffloadHandler:
         self.is_last_layer = False
         self.cpu_tensor_pool = cpu_tensor_pool
 
-        self.delay_offload_and_reload = True
-        self.delay_offload_group = []
-        self.delay_reload_group = 0
 
     def is_empty_chunk(self):
         """Check if this chunk has no tensors to manage."""
@@ -671,7 +668,7 @@ class ChunkOffloadHandler:
                     # Only reload if tensor was offloaded (stored as tuple)
                     if isinstance(state, tuple):
                         # Wait for offload to complete before reloading
-                        torch.cuda.current_stream().wait_event(event)
+                        # torch.cuda.current_stream().wait_event(event)
                         recovered_tensor = self.reload(state)
                         event.record(self.h2d_stream)
                         self._reload_events[name] = event
@@ -710,6 +707,9 @@ class ChunkOffloadHandler:
         debug_rank("----bulk_offload")
         if self.should_bulk_offload():
             group_to_offload = self._groups_to_offload.pop()
+            if group_to_offload[0] == 8:
+                print("rank", torch.distributed.get_rank(), "group_to_offload", group_to_offload)
+                return
             self._groups_to_reload.append(group_to_offload)
             self.bulk_offload_group(group_to_offload)
             # Manually release tensors not auto-freed by torch GC
@@ -726,17 +726,8 @@ class ChunkOffloadHandler:
         debug_rank("--on_group_commit_forward")
         # Wait for compute to finish before starting offload
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
-        if self.delay_offload_and_reload:
-            self.delay_offload_group.append(forced_released_tensors)
         self.bulk_offload(forced_released_tensors)
-        torch.cuda.current_stream().wait_stream(self.d2h_stream)
-
-    def flush_delay_offload_groups(self):
-        """Flush the delay offload groups."""
-        debug_rank("--flush_delay_offload_groups")
-        # for group in self.delay_offload_group:
-        #     self.bulk_offload(group)
-        # self.delay_offload_group = []
+        # torch.cuda.current_stream().wait_stream(self.d2h_stream)
 
     def bulk_reload(self):
         """Reload the next group of tensors from CPU to GPU."""
@@ -766,8 +757,8 @@ class ChunkOffloadHandler:
         assert cur_backward_chunk is self, "Chunk mismatch"
         # Wait for reload to complete before using tensors
         event = self.get_reload_event(name)
-        if event is not None:
-            torch.cuda.current_stream().wait_event(event)
+        # if event is not None:
+        #     torch.cuda.current_stream().wait_event(event)
         self._offloaded_group_index = self._offloaded_group_index - 1
 
     def on_group_start_forward(self, name):
@@ -788,19 +779,9 @@ class ChunkOffloadHandler:
         debug_rank("--on_group_start_backward")
         # Wait for compute to finish before starting reload
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
-        if self.delay_offload_and_reload:
-            self.delay_reload_group += 1
-        else:
-            self.bulk_reload()
-        torch.cuda.current_stream().wait_stream(self.h2d_stream)
+        self.bulk_reload()
+        # torch.cuda.current_stream().wait_stream(self.h2d_stream)
     
-    def flush_delay_reload_groups(self):
-        """Flush the delay reload groups."""
-        debug_rank("--flush_delay_reload_groups")
-        for i in range(self.delay_reload_group):
-            self.bulk_reload()
-        self.delay_reload_group = 0
-
 
 class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
     """
@@ -877,53 +858,6 @@ def fine_grained_offloading_group_start(tensor, name=None):
     cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
     return FineGrainedOffloadingGroupStartFunction.apply(tensor, cur_forward_chunk, name)
 
-class FineGrainedOffloadingGroupDelayOffloadFunction(torch.autograd.Function):
-    """
-    Identity operation that marks the end of a layer group for offload synchronization.
-    Triggers offload during forward and synchronizes reload during backward.
-    """
-
-    @staticmethod
-    def forward(ctx, tensor, cur_forward_chunk):
-        if DEBUG and torch.distributed.get_rank() == 0:
-            print("flush_delay_offload_groups")
-            print(cur_forward_chunk.delay_offload_group)
-            breakpoint()
-        if DEBUG:
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-        cur_forward_chunk.flush_delay_offload_groups()
-        return tensor
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output, None
-
-def fine_grained_offloading_flush_delay_offload_groups(tensor):
-    """Flush the delay offload groups."""
-    cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
-    return FineGrainedOffloadingGroupDelayOffloadFunction.apply(tensor, cur_forward_chunk)
-class FineGrainedOffloadingGroupDelayReloadFunction(torch.autograd.Function):
-    """
-    Identity operation that marks the end of a layer group for offload synchronization.
-    Triggers offload during forward and synchronizes reload during backward.
-    """
-
-    @staticmethod
-    def forward(ctx, tensor, cur_forward_chunk):
-        ctx.cur_forward_chunk = cur_forward_chunk
-        return tensor
-        
-    @staticmethod
-    def backward(ctx, grad_output):
-        cur_forward_chunk = ctx.cur_forward_chunk
-        cur_forward_chunk.flush_delay_reload_groups()
-        return grad_output, None
-
-def fine_grained_offloading_flush_delay_reload_groups(tensor):
-    """Flush the delay reload groups."""
-    cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
-    return FineGrainedOffloadingGroupDelayReloadFunction.apply(tensor, cur_forward_chunk)
 
 def get_fine_grained_offloading_context(flag):
     """Get the fine-grained offload context"""
@@ -932,8 +866,9 @@ def get_fine_grained_offloading_context(flag):
 
 def fine_grained_offloading_set_last_layer(is_last_layer):
     """Set the last layer flag."""
-    pass
-    # PipelineOffloadManager.get_instance().set_last_layer(is_last_layer)
+    # pass
+    # print("set_last_layer", is_last_layer)
+    PipelineOffloadManager.get_instance().set_last_layer(is_last_layer)
 
 
 def fine_grained_offloading_init_chunk_handler(vp_size, vp_stage, min_offloaded_tensor_size):
@@ -945,3 +880,38 @@ def fine_grained_offloading_init_chunk_handler(vp_size, vp_stage, min_offloaded_
 def fine_grained_offloading_reset():
     """Reset the chunk handler, called at the start of a training iteration."""
     PipelineOffloadManager.get_instance().reset()
+
+class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
+    """
+    Identity operation that marks the end of a layer group for offload synchronization.
+    Triggers offload during forward and synchronizes reload during backward.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, event):
+        ctx.event = event
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        h2d_stream = PipelineOffloadManager.get_instance().h2d_stream
+        torch.cuda.current_stream().record_event(ctx.event)
+        torch.cuda.current_stream().wait_stream(h2d_stream)
+        return grad_output, None
+
+def fine_grained_offloading_backward_record(tensor, event):
+    return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
+
+class FineGrainedOffloadingBackwardSyncFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, stream):
+        ctx.stream = stream
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        torch.cuda.current_stream().wait_stream(ctx.stream)
+        return grad_output, None
+
+def fine_grained_offloading_backward_sync(tensor, stream):
+    return FineGrainedOffloadingBackwardSyncFunction.apply(tensor, stream)

@@ -425,7 +425,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
-def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+def backward_step(model, input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -614,7 +614,7 @@ def forward_backward_no_pipelining(
                 total_num_tokens += num_tokens
                 if not forward_only:
                     backward_step(
-                        input_tensor, output_tensor, output_tensor_grad, model_type, config
+                        model, input_tensor, output_tensor, output_tensor_grad, model_type, config
                     )
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
@@ -637,7 +637,7 @@ def forward_backward_no_pipelining(
         total_num_tokens += num_tokens
 
         if not forward_only:
-            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+            backward_step(model, input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -1289,7 +1289,7 @@ def forward_backward_pipelining_with_interleaving(
         )
 
         input_tensor_grad = backward_step(
-            input_tensor, output_tensor, output_tensor_grad, model_type, config
+            None, input_tensor, output_tensor, output_tensor_grad, model_type, config
         )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
@@ -2236,7 +2236,7 @@ def forward_backward_pipelining_without_interleaving(
                     enable_grad_sync()
 
             input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
+                None, input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
             if last_iteration:
@@ -2272,7 +2272,7 @@ def forward_backward_pipelining_without_interleaving(
             )
 
             input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
+                None, input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
             p2p_communicator.send_backward(

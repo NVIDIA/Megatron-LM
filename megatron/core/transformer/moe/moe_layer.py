@@ -293,6 +293,8 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
+            d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map = self.route(hidden_states)
