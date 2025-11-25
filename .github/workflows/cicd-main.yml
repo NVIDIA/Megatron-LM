@@ -40,7 +40,6 @@ env:
 jobs:
   is-not-external-contributor:
     runs-on: ubuntu-latest
-    environment: nemo-ci
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
@@ -214,7 +213,6 @@ jobs:
   cicd-container-build:
     needs: [pre-flight, cicd-wait-in-queue]
     runs-on: nvidia-ci-aws-gpu-x8
-    environment: nemo-ci
     if: |
       (
         success()
@@ -369,7 +367,6 @@ jobs:
       - cicd-parse-unit-tests
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
-    environment: nemo-ci
     if: |
       (
         success()
@@ -402,7 +399,6 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
-    environment: nemo-ci
     if: |
       (
         success()
@@ -483,7 +479,6 @@ jobs:
       - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
-    environment: nemo-ci
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
@@ -564,7 +559,6 @@ jobs:
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
-    environment: nemo-ci
     steps:
       - name: Generate fake coverage report
         uses: actions/github-script@v6
