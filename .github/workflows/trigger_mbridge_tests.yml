@@ -87,75 +87,40 @@ jobs:
             echo "⏭️ Skipping ${{ matrix.workflow }} (not enabled)"
           fi
       
-      - name: Trigger MBridge ${{ matrix.workflow }}
+      - name: Trigger and monitor ${{ matrix.workflow }}
         if: steps.should_run.outputs.run == 'true'
-        id: trigger
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          echo "🚀 Triggering ${{ matrix.workflow }} | MCore: ${{ needs.get-mcore-info.outputs.sha }} | MBridge: ${{ inputs.mbridge_ref }}"
-          
-          gh workflow run ${{ matrix.workflow }} \
-            --repo NVIDIA-NeMo/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
-            --field mcore_commit=${{ needs.get-mcore-info.outputs.sha }} \
-            --field mcore_branch=${{ needs.get-mcore-info.outputs.branch }} \
-            --field test_suite=${{ inputs.test_suite }} \
-            --field triggered_by=mcore-ci
-      
-      - name: Wait for workflow to start and capture run ID
-        if: steps.should_run.outputs.run == 'true'
-        id: get_run_id
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          echo "⏳ Waiting for triggered workflow to appear..."
-          sleep 10
-          
-          echo "🔍 Looking for ${{ matrix.workflow }} run..."
-          RUN_ID=$(gh run list \
-            --repo NVIDIA-NeMo/Megatron-Bridge \
-            --workflow=${{ matrix.workflow }} \
-            --limit 5 \
-            --json databaseId,headSha,createdAt \
-            --jq "sort_by(.createdAt) | reverse | .[0] | .databaseId")
-          
-          echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
-          echo "📋 Run ID: ${RUN_ID}"
-          
-          printf "## 🔄 %s Triggered\n\n**MCore:** \`%s\` | **MBridge:** \`%s\` | **Suite:** \`%s\`\n\n- 🔄 [%s](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/%s) - Running...\n- ⏳ Polling every 5 minutes until completion or GHA timeout\n\n> **Note:** If tests exceed GitHub Actions' timeout, monitoring stops gracefully.\n" \
-            "${{ matrix.name }}" \
-            "${{ needs.get-mcore-info.outputs.short_sha }}" \
-            "${{ inputs.mbridge_ref }}" \
-            "${{ inputs.test_suite }}" \
-            "${{ matrix.workflow }}" \
-            "${RUN_ID}" \
-            >> $GITHUB_STEP_SUMMARY
-
-      - name: Monitor workflow
-        if: steps.should_run.outputs.run == 'true'
-        id: monitor
+        id: trigger_and_wait
+        uses: convictional/trigger-workflow-and-wait@v1.6.5
         continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
+        with:
+          owner: NVIDIA-NeMo
+          repo: Megatron-Bridge
+          github_token: ${{ secrets.PAT }}
+          workflow_file_name: ${{ matrix.workflow }}
+          ref: ${{ inputs.mbridge_ref }}
+          client_payload: '{"mcore_commit":"${{ needs.get-mcore-info.outputs.sha }}","mcore_branch":"${{ needs.get-mcore-info.outputs.branch }}","test_suite":"${{ inputs.test_suite }}","triggered_by":"mcore-ci"}'
+          wait_interval: 300
+          propagate_failure: false
+      
+      - name: Log trigger summary
+        if: steps.should_run.outputs.run == 'true'
         run: |
-          RUN_ID="${{ steps.get_run_id.outputs.run_id }}"
-          echo "📊 Monitoring ${{ matrix.workflow }} (Run ID: ${RUN_ID})"
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🔄 ${{ matrix.name }} Triggered
           
-          # gh run watch has built-in polling and status updates
-          gh run watch ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --exit-status
+          **MCore:** \`${{ needs.get-mcore-info.outputs.short_sha }}\` | **MBridge:** \`${{ inputs.mbridge_ref }}\` | **Suite:** \`${{ inputs.test_suite }}\`
           
-          # Capture final status
-          CONCLUSION=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion --jq -r .conclusion)
-          echo "workflow_status=${CONCLUSION}" >> $GITHUB_ENV
-          echo "✅ ${{ matrix.name }} completed with status: ${CONCLUSION}"
+          - 🔄 [${{ matrix.workflow }}](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${{ steps.trigger_and_wait.outputs.workflow_id }}) - Monitoring...
+          - ⏳ Polling every 5 minutes until completion or GHA timeout
+          
+          > **Note:** If tests exceed GitHub Actions' timeout, monitoring stops gracefully.
+          EOF
 
       - name: Report results
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
+        if: always() && steps.should_run.outputs.run == 'true'
         run: |
-          RUN_ID="${{ steps.get_run_id.outputs.run_id }}"
-          CONCLUSION=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion --jq -r .conclusion 2>/dev/null || echo "unknown")
+          CONCLUSION="${{ steps.trigger_and_wait.outputs.conclusion || 'unknown' }}"
+          RUN_ID="${{ steps.trigger_and_wait.outputs.workflow_id }}"
           
           case "$CONCLUSION" in
             "success") ICON="✅"; MSG="passed" ;;
