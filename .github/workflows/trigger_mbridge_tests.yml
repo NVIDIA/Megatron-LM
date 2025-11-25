@@ -158,27 +158,23 @@ jobs:
           CONCLUSION=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion --jq -r .conclusion 2>/dev/null || echo "unknown")
           
           case "$CONCLUSION" in
-            "success") ICON="✅" ;;
-            "failure") ICON="❌" ;;
-            "cancelled") ICON="🚫" ;;
-            *) ICON="⏳" ;;
+            "success") ICON="✅"; MSG="passed" ;;
+            "failure") ICON="❌"; MSG="failed - check link above"; EXIT_CODE=1 ;;
+            "cancelled") ICON="🚫"; MSG="cancelled"; EXIT_CODE=0 ;;
+            *) ICON="⏳"; MSG="still running or monitoring timed out"; EXIT_CODE=0 ;;
           esac
           
-          printf "## 📊 %s Results\n\n### %s %s\n**Status:** \`%s\`\n\n[View full results →](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/%s)\n\n---\n*Triggered from MCore commit \`%s\`*\n" \
-            "${{ matrix.name }}" \
-            "${ICON}" \
-            "${{ matrix.workflow }}" \
-            "${CONCLUSION}" \
-            "${RUN_ID}" \
-            "${{ needs.get-mcore-info.outputs.short_sha }}" \
-            >> $GITHUB_STEP_SUMMARY
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 📊 ${{ matrix.name }} Results
           
-          # Report status to console
-          if [ "$CONCLUSION" == "failure" ]; then
-            echo "❌ ${{ matrix.name }} failed - check link above"
-            exit 1
-          elif [ "$CONCLUSION" == "success" ]; then
-            echo "✅ ${{ matrix.name }} passed"
-          else
-            echo "⏳ ${{ matrix.name }} still running or monitoring timed out. Check the link in the summary above."
-          fi
+          ### ${ICON} ${{ matrix.workflow }}
+          **Status:** \`${CONCLUSION}\`
+          
+          [View full results →](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID})
+          
+          ---
+          *Triggered from MCore commit \`${{ needs.get-mcore-info.outputs.short_sha }}\`*
+          EOF
+          
+          echo "${ICON} ${{ matrix.name }} ${MSG}"
+          exit ${EXIT_CODE:-0}
