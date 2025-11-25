@@ -20,7 +20,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch", "numpy", "packaging>=24.2"]
+dependencies = ["torch", "numpy<2.0.0", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -68,7 +68,7 @@ mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
-    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.10.0",
+    "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
     "nvidia-resiliency-ext",
     "tqdm",
     "einops~=0.8",
@@ -76,15 +76,15 @@ dev = [
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
+    "setuptools<80.0.0",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
-    "av",
+    "av<16.0.0",                                        # At the time, av 16.0.0 is not compatible with Python 3.12
     "flashinfer-python",
     "wget",
     "onnxscript",
-    "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
 ]
 
 lts = [
@@ -94,15 +94,15 @@ lts = [
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
+    "setuptools<80.0.0",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
-    "av",
+    "av<16.0.0",                          # At the time, av 16.0.0 is not compatible with Python 3.12
     "flashinfer-python",
     "wget",
     "onnxscript",
-    "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
 ]
 
 [dependency-groups]
@@ -146,7 +146,7 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
+flash_mla = ["flash_mla"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
@@ -173,7 +173,7 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-# transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.9" } # on `release_v2.9`
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.9" } # on `release_v2.9`
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "fb1add873e7851ec34b48581ea1b15761b73d189" }
 

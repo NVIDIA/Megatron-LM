@@ -7,9 +7,9 @@ eval "IMAGE=\$$IMAGE"
 # Start a named container in detached mode
 docker run -d --name download_test_data -w /workdir/ python:3.12-slim bash -c 'sleep infinity'
 docker cp tests/. download_test_data:/workdir/tests
-docker exec download_test_data bash -c '
+docker exec -e GH_TOKEN=$GH_TOKEN download_test_data bash -c '
     ls -al /workdir/
-    pip install --no-cache-dir click requests
+    pip install --no-cache-dir pygithub click
     python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
 '
 docker cp download_test_data:/workdir/assets ./
@@ -50,7 +50,6 @@ DOCKER_BUILDKIT=1 docker build \
     --builder=container \
     --build-arg JET_API_VERSION=$JET_API_VERSION \
     --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID} \
-    --cache-from type=registry,ref=${IMAGE}-buildcache:dev \
     --cache-from type=registry,ref=${IMAGE}-buildcache:main \
     --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
     --push \
