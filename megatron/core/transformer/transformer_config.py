@@ -617,6 +617,9 @@ class TransformerConfig(ModelParallelConfig):
     keep_fp8_weight_transpose_cache: bool = False
     """Don't cache the FP8 weight transposes to save memory"""
 
+    use_fsdp2: bool = False
+    """Enable FSDP2 efficient sharding"""
+
     use_te_rng_tracker: bool = False
     """ Whether to use the TE or MCore version of the RNG tracker. """
 

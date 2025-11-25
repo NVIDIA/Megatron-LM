@@ -1250,6 +1250,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['disable_te_fused_rope'] = args.disable_te_fused_rope
         
     kw_args["cross_entropy_loss_fusion"] = args.cross_entropy_loss_fusion
+    kw_args["use_fsdp2"] = args.use_torch_fsdp2
     # Return config.
     return config_class(**kw_args)
 

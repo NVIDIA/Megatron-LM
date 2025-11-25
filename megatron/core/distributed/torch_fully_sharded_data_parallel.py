@@ -86,7 +86,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
         self.ddp_config = ddp_config
 
-        def save_custom_attrs(module):
+        def save_custom_attrs(module, _SKIP_KEYS = {"_data", "_module", "_transpose"}):
             custom_attrs = {}
             for name, param in module.named_parameters():
                 attrs = vars(param)
@@ -97,6 +97,8 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                     attrs['_fp8_attrs']['transpose_invalid'] = False
                     del attrs['_fp8_attrs']['transpose']
                 custom_attrs[name] = {k: v for k, v in attrs.items()}
+                for k in _SKIP_KEYS:
+                    custom_attrs[name].pop(k, None)
             return custom_attrs
 
         def restore_custom_attrs(module, custom_attrs):

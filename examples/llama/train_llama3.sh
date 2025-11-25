@@ -322,9 +322,6 @@ if [ "$TE_FP8" -eq 1 ]; then
         exit
     fi
 
-    if [ "$FSDP" -eq 1 ]; then
-        EXTRA_ARGS="$EXTRA_ARGS --keep_fp8_weight_transpose_cache" 
-    fi
 fi
 
 if [ -n "${WANDB_API_KEY}" ]; then
