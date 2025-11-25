@@ -44,7 +44,7 @@ class SamplingParams:
         for key, value in attribute_value_pair.items():
             setattr(self, key, value)
 
-    def serializable(self) -> dict:
+    def serialize(self) -> dict:
         """Return a dictionary that is msgpack-serializable."""
         return self.__dict__.copy()
 
