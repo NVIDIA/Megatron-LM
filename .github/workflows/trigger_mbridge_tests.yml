@@ -131,38 +131,23 @@ jobs:
             "${RUN_ID}" \
             >> $GITHUB_STEP_SUMMARY
 
-      - name: Monitor workflow  
+      - name: Monitor workflow
         if: steps.should_run.outputs.run == 'true'
         id: monitor
-        uses: actions/github-script@v7
         continue-on-error: true
-        with:
-          github-token: ${{ secrets.PAT }}
-          script: |
-            const runId = ${{ steps.get_run_id.outputs.run_id }};
-            const checkInterval = 300000; // 5 minutes
-            
-            console.log(`📊 Monitoring ${{ matrix.workflow }} (Run ID: ${runId})`);
-            
-            // Poll until completion or GitHub Actions timeout
-            while (true) {
-              const { data: run } = await github.rest.actions.getWorkflowRun({
-                owner: 'NVIDIA-NeMo',
-                repo: 'Megatron-Bridge',
-                run_id: runId,
-              });
-              
-              console.log(`Status: ${run.status}, Conclusion: ${run.conclusion}`);
-              
-              if (run.status === 'completed') {
-                core.exportVariable('workflow_status', run.conclusion);
-                console.log(`✅ ${{ matrix.name }} completed with status: ${run.conclusion}`);
-                return run.conclusion;
-              }
-              
-              console.log(`⏳ Still running... next check in ${checkInterval / 1000}s`);
-              await new Promise(resolve => setTimeout(resolve, checkInterval));
-            }
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          RUN_ID="${{ steps.get_run_id.outputs.run_id }}"
+          echo "📊 Monitoring ${{ matrix.workflow }} (Run ID: ${RUN_ID})"
+          
+          # gh run watch has built-in polling and status updates
+          gh run watch ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --exit-status
+          
+          # Capture final status
+          CONCLUSION=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion --jq -r .conclusion)
+          echo "workflow_status=${CONCLUSION}" >> $GITHUB_ENV
+          echo "✅ ${{ matrix.name }} completed with status: ${CONCLUSION}"
 
       - name: Report results
         if: always()
