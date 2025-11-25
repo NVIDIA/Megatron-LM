@@ -2341,6 +2341,12 @@ def megatron_rl_inference_mode(
 
         print(f"[{dist.get_rank()}:DP] Exiting inference mode")
 
+def rl_inference_interface_shutdown():
+    if _INFERENCE_INTERFACE is not None:
+        loop = get_asyncio_loop()
+        loop.run_until_complete(_INFERENCE_INTERFACE.kill())
+    else:
+        logger.warning("No inference interface to shutdown. This should not happen.")
 
 def get_iteration_sequence_count(args):
     """Get the total number of sequences processed in this iteration across all ranks."""
