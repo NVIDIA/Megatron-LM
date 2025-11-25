@@ -331,12 +331,8 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
 
     with mock.patch('megatron.training.utils.get_args', new=lambda: mock_args):
         # Make sure norm is correct when `main_param` attribute is not available.
-        norm_no_fp32_copy = training_util.calc_params_l2_norm(
-            model, force_create_fp32_copy=False
-        )
-        norm_fp32_copy = training_util.calc_params_l2_norm(
-            model, force_create_fp32_copy=True
-        )
+        norm_no_fp32_copy = training_util.calc_params_l2_norm(model, force_create_fp32_copy=False)
+        norm_fp32_copy = training_util.calc_params_l2_norm(model, force_create_fp32_copy=True)
         assert norm_no_fp32_copy == pytest.approx(norm_fp32_copy)
 
         # Make sure norm is correct when `main_param` attribute is available.
