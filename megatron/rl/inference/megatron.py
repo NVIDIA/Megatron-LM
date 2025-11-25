@@ -1,6 +1,7 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import logging
 from argparse import Namespace
 
 from pydantic import PrivateAttr
@@ -23,23 +24,29 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
     ChatInferenceInterface,
     InferenceRequest,
     InferenceResponse,
+    LLMChatMessage,
     ReturnsRaw,
     ReturnsTokens,
 )
 from ..server.api import InferenceServer
+
+logger = logging.getLogger(__name__)
 
 
 ## This code is copied from tools/run_text_generation_server.py
 def get_static_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
     """Get the relevant backend for running inference.
 
-    This function will automatically choose the TRTLLMBackend when possible, and default to Mcore backend if the user does not specify any backends. TRTLLMBackend is not implmented yet.
+    This function will automatically choose the TRTLLMBackend when possible,
+    and default to Mcore backend if the user does not specify any backends.
+    TRTLLMBackend is not implmented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line
@@ -76,24 +83,30 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
 
 
 ## This code is copied from tools/run_text_generation_server.py
-def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
+def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inference_logging_step_interval: int = 0,
+    metrics_writer = None) -> AbstractEngine:
     """Get the relevant backend for running inference.
 
-    This function will automatically choose the TRTLLMBackend when possible, and default to Mcore backend if the user does not specify any backends. TRTLLMBackend is not implmented yet.
+    This function will automatically choose the TRTLLMBackend when possible,
+    and default to Mcore backend if the user does not specify any backends.
+    TRTLLMBackend is not implmented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line
         model (MegatronModule): The megatron model.
+        inference_logging_step_interval (int): Step interval for logging inference metrics.
+        metrics_writer: Metrics writer (wandb module) for logging.
 
     Returns:
         AbstractBackend: The chosen backend
     """
     tokenizer = get_tokenizer()
 
-    enable_cuda_graph = args.cuda_graph_impl == "local"
     num_cuda_graphs = None
-    if enable_cuda_graph:
+    if args.enable_cuda_graph:
         num_cuda_graphs = args.inference_dynamic_batching_num_cuda_graphs
+
+    module = model.module.module if hasattr(model.module, "module") else model.module
 
     # Inference context.
     inference_context = DynamicInferenceContext(
@@ -107,12 +120,21 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
         num_cuda_graphs=num_cuda_graphs,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
-        block_size_tokens=args.inference_dynamic_batching_block_size,
+        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=True,
+        unified_memory_kvcache=args.inference_dynamic_batching_unified_memory_kvcache,
+        is_hybrid_model=args.is_hybrid_model,
+        layer_type_list=module.decoder.layer_type_list if args.is_hybrid_model else None,
+        mamba_head_dim=args.mamba_head_dim,
+        mamba_num_groups=args.mamba_num_groups,
+        mamba_d_model=args.hidden_size,
+        mamba_d_conv=4 if args.is_hybrid_model else None,
+        mamba_d_state=args.mamba_state_dim,
+        metrics_writer=metrics_writer,
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
@@ -128,8 +150,9 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
     return DynamicInferenceEngine(
         controller=text_generation_controller,
         context=inference_context,
-        enable_cuda_graph=enable_cuda_graph,
+        enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
+        inference_logging_step_interval=inference_logging_step_interval,
     )
 
 
@@ -142,6 +165,15 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def base_generate(self, request: InferenceRequest):
 
+        if any(isinstance(p, LLMChatMessage) for p in request.prompt):
+            raise ValueError(
+                "MegatronLocal does not support chat requests."
+                "Use MegatronChatLocal to apply chat templating."
+            )
+        assert all(
+            isinstance(p, str) for p in request.prompt
+        ), "MegatronLocal only supports string prompts."
+
         tokenizer = get_tokenizer()
 
         sampling_params = SamplingParams(
@@ -151,7 +183,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             top_p=request.generation_args.top_p or 0.0,
             termination_id=self._coordinator.engine.controller.tokenizer.eod,
             return_log_probs=True,
-            skip_prompt_log_probs_for_dynamic_inference=True,
+            skip_prompt_log_probs=True,
             add_BOS=tokenizer.bos is not None,
         )
         request_ids = [
@@ -175,8 +207,28 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     @classmethod
     async def launch(cls, model: GPTModel, **kwargs):
         args = get_args()
+        tokenizer = get_tokenizer()
 
-        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model)
+        if tokenizer.bos is None:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
+            )
+        
+        # Get inference logging configuration from args
+        inference_logging_step_interval = args.inference_wandb_logging_step_interval
+        
+        # Get metrics writer if logging is enabled and on the logging rank
+        # Use the same rank convention as training (last rank logs)
+        metrics_writer = None
+        if inference_logging_step_interval > 0 and args.rank == (args.world_size - 1):
+            metrics_writer = get_wandb_writer()
+            if metrics_writer is None:
+                log_single_rank(logger, logging.WARNING, "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
+                           "wandb module is available. Inference logging will be disabled.")
+
+        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model, inference_logging_step_interval, metrics_writer)
         coordinator = DynamicEngineCoordinator(
             inference_engine,
             inference_max_requests=inference_engine.context.max_requests,
@@ -196,6 +248,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def suspend(self):
         await self._coordinator.suspend_engine()
+
+    def resume(self):
+        self._coordinator.resume_engine()
 
 
 class MegatronChatLocal(ChatInferenceInterface, MegatronLocal): ...
