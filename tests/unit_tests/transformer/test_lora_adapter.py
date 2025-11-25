@@ -12,6 +12,7 @@ from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
+from megatron.core.parallel_state import get_tensor_model_parallel_group
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.mappings import _gather_along_first_dim
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -153,7 +154,7 @@ class TestLoraAdapterWithLoraLayers:
         current_local_weight = getattr(self.lora_adapter, non_parallel_non_zero_layer).weight
         assert not torch.allclose(original_weight, current_local_weight), f"Local weight wasn't updated for {non_parallel_non_zero_layer}"
         
-        full_weight = _gather_along_first_dim(current_local_weight)
+        full_weight = _gather_along_first_dim(current_local_weight, get_tensor_model_parallel_group())
         for idx, weight in enumerate(torch.split(full_weight, current_local_weight.shape[0])):
             assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {non_parallel_non_zero_layer}"
 
