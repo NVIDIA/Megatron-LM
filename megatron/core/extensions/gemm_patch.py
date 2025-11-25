@@ -1,13 +1,22 @@
+import logging
+import math
 import os
 import sys
-import math
+
 import torch
-import transformer_engine.pytorch.cpp_extensions.gemm
-from transformer_engine.pytorch.tensor.quantized_tensor import QuantizedTensorStorage
-from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
-from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor
-from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
-from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import NVFP4TensorStorage
+import transformer_engine.pytorch.cpp_extensions.gemm  # type: ignore
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor  # type: ignore
+from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor  # type: ignore
+from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (  # type: ignore
+    MXFP8TensorStorage,
+)
+from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import (  # type: ignore
+    NVFP4TensorStorage,
+)
+
+from megatron.core.utils import log_single_rank
+
+logger = logging.getLogger(__name__)
 
 _GLOBAL_IS_PATCHED_ = None
 
@@ -21,6 +30,7 @@ DTYPES = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}
 
 
 def get_rank_info():
+    """Return rank and device info for logging."""
     rank = os.environ.get("RANK", 0)
     node: str = os.uname()[1]
     device: int = torch.cuda.current_device()
@@ -28,6 +38,7 @@ def get_rank_info():
 
 
 def get_dtype(t):
+    """Return dtype info about a quantized tensor."""
     if isinstance(t, (MXFP8Tensor, MXFP8TensorStorage)):
         return "mxfp8"
     elif isinstance(t, (NVFP4Tensor, NVFP4TensorStorage)):
@@ -42,23 +53,27 @@ def new_general_gemm(
     A,
     B,
     workspace,
-    out_dtype = None,
-    quantization_params = None,
-    gelu = False,
-    gelu_in = None,
-    alpha = 1.0,
-    beta = None,
-    accumulate = False,
-    layout = "TN",
-    out = None,
-    bias = None,
-    use_split_accumulator = False,
-    grad = False,
-    ub = None,
-    ub_type = None,
-    extra_output = None,
-    bulk_overlap = False,
+    out_dtype=None,
+    quantization_params=None,
+    gelu=False,
+    gelu_in=None,
+    alpha=1.0,
+    beta=None,
+    accumulate=False,
+    layout="TN",
+    out=None,
+    bias=None,
+    use_split_accumulator=False,
+    grad=False,
+    ub=None,
+    ub_type=None,
+    extra_output=None,
+    bulk_overlap=False,
 ):
+    """
+    A wrapper for general_gemm that calls the original method twice
+    and compares results for consistency.
+    """
     cksum = [0, 0]
     for run_idx in range(2):
         will_rerun = run_idx == 0
@@ -102,15 +117,26 @@ def new_general_gemm(
             rerun_res = out_res
             continue
         if is_rerun:
-            same_cksum = math.fabs(cksum[1] - cksum[0]) / (math.fabs(cksum[1]) + EPSILON) <= CKSUM_TOLERANCE
+            same_cksum = (
+                math.fabs(cksum[1] - cksum[0]) / (math.fabs(cksum[1]) + EPSILON) <= CKSUM_TOLERANCE
+            )
             if not same_cksum:
-                print(f"RANK {get_rank_info()}: DIFFERENT CHECKSUM ON 2ND RUN for dtype {get_dtype(A)}. {cksum[1]} != {cksum[0]}, "
-                      f"shapes A:{list(A.size())},B:{list(B.size())},out:{list(out_res.shape)}")
+                logger.log(
+                    logging.ERROR,
+                    f"RANK {get_rank_info()}: DIFFERENT CHECKSUM ON 2ND RUN for dtype "
+                    f"{get_dtype(A)}. {cksum[1]} != {cksum[0]}, "
+                    f"shapes A:{list(A.size())},B:{list(B.size())},out:{list(out_res.shape)}",
+                )
             elif not torch.equal(rerun_res, out_res):
-                print(f"RANK {get_rank_info()}: DIFFERENT BITWISE on 2ND RUN for dtype {get_dtype(A)}. "
-                      f"shapes A:{list(A.size())},B:{list(B.size())},out:{list(out_res.shape)}")
+                logger.log(
+                    logging.ERROR,
+                    f"RANK {get_rank_info()}: DIFFERENT BITWISE on 2ND RUN for dtype "
+                    f"{get_dtype(A)}. "
+                    f"shapes A:{list(A.size())},B:{list(B.size())},out:{list(out_res.shape)}",
+                )
             del rerun_res
         return res
+
 
 def new_general_grouped_gemm(
     A,
@@ -118,24 +144,32 @@ def new_general_grouped_gemm(
     out,
     out_dtype,
     workspaces,
-    layout = "TN",
-    m_splits = None,
-    gelu = False,
-    grad =False,
-    accumulate = False,
-    bias = None,
-    use_bias = False,
-    use_split_accumulator = False,
-    D_dtype = None,
-    single_output = False,
+    layout="TN",
+    m_splits=None,
+    gelu=False,
+    grad=False,
+    accumulate=False,
+    bias=None,
+    use_bias=False,
+    use_split_accumulator=False,
+    D_dtype=None,
+    single_output=False,
 ):
+    """
+    A wrapper for general_grouped_gemm that calls the original method twice
+    and compares results for consistency.
+    """
     saved_output = None
     out_will_rerun = None
     bias_will_rerun = None
     for run_idx in range(2):
         is_rerun = run_idx == 1
         if not is_rerun:
-            out_will_rerun = [t.clone().detach() for t in out] if out is not None and (accumulate or out is bias) else out
+            out_will_rerun = (
+                [t.clone().detach() for t in out]
+                if out is not None and (accumulate or out is bias)
+                else out
+            )
             bias_will_rerun = out_for_rerun if bias is not None and out is bias else bias
         res = orig_general_grouped_gemm(
             A,
@@ -161,27 +195,34 @@ def new_general_grouped_gemm(
         if is_rerun:
             for tidx in range(len(output)):
                 if not torch.equal(output[tidx], saved_output[tidx]):
-                    print(
-                        f"RANK {get_rank_info()}: DIFFERENT GROUPED_GEMM RESULT ON 2ND RUN "
-                        f"FOR OP GroupedGEMM group {tidx} = {get_dtype(A[tidx])}({list(A[tidx].size())}) x {get_dtype(B[tidx])}({list(B[tidx].size())}) -> {get_dtype(output[tidx])}({list(output[tidx].size())})"
+                    logging.log(
+                        logging.ERROR,
+                        f"RANK {get_rank_info()}: DIFFERENT GROUPED_GEMM RESULT ON 2ND RUN FOR OP "
+                        f"GroupedGEMM group {tidx} = {get_dtype(A[tidx])}({list(A[tidx].size())}) "
+                        f"x {get_dtype(B[tidx])}({list(B[tidx].size())}) -> "
+                        f"{get_dtype(output[tidx])}({list(output[tidx].size())})",
                     )
         return res
 
+
 def patch_te_gemms() -> None:
+    """
+    Replaces general_gemm and general_grouped_gemm methods with wrappers to repeat
+    calculations and check consistency.
+    """
     global _GLOBAL_IS_PATCHED_
     if _GLOBAL_IS_PATCHED_ is not None and _GLOBAL_IS_PATCHED_:
         return
     transformer_engine.pytorch.cpp_extensions.gemm.general_gemm = new_general_gemm
     transformer_engine.pytorch.cpp_extensions.gemm.general_grouped_gemm = new_general_grouped_gemm
 
-    rank = int(os.environ.get("RANK", 0))
     for module in sys.modules:
         if 'general_gemm' in dir(sys.modules[module]):
-            if rank == 0:
-                print(f"PATCHING general_gemm IN MODULE: {module}")
+            log_single_rank(logger, logging.INFO, f"PATCHING general_gemm IN MODULE: {module}")
             sys.modules[module].general_gemm = new_general_gemm
         if 'general_grouped_gemm' in dir(sys.modules[module]):
-            if rank == 0:
-                print(f"PATCHING general_grouped_gemm IN MODULE: {module}")
+            log_single_rank(
+                logger, logging.INFO, f"PATCHING general_grouped_gemm IN MODULE: {module}"
+            )
             sys.modules[module].general_grouped_gemm = new_general_grouped_gemm
     _GLOBAL_IS_PATCHED_ = True
