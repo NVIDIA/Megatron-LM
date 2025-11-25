@@ -40,7 +40,7 @@ unset CUDA_DEVICE_MAX_CONNECTIONS
 
 #### 1. Disable `CUDA_DEVICE_MAX_CONNECTIONS`
 
-To ensure full parallelization of FSDP communication and computation, disable the CUDA_DEVICE_MAX_CONNECTIONS environment variable. This step avoids potential bubble in CUDA stream. (But it may slow down TP and CP to some extent.)
+To ensure full parallelization of FSDP communication and computation, disable the CUDA_DEVICE_MAX_CONNECTIONS environment variable. This step avoids potential bubbles in the CUDA stream. (But it may slow down TP and CP to some extent.)
 
 #### 2. Add `--calculate-per-token-loss`
 
@@ -56,7 +56,7 @@ Enables gradient reduction in BF16 precision instead of FP32, reducing communica
 
 #### 5. Add `--fsdp-double-buffer`
 
-Uses persistently allocated double buffers for temporarily-defined memory needed in `MegatronFSDP` communications. While having persistent douhle buffers may increase peak VRAM utilization, it is necessary to register NCCL user buffers (`nccl_ub=True`) for `MegatronFSDP`. Currently, this is supported only for simple repetitive model structures such as GPT.
+Uses persistently allocated double buffers for temporarily-defined memory needed in `MegatronFSDP` communications. While having persistent double buffers may increase peak VRAM utilization, it is necessary to register NCCL user buffers (`nccl_ub=True`) for `MegatronFSDP`. Currently, this is supported only for simple repetitive model structures such as GPT.
 
 - **Only effective when using Megatron-LM.**
 - Defaults to `False`. Automatically overridden to `True` when `nccl_ub` is enabled.
@@ -67,7 +67,7 @@ Allocates and registers NCCL user buffers for param and grad buffers. This optio
 
 - **Only effective when using Megatron-LM.**
 - Defaults to `False`.
-- By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registraion.
+- By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registration.
 
 ## Checkpoint Conversion from 3D-Parallel to Megatron-FSDP
 
@@ -90,6 +90,8 @@ Convert the `param_to_param_group_map` into a JSON file for easier processing by
 ```bash
 python tools/checkpoint/checkpoint_inspector.py print-torch-dcp-in-json /path/to/param_to_param_group_map
 ```
+
+This will create a `param_to_param_group_map.json` file in the `/path/to/param_to_param_group_map` directory.
 
 ### Step 3: Convert Checkpoint from `torch_dist` to `fsdp_dtensor`
 
