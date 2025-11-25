@@ -302,8 +302,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert (
                 mamba_ssm_states_shape is not None
             ), "`mamba_ssm_states_shape` must be specified for hybrid models"
-            assert (
-                not use_cuda_graphs_for_non_decode_steps
+            assert not (
+                num_cuda_graphs is not None and use_cuda_graphs_for_non_decode_steps
             ), "Non-decode CUDA graphs not yet supported for hybrid models"
 
             # For hybrid models, the layer map converts the global layer index to the
@@ -578,19 +578,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             """Allocate the memory buffer. This function is called below within
             `with ctx_manager:`."""
             if self.cache_mla_latent:
-                self.memory_buffer = torch.full(
+                self.memory_buffer = torch.empty(
                     (
                         self.num_attention_layers,
                         self.block_allocator.total_count,
                         self.block_size_tokens,
                         self.kv_reduced_dim,
                     ),
-                    -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
             else:
-                self.memory_buffer = torch.full(
+                self.memory_buffer = torch.empty(
                     (
                         2,  # key and value
                         self.num_attention_layers,
@@ -599,7 +598,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                         self.num_attention_heads_per_partition,
                         self.hidden_size_per_attention_head,
                     ),
-                    -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
@@ -610,12 +608,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             `with ctx_manager:`."""
             if self.is_hybrid_model:
                 self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
-                self.mamba_conv_states = torch.zeros(
+                self.mamba_conv_states = torch.empty(
                     (self.num_mamba_layers, self.max_total_requests) + self.mamba_conv_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
-                self.mamba_ssm_states = torch.zeros(
+                self.mamba_ssm_states = torch.empty(
                     (self.num_mamba_layers, self.max_total_requests) + self.mamba_ssm_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
@@ -1000,8 +998,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
-            self.mamba_conv_states.fill_(0)
-            self.mamba_ssm_states.fill_(0)
             self.mamba_metadata.reset()
 
     def using_cuda_graph_this_step(self) -> bool:
@@ -1427,6 +1423,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
 
+    def get_index_of_chunked_prefill_request(self) -> int:
+        """Get the index of the chunked prefill request in the context.
+
+        Return:
+            (int) Index of the chunked prefill request, or -1 if none exists.
+        """
+        return torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
+
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
         """Update context state after calling engine.step().
@@ -1583,8 +1587,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if self.chunked_prefill_request_id != -1:
                 # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-                pos = torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
-                active_requests_requiring_new_block[pos] = 0  # chunked prefill should not be paused
+                active_requests_requiring_new_block[self.get_index_of_chunked_prefill_request()] = (
+                    0  # chunked prefill should not be paused
+                )
 
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()
@@ -1651,11 +1656,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count += resume_request_count
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
-        # finally, swap the chunked prefill to the end of the active requests to obey the invariant
+        # finally, swap the chunked prefill to the end of the active requests to obey the invariance
         if self.chunked_prefill_request_id != -1:
-            pos = torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
             self._swap_book_keeping_tensors(
-                src_idxs=torch.tensor([pos]),
+                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
                 dst_idxs=torch.tensor([active_request_count + self.paused_request_count - 1]),
                 next_tokens=next_tokens,
             )
