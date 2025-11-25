@@ -272,7 +272,9 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+            # See https://github.com/NVIDIA/Megatron-LM/pull/2217 for detailed explanation
+            # of scaling by cp_group_size
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_group_size / num_microbatches)
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:

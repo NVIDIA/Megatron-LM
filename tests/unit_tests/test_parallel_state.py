@@ -1,5 +1,6 @@
-from math import log2
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from math import log2
 import pytest
 import torch
 
@@ -12,6 +13,7 @@ test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
 @pytest.mark.parametrize('order', test_parallel_order)
+@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_initialize_and_destroy_model_parallel(order):
     with pytest.raises(AssertionError):

@@ -64,6 +64,7 @@ from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyS
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.qk_clip import clip_qk
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -594,15 +595,15 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def get_no_wd_decay_cond(no_wd_decay_cond_type, default_skip_embedding_weight_decay):
+def get_no_weight_decay_cond(no_weight_decay_cond_type, default_skip_embedding_weight_decay):
     """Get the no weight decay condition function."""
 
-    # Default case: no_wd_decay_cond_type is None
-    no_wd_decay_cond_fn = None
+    # Default case: no_weight_decay_cond_type is None
+    no_weight_decay_cond_fn = None
 
-    if no_wd_decay_cond_type == 'qwen3_next':
+    if no_weight_decay_cond_type == 'apply_wd_to_qk_layernorm':
         # Qwen3-Next applies weight decay to qk layernorm as a special case
-        def qwen3_next_no_wd_decay_cond(name, param):
+        def apply_wd_to_qk_layernorm_fn(name, param):
             if "q_layernorm" in name or "k_layernorm" in name:
                 no_wd = False
             else:
@@ -612,11 +613,11 @@ def get_no_wd_decay_cond(no_wd_decay_cond_type, default_skip_embedding_weight_de
                     or (default_skip_embedding_weight_decay and "embedding" in name)
                 )
             return no_wd
-        no_wd_decay_cond_fn = qwen3_next_no_wd_decay_cond
-    elif no_wd_decay_cond_type is not None:
-        raise ValueError(f"Invalid no_wd_decay_cond_type: {no_wd_decay_cond_type}")
+        no_weight_decay_cond_fn = apply_wd_to_qk_layernorm_fn
+    elif no_weight_decay_cond_type is not None:
+        raise ValueError(f"Invalid no_weight_decay_cond_type: {no_weight_decay_cond_type}")
 
-    return no_wd_decay_cond_fn
+    return no_weight_decay_cond_fn
 
 def pretrain(
     train_valid_test_dataset_provider,
@@ -754,7 +755,7 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    no_wd_decay_cond = get_no_wd_decay_cond(
+    no_weight_decay_cond = get_no_weight_decay_cond(
         args.no_weight_decay_cond_type,
         default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
     )
@@ -762,7 +763,7 @@ def pretrain(
         model_provider,
         model_type,
         checkpointing_context=checkpointing_context,
-        no_wd_decay_cond=no_wd_decay_cond,
+        no_weight_decay_cond=no_weight_decay_cond,
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1181,7 +1182,7 @@ def get_optimizer_param_scheduler(optimizer):
 def setup_model_and_optimizer(
     model_provider_func,
     model_type,
-    no_wd_decay_cond=None,
+    no_weight_decay_cond=None,
     scale_lr_cond=None,
     lr_mult=1.0,
     checkpointing_context=None,
@@ -1206,7 +1207,7 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_optimizer(
             config,
             model,
-            no_wd_decay_cond,
+            no_weight_decay_cond,
             scale_lr_cond,
             lr_mult,
             use_gloo_process_groups=args.enable_gloo_process_groups,
@@ -1219,7 +1220,7 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_muon_optimizer(
             config,
             model,
-            no_wd_decay_cond,
+            no_weight_decay_cond,
             scale_lr_cond,
             lr_mult,
             use_gloo_process_groups=args.enable_gloo_process_groups,
@@ -1392,7 +1393,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -1407,6 +1408,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    # get max attention logit for logging and run clip_qk()
+    # Part of MuonClip Optimizer step
+    log_max_attention_logit = 0
+    if args.qk_clip or args.log_max_attention_logit:
+        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+            
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -1464,8 +1472,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             exit_code,
             grad_norm,
             num_zeros_in_grad,
+            log_max_attention_logit,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
 def training_log(
@@ -1480,6 +1489,7 @@ def training_log(
     grad_norm,
     params_norm,
     num_zeros_in_grad,
+    max_attention_logit,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1642,6 +1652,10 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+        if args.log_max_attention_logit:
+            writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
+            if wandb_writer:
+                wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -1672,7 +1686,7 @@ def training_log(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
     if iteration % args.log_interval == 0:
-        if args.record_memory_history and is_last_rank():
+        if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
 
@@ -1761,7 +1775,9 @@ def training_log(
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
-            report_memory_flag = False
+            if iteration > 1:
+                # Make sure the memory after the second iteration is reported to include optimizer state memory.
+                report_memory_flag = False
         # Write timers to wandb, don't reset the counts
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
@@ -2412,6 +2428,7 @@ def train(
             exit_code,
             grad_norm,
             num_zeros_in_grad,
+            max_attention_logit,
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
@@ -2516,6 +2533,7 @@ def train(
             grad_norm,
             params_norm,
             num_zeros_in_grad,
+            max_attention_logit,
         )
 
         # Evaluation.

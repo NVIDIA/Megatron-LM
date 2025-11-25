@@ -4,7 +4,6 @@ from typing import Optional
 
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
-from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
@@ -13,18 +12,7 @@ def get_linear_attention_module_spec_for_backend(
 ) -> ModuleSpec:
     """Helper function to get module spec for Linear Attention"""
     rms_norm = normalization == "RMSNorm"
-    if linear_attention_type == "mamba":
-        attention = (
-            ModuleSpec(
-                module=MambaMixer,
-                submodules=MambaMixerSubmodules(
-                    in_proj=backend.column_parallel_layer_norm_linear(),
-                    out_proj=backend.row_parallel_linear(),
-                ),
-                metainfo={"fuse_input_layernorm": True},
-            ),
-        )
-    elif linear_attention_type == "gated_delta_net":
+    if linear_attention_type == "gated_delta_net":
         attention = ModuleSpec(
             module=GatedDeltaNet,
             submodules=GatedDeltaNetSubmodules(
