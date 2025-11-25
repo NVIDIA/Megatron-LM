@@ -1,4 +1,4 @@
-#！/bin/bash
+#!/bin/bash
 
 export NCCL_IB_SL=1
 export NCCL_IB_TIMEOUT=19
