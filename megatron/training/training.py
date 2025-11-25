@@ -2873,9 +2873,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             do_valid = (args.full_validation or args.eval_iters > 0)
             do_test = (args.full_validation or args.eval_iters > 0)
         else:
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-                build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None
-            )
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
             valid_dataloaders = []
