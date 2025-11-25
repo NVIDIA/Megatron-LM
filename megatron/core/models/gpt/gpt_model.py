@@ -588,8 +588,6 @@ class GPTModel(LanguageModule):
                     # Perform the sequence parallel gather here instead of after the output layer
                     # because we need to slice the last token logits from the full view of the
                     # packed logits across all requests.
-                    # TODO(ksanthanam): Make the equivalent change in the `MambaModel` code after
-                    # merging in !3722.
                     hidden_states = gather_from_sequence_parallel_region(
                         hidden_states, group=self.pg_collection.tp
                     )
@@ -597,7 +595,7 @@ class GPTModel(LanguageModule):
                     sequence_parallel_override = True
 
                 # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
-                # state ([B, H]) → unsqueeze back to [1, B, H]
+                # state ([B, H]) → unsqueeze back to [B, 1, H]
                 # (so that the output layer, which expects S×B×H, receives only the final token)
                 hidden_states = inference_context.last_token_logits(
                     hidden_states.squeeze(1).unsqueeze(0)
