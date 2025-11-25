@@ -67,7 +67,7 @@ jobs:
         uses: ./.github/actions/check-nvidia-sso-membership
         with:
           username: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
-          github_token: ${{ secrets.PAT }}
+          github_token: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
       - name: Set maintainer status
         id: check-membership
