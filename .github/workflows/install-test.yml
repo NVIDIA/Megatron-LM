@@ -22,8 +22,8 @@ on:
     branches:
       - dev
       - main
-      - "pull-request/[0-9]+"
-      - "deploy-release/*"
+      - 'pull-request/[0-9]+'
+      - 'deploy-release/*'
   merge_group:
     types: [checks_requested]
 
@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12"]
+        python-version: ['3.12']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -93,7 +93,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12"]
+        python-version: ['3.12']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -140,13 +140,16 @@ jobs:
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Get workflow result
         id: result
         shell: bash -x -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
 
