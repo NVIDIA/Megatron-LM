@@ -135,6 +135,58 @@ class CUDAGraphBatchDimensionBuilder:
     CUDA_GRAPH_ROUNDER = 8
 
     @staticmethod
+    def _calculate_cuda_graph_token_counts(
+        tp_size: int, num_cuda_graphs: int, cuda_graph_max_tokens: int
+    ) -> List[int]:
+        """
+        Calculate CUDA graph token counts for a given configuration.
+
+        This method computes evenly-spaced token counts from step_size up to
+        cuda_graph_max_tokens, ensuring proper rounding and TP alignment.
+
+        Args:
+            tp_size: Tensor parallel size (for alignment)
+            num_cuda_graphs: Number of CUDA graphs to generate (must be >= 1)
+            cuda_graph_max_tokens: Maximum token count for CUDA graphs (must be > 0)
+
+        Returns:
+            List of token counts in descending order
+
+        Example:
+            >>> _calculate_cuda_graph_token_counts
+            (tp_size=2, num_cuda_graphs=4, cuda_graph_max_tokens=1000)
+            [1000, 752, 504, 256]
+        """
+        assert num_cuda_graphs >= 1, f"num_cuda_graphs must be >= 1, got {num_cuda_graphs}"
+        assert (
+            cuda_graph_max_tokens > 0
+        ), f"cuda_graph_max_tokens must be > 0, got {cuda_graph_max_tokens}"
+
+        # Cuda graph step size.
+        cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
+        cuda_graph_step_size = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER * int(
+            math.ceil(int(cuda_graph_step_size) / CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER)
+        )
+        # Make sure divisible by TP size
+        cuda_graph_step_size = math.ceil(cuda_graph_step_size / tp_size) * tp_size
+
+        # Cuda graph token counts.
+        if num_cuda_graphs == 1:
+            cuda_graph_token_counts = [cuda_graph_max_tokens]
+        else:
+            cuda_graph_token_counts = list(
+                range(cuda_graph_step_size, cuda_graph_max_tokens, cuda_graph_step_size)
+            )
+            if (
+                len(cuda_graph_token_counts) == 0
+                or cuda_graph_token_counts[-1] != cuda_graph_max_tokens
+            ):
+                cuda_graph_token_counts.append(cuda_graph_max_tokens)
+            cuda_graph_token_counts.reverse()
+
+        return cuda_graph_token_counts
+
+    @staticmethod
     def generate_cuda_graph_batch_dimensions_list(
         tp_size: int,
         num_cuda_graphs: Optional[int],
@@ -196,7 +248,8 @@ class CUDAGraphBatchDimensionBuilder:
 
         # Cuda graph token-counts
         # (i.e., token counts used by cuda-graph steps, both decode and non-decode).
-        cuda_graph_token_counts = None
+        cuda_graph_prefill_token_counts = None
+        cuda_graph_decode_token_counts = None
         if num_cuda_graphs is not None:
 
             # Ensure valid num_cuda_graphs.
@@ -208,29 +261,26 @@ class CUDAGraphBatchDimensionBuilder:
                 cuda_graph_max_tokens = max_tokens
             num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
 
-            # Cuda graph step size.
-            cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
-            cuda_graph_step_size = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER * int(
-                math.ceil(
-                    int(cuda_graph_step_size) / CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
+            # Calculate token counts for prefill and mixed graphs.
+            # These need the full cuda_graph_max_tokens to handle variable-length sequences.
+            cuda_graph_prefill_token_counts = (
+                CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+                    tp_size=tp_size,
+                    num_cuda_graphs=num_cuda_graphs,
+                    cuda_graph_max_tokens=cuda_graph_max_tokens,
                 )
             )
-            # Make sure divisible by TP size
-            cuda_graph_step_size = math.ceil(cuda_graph_step_size / tp_size) * tp_size
 
-            # Cuda graph token counts.
-            if num_cuda_graphs == 1:
-                cuda_graph_token_counts = [cuda_graph_max_tokens]
-            else:
-                cuda_graph_token_counts = list(
-                    range(cuda_graph_step_size, cuda_graph_max_tokens, cuda_graph_step_size)
+            # Calculate separate token counts for decode-only graphs.
+            # Decode graphs can be more conservative since each request uses exactly 1 token.
+            cuda_graph_max_tokens_decode = min(cuda_graph_max_tokens, max_requests)
+            cuda_graph_decode_token_counts = (
+                CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+                    tp_size=tp_size,
+                    num_cuda_graphs=num_cuda_graphs,
+                    cuda_graph_max_tokens=cuda_graph_max_tokens_decode,
                 )
-                if (
-                    len(cuda_graph_token_counts) == 0
-                    or cuda_graph_token_counts[-1] != cuda_graph_max_tokens
-                ):
-                    cuda_graph_token_counts.append(cuda_graph_max_tokens)
-                cuda_graph_token_counts.reverse()
+            )
 
         cuda_graph_batch_dimensions_list = []
         if num_cuda_graphs is None:
@@ -240,19 +290,17 @@ class CUDAGraphBatchDimensionBuilder:
             or cuda_graph_mixed_prefill_count <= 0
             or not use_cuda_graphs_for_non_decode_steps
         ):  # decode only
-            for size in cuda_graph_token_counts:
+            # Use decode-specific token counts for decode-only graphs
+            for size in cuda_graph_decode_token_counts:
                 add_if_valid(
                     token_count=min(size, max_requests),
                     prefill_req_count=0,
                     decode_req_count=min(size, max_requests),
                 )
         else:
-            for size in cuda_graph_token_counts:
-                add_if_valid(
-                    token_count=min(size, max_requests),
-                    prefill_req_count=0,
-                    decode_req_count=min(size, max_requests),
-                )
+            # Mixed prefill and decode mode
+            # Create prefill and mixed dimensions with full token counts
+            for size in cuda_graph_prefill_token_counts:
                 add_if_valid(
                     token_count=size,
                     prefill_req_count=min(cuda_graph_mixed_prefill_count, max_requests),
@@ -272,11 +320,30 @@ class CUDAGraphBatchDimensionBuilder:
                         decode_req_count=0,
                     )
 
+            # Create decode-only dimensions with optimized token counts
+            for size in cuda_graph_decode_token_counts:
+                add_if_valid(
+                    token_count=min(size, max_requests),
+                    prefill_req_count=0,
+                    decode_req_count=min(size, max_requests),
+                )
+
         # Remove duplicates and sort by prefill token count
         cuda_graph_batch_dimensions_list = list(set(cuda_graph_batch_dimensions_list))
         cuda_graph_batch_dimensions_list.sort(
             key=lambda x: ((x.token_count - x.decode_req_count), x.decode_req_count), reverse=True
         )
+
+        # Collect actual token counts from batch dimensions, then unique and sort
+        if num_cuda_graphs is None or len(cuda_graph_batch_dimensions_list) == 0:
+            # No CUDA graphs or no valid batch dimensions
+            cuda_graph_token_counts = None
+        else:
+            # Extract unique token counts from the batch dimensions we actually created
+            token_counts_set = {
+                batch_dim.token_count for batch_dim in cuda_graph_batch_dimensions_list
+            }
+            cuda_graph_token_counts = sorted(list(token_counts_set), reverse=True)
 
         return cuda_graph_batch_dimensions_list, cuda_graph_token_counts
 

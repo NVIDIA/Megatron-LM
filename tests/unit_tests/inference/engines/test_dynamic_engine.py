@@ -674,12 +674,12 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [16384]),
-            (1, [16384]),
-            (2, [16384, 8192]),
-            (4, [16384, 12288, 8192, 4096]),
-            (8, [16384, 14336, 12288, 10240, 8192, 6144, 4096, 2048]),
-            (16, list(range(16384, 0, -1024))),
+            (0, [40]),
+            (1, [40]),
+            (2, [40, 24]),
+            (4, [40, 32, 16]),
+            (8, [40, 32, 24, 16, 8]),
+            (16, [40, 32, 24, 16, 8]),
         ]:
 
             # Build cuda graphs (inside dynamic engine).
