@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from pathlib import Path
@@ -21,6 +21,7 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
@@ -53,6 +54,8 @@ def initialize_gpt_model(
         virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        mtp_num_layers=1 if with_mtp else None,
+        mtp_loss_scaling_factor=1.0 if with_mtp else None,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
@@ -61,9 +64,6 @@ def initialize_gpt_model(
         transformer_config.moe_ffn_hidden_size = 128
         transformer_config.num_moe_experts = 4
         transformer_config.add_bias_linear = False
-    if with_mtp:
-        transformer_config.mtp_num_layers = 1
-        transformer_config.mtp_loss_scaling_factor = 1.0
     model = []
     for i in range(virtual_pipeline_model_parallel_size or 1):
         if is_moe:
@@ -71,8 +71,11 @@ def initialize_gpt_model(
         else:
             layer_spec = layer_spec_fn()
 
-        if is_moe and with_mtp and mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i):
-            transformer_layer_spec_for_mtp = gpt_te_spec(transformer_config)
+        if with_mtp and mtp_on_this_rank(transformer_config, ignore_virtual=False, vp_stage=i):
+            if is_moe:
+                transformer_layer_spec_for_mtp = gpt_te_spec(transformer_config)
+            else:
+                transformer_layer_spec_for_mtp = layer_spec
             mtp_block_spec = get_gpt_mtp_block_spec(
                 transformer_config,
                 transformer_layer_spec_for_mtp,
@@ -81,6 +84,10 @@ def initialize_gpt_model(
             )
         else:
             mtp_block_spec = None
+
+        # print("========================")
+        # print("[DEBUG] mtp_block_spec is ", mtp_block_spec)
+        # exit()
         pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
         post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
         this_model = (
@@ -163,7 +170,7 @@ def create_args():
                 [],
                 ["decoder"],
                 ["decoder"],
-                ["decoder"] * 2 + ["loss"],
+                ["decoder"] * 2 + ["mtp"] + ["loss"],
             ],
             False,
             True,
@@ -185,7 +192,19 @@ def create_args():
             False,
         ),
         ((1, 2, None), [["embedding"] + ["decoder"] * 4, ["decoder"] * 4 + ["loss"]], True, False),
-        ((1, 4, 2), "E|t*3|(t|)*5L", True, True),
+        ((1, 4, 2), "E|t*3|(t|)*5mL", True, True),  # mtp in the last stage
+        (
+            (1, 4, 2),
+            "E|t*3|(t|)*4tm|L",
+            True,
+            True,
+        ),  # mtp in the second last stage with a decoder layer
+        (
+            (1, 4, 2),
+            "E|t*3|(t|)*3tt|m|L",
+            True,
+            True,
+        ),  # mtp in the second last stage with no other layers
     ],
 )
 def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp):
