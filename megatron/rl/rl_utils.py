@@ -879,6 +879,8 @@ def maybe_log_training_metrics(
                     'advantages_hist': wandb_writer.plot.histogram(
                         advantages, 'advantages', 'Advantages'
                     ),
+                    'nonzero_groups_ratio': np.count_nonzero(group_stats.advantages)
+                            / len(group_stats.advantages),
                     'min_piold_to_inf_prob': group_stats.min_piold_to_inf_prob,
                     'max_piold_to_inf_prob': group_stats.max_piold_to_inf_prob,
                     'mean_piold_to_inf_prob': group_stats.mean_piold_to_inf_prob,
@@ -2206,7 +2208,7 @@ def calculate_grpo_loss(
 
     ref_diff = ref_logprobs - current_logprobs
     kl_term = ref_diff.exp() - ref_diff - 1
-    entropy_term = current_logprobs.exp() * current_logprobs
+    entropy_term = -current_logprobs.exp() * current_logprobs
 
     is_weights = torch.tensor(1.0, dtype=old_logprobs.dtype).to(old_logprobs.device)
     if inference_logprobs is not None:
@@ -2220,7 +2222,7 @@ def calculate_grpo_loss(
     loss = (
         -is_weights * torch.min(ratios * advantages, clamped_ratios * advantages)
         + kl_beta * kl_term
-        + entropy_weight * entropy_term
+        - entropy_weight * entropy_term
     )
 
     return loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below
@@ -2339,6 +2341,12 @@ def megatron_rl_inference_mode(
 
         print(f"[{dist.get_rank()}:DP] Exiting inference mode")
 
+def rl_inference_interface_shutdown():
+    if _INFERENCE_INTERFACE is not None:
+        loop = get_asyncio_loop()
+        loop.run_until_complete(_INFERENCE_INTERFACE.kill())
+    else:
+        logger.warning("No inference interface to shutdown. This should not happen.")
 
 def get_iteration_sequence_count(args):
     """Get the total number of sequences processed in this iteration across all ranks."""

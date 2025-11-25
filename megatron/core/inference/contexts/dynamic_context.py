@@ -578,19 +578,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             """Allocate the memory buffer. This function is called below within
             `with ctx_manager:`."""
             if self.cache_mla_latent:
-                self.memory_buffer = torch.full(
+                self.memory_buffer = torch.empty(
                     (
                         self.num_attention_layers,
                         self.block_allocator.total_count,
                         self.block_size_tokens,
                         self.kv_reduced_dim,
                     ),
-                    -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
             else:
-                self.memory_buffer = torch.full(
+                self.memory_buffer = torch.empty(
                     (
                         2,  # key and value
                         self.num_attention_layers,
@@ -599,7 +598,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                         self.num_attention_heads_per_partition,
                         self.hidden_size_per_attention_head,
                     ),
-                    -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
@@ -610,12 +608,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             `with ctx_manager:`."""
             if self.is_hybrid_model:
                 self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
-                self.mamba_conv_states = torch.zeros(
+                self.mamba_conv_states = torch.empty(
                     (self.num_mamba_layers, self.max_total_requests) + self.mamba_conv_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
-                self.mamba_ssm_states = torch.zeros(
+                self.mamba_ssm_states = torch.empty(
                     (self.num_mamba_layers, self.max_total_requests) + self.mamba_ssm_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
@@ -1000,8 +998,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
-            self.mamba_conv_states.fill_(0)
-            self.mamba_ssm_states.fill_(0)
             self.mamba_metadata.reset()
 
     def using_cuda_graph_this_step(self) -> bool:
@@ -1749,7 +1745,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def calculate_log_probs(
         self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> List[List[float]]:
+    ) -> Tuple[List[List[float]], Tensor]:
         """Calculate log probs for all active requests and return them.
 
         TODO: @wdykas support top-n log probs.
@@ -1762,14 +1758,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         Returns:
             List of lists where each inner list contains log probs for a request in the
             same order as the active requests (from paused_request_count to total_request_count).
+            log_probs (Tensor): Used to compute top n logprobs later if required.
         """
+
         # Calculate log_probs (sequence_length x vocab_size)
         log_probs = F.log_softmax(logits.squeeze(0).float(), dim=-1)
 
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
             selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.flatten().tolist()]
+            return [[lp] for lp in selected_log_probs.flatten().tolist()], log_probs
 
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
@@ -1812,7 +1810,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Convert each log prob tensor into a list
-        return [lp.tolist() for lp in selected_log_probs_list]
+        return [lp.tolist() for lp in selected_log_probs_list], log_probs
 
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.
