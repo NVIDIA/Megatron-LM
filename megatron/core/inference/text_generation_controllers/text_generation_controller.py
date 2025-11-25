@@ -46,6 +46,7 @@ except ImportError:
     HAVE_TE = False
 
 
+# pylint: disable=line-too-long
 class TextGenerationController:
     """The text generation controller (the main sampling loop)
 
@@ -103,6 +104,10 @@ class TextGenerationController:
         self.termination_id_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
         self.return_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
         self.skip_prompt_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
+        self.top_n_logprobs_cuda = torch.empty(max_requests, dtype=torch.int32, device=device)
+        self.return_prompt_top_n_logprobs_cuda = torch.empty(
+            max_requests, dtype=torch.bool, device=device
+        )
 
         # Used for inefficient torch sampling.
         self.torch_sampling_buckets: List[Tensor] = []
@@ -624,6 +629,12 @@ class TextGenerationController:
         self.skip_prompt_log_probs_cuda[:active_request_count] = request_metadata[
             :, request_metadata_labels["skip_prompt_log_probs"]
         ].to(dtype=torch.bool, copy=True, non_blocking=True)
+        self.top_n_logprobs_cuda[:active_request_count] = request_metadata[
+            :, request_metadata_labels["top_n_logprobs"]
+        ].to(dtype=torch.int32, copy=True, non_blocking=True)
+        self.return_prompt_top_n_logprobs_cuda[:active_request_count] = request_metadata[
+            :, request_metadata_labels["return_prompt_top_n_logprobs"]
+        ].to(dtype=torch.bool, copy=True, non_blocking=True)
 
         if backend == "torch":
             # Bucketize the core sampling parameters.
@@ -699,14 +710,34 @@ class TextGenerationController:
 
         active_request_count = context.total_request_count - context.paused_request_count
 
-        to_check = self.return_log_probs_cuda[:active_request_count]
+        # Create a copy to avoid modifying the original tensor with in-place operations
+        to_check = self.return_log_probs_cuda[:active_request_count].clone()
         to_check &= ~self.skip_prompt_log_probs_cuda[:active_request_count]
 
         assert not (
             to_check.any() and materialize_only_last_token_logits
-        ), "Prompt log probs cannot be calculated if only last token logits are materialized."
+        ), "Prompt log probs cannot be calculated if only last token logits are materialized. Set materialize_only_last_token_logits to False in DynamicInferenceContext or skip_prompt_log_probs to True in SamplingParams."
 
         return self.return_log_probs_cuda[:active_request_count].any()
+
+    def _dynamic_step_top_n_logprobs_bookkeeping(self) -> bool:
+        """Perform bookkeeping necessary to compute top-n log probs for dynamic batching."""
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        # Check if any request wants prompt top-n logprobs (top_n > 0 AND return_prompt_top_n = True)
+        # Create a copy to avoid modifying the original tensor with in-place operations
+        to_check = (self.top_n_logprobs_cuda[:active_request_count] > 0).clone()
+        to_check &= self.return_prompt_top_n_logprobs_cuda[:active_request_count]
+
+        assert not (
+            to_check.any() and materialize_only_last_token_logits
+        ), "Prompt top-n logprobs cannot be calculated if only last token logits are materialized. Set materialize_only_last_token_logits to False in DynamicInferenceContext or set return_prompt_top_n_logprobs to False in SamplingParams."
+
+        # Check if any request has top_n_logprobs > 0
+        return (self.top_n_logprobs_cuda[:active_request_count] > 0).any()
 
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
@@ -715,12 +746,94 @@ class TextGenerationController:
 
         active_request_count = context.total_request_count - context.paused_request_count
 
-        ret = context.calculate_log_probs(
+        return context.calculate_log_probs(
             logits,
             self.sampled_tokens_cuda[:active_request_count],
             only_last_token_logits=materialize_only_last_token_logits,
         )
-        return ret
+
+    def _dynamic_step_calculate_top_n_logprobs(
+        self, logits: Tensor, log_probs_tensor: Optional[Tensor] = None
+    ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
+        """Calculate top-n log probs from logits for dynamic batching.
+
+        Args:
+            logits (Tensor): The logits to compute top-n log probs from.
+            log_probs_tensor (Optional[Tensor]): Pre-computed log probabilities tensor.
+                If provided, avoids recomputing log_softmax. Should be the tensor
+                returned by calculate_log_probs.
+
+        Returns:
+            A dictionary mapping request_idx to list of (top_n_logprobs, top_n_indices) tuples.
+            Each tuple in the list represents one token position.
+        """
+        assert log_probs_tensor is not None, (
+            "log_probs_tensor must be provided. This should be guaranteed by the calling code "
+            "computing log_probs when return_top_n_logprobs is True."
+        )
+
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        # Handle decode-only mode (only last token)
+        if materialize_only_last_token_logits or context.is_decode_only():
+            # In decode mode or when only last token logits are materialized,
+            # logits already represent only the last tokens
+            log_probs = log_probs_tensor[:active_request_count]
+
+            top_n_results = {}
+            for req_idx in range(active_request_count):
+                top_n = int(self.top_n_logprobs_cuda[req_idx].item())
+                if top_n > 0:
+                    # Get top-n logprobs and indices for this request (single token)
+                    top_n_logits = torch.topk(log_probs[req_idx], k=top_n)
+                    top_n_results[req_idx] = [
+                        (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                    ]
+            return top_n_results if top_n_results else None
+
+        # Handle prefill mode - need to extract top-n for tokens per request
+        # This follows the same pattern as calculate_log_probs in dynamic_context.py
+        # Note: logits may be padded, so we only take the first active_token_count tokens
+        log_probs = log_probs_tensor[: context.active_token_count]
+
+        active_query_lengths = context.request_query_lengths[
+            context.paused_request_count : context.total_request_count
+        ]
+
+        # Split log_probs across request boundaries
+        # log_probs has shape [active_token_count, vocab_size]
+        log_probs_per_request = log_probs.split(active_query_lengths.tolist(), dim=0)
+
+        top_n_results = {}
+        for req_idx in range(active_request_count):
+            top_n = int(self.top_n_logprobs_cuda[req_idx].item())
+            if top_n > 0:
+                request_log_probs = log_probs_per_request[
+                    req_idx
+                ]  # [num_tokens_for_request, vocab_size]
+                return_prompt_top_n = bool(self.return_prompt_top_n_logprobs_cuda[req_idx].item())
+
+                # If return_prompt_top_n_logprobs is False, only compute for last token
+                if not return_prompt_top_n and request_log_probs.size(0) > 1:
+                    # Only compute top-n for the last token (first generated token)
+                    top_n_logits = torch.topk(request_log_probs[-1], k=top_n)
+                    top_n_results[req_idx] = [
+                        (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                    ]
+                else:
+                    # Compute top-n for all tokens in the request
+                    top_n_per_token = []
+                    for token_idx in range(request_log_probs.size(0)):
+                        top_n_logits = torch.topk(request_log_probs[token_idx], k=top_n)
+                        top_n_per_token.append(
+                            (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                        )
+                    top_n_results[req_idx] = top_n_per_token
+
+        return top_n_results if top_n_results else None
 
     def _dynamic_step_context_bookkeeping(self, new_sample) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
@@ -785,9 +898,6 @@ class TextGenerationController:
                 cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
         context = self.inference_wrapped_model.inference_context
-        materialize_only_last_token_logits = context.materialize_only_last_token_logits
-
-        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
 
         # No tokens?
         if context.active_token_count == 0:
@@ -814,10 +924,16 @@ class TextGenerationController:
         new_sample = self._dynamic_step_sample_logits(logits)
 
         return_log_probs = self._dynamic_step_log_probs_bookkeeping()
-        if return_log_probs:
-            log_probs = self._dynamic_step_calculate_log_probs(logits)
-        else:
-            log_probs = None
+        return_top_n_logprobs = self._dynamic_step_top_n_logprobs_bookkeeping()
+
+        log_probs = None
+        top_n_logprobs = None
+        if return_log_probs or return_top_n_logprobs:
+            log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
+            if return_top_n_logprobs:
+                top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
+                    logits, log_probs_tensor
+                )
 
         if skip_bookkeeping:
             request_bookkeeping = {}
@@ -827,6 +943,7 @@ class TextGenerationController:
         ret = {
             "sample": new_sample,
             "log_probs": log_probs,
+            "top_n_logprobs": top_n_logprobs,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
         ret.update(request_bookkeeping)

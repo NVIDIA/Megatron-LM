@@ -1085,51 +1085,131 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.skip(
-        reason="test works in isolation, but memory dynamics change when run "
-        "within unt test suite."
-    )
-    def test_suspend_resume_memory(self):
-
-        # Run tests.
-        mem_usages = {}
-        for suspend_resume_interval in None, 8, 4, 2:  # interval 1 acts funny.
-
-            # Run test.
-            env = self._run_test(suspend_resume_interval=suspend_resume_interval, num_gap_steps=1)
-
-            # Record memory usage.
-            mem_usages[suspend_resume_interval] = env.mem_usage
-
-            # Clear memory to make recorded memories consistent between tests.
-            # TODO(@lmcafee): why is memory not automatically cleared?
-            # env.engine.suspend() # TODO(@lmcafee): useful?
-            del env
-
-        # Utility methods.
-        get_alloc = lambda mem_stats: mem_stats["allocated_bytes.all.current"]
-
-        # Validate overall 'end' memory usage.
-        golden_end_bytes = get_alloc(mem_usages[None]["end"])
-        for interval, mem_usage in mem_usages.items():
-            current_end_bytes = get_alloc(mem_usage["end"])
-            assert math.isclose(
-                golden_end_bytes, current_end_bytes, rel_tol=0.01
-            ), f"{current_end_bytes} != {golden_end_bytes}."
-
-        # Validate 'suspend/resume' memory usage.
-        get_suspend_resume_bytes = lambda key: list(
-            get_alloc(list(d["suspend_resume"].values())[-1][key])
-            for i, d in mem_usages.items()
-            if i is not None
+    @pytest.mark.parametrize("return_prompt_top_n_logprobs", [True, False])
+    @torch.inference_mode()
+    def test_top_n_logprobs_dynamic(self, return_prompt_top_n_logprobs: bool):
+        """
+        Test that top_n_logprobs are computed correctly in dynamic batching mode.
+        Verifies:
+        1. top_n_logprobs are returned for generated tokens
+        2. return_prompt_top_n_logprobs controls whether prompt top-n logprobs are returned
+        3. The top-n values are consistent with the selected token's log prob
+        """
+        # Build test environment with multiple requests of varying lengths
+        test_config = DynamicEngineTestConfig(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=12,
+            num_tokens_to_generate=4,
+            materialize_only_last_token_logits=False,
         )
-        suspend_resume_mid_bytes = get_suspend_resume_bytes("mid")
-        suspend_resume_end_bytes = get_suspend_resume_bytes("end")
-        for mid_bytes in suspend_resume_mid_bytes:
-            assert math.isclose(
-                suspend_resume_mid_bytes[0], mid_bytes, rel_tol=0.01
-            ), f"{mid_bytes} != {suspend_resume_mid_bytes[0]}."
-        for end_bytes in suspend_resume_end_bytes:
-            assert math.isclose(
-                suspend_resume_end_bytes[0], end_bytes, rel_tol=0.01
-            ), f"{end_bytes} != {suspend_resume_end_bytes[0]}."
+        env = self._build_test_env(test_config)
+
+        # Create requests with top_n_logprobs enabled
+        top_n = 5
+        requests_to_add = []
+        for request in env.requests:
+            # Update sampling params to include top_n_logprobs
+            request.sampling_params = SamplingParams(
+                num_tokens_to_generate=test_config.num_tokens_to_generate,
+                termination_id=test_config.vocab_size - 1,
+                return_log_probs=True,
+                top_n_logprobs=top_n,
+                return_prompt_top_n_logprobs=return_prompt_top_n_logprobs,
+                top_k=10,  # Add some sampling randomness
+            )
+            requests_to_add.append(request)
+
+        # Add requests and run inference
+        for request in requests_to_add:
+            env.engine._add_request(request)
+
+        # Step engine until all requests are finished
+        while env.engine.has_unfinished_requests():
+            result = env.engine.step_modern(verbose=False)
+
+        # Validate results
+        for request in requests_to_add:
+            assert request.status == Status.COMPLETED, f"Request {request.request_id} not completed"
+
+            # Validate generated top-n logprobs
+            assert hasattr(
+                request, 'generated_top_n_logprobs'
+            ), f"Request {request.request_id} missing generated_top_n_logprobs"
+            assert (
+                request.generated_top_n_logprobs is not None
+            ), f"Request {request.request_id} has None generated_top_n_logprobs"
+            assert len(request.generated_top_n_logprobs) == len(
+                request.generated_tokens
+            ), f"Request {request.request_id}: generated_top_n_logprobs length mismatch"
+
+            # Validate each top-n dict
+            for i, top_n_dict in enumerate(request.generated_top_n_logprobs):
+                assert isinstance(
+                    top_n_dict, dict
+                ), f"Request {request.request_id}, token {i}: top_n_dict is not a dict"
+                assert (
+                    len(top_n_dict) <= top_n
+                ), f"Request {request.request_id}, token {i}: too many top-n entries"
+                assert (
+                    len(top_n_dict) > 0
+                ), f"Request {request.request_id}, token {i}: empty top-n dict"
+
+            # Validate prompt top-n logprobs based on return_prompt_top_n_logprobs flag
+            if return_prompt_top_n_logprobs:
+                assert hasattr(
+                    request, 'prompt_top_n_logprobs'
+                ), f"Request {request.request_id} missing prompt_top_n_logprobs"
+                assert (
+                    request.prompt_top_n_logprobs is not None
+                ), f"Request {request.request_id} has None prompt_top_n_logprobs"
+                # Prompt top-n should have N-1 entries (excluding first token)
+                expected_prompt_top_n_len = len(request.prompt_tokens) - 1
+                assert (
+                    len(request.prompt_top_n_logprobs) == expected_prompt_top_n_len
+                ), f"Request {request.request_id}: prompt_top_n_logprobs length {len(request.prompt_top_n_logprobs)} != expected {expected_prompt_top_n_len}"
+
+                # Validate each prompt top-n dict
+                for i, top_n_dict in enumerate(request.prompt_top_n_logprobs):
+                    assert isinstance(
+                        top_n_dict, dict
+                    ), f"Request {request.request_id}, prompt token {i}: top_n_dict is not a dict"
+                    assert (
+                        len(top_n_dict) <= top_n
+                    ), f"Request {request.request_id}, prompt token {i}: too many top-n entries"
+                    assert (
+                        len(top_n_dict) > 0
+                    ), f"Request {request.request_id}, prompt token {i}: empty top-n dict"
+            else:
+                # When return_prompt_top_n_logprobs is False, prompt_top_n_logprobs should be None or empty
+                if hasattr(request, 'prompt_top_n_logprobs'):
+                    assert (
+                        request.prompt_top_n_logprobs is None
+                        or len(request.prompt_top_n_logprobs) == 0
+                    ), f"Request {request.request_id}: prompt_top_n_logprobs should be None or empty when return_prompt_top_n_logprobs is False"
+
+            # Validate consistency between log_probs and top_n_logprobs
+            if hasattr(request, 'generated_log_probs') and request.generated_log_probs is not None:
+                assert len(request.generated_log_probs) == len(
+                    request.generated_top_n_logprobs
+                ), f"Request {request.request_id}: generated_log_probs and generated_top_n_logprobs length mismatch"
+
+                # Check that the selected token's log prob appears in the top-n
+                for i, (log_prob, top_n_dict, token_id) in enumerate(
+                    zip(
+                        request.generated_log_probs,
+                        request.generated_top_n_logprobs,
+                        request.generated_tokens,
+                    )
+                ):
+                    # Get the token string for this token_id
+                    token_str = env.engine.controller.tokenizer.detokenize([token_id])
+                    # The selected token should be in the top-n
+                    assert (
+                        token_str in top_n_dict
+                    ), f"Request {request.request_id}, token {i}: selected token '{token_str}' not in top-n"
+                    # The log prob should match (with some tolerance for floating point precision)
+                    # Using 0.1 tolerance to account for FP16/BF16 precision in mixed precision training
+                    assert (
+                        abs(log_prob - top_n_dict[token_str]) < 0.1
+                    ), f"Request {request.request_id}, token {i}: log_prob mismatch {log_prob} vs {top_n_dict[token_str]}"

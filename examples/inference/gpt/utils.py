@@ -67,6 +67,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help='Return the top n logprobs for the generated tokens and their corresponding token as a dictionary',
     )
     group.add_argument(
+        "--return-prompt-top-n-logprobs",
+        action='store_true',
+        default=False,
+        help='Return the top n logprobs for the prompt tokens and their corresponding token as a dictionary',
+    )
+    group.add_argument(
         "--incoming-requests-per-step",
         type=int, default=None,
         help="Add a deterministic number of requests per step. This arg is "
@@ -95,6 +101,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         choices=["mamba", "gpt"],
         default="gpt",
         help="Model provider",
+    )
+    group.add_argument(
+        "--skip-prompt-log-probs",
+        action='store_true',
+        default=False,
+        help='Skip prompt log probs.',
     )
     group.add_argument(
         "--output-path",
@@ -300,7 +312,8 @@ def get_requests_from_file(
     # Load prompts.
     n_prompts = sum(1 for _ in open(args.prompt_file))
     prompts = []
-    sampling_params = get_default_sampling_params(tokenizer.eod)
+    if sampling_params is None:
+        sampling_params = get_default_sampling_params(tokenizer.eod)
     sampling_params_list = []
     with open(args.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):

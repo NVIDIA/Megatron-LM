@@ -732,6 +732,135 @@ class TestTextGenerationController:
                         == request_single.prompt_top_n_logprobs[i][token_str]
                     )
 
+    @pytest.mark.parametrize("return_prompt_top_n_logprobs", [True, False])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_dynamic_top_n_logprobs_calculation(
+        self, return_prompt_top_n_logprobs: bool, materialize_only_last_token_logits: bool
+    ):
+        """
+        Test the _dynamic_step_calculate_top_n_logprobs function directly.
+        Verifies:
+        1. top_n_logprobs are computed for all requests
+        2. return_prompt_top_n_logprobs controls computation for prompt tokens
+        3. Correct number of tokens are returned for each request
+        """
+        batch_size = 4
+        self.setup_model(torch.bfloat16, batch_size=batch_size, static=False)
+        self.mock_tokenizer.eod = self.vocab_size
+
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        context.materialize_only_last_token_logits = materialize_only_last_token_logits
+
+        # Prepare sampling params
+        top_n = 5
+        request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
+        request_metadata = torch.empty(
+            (batch_size, len(request_metadata_labels)), dtype=torch.float32
+        ).cuda()
+
+        # Set top_n_logprobs for all requests
+        request_metadata[:, request_metadata_labels["top_n_logprobs"]] = top_n
+        request_metadata[:, request_metadata_labels["return_prompt_top_n_logprobs"]] = float(
+            return_prompt_top_n_logprobs
+        )
+
+        # Bookkeeping
+        self.text_generation_controller._dynamic_step_sample_bookkeeping(
+            request_metadata=request_metadata
+        )
+
+        if materialize_only_last_token_logits:
+            # Decode mode: logits for last tokens only
+            logits = torch.randn(1, batch_size, self.vocab_size).cuda()
+
+            # Set up context state for decode mode
+            context.paused_request_count = 0
+            context.total_request_count = batch_size
+
+            # Compute log probabilities (required by _dynamic_step_calculate_top_n_logprobs)
+            # Note: squeeze(0) to match what calculate_log_probs does in dynamic_context.py
+            log_probs_tensor = torch.nn.functional.log_softmax(logits.squeeze(0), dim=-1)
+
+            # Calculate top-n logprobs
+            top_n_results = self.text_generation_controller._dynamic_step_calculate_top_n_logprobs(
+                logits, log_probs_tensor
+            )
+
+            # Validate results
+            assert top_n_results is not None, "top_n_results should not be None"
+            assert (
+                len(top_n_results) == batch_size
+            ), f"Expected {batch_size} requests, got {len(top_n_results)}"
+
+            for req_idx in range(batch_size):
+                assert req_idx in top_n_results, f"Request {req_idx} missing from results"
+                top_n_list = top_n_results[req_idx]
+
+                # In decode mode, should have exactly 1 token per request
+                assert (
+                    len(top_n_list) == 1
+                ), f"Request {req_idx}: expected 1 token, got {len(top_n_list)}"
+
+                top_n_values, top_n_indices = top_n_list[0]
+                assert top_n_values.shape[0] == top_n, f"Expected {top_n} values"
+                assert top_n_indices.shape[0] == top_n, f"Expected {top_n} indices"
+        else:
+            # Prefill mode: logits for all tokens
+            # Simulate different prompt lengths
+            query_lengths = [4, 6, 5, 7]  # Different lengths for each request
+            total_tokens = sum(query_lengths)
+
+            # Set up context state
+            context.paused_request_count = 0
+            context.total_request_count = batch_size
+            context.active_token_count = total_tokens
+            context.request_query_lengths = torch.tensor(
+                [0] * context.paused_request_count + query_lengths, dtype=torch.int32, device='cuda'
+            )
+
+            # Create logits for all tokens
+            logits = torch.randn(1, total_tokens, self.vocab_size).cuda()
+
+            # Compute log probabilities (required by _dynamic_step_calculate_top_n_logprobs)
+            # Note: squeeze(0) to match what calculate_log_probs does in dynamic_context.py
+            log_probs_tensor = torch.nn.functional.log_softmax(logits.squeeze(0), dim=-1)
+
+            # Calculate top-n logprobs
+            top_n_results = self.text_generation_controller._dynamic_step_calculate_top_n_logprobs(
+                logits, log_probs_tensor
+            )
+
+            # Validate results
+            assert top_n_results is not None, "top_n_results should not be None"
+            assert (
+                len(top_n_results) == batch_size
+            ), f"Expected {batch_size} requests, got {len(top_n_results)}"
+
+            for req_idx in range(batch_size):
+                assert req_idx in top_n_results, f"Request {req_idx} missing from results"
+                top_n_list = top_n_results[req_idx]
+
+                if return_prompt_top_n_logprobs:
+                    # Should have top-n for all tokens
+                    expected_count = query_lengths[req_idx]
+                    assert (
+                        len(top_n_list) == expected_count
+                    ), f"Request {req_idx}: expected {expected_count} tokens, got {len(top_n_list)}"
+                else:
+                    # Should have top-n for only the last token (first generated token)
+                    assert (
+                        len(top_n_list) == 1
+                    ), f"Request {req_idx}: expected 1 token when return_prompt_top_n_logprobs=False, got {len(top_n_list)}"
+
+                # Validate each token's top-n
+                for token_idx, (top_n_values, top_n_indices) in enumerate(top_n_list):
+                    assert (
+                        top_n_values.shape[0] == top_n
+                    ), f"Request {req_idx}, token {token_idx}: expected {top_n} values"
+                    assert (
+                        top_n_indices.shape[0] == top_n
+                    ), f"Request {req_idx}, token {token_idx}: expected {top_n} indices"
+
     @pytest.mark.parametrize("static", [True, False])
     @pytest.mark.parametrize("tp_size", [1, 2])
     @pytest.mark.parametrize("pp_size", [1, 2])
