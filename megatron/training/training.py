@@ -2870,8 +2870,8 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             valid_dataloaders = None
             test_dataloader = None
             do_train = args.train_iters > 0
-            do_valid = False
-            do_test = False
+            do_valid = (args.full_validation or args.eval_iters > 0)
+            do_test = (args.full_validation or args.eval_iters > 0)
         else:
             train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
                 build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None
