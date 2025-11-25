@@ -1943,6 +1943,7 @@ def get_batch_on_this_cp_rank(
 def get_thd_batch_on_this_cp_rank(
     batch: Dict[str, Any],
     cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
     max_seqlen: torch.Tensor,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
@@ -1955,8 +1956,8 @@ def get_thd_batch_on_this_cp_rank(
         qkv_format="thd",
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens,
-        cu_seqlens_kv_padded=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=int(max_seqlen[0].item()),
         max_seqlen_kv=int(max_seqlen[0].item()),
     )
@@ -1969,10 +1970,10 @@ def get_thd_batch_on_this_cp_rank(
             "Context Parallel with THD format data"
         )
         index = tex.thd_get_partitioned_indices(
-            cu_seqlens, batch['tokens'].size(1), cp_size, cp_rank
+            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
         )
         for key, data in batch.items():
-            if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
+            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
                 continue
             batch[key] = data.index_select(1, index)
 
@@ -2011,6 +2012,7 @@ def get_batch_on_this_hybrid_cp_rank(
             continue
         batch[key] = torch.stack([data], 0)
     sample_length = batch['tokens'].shape[1]
+    # TODO(pmannan): Take care of padding tokens here if not divisible by cp_size*2
     # Create packed_seq_params for SBHD format with cp group information.
     packed_seq_params = PackedSeqParams(
         qkv_format="sbhd",
