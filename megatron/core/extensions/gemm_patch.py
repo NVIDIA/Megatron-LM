@@ -49,27 +49,7 @@ def get_dtype(t):
         return "unknown"
 
 
-def new_general_gemm(
-    A,
-    B,
-    workspace,
-    out_dtype=None,
-    quantization_params=None,
-    gelu=False,
-    gelu_in=None,
-    alpha=1.0,
-    beta=None,
-    accumulate=False,
-    layout="TN",
-    out=None,
-    bias=None,
-    use_split_accumulator=False,
-    grad=False,
-    ub=None,
-    ub_type=None,
-    extra_output=None,
-    bulk_overlap=False,
-):
+def new_general_gemm(A, B, workspace, out=None, accumulate=False, bias=None, **kwargs):
     """
     A wrapper for general_gemm that calls the original method twice
     and compares results for consistency.
@@ -89,25 +69,7 @@ def new_general_gemm(
             bias_arg = bias
 
         res = orig_general_gemm(
-            A,
-            B,
-            workspace,
-            out_dtype,
-            quantization_params,
-            gelu,
-            gelu_in,
-            alpha,
-            beta,
-            accumulate,
-            layout,
-            out_arg,
-            bias_arg,
-            use_split_accumulator,
-            grad,
-            ub,
-            ub_type,
-            extra_output,
-            bulk_overlap,
+            A, B, workspace, out=out_arg, accumulate=accumulate, bias=bias_arg, **kwargs
         )
         out_res = res[0]
         is_rerun = run_idx == 1
@@ -139,21 +101,7 @@ def new_general_gemm(
 
 
 def new_general_grouped_gemm(
-    A,
-    B,
-    out,
-    out_dtype,
-    workspaces,
-    layout="TN",
-    m_splits=None,
-    gelu=False,
-    grad=False,
-    accumulate=False,
-    bias=None,
-    use_bias=False,
-    use_split_accumulator=False,
-    D_dtype=None,
-    single_output=False,
+    A, B, out, out_dtype, workspaces, grad=False, accumulate=False, bias=None, **kwargs
 ):
     """
     A wrapper for general_grouped_gemm that calls the original method twice
@@ -177,16 +125,10 @@ def new_general_grouped_gemm(
             out_will_rerun if not is_rerun else out,
             out_dtype,
             workspaces,
-            layout,
-            m_splits,
-            gelu,
-            grad if is_rerun else False,
-            accumulate,
-            bias_will_rerun if not is_rerun else bias,
-            use_bias,
-            use_split_accumulator,
-            D_dtype,
-            single_output,
+            grad=grad if is_rerun else False,
+            accumulate=accumulate,
+            bias=bias_will_rerun if not is_rerun else bias,
+            **kwargs,
         )
         output = res[0]
         if not is_rerun:
