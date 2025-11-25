@@ -115,4 +115,9 @@ class BlockAllocator:
         This resets the available block count to the entire memory pool
         (except for the dummy block).
         """
+        # Reset block bag to so we start consuming
+        # from the beginning of the pool for UVM performance
+        self.block_bag = torch.arange(
+            self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
+        )
         self.total_avail = self.total_count - 1

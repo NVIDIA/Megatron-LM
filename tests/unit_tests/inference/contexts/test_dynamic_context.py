@@ -292,8 +292,6 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
         if is_hybrid_model:
             assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_idx == -1)
-            assert torch.all(dynamic_context.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
     @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
@@ -450,9 +448,6 @@ class TestDynamicContext:
             active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
         )
         assert dynamic_context.total_request_count == 0
-        if is_hybrid_model:
-            assert torch.all(dynamic_context.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
         # This case would cover all cases
         # 1. Already there will be 2 paused requests
@@ -756,11 +751,6 @@ class TestDynamicContext:
 
         # Verify that all 6 blocks were released by checking the available blocks
         assert dynamic_context.block_allocator.total_avail == initial_available_blocks + 6
-
-        if is_hybrid_model:
-            # All mamba states should be zeroed out
-            assert torch.all(dynamic_context.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
     @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])

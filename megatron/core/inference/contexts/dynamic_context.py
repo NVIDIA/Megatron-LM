@@ -578,19 +578,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             """Allocate the memory buffer. This function is called below within
             `with ctx_manager:`."""
             if self.cache_mla_latent:
-                self.memory_buffer = torch.full(
+                self.memory_buffer = torch.empty(
                     (
                         self.num_attention_layers,
                         self.block_allocator.total_count,
                         self.block_size_tokens,
                         self.kv_reduced_dim,
                     ),
-                    -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
             else:
-                self.memory_buffer = torch.full(
+                self.memory_buffer = torch.empty(
                     (
                         2,  # key and value
                         self.num_attention_layers,
@@ -599,7 +598,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                         self.num_attention_heads_per_partition,
                         self.hidden_size_per_attention_head,
                     ),
-                    -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
@@ -610,12 +608,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             `with ctx_manager:`."""
             if self.is_hybrid_model:
                 self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
-                self.mamba_conv_states = torch.zeros(
+                self.mamba_conv_states = torch.empty(
                     (self.num_mamba_layers, self.max_total_requests) + self.mamba_conv_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
-                self.mamba_ssm_states = torch.zeros(
+                self.mamba_ssm_states = torch.empty(
                     (self.num_mamba_layers, self.max_total_requests) + self.mamba_ssm_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
@@ -1000,8 +998,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
-            self.mamba_conv_states.fill_(0)
-            self.mamba_ssm_states.fill_(0)
             self.mamba_metadata.reset()
 
     def using_cuda_graph_this_step(self) -> bool:
