@@ -326,13 +326,13 @@ class DynamicInferenceRequest(InferenceRequest):
                 on_device (bool) - Whether the metadata lives on GPU (True) or CPU (False).
         """
         return [
-            ("temperature", torch.float32, True),
-            ("top_k", torch.float32, True),  # CPU for torch sampling
-            ("top_p", torch.float32, True),  # CPU for torch sampling
-            ("termination_id", torch.float32, True),
-            ("return_log_probs", torch.float32, True),  # CPU for non-selective logprobs
-            ("skip_prompt_log_probs", torch.float32, True),  # CPU for non-selective logprobs
-            ("top_n_logprobs", torch.float32, True),  # CPU for torch sampling
+            ("temperature", torch.float32, False),  # CPU for torch sampling
+            ("top_k", torch.int32, False),  # CPU for torch sampling
+            ("top_p", torch.float32, False),  # CPU for torch sampling
+            ("termination_id", torch.int64, True),
+            ("return_log_probs", torch.bool, False),  # CPU for non-selective logprobs
+            ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
+            ("top_n_logprobs", torch.int32, False), # CPU for torch sampling
         ]
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:

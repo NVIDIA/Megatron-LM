@@ -538,12 +538,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Track request metadata.
         self.request_metadata = {
-            label: torch.empty(
-                (self.max_total_requests,),
-                dtype=dtype,
-                device=torch.cuda.current_device() if on_gpu else torch.device("cpu"),
-            )
-            for label, dtype, on_gpu in self.request_metadata_types
+            label: torch.empty((self.max_total_requests,), dtype=dtype, device=torch.cuda.current_device())
+            for label, dtype, _ in self.request_metadata_types
         }
 
         # Per-token state.
@@ -1054,11 +1050,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
-        for i, (label, dtype, on_gpu) in enumerate(self.request_metadata_types):
+        for i, (label, dtype, _) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
                 metadata_cols[i],
                 dtype=dtype,
-                device=torch.cuda.current_device() if on_gpu else torch.device("cpu"),
+                device=torch.cuda.current_device(),
             )
 
         dummy_block_idx = self.block_allocator.dummy_block_idx
