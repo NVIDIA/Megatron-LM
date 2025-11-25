@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
 from typing import Any, List, Optional
+
 import torch
+
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
