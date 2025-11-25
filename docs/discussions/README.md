@@ -14,6 +14,12 @@ This directory contains in-depth guides, tutorials, and discussions about optimi
   
   A detailed guide on how to reproduce the DeepSeek-V3 pre-training performance on GB200, incluing the dockerfile, package requirements and training scripts.
 
+### Training Guides
+
+- **[Megatron-FSDP User Guide](megatron-fsdp-user-guide/megatron-fsdp-user-guide.md)**
+
+  A practical guide to enable Megatron-FSDP training, including a quick-start example for DeepSeek-V3, required and recommended configurations, and instructions for checkpoint conversion from torch_dist to fsdp_dtensor.
+
 ## Contributing
 
 If you'd like to contribute a guide or tutorial, please follow this structure:
