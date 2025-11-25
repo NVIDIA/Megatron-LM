@@ -21,8 +21,6 @@ from megatron.core import parallel_state as mpu
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.model_parallel_config import ModelParallelConfig
-from mcore_reshard import reshard_with_general_planner, build_centralized_reshard_plan
-from mcore_reshard.reshard_planner import _extract_param_metadata, _detect_expert_index_from_param_name, _build_descriptors_for_param, _plan_multi_dim_lcm, _plan_dp_recv
 from typing import Tuple, Optional
 
 

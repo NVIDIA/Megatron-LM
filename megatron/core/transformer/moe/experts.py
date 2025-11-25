@@ -21,7 +21,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -34,7 +33,10 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
-from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
+from megatron.core.transformer.moe.moe_utils import (
+    ProcessGroupCollection,
+    get_align_size_for_quantization,
+)
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -134,8 +136,10 @@ class GroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
-        if self.activation_recompute and self.config.fp8:
-            raise ValueError("moe_act recompute for fp8 cannot work with the legacy GroupedMLP.")
+        if self.activation_recompute and (self.config.fp8 or self.config.fp4):
+            raise ValueError(
+                "moe_act recompute for fp8 or fp4 cannot work with the legacy GroupedMLP."
+            )
 
         @jit_fuser
         def activation_func_with_probs(x, probs):
@@ -809,15 +813,15 @@ class TEGroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
-        if self.activation_recompute and self.config.fp8:
+        if self.activation_recompute and (self.config.fp8 or self.config.fp4):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc2)
 
-        if self.config.fp8:
-            assert HAVE_TE, "FP8 requires TE."
-            self.fp8_padding = Fp8Padding(self.num_local_experts)
-            self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+        if self.config.fp8 or self.config.fp4:
+            assert HAVE_TE, "FP8 and FP4 requires TE."
+            self.quantization_padding = Fp8Padding(self.num_local_experts)
+            self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
@@ -857,12 +861,12 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert = tokens_per_expert.tolist()
-        if self.config.fp8:
+        if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
-            permuted_local_hidden_states, tokens_per_expert = self.fp8_padding(
+            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
-            permuted_probs, _ = self.fp8_padding(
+            permuted_probs, _ = self.quantization_padding(
                 permuted_probs.unsqueeze(-1), actual_tokens_per_expert
             )
         else:
@@ -954,8 +958,8 @@ class TEGroupedMLP(MegatronModule):
             output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
 
         # upad and concat the output
-        if self.config.fp8:
-            output = self.fp8_unpadding(output, actual_tokens_per_expert)
+        if self.config.fp8 or self.config.fp4:
+            output = self.quantization_unpadding(output, actual_tokens_per_expert)
 
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
         output_bias = None
@@ -1051,10 +1055,10 @@ class SequentialMLP(MegatronModule):
             )
             self.local_experts.append(expert)
 
-    def _pad_tensor_for_fp8(self, hidden, probs):
+    def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
         actual_num_tokens = hidden.shape[0]
-        divisor = get_fp8_align_size(self.config.fp8_recipe)
+        divisor = get_align_size_for_quantization(self.config)
         padded_num_tokens = ceil(actual_num_tokens / divisor) * divisor - actual_num_tokens
         if padded_num_tokens > 0:
             pad_tensor = torch.zeros(
@@ -1086,8 +1090,8 @@ class SequentialMLP(MegatronModule):
             permuted_probs = torch.ones_like(permuted_probs)
 
         if self.num_local_experts == 1:
-            if self.config.fp8:
-                hidden, probs = self._pad_tensor_for_fp8(
+            if self.config.fp8 or self.config.fp4:
+                hidden, probs = self._pad_tensor_for_quantization(
                     permuted_local_hidden_states, permuted_probs
                 )
                 output, output_bias = self.local_experts[0](hidden, probs)
@@ -1106,8 +1110,8 @@ class SequentialMLP(MegatronModule):
             output_local_list = []
 
             for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
-                if self.config.fp8:
-                    hidden, probs = self._pad_tensor_for_fp8(tokens, probs)
+                if self.config.fp8 or self.config.fp4:
+                    hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
                     output, output_bias = expert(hidden, probs)
                     output = output[: tokens.shape[0]]
                 else:

@@ -77,6 +77,17 @@ class BlendedMegatronDatasetConfig:
        datasets(s).
     """
 
+    allow_ambiguous_pad_tokens: Optional[bool] = False
+    """Whether to prevent pad tokens already present in the dataset from being masked out
+       when the pad token incorrectly shares the same id with other special tokens.
+       Treating such tokens as pad tokens results in training instability and divergence.
+       Such a scenario is best resolved by fixing the tokenizer, but leaving this option as False
+       provides a workaround.
+       This argument will have no effect if the tokenizer is correct. However, should the user
+       desire to train on a dataset that intentionally contains pad tokens - while also using an
+       incorrect tokenizer - this option may be set to True. This is typically not recommended.
+    """
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         if self.blend_per_split is not None and any(self.blend_per_split):
