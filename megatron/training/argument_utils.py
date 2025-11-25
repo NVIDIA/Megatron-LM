@@ -142,7 +142,7 @@ class ArgumentGroupFactory:
         argparse_kwargs = {}
         argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)]
         argparse_kwargs["dest"] = attribute.name
-        argparse_kwargs["help"] = self.field_docstrings[attribute.name]
+        argparse_kwargs["help"] = self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else ""
 
         # dataclasses specifies that both should not be set
         if isinstance(attribute.default, type(dataclasses.MISSING)):
@@ -196,7 +196,7 @@ class ArgumentGroupFactory:
         """
         arg_group = parser.add_argument_group(title=title, description=self.src_cfg_class.__doc__)
         for attr in fields(self.src_cfg_class):
-            if attr.name in self.exclude:
+            if attr.name in self.exclude or attr.init is False:
                 continue
 
             add_arg_kwargs = self._build_argparse_kwargs_from_field(attr)
