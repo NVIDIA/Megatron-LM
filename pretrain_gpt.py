@@ -46,7 +46,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -54,9 +54,10 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
         )
 
-    cu_seqlens = batch.pop('cu_seqlens')
-    max_seqlen = batch.pop('max_seqlen')
-    local_cp_size = batch.pop('local_cp_size')
+    cu_seqlens = batch.pop('cu_seqlens', None)
+    cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
+    max_seqlen = batch.pop('max_seqlen', None)
+    local_cp_size = batch.pop('local_cp_size', None)
     if local_cp_size is not None:
         local_cp_size = int(local_cp_size.item())
 
@@ -65,9 +66,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
     elif local_cp_size is None:  # Packed THD format
-        cu_seqlens = cu_seqlens[0]
         assert max_seqlen.dim() == 1
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, max_seqlen)
+        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
     
