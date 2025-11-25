@@ -250,6 +250,12 @@ class RerunStateMachine:
         return self.mode
 
     def _reduce_any(self, value: bool) -> bool:
+        """
+        All-reduce a boolean value across the world group.
+
+        If any of the ranks have a True value, return True.
+        If all the ranks have a False value, return False.
+        """
         val_tensor: torch.Tensor = torch.tensor([value], dtype=torch.int32, device='cuda')
         torch.distributed.all_reduce(val_tensor)
         return val_tensor.item() > 0
