@@ -87,46 +87,76 @@ jobs:
             echo "⏭️ Skipping ${{ matrix.workflow }} (not enabled)"
           fi
       
-      - name: Trigger and monitor ${{ matrix.workflow }}
+      - name: Trigger ${{ matrix.workflow }}
         if: steps.should_run.outputs.run == 'true'
-        id: trigger_and_wait
-        uses: convictional/trigger-workflow-and-wait@v1.6.5
-        continue-on-error: true
-        with:
-          owner: NVIDIA-NeMo
-          repo: Megatron-Bridge
-          github_token: ${{ secrets.PAT }}
-          workflow_file_name: ${{ matrix.workflow }}
-          ref: ${{ inputs.mbridge_ref }}
-          client_payload: '{"mcore_commit":"${{ needs.get-mcore-info.outputs.sha }}","mcore_branch":"${{ needs.get-mcore-info.outputs.branch }}","test_suite":"${{ inputs.test_suite }}","triggered_by":"mcore-ci"}'
-          wait_interval: 300
-          propagate_failure: false
-      
-      - name: Log trigger summary
-        if: steps.should_run.outputs.run == 'true'
+        id: trigger
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
+          echo "🚀 Triggering ${{ matrix.workflow }} | MCore: ${{ needs.get-mcore-info.outputs.short_sha }} | MBridge: ${{ inputs.mbridge_ref }}"
+          
+          gh workflow run ${{ matrix.workflow }} \
+            --repo NVIDIA-NeMo/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
+            --field mcore_commit=${{ needs.get-mcore-info.outputs.sha }} \
+            --field mcore_branch=${{ needs.get-mcore-info.outputs.branch }} \
+            --field test_suite=${{ inputs.test_suite }} \
+            --field triggered_by=mcore-ci
+      
+      - name: Get run ID
+        if: steps.should_run.outputs.run == 'true'
+        id: get_run_id
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          sleep 10  # Wait for run to appear
+          RUN_ID=$(gh run list \
+            --repo NVIDIA-NeMo/Megatron-Bridge \
+            --workflow=${{ matrix.workflow }} \
+            --limit 5 \
+            --json databaseId,createdAt \
+            --jq "sort_by(.createdAt) | reverse | .[0] | .databaseId")
+          
+          echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
+          echo "📋 Run ID: ${RUN_ID}"
+          
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🔄 ${{ matrix.name }} Triggered
           
           **MCore:** \`${{ needs.get-mcore-info.outputs.short_sha }}\` | **MBridge:** \`${{ inputs.mbridge_ref }}\` | **Suite:** \`${{ inputs.test_suite }}\`
           
-          - 🔄 [${{ matrix.workflow }}](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${{ steps.trigger_and_wait.outputs.workflow_id }}) - Monitoring...
-          - ⏳ Polling every 5 minutes until completion or GHA timeout
+          - 🔄 [${{ matrix.workflow }}](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID}) - Running...
+          - ⏳ Monitoring every 5 minutes until completion
           
-          > **Note:** If tests exceed GitHub Actions' timeout, monitoring stops gracefully.
+          > **Note:** Tests run without approval when triggered from MCore
           EOF
-
+      
+      - name: Monitor workflow
+        if: steps.should_run.outputs.run == 'true'
+        id: monitor
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          RUN_ID="${{ steps.get_run_id.outputs.run_id }}"
+          echo "📊 Monitoring ${{ matrix.workflow }} (Run ID: ${RUN_ID})"
+          
+          gh run watch ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --exit-status
+          
+          CONCLUSION=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion --jq -r .conclusion)
+          echo "workflow_status=${CONCLUSION}" >> $GITHUB_ENV
+          echo "✅ Completed: ${CONCLUSION}"
+      
       - name: Report results
         if: always() && steps.should_run.outputs.run == 'true'
         run: |
-          CONCLUSION="${{ steps.trigger_and_wait.outputs.conclusion || 'unknown' }}"
-          RUN_ID="${{ steps.trigger_and_wait.outputs.workflow_id }}"
+          CONCLUSION="${{ env.workflow_status || 'unknown' }}"
+          RUN_ID="${{ steps.get_run_id.outputs.run_id }}"
           
           case "$CONCLUSION" in
             "success") ICON="✅"; MSG="passed" ;;
-            "failure") ICON="❌"; MSG="failed - check link above"; EXIT_CODE=1 ;;
+            "failure") ICON="❌"; MSG="failed"; EXIT_CODE=1 ;;
             "cancelled") ICON="🚫"; MSG="cancelled"; EXIT_CODE=0 ;;
-            *) ICON="⏳"; MSG="still running or monitoring timed out"; EXIT_CODE=0 ;;
+            *) ICON="⏳"; MSG="still running or timed out"; EXIT_CODE=0 ;;
           esac
           
           cat >> $GITHUB_STEP_SUMMARY << EOF
@@ -138,8 +168,9 @@ jobs:
           [View full results →](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID})
           
           ---
-          *Triggered from MCore commit \`${{ needs.get-mcore-info.outputs.short_sha }}\`*
+          *Triggered from MCore \`${{ needs.get-mcore-info.outputs.short_sha }}\`*
           EOF
           
           echo "${ICON} ${{ matrix.name }} ${MSG}"
           exit ${EXIT_CODE:-0}
+
