@@ -27,6 +27,109 @@ except ImportError:
     hadamard_transform = None
 
 
+class IndexerLossLoggingHelper:
+    """Helper class for logging sparse attention indexer losses."""
+
+    tracker = {}
+
+    @staticmethod
+    def save_loss_to_tracker(
+        loss: torch.Tensor,
+        layer_number: int,
+        num_layers: int,
+        reduce_group: torch.distributed.ProcessGroup = None,
+        avg_group: torch.distributed.ProcessGroup = None,
+    ):
+        """Save the indexer loss for logging.
+
+        Args:
+            loss: The loss tensor.
+            layer_number: Layer index of the loss, 1-indexed.
+            num_layers: The number of total layers.
+            reduce_group: The group for reducing the loss.
+            avg_group: The group for averaging the loss.
+        """
+        # Skip indexer loss logging if layer_number is None.
+        if layer_number is None:
+            return
+
+        tracker = IndexerLossLoggingHelper.tracker
+        if "values" not in tracker:
+            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        tracker["values"][layer_number - 1] += loss.detach()
+        tracker["reduce_group"] = reduce_group
+        tracker["avg_group"] = avg_group
+
+    @staticmethod
+    def clean_loss_in_tracker():
+        """Clear the indexer losses."""
+        tracker = IndexerLossLoggingHelper.tracker
+        if "values" in tracker:
+            tracker["values"].zero_()
+        tracker["reduce_group"] = None
+        tracker["avg_group"] = None
+
+    @staticmethod
+    def reduce_loss_in_tracker():
+        """Collect and reduce the indexer losses across ranks."""
+        tracker = IndexerLossLoggingHelper.tracker
+        if "values" not in tracker:
+            return
+        values = tracker["values"]
+        # Reduce indexer losses across ranks.
+        if tracker.get('reduce_group') is not None:
+            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+        if tracker.get('avg_group') is not None:
+            torch.distributed.all_reduce(
+                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+            )
+
+    @staticmethod
+    def track_indexer_metrics(
+        loss_scale: float,
+        iteration: int,
+        writer,
+        wandb_writer=None,
+        total_loss_dict=None,
+        per_layer_logging: bool = False,
+    ):
+        """Track the sparse attention indexer metrics for logging.
+
+        Args:
+            loss_scale: Scale factor for the loss.
+            iteration: Current training iteration.
+            writer: TensorBoard writer.
+            wandb_writer: Weights & Biases writer.
+            total_loss_dict: Dictionary to accumulate total losses.
+            per_layer_logging: Whether to log per-layer losses.
+        """
+        IndexerLossLoggingHelper.reduce_loss_in_tracker()
+        tracker = IndexerLossLoggingHelper.tracker
+        if "values" not in tracker:
+            return
+
+        indexer_loss_values = tracker["values"] * loss_scale
+        num_layers = indexer_loss_values.shape[0]
+
+        # Average across all layers (assuming all layers have sparse attention)
+        avg_indexer_loss = indexer_loss_values.sum() / num_layers
+
+        # Log average loss
+        if total_loss_dict is not None:
+            if "indexer loss" in total_loss_dict:
+                total_loss_dict["indexer loss"] += avg_indexer_loss
+            else:
+                total_loss_dict["indexer loss"] = avg_indexer_loss
+
+        if writer is not None:
+            writer.add_scalar("indexer loss", avg_indexer_loss, iteration)
+
+        if wandb_writer is not None:
+            wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
+
+        IndexerLossLoggingHelper.clean_loss_in_tracker()
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
     Reference:
@@ -620,6 +723,9 @@ class SparseAttention(MegatronModule):
             self.config.context_parallel_size == 1
         ), "Currently context parallelism is not supported by SparseAttention!"
 
+        self.layer_number = layer_number
+        self.pg_collection = pg_collection
+
         self.indexer = build_module(
             submodules.indexer, config=self.config, pg_collection=pg_collection
         )
@@ -708,17 +814,26 @@ class SparseAttention(MegatronModule):
         # ===================================
         if self.training and torch.is_grad_enabled():
             # Compute KL divergence loss between indexer scores and true attention scores
+            indexer_loss_coeff = getattr(self.config, 'indexer_loss_coeff', 0.0)
             indexer_loss = compute_indexer_loss(
                 index_scores,
                 topk_indices,
                 query.detach(),
                 key.detach(),
                 self.softmax_scale,
-                getattr(self.config, 'indexer_loss_coeff', 0.0),
+                indexer_loss_coeff,
                 getattr(self.config, "use_sparse_indexer_loss", False),
                 self.indexer.pg_collection,
             )
-            # Attach loss to output output
+            # Save indexer loss for logging
+            if indexer_loss_coeff > 0:
+                IndexerLossLoggingHelper.save_loss_to_tracker(
+                    loss=indexer_loss,
+                    layer_number=self.layer_number,
+                    num_layers=self.config.num_layers,
+                    avg_group=self.pg_collection.dp_cp,
+                )
+            # Attach loss to output
             output = IndexerLossAutoScaler.apply(output, indexer_loss)
 
         return output
