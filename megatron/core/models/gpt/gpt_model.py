@@ -166,25 +166,6 @@ class GPTModel(LanguageModule):
             )
 
         elif self.position_embedding_type == 'yarn':
-            from megatron.training import get_args, print_rank_0
-
-            args = get_args()
-
-            # Handle GPT-OSS mode with YaRN RoPE configuration
-            if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:
-                print_rank_0("GPT-OSS mode enabled: Configuring YaRN RoPE parameters")
-
-                # Set GPT-OSS YaRN values directly on the config
-                # These defaults are based on Huggingface GPT-OSS configurations
-                config.position_embedding_type = "yarn"
-                config.yarn_rotary_scaling_factor = 32.0
-                config.yarn_original_max_position_embeddings = 131072
-                config.yarn_beta_fast = 32.0
-                config.yarn_beta_slow = 1.0
-                config.yarn_mscale = 1.0
-                config.yarn_mscale_all_dim = 0.0
-                config.yarn_correction_range_round_to_int = False
-
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
