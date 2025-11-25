@@ -773,8 +773,13 @@ class TestTextGenerationController:
             # Decode mode: logits for last tokens only
             logits = torch.randn(1, batch_size, self.vocab_size).cuda()
 
+            # Set up context state for decode mode
+            context.paused_request_count = 0
+            context.total_request_count = batch_size
+
             # Compute log probabilities (required by _dynamic_step_calculate_top_n_logprobs)
-            log_probs_tensor = torch.nn.functional.log_softmax(logits, dim=-1)
+            # Note: squeeze(0) to match what calculate_log_probs does in dynamic_context.py
+            log_probs_tensor = torch.nn.functional.log_softmax(logits.squeeze(0), dim=-1)
 
             # Calculate top-n logprobs
             top_n_results = self.text_generation_controller._dynamic_step_calculate_top_n_logprobs(
@@ -817,7 +822,8 @@ class TestTextGenerationController:
             logits = torch.randn(1, total_tokens, self.vocab_size).cuda()
 
             # Compute log probabilities (required by _dynamic_step_calculate_top_n_logprobs)
-            log_probs_tensor = torch.nn.functional.log_softmax(logits, dim=-1)
+            # Note: squeeze(0) to match what calculate_log_probs does in dynamic_context.py
+            log_probs_tensor = torch.nn.functional.log_softmax(logits.squeeze(0), dim=-1)
 
             # Calculate top-n logprobs
             top_n_results = self.text_generation_controller._dynamic_step_calculate_top_n_logprobs(
