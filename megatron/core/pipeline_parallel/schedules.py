@@ -1437,8 +1437,8 @@ def forward_backward_pipelining_with_interleaving(
     print (f'{torch.distributed.get_rank()}: forward_backward_pipelining_with_interleaving num_warmup_microbatches {num_warmup_microbatches} num_microbatches_1f1b {num_microbatches_remaining} total_num_microbatches {total_num_microbatches}')
     for k in range(num_warmup_microbatches):
         cur_model_chunk_id = get_model_chunk_id(k, forward=True)
-        if torch.distributed.get_rank() in [0, 2]:
-            print(f'{pipeline_parallel_rank}: +++++ warmup iteration {k}, fwd_model_chunk_id {model_chunk_ids[pipeline_parallel_rank][cur_model_chunk_id]}')
+        # if torch.distributed.get_rank() in [0, 2]:
+        #     print(f'{pipeline_parallel_rank}: +++++ warmup iteration {k}, fwd_model_chunk_id {model_chunk_ids[pipeline_parallel_rank][cur_model_chunk_id]}')
         if config.overlap_p2p_comm_warmup_flush:
             if (
                 not (
@@ -1610,8 +1610,8 @@ def forward_backward_pipelining_with_interleaving(
         if config.overlap_p2p_comm:
 
             backward_k = k
-            if torch.distributed.get_rank() in [0, 2]:
-                print(f'{pipeline_parallel_rank}: +++++ steady iteration forward_k {forward_k} fwd_model_chunk_id {model_chunk_ids[pipeline_parallel_rank][cur_model_chunk_id]}, backward_k {backward_k} bwd_model_chunk_id {-model_chunk_ids[pipeline_parallel_rank][get_model_chunk_id(backward_k, forward=False)]}')
+            # if torch.distributed.get_rank() in [0, 2]:
+            #     print(f'{pipeline_parallel_rank}: +++++ steady iteration forward_k {forward_k} fwd_model_chunk_id {model_chunk_ids[pipeline_parallel_rank][cur_model_chunk_id]}, backward_k {backward_k} bwd_model_chunk_id {-model_chunk_ids[pipeline_parallel_rank][get_model_chunk_id(backward_k, forward=False)]}')
 
             # Sync forward recv
             def pp_pre_forward(vp_stage=None):
@@ -1830,8 +1830,8 @@ def forward_backward_pipelining_with_interleaving(
             )
         for k in range(num_microbatches_remaining, total_num_microbatches):
             cur_model_chunk_id = get_model_chunk_id(k, forward=False)
-            if torch.distributed.get_rank() in [0, 2]:
-                print(f'{pipeline_parallel_rank}: cooldown iteration k {k} bwd_model_chunk_id {-model_chunk_ids[pipeline_parallel_rank][cur_model_chunk_id]}')
+            # if torch.distributed.get_rank() in [0, 2]:
+            #     print(f'{pipeline_parallel_rank}: cooldown iteration k {k} bwd_model_chunk_id {-model_chunk_ids[pipeline_parallel_rank][cur_model_chunk_id]}')
             if (
                 not (_is_vp_last_stage(vp_stage=cur_model_chunk_id) and is_pp_last_stage(pp_group))
                 and k != 0
