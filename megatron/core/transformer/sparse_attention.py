@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from megatron.core.fusions.fused_sparse_attention import FusedSparseAttention
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -20,7 +21,6 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-# TODO(kunlunl): Add third-party fused kernels.
 try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
@@ -49,7 +49,9 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 def compute_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
-    attention_scores: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    softmax_scale: float,
     indexer_loss_coeff: float,
     use_sparse_indexer_loss: bool,
     pg_collection: ProcessGroupCollection,
@@ -66,7 +68,9 @@ def compute_indexer_loss(
     Args:
         index_scores: Scores predicted by indexer [batch, seqlen_q, seqlen_k].
         topk_indices: Top-k indices [batch, seqlen_q, index_topk].
-        attention_scores: True attention scores from q @ k^T [batch, heads, seqlen_q, seqlen_k].
+        query: Query tensor [seqlen_q, batch, heads, dim].
+        key: Key tensor [seqlen_k, batch, heads, dim].
+        softmax_scale: Scale coefficient after q @ k^T.
         indexer_loss_coeff: Coefficient for the indexer KL divergence loss.
         use_sparse_indexer_loss: bool, whether to use sparse indexer loss. If True, only the topk
             indices will be used to compute the loss.
@@ -75,6 +79,28 @@ def compute_indexer_loss(
     Returns:
         index_loss: KL divergence loss (scalar).
     """
+    sq, b, np, hn = query.size()
+    sk = key.size(0)
+
+    # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
+    query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
+    # [sk, b, np, hn] -> [b, np, hn, sk] -> [b * np, hn, sk]
+    key = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
+    # Compute attention scores [b * np, sq, sk]
+    attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
+    # Reshape to [b, np, sq, sk]
+    attention_scores = attention_scores.reshape(b, np, sq, sk)
+
+    # causal_mask [sq, sk]
+    causal_mask = torch.triu(
+        torch.full((sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device),
+        diagonal=1,
+    )
+    # [b, np, sq, skv] + [1, 1, sq, skv] -> [b, np, sq, skv]
+    attention_scores += causal_mask.view(1, 1, sq, sk)
+    # [b, np, sq, sk] -> [b, np, sq, sk]
+    attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+
     # Sum attention scores across heads.
     # [batch, heads, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
     target_scores = attention_scores.sum(dim=1)
@@ -489,6 +515,83 @@ class Indexer(MegatronModule):
         return topk_indices
 
 
+def unfused_sparse_attention_fn(query, key, value, topk_indices, softmax_scale):
+    """
+    Unfused sparse attention implementation.
+    """
+    sq, b, np, hn = query.size()
+    skv = key.size(0)
+    hnv = value.size(3)
+
+    # ===================================
+    # Raw attention scores [b, np, sq, skv]
+    # ===================================
+    # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
+    query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
+    # [skv, b, np, hn] -> [b, np, hn, skv] -> [b * np, hn, skv]
+    key = key.permute(1, 2, 3, 0).reshape(b * np, hn, skv)
+    # Compute attention scores [b * np, sq, skv]
+    attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
+    # Reshape to [b, np, sq, skv]
+    attention_scores = attention_scores.reshape(b, np, sq, skv)
+
+    # ===================================
+    # Apply sparse mask from indexer
+    # ===================================
+    # index_mask [b, sq, skv]
+    index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
+    index_mask.scatter_(-1, topk_indices, 0)
+    # causal_mask [sq, skv]
+    causal_mask = torch.triu(
+        torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=index_mask.device),
+        diagonal=1,
+    )
+    # [b, sq, skv] + [1, sq, skv] -> [b, sq, skv]
+    index_mask += causal_mask.view(1, sq, skv)
+    # [b, np, sq, skv] + [b, 1, sq, skv] -> [b, np, sq, skv]
+    attention_scores += index_mask.unsqueeze(1)
+    attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+
+    # ===================================
+    # Output
+    # ===================================
+    # [skv, b, np, hnv] -> [b, np, skv, hnv] -> [b * np, skv, hnv]
+    value = value.permute(1, 2, 0, 3).reshape(b * np, skv, hnv)
+    # Reshape attention_scores: [b, np, sq, skv] -> [b * np, sq, skv]
+    attention_scores = attention_scores.reshape(b * np, sq, skv)
+    # Compute output: [b * np, sq, hnv]
+    output = torch.bmm(attention_scores.to(value.dtype), value)
+    # Reshape output: [b * np, sq, hnv] -> [b, np, sq, hnv] -> [sq, b, np, hnv]
+    output = output.reshape(b, np, sq, hnv).permute(2, 0, 1, 3).contiguous()
+    # Flatten: [sq, b, np, hnv] -> [sq, b, np * hnv]
+    output = output.reshape(sq, b, np * hnv)
+    return output
+
+
+def fused_sparse_attention_fn(query, key, value, topk_indices, softmax_scale):
+    """
+    Fused sparse attention implementation.
+    """
+    sq, b, np, _ = query.size()
+    skv = key.size(0)
+    hnv = value.size(3)
+    # [sq, b, ...] -> [b, sq, ...]
+    query = query.transpose(0, 1).contiguous()
+    # [skv, b, ...] -> [b, skv, ...]
+    key = key.transpose(0, 1).contiguous()
+    # [skv, b, ...] -> [b, skv, ...]
+    value = value.transpose(0, 1).contiguous()
+    # [b, s, index_topk] -> [b, s, head, index_topk]
+    topk_indices = topk_indices.unsqueeze(2).repeat(1, 1, np, 1)
+    # output [sq, b, np, hnv]
+    output = FusedSparseAttention.apply(query, key, value, topk_indices, hnv, softmax_scale)
+    # [b, sq, np, hnv] -> [s, b, np, hnv]
+    output = output.transpose(0, 1).contiguous()
+    # [sq, b, np, hnv] -> [sq, b, np * hnv]
+    output = output.view(sq, b, np * hnv)
+    return output
+
+
 class SparseAttention(MegatronModule):
     """
     This module implements sparse attention mechanism using an Indexer to compute top-k attention
@@ -569,6 +672,7 @@ class SparseAttention(MegatronModule):
             assert attn_mask_type == AttnMaskType.causal, 'Only causal mask is supported for now'
             # Generate upper triangular mask with -inf above diagonal, 0 elsewhere
             # torch.triu with diagonal=1 creates upper triangular matrix (excluding main diagonal)
+            # float_mask [sq, skv]
             float_mask = torch.triu(
                 torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=x.device),
                 diagonal=1,
@@ -590,45 +694,14 @@ class SparseAttention(MegatronModule):
         )
 
         # ===================================
-        # Raw attention scores [b, np, sq, skv]
+        # Run sparse attention kernel
         # ===================================
-        # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
-        query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
-        # [skv, b, np, hn] -> [b, np, hn, skv] -> [b * np, hn, skv]
-        key = key.permute(1, 2, 3, 0).reshape(b * np, hn, skv)
-        # Compute attention scores [b * np, sq, skv]
-        attention_scores = torch.bmm(query.float(), key.float()) * self.softmax_scale
-        # Reshape to [b, np, sq, skv]
-        attention_scores = attention_scores.reshape(b, np, sq, skv)
-
-        # ===================================
-        # Apply sparse mask from indexer
-        # ===================================
-        # index_mask [b, sq, skv]
-        index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
-        index_mask.scatter_(-1, topk_indices, 0)
-        index_mask += float_mask
-        # [b, np, sq, skv] + [b, 1, sq, skv] -> [b, np, sq, skv]
-        attention_scores += index_mask.unsqueeze(1)
-
-        # ===================================
-        # Attention probabilities [b, np, sq, skv]
-        # ===================================
-        attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
-
-        # ===================================
-        # Output
-        # ===================================
-        # [skv, b, np, hnv] -> [b, np, skv, hnv] -> [b * np, skv, hnv]
-        value = value.permute(1, 2, 0, 3).reshape(b * np, skv, hnv)
-        # Reshape attention_probs: [b, np, sq, skv] -> [b * np, sq, skv]
-        attention_probs_reshaped = attention_probs.reshape(b * np, sq, skv)
-        # Compute output: [b * np, sq, hnv]
-        output = torch.bmm(attention_probs_reshaped.to(value.dtype), value)
-        # Reshape output: [b * np, sq, hnv] -> [b, np, sq, hnv] -> [sq, b, np, hnv]
-        output = output.reshape(b, np, sq, hnv).permute(2, 0, 1, 3).contiguous()
-        # Flatten: [sq, b, np, hnv] -> [sq, b, np * hnv]
-        output = output.reshape(sq, b, np * hnv)
+        if getattr(self.config, "use_fused_sparse_attention", False):
+            output = fused_sparse_attention_fn(query, key, value, topk_indices, self.softmax_scale)
+        else:
+            output = unfused_sparse_attention_fn(
+                query, key, value, topk_indices, self.softmax_scale
+            )
 
         # ===================================
         # Attach indexer loss
@@ -638,7 +711,9 @@ class SparseAttention(MegatronModule):
             indexer_loss = compute_indexer_loss(
                 index_scores,
                 topk_indices,
-                attention_probs.detach(),
+                query.detach(),
+                key.detach(),
+                self.softmax_scale,
                 getattr(self.config, 'indexer_loss_coeff', 0.0),
                 getattr(self.config, "use_sparse_indexer_loss", False),
                 self.indexer.pg_collection,

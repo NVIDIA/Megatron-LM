@@ -241,6 +241,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
+    use_fused_sparse_attention: Optional[bool] = None
+    """Whether to use fused sparse attention implementation."""
+
     ####################
     # linear attention
     ####################

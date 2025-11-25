@@ -82,19 +82,22 @@ class TestComputeIndexerLoss:
         batch_size = 2
         seqlen = 16
         num_heads = 4
+        head_dim = 128
         index_topk = 8
 
         # Create dummy tensors
         index_scores = torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32).cuda()
         topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, index_topk)).cuda()
-        attention_scores = torch.softmax(
-            torch.randn(batch_size, num_heads, seqlen, seqlen, dtype=torch.float32).cuda(), dim=-1
-        )
+        query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+        key = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+        softmax_scale = head_dim**-0.5
 
         loss = compute_indexer_loss(
             index_scores=index_scores,
             topk_indices=topk_indices,
-            attention_scores=attention_scores,
+            query=query,
+            key=key,
+            softmax_scale=softmax_scale,
             indexer_loss_coeff=1.0,
             use_sparse_indexer_loss=False,
             pg_collection=self.pg_collection,
@@ -110,19 +113,22 @@ class TestComputeIndexerLoss:
         batch_size = 2
         seqlen = 16
         num_heads = 4
+        head_dim = 128
         index_topk = 8
 
         # Create dummy tensors
         index_scores = torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32).cuda()
         topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, index_topk)).cuda()
-        attention_scores = torch.softmax(
-            torch.randn(batch_size, num_heads, seqlen, seqlen, dtype=torch.float32).cuda(), dim=-1
-        )
+        query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+        key = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+        softmax_scale = head_dim**-0.5
 
         loss_sparse = compute_indexer_loss(
             index_scores=index_scores,
             topk_indices=topk_indices,
-            attention_scores=attention_scores,
+            query=query,
+            key=key,
+            softmax_scale=softmax_scale,
             indexer_loss_coeff=1.0,
             use_sparse_indexer_loss=True,
             pg_collection=self.pg_collection,
@@ -131,7 +137,9 @@ class TestComputeIndexerLoss:
         loss_dense = compute_indexer_loss(
             index_scores=index_scores,
             topk_indices=topk_indices,
-            attention_scores=attention_scores,
+            query=query,
+            key=key,
+            softmax_scale=softmax_scale,
             indexer_loss_coeff=1.0,
             use_sparse_indexer_loss=False,
             pg_collection=self.pg_collection,
@@ -909,7 +917,7 @@ class TestSparseAttentionTensorParallel:
         model_parallel_cuda_manual_seed(123)
 
         config_tp1 = self._create_config(
-            sequence_parallel=False, use_sparse_indexer_loss=False
+            sequence_parallel=False, use_sparse_indexer_loss=use_sparse_indexer_loss
         )  # TP=1 doesn't use SP
         pg_collection_tp1 = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         sparse_attention_tp1 = self._create_sparse_attention(config_tp1, pg_collection_tp1).cuda()
@@ -1053,8 +1061,7 @@ class TestSparseAttentionTensorParallel:
             output_tpn_gathered.detach(), output_tp1.detach(), rtol=0, atol=0
         ), f"Sparse attention outputs mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}, sparse_loss={use_sparse_indexer_loss}"
 
-        # Compare gradients
-        # 1. Indexer gradients should be identical
+        # 1. Check indexer gradients.
         for name, param in sparse_attention_tpn.indexer.named_parameters():
             if param.grad is not None and name in indexer_tp1_grads:
                 torch.testing.assert_close(

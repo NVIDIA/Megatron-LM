@@ -3281,6 +3281,8 @@ def _add_sparse_attention_args(parser):
                        help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
     group.add_argument('--use-sparse-indexer-loss', action='store_true',
                        help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
+    group.add_argument('--use-fused-sparse-attention', action='store_true',
+                       help='Use fused sparse attention. If set, the sparse attention will be computed using the fused sparse attention kernel.')
     return parser
 
 def _add_linear_attention_args(parser):
