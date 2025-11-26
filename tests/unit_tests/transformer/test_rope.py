@@ -2,6 +2,8 @@
 
 import pytest
 import torch
+from packaging.version import Version as PkgVersion
+from pytest_mock import mocker
 
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
@@ -10,6 +12,10 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.extensions.transformer_engine import (
+    fused_apply_rotary_pos_emb,
+    fused_apply_rotary_pos_emb_thd,
+)
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -94,6 +100,30 @@ class TestRotaryEmbedding:
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
 
+    @pytest.mark.internal
+    def test_transformer_engine_version_less_than_2_10(self, mocker):
+        with pytest.raises(Exception) as exc_info:
+            mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("2.9"))
+            t = torch.randn(64, 1, 1, 8)
+            freqs = torch.randn(64, 1, 1, 8)
+            fused_apply_rotary_pos_emb(t, freqs, start_positions=torch.tensor([0, 1, 2, 3]))
+
+        assert str(exc_info.value) == (
+            "Only TE >= 2.10.0.dev0 supports offset RoPE application with "
+            "`start_positions` argument."
+        )
+
+        with pytest.raises(Exception) as exc_info_thd:
+            mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("2.9"))
+            t = torch.randn(64, 1, 8)
+            freqs = torch.randn(64, 1, 1, 8)
+            cu_seqlens = torch.tensor([0, 64])
+            fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, start_positions=torch.tensor([0,]))
+
+        assert str(exc_info_thd.value) == (
+            "Only TE >= 2.10.0.dev0 supports offset RoPE application with "
+            "`start_positions` argument."
+        )
 
 class TestQKVRotaryEmbedding:
     def setup_method(self):
