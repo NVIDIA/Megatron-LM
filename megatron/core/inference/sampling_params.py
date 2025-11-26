@@ -27,8 +27,27 @@ class SamplingParams:
     num_tokens_total: Optional[int] = None  # Cannot set both this and num_tokens_to_generate
     termination_id: Optional[int] = None
     top_n_logprobs: int = 0
-    return_prompt_top_n_logprobs: bool = False
+    skip_prompt_top_n_logprobs: bool = False
+    return_prompt_top_n_logprobs: bool = False  # Deprecated, use skip_prompt_top_n_logprobs instead
     add_BOS: bool = False
+
+    def __post_init__(self):
+        """Ensure backward compatibility between deprecated and new fields.
+
+        Synchronizes return_prompt_top_n_logprobs (deprecated) with skip_prompt_top_n_logprobs.
+        These fields are inverses of each other:
+        - skip_prompt_top_n_logprobs=True means return_prompt_top_n_logprobs=False
+        - skip_prompt_top_n_logprobs=False means return_prompt_top_n_logprobs=True
+        """
+        self._sync_prompt_logprobs_fields()
+
+    def _sync_prompt_logprobs_fields(self):
+        """Synchronize return_prompt_top_n_logprobs with skip_prompt_top_n_logprobs."""
+        if self.top_n_logprobs > 0:
+            self.return_prompt_top_n_logprobs = not self.skip_prompt_top_n_logprobs
+        else:
+            self.skip_prompt_top_n_logprobs = True
+            self.return_prompt_top_n_logprobs = False
 
     def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to sampling params
@@ -43,6 +62,9 @@ class SamplingParams:
         """
         for key, value in attribute_value_pair.items():
             setattr(self, key, value)
+
+        # Synchronize fields after setting attributes
+        self._sync_prompt_logprobs_fields()
 
     def serialize(self) -> dict:
         """Return a dictionary that is msgpack-serializable."""

@@ -1255,14 +1255,14 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("return_prompt_top_n_logprobs", [True, False])
+    @pytest.mark.parametrize("skip_prompt_top_n_logprobs", [True, False])
     @torch.inference_mode()
-    def test_top_n_logprobs_dynamic(self, return_prompt_top_n_logprobs: bool):
+    def test_top_n_logprobs_dynamic(self, skip_prompt_top_n_logprobs: bool):
         """
         Test that top_n_logprobs are computed correctly in dynamic batching mode.
         Verifies:
         1. top_n_logprobs are returned for generated tokens
-        2. return_prompt_top_n_logprobs controls whether prompt top-n logprobs are returned
+        2. skip_prompt_top_n_logprobs controls whether prompt top-n logprobs are skipped
         3. The top-n values are consistent with the selected token's log prob
         """
         # Build test environment with multiple requests of varying lengths
@@ -1285,7 +1285,7 @@ class TestDynamicInferenceEngine:
                 termination_id=test_config.vocab_size - 1,
                 return_log_probs=True,
                 top_n_logprobs=top_n,
-                return_prompt_top_n_logprobs=return_prompt_top_n_logprobs,
+                skip_prompt_top_n_logprobs=skip_prompt_top_n_logprobs,
                 top_k=10,  # Add some sampling randomness
             )
             requests_to_add.append(request)
@@ -1325,8 +1325,8 @@ class TestDynamicInferenceEngine:
                     len(top_n_dict) > 0
                 ), f"Request {request.request_id}, token {i}: empty top-n dict"
 
-            # Validate prompt top-n logprobs based on return_prompt_top_n_logprobs flag
-            if return_prompt_top_n_logprobs:
+            # Validate prompt top-n logprobs based on skip_prompt_top_n_logprobs flag
+            if not skip_prompt_top_n_logprobs:
                 assert hasattr(
                     request, 'prompt_top_n_logprobs'
                 ), f"Request {request.request_id} missing prompt_top_n_logprobs"
@@ -1351,12 +1351,12 @@ class TestDynamicInferenceEngine:
                         len(top_n_dict) > 0
                     ), f"Request {request.request_id}, prompt token {i}: empty top-n dict"
             else:
-                # When return_prompt_top_n_logprobs is False, prompt_top_n_logprobs should be None or empty
+                # When skip_prompt_top_n_logprobs is True, prompt_top_n_logprobs should be None or empty
                 if hasattr(request, 'prompt_top_n_logprobs'):
                     assert (
                         request.prompt_top_n_logprobs is None
                         or len(request.prompt_top_n_logprobs) == 0
-                    ), f"Request {request.request_id}: prompt_top_n_logprobs should be None or empty when return_prompt_top_n_logprobs is False"
+                    ), f"Request {request.request_id}: prompt_top_n_logprobs should be None or empty when skip_prompt_top_n_logprobs is True"
 
             # Validate consistency between log_probs and top_n_logprobs
             if hasattr(request, 'generated_log_probs') and request.generated_log_probs is not None:
