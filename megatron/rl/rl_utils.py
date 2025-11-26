@@ -1453,6 +1453,13 @@ def prepare_data_for_update(
                         bin_idx = current_bins + i
                         packing_info['bin_seq_indices'].append(entry['bin_seq_indices'])
                         packing_info['seq_starts'][bin_idx] = entry['seq_starts']
+                else:
+                    num_empty_bins = 0
+
+                # Sum the total number of empty bins across the ranks
+                empty_bin_count = torch.tensor([num_empty_bins], device='cuda')
+                torch.distributed.all_reduce(empty_bin_count, op=torch.distributed.ReduceOp.SUM)
+                num_empty_bins = empty_bin_count[0].cpu().numpy()
 
                 packing_context['packing_info'] = packing_info
                 packing_context['original_generation_masks'] = generation_masks
@@ -1833,6 +1840,7 @@ def prepare_data_for_update(
                     'num_sequences': len(packing_info['seq_lengths']),
                     'avg_seqs_per_bin': global_avg_seqs_per_bin,
                     'avg_seqs_per_bin_this_rank': actual_seqs_per_bin_this_rank,
+                    'num_empty_bins': num_empty_bins,  # summed across ranks
                 }
 
                 if args.micro_batch_size != 1:

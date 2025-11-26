@@ -129,6 +129,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     """
     args = get_args()
     timers = get_timers()
+    num_empty_bins = 0  # Number of padding bins from the data loader
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
@@ -155,7 +156,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    return output_tensor, partial(loss_func, loss_mask, model=model), num_empty_bins
 
 
 def is_dataset_built_on_rank(vp_stage=None):
