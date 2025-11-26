@@ -20,8 +20,8 @@ on:
     branches:
       - dev
       - main
-      - "pull-request/[0-9]+"
-      - "deploy-release/*"
+      - 'pull-request/[0-9]+'
+      - 'deploy-release/*'
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
@@ -111,7 +111,7 @@ jobs:
         with:
           issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           repository: ${{ github.repository }}
-          body-includes: "<!--external-contributor-comment-->"
+          body-includes: '<!--external-contributor-comment-->'
 
       - name: Delete comment
         uses: actions/github-script@v7
@@ -252,11 +252,9 @@ jobs:
 
       - name: Download test data
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           echo "::group::Download test data"
-          pip install --no-cache-dir pygithub click
+          pip install --no-cache-dir click requests
           python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
           echo "::endgroup::"
 
@@ -366,7 +364,7 @@ jobs:
       - cicd-container-build
       - cicd-parse-unit-tests
     runs-on: nvidia-ci-aws-gpu-x8
-    name: "${{ matrix.bucket }} - latest"
+    name: '${{ matrix.bucket }} - latest'
     if: |
       (
         success()
@@ -388,7 +386,7 @@ jobs:
           test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: "true"
+          is_unit_test: 'true'
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
@@ -478,7 +476,7 @@ jobs:
       - cicd-parse-integration-tests
       - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
-    name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
+    name: '${{ matrix.model }}/${{ matrix.test_case }} - latest'
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
@@ -501,7 +499,7 @@ jobs:
           model: ${{ matrix.model }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: "false"
+          is_unit_test: 'false'
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
