@@ -26,7 +26,7 @@ pipeline {
     }
 
     parameters {
-        string(name: 'TEST_NODE_LABEL', defaultValue: 'MI300X_BANFF', description: 'Node or Label to launch Jenkins Job')
+        string(name: 'TEST_NODE_LABEL', defaultValue: 'linux-mi325-8', description: 'Node or Label to launch Jenkins Job')
         string(name: 'GPU_ARCH', defaultValue: 'gfx942', description: 'GPU Architecture')
     }
 
