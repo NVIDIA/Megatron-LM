@@ -27,9 +27,9 @@ class SamplingParams:
     num_tokens_total: Optional[int] = None  # Cannot set both this and num_tokens_to_generate
     termination_id: Optional[int] = None
     top_n_logprobs: int = 0
-    skip_prompt_top_n_logprobs: bool = False
     return_prompt_top_n_logprobs: bool = False  # Deprecated, use skip_prompt_top_n_logprobs instead
     add_BOS: bool = False
+    skip_prompt_top_n_logprobs: bool = False
 
     def __post_init__(self):
         """Ensure backward compatibility between deprecated and new fields.
