@@ -15,7 +15,7 @@ except ImportError:
     HAVE_TRITON = False
 
 # Packed Moe Expert Offload implementation for pipeline parallelism
-DEBUG = False
+DEBUG = True
 DEBUG_RANK = [0]
 def debug_print(message):
     """Print debug message for a specific rank when DEBUG is enabled."""
@@ -906,7 +906,7 @@ class PP_ScheduleFunction(torch.autograd.Function):
                         packed_tensor._original_tensor = None
 
         if offload_manager.status == 'captured':
-            current_schedule_layer = (ctx.vp_stage+1)*100 + ctx.layer_no*10 + ctx.microbatch_no
+            current_schedule_layer = offload_manager.get_schedule_layer(ctx.vp_stage+1, ctx.layer_no, ctx.microbatch_no)
             next_schedule_layer = ctx.offload_manager._pp_schedule[ctx.offload_manager.current_schedule_index+1]
             if current_schedule_layer != -next_schedule_layer:
                 # Start offload for current layer
@@ -1008,6 +1008,10 @@ class PackedOffloadManager:
         """Set the current layer name."""
         self._current_layer_name = name
 
+    def get_schedule_layer(self, vp_stage, layer_no, microbatch_no):
+        """Get the schedule layer."""
+        return vp_stage*1000000 + layer_no*1000 + microbatch_no
+
     def add_packed_tensor_to_offload(self, packed_tensor):
         """Add a packed tensor to the offload list."""
         if self.status == 'captured':
@@ -1077,7 +1081,7 @@ class PackedOffloadManager:
         """Allocate offload buffers for each vp stage, organized by [vp_stage][dtype][hidden_size]."""
         self.stash_buffers = []
         self.overflow = torch.zeros(1, dtype=torch.int64, device=self.device)
-        
+
         for vp_stage in range(self.vp_size):
             self.stash_buffers.append({})
             for dtype in self.max_tokens_per_vp_stage[vp_stage]:
@@ -1119,12 +1123,12 @@ class PackedOffloadManager:
                 self.current_microbatch[vp_stage-1] += 1
 
         if self.status == 'capture':
-            self._pp_schedule.append(vp_stage*100 + layer_no*10 + microbatch_no)
+            self._pp_schedule.append(self.get_schedule_layer(vp_stage, layer_no, microbatch_no))
             num_tokens = self.num_tokens_tensor.item()
 
         #debug_print(f"------{self.current_schedule_index} len PP_Schedule {len(self._pp_schedule)}")
         #debug_print(f"      {self.status} {self.current_schedule_index} {self._pp_schedule[self.current_schedule_index]} {vp_stage*100 + layer_no*10 + microbatch_no}")
-        assert self._pp_schedule[self.current_schedule_index] == vp_stage*100 + layer_no*10 + microbatch_no, f"schedule {self._pp_schedule[self.current_schedule_index]} != {vp_stage*100 + layer_no*10 + microbatch_no}"
+        assert self._pp_schedule[self.current_schedule_index] == self.get_schedule_layer(vp_stage, layer_no, microbatch_no), f"schedule {self._pp_schedule[self.current_schedule_index]} != {self.get_schedule_layer(vp_stage, layer_no, microbatch_no)}"
         
         
         return layer_no, microbatch_no
