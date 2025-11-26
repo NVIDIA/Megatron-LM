@@ -140,8 +140,10 @@ pipeline {
                     }
                 }
                 always {
-                    // Archive test results
+                    // Publish JUnit results for Jenkins Test Result Analyzer and test trends
                     script {
+                        junit testResults: 'junit_report_*.xml', allowEmptyResults: true
+
                         archiveArtifacts artifacts: 'unified_test_report.csv', allowEmptyArchive: true
                         clean_up_docker_images()
                         clean_workspace()
