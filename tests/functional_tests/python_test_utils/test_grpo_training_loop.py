@@ -38,8 +38,12 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
     if "iteration-time" in output_groundtruth.keys():
 
         # First warmup iteration is excluded from iteration-time statistics.
-        iteration_time_sampled = median([l for l in output_current["iteration-time"]['values'].values()][1:])
-        iteration_time_golden = median([l for l in output_groundtruth["iteration-time"]['values'].values()][1:])
+        iteration_time_sampled = median(
+            [l for l in output_current["iteration-time"]['values'].values()][1:]
+        )
+        iteration_time_golden = median(
+            [l for l in output_groundtruth["iteration-time"]['values'].values()][1:]
+        )
 
         # 10% is empirically observed to be within hardware variance.
         assert (
