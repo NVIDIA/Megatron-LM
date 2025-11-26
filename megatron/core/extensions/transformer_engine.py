@@ -205,10 +205,26 @@ else:
 
 class TENorm:
     """A conditional wrapper to initialize an instance of
-    Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""
+    Transformer-Engine's `LayerNorm` or `RMSNorm` based on input.
 
-    # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
-    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+    Args:
+        config (TransformerConfig): Transformer config.
+
+        hidden_size (int): Transformer hidden dimension.
+
+        eps (float): Epsilon added to denominator, for numerical stability.
+
+        maybe_fuse_quantize (bool): Whether to fuse quantize. This only works when FP8/FP4 is
+                                    enabled, otherwise it's a no-op.
+    """
+
+    def __new__(
+        cls,
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float = 1e-5,
+        maybe_fuse_quantize: bool = False,
+    ):
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -236,6 +252,18 @@ class TENorm:
             )
         else:
             raise Exception("Only LayerNorm and RMSNorm are curently supported")
+
+        # Ideally, we should use `LayerNormLinear` if we want to fuse normalization and
+        # quantization. But there're some exceptions, e.g., in MLA, we're using separate
+        # input layernorm and `Linear` layers. So we provide this option to allow users to
+        # fuse quantization in LayerNorm/RMSNorm.
+        if maybe_fuse_quantize:
+            assert is_te_min_version("2.10.0"), (
+                "Only TE >=2.10.0 supports fusing quantization in LayerNorm/RMSNorm."
+            )
+            instance = te.pytorch.ops.Sequential(
+                instance, te.pytorch.ops.Quantize(forward=True, backward=False)
+            )
 
         return instance
 
