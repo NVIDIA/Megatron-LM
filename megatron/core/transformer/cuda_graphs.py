@@ -1626,8 +1626,6 @@ class TECudaGraphHelper:
                     consumed_sample_q[sample_keys].append(per_callable_fwd_idx)
                 fwd_sample_qs[m_chunk] = fwd_sample_qs[m_chunk][num_consumed_samples:]
 
-        if not any(sample_kwargs):
-            sample_kwargs = None
         return sample_args, sample_kwargs
 
     def _get_cuda_graph_input_data(self):
