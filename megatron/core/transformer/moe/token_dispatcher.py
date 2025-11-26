@@ -435,13 +435,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_finish": 3,
             "no_sync": 4,
         }
+        self.cuda_dtoh_point = "before_permutation_1"
         if (
             config.cuda_graph_impl == "transformer_engine"
             and CudaGraphScope.moe_preprocess in config.cuda_graph_scope
         ):
             self.cuda_dtoh_point = "before_ep_alltoall"
-        else:
-            self.cuda_dtoh_point = "before_permutation_1"
         if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
             MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
 

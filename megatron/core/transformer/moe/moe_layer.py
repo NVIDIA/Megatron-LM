@@ -267,6 +267,13 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
+    def router_and_preprocess(self, hidden_states: torch.Tensor):
+        """This method is a combined method of route and preprocess. Deprecated."""
+
+        probs, routing_map = self.route(hidden_states)
+        hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
+        return hidden_states, probs, residual
+
     def forward(self, hidden_states: torch.Tensor):
         """Forward pass for the MoE layer.
 
