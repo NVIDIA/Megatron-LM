@@ -562,8 +562,9 @@ class TopKRouter(Router):
         logits = self.gating(input)
 
         if self.config.moe_router_force_load_balancing:
+            cg_capture_router = self.config.cuda_graph_impl != "none" and ("moe_router" in self.config.cuda_graph_scope or "full_iteration" in self.config.cuda_graph_scope)
             # Apply force load balancing with random logits for benchmark
-            logits = apply_random_logits(logits)
+            logits = apply_random_logits(logits, static_logits=cg_capture_router)
 
         probs, routing_map = self.routing(logits)
 

@@ -12,7 +12,9 @@ try:
 except ImportError:
     HAVE_DEEP_EP = False
 
+from typing import Optional
 import torch
+from torch._subclasses.fake_tensor import DispatchCacheInfo
 
 _buffer = None
 
@@ -307,7 +309,6 @@ def init_hybrid_ep_buffer(
         fp8_dispatch (bool):
             Whether to use FP8 communication during the dispatch phase.
     '''
-    assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
@@ -344,7 +345,7 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         if _hybrid_ep_buffer is None:
             seq_len, hidden_dim = x.shape[-2:]
-            fp8_dispatch = False  # Currently, we do not support fp8 dispatch
+            fp8_dispatch = False  # Currently, we do not support fp8 token dispatch
             init_hybrid_ep_buffer(
                 group,
                 hidden_dim,
@@ -376,6 +377,7 @@ class HybridEPDispatch(torch.autograd.Function):
             num_dispatched_tokens=num_dispatched_tokens,
             num_permuted_tokens=num_permuted_tokens,
             use_host_meta=use_host_meta,
+            use_fp8=False,
         )
 
         ctx.handle = handle
@@ -446,7 +448,197 @@ class HybridEPCombine(torch.autograd.Function):
         return dispatched_hidden, None, None, None, None
 
 
+
+try:
+    from transformer_engine.pytorch.tensor import QuantizedTensor
+except ImportError:
+    HAVE_TE_QUANTIZED_TENSOR = False
+else:
+    HAVE_TE_QUANTIZED_TENSOR = True
+
+from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor 
+import transformer_engine_torch as tex
+
+class HybridEPExpertDispatch(torch.autograd.Function):
+    '''
+    Fused dispatch operation for expert dispatch using the HybridEP backend
+    '''
+    expert_dispatch_buffer = None
+
+    @staticmethod
+    def forward(ctx, routing_map, group, num_local_echo_experts, num_sms_dispatch_api, num_sms_combine_api, num_dispatched_weights, weight_chunk_size, *expert_weights):
+        '''
+        Forward pass of fused dispatch of the HybridEP backend
+        '''
+        # Extract raw weight and scales from 
+        num_total_experts = routing_map.shape[1]
+        num_local_home_experts = len(expert_weights)
+        weight_list = []
+        scale_list = []
+        weight_shape = expert_weights[0].shape
+        ctx.weight_shape = weight_shape
+        fp8_dispatch = False
+        quantized_tensor_class = None
+        for weight in expert_weights:
+            if HAVE_TE_QUANTIZED_TENSOR and isinstance(weight, QuantizedTensor):
+                quantized_tensor_class = weight.__class__
+                row_weight, col_weight = weight.get_data_tensors()
+                metadata = weight.get_metadata()
+                row_scale, col_scale = (
+                    metadata['rowwise_scale_inv'].view(torch.float32),
+                    metadata['columnwise_scale_inv'].view(torch.float32),
+                )
+                weight_list.extend([row_weight.ravel(), col_weight.ravel()])
+                scale_list.extend([row_scale.ravel(), col_scale.ravel()])
+                fp8_dispatch = True
+            else:
+                weight_list.append(weight.ravel())
+
+        # Chunk the weight for hybridep to dispatch a small piece each time
+        weight_tensor = torch.stack(weight_list, dim=0).reshape(num_local_home_experts, -1)
+        num_chunks_per_weight = weight_tensor.shape[1] // weight_chunk_size
+        ctx.num_chunks_per_weight = num_chunks_per_weight
+        ctx.num_local_echo_experts = num_local_echo_experts
+        ctx.num_local_home_experts = num_local_home_experts
+        weight_tensor = weight_tensor.reshape(num_local_home_experts*num_chunks_per_weight, weight_chunk_size)
+
+        if fp8_dispatch:
+            scale_tensor = torch.stack(scale_list, dim=0)
+            scale_tensor = scale_tensor.reshape(num_local_home_experts*num_chunks_per_weight, -1)
+        else:
+            scale_tensor = None
+        routing_map = (
+            routing_map.reshape(num_local_home_experts, 1, num_total_experts)
+            .expand(-1, num_chunks_per_weight, -1)
+            .reshape(num_local_home_experts * num_chunks_per_weight, num_total_experts)
+        ).contiguous()
+
+        # Dispatch the data and scales with hybridep
+        ## Initialize the buffer for hybridep
+        seq_len = routing_map.shape[0]
+        if HybridEPExpertDispatch.expert_dispatch_buffer is None:
+            seq_len, hidden_dim = weight_tensor.shape
+            HybridEPExpertDispatch.expert_dispatch_buffer = HybridEPBuffer(
+                group=group,
+                hidden_dim=hidden_dim,
+                max_num_of_tokens_per_rank=seq_len,
+                num_local_experts=num_local_echo_experts,
+                use_fp8=fp8_dispatch,
+                num_sms_dispatch_api=num_sms_dispatch_api,
+                num_sms_combine_api=num_sms_combine_api,
+            )
+        use_host_meta = num_dispatched_weights is None
+        if fp8_dispatch:
+            assert scale_tensor.dtype == torch.float32
+            assert weight_tensor.shape[1] // scale_tensor.shape[1] == 128
+        # Process the dispatch
+        (
+            dispatched_weight,
+            _,
+            dispatched_scaling_factor,
+            tokens_per_expert,
+            handle,
+        ) = HybridEPExpertDispatch.expert_dispatch_buffer.dispatch_with_permute(
+            hidden=weight_tensor,
+            routing_map=routing_map,
+            probs=None,
+            scaling_factor=scale_tensor,
+            pad_multiple=None,
+            num_dispatched_tokens=num_dispatched_weights * num_chunks_per_weight,
+            num_permuted_tokens=num_dispatched_weights * num_chunks_per_weight,
+            use_host_meta=use_host_meta,
+        )
+
+        ctx.handle = handle
+        if use_host_meta:
+            ctx.num_dispatched_tokens = tokens_per_expert.sum()
+            ctx.num_permuted_tokens = ctx.num_dispatched_tokens
+        else:
+            ctx.num_dispatched_tokens = num_dispatched_weights * num_chunks_per_weight
+            ctx.num_permuted_tokens = num_dispatched_weights * num_chunks_per_weight
+
+        # Wrap the data into quantized tensor
+        if fp8_dispatch:
+            dispatched_raw_weight = dispatched_weight.chunk(num_dispatched_weights, dim=0)
+            dispatched_raw_scale = dispatched_scaling_factor.chunk(num_dispatched_weights, dim=0)
+            dispatched_weight_list = []
+            for i in range(num_dispatched_weights):
+                row_weight, col_weight = dispatched_raw_weight[i].chunk(2, dim=0)
+                row_scale, col_scale = dispatched_raw_scale[i].chunk(2, dim=0)
+                if quantized_tensor_class is MXFP8Tensor:
+                    weight_tensor = MXFP8Tensor(
+                        weight_shape,
+                        torch.bfloat16,
+                        rowwise_data=row_weight.reshape(weight_shape),
+                        rowwise_scale_inv=row_scale.view(torch.uint8).reshape(weight_shape[0], -1),
+                        columnwise_data=col_weight.reshape(weight_shape),
+                        columnwise_scale_inv=col_scale.view(torch.uint8).reshape(-1, weight_shape[1]),
+                        fp8_dtype=tex.DType.kFloat8E4M3,
+                        quantizer=None,
+                    )
+                elif quantized_tensor_class is Float8BlockwiseQTensor:
+                    weight_tensor = Float8BlockwiseQTensor(
+                        weight_shape,
+                        torch.bfloat16,
+                        rowwise_data=row_weight.reshape(weight_shape),
+                        rowwise_scale_inv=row_scale.reshape(weight_shape[0], -1),
+                        columnwise_data=col_weight.reshape(weight_shape),
+                        columnwise_scale_inv=col_scale.reshape(-1, weight_shape[1]),
+                        fp8_dtype=tex.DType.kFloat8E4M3,
+                        quantizer=None,
+                        is_2D_scaled=False,
+                    )
+                dispatched_weight_list.append(weight_tensor)
+        else:
+            dispatched_weight_list = [weight.reshape(weight_shape) for weight in dispatched_weight.chunk(num_dispatched_weights, dim=0)]
+
+        ctx.handle = handle
+        ctx.fp8_dispatch = fp8_dispatch
+        ctx.num_local_echo_experts = num_local_echo_experts
+        ctx.num_local_home_experts = num_local_home_experts
+        return tuple(dispatched_weight_list)
+    
+    @staticmethod
+    def backward(ctx, *grad_expert_weights):
+        '''
+        Backward pass of fused dispatch of the HybridEP backend
+        '''
+        # TODO: dispatch and accmualte the gradient of the expert weights with fp32
+        num_chunks_per_weight = ctx.num_chunks_per_weight
+        weight_shape = ctx.weight_shape
+        if ctx.fp8_dispatch:
+            ctx.handle[-1].hidden_dim //= 2
+        # chunk the grad_expert_weights into pieces
+        expert_grad_tensor = torch.stack(grad_expert_weights, dim=0).reshape(ctx.num_local_echo_experts*num_chunks_per_weight, -1)
+
+
+        combined_expert_grad, _ = HybridEPExpertDispatch.expert_dispatch_buffer.combine_with_unpermute(
+            hidden=expert_grad_tensor,
+            probs=None,
+            handle=ctx.handle,
+            pad_multiple=None,
+            num_dispatched_tokens=ctx.num_dispatched_tokens,
+        )
+        # Extract grad for each expert
+        weight_grad_list = [weight_grad.reshape(weight_shape) for weight_grad in combined_expert_grad.chunk(ctx.num_local_home_experts, dim=0)]
+
+        return None, None, None, None, None, None, None, *weight_grad_list
+
 if HAVE_HYBRIDEP:
+
+    def hybrid_ep_expert_dispatch(
+        expert_weights,
+        routing_map,
+        group, 
+        num_local_experts,
+        num_of_experts,
+        num_sms_dispatch_api,
+        num_dispatched_weights,
+    ):
+        """
+        """
+        pass
 
     def hybrid_ep_dispatch(
         x,

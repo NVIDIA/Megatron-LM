@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from optparse import Option
 import warnings
 from dataclasses import dataclass
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -594,6 +595,9 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
+    moe_use_device_initiated_grouped_gemm: bool = False
+    """Use the cutlass grouped gemm kernel, which allows for the token_per_expert tensor on GPU. This can prevent the GPU-CPU synchronization during the grouped gemm."""
+
     moe_use_legacy_grouped_gemm: bool = False
     """Use legacy GroupedMLP rather than TEGroupedMLP.
     Note: The legacy one will be deprecated soon."""
@@ -618,6 +622,27 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
+    moe_enable_echo: bool = False
+    """[Experimental] Enable Elastic Cloning for Hot Experts."""
+
+    moe_num_echo_experts: Optional[int] = None
+    """[Experimental] Number of echo experts to use. If None, the number of echo experts is set to
+    the number of experts."""
+
+    moe_echo_expert_dispatch_overlap: bool = False
+    """Enable overlap of echo expert dispatch and expert computation."""
+
+    moe_echo_recompute_expert_dispatch: bool = False
+    """[Experimental] Recompute the expert dispatch for echo experts in the backward pass to reduce the memory overhead.
+    It is only effective when moe_enable_echo is enabled."""
+
+    moe_echo_expert_dispatcher_type: str = "hybridep"
+    """The type of expert dispatcher to use for echo experts. Can be either "hybridep" or "alltoall"."""
+
+    moe_echo_enable_random_offloading: bool = False
+    """[Experimental] Enable random offloading of echo experts for debugging and numerical verification. 
+    It is only effective when moe_enable_echo is enabled."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
@@ -625,6 +650,9 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
     the MNNVL case."""
+
+    moe_received_token_capacity: Optional[float] = None
+    """The capacity of total received tokens on each ep rank."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
@@ -1734,6 +1762,14 @@ class TransformerConfig(ModelParallelConfig):
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
                     f"variable sequence length, please use alltoall dispatcher instead."
                 )
+
+        if self.moe_enable_echo:
+            assert (
+                self.moe_num_echo_experts is not None
+            ), "moe_num_echo_experts must be specified when moe_enable_echo is True"
+            assert (
+                self.moe_num_echo_experts % self.expert_model_parallel_size == 0
+            ), "moe_num_echo_experts must be divisible by expert_model_parallel_size when moe_enable_echo is True"
 
         if self.moe_permute_fusion:
             from megatron.core.transformer.moe.moe_utils import (

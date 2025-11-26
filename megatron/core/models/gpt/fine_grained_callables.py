@@ -362,10 +362,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
         probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
-        local_tokens, probs, _ = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
+        local_tokens, probs, metadata = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
+        node.layer_state.metadata = metadata
         if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
             # Detach here for shared expert connection
             node.layer_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
@@ -382,9 +383,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if enable_deepep:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to attn submodule
-            token_dispatcher._comm_manager.token_probs = probs
+            node.layer_state.metadata.token_probs = probs
 
-        dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
+        dispatched_tokens, dispatched_probs = layer.mlp.dispatch(
+            local_tokens, probs, node.layer_state.metadata
+        )
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
 
@@ -395,6 +398,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         shared_expert_output = None
         dispatched_probs = node.layer_state.dispatched_probs
+        metadata = node.layer_state.metadata
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep:
             # update dispatched_probs to be detached version, prevents
@@ -404,7 +408,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
         shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
         expert_output, mlp_bias = layer.mlp.routed_experts_compute(
-            dispatched_tokens, dispatched_probs, pre_mlp_layernorm_output
+            dispatched_tokens, dispatched_probs, metadata
         )
 
         if layer.recompute_pre_mlp_layernorm:
@@ -433,8 +437,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # with another microbatch's computation and expose the communication.
         """
         residual = node.layer_state.residual
-
-        output = layer.mlp.combine(output, shared_expert_output)
+        metadata = node.layer_state.metadata
+        output = layer.mlp.combine(output, metadata, shared_expert_output)
         mlp_output_with_bias = (output, None)
 
         with layer.bias_dropout_add_exec_handler():

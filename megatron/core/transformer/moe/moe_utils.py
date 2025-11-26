@@ -916,11 +916,11 @@ class RandomSTE(torch.autograd.Function):
     random_logits = None
 
     @staticmethod
-    def forward(ctx, logits):
+    def forward(ctx, logits, static_logits=False):
         """
         Forward pass returns random logits with rank-specific seed.
         """
-        if is_graph_capturing() and RandomSTE.random_logits is not None:
+        if static_logits and RandomSTE.random_logits is not None:
             return RandomSTE.random_logits
 
         if RandomSTE.generator is None:
@@ -938,14 +938,14 @@ class RandomSTE(torch.autograd.Function):
         """
         Backward pass propagates the gradient for logits.
         """
-        return grad_output
+        return grad_output, None
 
 
-def apply_random_logits(logits):
+def apply_random_logits(logits, static_logits=False):
     """
     Apply the RandomSTE function to the logits.
     """
-    return RandomSTE.apply(logits)
+    return RandomSTE.apply(logits, static_logits)
 
 
 class RouterGatingLinearFunction(torch.autograd.Function):
@@ -967,8 +967,8 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        if te_general_gemm is not None and router_dtype != torch.float64:
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
+        if te_general_gemm is not None and router_dtype != torch.float64 and weight.dtype == torch.bfloat16:
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN")
             output = output[0]
         elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())

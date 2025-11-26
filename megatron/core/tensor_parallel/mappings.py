@@ -532,10 +532,10 @@ def reduce_scatter_last_dim_to_tensor_parallel_region(input_, group=None):
     return _ReduceScatterToTensorParallelRegion.apply(input_, group)
 
 
-def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
+def all_to_all(group, input_, output_split_sizes=None, input_split_sizes=None):
     """Wrapper for autograd function"""
     assert group is not None, "group should not be None"
-    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes)
+    return _AllToAll.apply(group, input_, output_split_sizes, input_split_sizes)
 
 
 def all_to_all_sp2hp(input_, group=None):

@@ -342,7 +342,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         ctx.save_for_backward(weight)
         ctx.allreduce_dgrad = allreduce_dgrad
         ctx.tp_group = tp_group
-        output = torch.matmul(input, weight.t())
+        output = torch.mm(input, weight.t())
         if bias is not None:
             output = output + bias
         return output
@@ -352,7 +352,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
-        grad_input = grad_output.matmul(weight)
+        grad_input = grad_output.mm(weight)
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
@@ -489,7 +489,11 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             total_input = input
 
-        output = torch.matmul(total_input, weight.t())
+        # Change torch.matmul to torch.mm for batch invariant mode
+        if total_input.dim() == 2:
+            output = torch.mm(total_input, weight.t())
+        else:
+            output = torch.matmul(total_input, weight.t())
         if bias is not None:
             output = output + bias
         return output
@@ -532,7 +536,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 total_input = all_gather_buffer
             else:
                 total_input = input
-        grad_input = grad_output.matmul(weight)
+        if grad_output.dim() == 2:
+            grad_input = grad_output.mm(weight)
+        else:
+            grad_input = grad_output.matmul(weight)
 
         if ctx.sequence_parallel and wgrad_compute:
             # pylint: disable=possibly-used-before-assignment
@@ -615,7 +622,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             else:
                 grad_weight = None
         else:
-            grad_weight = grad_output.t().matmul(total_input)
+            grad_weight = grad_output.t().mm(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         if ctx.sequence_parallel:

@@ -37,6 +37,7 @@ _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 
+from transformer_engine.pytorch.tensor import QuantizedTensor
 
 def _get_cuda_rng_state(
     device: Union[int, str, torch.device] = "cuda", clone: bool = False, graph_safe: bool = False
@@ -420,7 +421,7 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.distribute_saved_activations = distribute_saved_activations
 
         # Copy the rng states.
-        ctx.rng_states = _get_all_rng_states()
+        # ctx.rng_states = _get_all_rng_states()
 
         with torch.no_grad():
             outputs = run_function(*args)
@@ -453,14 +454,11 @@ class CheckpointFunction(torch.autograd.Function):
                 inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
             )
 
-        with _fork_rng():
-            # Set the states to what it used to be before the forward pass.
-            _set_all_rng_states(*ctx.rng_states)
 
-            # Compute the forward pass.
-            detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
-                outputs = ctx.run_function(*detached_inputs)
+        # Compute the forward pass.
+        detached_inputs = detach_variable(inputs)
+        with torch.enable_grad():
+            outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -501,7 +499,9 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
-        ctx.save_for_backward(*detach_variable(args))
+        detached_args = detach_variable(args)
+        ctx.detached_args = detached_args
+        # ctx.save_for_backward(*detached_args)
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
         checkpoint_without_output_obj.ctx = ctx
@@ -510,10 +510,7 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
-        # Get the inputs from the context instead of the saved tensors
-        # because the saved tensors are already cached by the recomputation.
-        # This is to avoid double-reloading the inputs in CPU offloading scenario.
-        inputs = ctx.inputs
+        inputs = ctx.detached_args
         outputs = ctx.outputs
         torch.autograd.backward(outputs, args)
         ctx.outputs = None
@@ -549,12 +546,17 @@ class CheckpointWithoutOutput(object):
         """Checkpoint function."""
         self.run_function = run_function
 
-        self.rng_states = _get_all_rng_states()
+        # self.rng_states = _get_all_rng_states()
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
-        self.outputs = outputs
-        if isinstance(self.outputs, torch.Tensor):
-            self.outputs = (self.outputs,)
+        if isinstance(outputs, tuple):
+            saved_outputs = list([x for x in outputs if isinstance(x, torch.Tensor)])
+        elif isinstance(outputs, torch.Tensor):
+            saved_outputs = (outputs,)
+        else:
+            raise ValueError(f"Unsupported output type: {type(outputs)}")
+
+        self.outputs = saved_outputs
         return outputs
 
     def _recompute(self, _):
@@ -565,17 +567,15 @@ class CheckpointWithoutOutput(object):
                 "please use .backward() if possible"
             )
 
-        with _fork_rng():
-            _set_all_rng_states(*self.rng_states)
 
-            if self.fp8:
-                recompute_ctx = activation_recompute_forward(
-                    activation_recompute=True, recompute_phase=True
-                )
-                fp8_ctx = fp8_autocast(enabled=self.ctx.fp8, fp8_recipe=self.ctx.fp8_recipe)
-            else:
-                recompute_ctx = contextlib.nullcontext()
-                fp8_ctx = contextlib.nullcontext()
+        if self.fp8:
+            recompute_ctx = activation_recompute_forward(
+                activation_recompute=True, recompute_phase=True
+            )
+            fp8_ctx = fp8_autocast(enabled=self.ctx.fp8, fp8_recipe=self.ctx.fp8_recipe)
+        else:
+            recompute_ctx = contextlib.nullcontext()
+            fp8_ctx = contextlib.nullcontext()
 
             # Store the inputs for backward pass
             inputs = self.ctx.saved_tensors
@@ -592,17 +592,26 @@ class CheckpointWithoutOutput(object):
                 outputs = self.run_function(*inputs)
 
         self.run_function = None
-        self.rng_states = None
 
-        if isinstance(outputs, torch.Tensor):
+        if isinstance(outputs, tuple):
+            outputs = list([x for x in outputs if isinstance(x, torch.Tensor)])
+        elif isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
+        else:
+            raise ValueError(f"Unsupported output type: {type(outputs)}")
 
         # restore the recomputed memory without changing the metadata
         with torch.no_grad():
             for output, recomputation_output in zip(self.outputs, outputs):
-                output_size = recomputation_output.untyped_storage().size()
-                output.untyped_storage().resize_(output_size)
-                output.untyped_storage().copy_(recomputation_output.untyped_storage())
+                if isinstance(output, QuantizedTensor):
+                    output._rowwise_data.untyped_storage().resize_(recomputation_output._rowwise_data.untyped_storage().size())
+                    output._rowwise_data.untyped_storage().copy_(recomputation_output._rowwise_data.untyped_storage())
+                    output._columnwise_data.untyped_storage().resize_(recomputation_output._columnwise_data.untyped_storage().size())
+                    output._columnwise_data.untyped_storage().copy_(recomputation_output._columnwise_data.untyped_storage())
+                else:
+                    output_size = recomputation_output.untyped_storage().size()
+                    output.untyped_storage().resize_(output_size)
+                    output.untyped_storage().copy_(recomputation_output.untyped_storage())
 
         self.ctx.outputs = outputs
         self.ctx.inputs = inputs
@@ -621,8 +630,11 @@ class CheckpointWithoutOutput(object):
         # use resize to release the output tensor memory and still keep the metadata in the tensors.
         # the metadata is still needed for backward
         for output in self.outputs:
-            output.untyped_storage().resize_(0)
-
+            if isinstance(output, QuantizedTensor):
+                output._rowwise_data.untyped_storage().resize_(0)
+                output._columnwise_data.untyped_storage().resize_(0)
+            else:
+                output.untyped_storage().resize_(0)
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
         # is computed, the recomputation will be triggered. The hook_tensor should be selected
         # carefully to ensure that the tensors are recomputed before it is used by other backward
