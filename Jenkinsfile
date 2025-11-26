@@ -39,9 +39,26 @@ pipeline {
     }
 
     stages {
+        stage('Set GitHub Status: Pending') {
+            steps {
+                script {
+                    // Overall pipeline status set to pending as soon as we start
+                    githubNotify context: 'jenkins/pr',
+                                 status: 'PENDING',
+                                 description: "Jenkins build #${env.BUILD_NUMBER} is running on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
+                                 targetUrl: env.BUILD_URL
+                }
+            }
+        }
+
         stage('Build Docker Image') {
             steps {
                 script {
+                    // Mark the build stage as pending
+                    githubNotify context: 'jenkins/pr:build',
+                                 status: 'PENDING',
+                                 description: "Building Docker image for GPU_ARCH=${params.GPU_ARCH}",
+                                 targetUrl: env.BUILD_URL
 
                     // Generate a unique UUID for the Docker image name
                     def uuid = sh(script: 'uuidgen', returnStdout: true).trim()
@@ -57,6 +74,22 @@ pipeline {
                 }
             }
             post {
+                success {
+                    script {
+                        githubNotify context: 'jenkins/pr:build',
+                                     status: 'SUCCESS',
+                                     description: "Docker image build succeeded for GPU_ARCH=${params.GPU_ARCH}",
+                                     targetUrl: env.BUILD_URL
+                    }
+                }
+                failure {
+                    script {
+                        githubNotify context: 'jenkins/pr:build',
+                                     status: 'FAILURE',
+                                     description: "Docker image build failed for GPU_ARCH=${params.GPU_ARCH}",
+                                     targetUrl: env.BUILD_URL
+                    }
+                }
                 always {
                     clean_up_docker_images()
                 }
@@ -72,6 +105,12 @@ pipeline {
 
             steps {
                 script {
+                    // Mark the test stage as pending
+                    githubNotify context: 'jenkins/pr:tests',
+                                 status: 'PENDING',
+                                 description: "Running unit tests on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
+                                 targetUrl: env.BUILD_URL
+
                     // Pull the Docker image from the repository on the test node
                     withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
                         sh "docker login -u ${DOCKER_USERNAME} -p ${DOCKER_PASSWORD}"
@@ -84,6 +123,22 @@ pipeline {
                 }
             }
             post {
+                success {
+                    script {
+                        githubNotify context: 'jenkins/pr:tests',
+                                     status: 'SUCCESS',
+                                     description: "Unit tests passed on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
+                                     targetUrl: env.BUILD_URL
+                    }
+                }
+                failure {
+                    script {
+                        githubNotify context: 'jenkins/pr:tests',
+                                     status: 'FAILURE',
+                                     description: "Unit tests failed on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
+                                     targetUrl: env.BUILD_URL
+                    }
+                }
                 always {
                     // Archive test results
                     script {
@@ -92,6 +147,33 @@ pipeline {
                         clean_workspace()
                     }
                 }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                githubNotify context: 'jenkins/pr',
+                             status: 'SUCCESS',
+                             description: "Jenkins build #${env.BUILD_NUMBER} passed on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
+                             targetUrl: env.BUILD_URL
+            }
+        }
+        failure {
+            script {
+                githubNotify context: 'jenkins/pr',
+                             status: 'FAILURE',
+                             description: "Jenkins build #${env.BUILD_NUMBER} failed on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
+                             targetUrl: env.BUILD_URL
+            }
+        }
+        aborted {
+            script {
+                githubNotify context: 'jenkins/pr',
+                             status: 'ERROR',
+                             description: "Jenkins build #${env.BUILD_NUMBER} was aborted on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
+                             targetUrl: env.BUILD_URL
             }
         }
     }
