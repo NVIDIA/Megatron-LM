@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import torch
@@ -711,7 +711,7 @@ class TransformerConfig(ModelParallelConfig):
     excluding optimizer) is enabled.
     "transformer_engine": capture the CUDA graph using TE make_graphed_callables()."""
 
-    cuda_graph_scope: List[CudaGraphScope] = field(default_factory=list)
+    cuda_graph_scope: Optional[List[CudaGraphScope]] = None
     """Determines the CUDA graphs capturing scope.
     When cuda_graph_impl is set to "transformer_engine", valid values are "attn", "mlp", "moe",
     "moe_router", "moe_preprocess", "mamba". None means the full layer.
