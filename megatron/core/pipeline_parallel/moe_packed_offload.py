@@ -312,7 +312,7 @@ class PagedStashBuffer:
     
     def reset(self):
         """Reset the paged buffer - reinitialize free list."""
-        self.free_list = torch.arange(self.num_pages, dtype=torch.int64, device=self.device)
+        self.free_list.copy_(torch.arange(self.num_pages, dtype=torch.int64, device=self.device))
         self.free_list_head.zero_()
         self.free_list_tail.fill_(self.num_pages)
     
@@ -670,7 +670,7 @@ class PagedTensor:
     Similar to PackedTensor but uses page-level memory management.
     """
     
-    def __init__(self, tensor, num_tokens_tensor=None, vp_stage=None, layer_name=None, max_tokens=None, page_size=64):
+    def __init__(self, tensor, num_tokens_tensor=None, vp_stage=None, layer_name=None, max_tokens=None, page_size=64, num_d2d_pages=0):
         """
         Args:
             tensor: The tensor to store
@@ -679,6 +679,7 @@ class PagedTensor:
             layer_name: Name of the layer
             max_tokens: Maximum number of tokens
             page_size: Number of tokens per page
+            num_d2d_pages: Number of pages to copy using native PyTorch (rest uses Triton)
         """
         self._tensor = tensor
         self._original_tensor = None
@@ -688,6 +689,7 @@ class PagedTensor:
         self.layer_name = layer_name
         self.max_tokens = max_tokens
         self.page_size = page_size
+        self.num_d2d_pages = num_d2d_pages
         
         # Original tensor information
         self.original_shape = list(tensor.shape)
@@ -702,9 +704,21 @@ class PagedTensor:
         
         # Page record: stores which pages are being used for this tensor
         self.page_record = torch.zeros(self.max_num_pages, dtype=torch.int64, device=self.device)
+        
+        # Static tensor for D2D pages (allocate upfront if needed)
+        d2d_tokens = min(self.num_d2d_pages * self.page_size, self.max_num_tokens)
+        if d2d_tokens > 0:
+            self.static_tensor = torch.empty((d2d_tokens, self.hidden_size), dtype=self.dtype, device=self.device)
+        else:
+            self.static_tensor = None
     
     def offload_to_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
-        """Offload the paged tensor to paged stash buffer."""
+        """Offload the paged tensor to paged stash buffer.
+        
+        Args:
+            paged_stash_buffer: The paged stash buffer to offload to
+            max_blocks: Maximum number of blocks for Triton kernel
+        """
         if not HAVE_TRITON:
             raise RuntimeError("Triton is required for PagedTensor.offload_to_stash(). Please install triton.")
         
@@ -718,51 +732,72 @@ class PagedTensor:
         else:
             tensor_to_copy = self._tensor
         
-        # Determine grid size
-        BLOCK_SIZE = GLOBAL_BLOCK_SIZE
-        total_blocks_needed = self.max_num_tokens
-        num_blocks = min(total_blocks_needed, max_blocks)
+        # Split tensor into two parts: D2D portion and Triton portion
+        # Use max_num_tokens for consistent size across iterations
+        d2d_tokens = min(self.num_d2d_pages * self.page_size, self.max_num_tokens)
+        triton_tokens = self.max_num_tokens - d2d_tokens
         
         if DEBUG:
-            debug_print(f"PagedTensor offload ({self.layer_name}) {self._tensor.shape}-{self.dtype} page_size={self.page_size} num_tokens={self.num_tokens_tensor.item()} num_blocks={num_blocks}")
+            debug_print(f"PagedTensor offload ({self.layer_name}) {self._tensor.shape}-{self.dtype} page_size={self.page_size} max_num_tokens={self.max_num_tokens} num_d2d_pages={self.num_d2d_pages} d2d_tokens={d2d_tokens} triton_tokens={triton_tokens}")
         
-        grid = (num_blocks,)
+        # Perform both D2D copy and Triton kernel together
+        # Part 1: Copy first d2d_tokens to static_tensor using native PyTorch
+        if d2d_tokens > 0:
+            self.static_tensor[:d2d_tokens] = tensor_to_copy[:d2d_tokens]
+            if DEBUG:
+                debug_print(f"Copied {d2d_tokens} tokens to static_tensor using D2D")
         
-        # Create temporary tensor for new head (kernel will write to this)
-        new_free_list_head = torch.empty(1, dtype=torch.int64, device=self.device)
-        
-        # Launch paged stash copy kernel (strided access pattern)
-        # Allocates pages from free list (reads from head, advances head)
-        _paged_stash_copy_kernel[grid](
-            tensor_to_copy,
-            paged_stash_buffer.buffer,
-            self.num_tokens_tensor,
-            paged_stash_buffer.free_list,
-            paged_stash_buffer.free_list_head,
-            paged_stash_buffer.free_list_tail,
-            paged_stash_buffer.free_list_capacity,
-            self.page_record,
-            paged_stash_buffer.overflow,
-            new_free_list_head,  # Temporary tensor for new head
-            PAGE_SIZE=self.page_size,
-            HIDDEN_SIZE=self.hidden_size,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-        # if paged_stash_buffer.overflow.item() == 1 and torch.distributed.get_rank() == 0: import pdb; pdb.set_trace()
-        # torch.distributed.barrier()
-        
-        # Copy new head value after kernel completes (stream-ordered, avoids race condition)
-        paged_stash_buffer.free_list_head.copy_(new_free_list_head)
+        # Part 2: Copy remaining tokens using Triton kernel
+        if triton_tokens > 0:
+            triton_tensor = tensor_to_copy[d2d_tokens:self.max_num_tokens]
+            # Use actual num_tokens for the kernel (how many tokens to actually copy)
+            triton_num_tokens = self.num_tokens_tensor - d2d_tokens
+            
+            # Determine grid size
+            BLOCK_SIZE = GLOBAL_BLOCK_SIZE
+            num_blocks = min(triton_tokens, max_blocks)
+            grid = (num_blocks,)
+            
+            # Create temporary tensor for new head
+            new_free_list_head = torch.empty(1, dtype=torch.int64, device=self.device)
+            
+            # Launch paged stash copy kernel
+            _paged_stash_copy_kernel[grid](
+                triton_tensor,
+                paged_stash_buffer.buffer,
+                triton_num_tokens,
+                paged_stash_buffer.free_list,
+                paged_stash_buffer.free_list_head,
+                paged_stash_buffer.free_list_tail,
+                paged_stash_buffer.free_list_capacity,
+                self.page_record,  # Triton kernel will populate page_record
+                paged_stash_buffer.overflow,
+                new_free_list_head,
+                PAGE_SIZE=self.page_size,
+                HIDDEN_SIZE=self.hidden_size,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+            
+            # Update free list head
+            paged_stash_buffer.free_list_head.copy_(new_free_list_head)
+            
+            if DEBUG:
+                debug_print(f"Copied {triton_tokens} tokens using Triton kernel")
         
         # Save reference to original tensor
         self._original_tensor = self._tensor
         self._tensor = None
         
         if DEBUG:
-            debug_print(f"After PagedTensor offload page_record={self.page_record[:5]}")
+            debug_print(f"After PagedTensor offload")
     
     def reload_from_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
-        """Reload the paged tensor from paged stash buffer."""
+        """Reload the paged tensor from paged stash buffer.
+        
+        Args:
+            paged_stash_buffer: The paged stash buffer to reload from
+            max_blocks: Maximum number of blocks for Triton kernel
+        """
         if not HAVE_TRITON:
             raise RuntimeError("Triton is required for PagedTensor.reload_from_stash(). Please install triton.")
         
@@ -784,38 +819,56 @@ class PagedTensor:
             self._tensor = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
             tensor_to_reload = self._tensor
         
-        # Determine grid size
-        BLOCK_SIZE = GLOBAL_BLOCK_SIZE
-        total_blocks_needed = self.max_num_tokens
-        num_blocks = min(total_blocks_needed, max_blocks)
+        # Split tensor into two parts: D2D portion and Triton portion
+        # Use max_num_tokens for consistency with offload
+        d2d_tokens = min(self.num_d2d_pages * self.page_size, self.max_num_tokens)
+        triton_tokens = self.max_num_tokens - d2d_tokens
         
         if DEBUG:
-            debug_print(f"PagedTensor reload {self._tensor.shape}-{self.dtype} page_size={self.page_size} num_blocks={num_blocks}")
+            debug_print(f"PagedTensor reload {self._tensor.shape}-{self.dtype} page_size={self.page_size} max_num_tokens={self.max_num_tokens} num_d2d_pages={self.num_d2d_pages} d2d_tokens={d2d_tokens} triton_tokens={triton_tokens}")
         
-        grid = (num_blocks,)
+        # Perform both D2D copy and Triton kernel together
+        # Part 1: Copy first d2d_tokens from static_tensor using native PyTorch
+        if d2d_tokens > 0 and self.static_tensor is not None:
+            tensor_to_reload[:d2d_tokens] = self.static_tensor[:d2d_tokens]
+            if DEBUG:
+                debug_print(f"Reloaded {d2d_tokens} tokens from static_tensor using D2D")
         
-        # Create temporary tensor for new tail (kernel will write to this)
-        new_free_list_tail = torch.empty(1, dtype=torch.int64, device=self.device)
-        
-        # Launch paged stash pop kernel (strided access pattern)
-        # Returns pages to free list (writes to tail, advances tail)
-        _paged_stash_pop_kernel[grid](
-            paged_stash_buffer.buffer,
-            tensor_to_reload,
-            self.num_tokens_tensor,
-            self.page_record,
-            paged_stash_buffer.free_list,
-            paged_stash_buffer.free_list_head,
-            paged_stash_buffer.free_list_tail,
-            paged_stash_buffer.free_list_capacity,
-            new_free_list_tail,  # Temporary tensor for new tail
-            PAGE_SIZE=self.page_size,
-            HIDDEN_SIZE=self.hidden_size,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-        
-        # Copy new tail value after kernel completes (stream-ordered, avoids race condition)
-        paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
+        # Part 2: Copy remaining tokens using Triton kernel
+        if triton_tokens > 0:
+            triton_tensor = tensor_to_reload[d2d_tokens:self.max_num_tokens]
+            # Use actual num_tokens for the kernel (how many tokens to actually copy)
+            triton_num_tokens = self.num_tokens_tensor - d2d_tokens
+            
+            # Determine grid size
+            BLOCK_SIZE = GLOBAL_BLOCK_SIZE
+            num_blocks = min(triton_tokens, max_blocks)
+            grid = (num_blocks,)
+            
+            # Create temporary tensor for new tail
+            new_free_list_tail = torch.empty(1, dtype=torch.int64, device=self.device)
+            
+            # Launch paged stash pop kernel
+            _paged_stash_pop_kernel[grid](
+                paged_stash_buffer.buffer,
+                triton_tensor,
+                triton_num_tokens,
+                self.page_record,  # Triton kernel will read from page_record
+                paged_stash_buffer.free_list,
+                paged_stash_buffer.free_list_head,
+                paged_stash_buffer.free_list_tail,
+                paged_stash_buffer.free_list_capacity,
+                new_free_list_tail,
+                PAGE_SIZE=self.page_size,
+                HIDDEN_SIZE=self.hidden_size,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+            
+            # Update free list tail
+            paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
+            
+            if DEBUG:
+                debug_print(f"Reloaded {triton_tokens} tokens using Triton kernel")
         
         if DEBUG:
             debug_print(f"After PagedTensor reload")
@@ -937,6 +990,9 @@ class PackedOffloadManager:
         # Page size for paged memory management
         self.page_size = int(os.getenv('PAGED_STASH_PAGE_SIZE', '64'))  # Default 64 tokens per page
         self.use_paged_stash = os.getenv('USE_PAGED_STASH', '0') == '1'  # Enable via env var
+        
+        # Number of pages to copy using native PyTorch (D2D)
+        self.num_d2d_pages = int(os.getenv('NUM_D2D_PAGES', '0'))  # Default 0 (all Triton)
 
     @property
     def pack_stream(self):
@@ -1135,7 +1191,8 @@ class PackedOffloadManager:
                 vp_stage=self.current_vp_stage, 
                 layer_name=self._current_layer_name, 
                 max_tokens=self.max_num_tokens,
-                page_size=self.page_size
+                page_size=self.page_size,
+                num_d2d_pages=self.num_d2d_pages
             )
         else:
             packed_tensor = PackedTensor(
