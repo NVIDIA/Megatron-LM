@@ -1,0 +1,123 @@
+name: Megatron-LM CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'release*'
+  pull_request:
+    branches:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      gpu_arch:
+        description: 'GPU architecture to use for build/tests (e.g. gfx942)'
+        required: false
+        default: 'gfx942'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_and_test:
+    name: Build and Test on GPU
+    timeout-minutes: 720
+    runs-on: linux-mi325-8
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Print environment
+        run: |
+          echo "::group::Environment"
+          env | sort
+          echo "::endgroup::"
+
+      - name: ROCm diagnostics (host)
+        run: |
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi || true
+          else
+            echo "rocm-smi not found on runner"
+          fi
+
+      - name: Determine GPU architecture via rocminfo
+        id: gpu-arch
+        run: |
+          set -e
+          DEFAULT_ARCH="${{ github.event.inputs.gpu_arch || 'gfx942' }}"
+          if command -v rocminfo >/dev/null 2>&1; then
+            ARCH=$(rocminfo | grep -m 1 -oP 'gfx[0-9a-fA-F]+') || true
+          else
+            echo "rocminfo not found on runner, falling back to default arch"
+            ARCH=""
+          fi
+
+          if [ -z "$ARCH" ]; then
+            echo "Could not detect GPU arch automatically, falling back to $DEFAULT_ARCH"
+            ARCH="$DEFAULT_ARCH"
+          fi
+
+          echo "Using GPU arch: $ARCH"
+          echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: |
+          set -euxo pipefail
+          docker build --no-cache \
+            -f Dockerfile_rocm.ci \
+            --build-arg PYTORCH_ROCM_ARCH_OVERRIDE=${{ steps.gpu-arch.outputs.arch }} \
+            -t megatron-lm-ci:${{ github.sha }} \
+            .
+
+      - name: Run unit tests in container
+        run: |
+          set -euxo pipefail
+          docker run --rm \
+            --network=host \
+            -u root \
+            --device=/dev/kfd \
+            --device=/dev/dri \
+            --group-add "$(getent group video | cut -d: -f3)" \
+            --ipc=host \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            --shm-size=128G \
+            -v "${{ github.workspace }}:/workspace/Megatron-LM/output" \
+            --workdir /workspace/Megatron-LM \
+            --name megatron-lm-container \
+            --entrypoint /workspace/Megatron-LM/run_unit_tests.sh \
+            megatron-lm-ci:${{ github.sha }}
+
+      - name: List test reports
+        if: always()
+        run: |
+          echo "Workspace contents:"
+          ls -R
+          if [ -d output ]; then
+            echo "Contents of output/:"
+            ls -R output || true
+          fi
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: megatron-lm-test-reports
+          path: |
+            output/unified_test_report.csv
+            output/junit_report_*.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Cleanup Docker image
+        if: always()
+        run: |
+          docker image rm megatron-lm-ci:${{ github.sha }} || true
+
+
