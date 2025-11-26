@@ -171,6 +171,11 @@ class SFTTokenizer(MegatronLegacyTokenizer):
         return self._prompt_config.pad_token_id
 
     @property
+    def bos(self):
+        """Beginning of sequence token ID."""
+        return self._tokenizer.bos_token_id
+
+    @property
     def eod(self):
         """End of sentence token ID."""
         return self._tokenizer.eos_token_id

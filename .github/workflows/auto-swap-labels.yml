@@ -5,11 +5,14 @@ on:
   pull_request_review:
     types: [submitted]
 
+permissions:
+  pull-requests: write
+  contents: read
+
 jobs:
   check-approval:
     runs-on: ubuntu-latest
-    if: github.event.review.state == 'approved'
-    environment: nemo-ci
+    if: github.event.review.state == 'approved' && github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
@@ -25,6 +28,6 @@ jobs:
 
       - name: Run Auto Reminder Bot
         run: |
-          export GH_TOKEN=${{ secrets.PAT }}
+          export GH_TOKEN=${{ github.token }}
           export PR_NUMBER=${{ github.event.pull_request.number }}
           python tests/test_utils/python_scripts/swap_pr_labels.py

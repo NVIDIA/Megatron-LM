@@ -46,7 +46,7 @@ spec:
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts/model/{name}"
         "TRAINING_SCRIPT_PATH=pretrain_mamba.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_$CLUSTER.json"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
@@ -67,7 +67,7 @@ products:
   # - test_case: [hybrid_mr_mcore_te_tp1_pp4_cp1_dgx_a100_1N8G]
   #   products:
   #     - environment: [dev]
-  #       scope: [mr]
+  #       scope: [mr, mr-github]
   #     - environment: [lts] # disabled until triton is bumped
   #       scope: [nightly]
 

@@ -8,6 +8,7 @@ import random
 import shutil
 import sys
 import threading
+import types
 from argparse import Namespace
 from enum import Enum, auto
 from logging import getLogger
@@ -266,7 +267,7 @@ def checkpoint_exists(checkpoints_path):
 def read_metadata(tracker_filename):
     # Read the tracker file and either set the iteration or
     # mark it as a release checkpoint.
-    iteration = 0
+    iteration = -1
     release = False
 
     with open_file(tracker_filename, 'r') as f:
@@ -279,7 +280,10 @@ def read_metadata(tracker_filename):
                 print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
                     tracker_filename))
                 sys.exit()
-    assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+            else:
+                # Set iteration to 0 for release checkpoints
+                iteration = 0
+    assert iteration > -1 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
 
     # Get the max iteration retrieved across the ranks.
@@ -861,7 +865,7 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
             )
             state_dict["model"] = model_state_dict
     if args.num_experts:
-        state_dict["model"] = handle_experts_in_state_dict(state_dict["model"])
+        state_dict["model"] = handle_experts_in_state_dict(state_dict["model"], args.num_experts)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
@@ -1412,18 +1416,27 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     ignore_rng_state = False
     ignore_rerun_state = True
     if ckpt_format == "torch_dist":
+        ckpt_args = types.SimpleNamespace()
+        if state_dict is not None and "args" in state_dict:
+            ckpt_args = state_dict.get("args")
+
+        if not hasattr(ckpt_args, "tensor_model_parallel_size"):
+            print_rank_0("WARNING: TP size not found in checkpoint args, using 0 as default.")
+        if not hasattr(ckpt_args, "pipeline_model_parallel_size"):
+            print_rank_0("WARNING: PP size not found in checkpoint args, using 0 as default.")
+
         ckpt_tp_pp = (
-            state_dict['args'].tensor_model_parallel_size,
-            state_dict['args'].pipeline_model_parallel_size,
+            getattr(ckpt_args, "tensor_model_parallel_size", 0),
+            getattr(ckpt_args, "pipeline_model_parallel_size", 0),
         )
         run_tp_pp = (
             args.tensor_model_parallel_size,
             args.pipeline_model_parallel_size,
         )
 
-        ckpt_world_size = getattr(state_dict['args'], 'world_size', 0)
+        ckpt_world_size = getattr(ckpt_args, 'world_size', 0)
         run_world_size = getattr(args, 'world_size', 0)
-        ckpt_dp = getattr(state_dict['args'], 'data_parallel_size', 0)
+        ckpt_dp = getattr(ckpt_args, 'data_parallel_size', 0)
         run_dp = getattr(args, 'data_parallel_size', 0)
         mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(
             run_tp_pp, ckpt_tp_pp
@@ -1431,7 +1444,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         # Determine if RNG state will be loaded
         if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune and not args.no_load_rng
-                and not getattr(state_dict['args'], 'no_save_rng', False)):
+                and not getattr(ckpt_args, 'no_save_rng', False)):
             gen_sd_rng_state = get_rng_state(args.ckpt_format)  # we can load the rng state
         else:
             ignore_rng_state = True
@@ -1446,7 +1459,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         print_rank_0(f'sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}')
         # Determine if optimizer state will be loaded
         if (not release and not args.finetune and not args.no_load_optim
-                and not getattr(state_dict['args'], 'no_save_optim', False)):
+                and not getattr(ckpt_args, 'no_save_optim', False)):
             gen_sd_optim = optimizer
             gen_sd_opt_param_scheduler = opt_param_scheduler
 
@@ -1457,7 +1470,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     # (for MCore v0.13+ checkpoints `sharded_sd_metadata is not None`)
                     sharded_sd_metadata = {
                         'distrib_optim_sharding_type': ('fully_sharded_model_space'
-                                                        if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
+                                                        if getattr(ckpt_args, 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter'),
                     }
                 if (
@@ -1757,6 +1770,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Notify FT that a checkpoint was loaded.
         is_local_chkpt = (ckpt_type == CheckpointType.LOCAL)
         ft_integration.on_checkpoint_loaded(is_local_chkpt=is_local_chkpt)
+
+    # Patch checkpoint as needed if required field is not found.
+    if optimizer is not None:
+        log_printed = False
+        for param_group in optimizer.param_groups:
+            if 'default_config' not in param_group:
+                param_group['default_config'] = True
+                if not log_printed:
+                    print_rank_0(">>> Inserting 'default_config' field into optimizer.param_groups...")
+                log_printed = True
 
     return iteration, num_floating_point_operations_so_far
 

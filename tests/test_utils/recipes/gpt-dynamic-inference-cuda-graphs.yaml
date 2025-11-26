@@ -47,5 +47,5 @@ products:
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_validation]
     products:
       - environment: [dev]
-        scope: [mr-broken]
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
