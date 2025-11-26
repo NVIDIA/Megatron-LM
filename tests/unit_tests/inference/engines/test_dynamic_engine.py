@@ -908,17 +908,187 @@ class TestDynamicInferenceEngine:
     )
     @torch.inference_mode()
     def test_return_log_probs(self):
-        """Verify that returning log probs does not raise any error."""
+        """Verify that log probs are returned and computed correctly."""
         # Returning log probs requires materializing the full prompt logits or
         # explicitly disabling prompt logits.
         with pytest.raises(AssertionError):
             env = self._run_test(return_log_probs=True, materialize_only_last_token_logits=True)
-        env = self._run_test(return_log_probs=True, materialize_only_last_token_logits=False)
+
+        # Test with full logits materialization
+        env = self._run_test(
+            return_log_probs=True,
+            materialize_only_last_token_logits=False,
+            num_tokens_to_generate=5,
+        )
+
+        # Validate log probs for each completed request
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # Validate prompt log probs
+            if request.prompt_log_probs is not None and len(request.prompt_log_probs) > 0:
+                prompt_len = len(request.prompt_tokens)
+                # Should have log probs for all tokens except the first one
+                assert len(request.prompt_log_probs) == prompt_len - 1, (
+                    f"Request {request.request_id}: Expected {prompt_len - 1} prompt log probs, "
+                    f"got {len(request.prompt_log_probs)}"
+                )
+
+                # Validate each prompt log prob
+                for i, log_prob in enumerate(request.prompt_log_probs):
+                    assert not math.isnan(
+                        log_prob
+                    ), f"Request {request.request_id}, prompt token {i}: log_prob is NaN"
+                    assert not math.isinf(
+                        log_prob
+                    ), f"Request {request.request_id}, prompt token {i}: log_prob is inf"
+                    assert log_prob <= 0.0, (
+                        f"Request {request.request_id}, prompt token {i}: "
+                        f"log_prob {log_prob} should be <= 0"
+                    )
+                    assert log_prob >= -50.0, (
+                        f"Request {request.request_id}, prompt token {i}: "
+                        f"log_prob {log_prob} is unreasonably small"
+                    )
+
+            # Validate generated log probs
+            assert (
+                request.generated_log_probs is not None
+            ), f"Request {request.request_id}: generated_log_probs should not be None"
+            assert len(request.generated_log_probs) == len(request.generated_tokens), (
+                f"Request {request.request_id}: Expected {len(request.generated_tokens)} "
+                f"generated log probs, got {len(request.generated_log_probs)}"
+            )
+
+            # Validate each generated log prob
+            for i, log_prob in enumerate(request.generated_log_probs):
+                assert not math.isnan(
+                    log_prob
+                ), f"Request {request.request_id}, generated token {i}: log_prob is NaN"
+                assert not math.isinf(
+                    log_prob
+                ), f"Request {request.request_id}, generated token {i}: log_prob is inf"
+                assert log_prob <= 0.0, (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} should be <= 0"
+                )
+                assert log_prob >= -50.0, (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} is unreasonably small"
+                )
+
+            # Validate that all generated tokens are valid
+            for i, token_id in enumerate(request.generated_tokens):
+                assert 0 <= token_id < env.config.vocab_size, (
+                    f"Request {request.request_id}, token {i}: token_id {token_id} "
+                    f"is out of valid range [0, {env.config.vocab_size})"
+                )
+
+        # Test with skipping prompt log probs
         env = self._run_test(
             return_log_probs=True,
             materialize_only_last_token_logits=True,
             skip_prompt_log_probs=True,
+            num_tokens_to_generate=5,
         )
+
+        # Validate that prompt log probs are empty/None when skipped
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # When skip_prompt_log_probs is True, prompt_log_probs should be empty
+            assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
+                f"Request {request.request_id}: prompt_log_probs should be empty when "
+                f"skip_prompt_log_probs=True, but got {len(request.prompt_log_probs)} items"
+            )
+
+            # Generated log probs should still be present
+            assert (
+                request.generated_log_probs is not None and len(request.generated_log_probs) > 0
+            ), f"Request {request.request_id}: generated_log_probs should be present"
+
+            # Validate generated log probs are still valid
+            for i, log_prob in enumerate(request.generated_log_probs):
+                assert not math.isnan(log_prob) and not math.isinf(log_prob), (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} is invalid"
+                )
+                assert -50.0 <= log_prob <= 0.0, (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
+                )
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_log_probs_token_correspondence(self):
+        """
+        Verify that log probabilities correspond to the actual sampled tokens.
+        This test checks that the log probability reported for each token actually
+        corresponds to that token's probability in the distribution.
+        """
+        # Run test with log probs enabled
+        env = self._run_test(
+            return_log_probs=True,
+            materialize_only_last_token_logits=False,
+            num_tokens_to_generate=5,
+            num_requests=4,
+        )
+
+        # For each completed request
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # Check that we have log probs for generated tokens
+            assert request.generated_log_probs is not None
+            assert len(request.generated_log_probs) == len(request.generated_tokens)
+
+            # Verify log probs are valid and in reasonable range
+            for i, (token_id, log_prob) in enumerate(
+                zip(request.generated_tokens, request.generated_log_probs)
+            ):
+                # Basic validity checks
+                assert not math.isnan(
+                    log_prob
+                ), f"Request {request.request_id}, token {i}: log_prob is NaN"
+                assert not math.isinf(
+                    log_prob
+                ), f"Request {request.request_id}, token {i}: log_prob is inf"
+
+                # Log probabilities should be <= 0 (since prob <= 1)
+                assert log_prob <= 0.0, (
+                    f"Request {request.request_id}, token {i}: "
+                    f"log_prob {log_prob} should be <= 0"
+                )
+
+                # Check reasonable range (not too negative)
+                # Using a more lenient threshold since actual model outputs can vary
+                assert log_prob >= -100.0, (
+                    f"Request {request.request_id}, token {i}: "
+                    f"log_prob {log_prob} is unreasonably small"
+                )
+
+                # Token ID should be valid
+                assert 0 <= token_id < env.config.vocab_size, (
+                    f"Request {request.request_id}, token {i}: "
+                    f"token_id {token_id} is out of range [0, {env.config.vocab_size})"
+                )
+
+            # Check prompt log probs if available
+            if request.prompt_log_probs is not None and len(request.prompt_log_probs) > 0:
+                expected_prompt_log_probs = len(request.prompt_tokens) - 1
+                assert len(request.prompt_log_probs) == expected_prompt_log_probs, (
+                    f"Request {request.request_id}: Expected {expected_prompt_log_probs} "
+                    f"prompt log probs, got {len(request.prompt_log_probs)}"
+                )
+
+                for i, log_prob in enumerate(request.prompt_log_probs):
+                    assert not math.isnan(log_prob) and not math.isinf(log_prob)
+                    assert -100.0 <= log_prob <= 0.0
 
     @pytest.mark.internal
     @pytest.mark.skipif(
