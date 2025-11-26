@@ -2824,13 +2824,13 @@ def _add_tokenizer_args(parser):
                        help='List of special tokens. For TikTokenizer needs to have '
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
     group.add_argument('--legacy-tokenizer', action='store_true', default=False,
-                       help='To use legacy tokenizer system.')
+                       help='To use Megatron-LM legacy tokenizer system.')
     group.add_argument('--tiktoken-pattern', type=str, default=None,
                        help='Which tiktoken pattern to use. Options: [v1, v2]')
     group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
                        help='Number of special tokens in tiktoken tokenizer')
     group.add_argument('--sentencepiece-legacy', action='store_true', default=False,
-                       help='SentencePiece tokenizer legacy behavior. Allows special tokens usage.')
+                       help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.')
     group.add_argument('--hf-use-fast', action='store_true', default=False,
                        help='Whether to use fast HuggingFace tokenizer.')
     group.add_argument('--hf-include-special-tokens', action='store_true', default=False,
