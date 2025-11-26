@@ -302,8 +302,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert (
                 mamba_ssm_states_shape is not None
             ), "`mamba_ssm_states_shape` must be specified for hybrid models"
-            assert (
-                not use_cuda_graphs_for_non_decode_steps
+            assert not (
+                num_cuda_graphs is not None and use_cuda_graphs_for_non_decode_steps
             ), "Non-decode CUDA graphs not yet supported for hybrid models"
 
             # For hybrid models, the layer map converts the global layer index to the
@@ -337,7 +337,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
             self.block_size_bytes = (
                 dtype_size_bytes
-                * num_attention_layers
+                * self.num_attention_layers
                 * self.block_size_tokens
                 * self.kv_reduced_dim
             )
@@ -578,19 +578,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             """Allocate the memory buffer. This function is called below within
             `with ctx_manager:`."""
             if self.cache_mla_latent:
-                self.memory_buffer = torch.full(
+                self.memory_buffer = torch.empty(
                     (
                         self.num_attention_layers,
                         self.block_allocator.total_count,
                         self.block_size_tokens,
                         self.kv_reduced_dim,
                     ),
-                    -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
             else:
-                self.memory_buffer = torch.full(
+                self.memory_buffer = torch.empty(
                     (
                         2,  # key and value
                         self.num_attention_layers,
@@ -599,36 +598,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                         self.num_attention_heads_per_partition,
                         self.hidden_size_per_attention_head,
                     ),
-                    -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
-
-        # `*_cudagraph_only` tensors are for use with cuda graphs to maintain
-        # consistent input shapes, which is required to use cuda graphs.
-        # During these steps, the `*_cudagraph_only`
-        # tensors are used, otherwise their same-name but un-suffixed
-        # corresponding tensors are used.
-
-        self.query_seq_lengths_cudagraph_only = torch.full(
-            (self.max_total_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self.cu_query_seq_lengths_cudagraph_only = torch.full(
-            (self.max_total_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self.kv_seq_lengths_cudagraph_only = torch.full(
-            (self.max_total_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self.cu_kv_seq_lengths_cudagraph_only = torch.full(
-            (self.max_total_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-
-        self.request_to_kv_block_ids_cudagraph_only = torch.full(
-            (self.max_total_requests, self.max_kv_block_count),
-            0,
-            dtype=torch.int,
-            device=torch.cuda.current_device(),
-        )
 
         # Optional state tensors for hybrid models
         def allocate_mamba_states():
@@ -636,12 +608,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             `with ctx_manager:`."""
             if self.is_hybrid_model:
                 self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
-                self.mamba_conv_states = torch.zeros(
+                self.mamba_conv_states = torch.empty(
                     (self.num_mamba_layers, self.max_total_requests) + self.mamba_conv_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
-                self.mamba_ssm_states = torch.zeros(
+                self.mamba_ssm_states = torch.empty(
                     (self.num_mamba_layers, self.max_total_requests) + self.mamba_ssm_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
@@ -1026,8 +998,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
-            self.mamba_conv_states.fill_(0)
-            self.mamba_ssm_states.fill_(0)
             self.mamba_metadata.reset()
 
     def using_cuda_graph_this_step(self) -> bool:
@@ -1453,6 +1423,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
 
+    def get_index_of_chunked_prefill_request(self) -> int:
+        """Get the index of the chunked prefill request in the context.
+
+        Return:
+            (int) Index of the chunked prefill request, or -1 if none exists.
+        """
+        return torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
+
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
         """Update context state after calling engine.step().
@@ -1494,10 +1472,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Newly paused request IDs.
         """
-
-        # If tensor state is deallocated, do not add request.
-        if not self.is_tensor_state_allocated:
-            raise TensorStateDeallocatedError(req.request_id)
 
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
@@ -1613,8 +1587,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if self.chunked_prefill_request_id != -1:
                 # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-                pos = torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
-                active_requests_requiring_new_block[pos] = 0  # chunked prefill should not be paused
+                active_requests_requiring_new_block[self.get_index_of_chunked_prefill_request()] = (
+                    0  # chunked prefill should not be paused
+                )
 
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()
@@ -1681,11 +1656,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count += resume_request_count
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
-        # finally, swap the chunked prefill to the end of the active requests to obey the invariant
+        # finally, swap the chunked prefill to the end of the active requests to obey the invariance
         if self.chunked_prefill_request_id != -1:
-            pos = torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
             self._swap_book_keeping_tensors(
-                src_idxs=torch.tensor([pos]),
+                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
                 dst_idxs=torch.tensor([active_request_count + self.paused_request_count - 1]),
                 next_tokens=next_tokens,
             )
@@ -1771,7 +1745,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def calculate_log_probs(
         self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> List[List[float]]:
+    ) -> Tuple[List[List[float]], Tensor]:
         """Calculate log probs for all active requests and return them.
 
         TODO: @wdykas support top-n log probs.
@@ -1784,14 +1758,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         Returns:
             List of lists where each inner list contains log probs for a request in the
             same order as the active requests (from paused_request_count to total_request_count).
+            log_probs (Tensor): Used to compute top n logprobs later if required.
         """
+
         # Calculate log_probs (sequence_length x vocab_size)
         log_probs = F.log_softmax(logits.squeeze(0).float(), dim=-1)
 
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
             selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.flatten().tolist()]
+            return [[lp] for lp in selected_log_probs.flatten().tolist()], log_probs
 
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
@@ -1834,7 +1810,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Convert each log prob tensor into a list
-        return [lp.tolist() for lp in selected_log_probs_list]
+        return [lp.tolist() for lp in selected_log_probs_list], log_probs
 
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.
