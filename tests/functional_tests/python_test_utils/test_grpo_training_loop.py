@@ -35,7 +35,6 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
         )
     assert len(output_groundtruth) > 0, "No test performed for output"
 
-    # iteration-time assertions.
     if "iteration-time" in output_groundtruth.keys():
 
         # First warmup iteration is excluded from iteration-time statistics.
@@ -44,12 +43,12 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
 
         # 10% is empirically observed to be within hardware variance.
         assert (
-            iteration_time_sampled >= 0.9 * iteration_time_golden
-        ), f"Iteration time is slower than expected! Expected to be within 10% of ~{iteration_time_golden} ms but benchmarked {output_current['iteration-time']} ms"
-
-        # If throughput is significantly improved (> 20%), update golden values accordingly.
-        assert (
-            iteration_time_sampled < iteration_time_golden * 1.2
-        ), f"Iteration time has been improved from expected ~{iteration_time_golden} ms to {output_current['iteration-time']} ms. Please update golden values in the functional tests."
+            0.9 * iteration_time_golden <= iteration_time_sampled <= 1.2 * iteration_time_golden
+        ), (
+            f"Iteration time {iteration_time_sampled} ms not within 10% below or 20% above "
+            f"golden value ~{iteration_time_golden} ms. "
+            f"Sampled: {output_current['iteration-time']} ms. "
+            f"Please update golden values in the functional tests if this is expected."
+        )
 
         output_groundtruth.pop('iteration-time')
