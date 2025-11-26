@@ -44,6 +44,7 @@ pipeline {
                 script {
                     // Overall pipeline status set to pending as soon as we start
                     githubNotify context: 'jenkins/pr',
+                                 credentialsId: 'rocm-repo-management-api',
                                  status: 'PENDING',
                                  description: "Jenkins build #${env.BUILD_NUMBER} is running on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
                                  targetUrl: env.BUILD_URL
@@ -56,6 +57,7 @@ pipeline {
                 script {
                     // Mark the build stage as pending
                     githubNotify context: 'jenkins/pr:build',
+                                 credentialsId: 'rocm-repo-management-api',
                                  status: 'PENDING',
                                  description: "Building Docker image for GPU_ARCH=${params.GPU_ARCH}",
                                  targetUrl: env.BUILD_URL
@@ -77,6 +79,7 @@ pipeline {
                 success {
                     script {
                         githubNotify context: 'jenkins/pr:build',
+                                     credentialsId: 'rocm-repo-management-api',
                                      status: 'SUCCESS',
                                      description: "Docker image build succeeded for GPU_ARCH=${params.GPU_ARCH}",
                                      targetUrl: env.BUILD_URL
@@ -85,6 +88,7 @@ pipeline {
                 failure {
                     script {
                         githubNotify context: 'jenkins/pr:build',
+                                     credentialsId: 'rocm-repo-management-api',
                                      status: 'FAILURE',
                                      description: "Docker image build failed for GPU_ARCH=${params.GPU_ARCH}",
                                      targetUrl: env.BUILD_URL
@@ -107,6 +111,7 @@ pipeline {
                 script {
                     // Mark the test stage as pending
                     githubNotify context: 'jenkins/pr:tests',
+                                 credentialsId: 'rocm-repo-management-api',
                                  status: 'PENDING',
                                  description: "Running unit tests on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
                                  targetUrl: env.BUILD_URL
@@ -126,6 +131,7 @@ pipeline {
                 success {
                     script {
                         githubNotify context: 'jenkins/pr:tests',
+                                     credentialsId: 'rocm-repo-management-api',
                                      status: 'SUCCESS',
                                      description: "Unit tests passed on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
                                      targetUrl: env.BUILD_URL
@@ -134,6 +140,7 @@ pipeline {
                 failure {
                     script {
                         githubNotify context: 'jenkins/pr:tests',
+                                     credentialsId: 'rocm-repo-management-api',
                                      status: 'FAILURE',
                                      description: "Unit tests failed on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
                                      targetUrl: env.BUILD_URL
@@ -157,6 +164,7 @@ pipeline {
         success {
             script {
                 githubNotify context: 'jenkins/pr',
+                             credentialsId: 'rocm-repo-management-api',
                              status: 'SUCCESS',
                              description: "Jenkins build #${env.BUILD_NUMBER} passed on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
                              targetUrl: env.BUILD_URL
@@ -165,6 +173,7 @@ pipeline {
         failure {
             script {
                 githubNotify context: 'jenkins/pr',
+                             credentialsId: 'rocm-repo-management-api',
                              status: 'FAILURE',
                              description: "Jenkins build #${env.BUILD_NUMBER} failed on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
                              targetUrl: env.BUILD_URL
@@ -173,6 +182,7 @@ pipeline {
         aborted {
             script {
                 githubNotify context: 'jenkins/pr',
+                             credentialsId: 'rocm-repo-management-api',
                              status: 'ERROR',
                              description: "Jenkins build #${env.BUILD_NUMBER} was aborted on ${params.TEST_NODE_LABEL} (GPU: ${params.GPU_ARCH})",
                              targetUrl: env.BUILD_URL
