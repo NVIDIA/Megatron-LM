@@ -85,7 +85,6 @@ dev = [
     "flashinfer-python",
     "wget",
     "onnxscript",
-    "datasets",
 ]
 
 lts = [
@@ -104,7 +103,6 @@ lts = [
     "flashinfer-python",
     "wget",
     "onnxscript",
-    "datasets",
 ]
 
 [dependency-groups]
