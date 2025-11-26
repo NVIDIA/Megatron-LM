@@ -5,6 +5,10 @@ import torch
 from packaging.version import Version as PkgVersion
 from pytest_mock import mocker
 
+from megatron.core.extensions.transformer_engine import (
+    fused_apply_rotary_pos_emb,
+    fused_apply_rotary_pos_emb_thd,
+)
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -12,10 +16,6 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.extensions.transformer_engine import (
-    fused_apply_rotary_pos_emb,
-    fused_apply_rotary_pos_emb_thd,
-)
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -118,12 +118,13 @@ class TestRotaryEmbedding:
             t = torch.randn(64, 1, 8)
             freqs = torch.randn(64, 1, 1, 8)
             cu_seqlens = torch.tensor([0, 64])
-            fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, start_positions=torch.tensor([0,]))
+            fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, start_positions=torch.tensor([0]))
 
         assert str(exc_info_thd.value) == (
             "Only TE >= 2.10.0.dev0 supports offset RoPE application with "
             "`start_positions` argument."
         )
+
 
 class TestQKVRotaryEmbedding:
     def setup_method(self):
