@@ -22,7 +22,6 @@ class TestNCCLAllocator:
         version.parse(torch.__version__) < version.parse('2.7.0'),
         reason="Requires PyTorch 2.7.0 or later",
     )
-    @pytest.mark.failing_on_rocm
     def test_nccl_allocator_init_sets_env_vars(self):
         nccl_allocator.init()
         assert os.environ.get("NCCL_NVLS_ENABLE") == "1"
@@ -33,7 +32,6 @@ class TestNCCLAllocator:
         reason="Requires PyTorch 2.7.0 or later",
     )
     @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires at least 4 GPUs")
-    @pytest.mark.failing_on_rocm
     def test_nccl_nccl_mem_register_and_allreduce(self):
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required for NCCL allocator tests")
@@ -66,7 +64,6 @@ class TestNCCLAllocator:
     @pytest.mark.skipif(
         torch.cuda.nccl.version() < (2, 27, 0), reason="Requires at least NCCL v2.27.0"
     )
-    @pytest.mark.failing_on_rocm
     def test_ag_with_nccl_cta_policy(self):
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required for NCCL allocator tests")

@@ -27,7 +27,7 @@ for file in $TEST_FILES; do
     torchrun --standalone --nproc_per_node=$NUM_GPUS -m pytest \
         --showlocals --tb=long -v -s -m "$PYTEST_MARKERS" \
         --csv $OUT_DIR/test_report_$(basename $file .py).csv \
-        $file --dist=loadscope
+        $file
 
     if [[ $? -ne 0 ]]; then
         echo "Test failed in $file. Stopping execution."

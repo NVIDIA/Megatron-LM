@@ -48,7 +48,6 @@ class TestSerialization:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.failing_on_rocm
     def test_single_process_save_load(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
 
@@ -689,7 +688,6 @@ class TestNonStrictLoad:
 
     @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
-    @pytest.mark.failing_on_rocm
     def test_unexpected_keys_handling_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
     ):

@@ -128,7 +128,6 @@ def _deinit_distributed():
     "msg,suffix",
     [(None, None), ("test_message", None), (None, "test_suffix"), ("test_message", "test_suffix")],
 )
-@pytest.mark.failing_on_rocm
 def test_nvtx_range(msg, suffix):
     # Track function execution
     execution_tracker = {'ranges': False}
@@ -151,7 +150,6 @@ def test_nvtx_range(msg, suffix):
     _call_nvtx_range()
     assert execution_tracker['ranges']
 
-@pytest.mark.failing_on_rocm
 def test_nvtx_decorator():
     # Track function execution
     execution_tracker = {'decorated': False, 'decorated_with_message': False}
@@ -278,7 +276,6 @@ def test_param_norm(use_distributed_optimizer: bool):
     _deinit_distributed()
 
 @pytest.mark.skip(reason="AmdSmiLibraryException error with GPU monitoring")
-@pytest.mark.failing_on_rocm
 @pytest.mark.flaky_in_dev
 def test_straggler_detector():
     world = int(os.getenv('WORLD_SIZE', '1'))

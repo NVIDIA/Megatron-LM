@@ -54,11 +54,15 @@ def _build_nccl_allocator():
     nccl_allocator_libname = "nccl_allocator"
     os.makedirs(source_dir, exist_ok=True)
 
+    # Detect whether we're using ROCm or CUDA
+    is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+    nccl_lib = "-lrccl" if is_rocm else "-lnccl"
+
     nccl_allocator = torch.utils.cpp_extension.load_inline(
         name=nccl_allocator_libname,
         cpp_sources=nccl_allocator_source,
         with_cuda=True,
-        extra_ldflags=["-lnccl"],
+        extra_ldflags=[nccl_lib],
         verbose=True,
         is_python_module=False,
         build_directory=source_dir,

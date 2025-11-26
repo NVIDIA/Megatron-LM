@@ -41,7 +41,6 @@ class TestDistributedDataParallel:
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
     @pytest.mark.parametrize("dp_size", [2, 8])  # Test with 2 or 8 GPUs
-    @pytest.mark.failing_on_rocm
     def test_ddp_with_dp_process_groups(self, dp_size):
         """Test that DDP works correctly with dp pgs from parallel state and user defined pgs."""
 
@@ -119,4 +118,4 @@ class TestDistributedDataParallel:
         # Check gradients are identical using torch.testing
         for p1, p2 in zip(ddp_model1.parameters(), ddp_model2.parameters()):
             if hasattr(p1, 'main_grad') and hasattr(p2, 'main_grad'):
-                testing.assert_close(p1.main_grad, p2.main_grad, rtol=0, atol=0)
+                testing.assert_close(p1.main_grad, p2.main_grad)

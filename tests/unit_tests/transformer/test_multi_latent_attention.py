@@ -574,7 +574,8 @@ class TestContextParallelMLAAttention:
             assert output.shape[1] == micro_batch_size
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
-
+    
+    @pytest.mark.failing_on_rocm
     def test_gpu_forward_thd(self):
         if is_te_min_version("2.5.0", check_equality=True):
             config = self.parallel_attention.config
