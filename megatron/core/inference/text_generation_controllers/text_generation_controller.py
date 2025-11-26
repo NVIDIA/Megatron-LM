@@ -94,7 +94,7 @@ class TextGenerationController:
         self.sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
 
         # Used for inefficient torch sampling.
-        self.torch_sampling_buckets: List[Tensor] = []
+        self.torch_sampling_buckets: List[Tuple] = []
 
     def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -582,20 +582,27 @@ class TextGenerationController:
 
         if backend == "torch":
             # Bucketize the core sampling parameters.
-            # `core_hash` sits on CPU, so there are no D2H syncs yet.
-            _, inv_indices, cnts = torch.unique(
-                request_metadata["core_hash"], dim=0, return_inverse=True, return_counts=True
-            )
-            order = torch.argsort(inv_indices, stable=True)
-            sampling_buckets = torch.split(order, cnts.tolist())
-            bucket_starts = torch.cat((cnts.new_zeroes(1), cnts.cumsum(dim=0)[:-1]), dim=0)
-            group_reps = order.index_select(0, bucket_starts)
+            # Doing so via list comprehension is orders of magnitude faster than via torch.
+            temp_hash = {}
+            buckets = []
+            bucket_reps = []
+
+            bucket_cnt = -1
+            for idx, val in enumerate(inp.tolist()):
+                try:
+                    bucket = temp_hash[val]
+                except IndexError:
+                    bucket_cnt += 1
+                    temp_hash[val] = bucket_cnt
+                    buckets.append([])
+                    bucket_reps.append(val)
+                buckets[bucket_cnt].append(bucket)
+            del temp_hash, bucket_cnt
 
             # Get representatives for each equivalence class.
-            # The representative tensors stay on their devices, so there are no D2H syncs yet.
-            temp_reps = request_metadata["temperature"][group_reps]
-            top_k_reps = request_metadata["top_k"][group_reps]
-            top_p_reps = request_metadata["top_p"][group_reps]
+            temp_reps = request_metadata["temperature"][bucket_reps]
+            top_k_reps = request_metadata["top_k"][bucket_reps]
+            top_p_reps = request_metadata["top_p"][bucket_reps]
 
             # Store the buckets and their equivalence class representatives.
             self.torch_sampling_buckets = (
