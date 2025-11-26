@@ -582,25 +582,21 @@ class TextGenerationController:
 
         if backend == "torch":
             # Bucketize the core sampling parameters.
-            core_params = torch.stack(
-                (
-                    request_metadata["temperature"],
-                    request_metadata["top_k"],
-                    request_metadata["top_p"],
-                ),
-                dim=1,
-            )
+            # `core_hash` sits on CPU, so there are no D2H syncs yet.
             _, inv_indices, cnts = torch.unique(
-                core_params, dim=0, return_inverse=True, return_counts=True
+                request_metadata["core_hash"], dim=0, return_inverse=True, return_counts=True
             )
             order = torch.argsort(inv_indices, stable=True)
             sampling_buckets = torch.split(order, cnts.tolist())
-            # Perform the D2H sync needed by `_torch_sampling_func` here.
-            group_reps = torch.stack([indices[0] for indices in sampling_buckets], dim=0)
-            core_params_reps = core_params[group_reps].detach().cpu()
-            temp_reps = core_params_reps[:, 0].tolist()
-            top_k_reps = core_params_reps[:, 1].tolist()
-            top_p_reps = core_params_reps[:, 2].tolist()
+            bucket_starts = torch.cat((cnts.new_zeroes(1), cnts.cumsum(dim=0)[:-1]), dim=0)
+            group_reps = order.index_select(0, bucket_starts)
+
+            # Get representatives for each equivalence class.
+            # The representative tensors stay on their devices, so there are no D2H syncs yet.
+            temp_reps = request_metadata["temperature"][group_reps]
+            top_k_reps = request_metadata["top_k"][group_reps]
+            top_p_reps = request_metadata["top_p"][group_reps]
+
             # Store the buckets and their equivalence class representatives.
             self.torch_sampling_buckets = (
                 (sampling_buckets[idx], temp_reps[idx], top_k_reps[idx], top_p_reps[idx])
@@ -643,11 +639,10 @@ class TextGenerationController:
             indices_list = []
 
             for indices, temp, top_k, top_p in self.torch_sampling_buckets:
-                token_list.append(
-                    self._torch_sampling_func(
-                        self.sampling_logits_cuda[indices, :], temp, top_k, top_p
-                    )
+                sampled_tokens = self._torch_sampling_func(
+                    self.sampling_logits_cuda[indices, :], temp.item(), top_k.item(), top_p.item()
                 )
+                token_list.append(sampled_tokens)
                 indices_list.append(indices)
 
             # Single write to the output tensor.

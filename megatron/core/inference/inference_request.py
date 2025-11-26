@@ -313,7 +313,8 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
-        return [getattr(sp, field) for field, _, _ in self.get_metadata_types()]
+        extras = {"core_hash": hash((sp.temperature, sp.top_k, sp.top_p))}
+        return [getattr(sp, field, extras.get(field)) for field, _, _ in self.get_metadata_types()]
 
     @staticmethod
     def get_metadata_types() -> List[Tuple[str, torch.dtype, bool]]:
@@ -326,6 +327,7 @@ class DynamicInferenceRequest(InferenceRequest):
                 on_device (bool) - Whether the metadata lives on GPU (True) or CPU (False).
         """
         return [
+            ("core_hash", torch.int64, False),
             ("temperature", torch.float32, False),  # CPU for torch sampling
             ("top_k", torch.int32, False),  # CPU for torch sampling
             ("top_p", torch.float32, False),  # CPU for torch sampling
