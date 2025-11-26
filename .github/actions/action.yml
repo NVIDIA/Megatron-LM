@@ -146,7 +146,7 @@ runs:
           )
         else
           ARGS=(
-            --scope mr-slim
+            --scope mr-github-slim
           )
         fi
 
