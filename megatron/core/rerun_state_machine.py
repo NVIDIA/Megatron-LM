@@ -9,7 +9,7 @@ import random
 import re
 from collections import defaultdict
 from enum import Enum
-from typing import Any, Callable, Iterable, NamedTuple, Optional, Set, Tuple, Union
+from typing import Any, Callable, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -249,16 +249,23 @@ class RerunStateMachine:
 
         return self.mode
 
-    def _reduce_any(self, value: bool) -> bool:
+    def _reduce_any(self, value: Union[bool, List[bool]]) -> Union[bool, Tuple[bool, ...]]:
         """
-        All-reduce a boolean value across the world group.
+        All-reduce a boolean value (or multiple boolean values) across the world group.
 
         If any of the ranks have a True value, return True.
         If all the ranks have a False value, return False.
+
+        For multiple inputs, returns a tuple.
         """
-        val_tensor: torch.Tensor = torch.tensor([value], dtype=torch.int32, device='cuda')
-        torch.distributed.all_reduce(val_tensor)
-        return val_tensor.item() > 0
+        if isinstance(value, list):
+            val_tensor: torch.Tensor = torch.tensor(value, dtype=torch.int32, device='cuda')
+            torch.distributed.all_reduce(val_tensor)
+            return tuple([x > 0 for x in val_tensor.tolist()])
+        else:
+            val_tensor: torch.Tensor = torch.tensor([value], dtype=torch.int32, device='cuda')
+            torch.distributed.all_reduce(val_tensor)
+            return val_tensor.item() > 0
 
     def should_run_forward_backward(self, data_iterator: DataIteratorArgType) -> bool:
         """Method instructing whether to (re)run the forward-backward pass.
@@ -338,7 +345,13 @@ class RerunStateMachine:
                 self._maybe_report_stats()
                 self.saved_results = defaultdict(list)
                 return False
-            will_continue = self._reduce_any(self.continue_requested)
+            # N.B. We may be able to rely on the behavior of the state machine
+            # to produce an equivalent value of self.continue_requested across
+            # ranks, since it depends on "fatal". That logic coupling seems
+            # brittle though.
+            will_continue, will_checkpoint = self._reduce_any(
+                [self.continue_requested, self.checkpoint_requested]
+            )
             if will_continue:
                 if _safe_get_rank() == 0:
                     logger.warning(
@@ -346,7 +359,6 @@ class RerunStateMachine:
                     )
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
-            will_checkpoint = self._reduce_any(self.checkpoint_requested)
             if will_checkpoint:
                 self.state = RerunState.WILL_RERUN_FROM_CHECKPOINT
             self._restore_state()
@@ -360,7 +372,9 @@ class RerunStateMachine:
             return True
         # Are we done re-running from a checkpoint?
         elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
-            will_restart_again = self._reduce_any(self.restart_again_requested)
+            will_restart_again, will_continue = self._reduce_any(
+                [self.restart_again_requested, self.continue_requested]
+            )
             if will_restart_again:
                 if _safe_get_rank() == 0:
                     logger.warning(
@@ -369,7 +383,6 @@ class RerunStateMachine:
                     )
                 self.state = RerunState.RERUNNING_AGAIN_FROM_CHECKPOINT
             else:
-                will_continue = self._reduce_any(self.continue_requested)
                 if will_continue:
                     if _safe_get_rank() == 0:
                         logger.warning(
