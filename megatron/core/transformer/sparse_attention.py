@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.fusions.fused_sparse_attention import FusedSparseAttention
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
@@ -76,6 +77,10 @@ class IndexerLossLoggingHelper:
         if "values" not in tracker:
             return
         values = tracker["values"]
+
+        torch.distributed.all_reduce(
+            values, group=parallel_state.get_pipeline_model_parallel_group()
+        )
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
@@ -83,6 +88,11 @@ class IndexerLossLoggingHelper:
             torch.distributed.all_reduce(
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
+        torch.distributed.all_reduce(
+            values,
+            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
+            op=torch.distributed.ReduceOp.AVG,
+        )
 
     @staticmethod
     def track_indexer_metrics(
@@ -199,34 +209,42 @@ def compute_indexer_loss(
         torch.full((sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device),
         diagonal=1,
     )
+    # index_mask [b, sq, sk]
+    index_mask = torch.full(
+        (b, sq, sk), float("-inf"), dtype=torch.float32, device=causal_mask.device
+    ).scatter_(-1, topk_indices, 0)
+
     # [b, np, sq, skv] + [1, 1, sq, skv] -> [b, np, sq, skv]
     attention_scores += causal_mask.view(1, 1, sq, sk)
+    if use_sparse_indexer_loss:
+        # [b, np, sq, sk] + [b, 1, sq, sk] -> [b, np, sq, sk]
+        attention_scores += index_mask.view(b, 1, sq, sk)
+        # [b, sq, sk] + [b, sq, sk] -> [b, sq, sk]
+        index_scores += index_mask
+
     # [b, np, sq, sk] -> [b, np, sq, sk]
     attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+    # [b, sq, sk] -> [b, sq, sk]
+    index_scores = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
 
     # Sum attention scores across heads.
     # [batch, heads, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
-    target_scores = attention_scores.sum(dim=1)
+    attention_scores = attention_scores.sum(dim=1)
     if pg_collection.tp.size() > 1:
         # attention scores are scattered to TP ranks in head dimension.
-        torch.distributed.all_reduce(target_scores.contiguous(), group=pg_collection.tp)
-
+        torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
     # L1 normalize target on the last dimension. Doesn't use abs() because attention_scores are
     # obtained from softmax so they are already non-negative.
-    target_probs = target_scores / target_scores.sum(dim=-1, keepdim=True)
-
-    # Convert index_scores to probabilities with softmax.
-    index_probs = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+    attention_scores = attention_scores / attention_scores.sum(dim=-1, keepdim=True)
 
     # Compute KL divergence: KL(target || index) = target(x) * log(target(x) / index(x))
-    kl_per_element = target_probs * (
-        torch.log(target_probs + 1e-10) - torch.log(index_probs + 1e-10)
+    # kl_per_element [b, sq, sk]
+    kl_per_element = attention_scores * (
+        torch.log(attention_scores + 1e-10) - torch.log(index_scores + 1e-10)
     )
 
-    if use_sparse_indexer_loss:
-        sparse_mask = torch.zeros_like(kl_per_element).scatter_(-1, topk_indices, 1)
-        kl_per_element = kl_per_element * sparse_mask
-
+    # [b, sq, sk] -> [b, sq] -> [1]
+    # Each token has same weight in the loss.
     kl_div = kl_per_element.sum(dim=-1).mean()
 
     # Scale by coefficient.
@@ -724,7 +742,6 @@ class SparseAttention(MegatronModule):
         ), "Currently context parallelism is not supported by SparseAttention!"
 
         self.layer_number = layer_number
-        self.pg_collection = pg_collection
 
         self.indexer = build_module(
             submodules.indexer, config=self.config, pg_collection=pg_collection
@@ -831,7 +848,6 @@ class SparseAttention(MegatronModule):
                     loss=indexer_loss,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
-                    avg_group=self.pg_collection.dp_cp,
                 )
             # Attach loss to output
             output = IndexerLossAutoScaler.apply(output, indexer_loss)

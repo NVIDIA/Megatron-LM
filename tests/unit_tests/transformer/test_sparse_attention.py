@@ -85,9 +85,23 @@ class TestComputeIndexerLoss:
         head_dim = 128
         index_topk = 8
 
-        # Create dummy tensors
+        # Create dummy index scores
         index_scores = torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32).cuda()
-        topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, index_topk)).cuda()
+
+        # Apply causal mask to index_scores before computing topk
+        causal_mask = torch.triu(
+            torch.full(
+                (seqlen, seqlen), float('-inf'), dtype=torch.float32, device=index_scores.device
+            ),
+            diagonal=1,
+        )
+        # [batch_size, seqlen, seqlen] + [seqlen, seqlen] -> [batch_size, seqlen, seqlen]
+        masked_index_scores = index_scores + causal_mask
+
+        # Get topk indices from masked index_scores
+        topk_k = min(index_topk, seqlen)
+        topk_indices = masked_index_scores.topk(topk_k, dim=-1)[1]
+
         query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
         key = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
         softmax_scale = head_dim**-0.5
@@ -116,9 +130,23 @@ class TestComputeIndexerLoss:
         head_dim = 128
         index_topk = 8
 
-        # Create dummy tensors
+        # Create dummy index scores
         index_scores = torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32).cuda()
-        topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, index_topk)).cuda()
+
+        # Apply causal mask to index_scores before computing topk
+        causal_mask = torch.triu(
+            torch.full(
+                (seqlen, seqlen), float('-inf'), dtype=torch.float32, device=index_scores.device
+            ),
+            diagonal=1,
+        )
+        # [batch_size, seqlen, seqlen] + [seqlen, seqlen] -> [batch_size, seqlen, seqlen]
+        masked_index_scores = index_scores + causal_mask
+
+        # Get topk indices from masked index_scores
+        topk_k = min(index_topk, seqlen)
+        topk_indices = masked_index_scores.topk(topk_k, dim=-1)[1]
+
         query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
         key = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
         softmax_scale = head_dim**-0.5
