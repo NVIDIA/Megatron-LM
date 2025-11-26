@@ -318,7 +318,7 @@ for i in $(seq 1 $N_REPEAT); do
         if [[ "$MODE" == "rl" && ("$TRAINING_EXIT_CODE" -eq 0 || "$TEST_TYPE" == "release") ]]; then
             if [[ "$TEST_TYPE" == "frozen-start" ]]; then
                 TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
-                    /usr/local/bin/yq '.MODEL_ARGS."--exit-interval" // "10"')
+                    /usr/local/bin/yq '.MODEL_ARGS."--exit-interval" // "50"')
                 uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                     --logs-dir $TENSORBOARD_PATH \
                     --train-iters $TRAIN_ITERS \
