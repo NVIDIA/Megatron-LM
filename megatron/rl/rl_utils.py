@@ -1659,23 +1659,21 @@ def prepare_data_for_update(
         # Inference logprobs 2 tokens shorter than old_logprobs.
         # One token difference is because we remove the first one in get_logprobs(), the other one is eod padding, if I got it correct. The difference should be one token if we are cut by the sequence length.
 
-        # Handle inference logprobs alignment (skip if using sequence packing)
-        if (
-            inference_logprobs is not None
-            and args.rl_inference_logprobs_is_correction
-            and not args.rl_use_sequence_packing
-        ):
+        if inference_logprobs is not None and not args.rl_use_sequence_packing:
             inference_logprobs = align_unpacked_inference_logprobs(
                 inference_logprobs=inference_logprobs,
                 old_logprobs_for_data=old_logprobs_for_data,
                 generation_masks=generation_masks,
                 group_stats=group_stats,
             )
-        else:
-            if not args.rl_use_sequence_packing:
-                # Keep inference_logprobs as None instead of zeros
+            # We run the above to fill in the inference/train side mismatch stats.
+            # We do the above for logging purposes.
+            # Nullify logprobs if not used in IS correction,
+            if not args.rl_inference_logprobs_is_correction:
                 inference_logprobs = None
+        elif not args.rl_use_sequence_packing:
             # For sequence packing, inference_logprobs will be handled separately
+            inference_logprobs = None
 
         # Handle packing of inference_logprobs for sequence packing mode
         if (
