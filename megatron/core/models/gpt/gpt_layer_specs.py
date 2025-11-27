@@ -320,7 +320,9 @@ def get_attention_module_spec_for_backend(
             normalization=normalization,
         )
     else:
-        core_attention = backend.core_attention() if not fallback_to_eager_attn else DotProductAttention
+        core_attention = (
+            backend.core_attention() if not fallback_to_eager_attn else DotProductAttention
+        )
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."

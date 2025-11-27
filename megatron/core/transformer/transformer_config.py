@@ -1895,7 +1895,7 @@ class TransformerConfig(ModelParallelConfig):
                         f"fallback_to_eager_attn only supports all_gather communication type "
                         f"for context parallelism, but got {self.cp_comm_type=} instead."
                     )
-        
+
         if self.sparse_attention_type is not None:
             assert (
                 self.context_parallel_size == 1
