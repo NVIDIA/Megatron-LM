@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Overflow Analysis Tool by Layer and Tensor Type
+Underflow Analysis Tool by Layer and Tensor Type
 
-Analyzes overflow when simulating quantization on BF16 tensors.
+Analyzes underflow when simulating quantization on BF16 tensors.
 Groups tensors by type (input, weight, query, key, value) and layer,
-analyzes overflow in forward pass only, generating line plots by layer.
+analyzes underflow in forward pass only, generating line plots by layer.
 Usage: python fake_quant_type_underflow_analysis.py --layer 1,8,15,16 --elem-format hifp8
 """
 
@@ -138,7 +138,7 @@ def remove_scaling(tensor: torch.Tensor, elem_format: str) -> torch.Tensor:
 
 
 def analyze_tensor(file_path: Path, elem_format: str) -> dict:
-    """Analyze tensor for overflow."""
+    """Analyze tensor for underflow."""
     # Load tensor
     tensor = torch.load(file_path, map_location='cpu', weights_only=False)
     
@@ -165,16 +165,17 @@ def analyze_tensor(file_path: Path, elem_format: str) -> dict:
     if total == 0:
         return None
     
-    # Calculate overflow: values exceeding maximum representable value
+    # Calculate underflow: non-zero values < min_normal
     abs_vals = torch.abs(flat)
+    non_zero = flat != 0.0
     if elem_format in DATA_TYPE_RANGES:
-        max_normal = DATA_TYPE_RANGES[elem_format]['max_normal']
+        min_normal = DATA_TYPE_RANGES[elem_format]['min_normal']
     else:
         raise ValueError(f"Unsupported element format: {elem_format}")
     
-    overflow = abs_vals > max_normal
-    overflow_count = torch.sum(overflow).item()
-    overflow_pct = (overflow_count / total) * 100.0
+    underflow = non_zero & (abs_vals < min_normal)
+    underflow_count = torch.sum(underflow).item()
+    underflow_pct = (underflow_count / total) * 100.0
     
     # Get metadata
     tensor_type, layer, pass_type = get_tensor_type_layer_and_pass(file_path.name)
@@ -186,15 +187,15 @@ def analyze_tensor(file_path: Path, elem_format: str) -> dict:
         'layer': layer,
         'pass_type': pass_type,
         'total_elements': int(total),
-        'overflow_count': int(overflow_count),
-        'overflow_percentage': float(overflow_pct),
+        'underflow_count': int(underflow_count),
+        'underflow_percentage': float(underflow_pct),
         'filename': file_path.name,
     }
 
 
-def plot_overflow_analysis(results: dict, elem_format: str, output_path: Path):
-    """Generate line plots for overflow analysis by layer."""
-    # Structure: {tensor_type: {layer: overflow_percentage}}
+def plot_underflow_analysis(results: dict, elem_format: str, output_path: Path):
+    """Generate line plots for underflow analysis by layer."""
+    # Structure: {tensor_type: {layer: underflow_percentage}}
     # Prepare data: collect all layers and tensor types
     all_layers = set()
     tensor_types_in_data = set()
@@ -212,13 +213,13 @@ def plot_overflow_analysis(results: dict, elem_format: str, output_path: Path):
         print("Warning: No data to plot")
         return
     
-    # Prepare plot data: {tensor_type: [overflow_pct for each layer]}
+    # Prepare plot data: {tensor_type: [underflow_pct for each layer]}
     plot_data = {}
     for tensor_type in tensor_types_in_data:
         plot_data[tensor_type] = []
         for layer in all_layers:
             if layer in results[tensor_type]['forward']:
-                plot_data[tensor_type].append(results[tensor_type]['forward'][layer]['overflow_percentage'])
+                plot_data[tensor_type].append(results[tensor_type]['forward'][layer]['underflow_percentage'])
             else:
                 plot_data[tensor_type].append(0.0)
     
@@ -245,8 +246,8 @@ def plot_overflow_analysis(results: dict, elem_format: str, output_path: Path):
                            ha='center', fontsize=8, color=color, alpha=0.7)
     
     ax.set_xlabel('Layer', fontsize=13, fontweight='bold')
-    ax.set_ylabel('Overflow Percentage (%)', fontsize=13, fontweight='bold')
-    ax.set_title(f'{elem_format.upper()} Overflow Analysis by Layer (Forward Pass)', 
+    ax.set_ylabel('Underflow Percentage (%)', fontsize=13, fontweight='bold')
+    ax.set_title(f'{elem_format.upper()} Underflow Analysis by Layer (Forward Pass)', 
                 fontsize=15, fontweight='bold', pad=20)
     ax.set_xticks(all_layers)
     ax.set_xticklabels(all_layers, fontsize=10)
@@ -262,7 +263,7 @@ def plot_overflow_analysis(results: dict, elem_format: str, output_path: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze overflow by tensor type and layer for BF16 tensors')
+    parser = argparse.ArgumentParser(description='Analyze underflow by tensor type and layer for BF16 tensors')
     parser.add_argument('--layer', required=True, help='Layer numbers: 1,8,15,16')
     parser.add_argument('--base-dir', default='enhanced_tensor_logs', help='Base directory')
     parser.add_argument('--elem-format', default='hifp8', 
@@ -288,8 +289,8 @@ def main():
     # Structure: {tensor_type: {'forward': {layer: aggregated_stats}}}
     results = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {
         'total_elements': 0,
-        'total_overflow': 0,
-        'overflow_percentage': 0.0,
+        'total_underflow': 0,
+        'underflow_percentage': 0.0,
         'num_tensors': 0
     })))
     
@@ -320,7 +321,7 @@ def main():
             if pass_type == 'forward' and layer in layers:
                 # Aggregate results by layer
                 results[tensor_type][pass_type][layer]['total_elements'] += result['total_elements']
-                results[tensor_type][pass_type][layer]['total_overflow'] += result['overflow_count']
+                results[tensor_type][pass_type][layer]['total_underflow'] += result['underflow_count']
                 results[tensor_type][pass_type][layer]['num_tensors'] += 1
     
     # Calculate percentages for each layer
@@ -328,14 +329,14 @@ def main():
         for pass_type in results[tensor_type]:
             for layer in results[tensor_type][pass_type]:
                 total_elements = results[tensor_type][pass_type][layer]['total_elements']
-                total_overflow = results[tensor_type][pass_type][layer]['total_overflow']
+                total_underflow = results[tensor_type][pass_type][layer]['total_underflow']
                 if total_elements > 0:
-                    results[tensor_type][pass_type][layer]['overflow_percentage'] = \
-                        (total_overflow / total_elements) * 100.0
+                    results[tensor_type][pass_type][layer]['underflow_percentage'] = \
+                        (total_underflow / total_elements) * 100.0
     
     # Print report
     print("\n" + "=" * 80)
-    print(f"{args.elem_format.upper()} OVERFLOW ANALYSIS BY LAYER AND TENSOR TYPE (FORWARD)")
+    print(f"{args.elem_format.upper()} UNDERFLOW ANALYSIS BY LAYER AND TENSOR TYPE (FORWARD)")
     print("=" * 80)
     
     # Prepare data for JSON output
@@ -351,8 +352,8 @@ def main():
         if 'forward' in results[tensor_type]:
             for layer in sorted(results[tensor_type]['forward'].keys()):
                 stats = results[tensor_type]['forward'][layer]
-                print(f"  Layer {layer}: {stats['overflow_percentage']:.4f}% overflow "
-                      f"({stats['total_overflow']:,}/{stats['total_elements']:,} elements, "
+                print(f"  Layer {layer}: {stats['underflow_percentage']:.4f}% underflow "
+                      f"({stats['total_underflow']:,}/{stats['total_elements']:,} elements, "
                       f"{stats['num_tensors']} tensors)")
                 
                 # Add to JSON data
@@ -361,23 +362,23 @@ def main():
                     'layer': layer,
                     'pass_type': 'forward',
                     'total_elements': int(stats['total_elements']),
-                    'total_overflow': int(stats['total_overflow']),
-                    'overflow_percentage': float(stats['overflow_percentage']),
+                    'total_underflow': int(stats['total_underflow']),
+                    'underflow_percentage': float(stats['underflow_percentage']),
                     'num_tensors': int(stats['num_tensors'])
                 })
     
     # Save to JSON file
     layers_str = '_'.join(map(str, layers))
-    json_filename = f"{args.elem_format}_overflow_by_layer_{layers_str}.json"
+    json_filename = f"{args.elem_format}_underflow_by_layer_{layers_str}.json"
     json_path = output_dir / json_filename
     with open(json_path, 'w') as f:
         json.dump(json_data, f, indent=2)
     print(f"\nResults saved to: {json_path}")
     
     # Generate plots
-    plot_filename = f"{args.elem_format}_overflow_by_layer_{layers_str}.png"
+    plot_filename = f"{args.elem_format}_underflow_by_layer_{layers_str}.png"
     plot_path = output_dir / plot_filename
-    plot_overflow_analysis(results, args.elem_format, plot_path)
+    plot_underflow_analysis(results, args.elem_format, plot_path)
     
     return 0
 
