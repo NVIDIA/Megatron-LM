@@ -801,6 +801,9 @@ class TransformerConfig(ModelParallelConfig):
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
+    offload_module_in_cuda_graph: bool = False
+    """The flag is derived from the fine_grained_activation_offloading flag.
+    If True, mark the module in the cuda graph will be offloaded."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -1188,6 +1191,22 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            if self.enable_cuda_graph or self.cuda_graph_impl == "local":
+                raise ValueError("Fine-grained activation offloading does not support local implementation of CUDA graph.")
+            if self.external_cuda_graph or self.cuda_graph_impl == "transformer_engine":
+                assert "attn" in self.cuda_graph_scope and "moe_router" in self.cuda_graph_scope, "attn and moe_router must be in cuda_graph_scope when enabling offloading."
+                assert "attn_norm" not in self.offload_modules, "input of attn_norm is exactly the entry point of cuda graph, which cannot be offloaded."
+                self.offload_module_in_cuda_graph = \
+                    "attn_proj" in self.offload_modules \
+                    or "core_attn" in self.offload_modules \
+                    or "mlp_norm" in self.offload_modules \
+                    or "qkv_linear" in self.offload_modules
+                if self.offload_module_in_cuda_graph:
+                    assert is_torch_min_version("2.9.0a0"), \
+                        "Fine-grained activation offloading needs torch>=2.9.0 to support cuda graph. " \
+                        f"Current torch version is {torch.__version__}."
+                    assert self.cuda_graph_warmup_steps > 0, \
+                        "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
 
         if (
             self.num_layers_in_first_pipeline_stage is not None

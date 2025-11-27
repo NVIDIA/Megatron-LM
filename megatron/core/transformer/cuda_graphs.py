@@ -1581,7 +1581,7 @@ class TECudaGraphHelper:
         )
 
         def get_make_graphed_callables_kwargs():
-            kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
+            kwargs = {'num_warmup_iters': 2, 'allow_unused_input': True, '_order': order}
 
             if is_te_min_version("2.6.0"):
                 # Starting from TE 2.6.0, make_graphed_callables() accepts different number
@@ -1630,6 +1630,13 @@ class TECudaGraphHelper:
                     )
             else:
                 kwargs['fp8_enabled'] = False
+            
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                fine_grained_offloading_disable_offload,
+                fine_grained_offloading_enable_offload,
+            )
+            kwargs['pre_warmup_hook'] = fine_grained_offloading_disable_offload
+            kwargs['post_warmup_hook'] = fine_grained_offloading_enable_offload
             return kwargs
 
         kwargs = get_make_graphed_callables_kwargs()
