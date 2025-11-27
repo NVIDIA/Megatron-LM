@@ -14,7 +14,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     get_fine_grained_offloading_context,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
-from megatron.core.utils import internal_api
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
@@ -22,6 +21,7 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.utils import internal_api
 
 
 def weak_method(method):
