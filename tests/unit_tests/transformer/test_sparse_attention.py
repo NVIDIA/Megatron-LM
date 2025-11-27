@@ -64,6 +64,7 @@ class TestRotateActivation:
             rotate_activation(x)
 
 
+@pytest.mark.parametrize("seqlen_and_topk", [[16, 32], [64, 32]])
 class TestComputeIndexerLoss:
     """Test compute_indexer_loss function."""
 
@@ -77,13 +78,13 @@ class TestComputeIndexerLoss:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_loss_shape(self):
+    def test_indexer_loss_shape(self, seqlen_and_topk):
         """Test that indexer loss returns a scalar."""
         batch_size = 2
-        seqlen = 16
+        seqlen = seqlen_and_topk[0]
         num_heads = 4
         head_dim = 128
-        index_topk = 8
+        index_topk = seqlen_and_topk[1]
 
         # Create dummy index scores
         index_scores = torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32).cuda()
@@ -122,13 +123,13 @@ class TestComputeIndexerLoss:
         assert loss >= 0  # KL divergence should be non-negative
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_loss_sparse(self):
+    def test_indexer_loss_sparse(self, seqlen_and_topk):
         """Test sparse indexer loss computation."""
         batch_size = 2
-        seqlen = 16
+        seqlen = seqlen_and_topk[0]
         num_heads = 4
         head_dim = 128
-        index_topk = 8
+        index_topk = seqlen_and_topk[1]
 
         # Create dummy index scores
         index_scores = torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32).cuda()
@@ -174,7 +175,10 @@ class TestComputeIndexerLoss:
         )
 
         # Sparse loss should be different from dense loss
-        assert loss_sparse != loss_dense
+        if seqlen > index_topk:
+            assert loss_sparse != loss_dense
+        else:
+            assert loss_sparse == loss_dense
         assert loss_sparse >= 0
         assert loss_dense >= 0
 
@@ -200,7 +204,7 @@ class TestIndexerLossAutoScaler:
 
         result = IndexerLossAutoScaler.apply(output, indexer_loss)
 
-        assert torch.allclose(result, output)
+        assert torch.allclose(result, output, atol=0, rtol=0)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_backward_pass(self):
@@ -241,6 +245,7 @@ class TestIndexerLossAutoScaler:
         ), f"Gradient should be scaled by loss scale, expected {expected_grad_per_element}, got {dummy_input.grad[0].item()}"
 
 
+@pytest.mark.parametrize("seqlen", [16, 64])
 class TestIndexer:
     """Test Indexer module basic functionality with TP=1."""
 
@@ -295,7 +300,7 @@ class TestIndexer:
         yield
         Utils.destroy_model_parallel()
 
-    def test_indexer_constructor(self):
+    def test_indexer_constructor(self, seqlen):
         """Test indexer initialization."""
         assert isinstance(self.indexer, Indexer)
         assert self.indexer.hidden_size == 256
@@ -304,58 +309,67 @@ class TestIndexer:
         assert self.indexer.index_topk == 32
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_forward(self):
+    def test_indexer_forward(self, seqlen):
         """Test indexer forward pass."""
-        seq_len = 64
         batch_size = 2
 
         self.indexer.cuda()
 
         # Create input tensors
-        x = torch.randn(seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
-        qr = torch.randn(seq_len, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
+        x = torch.randn(seqlen, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
+        qr = torch.randn(seqlen, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
 
         # Forward pass
         topk_indices = self.indexer(x, qr)
 
         # Check output shape
-        assert topk_indices.shape == (batch_size, seq_len, min(self.config.index_topk, seq_len))
+        assert topk_indices.shape == (batch_size, seqlen, min(self.config.index_topk, seqlen))
         assert topk_indices.dtype == torch.long
+        assert torch.all((topk_indices >= 0) & (topk_indices < seqlen))
+        # Make sure no duplicate indices are selected
+        assert torch.all(
+            torch.sort(topk_indices, dim=-1).values[:, :, 1:]
+            != torch.sort(topk_indices, dim=-1).values[:, :, :-1]
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_forward_with_scores(self):
+    def test_indexer_forward_with_scores(self, seqlen):
         """Test indexer forward pass with scores."""
-        seq_len = 16
         batch_size = 2
 
         self.indexer.cuda()
 
         # Create input tensors
-        x = torch.randn(seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
-        qr = torch.randn(seq_len, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
+        x = torch.randn(seqlen, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
+        qr = torch.randn(seqlen, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
 
         # Forward pass with scores
         index_scores, topk_indices = self.indexer.forward_with_scores(x, qr)
 
         # Check output shapes
-        assert index_scores.shape == (batch_size, seq_len, seq_len)
-        assert topk_indices.shape == (batch_size, seq_len, min(self.config.index_topk, seq_len))
+        assert index_scores.shape == (batch_size, seqlen, seqlen)
+        assert topk_indices.shape == (batch_size, seqlen, min(self.config.index_topk, seqlen))
         assert index_scores.dtype == torch.float32
         assert topk_indices.dtype == torch.long
+        assert torch.all((topk_indices >= 0) & (topk_indices < seqlen))
+        # Make sure no duplicate indices are selected
+        assert torch.all(
+            torch.sort(topk_indices, dim=-1).values[:, :, 1:]
+            != torch.sort(topk_indices, dim=-1).values[:, :, :-1]
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_with_mask(self):
+    def test_indexer_with_mask(self, seqlen):
         """Test indexer with attention mask."""
-        seq_len = 16
         batch_size = 2
 
         self.indexer.cuda()
 
         # Create input tensors
-        x = torch.randn(seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
-        qr = torch.randn(seq_len, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
+        x = torch.randn(seqlen, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
+        qr = torch.randn(seqlen, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
         mask = torch.triu(
-            torch.full((batch_size, seq_len, seq_len), float('-inf'), dtype=torch.float32).cuda(),
+            torch.full((batch_size, seqlen, seqlen), float('-inf'), dtype=torch.float32).cuda(),
             diagonal=1,
         )
 
@@ -366,7 +380,7 @@ class TestIndexer:
         # For causal mask, topk_indices[b, i, :] should all be <= i (except for the case that
         # i < index_topk).
         for b in range(batch_size):
-            for i in range(seq_len):
+            for i in range(seqlen):
                 assert torch.all(topk_indices[b, i] <= max(self.index_topk, i))
 
 

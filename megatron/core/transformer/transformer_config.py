@@ -1682,6 +1682,12 @@ class TransformerConfig(ModelParallelConfig):
                     f"the number of layers ({self.num_layers})"
                 )
 
+        if self.sparse_attention_type is not None:
+            assert (
+                self.context_parallel_size == 1
+            ), "Currently context parallelism is not supported by SparseAttention!"
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for SparseAttention"
+
 
 @dataclass
 class MLATransformerConfig(TransformerConfig):

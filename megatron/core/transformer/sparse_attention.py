@@ -538,7 +538,6 @@ class Indexer(MegatronModule):
             topk_indices: Top-k indices [batch, seqlen, index_topk].
         """
         assert packed_seq_params is None, "Packed sequence is not supported for SparseAttention"
-        assert not self.config.apply_rope_fusion, "RoPE fusion is not supported for SparseAttention"
 
         # =========================================
         # Prepare RoPE params
@@ -737,9 +736,6 @@ class SparseAttention(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(config=config)
-        assert (
-            self.config.context_parallel_size == 1
-        ), "Currently context parallelism is not supported by SparseAttention!"
 
         self.layer_number = layer_number
 
