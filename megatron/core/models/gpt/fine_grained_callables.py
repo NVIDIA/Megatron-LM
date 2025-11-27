@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     get_fine_grained_offloading_context,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.utils import internal_api
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
@@ -40,6 +41,7 @@ def weak_method(method):
     return wrapped_func
 
 
+@internal_api
 def should_free_input(name, is_moe, use_flex_dispatcher):
     """Determine if the node should free its input memory.
 
