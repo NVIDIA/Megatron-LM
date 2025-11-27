@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}_{platforms}"
+  name: '{test_case}_{environment}_{platforms}'
   model: bert
   nodes: 1
   build: mcore-pyt-{environment}
@@ -59,22 +59,22 @@ products:
   - test_case: [bert_mcore_tp2_pp2]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [bert_mcore_tp2_pp2_local_spec]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [bert_mcore_tp2_pp2_resume_torch_dist]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [bert_mcore_tp2_pp2_resume_torch_dist_local_spec]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [bert_mcore_tp1_pp2]
     products:
