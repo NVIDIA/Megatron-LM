@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
 from typing import Optional, Tuple
@@ -24,7 +24,12 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version, make_tp_sharded_tensor_for_checkpoint
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+from megatron.core.utils import (
+    get_tensor_model_parallel_group_if_none,
+    is_te_min_version,
+    make_tp_sharded_tensor_for_checkpoint,
+)
 
 
 class LanguageModule(MegatronModule):
@@ -44,6 +49,7 @@ class LanguageModule(MegatronModule):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp
+        self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
         self.pp_group = pg_collection.pp
         assert hasattr(self.pg_collection, 'embd'), (
             "pg_collection must have a embd. In previous version, it used default "
@@ -62,6 +68,8 @@ class LanguageModule(MegatronModule):
         if torch.distributed.get_rank() in torch.distributed.get_process_group_ranks(
             self.embd_group
         ):
+            if getattr(self, 'mtp_process', False):
+                return True
             if (
                 torch.distributed.get_rank()
                 == torch.distributed.get_process_group_ranks(self.embd_group)[0]
@@ -136,7 +144,8 @@ class LanguageModule(MegatronModule):
                     # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
                     is_cg_capturable = (
                         hasattr(self.config, 'cuda_graph_scope')
-                        and self.config.cuda_graph_scope == 'full_iteration'
+                        and self.config.cuda_graph_scope
+                        and 'full_iteration' in self.config.cuda_graph_scope
                     )
                     if is_cg_capturable and not is_te_min_version("2.7.0"):
                         from megatron.core.utils import get_te_version
@@ -201,7 +210,10 @@ class LanguageModule(MegatronModule):
         ):
             self.shared_embedding_or_output_weight().shared_embedding = True
 
-        if (self.post_process or getattr(self, 'mtp_process', False)) and not self.pre_process:
+        if (
+            (self.post_process and self.share_embeddings_and_output_weights)
+            or getattr(self, 'mtp_process', False)
+        ) and not self.pre_process:
             assert not (
                 is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(self.pp_group)
             )
@@ -272,6 +284,10 @@ class LanguageModule(MegatronModule):
             ShardedStateDict: sharded state dict for the LanguageModel
         """
         assert not sharded_offsets, "Unexpected sharded offsets"
+
+        # Guard for cases metadata is not provided
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
@@ -280,7 +296,7 @@ class LanguageModule(MegatronModule):
 
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
-                sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key
+                sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key, metadata
             )
         elif self.post_process:
             # Make sure the output layer follows the embeddings padding logic
@@ -297,6 +313,7 @@ class LanguageModule(MegatronModule):
         sharded_state_dict: ShardedStateDict,
         output_layer_weight_key: str,
         first_stage_word_emb_key: str,
+        metadata: Optional[dict] = None,
     ) -> None:
         """Ties the embedding and output weights in a given sharded state dict.
 
@@ -306,9 +323,11 @@ class LanguageModule(MegatronModule):
                 This entry will be replaced with a tied version
             first_stage_word_emb_key (str): this must be the same as the
                 ShardedTensor.key of the first stage word embeddings.
+            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
 
         Returns: None, acts in-place
         """
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         if not self.post_process:
             # No output layer
             assert output_layer_weight_key not in sharded_state_dict, sharded_state_dict.keys()
@@ -341,4 +360,6 @@ class LanguageModule(MegatronModule):
             key=first_stage_word_emb_key,
             replica_id=last_stage_word_emb_replica_id,
             allow_shape_mismatch=True,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 import math
@@ -21,6 +21,11 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_group_commit,
+    fine_grained_offloading_group_start,
+    get_fine_grained_offloading_context,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -177,12 +182,17 @@ class MultiLatentAttention(Attention):
 
         if (
             HAVE_TE
-            and self.config.fp8
-            and self.config.fp8_recipe != 'delayed'
-            and is_te_min_version("2.6.0dev0")
             and isinstance(self.linear_proj, TELinear)
+            and (
+                (
+                    self.config.fp8
+                    and self.config.fp8_recipe != 'delayed'
+                    and is_te_min_version("2.6.0dev0")
+                )
+                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
+            )
         ):
-            # For fp8 training, the output of the fused core_attn is saved by itself, and
+            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
             # linear_proj also saves the quantized tensor of this output. Here we set the
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
@@ -276,30 +286,34 @@ class MultiLatentAttention(Attention):
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
             )
         else:
+            if self.offload_core_attention and self.training:
+                query = fine_grained_offloading_group_start(query, name="core_attn")
+
             if inference_context is None or inference_context.is_static_batching():
-                if self.config.sparse_attention_type is None:
-                    core_attn_out = self.core_attention(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        packed_seq_params=packed_seq_params,
-                        attn_mask_type=attn_mask_type,
-                    )
-                else:
-                    # For sparse attention, use a specialized forward.
-                    # TODO(kunlunl): Is there a unified interface for sparse attention?
-                    core_attn_out = self.core_attention(
-                        query,
-                        key,
-                        value,
-                        x=hidden_states,
-                        qr=q_compressed,
-                        attention_mask=attention_mask,
-                        attn_mask_type=attn_mask_type,
-                        attention_bias=None,
-                        packed_seq_params=packed_seq_params,
-                    )
+                with get_fine_grained_offloading_context(self.offload_core_attention):
+                    if self.config.sparse_attention_type is None:
+                        core_attn_out = self.core_attention(
+                            query,
+                            key,
+                            value,
+                            attention_mask,
+                            packed_seq_params=packed_seq_params,
+                            attn_mask_type=attn_mask_type,
+                        )
+                    else:
+                        # For sparse attention, use a specialized forward.
+                        # TODO(kunlunl): Is there a unified interface for sparse attention?
+                        core_attn_out = self.core_attention(
+                            query,
+                            key,
+                            value,
+                            x=hidden_states,
+                            qr=q_compressed,
+                            attention_mask=attention_mask,
+                            attn_mask_type=attn_mask_type,
+                            attention_bias=None,
+                            packed_seq_params=packed_seq_params,
+                        )
             elif self.cache_mla_latents:
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
@@ -320,6 +334,10 @@ class MultiLatentAttention(Attention):
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+            if self.offload_core_attention and self.training:
+                (core_attn_out,) = fine_grained_offloading_group_commit(
+                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                )
 
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
@@ -345,7 +363,14 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            core_attn_out = fine_grained_offloading_group_start(core_attn_out, name="attn_proj")
+        with get_fine_grained_offloading_context(self.offload_attn_proj):
+            output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output, bias = fine_grained_offloading_group_commit(
+                output, bias, name="attn_proj", forced_released_tensors=[core_attn_out]
+            )
 
         return output, bias
 
@@ -810,7 +835,8 @@ class MLASelfAttention(MultiLatentAttention):
             return query, key, value
 
         if self.recompute_up_proj:
-            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=self.config.fp8)
+            quantization = self.config.fp8 or self.config.fp4
+            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             query, key, value = self.qkv_up_checkpoint.checkpoint(
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )
@@ -950,9 +976,129 @@ class MLASelfAttention(MultiLatentAttention):
         self.linear_proj.backward_dw()
 
     def set_for_recompute_input_layernorm(self):
-        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
         if self.config.q_lora_rank is not None:
             set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_down_proj)
+
+    def clip_qk(self):
+        """
+        QK Clipping is a technique to clip the query and key attention logits to prevent the
+        attention logits from exploding. Per MuonClip usage, we update the weight by calling this
+        function after Muon optimizer step.
+        """
+
+        if not self.config.qk_clip:
+            raise ValueError("qk_clip option needs to be enabled")
+
+        if self.core_attention.current_max_attn_logits is None:
+            raise ValueError("current_max_attn_logits is None")
+
+        # Check if we're in absorption mode
+        if self.cache_mla_latents and not hasattr(self, 'linear_kv_up_proj'):
+            raise ValueError(
+                "qk_clip is not supported when cache_mla_latents is enabled and absorption is "
+                "active. The linear_kv_up_proj layer has been deleted during absorption "
+                "preparation."
+            )
+
+        assert self.core_attention.current_max_attn_logits.shape == (
+            self.num_attention_heads_per_partition,
+        ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
+                    but {self.core_attention.current_max_attn_logits.shape}"
+
+        # only update the weight if any head has
+        # current_max_attn_logits > qk_clip_threshold
+        if torch.any(self.core_attention.current_max_attn_logits > self.config.qk_clip_threshold):
+            # Use num_attention_heads_per_partition for tensor parallel scenarios
+
+            # qk_clip_balancing_eta (n, 1, 1)
+            assert self.core_attention.current_max_attn_logits.shape == (
+                self.num_attention_heads_per_partition,
+            ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition},) \
+                but {self.core_attention.current_max_attn_logits.shape}"
+            self.qk_clip_balancing_eta = torch.clamp(
+                self.config.qk_clip_threshold / self.core_attention.current_max_attn_logits, max=1.0
+            ).view(self.num_attention_heads_per_partition, 1, 1)
+            assert torch.all(self.qk_clip_balancing_eta <= 1.0)
+
+            # Update q side weight, keep qk_pos_emb_head_dim side weight unchanged
+            if self.config.q_lora_rank is None:
+                q_proj_weight = self.linear_q_proj.weight
+            else:
+                q_proj_weight = self.linear_q_up_proj.weight
+
+            # Handle different weight access patterns (main_param vs direct access)
+            if hasattr(q_proj_weight, 'main_param'):
+                q_proj_weight.main_param.data.copy_(
+                    self._clip_q_proj_weight(q_proj_weight.main_param.data)
+                )
+            q_proj_weight.data.copy_(self._clip_q_proj_weight(q_proj_weight.data))
+
+            # Update k side weight, keep v side weight unchanged
+            kv_proj_weight = self.linear_kv_up_proj.weight
+
+            # Handle different weight access patterns
+            if hasattr(kv_proj_weight, 'main_param'):
+                kv_proj_weight.main_param.data.copy_(
+                    self._clip_kv_proj_weight(kv_proj_weight.main_param.data)
+                )
+            kv_proj_weight.data.copy_(self._clip_kv_proj_weight(kv_proj_weight.data))
+
+        # reset current_max_attn_logits
+        self.core_attention.current_max_attn_logits = None
+
+    def _clip_q_proj_weight(self, weight):
+        """Clip q_proj_weight"""
+        # Reshape to (n, a + b, -1)
+        weight_reshaped = weight.view(
+            self.num_attention_heads_per_partition,
+            self.config.qk_head_dim + self.config.qk_pos_emb_head_dim,
+            -1,
+        )
+
+        # Split into qk_head_dim and qk_pos_emb_head_dim parts: (n, a, -1) and (n, b, -1)
+        weight_q_nope = weight_reshaped[:, : self.config.qk_head_dim, :]
+        weight_q_pe = weight_reshaped[:, self.config.qk_head_dim :, :]
+
+        # Clipping
+        weight_q_nope.mul_(torch.pow(self.qk_clip_balancing_eta, self.config.qk_clip_alpha))
+        weight_q_pe.mul_(self.qk_clip_balancing_eta)
+
+        # Concatenate back and reshape to original shape
+        weight_q_updated = torch.cat([weight_q_nope, weight_q_pe], dim=1)
+        weight_q_updated = weight_q_updated.view(
+            self.num_attention_heads_per_partition
+            * (self.config.qk_head_dim + self.config.qk_pos_emb_head_dim),
+            -1,
+        )
+
+        return weight_q_updated
+
+    def _clip_kv_proj_weight(self, weight):
+        """Clip kv_proj_weight"""
+        # shape: (n, qk_head_dim + v_head_dim, kv_lora_rank)
+        weight_reshaped = weight.view(
+            self.num_attention_heads_per_partition,
+            self.config.qk_head_dim + self.config.v_head_dim,
+            -1,
+        )
+
+        # Split into qk_head_dim and v_head_dim parts: (n, a, -1) and (n, b, -1)
+        weight_k = weight_reshaped[:, : self.config.qk_head_dim, :]
+        weight_v = weight_reshaped[:, self.config.qk_head_dim :, :]
+
+        # Clipping
+        weight_k.mul_(torch.pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha))
+
+        # Concatenate back and reshape to original shape
+        weight_kv_updated = torch.cat([weight_k, weight_v], dim=1)
+        weight_kv_updated = weight_kv_updated.view(
+            self.num_attention_heads_per_partition
+            * (self.config.qk_head_dim + self.config.v_head_dim),
+            -1,
+        )
+
+        return weight_kv_updated

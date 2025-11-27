@@ -130,9 +130,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             self.original_max_position_embeddings,
             self.correction_range_round_to_int,
         )
-        inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, self.dim // 2).to(
-            device=self.inv_freq_extra.device, dtype=torch.float32
-        )
+        inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(
+            low, high, self.dim // 2, device=self.inv_freq_extra.device
+        ).to(dtype=torch.float32)
         inv_freq = self.inv_freq_inter * (1 - inv_freq_mask) + self.inv_freq_extra * inv_freq_mask
 
         seq = (
@@ -211,11 +211,11 @@ def _yarn_find_correction_range(
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
-def _yarn_linear_ramp_mask(min: float, max: float, dim: int) -> Tensor:
+def _yarn_linear_ramp_mask(min: float, max: float, dim: int, device: torch.device) -> Tensor:
     if min == max:
         max += 0.001  # Prevent singularity
 
-    linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+    linear_func = (torch.arange(dim, dtype=torch.float32, device=device) - min) / (max - min)
     ramp_func = torch.clamp(linear_func, 0, 1)
     return ramp_func
 
@@ -228,22 +228,25 @@ def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 @lru_cache(maxsize=8)
 def _yarn_get_concentration_factor(
-    scaling_factor: float, mscale: float, mscale_all_dim: float
+    scaling_factor: float, mscale: Optional[float], mscale_all_dim: Optional[float]
 ) -> float:
     """
     Get the concentration factor (factor multiplied to the sine and cosine components of the
     embedding). This factor is also known as attention factor, and sometimes homonymously known as
     "mscale"
     """
+    if mscale is None or mscale_all_dim is None:
+        return _yarn_get_mscale(scaling_factor)
     return float(
         _yarn_get_mscale(scaling_factor, mscale) / _yarn_get_mscale(scaling_factor, mscale_all_dim)
     )
 
 
 def _yarn_get_concentration_factor_from_config(config: TransformerConfig) -> float:
-    fields = ["yarn_rotary_scaling_factor", "yarn_mscale", "yarn_mscale_all_dim"]
-    if all(hasattr(config, f) for f in fields):
+    if hasattr(config, "yarn_rotary_scaling_factor"):
         return _yarn_get_concentration_factor(
-            config.yarn_rotary_scaling_factor, config.yarn_mscale, config.yarn_mscale_all_dim
+            config.yarn_rotary_scaling_factor,
+            getattr(config, "yarn_mscale", None),
+            getattr(config, "yarn_mscale_all_dim", None),
         )
     return 1.0

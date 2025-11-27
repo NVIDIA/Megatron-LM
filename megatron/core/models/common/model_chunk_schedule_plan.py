@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
 from typing import Optional
@@ -8,13 +8,15 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
     get_comm_stream,
     get_comp_stream,
 )
-from megatron.core.transformer.multi_token_prediction import get_mtp_num_layers_to_build
 
 
 class ModelChunkState:
@@ -316,36 +318,39 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.context_mask = None
         self._model_chunk_state.attention_bias = None
 
-        transformer_num_layers = model.decoder.num_layers_per_pipeline_rank
-        mtp_num_layers = get_mtp_num_layers_to_build(model.config, vp_stage=self.vp_stage)
-
         # build preprocess
         self.pre_process = PreProcessNode(model, self._model_chunk_state, self._event, comp_stream)
-        # build layer schedule plan for each layer
-        for layer_idx in range(transformer_num_layers):
-            layer = model.decoder._get_layer(layer_idx)
-            layer_plan = TransformerLayerSchedulePlan(
-                layer, self._event, self._model_chunk_state, comp_stream, comm_stream
-            )
-            self._transformer_layers.append(layer_plan)
 
-        # build mtp layers
-        for layer_idx in range(mtp_num_layers):
-            extra_args = {
-                "is_first_layer": layer_idx == 0,
-                "is_last_layer": layer_idx == mtp_num_layers - 1,
-            }
-            layer = model.mtp.layers[layer_idx]
-            layer_plan = TransformerLayerSchedulePlan(
-                layer, self.event, self.state, comp_stream, comm_stream, extra_args
-            )
-            self._transformer_layers.append(layer_plan)
+        # build layer schedule plan for each layer.
+        # The methods to obtain layers are different for MTP so we need the other build plan for
+        # MTP. Also, this can help annotate MTP layer so that it can know where MTP is.
+        self._build_layer_schedule_plan(model.decoder, comp_stream, comm_stream)
+        self._build_layer_schedule_plan(getattr(model, "mtp", None), comp_stream, comm_stream)
 
         # build post process
         if model.post_process:
             self.post_process = PostProcessNode(
                 model, self._model_chunk_state, self._event, comp_stream
             )
+
+    def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
+        if module is None:
+            return
+        num_layers = len(module.layers)
+        for layer_idx in range(num_layers):
+            extra_args = {
+                "is_first_layer": layer_idx == 0,
+                "is_last_layer": layer_idx == num_layers - 1,
+            }
+            layer_plan = TransformerLayerSchedulePlan(
+                module.layers[layer_idx],
+                self.event,
+                self.state,
+                comp_stream,
+                comm_stream,
+                extra_args,
+            )
+            self._transformer_layers.append(layer_plan)
 
     @property
     def event(self):
@@ -450,6 +455,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_layer = f_schedule_plan.get_layer(i)
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_num_layers - 1 - i}b")
+            if f_layer.layer.config.fine_grained_activation_offloading:
+                fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
                 b_layer,
@@ -472,6 +479,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         for i in range(overlapped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
             torch.cuda.nvtx.range_push(f"layer_{i}f")
+            if f_layer.layer.config.fine_grained_activation_offloading:
+                fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
             torch.cuda.nvtx.range_pop()
 

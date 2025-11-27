@@ -1,12 +1,14 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import logging
 import os
 import time
 from typing import List, Union
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
 
@@ -102,10 +104,11 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = asyncio.get_event_loop().create_future()
+        self.completion_futures[request_id] = get_asyncio_loop().create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
+    @trace_async_exceptions
     async def _listen_for_completed_requests(self):
         """
         Listens for completed inference requests from the coordinator.
@@ -123,7 +126,7 @@ class InferenceClient:
                     request_id
                 )
                 completion_future = self.completion_futures.pop(request_id)
-                completion_future.set_result(DynamicInferenceRequest(**reply))
+                completion_future.set_result(DynamicInferenceRequest.deserialize(reply))
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -150,7 +153,7 @@ class InferenceClient:
         the initial handshake and spawns the `listen_for_completed_requests`
         coroutine.
         """
-        print("Client: Connecting to InferenceCoordinator...")
+        logging.info("Client: Connecting to InferenceCoordinator...")
         self._connect_with_inference_coordinator()
         self.listener_task = asyncio.create_task(self._listen_for_completed_requests())
 

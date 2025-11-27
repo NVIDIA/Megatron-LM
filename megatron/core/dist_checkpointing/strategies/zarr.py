@@ -77,9 +77,9 @@ class ZarrSaveShardedStrategy(SaveShardedStrategy):
 
     def __init__(self, backend: str, version: int):
         super().__init__(backend, version)
-        logger.warning(
-            f"`zarr` distributed checkpoint backend is deprecated."
-            " Please switch to PyTorch Distributed format (`torch_dist`)."
+        raise CheckpointingException(
+            "`zarr` distributed checkpoint backend is no longer supported. "
+            "Please switch to PyTorch Distributed format (`torch_dist`)."
         )
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
@@ -197,6 +197,13 @@ def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
 class ZarrLoadShardedStrategy(LoadShardedStrategy):
     """Load strategy for the Zarr backend."""
 
+    def __init__(self, backend: str, version: int):
+        super().__init__(backend, version)
+        raise CheckpointingException(
+            "`zarr` distributed checkpoint backend is no longer supported. "
+            "Please switch to PyTorch Distributed format (`torch_dist`)."
+        )
+
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         if isinstance(checkpoint_dir, str):
             checkpoint_dir = Path(checkpoint_dir)
@@ -310,7 +317,7 @@ def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
         return torch.nn.functional.pad(x, pad_args)
 
     # unsqueeze and squeeze to get shapes supported by cudnn
-    print(f"Replicating last row for {expected_sharded_ten.key}")
+    logger.info(f"Replicating last row for {expected_sharded_ten.key}")
     if x.dtype == torch.bfloat16:
         return (
             torch.nn.functional.pad(x.float().unsqueeze(0), pad_args, mode="replicate")

@@ -23,9 +23,10 @@ jobs:
   approve-queue:
     runs-on: ubuntu-latest
     environment: main
+    if: github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
-        branch: [main, dev]
+        branch: [main, dev, others]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -44,6 +45,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
           MAX_CONCURRENCY: ${{ vars.MAX_CONCURRENCY || 1 }}
+          PYTHONUNBUFFERED: 1
         shell: python
         run: |
           import os
@@ -99,7 +101,10 @@ jobs:
                   return False
 
               base_branch = pr_info.get("base", {}).get("ref")
-              if base_branch == target_branch:
+              if (
+                (base_branch == target_branch) or 
+                (base_branch != "main" and base_branch != "dev" and target_branch == "others")
+              ):
                   print(f"PR #{pr_number} targets {target_branch}")
                   return True
 

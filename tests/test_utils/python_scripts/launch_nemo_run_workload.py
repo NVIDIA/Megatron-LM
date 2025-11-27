@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 import os
 import pathlib
@@ -150,12 +152,6 @@ def main(
         sys.exit(1)
 
     sys.exit(1)
-
-    result_dict = exp.status(return_dict=True)
-    _, job_dict = list(result_dict.items())[0]
-
-    logger.info(f"Job status: {job_dict["status"]}")
-    sys.exit(0 if str(job_dict["status"]) == "SUCCEEDED" else 1)
 
 
 if __name__ == "__main__":

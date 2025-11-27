@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
 import inspect
@@ -42,6 +42,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
@@ -299,6 +300,7 @@ class TELinear(te.pytorch.Linear):
                 extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
             else:
                 raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
+
         if (
             self.config.tp_comm_overlap
             and tp_comm_buffer_name
@@ -419,6 +421,9 @@ class TELinear(te.pytorch.Linear):
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
 
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
+
     def forward(self, x):
         """Forward."""
         _is_first_microbatch = (
@@ -443,7 +448,14 @@ class TELinear(te.pytorch.Linear):
             self.parallel_mode is None
         ), "TELinear sharded_state_dict can only be used with duplicated parallel mode"
         state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict,
+            prefix,
+            None,
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
@@ -491,6 +503,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         # TODO: For backward compatibility, remove in v0.15.
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -624,9 +637,15 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0, "bias": 0},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def __repr__(self):
@@ -669,6 +688,7 @@ class TEColumnParallelLinear(TELinear):
         if gather_output:
             raise ValueError("Transformer Engine linear layers do not support gather_output = True")
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
 
@@ -719,7 +739,12 @@ class TEColumnParallelLinear(TELinear):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0, "bias": 0},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def __repr__(self):
@@ -763,6 +788,7 @@ class TERowParallelLinear(TELinear):
                 "Transformer Engine linear layers do not support input_is_parallel = False"
             )
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
 
         super().__init__(
             input_size=input_size,
@@ -813,7 +839,12 @@ class TERowParallelLinear(TELinear):
         """Sharding along axis 1, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 1}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 1},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def __repr__(self):
@@ -900,6 +931,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 assert hasattr(
                     pg_collection, "hcp"
                 ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
+        self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
@@ -989,6 +1021,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
+        if config.qk_clip or config.log_max_attention_logit:
+            # qk-clip is only supported in TE 2.9.0 and later
+            assert is_te_min_version("2.9.0"), "qk-clip is only supported in TE 2.9.0 and later"
+
+            # TE 2.9.0 introduces return_max_logit for qk-clip getting the max attention logits
+            extra_kwargs["return_max_logit"] = True
+            self.current_max_attn_logits = None
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=kv_channels,
@@ -1058,6 +1098,22 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 **attention_bias_kwargs,
                 **packed_seq_kwargs,
             )
+
+            if self.config.qk_clip or self.config.log_max_attention_logit:
+                # qk-clip is only supported in TE 2.9.0 and later
+                assert is_te_min_version("2.9.0"), "qk-clip is only supported in TE 2.9.0 and later"
+
+                # Update Q K outside of TE Attention API
+                core_attn_out, batch_max_attention_logits = core_attn_out
+
+                # Update QK_Clip balancing eta
+                if self.current_max_attn_logits is None:
+                    self.current_max_attn_logits = batch_max_attention_logits
+                else:
+                    self.current_max_attn_logits = torch.max(
+                        self.current_max_attn_logits, batch_max_attention_logits
+                    )
+
         else:
             core_attn_out = super().forward(
                 query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs
@@ -1077,7 +1133,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {'softmax_offset': 0},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
 
@@ -1137,6 +1198,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
             tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+            self._tp_group = tp_group
             tp_size = get_pg_size(tp_group)
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
@@ -1371,7 +1433,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         (ep_axis, global_expert_idx, num_global_experts),
                     )
                 sub_sd = make_sharded_tensors_for_checkpoint(
-                    state_dict, '', tp_axis_map, new_sharded_offsets
+                    state_dict,
+                    '',
+                    tp_axis_map,
+                    new_sharded_offsets,
+                    tp_group=self._tp_group,
+                    dp_cp_group=metadata["dp_cp_group"],
                 )
                 # Remove expert layers indexing from sharded keys
                 replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
@@ -2116,3 +2183,12 @@ def set_save_original_input(module):
             "set_save_original_input is only needed on transformer-engine modules that save "
             "quantized tensors by default. It needs transformer-engine>=2.6.0dev0."
         )
+
+
+try:
+    # pylint: disable=unused-import
+    from transformer_engine.pytorch import cpu_offload
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+except ImportError:
+    Float8Tensor = None
+    cpu_offload = None

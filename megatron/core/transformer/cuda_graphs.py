@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import inspect
@@ -22,10 +22,11 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
 )
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_attr_wrapped_model,
+    get_torch_version,
     is_te_min_version,
     log_on_each_pipeline_stage,
     log_single_rank,
@@ -57,6 +58,18 @@ except:
 _IS_GRAPH_CAPTURING = False
 
 logger = logging.getLogger(__name__)
+
+# Freeze GC during capture.
+# TODO (@lmcafee): remove all freeze-GC code once most users are on PyTorch 2.9+.
+FREEZE_GC = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
+try:
+    from packaging.version import Version as PkgVersion
+
+    FREEZE_GC_MAX_TORCH_VERSION = PkgVersion("2.9.0a0")
+    if get_torch_version() >= FREEZE_GC_MAX_TORCH_VERSION:
+        FREEZE_GC = False
+except ImportError:
+    pass
 
 
 def is_graph_capturing():
@@ -616,8 +629,7 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()'."""
 
         # Freeze GC, to speed up capture time ~15-20x.
-        freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
-        if freeze_gc:
+        if FREEZE_GC:
             gc.freeze()
 
         # save grads and other variables that may be affected by graph warmup
@@ -706,7 +718,7 @@ class _CudaGraphRunner(torch.nn.Module):
             restore_fp8_tensors([self.base_module], saved_fp8_tensors)
 
         # Unfreeze GC.
-        if freeze_gc:
+        if FREEZE_GC:
             gc.unfreeze()
 
             # gc.collect() drops references to unreachable tensors created during capture,
@@ -721,8 +733,7 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()'."""
 
         # Freeze GC, to speed up capture time ~15-20x.
-        freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
-        if freeze_gc:
+        if FREEZE_GC:
             gc.freeze()
 
         self.bwd_graph = torch.cuda.CUDAGraph()
@@ -782,7 +793,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.static_grad_inputs = static_grad_inputs
 
         # Unfreeze GC.
-        if freeze_gc:
+        if FREEZE_GC:
             gc.unfreeze()
 
             if self.is_first_layer:
@@ -1059,9 +1070,12 @@ class CudaGraphManager(torch.nn.Module):
         ), "RNG tracker does not support cudagraphs!"
 
         assert config.cuda_graph_impl == "local", "Option cuda_graph_impl=local not enabled."
-        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-            "a crash due to illegal memory access or other undefined behaviour."
+        assert (
+            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+        ), (
+            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
 
         self.cudagraph_runners = []
@@ -1171,7 +1185,11 @@ class CudaGraphManager(torch.nn.Module):
 
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
-                    assert False
+                    assert False, (
+                        f"`cudagraph_created` is set to True but no matching cudagraph "
+                        f"runners were found. This module has {len(self.cudagraph_runners)} "
+                        f"existing runners. Use `get_mismatch_errors` to debug mismatches."
+                    )
                 else:
                     runner = _CudaGraphRunner(
                         megatron_module,
@@ -1311,23 +1329,40 @@ def _layer_is_graphable(layer, config):
     Check if a layer is graphable.
     """
 
+    # Only GraphableMegatronModule can be graphed.
+    if not isinstance(layer, GraphableMegatronModule):
+        return False
+
+    # If cuda_graph_scope is not set, every layer is graphed.
+    if not config.cuda_graph_scope:
+        return True
+
     # import modules here to avoid a circular import
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
+    from megatron.core.transformer.mlp import MLP
+    from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    if isinstance(layer, MambaLayer) and config.cuda_graph_scope == "full":
+    if isinstance(layer, MambaLayer) and 'mamba' in config.cuda_graph_scope:
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if config.cuda_graph_scope == 'attn':
-            if not (
-                isinstance(layer.self_attention, IdentityOp)
-                and isinstance(layer.cross_attention, IdentityOp)
-            ):
-                # attn layer.
-                return True
-        else:
+        if 'attn' in config.cuda_graph_scope and not (
+            isinstance(layer.self_attention, IdentityOp)
+            and isinstance(layer.cross_attention, IdentityOp)
+        ):
+            # attn layer.
+            return True
+        if (
+            'moe' in config.cuda_graph_scope
+            or 'moe_router' in config.cuda_graph_scope
+            or 'moe_preprocess' in config.cuda_graph_scope
+        ) and isinstance(layer.mlp, MoELayer):
+            # moe layer.
+            return True
+        if 'mlp' in config.cuda_graph_scope and isinstance(layer.mlp, MLP):
+            # mlp layer.
             return True
     return False
 
@@ -1346,18 +1381,17 @@ class TECudaGraphHelper:
         assert (
             config.cuda_graph_impl == "transformer_engine"
         ), "Option cuda_graph_impl=transformer_engine not enabled."
-        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-            "a crash due to illegal memory access or other undefined behaviour."
+        assert (
+            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+        ), (
+            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
-        assert config.cuda_graph_scope != "full_iteration", (
+        assert "full_iteration" not in config.cuda_graph_scope, (
             "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
             "Please use cuda_graph_impl=local instead."
         )
-        assert config.cuda_graph_scope in [
-            'full',
-            'attn',
-        ], f"--cuda-graph-scope should be full or attn, got {config.cuda_graph_scope}."
 
         self.model = model
         self.config = config
@@ -1440,6 +1474,16 @@ class TECudaGraphHelper:
             f'{len(self.flattened_callables)} graphable layers.',
         )
 
+        # One helper object can only capture CUDA Graphs once. Use this flag to check if the graphs
+        # have been created.
+        self._graphs_created = False
+
+    def graphs_created(self):
+        """
+        Returns whether the CUDA Graphs have been created.
+        """
+        return self._graphs_created
+
     def _get_cuda_graph_input_data(self):
         """
         Create the CUDA Graph capturing input data.
@@ -1480,8 +1524,13 @@ class TECudaGraphHelper:
                     from megatron.core.transformer.identity_op import IdentityOp
                     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-                    contains_self_attn = isinstance(layer, TransformerLayer) and not isinstance(
-                        layer.self_attention, IdentityOp
+                    contains_self_attn = (
+                        isinstance(layer, TransformerLayer)
+                        and not isinstance(layer.self_attention, IdentityOp)
+                        and (
+                            not self.config.cuda_graph_scope
+                            or 'attn' in self.config.cuda_graph_scope
+                        )
                     )
                     if is_te_min_version("1.10.0"):
                         # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
@@ -1590,6 +1639,8 @@ class TECudaGraphHelper:
         """
         Start capturing CUDA Graphs.
         """
+        assert not self._graphs_created, "CUDA Graphs have already been created."
+
         torch.distributed.barrier()
         gc.collect()
         torch.cuda.empty_cache()
@@ -1622,6 +1673,8 @@ class TECudaGraphHelper:
         reset_model_temporary_tensors(self.config, self.model)
         gc.collect()
         torch.cuda.empty_cache()
+
+        self._graphs_created = True
 
     def create_cudagraphs(self):
         """

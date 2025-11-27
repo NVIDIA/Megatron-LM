@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -16,6 +16,9 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import LayerType
@@ -281,6 +284,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
 
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
@@ -373,7 +377,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
-        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+        if self.has_final_layernorm_in_this_stage():
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
                 config=self.config,
@@ -382,6 +386,35 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )
         else:
             self.final_layernorm = None  # Either this or nn.Identity
+
+    def has_final_layernorm_in_this_stage(self):
+        """
+        Check if this vpp stage contains the final layernorm.
+
+        Note:
+            Final layernorm now has been moved from the post-process stage to the last decoder
+            layer by using this function.
+            There will be a small numeric difference because of grad norm reduction when final
+            layernorm is placed in different pipeline stages in deterministic mode. It can still
+            be bitwise aligned by disabling grad norm clipping.
+        """
+        if self.config.mtp_num_layers is None:
+            # for model without MTPLayer, the final layernorm is set in the stage which does
+            # post_process
+            return self.submodules.layer_norm and self.post_process and self.post_layer_norm
+        else:
+            # for model with MTPLayer, the final layernorm is set in the stage which has the
+            # last layer of the decoder
+            has_final_layernorm_in_this_stage = False
+            for layer in self.layers:
+                if layer.layer_number == self.config.num_layers:
+                    has_final_layernorm_in_this_stage = True
+                    break
+            return (
+                self.submodules.layer_norm
+                and has_final_layernorm_in_this_stage
+                and self.post_layer_norm
+            )
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
@@ -522,7 +555,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and self.config.cuda_graph_scope == 'full_iteration'
+            and 'full_iteration' in self.config.cuda_graph_scope
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -693,6 +726,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
+                    if self.config.fine_grained_activation_offloading:
+                        fine_grained_offloading_set_last_layer(
+                            l_no == self.num_layers_per_pipeline_rank - 1
+                        )
+
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -764,6 +802,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         elif isinstance(self.config.moe_layer_freq, list):
             non_homogeneous_layers = True
 
+        if isinstance(self.config.linear_attention_freq, int):
+            if self.config.linear_attention_freq > 1:
+                non_homogeneous_layers = True
+        elif isinstance(self.config.linear_attention_freq, list):
+            non_homogeneous_layers = True
+
         if self.config.heterogeneous_block_specs:
             non_homogeneous_layers = True
 
@@ -808,7 +852,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, metadata
+                        module,
+                        f'{prefix}{name}.',
+                        sharded_offsets,
+                        metadata,
+                        tp_group=self.tp_group,
                     )
                 )
 

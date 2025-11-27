@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
@@ -9,7 +9,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -139,6 +139,7 @@ class MambaStack(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for MambaStack"
 
         self.pp_group = pg_collection.pp
+        self.tp_group = pg_collection.tp
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -147,7 +148,7 @@ class MambaStack(MegatronModule):
         self.hybrid_mlp_ratio = hybrid_mlp_ratio
         self.hybrid_override_pattern = hybrid_override_pattern
 
-        layer_type_list = allocate_layers(
+        self.layer_type_list = allocate_layers(
             self.config.num_layers,
             self.hybrid_attention_ratio,
             self.hybrid_mlp_ratio,
@@ -156,12 +157,12 @@ class MambaStack(MegatronModule):
 
         pp_layer_offset = 0
         if self.pp_group.size() > 1:
-            pp_layer_offset, layer_type_list = self._select_layers_for_pipeline_parallel(
-                layer_type_list
+            pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
+                self.layer_type_list
             )
 
         self.layers = nn.ModuleList()
-        for i, layer_type in enumerate(layer_type_list):
+        for i, layer_type in enumerate(self.layer_type_list):
             fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
             with fp8_init_context:
                 if layer_type == LayerSymbols.MAMBA:
@@ -203,13 +204,14 @@ class MambaStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        self.apply(
-            partial(
-                _init_weights,
-                n_layer=self.config.num_layers,
-                initializer_range=self.config.init_method_std,
+        if self.config.perform_initialization:
+            self.apply(
+                partial(
+                    _init_weights,
+                    n_layer=self.config.num_layers,
+                    initializer_range=self.config.init_method_std,
+                )
             )
-        )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
@@ -224,22 +226,6 @@ class MambaStack(MegatronModule):
 
         return offset, selected_list
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
-        """
-        Allocate inference cache for each layer.
-
-        Args:
-            batch_size (int): The batch size to use for inference.
-            max_seqlen (int): The maximum sequence length to use
-                for inference.
-            dtype (optional): The data type to use for allocation.
-                Defaults to the data type of the model.
-        """
-        return {
-            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
-            for i, layer in enumerate(self.layers)
-        }
-
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
 
@@ -249,6 +235,16 @@ class MambaStack(MegatronModule):
         used by internal code to bypass the input provided by the
         forward_step_func"""
         self.input_tensor = input_tensor
+
+    def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
+        """
+        Returns the Mamba conv and ssm states shapes per input sequence
+        if this block contains Mamba layers (this may not be the case with PP > 1).
+        """
+        for layer_type, layer in zip(self.layer_type_list, self.layers):
+            if layer_type == LayerSymbols.MAMBA:
+                return layer.mamba_state_shapes_per_request()
+        return None
 
     def forward(
         self,
@@ -287,10 +283,7 @@ class MambaStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        if inference_context:
-            assert (
-                inference_context.is_static_batching()
-            ), "Mamba currently does not support dynamic inference batching."
+        if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
             # mamba_ssm.utils.generation.BaseInferenceContext,
             # this hack supports eval
@@ -301,7 +294,7 @@ class MambaStack(MegatronModule):
             (
                 (
                     self.config.cuda_graph_impl == "local"
-                    and self.config.cuda_graph_scope != "full_iteration"
+                    and "full_iteration" not in self.config.cuda_graph_scope
                 )
                 or self.config.flash_decode
             )
@@ -416,7 +409,11 @@ class MambaStack(MegatronModule):
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, metadata
+                        module,
+                        f'{prefix}{name}.',
+                        sharded_offsets,
+                        metadata,
+                        tp_group=self.tp_group,
                     )
                 )
 

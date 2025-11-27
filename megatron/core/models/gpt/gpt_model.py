@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
@@ -18,6 +18,9 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_init_chunk_handler,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
@@ -27,7 +30,6 @@ from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     roll_tensor,
-    tie_output_layer_state_dict,
     tie_word_embeddings_state_dict,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -117,6 +119,7 @@ class GPTModel(LanguageModule):
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.vp_stage = vp_stage
+        self.disable_param_offloading = True
 
         if hasattr(self.config, 'position_embedding_type'):
             self.position_embedding_type = self.config.position_embedding_type
@@ -246,7 +249,7 @@ class GPTModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.pre_process or self.post_process:
+        if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
         if has_config_logger_enabled(self.config):
@@ -371,18 +374,17 @@ class GPTModel(LanguageModule):
             and (
                 (
                     self.config.cuda_graph_impl == "local"
-                    and self.config.cuda_graph_scope != "full_iteration"
+                    and "full_iteration" not in self.config.cuda_graph_scope
                 )
                 or self.config.flash_decode
             )
-            and rotary_pos_cos is not None
             and inference_context.is_static_batching()
         ):
             current_batch_size = input_ids.shape[0]
             sequence_len_offset = torch.tensor(
                 [inference_context.sequence_len_offset] * current_batch_size,
                 dtype=torch.int32,
-                device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
+                device=torch.cuda.current_device(),
             )
         else:
             sequence_len_offset = None
@@ -410,6 +412,24 @@ class GPTModel(LanguageModule):
 
         return preproc_output
 
+    def preprocess_for_fine_grained_offloading(self):
+        """Preprocess for fine-grained activation offloading."""
+        fine_grained_offloading_init_chunk_handler(
+            vp_size=self.config.virtual_pipeline_model_parallel_size,
+            vp_stage=self.vp_stage,
+            min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+        )
+        if self.disable_param_offloading:
+            for param in self.decoder.parameters():
+                param.offloading_activation = False
+            if self.mtp_process:
+                for param in self.mtp.parameters():
+                    param.offloading_activation = False
+            if self.post_process:
+                for param in self.output_layer.parameters():
+                    param.offloading_activation = False
+            self.disable_param_offloading = False
+
     def forward(
         self,
         input_ids: Tensor,
@@ -435,6 +455,8 @@ class GPTModel(LanguageModule):
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
         """
+        if self.config.fine_grained_activation_offloading:
+            self.preprocess_for_fine_grained_offloading()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -519,7 +541,6 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-
         if mtp_in_postprocess:
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -539,7 +560,7 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.mtp_process:
+        if self.config.mtp_num_layers is not None:
             mtp_labels = labels.clone()
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
             hidden_states = hidden_states_list[0]
@@ -581,6 +602,7 @@ class GPTModel(LanguageModule):
                         hidden_states, mtp_loss_scale * mtp_loss / num_tokens
                     )
         sequence_parallel_override = False
+
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
@@ -589,8 +611,6 @@ class GPTModel(LanguageModule):
                     # Perform the sequence parallel gather here instead of after the output layer
                     # because we need to slice the last token logits from the full view of the
                     # packed logits across all requests.
-                    # TODO(ksanthanam): Make the equivalent change in the `MambaModel` code after
-                    # merging in !3722.
                     hidden_states = gather_from_sequence_parallel_region(
                         hidden_states, group=self.pg_collection.tp
                     )
@@ -598,7 +618,7 @@ class GPTModel(LanguageModule):
                     sequence_parallel_override = True
 
                 # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
-                # state ([B, H]) → unsqueeze back to [1, B, H]
+                # state ([B, H]) → unsqueeze back to [B, 1, H]
                 # (so that the output layer, which expects S×B×H, receives only the final token)
                 hidden_states = inference_context.last_token_logits(
                     hidden_states.squeeze(1).unsqueeze(0)
@@ -701,6 +721,9 @@ class GPTModel(LanguageModule):
             TransformerModelChunkSchedulePlan: The model chunk schedule plan.
         """
 
+        if self.config.fine_grained_activation_offloading:
+            self.preprocess_for_fine_grained_offloading()
+
         from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 
         return TransformerModelChunkSchedulePlan(
@@ -742,27 +765,20 @@ class GPTModel(LanguageModule):
             output_extra_state and output_extra_state.data
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
-        # Multi-Token Prediction (MTP) need both embedding layer and output layer in
-        # mtp process stage.
+        # Multi-Token Prediction (MTP) need embedding layer in mtp process stage.
         # If MTP is not placed in the pre processing stage, we need to maintain a copy of
         # embedding layer in the mtp process stage and tie it to the embedding in the pre
         # processing stage.
-        # Also, if MTP is not placed in the post processing stage, we need to maintain a copy
-        # of output layer in the mtp process stage and tie it to the output layer in the post
-        # processing stage.
+        # Now MTP loss is computed in post processing stage, so the output_layer is not needed.
         if self.mtp_process and not self.pre_process:
             emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
             emb_weight = self.embedding.word_embeddings.weight
-            tie_word_embeddings_state_dict(sharded_state_dict, emb_weight, emb_weight_key)
-        if self.mtp_process and not self.post_process:
-            # We only need to tie the output layer weight if share_embeddings_and_output_weights
-            # is False. Because if share_embeddings_and_output_weights is True, the shared weight
-            # will be stored in embedding layer, and output layer will not have any weight.
-            if not self.share_embeddings_and_output_weights:
-                output_layer_weight_key = f'{prefix}output_layer.weight'
-                output_layer_weight = self.output_layer.weight
-                tie_output_layer_state_dict(
-                    sharded_state_dict, output_layer_weight, output_layer_weight_key
-                )
+            tie_word_embeddings_state_dict(
+                sharded_state_dict,
+                emb_weight,
+                emb_weight_key,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
+            )
 
         return sharded_state_dict

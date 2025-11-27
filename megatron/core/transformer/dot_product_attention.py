@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 import math
@@ -12,6 +12,9 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.dot_product_attention_context_parallel import (
+    AttentionFuncionWithContextParallel,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -54,9 +57,12 @@ class DotProductAttention(MegatronModule):
 
         self.config: TransformerConfig = config
 
-        assert (
-            self.config.context_parallel_size == 1
-        ), "Context parallelism is only supported by TEDotProductAttention!"
+        if self.config.context_parallel_size > 1:
+            assert attention_dropout is None and self.config.attention_dropout == 0.0, (
+                f'DotProductAttention with context parallelism does not support attention dropout,'
+                f' but got {self.config.context_parallel_size=},'
+                f' {attention_dropout=}, and {self.config.attention_dropout=}.'
+            )
 
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
@@ -71,6 +77,8 @@ class DotProductAttention(MegatronModule):
             assert hasattr(
                 pg_collection, 'tp'
             ), "DotProductAttention pg_collection must have tp process group"
+        self.pg_collection = pg_collection
+        self.tp_group = self.pg_collection.tp
 
         world_size = pg_collection.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
@@ -116,13 +124,19 @@ class DotProductAttention(MegatronModule):
         if self.config.softmax_type == "vanilla":
             self.softmax_offset = None
         elif self.config.softmax_type == "off-by-one":
-            self.softmax_offset = torch.zeros(self.num_attention_heads_per_partition)
+            self.softmax_offset = torch.zeros(
+                self.num_attention_heads_per_partition,
+                device=torch.cuda.current_device(),
+                dtype=self.config.params_dtype,
+            )
         elif self.config.softmax_type == "learnable":
             self.register_parameter(
                 "softmax_offset",
                 torch.nn.Parameter(
                     torch.empty(
-                        self.num_attention_heads_per_partition, dtype=self.config.params_dtype
+                        self.num_attention_heads_per_partition,
+                        device=torch.cuda.current_device(),
+                        dtype=self.config.params_dtype,
                     )
                 ),
             )
@@ -165,6 +179,19 @@ class DotProductAttention(MegatronModule):
             value = value.repeat_interleave(
                 self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
             )
+
+        if self.config.context_parallel_size > 1:
+            output = AttentionFuncionWithContextParallel.apply(
+                query,
+                key,
+                value,
+                attention_mask,
+                self.config.attention_dropout,
+                self.softmax_scale,
+                parallel_state.get_context_parallel_group(),
+            )
+            output = output.view(query.shape[0], query.shape[1], self.hidden_size_per_partition)
+            return output
 
         # [b, np, sq, sk]
         output_size = (query.size(1), query.size(2), query.size(0), key.size(0))
@@ -254,5 +281,10 @@ class DotProductAttention(MegatronModule):
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {'softmax_offset': 0},
+            sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )

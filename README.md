@@ -61,7 +61,8 @@ pip install -e .[mlm,dev]
 
 ## Performance & Benchmarking
 
-🚧 **Coming Soon** - We will update this section with performance benchmarks of experimental features as they become available.
+- 🚀 [2025/11] [Optimizing DeepSeek-V3 Training Performance on NVIDIA GB200 NVL72](docs/discussions/deepseek-v3-gb200-optimization/deepseek-v3-gb200-optimization.md).
+- ⚡ [2025/11] [A Guide to Reproduce DeepSeek-V3 Pre-training Performance on GB200](docs/discussions/deepseek-v3-gb200-optimization/deepseek-v3-gb200-reproduce-guide.md).
 
 ## Community & Support
 
