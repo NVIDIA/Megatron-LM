@@ -21,6 +21,7 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.utils import internal_api
 
 
 def weak_method(method):
@@ -40,13 +41,14 @@ def weak_method(method):
     return wrapped_func
 
 
-def should_free_input(name, is_moe, is_deepep):
+@internal_api
+def should_free_input(name, is_moe, use_flex_dispatcher):
     """Determine if the node should free its input memory.
 
     Args:
         name: Node name
         is_moe: Whether it's a MoE model
-        is_deepep: Whether it's a DeepEP model
+        use_flex_dispatcher: Whether to use flex dispatcher
 
     Returns:
         bool: Whether to free input memory
@@ -60,12 +62,12 @@ def should_free_input(name, is_moe, is_deepep):
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
     free_input_nodes = {
-        "mlp": True,
+        "mlp": False,
         "moe_combine": True,
-        # For non-deepep mode, the input is the un-dispatched tokens and probs before dispatch A2A
-        # and it's not needed anymore after the forward pass
-        # For deepep mode, they are both needed in backward pass, so they cannot be freed.
-        "moe_dispatch": not is_deepep,
+        # For non-flex dispatcher mode, the input is the un-dispatched tokens and probs
+        # before dispatch A2A and it's not needed anymore after the forward pass
+        # For flex dispatcher mode, they are both needed in backward pass, so they cannot be freed.
+        "moe_dispatch": not use_flex_dispatcher,
     }
 
     return free_input_nodes.get(name, False)
@@ -223,12 +225,12 @@ class TransformerLayerNode(ScheduleNode):
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
             bwd_dw_callables (list): List of weight gradient functions for the layer.
-            extra_args (dict): Extra arguments for the node: is_moe, enable_deepep.
+            extra_args (dict): Extra arguments for the node: is_moe, use_flex_dispatcher.
         """
         # determine whether to free input memory
         is_moe = extra_args.get("is_moe", False)
-        enable_deepep = extra_args.get("enable_deepep", False)
-        free_input = should_free_input(name, is_moe, enable_deepep)
+        use_flex_dispatcher = extra_args.get("use_flex_dispatcher", False)
+        free_input = should_free_input(name, is_moe, use_flex_dispatcher)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
@@ -324,10 +326,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     """
 
     is_moe = isinstance(layer.mlp, MoELayer)
-    enable_deepep = (
-        layer.config.moe_token_dispatcher_type == "flex"
-        and layer.config.moe_flex_dispatcher_backend == "deepep"
-    )
+    use_flex_dispatcher = layer.config.moe_token_dispatcher_type == "flex"
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
@@ -380,7 +379,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep:
+        if use_flex_dispatcher:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to attn submodule
             node.layer_state.metadata.token_probs = probs
@@ -400,10 +399,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         dispatched_probs = node.layer_state.dispatched_probs
         metadata = node.layer_state.metadata
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep:
+        if use_flex_dispatcher:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
-            token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
+            node.layer_state.metadata.dispatched_probs = dispatched_probs
 
         pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
         shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
