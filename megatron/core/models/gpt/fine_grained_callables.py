@@ -285,7 +285,6 @@ class TransformerLayerNode(ScheduleNode):
         with torch.cuda.nvtx.range(f"{self.name} wgrad"):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
-
         self.bwd_dw_callables = None
 
     def _release_state(self):
