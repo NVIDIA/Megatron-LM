@@ -614,30 +614,6 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def get_no_weight_decay_cond(no_weight_decay_cond_type, default_skip_embedding_weight_decay):
-    """Get the no weight decay condition function."""
-
-    # Default case: no_weight_decay_cond_type is None
-    no_weight_decay_cond_fn = None
-
-    if no_weight_decay_cond_type == 'apply_wd_to_qk_layernorm':
-        # Qwen3-Next applies weight decay to qk layernorm as a special case
-        def apply_wd_to_qk_layernorm_fn(name, param):
-            if "q_layernorm" in name or "k_layernorm" in name:
-                no_wd = False
-            else:
-                no_wd = (
-                    name.endswith(".bias")
-                    or len(param.shape) == 1
-                    or (default_skip_embedding_weight_decay and "embedding" in name)
-                )
-            return no_wd
-        no_weight_decay_cond_fn = apply_wd_to_qk_layernorm_fn
-    elif no_weight_decay_cond_type is not None:
-        raise ValueError(f"Invalid no_weight_decay_cond_type: {no_weight_decay_cond_type}")
-
-    return no_weight_decay_cond_fn
-
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -774,15 +750,8 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    no_weight_decay_cond = get_no_weight_decay_cond(
-        args.no_weight_decay_cond_type,
-        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
-    )
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider,
-        model_type,
-        checkpointing_context=checkpointing_context,
-        no_weight_decay_cond=no_weight_decay_cond,
+        model_provider, model_type, checkpointing_context=checkpointing_context
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1202,7 +1171,9 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
     config = None
-    if args.optimizer == 'adam':
+    if args.optimizer == 'adam' or 'muon' in args.optimizer:
+        # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
+        # So for now we keep using adam config that's back compat with old way
         kwargs = {}
         for f in dataclasses.fields(AdamOptimizerConfig):
             if hasattr(args, f.name):
@@ -1264,9 +1235,7 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_muon_optimizer(
             config,
             model,
-            no_weight_decay_cond,
-            scale_lr_cond,
-            lr_mult,
+            config_overrides=config_overrides,
             use_gloo_process_groups=args.enable_gloo_process_groups,
             layer_wise_distributed_optimizer='dist' in config.optimizer,
         )
