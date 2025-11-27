@@ -68,6 +68,7 @@ Allocates and registers NCCL user buffers for param and grad buffers. This optio
 - **Only effective when using Megatron-LM.**
 - Defaults to `False`.
 - By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registration.
+- **Incompatible with PyTorch's segmentable allocator:** Do not set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` when using `--use-nccl-ub`, as this will cause a runtime error due to compatibility issues with the `torch.cuda.MemPool` API.
 
 ## Checkpoint Conversion from 3D-Parallel to Megatron-FSDP
 
