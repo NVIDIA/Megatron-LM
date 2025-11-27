@@ -200,6 +200,34 @@ jobs:
       && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
+      - name: Taint node for job isolation
+        if: contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
+        shell: bash
+        run: |
+          # Verify prerequisites
+          if [ -z "$NODE_NAME" ]; then
+            echo "ERROR: NODE_NAME not set"
+            exit 1
+          fi
+
+          if ! command -v kubectl &> /dev/null; then
+            echo "ERROR: kubectl not found"
+            exit 1
+          fi
+
+          # Apply taint
+          JOB_ID="${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          echo "=== Adding node taint for job isolation ==="
+          echo "Node: $NODE_NAME"
+          echo "Job ID: $JOB_ID"
+
+          kubectl taint node "$NODE_NAME" "github.com/job-id=${JOB_ID}:NoSchedule" --overwrite=true
+          kubectl label node "$NODE_NAME" \
+            "github.com/workflow=${GITHUB_WORKFLOW}" \
+            "github.com/run-id=${GITHUB_RUN_ID}" \
+            "github.com/job=${GITHUB_JOB}" \
+            --overwrite=true
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -359,6 +387,34 @@ jobs:
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
     steps:
+      - name: Taint node for job isolation
+        if: contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
+        shell: bash
+        run: |
+          # Verify prerequisites
+          if [ -z "$NODE_NAME" ]; then
+            echo "ERROR: NODE_NAME not set"
+            exit 1
+          fi
+
+          if ! command -v kubectl &> /dev/null; then
+            echo "ERROR: kubectl not found"
+            exit 1
+          fi
+
+          # Apply taint
+          JOB_ID="${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          echo "=== Adding node taint for job isolation ==="
+          echo "Node: $NODE_NAME"
+          echo "Job ID: $JOB_ID"
+
+          kubectl taint node "$NODE_NAME" "github.com/job-id=${JOB_ID}:NoSchedule" --overwrite=true
+          kubectl label node "$NODE_NAME" \
+            "github.com/workflow=${GITHUB_WORKFLOW}" \
+            "github.com/run-id=${GITHUB_RUN_ID}" \
+            "github.com/job=${GITHUB_JOB}" \
+            --overwrite=true
+
       - name: Checkout
         uses: actions/checkout@v4
       - name: main
@@ -472,6 +528,34 @@ jobs:
       && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
+      - name: Taint node for job isolation
+        if: contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
+        shell: bash
+        run: |
+          # Verify prerequisites
+          if [ -z "$NODE_NAME" ]; then
+            echo "ERROR: NODE_NAME not set"
+            exit 1
+          fi
+
+          if ! command -v kubectl &> /dev/null; then
+            echo "ERROR: kubectl not found"
+            exit 1
+          fi
+
+          # Apply taint
+          JOB_ID="${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          echo "=== Adding node taint for job isolation ==="
+          echo "Node: $NODE_NAME"
+          echo "Job ID: $JOB_ID"
+
+          kubectl taint node "$NODE_NAME" "github.com/job-id=${JOB_ID}:NoSchedule" --overwrite=true
+          kubectl label node "$NODE_NAME" \
+            "github.com/workflow=${GITHUB_WORKFLOW}" \
+            "github.com/run-id=${GITHUB_RUN_ID}" \
+            "github.com/job=${GITHUB_JOB}" \
+            --overwrite=true
+
       - name: Checkout
         uses: actions/checkout@v4
       - name: main
