@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}_{platforms}"
+  name: '{test_case}_{environment}_{platforms}'
   model: hybrid
   build: mcore-pyt-{environment}
   nodes: 1
@@ -57,5 +57,5 @@ products:
   - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
