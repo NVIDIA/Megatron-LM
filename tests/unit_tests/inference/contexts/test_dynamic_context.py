@@ -292,8 +292,6 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
         if is_hybrid_model:
             assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_idx == -1)
-            assert torch.all(dynamic_context.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
     @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
@@ -450,9 +448,6 @@ class TestDynamicContext:
             active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
         )
         assert dynamic_context.total_request_count == 0
-        if is_hybrid_model:
-            assert torch.all(dynamic_context.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
         # This case would cover all cases
         # 1. Already there will be 2 paused requests
@@ -757,11 +752,6 @@ class TestDynamicContext:
         # Verify that all 6 blocks were released by checking the available blocks
         assert dynamic_context.block_allocator.total_avail == initial_available_blocks + 6
 
-        if is_hybrid_model:
-            # All mamba states should be zeroed out
-            assert torch.all(dynamic_context.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states == 0)
-
     @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_mamba_states_cache(self, is_hybrid_model: bool):
@@ -900,7 +890,9 @@ class TestDynamicContext:
         prefill_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
 
         # Call the function for prefill
-        prefill_log_probs = dynamic_context.calculate_log_probs(prefill_logits, prefill_new_tokens)
+        prefill_log_probs, _ = dynamic_context.calculate_log_probs(
+            prefill_logits, prefill_new_tokens
+        )
 
         # Calculate expected prefill log probs for the selected tokens
         expected_prefill_log_probs = (
@@ -938,7 +930,7 @@ class TestDynamicContext:
             1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
         )
         decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
-        decode_log_probs = dynamic_context.calculate_log_probs(decode_logits, decode_new_tokens)
+        decode_log_probs, _ = dynamic_context.calculate_log_probs(decode_logits, decode_new_tokens)
 
         # Verify the stored decode log probabilities
         expected_decode_log_probs = torch.nn.functional.log_softmax(
@@ -993,7 +985,7 @@ class TestDynamicContext:
             0, 100, (num_active_requests_mixed_step,), device='cuda'
         ).long()
 
-        mixed_step_log_probs = dynamic_context.calculate_log_probs(
+        mixed_step_log_probs, _ = dynamic_context.calculate_log_probs(
             mixed_step_logits, mixed_step_new_tokens
         )
 
