@@ -72,16 +72,16 @@ def _stash_copy_kernel_2d(
     new_free_offset_ptr,  # Output: new free_offset value (written by kernel)
     HIDDEN_SIZE: tl.constexpr,  # Hidden dimension (compile-time constant)
     BLOCK_SIZE: tl.constexpr,   # Threads per block (for hidden dimension)
-    tokens_per_block: tl.constexpr,  # Number of tokens each block handles
 ):
     """2D Triton kernel to copy tensor data to stash buffer.
     
     Grid: (num_blocks,) - fixed number of blocks
-    Each block handles multiple tokens (tokens_per_block) using a while loop.
+    Uses strided access pattern: block i handles tokens [i, i+num_blocks, i+2*num_blocks, ...].
     Works directly with contiguous 2D tensors [tokens, hidden_size].
     Offsets are tracked in tokens, not elements.
     """
     pid = tl.program_id(axis=0)
+    num_blocks = tl.num_programs(axis=0)
     
     # Load parameters (in tokens, not elements)
     num_tokens = tl.load(num_tokens_ptr)
@@ -106,13 +106,9 @@ def _stash_copy_kernel_2d(
     if overflow_detected:
         return
     
-    # Each block handles multiple tokens
-    token_start = pid * tokens_per_block
-    token_end = min(token_start + tokens_per_block, num_tokens)
-    
-    # Process tokens assigned to this block
-    token_idx = token_start
-    while token_idx < token_end:
+    # Strided access: block pid handles tokens [pid, pid+num_blocks, pid+2*num_blocks, ...]
+    token_idx = pid
+    while token_idx < num_tokens:
         # Calculate destination token index with wraparound
         dst_token_idx = (free_offset + token_idx) % capacity
         
@@ -141,7 +137,8 @@ def _stash_copy_kernel_2d(
                 data = tl.load(src_base + hidden_offsets)
                 tl.store(dst_base + hidden_offsets, data)
         
-        token_idx += 1
+        # Stride to next token for this block
+        token_idx += num_blocks
     
     # Update new_free_offset (only first block writes it)
     if pid == 0:
@@ -159,30 +156,26 @@ def _stash_pop_kernel_2d(
     capacity_ptr,       # In tokens (read-only)
     HIDDEN_SIZE: tl.constexpr,  # Hidden dimension (compile-time constant)
     BLOCK_SIZE: tl.constexpr,   # Threads per block (for hidden dimension)
-    tokens_per_block: tl.constexpr,  # Number of tokens each block handles
 ):
     """2D Triton kernel to reload tensor data from stash buffer.
     
     Grid: (num_blocks,) - fixed number of blocks
-    Each block handles multiple tokens (tokens_per_block) using a while loop.
+    Uses strided access pattern: block i handles tokens [i, i+num_blocks, i+2*num_blocks, ...].
     Works directly with contiguous 2D tensors [tokens, hidden_size].
     Offsets are tracked in tokens, not elements.
     Uses LIFO (stack) semantics - moves free_offset backward after popping.
     """
     pid = tl.program_id(axis=0)
+    num_blocks = tl.num_programs(axis=0)
     
     # Load parameters (in tokens, not elements)
     num_tokens = tl.load(num_tokens_ptr)
     tensor_offset = tl.load(tensor_offset_ptr)  # Where data was stashed
     capacity = tl.load(capacity_ptr)
     
-    # Each block handles multiple tokens
-    token_start = pid * tokens_per_block
-    token_end = min(token_start + tokens_per_block, num_tokens)
-    
-    # Process tokens assigned to this block
-    token_idx = token_start
-    while token_idx < token_end:
+    # Strided access: block pid handles tokens [pid, pid+num_blocks, pid+2*num_blocks, ...]
+    token_idx = pid
+    while token_idx < num_tokens:
         # Calculate source token index with wraparound
         src_token_idx = (tensor_offset + token_idx) % capacity
         
@@ -211,7 +204,8 @@ def _stash_pop_kernel_2d(
                 data = tl.load(src_base + hidden_offsets)
                 tl.store(dst_base + hidden_offsets, data)
         
-        token_idx += 1
+        # Stride to next token for this block
+        token_idx += num_blocks
     
     # For LIFO (stack) behavior: move free_offset backward
     # After popping, free_offset should be at tensor_offset (freeing the space we just read)
@@ -564,14 +558,10 @@ class PackedTensor:
         
         # Determine grid size with cap on max blocks
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
-        total_blocks_needed = self.max_num_tokens  # Ideally 1 block per token
-        
-        # Cap the number of blocks and calculate tokens per block
-        num_blocks = min(total_blocks_needed, max_blocks)
-        tokens_per_block = (self.max_num_tokens + num_blocks - 1) // num_blocks  # Ceiling division
+        num_blocks = min(self.max_num_tokens, max_blocks)
 
         if DEBUG:
-            debug_print (f"offload_to_stash ({self.layer_name}) {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} hidden_size {self.hidden_size} max_blocks {max_blocks} num_blocks {num_blocks} tokens_per_block {tokens_per_block} overflow {stash_buffer.overflow.item()}")
+            debug_print (f"offload_to_stash ({self.layer_name}) {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} hidden_size {self.hidden_size} max_blocks {max_blocks} num_blocks {num_blocks} overflow {stash_buffer.overflow.item()}")
         #
         grid = (num_blocks,)
         self.stash_buffer_offset = stash_buffer.free_offset.clone()
@@ -579,7 +569,7 @@ class PackedTensor:
         # Create temporary tensor for new offset (kernel will write to this)
         new_free_offset_tensor = torch.empty(1, dtype=torch.int64, device=self.device)
         
-        # Launch Triton kernel to copy data (2D version)
+        # Launch Triton kernel to copy data (2D version, strided access)
         # self.offload_stream.wait_stream(torch.cuda.current_stream())
         # with torch.cuda.stream(self.offload_stream):
         # TODO: make this async. Something unexpected with TE on deallocate the tensor
@@ -594,7 +584,6 @@ class PackedTensor:
             new_free_offset_tensor,  # Write: New free_offset computed by kernel
             HIDDEN_SIZE=self.hidden_size,
             BLOCK_SIZE=BLOCK_SIZE,
-            tokens_per_block=tokens_per_block,
         )
         
         # Copy new offset value after kernel completes (stream-ordered)
@@ -632,19 +621,15 @@ class PackedTensor:
                 
         # Determine grid size with cap on max blocks
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
-        total_blocks_needed = self.max_num_tokens  # Ideally 1 block per token
-        
-        # Cap the number of blocks and calculate tokens per block
-        num_blocks = min(total_blocks_needed, max_blocks)
-        tokens_per_block = (self.max_num_tokens + num_blocks - 1) // num_blocks  # Ceiling division
+        num_blocks = min(self.max_num_tokens, max_blocks)
         
         if DEBUG:
-            debug_print (f"reload_from_stash {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} hidden_size {self.hidden_size} max_blocks {max_blocks} num_blocks {num_blocks} tokens_per_block {tokens_per_block}")
+            debug_print (f"reload_from_stash {self._tensor.shape}-{self.dtype} stash_buffer {stash_buffer.buffer.dtype} num_tokens {self.num_tokens_tensor.item()} hidden_size {self.hidden_size} max_blocks {max_blocks} num_blocks {num_blocks}")
         #
         grid = (num_blocks,)
         
         
-        # Launch Triton kernel to copy data (2D version)
+        # Launch Triton kernel to copy data (2D version, strided access)
         # self.offload_stream.wait_stream(torch.cuda.current_stream())
         # with torch.cuda.stream(self.offload_stream):
 
@@ -660,7 +645,6 @@ class PackedTensor:
             stash_buffer.capacity,  # Read-only: Capacity of the buffer (in tokens)
             HIDDEN_SIZE=self.hidden_size,
             BLOCK_SIZE=BLOCK_SIZE,
-            tokens_per_block=tokens_per_block,
         )
         
         #torch.cuda.synchronize()
@@ -973,7 +957,7 @@ class PackedOffloadManager:
     """
     Singleton manager for coordinating activation offloading across pipeline stages.
     Manages chunk handlers, synchronizes GPU-GPU transfers,
-    and handles virtual pipeline parallelism.
+    and handles virtual pipeline parallelism
     """
 
     OFFLOAD_MGR = None
