@@ -259,8 +259,6 @@ jobs:
 
       - name: Download test data
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           echo "::group::Download test data"
           pip install --no-cache-dir pygithub click
@@ -463,10 +461,20 @@ jobs:
           HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
           echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
+      - name: Has Run functional tests label
+        id: has-run-functional-tests-label
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "false"
+          echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
+
       - name: Parse functional tests
         id: main
         env:
           HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL: ${{ steps.has-run-functional-tests-label.outputs.main }}
         run: |
           export PYTHONPATH=$(pwd)
 
@@ -475,10 +483,13 @@ jobs:
               --scope mr-github
               --enable-lightweight-mode
             )
+          elif [ "$HAS_RUN_FUNCTIONAL_TESTS_LABEL" == "true" ]; then
+            ARGS=(
+              --scope mr-github
+            )
           else
             ARGS=(
-              --scope mr-slim
-              --enable-lightweight-mode
+              --scope mr-github-slim
             )
           fi
 
