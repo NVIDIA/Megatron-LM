@@ -814,6 +814,7 @@ class TestTextGenerationController:
             context.paused_request_count = 0
             context.total_request_count = batch_size
             context.active_token_count = total_tokens
+            context.num_prefill_requests = batch_size
             context.request_query_lengths = torch.tensor(
                 [0] * context.paused_request_count + query_lengths, dtype=torch.int32, device='cuda'
             )
