@@ -7,6 +7,17 @@
 # - Forward/Backward passes
 # - Tensor types: input, weight, query, key, value
 # - Formats: MXFP8(E4M3), MXFP8(E5M2), HiFP8
+#
+# Usage:
+#   ./test_dtype_batch.sh [TENSOR_DIR] [OUTPUT_DIR] [LAYER_FILTER]
+#
+# Examples:
+#   # Test single layer (L1)
+#   ./test_dtype_batch.sh enhanced_tensor_logs/bf16 ./results 1
+#
+#   # Calculate average across all layers (L1-L16)
+#   ./test_dtype_batch.sh enhanced_tensor_logs/bf16 ./results all
+#   ./test_dtype_batch.sh enhanced_tensor_logs/bf16 ./results 1-16
 # =============================================================================
 
 set -e
@@ -22,7 +33,15 @@ TENSOR_DIR="${1:-enhanced_tensor_logs/bf16}"
 OUTPUT_DIR="${2:-./quant_test_results}"
 
 # Layer filter (default: L1)
+# If set to "all" or "1-16", will calculate average across all layers
 LAYER_FILTER="${3:-1}"
+
+# Calculate average across layers (if LAYER_FILTER is "all" or "1-16")
+CALC_AVG=false
+if [[ "$LAYER_FILTER" == "all" ]] || [[ "$LAYER_FILTER" == "1-16" ]]; then
+    CALC_AVG=true
+    LAYER_FILTER="all"
+fi
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -118,6 +137,44 @@ run_quantization_test() {
     fi
 }
 
+# Calculate average of numeric values (handles scientific notation)
+calculate_average() {
+    local values=("$@")
+    local count=0
+    local temp_file=$(mktemp)
+    
+    # Collect valid values
+    for val in "${values[@]}"; do
+        if [[ "$val" =~ ^[0-9.eE+-]+$ ]] && [[ "$val" != "N/A" ]] && [[ "$val" != "ERROR" ]]; then
+            echo "$val" >> "$temp_file"
+            ((count++))
+        fi
+    done
+    
+    if [ $count -eq 0 ]; then
+        rm -f "$temp_file"
+        echo "N/A"
+        return
+    fi
+    
+    # Use Python to calculate average (handles scientific notation properly)
+    local avg=$(python3 -c "
+import sys
+values = []
+with open('$temp_file', 'r') as f:
+    for line in f:
+        values.append(float(line.strip()))
+if values:
+    avg = sum(values) / len(values)
+    print(f'{avg:.6e}')
+else:
+    print('N/A')
+" 2>/dev/null)
+    
+    rm -f "$temp_file"
+    echo "$avg"
+}
+
 # =============================================================================
 # Main Processing
 # =============================================================================
@@ -129,7 +186,11 @@ echo "Batch Quantization Error Analysis"
 echo "=============================================================================="
 echo "Tensor directory: $TENSOR_DIR"
 echo "Output directory: $OUTPUT_DIR"
-echo "Layer filter: L${LAYER_FILTER}"
+if [ "$CALC_AVG" = true ]; then
+    echo "Mode: Average across all layers (L1-L16)"
+else
+    echo "Layer filter: L${LAYER_FILTER}"
+fi
 echo "Test script: $TEST_SCRIPT"
 echo "=============================================================================="
 echo ""
@@ -148,14 +209,29 @@ fi
 echo "Found ${#TENSOR_FILES[@]} tensor file(s)"
 echo ""
 
-# Organize files by pass type and tensor type
+# Organize files by pass type, tensor type, and layer
 declare -A FORWARD_FILES
 declare -A BACKWARD_FILES
 
+# For average mode: organize by pass_type -> tensor_type -> layer
+declare -A FORWARD_FILES_BY_LAYER
+declare -A BACKWARD_FILES_BY_LAYER
+
 for tensor_file in "${TENSOR_FILES[@]}"; do
-    # Check if file matches layer filter
     layer=$(get_layer "$(basename "$tensor_file")")
-    if [ -z "$layer" ] || [ "$layer" != "$LAYER_FILTER" ]; then
+    
+    # Skip if no layer found
+    if [ -z "$layer" ]; then
+        continue
+    fi
+    
+    # Check layer filter
+    if [ "$CALC_AVG" = false ] && [ "$layer" != "$LAYER_FILTER" ]; then
+        continue
+    fi
+    
+    # Only process layers 1-16 for average mode
+    if [ "$CALC_AVG" = true ] && (( layer < 1 || layer > 16 )); then
         continue
     fi
     
@@ -163,10 +239,20 @@ for tensor_file in "${TENSOR_FILES[@]}"; do
     pass_type=$(get_pass_type "$(basename "$tensor_file")")
     
     if [ -n "$tensor_type" ] && [ -n "$pass_type" ]; then
-        if [ "$pass_type" == "forward" ]; then
-            FORWARD_FILES["$tensor_type"]="$tensor_file"
-        elif [ "$pass_type" == "backward" ]; then
-            BACKWARD_FILES["$tensor_type"]="$tensor_file"
+        if [ "$CALC_AVG" = true ]; then
+            # Store files by layer for average calculation
+            if [ "$pass_type" == "forward" ]; then
+                FORWARD_FILES_BY_LAYER["${tensor_type}_L${layer}"]="$tensor_file"
+            elif [ "$pass_type" == "backward" ]; then
+                BACKWARD_FILES_BY_LAYER["${tensor_type}_L${layer}"]="$tensor_file"
+            fi
+        else
+            # Single layer mode
+            if [ "$pass_type" == "forward" ]; then
+                FORWARD_FILES["$tensor_type"]="$tensor_file"
+            elif [ "$pass_type" == "backward" ]; then
+                BACKWARD_FILES["$tensor_type"]="$tensor_file"
+            fi
         fi
     fi
 done
@@ -224,13 +310,88 @@ generate_table() {
     echo ""
 }
 
-# Generate tables
-if [ ${#FORWARD_FILES[@]} -gt 0 ]; then
-    generate_table "forward" FORWARD_FILES
-fi
+# Function to generate average table
+generate_average_table() {
+    local pass_type="$1"
+    local -n files_ref="$2"
+    
+    echo "=============================================================================="
+    echo "$(echo $pass_type | tr '[:lower:]' '[:upper:]') Pass - Average Across Layers (L1-L16)"
+    echo "=============================================================================="
+    echo ""
+    
+    # Print header
+    printf "%-20s |" "Format"
+    for ttype in "${TENSOR_TYPES[@]}"; do
+        printf " %-12s |" "$ttype"
+    done
+    echo ""
+    echo "$(printf '=%.0s' {1..95})"
+    
+    # Process each format
+    for i in "${!FORMATS[@]}"; do
+        format="${FORMATS[$i]}"
+        format_name="${FORMAT_NAMES[$i]}"
+        
+        printf "%-20s |" "$format_name"
+        
+        # Process each tensor type
+        for ttype in "${TENSOR_TYPES[@]}"; do
+            # Collect errors from all layers for this tensor type
+            local layer_errors=()
+            local found_any=false
+            
+            for layer in {1..16}; do
+                local key="${ttype}_L${layer}"
+                if [ -n "${files_ref[$key]}" ]; then
+                    tensor_file="${files_ref[$key]}"
+                    echo -n "Testing $ttype L${layer} ($format)... " >&2
+                    result=$(run_quantization_test "$tensor_file" "$format")
+                    echo "done" >&2
+                    
+                    if [[ "$result" =~ ^[0-9.eE+-]+$ ]] && [[ "$result" != "N/A" ]] && [[ "$result" != "ERROR" ]]; then
+                        layer_errors+=("$result")
+                        found_any=true
+                    fi
+                fi
+            done
+            
+            # Calculate average
+            if [ "$found_any" = true ] && [ ${#layer_errors[@]} -gt 0 ]; then
+                avg_result=$(calculate_average "${layer_errors[@]}")
+                if [[ "$avg_result" == "N/A" ]]; then
+                    printf " %-12s |" "$avg_result"
+                else
+                    printf " %12.4e |" "$avg_result"
+                fi
+            else
+                printf " %-12s |" "N/A"
+            fi
+        done
+        echo ""
+    done
+    echo ""
+}
 
-if [ ${#BACKWARD_FILES[@]} -gt 0 ]; then
-    generate_table "backward" BACKWARD_FILES
+# Generate tables
+if [ "$CALC_AVG" = true ]; then
+    # Average mode
+    if [ ${#FORWARD_FILES_BY_LAYER[@]} -gt 0 ]; then
+        generate_average_table "forward" FORWARD_FILES_BY_LAYER
+    fi
+    
+    if [ ${#BACKWARD_FILES_BY_LAYER[@]} -gt 0 ]; then
+        generate_average_table "backward" BACKWARD_FILES_BY_LAYER
+    fi
+else
+    # Single layer mode
+    if [ ${#FORWARD_FILES[@]} -gt 0 ]; then
+        generate_table "forward" FORWARD_FILES
+    fi
+    
+    if [ ${#BACKWARD_FILES[@]} -gt 0 ]; then
+        generate_table "backward" BACKWARD_FILES
+    fi
 fi
 
 # =============================================================================
@@ -241,20 +402,55 @@ echo "==========================================================================
 echo "Summary"
 echo "=============================================================================="
 echo "Results saved to: $OUTPUT_DIR/"
-echo "Total tensor files processed: ${#TENSOR_FILES[@]}"
+echo "Total tensor files found: ${#TENSOR_FILES[@]}"
 echo ""
-echo "Forward pass tensors found: ${#FORWARD_FILES[@]}"
-for ttype in "${TENSOR_TYPES[@]}"; do
-    if [ -n "${FORWARD_FILES[$ttype]}" ]; then
-        echo "  - $ttype: $(basename "${FORWARD_FILES[$ttype]}")"
-    fi
-done
-echo ""
-echo "Backward pass tensors found: ${#BACKWARD_FILES[@]}"
-for ttype in "${TENSOR_TYPES[@]}"; do
-    if [ -n "${BACKWARD_FILES[$ttype]}" ]; then
-        echo "  - $ttype: $(basename "${BACKWARD_FILES[$ttype]}")"
-    fi
-done
+
+if [ "$CALC_AVG" = true ]; then
+    echo "Mode: Average across layers (L1-L16)"
+    echo ""
+    echo "Forward pass tensors found by layer:"
+    for ttype in "${TENSOR_TYPES[@]}"; do
+        local count=0
+        for layer in {1..16}; do
+            local key="${ttype}_L${layer}"
+            if [ -n "${FORWARD_FILES_BY_LAYER[$key]}" ]; then
+                ((count++))
+            fi
+        done
+        if [ $count -gt 0 ]; then
+            echo "  - $ttype: found in $count layer(s)"
+        fi
+    done
+    echo ""
+    echo "Backward pass tensors found by layer:"
+    for ttype in "${TENSOR_TYPES[@]}"; do
+        local count=0
+        for layer in {1..16}; do
+            local key="${ttype}_L${layer}"
+            if [ -n "${BACKWARD_FILES_BY_LAYER[$key]}" ]; then
+                ((count++))
+            fi
+        done
+        if [ $count -gt 0 ]; then
+            echo "  - $ttype: found in $count layer(s)"
+        fi
+    done
+else
+    echo "Mode: Single layer (L${LAYER_FILTER})"
+    echo ""
+    echo "Forward pass tensors found: ${#FORWARD_FILES[@]}"
+    for ttype in "${TENSOR_TYPES[@]}"; do
+        if [ -n "${FORWARD_FILES[$ttype]}" ]; then
+            echo "  - $ttype: $(basename "${FORWARD_FILES[$ttype]}")"
+        fi
+    done
+    echo ""
+    echo "Backward pass tensors found: ${#BACKWARD_FILES[@]}"
+    for ttype in "${TENSOR_TYPES[@]}"; do
+        if [ -n "${BACKWARD_FILES[$ttype]}" ]; then
+            echo "  - $ttype: $(basename "${BACKWARD_FILES[$ttype]}")"
+        fi
+    done
+fi
 echo ""
 
