@@ -15,7 +15,7 @@ except ImportError:
     HAVE_TRITON = False
 
 # Packed Moe Expert Offload implementation for pipeline parallelism
-DEBUG = True
+DEBUG = False
 DEBUG_RANK = [0]
 def debug_print(message):
     """Print debug message for a specific rank when DEBUG is enabled."""
@@ -988,6 +988,7 @@ class PackedOffloadManager:
     def __init__(self):
         """Initialize the manager with queues and dedicated CUDA streams."""
         # allocate streams and events for synchronization
+        self.enabled = False
         self._pack_stream = torch.cuda.Stream()
         self._unpack_stream = torch.cuda.Stream()
         self._pack_stream_status = 'idle' # idle, offloading
@@ -1350,6 +1351,8 @@ def get_packed_moe_expert_offloading_context(name=None, max_num_tokens=None, num
     """Get the fine-grained offload context"""
     #debug_print(f'get_packed_moe_expert_offloading_context name {name}')
     offload_manager = PackedOffloadManager.get_instance()
+    if not offload_manager.enabled:
+        return nullcontext()
     offload_manager.max_num_tokens = max_num_tokens
     assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor)
     offload_manager.num_tokens_tensor = num_tokens_tensor
@@ -1363,13 +1366,16 @@ def packed_moe_expert_offloading_group_commit(tensor, name=None):
     #debug_print(f'{rank}: packed_moe_expert_offloading_group_commit tensor {tensor.shape}-{tensor.dtype} name {name}')
     offload_manager = PackedOffloadManager.get_instance()
     offload_manager.device = tensor.device
-    
+    if not offload_manager.enabled:
+        return tensor
     return PP_ScheduleFunction.apply(tensor, offload_manager)
 
 def packed_moe_expert_offloading_init_chunk_handler(vp_size, vp_stage):
     """Initialize the chunk handler, called at the start of a microbatch forward pass."""
     #debug_print(f'packed_moe_expert_offloading_init_chunk_handler vp_size {vp_size} vp_stage {vp_stage}')
     offload_manager = PackedOffloadManager.get_instance()
+    if not offload_manager.enabled:
+        return
     offload_manager.current_vp_stage = vp_stage if vp_stage is not None else 0
     if vp_size is not None:
         offload_manager.vp_size = vp_size
@@ -1387,11 +1393,14 @@ def packed_moe_expert_offloading_set_last_layer(is_last_layer=False):
     #PipelineOffloadManager.get_instance().set_last_layer(is_last_layer)
     #debug_print(f'packed_moe_expert_offloading_set_last_layer is_last_layer {is_last_layer}')
     offload_manager = PackedOffloadManager.get_instance()
+    if not offload_manager.enabled:
+        return
     offload_manager._last_layer = is_last_layer
 
 def packed_moe_expert_offloading_reset(enabled=True):
     """Reset the chunk handler, called at the start of a training iteration."""
     offload_manager = PackedOffloadManager.get_instance()
+    offload_manager.enabled = enabled
     offload_manager.iteration += 1
     # current layer and microbatch for each vp stage for forward pass
     offload_manager.current_schedule_index = 0

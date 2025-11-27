@@ -188,8 +188,7 @@ class FullCudaGraphWrapper:
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
-            if training_str == 'training':
-                packed_moe_expert_offloading_reset(enabled=self.packed_moe_expert_offloading)
+            packed_moe_expert_offloading_reset(enabled=self.packed_moe_expert_offloading and training)
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
         self.speculative_cuda_graph_check(model)
         self.next_iter(training_str)
