@@ -559,6 +559,19 @@ def validate_args(args, defaults={}):
         hybrid_pipeline_segments = get_hybrid_total_pipeline_segment_count(
             args.hybrid_override_pattern
         )
+        if hybrid_pipeline_segments == 1 and args.transformer_pipeline_model_parallel_size > 1:
+            n = len(args.hybrid_override_pattern)
+            assert n % args.transformer_pipeline_model_parallel_size == 0
+            # Update hybrid_override_pattern to just have pipes at even intervals.
+            segment_length = n // args.transformer_pipeline_model_parallel_size
+            segments = []
+            for i in range(0, n, segment_length):
+                segments.append(args.hybrid_override_pattern[i:i+segment_length])
+            args.hybrid_override_pattern = "|".join(segments)
+            hybrid_pipeline_segments = get_hybrid_total_pipeline_segment_count(
+                args.hybrid_override_pattern
+            )
+
         assert hybrid_pipeline_segments % args.transformer_pipeline_model_parallel_size == 0, \
             'The number of hybrid pipeline segments described by --hybrid-override-pattern must ' \
             'be evenly divisible by --pipeline-model-parallel-size'
