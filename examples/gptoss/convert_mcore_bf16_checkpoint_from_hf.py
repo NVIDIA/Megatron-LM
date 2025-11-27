@@ -27,12 +27,14 @@ MODEL_DIR="/workspace/models"
 HF_MODEL_DIR=f"{MODEL_DIR}/{MODEL}"
 
 # Specify model partitions, we use parallel folding strategy to separate EP for MLP from pp-tp-cp-dp for Attention
-TP=int(os.environ.get("TP", 1))
+TP=int(os.environ.get("TP", 8))
 PP=int(os.environ.get("PP", 1))
 CP=int(os.environ.get("CP", 1))
 
 # Assume a single node setup in this script
-EP=int(os.environ.get("EDP", 8 // (TP * PP))) # distributed evenly among all gpu cards
+EP=int(os.environ.get("EDP", 8 // PP)) # distributed evenly among all gpu cards
+# ETP can only be 1 for GptOSS for the moment with Mcore backend
+ETP=1
 
 SAVER="mcore_bridge"
 
@@ -109,6 +111,7 @@ def export(checkpoint=True):
 
     # sparse model
     provider.expert_model_parallel_size = EP
+    provider.expert_tensor_parallel_size = ETP
 
     provider.finalize()
 
@@ -122,7 +125,7 @@ def export(checkpoint=True):
         bridge.save_hf_pretrained(model, f"{OUTPUT}")
     else:
         # to megatron checkpoint
-        # save_megatron_model(model, f"{OUTPUT}", hf_tokenizer_path=f"{HF_MODEL_DIR}")
+        save_megatron_model(model, f"{OUTPUT}", hf_tokenizer_path=f"{HF_MODEL_DIR}")
         OUTPUT = f"{OUTPUT}/iter_0000000"
 
     return model, OUTPUT

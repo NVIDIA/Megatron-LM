@@ -334,7 +334,7 @@ mkdir -p $OUTPUT_BASEPATH/index_mapping
 
 DATA_ARGS="
   $load_dataset \
-  --data-cache-path $OUTPUT_BASEPATH/index_mappings \
+  --data-cache-path $OUTPUT_BASEPATH/index_mapping \
   --num-workers 5
 "
 

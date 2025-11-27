@@ -62,17 +62,20 @@ fi
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 ## Model Parallel
-TP=1
+TP=8
 PP=1
 CP=1
 EDP=8
+ETP=1
 
 # TODO (yiakwy) : rename to DIST_OPT, --use-distributed-optimizer
 DO=${DIST_OPT:-true}
 
 TE=${TE:-true} # ${TE:-false}
 
-PRETRAIN_CHECKPOINT_PATH="/raid/gpt-oss-20b-BF16-to-mcore_bridge-tp1-pp1-cp1-ep8-bf16/iter_0000000"
+PRETRAIN_CHECKPOINT_PATH="/raid/gpt-oss-20b-BF16-to-mcore_bridge-tp8-pp1-cp1-ep8-bf16/iter_0000000"
+
+# PRETRAIN_CHECKPOINT_PATH="/raid/gpt-oss-20b-BF16-to-mcore_bridge-tp1-pp1-cp1-ep8-bf16/iter_0000000"
 # PRETRAIN_CHECKPOINT_PATH="/raid/gpt-oss-20b-BF16-to-mcore_bridge-tp1-pp2-cp1-ep4-bf16/iter_0000000"
 
 OUTPUT_BASEPATH=output
@@ -201,7 +204,7 @@ mkdir -p $OUTPUT_BASEPATH/index_mapping
 
 DATA_ARGS=(
     $load_dataset
-    --data-cache-path $OUTPUT_BASEPATH/index_mappings
+    --data-cache-path $OUTPUT_BASEPATH/index_mapping
     --num-workers 5
     --tokenizer-type HuggingFaceTokenizer
     --tokenizer-model "$PRETRAIN_CHECKPOINT_PATH/tokenizer"
@@ -227,6 +230,7 @@ MODEL_PARALLEL_ARGS=(
     --pipeline-model-parallel-size $PP
     --context-parallel-size $CP
     --expert-model-parallel-size $EDP
+    --expert-tensor-parallel-size $ETP
     --sequence-parallel
     --use-distributed-optimizer
     --disable-gloo-process-groups
