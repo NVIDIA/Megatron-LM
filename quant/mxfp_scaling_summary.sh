@@ -1,21 +1,29 @@
 #!/bin/bash
 # =============================================================================
-# MXFP Scaling Summary Script
+# MXFP Scaling Summary Script (Multi-threaded)
 # 批量处理 enhanced_tensor_logs/bf16 目录下的所有 tensor 文件
 # 对每个 tensor 进行 fp8_e4m3, fp8_e5m2, fp4_e2m1 三种格式的模拟量化分析
+#
+# Usage:
+#   ./mxfp_scaling_summary.sh [INPUT_DIR] [OUTPUT_DIR] [JOBS]
+#
+# Arguments:
+#   INPUT_DIR    - Input directory containing BF16 tensors (default: enhanced_tensor_logs/bf16)
+#   OUTPUT_DIR   - Output base directory (default: ./draw/scaling_analysis)
+#   JOBS         - Number of parallel jobs (default: number of CPU cores)
+#
+# Example:
+#   ./mxfp_scaling_summary.sh enhanced_tensor_logs/bf16 ./draw/scaling_analysis 8
 # =============================================================================
-
-set -e  # Exit on error
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-# Input directory containing BF16 tensors
+# Parse command line arguments
 INPUT_DIR="${1:-enhanced_tensor_logs/bf16}"
-
-# Output base directory (default: ./draw/scaling_analysis/)
 OUTPUT_BASE_DIR="${2:-./draw/scaling_analysis}"
+JOBS="${3:-$(nproc 2>/dev/null || echo 4)}"  # Number of parallel jobs (default: CPU cores or 4)
 
 # Element formats to test
 ELEM_FORMATS=("fp8_e4m3" "fp8_e5m2" "fp4_e2m1")
@@ -46,11 +54,12 @@ fi
 # =============================================================================
 
 echo "=============================================================================="
-echo "MXFP Scaling Summary - Batch Processing"
+echo "MXFP Scaling Summary - Batch Processing (Multi-threaded)"
 echo "=============================================================================="
 echo "Input directory: $INPUT_DIR"
 echo "Output base directory: $OUTPUT_BASE_DIR"
 echo "Element formats: ${ELEM_FORMATS[*]}"
+echo "Parallel jobs: $JOBS"
 echo "=============================================================================="
 echo ""
 
@@ -70,52 +79,108 @@ echo "Will run $TOTAL_TESTS test(s) in total"
 echo ""
 
 # =============================================================================
-# Process each tensor with each format
+# Process each tensor with each format (Parallel)
 # =============================================================================
 
 cd "$PROJECT_ROOT"
+
+# Create temporary directory for job tracking
+TMP_DIR=$(mktemp -d)
+trap "rm -rf '$TMP_DIR'" EXIT
+
+# Create output lock file for synchronized output
+OUTPUT_LOCK="$TMP_DIR/output.lock"
+touch "$OUTPUT_LOCK"
+
+# Check if flock is available
+HAS_FLOCK=$(command -v flock >/dev/null 2>&1 && echo "yes" || echo "no")
+
+# Export variables for subprocesses
+export PROJECT_ROOT TEST_SCRIPT OUTPUT_BASE_DIR TMP_DIR TOTAL_TESTS OUTPUT_LOCK HAS_FLOCK
+
+# Build task list
+TASK_ID=0
+declare -a TASKS
+
+for tensor_file in "${TENSOR_FILES[@]}"; do
+    for elem_format in "${ELEM_FORMATS[@]}"; do
+        TASK_ID=$((TASK_ID + 1))
+        TASKS+=("$tensor_file|$elem_format|$TASK_ID")
+    done
+done
+
+# Process tasks in parallel
+echo "Starting parallel processing with $JOBS concurrent jobs..."
+echo ""
 
 SUCCESSFUL_TESTS=0
 FAILED_TESTS=0
 FAILED_FILES=()
 
-# Track progress
-CURRENT_TEST=0
-
-for tensor_file in "${TENSOR_FILES[@]}"; do
+# Process all tasks using job control
+for task in "${TASKS[@]}"; do
+    IFS='|' read -r tensor_file elem_format test_id <<< "$task"
     tensor_name=$(basename "$tensor_file" .pt)
-    tensor_rel_path=$(realpath --relative-to="$PROJECT_ROOT" "$tensor_file")
+    output_dir="$OUTPUT_BASE_DIR/$elem_format/$tensor_name"
+    log_file="$TMP_DIR/test_${test_id}.log"
+    result_file="$TMP_DIR/result_${test_id}.txt"
     
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Processing tensor: $tensor_name"
-    echo "File: $tensor_rel_path"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    
-    for elem_format in "${ELEM_FORMATS[@]}"; do
-        CURRENT_TEST=$((CURRENT_TEST + 1))
-        
-        echo ""
-        echo "[$CURRENT_TEST/$TOTAL_TESTS] Testing: $tensor_name with $elem_format"
-        echo "──────────────────────────────────────────────────────────────────────"
-        
-        # Run the test script
-        # Output will be saved to: ./draw/scaling_analysis/{elem_format}/{tensor_name}/
-        if python3 "$TEST_SCRIPT" "$tensor_file" \
-            --elem-format "$elem_format" \
-            --output-dir "$OUTPUT_BASE_DIR/$elem_format/$tensor_name"; then
-            
-            SUCCESSFUL_TESTS=$((SUCCESSFUL_TESTS + 1))
-            echo "✅ Success: $tensor_name ($elem_format)"
-        else
-            FAILED_TESTS=$((FAILED_TESTS + 1))
-            FAILED_FILES+=("$tensor_name ($elem_format)")
-            echo "❌ Failed: $tensor_name ($elem_format)"
-        fi
-        
-        echo ""
+    # Wait if we've reached the job limit
+    while [ $(jobs -r | wc -l) -ge $JOBS ]; do
+        sleep 0.1
     done
     
-    echo ""
+    # Start background job
+    (
+        {
+            echo "[$test_id/$TOTAL_TESTS] Testing: $tensor_name with $elem_format"
+            echo "──────────────────────────────────────────────────────────────────────"
+            
+            # Run the test script
+            if python3 "$TEST_SCRIPT" "$tensor_file" \
+                --elem-format "$elem_format" \
+                --output-dir "$output_dir" > "$log_file" 2>&1; then
+                echo "SUCCESS|$tensor_name ($elem_format)" > "$result_file"
+                echo "✅ Success: $tensor_name ($elem_format)"
+            else
+                echo "FAILED|$tensor_name ($elem_format)" > "$result_file"
+                echo "❌ Failed: $tensor_name ($elem_format)"
+            fi
+            echo ""
+        } | {
+            # Use flock to synchronize output (if available)
+            if [ "$HAS_FLOCK" = "yes" ]; then
+                flock -x 200
+                cat
+            else
+                # Fallback: simple output without locking
+                cat
+            fi
+        } 200>"$OUTPUT_LOCK" 2>/dev/null || cat
+    ) &
+done
+
+# Wait for all background jobs to complete
+wait
+
+# Collect results
+for task in "${TASKS[@]}"; do
+    IFS='|' read -r tensor_file elem_format test_id <<< "$task"
+    result_file="$TMP_DIR/result_${test_id}.txt"
+    
+    if [ -f "$result_file" ]; then
+        IFS='|' read -r status message <<< "$(cat "$result_file")"
+        if [ "$status" = "SUCCESS" ]; then
+            SUCCESSFUL_TESTS=$((SUCCESSFUL_TESTS + 1))
+        else
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            FAILED_FILES+=("$message")
+        fi
+    else
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        tensor_name=$(basename "$tensor_file" .pt)
+        FAILED_FILES+=("$tensor_name ($elem_format)")
+    fi
 done
 
 # =============================================================================
