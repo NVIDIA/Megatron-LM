@@ -126,14 +126,6 @@ jobs:
 
             Thank you for your understanding.
 
-      - name: exit
-        run: |
-          if [ "${{ steps.check-membership.outputs.is_maintainer }}" == "true" ]; then
-            exit 0
-          else
-            exit 1
-          fi
-
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
