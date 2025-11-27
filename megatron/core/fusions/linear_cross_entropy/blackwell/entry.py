@@ -2,6 +2,8 @@
 
 import typing
 from dataclasses import dataclass, field
+from functools import lru_cache
+import os
 
 import cuda.bindings.driver as cuda  # type: ignore
 import cutlass
@@ -29,6 +31,7 @@ class FwdConfig:
     _dedicated_events: typing.List[torch.cuda.Event] = field(default_factory=list)
     _initialized: bool = field(default=False)
     _fwd_mainloop_kernels: typing.Dict[str, cute.kernel] = field(default_factory=dict)
+    _vocab_per_split: int = field(default=int(os.environ.get("LCE_FWD_VOCAB_SPLIT_SIZE", 512 * 6)))
 
 
 @dataclass
@@ -38,11 +41,23 @@ class BwdConfig:
     """
 
     _bwd_kernel: typing.Dict[str, cute.kernel] = field(default_factory=dict)
+    _vocab_per_split: int = field(default=int(os.environ.get("LCE_BWD_VOCAB_SPLIT_SIZE", 512 * 6)))
+    _backward_method: utils.BackwardMethodEnum = field(default=utils.BackwardMethodEnum.kDlogitsSplitN)
 
 
-_fwd_config = FwdConfig()
-_bwd_config = BwdConfig()
+@lru_cache(maxsize=1)
+def _get_fwd_config() -> FwdConfig:
+    """
+    Helper function to lazy initialize the forward configuration.
+    """
+    return FwdConfig()
 
+@lru_cache(maxsize=1)
+def _get_bwd_config() -> BwdConfig:
+    """
+    Helper function to lazy initialize the backward configuration.
+    """
+    return BwdConfig()
 
 def forward(
     hidden: torch.Tensor,
@@ -91,11 +106,10 @@ def forward(
     num_tokens, dim = hidden_view.shape
     vocab_size, _ = weight.shape
 
-    global _fwd_config
-    if not _fwd_config._initialized:
-        _fwd_config._dedicated_stream = torch.cuda.Stream(hidden.device)
-        _fwd_config._dedicated_events = [torch.cuda.Event() for _ in range(2)]
-        _fwd_config._initialized = True
+    if not _get_fwd_config()._initialized:
+        _get_fwd_config()._dedicated_stream = torch.cuda.Stream(hidden.device)
+        _get_fwd_config()._dedicated_events = [torch.cuda.Event() for _ in range(2)]
+        _get_fwd_config()._initialized = True
 
     REDUCTION = utils.str_to_reduction_enum(reduction)
     # declare logprobs
@@ -114,8 +128,7 @@ def forward(
     )
     # declare intermediate tensors
     # NOTE: this is a parameter for tuning
-    vocab_per_split = 512 * 6
-    num_splits = (vocab_size + vocab_per_split - 1) // vocab_per_split
+    num_splits = (vocab_size + _get_fwd_config()._vocab_per_split - 1) // _get_fwd_config()._vocab_per_split
     _max = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
     _accu = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
     if REDUCTION == utils.EntropyReductionEnum.kNone:
@@ -150,8 +163,8 @@ def forward(
     # VocabSize and Dim are fixed for a given model,
     # only the number of tokens can vary
     key = f"vocab_size:{vocab_size}+dim:{dim}+dtype:{hidden_view.dtype}"
-    if _fwd_config._fwd_mainloop_kernels.get(key) is None:
-        fwd_mainloop_kernel = fwd_mainloop.FwdMainLoop(vocab_per_split=vocab_per_split)
+    if _get_fwd_config()._fwd_mainloop_kernels.get(key) is None:
+        fwd_mainloop_kernel = fwd_mainloop.FwdMainLoop(vocab_per_split=_get_fwd_config()._vocab_per_split)
         fwd_mainloop_compiled_kernel = cute.compile(
             fwd_mainloop_kernel,
             hidden_packed,
@@ -164,9 +177,9 @@ def forward(
             tp_rank,
             cuda_stream,
         )
-        _fwd_config._fwd_mainloop_kernels[key] = fwd_mainloop_compiled_kernel
+        _get_fwd_config()._fwd_mainloop_kernels[key] = fwd_mainloop_compiled_kernel
     else:
-        fwd_mainloop_compiled_kernel = _fwd_config._fwd_mainloop_kernels[key]
+        fwd_mainloop_compiled_kernel = _get_fwd_config()._fwd_mainloop_kernels[key]
     fwd_mainloop_compiled_kernel(
         hidden_packed,
         weight_packed,
@@ -210,11 +223,11 @@ def forward(
         _max_backup = _max.clone()
         dist.all_reduce(_max, op=dist.ReduceOp.MAX, group=tp_group)
 
-        torch.cuda.current_stream().record_event(_fwd_config._dedicated_events[0])
-        with torch.cuda.stream(_fwd_config._dedicated_stream):
-            _fwd_config._dedicated_stream.wait_event(_fwd_config._dedicated_events[0])
+        torch.cuda.current_stream().record_event(_get_fwd_config()._dedicated_events[0])
+        with torch.cuda.stream(_get_fwd_config()._dedicated_stream):
+            _get_fwd_config()._dedicated_stream.wait_event(_get_fwd_config()._dedicated_events[0])
             dist.all_reduce(_logprobs, op=dist.ReduceOp.SUM, group=tp_group)
-            _fwd_config._dedicated_stream.record_event(_fwd_config._dedicated_events[1])
+            _get_fwd_config()._dedicated_stream.record_event(_get_fwd_config()._dedicated_events[1])
 
         def grid(meta):
             return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]),)
@@ -240,7 +253,7 @@ def forward(
         dist.all_reduce(accumulate, op=dist.ReduceOp.SUM, group=tp_group)
 
         # update logprobs
-        torch.cuda.current_stream().wait_event(_fwd_config._dedicated_events[1])
+        torch.cuda.current_stream().wait_event(_get_fwd_config()._dedicated_events[1])
         triton_kernels.forward_tp_epilogue_update_logprobs[grid](
             num_tokens,
             ignore_index,
@@ -304,9 +317,9 @@ def backward(
     assert d_hidden.is_contiguous() and d_weight.is_contiguous()
 
     # FIXME: implement different backward methods
-    _backward = utils.BackwardMethodEnum.kDlogitsSplitN
-    if _backward == utils.BackwardMethodEnum.kDlogitsSplitN:
-        vocab_per_split = 512 * 6
+    _backward_method = _get_bwd_config()._backward_method
+    if _backward_method == utils.BackwardMethodEnum.kDlogitsSplitN:
+        vocab_per_split = _get_bwd_config()._vocab_per_split
         num_splits = (vocab_size + vocab_per_split - 1) // vocab_per_split
 
         _d_logits = torch.empty(
@@ -335,7 +348,7 @@ def backward(
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
         key = f"vocab_size:{vocab_size}+dim:{dim}+reduction:{REDUCTION}+dtype:{hidden_view.dtype}"
-        if _bwd_config._bwd_kernel.get(key) is None:
+        if _get_bwd_config()._bwd_kernel.get(key) is None:
             bwd_kernel = bwd_partial_dlogits.BwdPartialDlogits(
                 reduction=REDUCTION.value, vocab_per_split=vocab_per_split
             )
@@ -354,9 +367,9 @@ def backward(
                 tp_rank,
                 stream,
             )
-            _bwd_config._bwd_kernel[key] = bwd_kernel_compiled
+            _get_bwd_config()._bwd_kernel[key] = bwd_kernel_compiled
         else:
-            bwd_kernel_compiled = _bwd_config._bwd_kernel.get(key)
+            bwd_kernel_compiled = _get_bwd_config()._bwd_kernel.get(key)
 
         for split_idx in range(num_splits):
             bwd_kernel_compiled(
@@ -395,7 +408,7 @@ def backward(
                 out=d_weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :],
             )
     else:
-        raise NotImplementedError(f"Unsupported backward method: {_backward}")
+        raise NotImplementedError(f"Unsupported backward method: {_backward_method}")
 
     if in_tp_mode:
         dist.all_reduce(d_hidden, op=dist.ReduceOp.SUM, group=tp_group)

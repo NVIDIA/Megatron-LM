@@ -6,6 +6,7 @@ Fuse cross entropy with linear layer.
 """
 
 import typing
+from functools import lru_cache
 
 import torch
 
@@ -40,11 +41,13 @@ class Platform:
 
         self._initialized = True
 
-try:
-    _platform = Platform()
-except ValueError as e:
-    _unsupported_architecture_error = e
-    _platform = None
+@lru_cache(maxsize=1)
+def _get_platform() -> Platform:
+    """
+    Helper function to lazy initialize the platform.
+    """
+    return Platform()
+
 
 class LinearCrossEntropy(torch.autograd.Function):
     """
@@ -154,12 +157,9 @@ class LinearCrossEntropy(torch.autograd.Function):
         # each rank will get distinct local d_hidden and d_weight
         ```
         """
-        if _unsupported_architecture_error:
-            raise _unsupported_architecture_error
-
         with torch.cuda.nvtx.range("LinearCrossEntropy-forward"):
             logprobs, _maximum, _acc, _num_valid_tokens, tp_rank, tp_world_size, global_hidden = (
-                _platform.forward_func(
+                _get_platform().forward_func(
                     hidden, weight, labels, tp_group, reduction, ignore_index, sequence_parallel
                 )
             )
@@ -187,9 +187,6 @@ class LinearCrossEntropy(torch.autograd.Function):
             dhidden (torch.Tensor): The gradient of the hidden.
             dweight (torch.Tensor): The gradient of the weight.
         """
-        if _unsupported_architecture_error:
-            raise _unsupported_architecture_error
-
         with torch.cuda.nvtx.range("LinearCrossEntropy-backward"):
             (global_hidden, weight, labels, _maximum, _accu, _num_valid_tokens) = ctx.saved_tensors
 
@@ -200,7 +197,7 @@ class LinearCrossEntropy(torch.autograd.Function):
             tp_world_size = ctx.tp_world_size
             sequence_parallel = ctx.sequence_parallel
 
-            d_hidden, d_weight = _platform.backward_func(
+            d_hidden, d_weight = _get_platform().backward_func(
                 dlogprobs,
                 global_hidden,
                 weight,
