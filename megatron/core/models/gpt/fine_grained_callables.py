@@ -275,13 +275,7 @@ class TransformerLayerNode(ScheduleNode):
         detached_grad = tuple([e.grad for e in self.detached])
         grads = output_grad + detached_grad
         self.default_backward_func(outputs + self.before_detached, grads)
-        # release the output grad memory after use
-        if self.delay_wgrad_compute:
-            self.output_grads = grads
-        else:
-            for tensor in grads:
-                tensor.untyped_storage().resize_(0)
-
+        self._release_state()
         # return grads for record stream
         return grads
 
@@ -293,14 +287,9 @@ class TransformerLayerNode(ScheduleNode):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
 
-        # the output grad memory is last used in wgrad compute, should be safe to release.
-        for tensor in self.output_grads:
-            tensor.untyped_storage().resize_(0)
-        self.output_grads = None
-
         self.bwd_dw_callables = None
 
-    def __del__(self):
+    def _release_state(self):
         # Release reference as early as possible, this helps avoid memory leak.
         self.before_detached = None
         self.detached = None
