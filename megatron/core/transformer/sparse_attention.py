@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.fusions.fused_sparse_attention import FusedSparseAttention
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -688,30 +687,6 @@ def unfused_sparse_attention_fn(query, key, value, topk_indices, softmax_scale):
     return output
 
 
-def fused_sparse_attention_fn(query, key, value, topk_indices, softmax_scale):
-    """
-    Fused sparse attention implementation.
-    """
-    sq, b, np, _ = query.size()
-    skv = key.size(0)
-    hnv = value.size(3)
-    # [sq, b, ...] -> [b, sq, ...]
-    query = query.transpose(0, 1).contiguous()
-    # [skv, b, ...] -> [b, skv, ...]
-    key = key.transpose(0, 1).contiguous()
-    # [skv, b, ...] -> [b, skv, ...]
-    value = value.transpose(0, 1).contiguous()
-    # [b, s, index_topk] -> [b, s, head, index_topk]
-    topk_indices = topk_indices.unsqueeze(2).repeat(1, 1, np, 1)
-    # output [sq, b, np, hnv]
-    output = FusedSparseAttention.apply(query, key, value, topk_indices, hnv, softmax_scale)
-    # [b, sq, np, hnv] -> [s, b, np, hnv]
-    output = output.transpose(0, 1).contiguous()
-    # [sq, b, np, hnv] -> [sq, b, np * hnv]
-    output = output.view(sq, b, np * hnv)
-    return output
-
-
 class SparseAttention(MegatronModule):
     """
     This module implements sparse attention mechanism using an Indexer to compute top-k attention
@@ -815,12 +790,7 @@ class SparseAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
-        if getattr(self.config, "use_fused_sparse_attention", False):
-            output = fused_sparse_attention_fn(query, key, value, topk_indices, self.softmax_scale)
-        else:
-            output = unfused_sparse_attention_fn(
-                query, key, value, topk_indices, self.softmax_scale
-            )
+        output = unfused_sparse_attention_fn(query, key, value, topk_indices, self.softmax_scale)
 
         # ===================================
         # Attach indexer loss
