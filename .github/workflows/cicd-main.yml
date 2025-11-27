@@ -260,7 +260,7 @@ jobs:
         shell: bash
         run: |
           echo "::group::Download test data"
-          pip install --no-cache-dir pygithub click
+          pip install --no-cache-dir click requests
           python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
           echo "::endgroup::"
 
