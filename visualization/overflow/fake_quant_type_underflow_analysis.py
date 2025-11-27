@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Overflow Analysis Tool by Tensor Type
+Overflow Analysis Tool by Layer and Tensor Type
 
 Analyzes overflow when simulating quantization on BF16 tensors.
-Groups tensors by type (input, weight, query, key, value) and analyzes overflow
-in forward and backward passes, generating line plots.
-Usage: python fake_quant_type_underflow_analysis.py --elem-format hifp8
+Groups tensors by type (input, weight, query, key, value) and layer,
+analyzes overflow in forward pass only, generating line plots by layer.
+Usage: python fake_quant_type_underflow_analysis.py --layer 1,8,15,16 --elem-format hifp8
 """
 
 import re
@@ -85,17 +85,27 @@ DATA_TYPE_RANGES = {
 TENSOR_TYPES = ['input', 'weight', 'query', 'key', 'value']
 
 
-def get_tensor_type_and_pass(filename: str) -> tuple:
-    """Extract tensor type and pass type (forward/backward) from filename."""
+def parse_layers(layer_str: str) -> list:
+    """Parse layer argument: '1,8,15,16' -> [1, 8, 15, 16]"""
+    return [int(l.strip()) for l in layer_str.split(',')]
+
+
+def get_tensor_type_layer_and_pass(filename: str) -> tuple:
+    """Extract tensor type, layer number and pass type (forward/backward) from filename."""
     filename_lower = filename.lower()
     
-    # Extract pass type
+    # Extract layer number
+    layer_match = re.search(r'_L(\d+)_', filename)
+    if not layer_match:
+        return None, None, None
+    
+    layer = int(layer_match.group(1))
+    
+    # Extract pass type (only forward)
     if '_forward_' in filename_lower:
         pass_type = 'forward'
-    elif '_backward_' in filename_lower:
-        pass_type = 'backward'
     else:
-        pass_type = None
+        pass_type = None  # Only process forward pass
     
     # Extract tensor type from suffix
     tensor_type = None
@@ -109,7 +119,7 @@ def get_tensor_type_and_pass(filename: str) -> tuple:
             tensor_type = ttype
             break
     
-    return tensor_type, pass_type
+    return tensor_type, layer, pass_type
 
 
 def remove_scaling(tensor: torch.Tensor, elem_format: str) -> torch.Tensor:
@@ -167,12 +177,13 @@ def analyze_tensor(file_path: Path, elem_format: str) -> dict:
     overflow_pct = (overflow_count / total) * 100.0
     
     # Get metadata
-    tensor_type, pass_type = get_tensor_type_and_pass(file_path.name)
-    if tensor_type is None or pass_type is None:
+    tensor_type, layer, pass_type = get_tensor_type_layer_and_pass(file_path.name)
+    if tensor_type is None or layer is None or pass_type is None:
         return None
     
     return {
         'tensor_type': tensor_type,
+        'layer': layer,
         'pass_type': pass_type,
         'total_elements': int(total),
         'overflow_count': int(overflow_count),
@@ -182,107 +193,86 @@ def analyze_tensor(file_path: Path, elem_format: str) -> dict:
 
 
 def plot_overflow_analysis(results: dict, elem_format: str, output_path: Path):
-    """Generate line plots for overflow analysis."""
-    # Prepare data for plotting
-    # Structure: {tensor_type: {pass_type: overflow_percentage}}
-    plot_data = defaultdict(lambda: {'forward': [], 'backward': []})
-    tensor_types = sorted([t for t in TENSOR_TYPES if t in results])
+    """Generate line plots for overflow analysis by layer."""
+    # Structure: {tensor_type: {layer: overflow_percentage}}
+    # Prepare data: collect all layers and tensor types
+    all_layers = set()
+    tensor_types_in_data = set()
     
-    for tensor_type in tensor_types:
-        for pass_type in ['forward', 'backward']:
-            if pass_type in results[tensor_type]:
-                plot_data[tensor_type][pass_type] = results[tensor_type][pass_type]['overflow_percentage']
+    for tensor_type in results:
+        if 'forward' in results[tensor_type]:
+            for layer in results[tensor_type]['forward']:
+                all_layers.add(layer)
+                tensor_types_in_data.add(tensor_type)
+    
+    all_layers = sorted(all_layers)
+    tensor_types_in_data = sorted(tensor_types_in_data)
+    
+    if not all_layers or not tensor_types_in_data:
+        print("Warning: No data to plot")
+        return
+    
+    # Prepare plot data: {tensor_type: [overflow_pct for each layer]}
+    plot_data = {}
+    for tensor_type in tensor_types_in_data:
+        plot_data[tensor_type] = []
+        for layer in all_layers:
+            if layer in results[tensor_type]['forward']:
+                plot_data[tensor_type].append(results[tensor_type]['forward'][layer]['overflow_percentage'])
             else:
-                plot_data[tensor_type][pass_type] = 0.0
+                plot_data[tensor_type].append(0.0)
     
-    # Create figure with subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    # Create line plot
+    fig, ax = plt.subplots(figsize=(14, 8))
     
-    # Plot 1: Forward pass
-    forward_data = {ttype: plot_data[ttype]['forward'] for ttype in tensor_types}
-    backward_data = {ttype: plot_data[ttype]['backward'] for ttype in tensor_types}
+    # Color palette for different tensor types
+    colors = ['#2ecc71', '#3498db', '#e74c3c', '#f39c12', '#9b59b6']
+    markers = ['o', 's', '^', 'D', 'v']
     
-    x_pos = np.arange(len(tensor_types))
-    width = 0.35
+    for idx, tensor_type in enumerate(tensor_types_in_data):
+        color = colors[idx % len(colors)]
+        marker = markers[idx % len(markers)]
+        ax.plot(all_layers, plot_data[tensor_type], 
+               marker=marker, linewidth=2.5, markersize=8, 
+               label=tensor_type.capitalize(), color=color, alpha=0.8)
+        
+        # Add value annotations for better readability
+        for i, (layer, val) in enumerate(zip(all_layers, plot_data[tensor_type])):
+            if val > 0:  # Only annotate non-zero values
+                ax.annotate(f'{val:.2f}%', (layer, val), 
+                           textcoords="offset points", 
+                           xytext=(0, 8 if idx % 2 == 0 else -15), 
+                           ha='center', fontsize=8, color=color, alpha=0.7)
     
-    # Forward pass bars
-    forward_values = [forward_data[ttype] for ttype in tensor_types]
-    ax1.bar(x_pos - width/2, forward_values, width, label='Forward', color='#2ecc71', alpha=0.8)
-    
-    # Add value labels on bars
-    for i, (ttype, val) in enumerate(zip(tensor_types, forward_values)):
-        ax1.text(i - width/2, val, f'{val:.2f}%', ha='center', va='bottom', fontsize=9)
-    
-    ax1.set_xlabel('Tensor Type', fontsize=12)
-    ax1.set_ylabel('Overflow Percentage (%)', fontsize=12)
-    ax1.set_title(f'{elem_format.upper()} Overflow Analysis - Forward Pass', fontsize=14, fontweight='bold')
-    ax1.set_xticks(x_pos)
-    ax1.set_xticklabels(tensor_types, fontsize=10)
-    ax1.legend()
-    ax1.grid(True, alpha=0.3, axis='y')
-    
-    # Plot 2: Backward pass
-    backward_values = [backward_data[ttype] for ttype in tensor_types]
-    ax2.bar(x_pos - width/2, backward_values, width, label='Backward', color='#e74c3c', alpha=0.8)
-    
-    # Add value labels on bars
-    for i, (ttype, val) in enumerate(zip(tensor_types, backward_values)):
-        ax2.text(i - width/2, val, f'{val:.2f}%', ha='center', va='bottom', fontsize=9)
-    
-    ax2.set_xlabel('Tensor Type', fontsize=12)
-    ax2.set_ylabel('Overflow Percentage (%)', fontsize=12)
-    ax2.set_title(f'{elem_format.upper()} Overflow Analysis - Backward Pass', fontsize=14, fontweight='bold')
-    ax2.set_xticks(x_pos)
-    ax2.set_xticklabels(tensor_types, fontsize=10)
-    ax2.legend()
-    ax2.grid(True, alpha=0.3, axis='y')
+    ax.set_xlabel('Layer', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Overflow Percentage (%)', fontsize=13, fontweight='bold')
+    ax.set_title(f'{elem_format.upper()} Overflow Analysis by Layer (Forward Pass)', 
+                fontsize=15, fontweight='bold', pad=20)
+    ax.set_xticks(all_layers)
+    ax.set_xticklabels(all_layers, fontsize=10)
+    ax.legend(loc='best', fontsize=11, framealpha=0.9)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.set_ylim(bottom=0)  # Start y-axis from 0
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    # Also create a combined line plot
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    x = np.arange(len(tensor_types))
-    forward_line = ax.plot(x, forward_values, marker='o', linewidth=2, markersize=8, 
-                          label='Forward', color='#2ecc71')
-    backward_line = ax.plot(x, backward_values, marker='s', linewidth=2, markersize=8, 
-                            label='Backward', color='#e74c3c')
-    
-    # Add value annotations
-    for i, (ttype, fval, bval) in enumerate(zip(tensor_types, forward_values, backward_values)):
-        ax.annotate(f'{fval:.2f}%', (i, fval), textcoords="offset points", 
-                   xytext=(0,10), ha='center', fontsize=9, color='#2ecc71')
-        ax.annotate(f'{bval:.2f}%', (i, bval), textcoords="offset points", 
-                   xytext=(0,-15), ha='center', fontsize=9, color='#e74c3c')
-    
-    ax.set_xlabel('Tensor Type', fontsize=12)
-    ax.set_ylabel('Overflow Percentage (%)', fontsize=12)
-    ax.set_title(f'{elem_format.upper()} Overflow Analysis - Forward vs Backward', 
-                fontsize=14, fontweight='bold')
-    ax.set_xticks(x)
-    ax.set_xticklabels(tensor_types, fontsize=10)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    
-    # Save combined plot
-    combined_path = output_path.parent / f"{output_path.stem}_combined{output_path.suffix}"
-    plt.tight_layout()
-    plt.savefig(combined_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Plots saved to: {output_path} and {combined_path}")
+    print(f"Plot saved to: {output_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze overflow by tensor type for BF16 tensors')
+    parser = argparse.ArgumentParser(description='Analyze overflow by tensor type and layer for BF16 tensors')
+    parser.add_argument('--layer', required=True, help='Layer numbers: 1,8,15,16')
     parser.add_argument('--base-dir', default='enhanced_tensor_logs', help='Base directory')
     parser.add_argument('--elem-format', default='hifp8', 
                        choices=['hifp8', 'mxfp8e4m3', 'mxfp8e5m2', 'mxfp4'], 
                        help='Element format: hifp8, mxfp8e4m3, mxfp8e5m2, mxfp4')
     parser.add_argument('--output-dir', default=None, help='Output directory for plots (default: base-dir)')
     args = parser.parse_args()
+    
+    # Parse layers
+    layers = parse_layers(args.layer)
     
     base_dir = Path(args.base_dir)
     bf16_dir = base_dir / 'bf16'
@@ -295,25 +285,27 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else base_dir
     
     # Find and analyze files
-    # Structure: {tensor_type: {pass_type: aggregated_stats}}
-    results = defaultdict(lambda: defaultdict(lambda: {
+    # Structure: {tensor_type: {'forward': {layer: aggregated_stats}}}
+    results = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {
         'total_elements': 0,
         'total_overflow': 0,
         'overflow_percentage': 0.0,
         'num_tensors': 0
-    }))
+    })))
     
     # Collect all matching files
     all_files = list(bf16_dir.glob("*.pt"))
     matching_files = []
     for file_path in all_files:
-        tensor_type, pass_type = get_tensor_type_and_pass(file_path.name)
-        if tensor_type in TENSOR_TYPES and pass_type:
+        tensor_type, layer, pass_type = get_tensor_type_layer_and_pass(file_path.name)
+        if tensor_type in TENSOR_TYPES and layer in layers and pass_type == 'forward':
             matching_files.append(file_path)
     
+    print(f"Analyzing layers: {layers}")
     print(f"Found {len(matching_files)} matching tensor files to analyze")
     print(f"Tensor types: {TENSOR_TYPES}")
     print(f"Element format: {args.elem_format}")
+    print(f"Pass type: forward only")
     print()
     
     # Analyze all matching files
@@ -321,64 +313,69 @@ def main():
         result = analyze_tensor(file_path, args.elem_format)
         if result:
             tensor_type = result['tensor_type']
+            layer = result['layer']
             pass_type = result['pass_type']
             
-            # Aggregate results
-            results[tensor_type][pass_type]['total_elements'] += result['total_elements']
-            results[tensor_type][pass_type]['total_overflow'] += result['overflow_count']
-            results[tensor_type][pass_type]['num_tensors'] += 1
+            # Only process forward pass
+            if pass_type == 'forward' and layer in layers:
+                # Aggregate results by layer
+                results[tensor_type][pass_type][layer]['total_elements'] += result['total_elements']
+                results[tensor_type][pass_type][layer]['total_overflow'] += result['overflow_count']
+                results[tensor_type][pass_type][layer]['num_tensors'] += 1
     
-    # Calculate percentages
+    # Calculate percentages for each layer
     for tensor_type in results:
         for pass_type in results[tensor_type]:
-            total_elements = results[tensor_type][pass_type]['total_elements']
-            total_overflow = results[tensor_type][pass_type]['total_overflow']
-            if total_elements > 0:
-                results[tensor_type][pass_type]['overflow_percentage'] = \
-                    (total_overflow / total_elements) * 100.0
+            for layer in results[tensor_type][pass_type]:
+                total_elements = results[tensor_type][pass_type][layer]['total_elements']
+                total_overflow = results[tensor_type][pass_type][layer]['total_overflow']
+                if total_elements > 0:
+                    results[tensor_type][pass_type][layer]['overflow_percentage'] = \
+                        (total_overflow / total_elements) * 100.0
     
     # Print report
     print("\n" + "=" * 80)
-    print(f"{args.elem_format.upper()} OVERFLOW ANALYSIS BY TENSOR TYPE")
+    print(f"{args.elem_format.upper()} OVERFLOW ANALYSIS BY LAYER AND TENSOR TYPE (FORWARD)")
     print("=" * 80)
     
     # Prepare data for JSON output
     json_data = {
         'elem_format': args.elem_format,
+        'layers': layers,
         'tensor_types': sorted([t for t in TENSOR_TYPES if t in results]),
         'results': []
     }
     
     for tensor_type in sorted(results.keys()):
         print(f"\n{tensor_type.upper()}:")
-        for pass_type in ['forward', 'backward']:
-            if pass_type not in results[tensor_type]:
-                continue
-            
-            stats = results[tensor_type][pass_type]
-            print(f"  {pass_type.upper()}: {stats['overflow_percentage']:.4f}% overflow "
-                  f"({stats['total_overflow']:,}/{stats['total_elements']:,} elements, "
-                  f"{stats['num_tensors']} tensors)")
-            
-            # Add to JSON data
-            json_data['results'].append({
-                'tensor_type': tensor_type,
-                'pass_type': pass_type,
-                'total_elements': int(stats['total_elements']),
-                'total_overflow': int(stats['total_overflow']),
-                'overflow_percentage': float(stats['overflow_percentage']),
-                'num_tensors': int(stats['num_tensors'])
-            })
+        if 'forward' in results[tensor_type]:
+            for layer in sorted(results[tensor_type]['forward'].keys()):
+                stats = results[tensor_type]['forward'][layer]
+                print(f"  Layer {layer}: {stats['overflow_percentage']:.4f}% overflow "
+                      f"({stats['total_overflow']:,}/{stats['total_elements']:,} elements, "
+                      f"{stats['num_tensors']} tensors)")
+                
+                # Add to JSON data
+                json_data['results'].append({
+                    'tensor_type': tensor_type,
+                    'layer': layer,
+                    'pass_type': 'forward',
+                    'total_elements': int(stats['total_elements']),
+                    'total_overflow': int(stats['total_overflow']),
+                    'overflow_percentage': float(stats['overflow_percentage']),
+                    'num_tensors': int(stats['num_tensors'])
+                })
     
     # Save to JSON file
-    json_filename = f"{args.elem_format}_overflow_by_type.json"
+    layers_str = '_'.join(map(str, layers))
+    json_filename = f"{args.elem_format}_overflow_by_layer_{layers_str}.json"
     json_path = output_dir / json_filename
     with open(json_path, 'w') as f:
         json.dump(json_data, f, indent=2)
     print(f"\nResults saved to: {json_path}")
     
     # Generate plots
-    plot_filename = f"{args.elem_format}_overflow_by_type.png"
+    plot_filename = f"{args.elem_format}_overflow_by_layer_{layers_str}.png"
     plot_path = output_dir / plot_filename
     plot_overflow_analysis(results, args.elem_format, plot_path)
     
