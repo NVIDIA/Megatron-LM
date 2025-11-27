@@ -1495,7 +1495,7 @@ def _add_inference_args(parser):
                        '"none": no CUDA graph. '
                        '"local": capture the CUDA graph using MCore local implementation. --cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. '
                        '"transformer_engine": capture the CUDA graph using TE make_graphed_callables().')
-    group.add_argument('--cuda-graph-scope', nargs='+', type=lambda scope: CudaGraphScope[scope] if isinstance(scope, str) and scope != "full" else scope, default=[],
+    group.add_argument('--cuda-graph-scope', nargs='+', type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope, default=[],
                        help='Determines the CUDA graphs capturing scope. '
                        'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
                        '"attn": captures operations in TransformerLayer._forward_attention(). '

@@ -68,12 +68,12 @@ class AttnBackend(enum.Enum):
 
 
 class CudaGraphScope(enum.Enum):
-    """Cuda Graph Scope"""
+    """Cuda Graph Scope - defines which parts of the model to capture."""
 
-    full_iteration = 1
-    attn = 2
-    mlp = 3
-    moe = 4  # only used for MoeLayer
-    moe_router = 5  # only used for MoeLayer
-    moe_preprocess = 6  # only used for MoeLayer
-    mamba = 7  # only used for MambaLayer
+    full_iteration = 1  # Captures the entire training/inference iteration
+    attn = 2  # Captures attention layers
+    mlp = 3  # Captures MLP layers (dense layers only)
+    moe = 4  # Captures MoE layers (drop-and-pad MoE layers only)
+    moe_router = 5  # Captures MoE router part
+    moe_preprocess = 6  # Captures MoE preprocessing part (requires moe_router)
+    mamba = 7  # Captures Mamba layers
