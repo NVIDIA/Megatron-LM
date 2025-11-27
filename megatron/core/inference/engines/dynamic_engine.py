@@ -683,14 +683,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
 
-        if not request.sampling_params.skip_prompt_top_n_logprobs:
-            assert (
-                request.sampling_params.return_log_probs
-            ), "Requesting prompt top-n logprobs (skip_prompt_top_n_logprobs=False) requires sampling_params.return_log_probs to be True"
-            assert (
-                request.sampling_params.top_n_logprobs > 0
-            ), "Requesting prompt top-n logprobs (skip_prompt_top_n_logprobs=False) requires sampling_params.top_n_logprobs to be greater than 0"
-
         assert (
             request.sampling_params.num_tokens_to_generate is None
             or request.sampling_params.num_tokens_total is None
@@ -917,10 +909,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_top_n_logprobs
                     )
 
-                    # If skip_prompt_top_n_logprobs is False and we haven't reached prompt end,
+                    # If skip_prompt_log_probs is False and we haven't reached prompt end,
                     # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
                     if (
-                        not request.sampling_params.skip_prompt_top_n_logprobs
+                        not request.sampling_params.skip_prompt_log_probs
                         and total_accumulated < prompt_length - 1
                     ):
                         request.prompt_top_n_logprobs.append(logit_dict)

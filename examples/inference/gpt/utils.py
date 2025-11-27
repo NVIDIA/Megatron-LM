@@ -67,12 +67,6 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help='Return the top n logprobs for the generated tokens and their corresponding token as a dictionary',
     )
     group.add_argument(
-        "--skip-prompt-top-n-logprobs",
-        action='store_true',
-        default=False,
-        help='Skip the top n logprobs for the prompt tokens (only return for generated tokens)',
-    )
-    group.add_argument(
         "--incoming-requests-per-step",
         type=int, default=None,
         help="Add a deterministic number of requests per step. This arg is "

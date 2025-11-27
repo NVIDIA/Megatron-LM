@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -27,26 +28,31 @@ class SamplingParams:
     num_tokens_total: Optional[int] = None  # Cannot set both this and num_tokens_to_generate
     termination_id: Optional[int] = None
     top_n_logprobs: int = 0
-    return_prompt_top_n_logprobs: bool = False  # Deprecated, use skip_prompt_top_n_logprobs instead
+    return_prompt_top_n_logprobs: bool = False  # Deprecated field for backwards compatibility
     add_BOS: bool = False
-    skip_prompt_top_n_logprobs: bool = False
 
     def __post_init__(self):
-        """Ensure backward compatibility between deprecated and new fields.
+        """Ensure backward compatibility for return_prompt_top_n_logprobs.
 
-        Synchronizes return_prompt_top_n_logprobs (deprecated) with skip_prompt_top_n_logprobs.
-        These fields are inverses of each other:
-        - skip_prompt_top_n_logprobs=True means return_prompt_top_n_logprobs=False
-        - skip_prompt_top_n_logprobs=False means return_prompt_top_n_logprobs=True
+        Sets return_prompt_top_n_logprobs based on skip_prompt_log_probs and top_n_logprobs:
+        - return_prompt_top_n_logprobs = not skip_prompt_log_probs and top_n_logprobs > 0
         """
         self._sync_prompt_logprobs_fields()
 
     def _sync_prompt_logprobs_fields(self):
-        """Synchronize return_prompt_top_n_logprobs with skip_prompt_top_n_logprobs."""
+        """Synchronize return_prompt_top_n_logprobs with skip_prompt_log_probs."""
+
+        if self.return_prompt_top_n_logprobs:
+            warnings.warn(
+                "return_prompt_top_n_logprobs is deprecated, use skip_prompt_log_probs instead",
+                DeprecationWarning,
+            )
+            assert (
+                self.skip_prompt_log_probs
+            ), "return_prompt_top_n_logprobs requires skip_prompt_log_probs to be False"
         if self.top_n_logprobs > 0:
-            self.return_prompt_top_n_logprobs = not self.skip_prompt_top_n_logprobs
+            self.return_prompt_top_n_logprobs = not self.skip_prompt_log_probs
         else:
-            self.skip_prompt_top_n_logprobs = True
             self.return_prompt_top_n_logprobs = False
 
     def add_attributes(self, attribute_value_pair: dict):
