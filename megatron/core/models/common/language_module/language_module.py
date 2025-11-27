@@ -60,7 +60,7 @@ class LanguageModule(MegatronModule):
             "If you don't need embd_group, you need to explicitly set it to None."
         )
         self.embd_group = pg_collection.embd
-        self.vp_stage: Optional[int] = None
+        self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
 
     def _is_in_embd_group(self):
@@ -136,7 +136,7 @@ class LanguageModule(MegatronModule):
         col_linear_kwargs: Dict[str, Any] = {},
         reduction: Literal["none", "sum", "mean"] = "none",
         ignore_index: int = -100,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+    ) -> Tensor:
         """Computes the language model logits and loss (Cross entropy across vocabulary)
 
         Args:
@@ -333,7 +333,7 @@ class LanguageModule(MegatronModule):
     def sharded_state_dict(
         self,
         prefix: str = '',
-        sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Sharded state dict implementation that handles the output layer weights tying.
