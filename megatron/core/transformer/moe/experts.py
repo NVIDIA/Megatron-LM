@@ -3,7 +3,7 @@
 import copy
 import itertools
 from copy import deepcopy
-from functools import partial, wraps
+from functools import partial
 from math import ceil
 from typing import Optional, Tuple
 
@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
@@ -21,8 +21,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.fp4_utils import get_fp4_align_size
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -41,10 +39,14 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
-from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
+from megatron.core.transformer.moe.moe_utils import (
+    ProcessGroupCollection,
+    get_align_size_for_quantization,
+)
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
@@ -59,49 +61,6 @@ try:
 except ImportError:
 
     HAVE_TE = False
-
-
-# TODO(Hepteract): delete the usage of the global parallel_state.
-# Currently we still have to use the global parallel_state in expert_dist_ckpt_decorator(),
-# in order to set sub-module's process group while getting sharded_state_dict.
-# After sub-module's refactoring is done, we can pass pg_collection to sub-module
-# and delete the function expert_dist_ckpt_decorator.
-def expert_dist_ckpt_decorator(func):
-    """Decorator of shared_state_dict in expert layer for distributed checkpoint.
-
-    Since !1940, the TP size for Expert layer can be different with Attention.
-    To make distributed checkpoint work in such cases, we use a decorator to
-    replace the default TP parallel states with expert-TP parallel states.
-    """
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        # Store original states
-        original_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
-        original_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-        original_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
-        try:
-            # Set new states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = (
-                parallel_state.get_expert_tensor_parallel_rank()
-            )
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = (
-                parallel_state.get_expert_tensor_parallel_world_size()
-            )
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = (
-                parallel_state.get_expert_tensor_parallel_group()
-            )
-
-            # Execute the function
-            result = func(*args, **kwargs)
-        finally:
-            # Restore original states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = original_rank
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = original_size
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = original_group
-        return result
-
-    return wrapper
 
 
 class GroupedMLP(MegatronModule):
@@ -330,7 +289,6 @@ class GroupedMLP(MegatronModule):
 
         return fc2_output, None
 
-    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """
         Maps local expert to global experts.
@@ -789,6 +747,7 @@ class TEGroupedMLP(MegatronModule):
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
 
         self.ep_group = pg_collection.ep
+        self.tp_group = pg_collection.expt_tp
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.moe_ffn_hidden_size
@@ -1023,7 +982,6 @@ class TEGroupedMLP(MegatronModule):
 
         return output, output_bias
 
-    @expert_dist_ckpt_decorator
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -1031,10 +989,14 @@ class TEGroupedMLP(MegatronModule):
         Maps local expert to global experts.
         The sharded state dict is interchangable with SequentialMLP's.
         """
+        # Guard for cases metadata is not provided
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
-            sub_sd = sharded_state_dict_default(module, f'{name}.', sharded_offsets, metadata)
+            sub_sd = sharded_state_dict_default(
+                module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
+            )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
                 local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
@@ -1098,6 +1060,7 @@ class SequentialMLP(MegatronModule):
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
         self.ep_group = pg_collection.ep
+        self.tp_group = pg_collection.expt_tp
         # use pg_collection.expt_dp_group as data parallel group in this module.
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
         self.dp_group = pg_collection.expt_dp
@@ -1112,18 +1075,10 @@ class SequentialMLP(MegatronModule):
             )
             self.local_experts.append(expert)
 
-    def _get_align_size_for_quantization(self):
-        """Get the alignment size for quantization."""
-        if self.config.fp8:
-            return get_fp8_align_size(self.config.fp8_recipe)
-        elif self.config.fp4:
-            return get_fp4_align_size(self.config.fp4_recipe)
-        return 16
-
     def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
         actual_num_tokens = hidden.shape[0]
-        divisor = self._get_align_size_for_quantization()
+        divisor = get_align_size_for_quantization(self.config)
         padded_num_tokens = ceil(actual_num_tokens / divisor) * divisor - actual_num_tokens
         if padded_num_tokens > 0:
             pad_tensor = torch.zeros(
@@ -1193,9 +1148,11 @@ class SequentialMLP(MegatronModule):
         for expert in self.local_experts:
             expert.backward_dw()
 
-    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
+        # Guard for cases metadata is not provided
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+
         sharded_state_dict = {}
         num_global_experts = self.ep_group.size() * self.num_local_experts
         local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts

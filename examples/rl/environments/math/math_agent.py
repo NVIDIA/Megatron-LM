@@ -1,7 +1,10 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import re
 import traceback
 
-from megatron.rl.agent.reward_only_agent import PassAtEvaluationAgent
+from megatron.rl.agent.pass_at_evaluation_agent import PassAtEvaluationAgent
+from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 
 try:
     from math_verify import parse, verify
@@ -21,7 +24,7 @@ assert (
 NEGATIVE_REWARD = 0.0
 
 
-class MathAgent(PassAtEvaluationAgent):
+class MathAgent(RewardOnlyAgent):
     def __init__(self, format_reward: float = 0.0, answer_format: str = "tagged", **kwargs):
         super().__init__(**kwargs)
         assert answer_format in ["tagged", "boxed"], "Invalid answer format"

@@ -1003,6 +1003,19 @@ def validate_args(args, defaults={}):
     if args.add_bias_linear:
         args.add_qkv_bias = True
 
+    if args.qk_clip:
+        assert is_te_min_version("2.9.0"), \
+            '--qk-clip is only supported with TE >= 2.9.0.'
+        assert 0.0 < args.qk_clip_alpha < 1.0, \
+            '--qk-clip-alpha must be between 0.0 and 1.0 when using --qk-clip.'
+        assert args.qk_clip_threshold > 0, \
+            '--qk-clip-threshold must be greater than 0 when using --qk-clip.'
+
+    # decoupled log max attention logit check
+    if args.log_max_attention_logit:
+        assert is_te_min_version("2.9.0"), \
+            '--log-max-attention-logit is only supported with TE >= 2.9.0.'
+
     # Retro checks.
     if args.retro_add_retriever:
 
@@ -1129,6 +1142,11 @@ def validate_args(args, defaults={}):
                 assert not args.distrib_optim_fully_reshardable_mem_efficient, \
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
 
+    if args.fake_process_group:
+        # Disable nan check for fake process group
+        args.check_for_nan_in_loss_and_grad = False
+        # Disable gloo process groups for fake process group
+        args.enable_gloo_process_groups = False
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
@@ -1182,6 +1200,8 @@ def validate_args(args, defaults={}):
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+        assert args.linear_attention_type is None, "Muon optimizer does not support linear attention type for now."
+        assert not args.attention_output_gate, "Muon optimizer does not support attention output gate for now."
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -1227,6 +1247,9 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    if args.cpu_offloading_num_layers > 0:
+        args.cpu_offloading = True
+
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
         if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
@@ -1242,6 +1265,9 @@ def validate_args(args, defaults={}):
         assert (
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
+    
+    if args.multi_latent_attention:
+        assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1356,9 +1382,13 @@ def _add_transformer_engine_args(parser):
                        dest='fp8')
     # per tensor current scaling recipe selection
     group.add_argument('--fp8-recipe', default='delayed',
-                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise'],
+                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise', 'custom'],
                        help='Which fp8 recipe to use for FP8 tensors in the forward and backward pass',
                        dest='fp8_recipe')
+    group.add_argument('--fp8-quantizer-factory', default=None,
+                       help='Python import path to a callable quantizer factory, '
+                            'e.g., package.module.quantizer_factory.',
+                       dest='fp8_quantizer_factory')
     # delayed scaling only configs
     group.add_argument('--fp8-margin', type=int, default=0,
                        help='Scaling margin for fp8',
@@ -1379,6 +1409,9 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
+    group.add_argument('--fallback-to-eager-attn', action='store_true',
+                       help='Fallback to eager attention in TE implementation. '
+                       'Suggested for when desired features are not available in TE implementation.')
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
@@ -1395,9 +1428,13 @@ def _add_transformer_engine_args(parser):
                        help='Which nvfp4 format scheme to use for FP4 tensors in the forward and backward pass',
                        dest='fp4')
     group.add_argument('--fp4-recipe', default='nvfp4',
-                       choices=['nvfp4'],
+                       choices=['nvfp4', 'custom'],
                        help='Which fp4 recipe to use for FP4 tensors in the forward and backward pass',
                        dest='fp4_recipe')
+    group.add_argument('--fp4-quantizer-factory', default=None,
+                       help='Python import path to a callable quantizer factory, '
+                            'e.g., package.module.quantizer_factory.',
+                       dest='fp4_quantizer_factory')
     group.add_argument('--fp4-param-gather', action='store_true',
                        help='Keep the compute param in fp4 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp4.',
@@ -1462,6 +1499,9 @@ def _add_inference_args(parser):
                        '"full_iteration": captures a whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
                        'If not specified, the default scope is to capture the whole Transformer layer.')
+    group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
+                       help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
+                       dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
@@ -1536,7 +1576,11 @@ def _add_inference_args(parser):
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
-                       help='Disable chunked prefill (chunked prefill is enabled by default).')  
+                       help='Disable chunked prefill (chunked prefill is enabled by default).')
+    group.add_argument('--inference-wandb-logging-step-interval', type=int, default=0,
+                       help='Step interval for logging inference metrics to wandb. '
+                            'Default to 0 to disable inference wandb logging.')
+
     return parser
 
 
@@ -1901,6 +1945,8 @@ def _add_logging_args(parser):
     group.add_argument('--log-world-size-to-tensorboard',
                        action='store_true',
                        help='Enable world size logging to tensorboard.')
+    group.add_argument('--log-max-attention-logit', action='store_true',
+                       help='Enable max attention logit logging to tensorboard.')
     group.add_argument('--wandb-project', type=str, default='',
                        help='The wandb project name. Ignore wandb by default.')
     group.add_argument('--wandb-entity', type=str, default='',
@@ -1933,11 +1979,11 @@ def _add_regularization_args(parser):
     group.add_argument('--weight-decay-incr-style', type=str, default='constant',
                        choices=['constant', 'linear', 'cosine'],
                        help='Weight decay increment function.')
-    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['qwen3_next'],
+    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
                        'None (default): param no weight decay if and only if it is 1D; or it is bias; '
                        'or it is embedding and embedding_init_method_std is not None. '
-                       '"qwen3_next": In addition to the default rules, '
+                       '"apply_wd_to_qk_layernorm": In addition to the default rules, '
                        'apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
@@ -2130,6 +2176,8 @@ def _add_training_args(parser):
                        '"shared_experts": recompute the shared experts in the MoE layer.'
                        '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
                        '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
+    group.add_argument('--cpu-offloading-num-layers', type=int, default=0,
+                       help='The number of Transformer layers to offload to CPU.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
@@ -2268,6 +2316,12 @@ def _add_training_args(parser):
     group.add_argument('--add-qkv-bias', action='store_true',
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
+    group.add_argument('--qk-clip', action='store_true',
+                       help='Whether to use qk-clip for training stabilization, strongly recommended for Muon.')
+    group.add_argument('--qk-clip-alpha', type=float, default=0.5,
+                       help='The balancing alpha for qk-clip.')
+    group.add_argument('--qk-clip-threshold', type=float, default=100,
+                       help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd', 'muon', 'dist_muon'],
                        help='Optimizer function')
@@ -2709,6 +2763,10 @@ def _add_distributed_args(parser):
                        'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
                        'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
                        'apparently needs to be divisible by a power of 2 for high busbw.')
+    group.add_argument('--ddp-reduce-scatter-with-fp32-accumulation', action='store_true',
+                       default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
+                       'values over the wire (using an all-to-all to keep total communication overhead in line '
+                       'with the standard ring implementation) but performs accumulation locally in FP32.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
@@ -2818,6 +2876,10 @@ def _add_distributed_args(parser):
                        "and must be consistent across all ranks.")
     group.add_argument('--replication-factor', default=2, type=int,
                        help="Number of machines storing the replica of a given rank's data.")
+    group.add_argument('--fake-process-group', action='store_true', default=False,
+                       help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
+                       This is quite useful for profiling memory usage of distributed training with just one GPU. \
+                       Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
     return parser
 
 
@@ -3291,8 +3353,8 @@ def _add_mla_args(parser):
 
 def _add_linear_attention_args(parser):
     group = parser.add_argument_group(title="la")
-    group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net', 'mamba'], type=str,
-                       help='Type of linear attention to use. Currently support gated_delta_net and mamba.')
+    group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net'], type=str,
+                       help='Type of linear attention to use. Currently support gated_delta_net.')
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
                        help='Frequency between LA (linear attention) layers and'
                             ' SDPA (scaled dot-product attention) layers. Accepts either: '

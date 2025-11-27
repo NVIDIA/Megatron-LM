@@ -12,11 +12,12 @@ ENV_VARS:
   NCCL_DEBUG: VERSION
   NON_DETERMINSTIC_RESULTS: 1
   NVSHMEM_IB_ENABLE_IBGDA: 0
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
-  --tensor-model-parallel-size: 1
+  --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 4
   --pipeline-model-parallel-layout: Et*2\\|\\(tt\\|\\)*5t\\|tmL # Et*2|(tt|)*5t|tmL
   --expert-model-parallel-size: 16
@@ -47,8 +48,8 @@ MODEL_ARGS:
   # Data args
   --seq-length: 4096
   --data-cache-path: ${DATA_CACHE_PATH}
-  --tokenizer-type: HuggingFaceTokenizer
-  --tokenizer-model: ${TOKENIZER_PATH}
+  --tokenizer-type: GPTSentencePieceTokenizer
+  --tokenizer-model: ${DATA_PATH}/utils/nemotron_2_256k.model
   --data-path: $DATA_BLEND
   --split: 99,1,0
   --no-mmap-bin-files: true
@@ -81,12 +82,11 @@ MODEL_ARGS:
   --qk-layernorm: true
 
   # Add learning rate args
-  --lr-decay-samples: 584765624
+  --lr-decay-samples: 24413696
   --lr-warmup-samples: 1536000
-  # Learning rate scaled down from 7.3e-6 (DeepSeek-V3 technical report, GBS=15360) to 3.9e-6 (GBS=8192)
-  --lr-warmup-init: 3.9e-7
-  --lr: 3.9e-6
-  --min-lr: 3.9e-7
+  --lr-warmup-init: 1e-7
+  --lr: 1e-5
+  --min-lr: 1e-6
   --lr-decay-style: cosine
   --adam-beta1: 0.9
   --adam-beta2: 0.95
@@ -127,14 +127,13 @@ MODEL_ARGS:
   --eval-interval: 200
 
   # Add checkpointing args
-  --no-load-optim: true
-  --no-load-rng: true
   --auto-detect-ckpt-format:
     true
     # Add checkpointing args
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --save-interval: 500
+  --save-retain-interval: 10000
   --dist-ckpt-strictness: log_all
 
   # Add initialization args
@@ -152,6 +151,7 @@ MODEL_ARGS:
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
 
   # Add mixed precision args
   --bf16: true

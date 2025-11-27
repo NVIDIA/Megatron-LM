@@ -32,6 +32,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
 from megatron.core.transformer.module import MegatronModule
+from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
 from model_provider import model_provider
 
@@ -120,6 +121,7 @@ def add_text_generate_args(parser):
         default=None,
         help='Deprecated in favor of `--inference-max-batch-size`',
     )
+    add_modelopt_args(parser)
     return parser
 
 

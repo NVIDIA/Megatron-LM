@@ -7,8 +7,11 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.fp4_utils import get_fp4_align_size
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -770,12 +773,15 @@ def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = No
             torch.distributed.all_reduce(
                 values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
-        # This ensures proper loss averaging across all ranks including CP ranks
-        torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=True),
-            op=torch.distributed.ReduceOp.AVG,
-        )
+        # Average aux losses across data parallel ranks.
+        # The `global_load_balancing_loss` already uses `tp_dp_cp_group` in `reduce_group`,
+        # so we don't need to reduce it again. Others use `tp_cp_group` in `reduce_group`.
+        if name != "global_load_balancing_loss":
+            torch.distributed.all_reduce(
+                values,
+                group=parallel_state.get_data_parallel_group(with_context_parallel=False),
+                op=torch.distributed.ReduceOp.AVG,
+            )
 
 
 def track_moe_metrics(
@@ -1012,6 +1018,15 @@ def router_gating_linear(
     It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
     """
     return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+
+
+def get_align_size_for_quantization(config: TransformerConfig):
+    """Get the alignment size for quantization."""
+    if config.fp8:
+        return get_fp8_align_size(config.fp8_recipe)
+    elif config.fp4:
+        return get_fp4_align_size(config.fp4_recipe)
+    return 16
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
