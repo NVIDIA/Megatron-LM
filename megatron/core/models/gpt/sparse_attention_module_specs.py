@@ -4,29 +4,29 @@ from typing import Optional
 
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.transformer.sparse_attention import (
-    Indexer,
-    IndexerSubmodules,
-    SparseAttention,
-    SparseAttentionSubmodules,
+    DSAIndexer,
+    DSAIndexerSubmodules,
+    DSAttention,
+    DSAttentionSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
-def get_indexer_spec_for_backend(
+def get_dsa_indexer_spec_for_backend(
     backend: BackendSpecProvider, normalization: Optional[str] = None
 ) -> ModuleSpec:
-    """Helper function to get Indexer module spec for a given backend.
+    """Helper function to get DSA Indexer module spec for a given backend.
 
     Args:
         backend: Backend specification provider (TE or Local).
         normalization: Normalization type ("RMSNorm" or None for LayerNorm).
 
     Returns:
-        ModuleSpec for Indexer with appropriate submodules.
+        ModuleSpec for DSA Indexer with appropriate submodules.
     """
     return ModuleSpec(
-        module=Indexer,
-        submodules=IndexerSubmodules(
+        module=DSAIndexer,
+        submodules=DSAIndexerSubmodules(
             linear_wq_b=backend.linear(),
             linear_wk=backend.linear(),
             k_norm=backend.layer_norm(rms_norm=False, for_qk=True),
@@ -52,9 +52,9 @@ def get_sparse_attention_module_spec_for_backend(
         # Because TransformerEngine does not support sparse attention yet, we use local
         # implementation whether the backend is TransformerEngine or not.
         return ModuleSpec(
-            module=SparseAttention,
-            submodules=SparseAttentionSubmodules(
-                indexer=get_indexer_spec_for_backend(backend, normalization=normalization)
+            module=DSAttention,
+            submodules=DSAttentionSubmodules(
+                indexer=get_dsa_indexer_spec_for_backend(backend, normalization=normalization)
             ),
         )
     else:

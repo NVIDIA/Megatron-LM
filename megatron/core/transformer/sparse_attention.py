@@ -27,7 +27,26 @@ except ImportError:
     hadamard_transform = None
 
 
-class IndexerLossLoggingHelper:
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    """Apply Hadamard rotation activation.
+    Reference:
+        https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L424-L428
+
+    Args:
+        x: Input tensor (must be bfloat16).
+
+    Returns:
+        Rotated tensor.
+    """
+    assert (
+        x.dtype == torch.bfloat16
+    ), f"rotate_activation only support bf16 input, but got {x.dtype}"
+    assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
+    hidden_size = x.size(-1)
+    return hadamard_transform(x, scale=hidden_size**-0.5)
+
+
+class DSAIndexerLossLoggingHelper:
     """Helper class for logging sparse attention indexer losses."""
 
     tracker = {}
@@ -53,7 +72,7 @@ class IndexerLossLoggingHelper:
         if layer_number is None:
             return
 
-        tracker = IndexerLossLoggingHelper.tracker
+        tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
         tracker["values"][layer_number - 1] += loss.detach()
@@ -63,7 +82,7 @@ class IndexerLossLoggingHelper:
     @staticmethod
     def clean_loss_in_tracker():
         """Clear the indexer losses."""
-        tracker = IndexerLossLoggingHelper.tracker
+        tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" in tracker:
             tracker["values"].zero_()
         tracker["reduce_group"] = None
@@ -72,7 +91,7 @@ class IndexerLossLoggingHelper:
     @staticmethod
     def reduce_loss_in_tracker():
         """Collect and reduce the indexer losses across ranks."""
-        tracker = IndexerLossLoggingHelper.tracker
+        tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             return
         values = tracker["values"]
@@ -112,8 +131,8 @@ class IndexerLossLoggingHelper:
             total_loss_dict: Dictionary to accumulate total losses.
             per_layer_logging: Whether to log per-layer losses.
         """
-        IndexerLossLoggingHelper.reduce_loss_in_tracker()
-        tracker = IndexerLossLoggingHelper.tracker
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
+        tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             return
 
@@ -136,36 +155,17 @@ class IndexerLossLoggingHelper:
         if wandb_writer is not None:
             wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
 
-        IndexerLossLoggingHelper.clean_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
 
 
-def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    """Apply Hadamard rotation activation.
-    Reference:
-        https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L424-L428
-
-    Args:
-        x: Input tensor (must be bfloat16).
-
-    Returns:
-        Rotated tensor.
-    """
-    assert (
-        x.dtype == torch.bfloat16
-    ), f"rotate_activation only support bf16 input, but got {x.dtype}"
-    assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
-    hidden_size = x.size(-1)
-    return hadamard_transform(x, scale=hidden_size**-0.5)
-
-
-def compute_indexer_loss(
+def compute_dsa_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
     softmax_scale: float,
-    indexer_loss_coeff: float,
-    use_sparse_indexer_loss: bool,
+    loss_coeff: float,
+    sparse_loss: bool,
     pg_collection: ProcessGroupCollection,
 ) -> torch.Tensor:
     """
@@ -183,8 +183,8 @@ def compute_indexer_loss(
         query: Query tensor [seqlen_q, batch, heads, dim].
         key: Key tensor [seqlen_k, batch, heads, dim].
         softmax_scale: Scale coefficient after q @ k^T.
-        indexer_loss_coeff: Coefficient for the indexer KL divergence loss.
-        use_sparse_indexer_loss: bool, whether to use sparse indexer loss. If True, only the topk
+        loss_coeff: Coefficient for the indexer KL divergence loss.
+        sparse_loss: bool, whether to use sparse indexer loss. If True, only the topk
             indices will be used to compute the loss.
         pg_collection: Process group collection, must have TP process group.
 
@@ -215,7 +215,7 @@ def compute_indexer_loss(
 
     # [b, np, sq, skv] + [1, 1, sq, skv] -> [b, np, sq, skv]
     attention_scores += causal_mask.view(1, 1, sq, sk)
-    if use_sparse_indexer_loss:
+    if sparse_loss:
         # [b, np, sq, sk] + [b, 1, sq, sk] -> [b, np, sq, sk]
         attention_scores += index_mask.view(b, 1, sq, sk)
         # [b, sq, sk] + [b, sq, sk] -> [b, sq, sk]
@@ -247,12 +247,12 @@ def compute_indexer_loss(
     kl_div = kl_per_element.sum(dim=-1).mean()
 
     # Scale by coefficient.
-    indexer_loss = kl_div * indexer_loss_coeff
+    indexer_loss = kl_div * loss_coeff
 
     return indexer_loss
 
 
-class IndexerLossAutoScaler(torch.autograd.Function):
+class DSAIndexerLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for indexer loss.
 
     This custom autograd function attaches a KL divergence loss to the activation
@@ -287,11 +287,11 @@ class IndexerLossAutoScaler(torch.autograd.Function):
                 gradient.
         """
         (indexer_loss,) = ctx.saved_tensors
-        if IndexerLossAutoScaler.main_loss_backward_scale is None:
-            IndexerLossAutoScaler.main_loss_backward_scale = torch.tensor(
+        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
+            DSAIndexerLossAutoScaler.main_loss_backward_scale = torch.tensor(
                 1.0, device=indexer_loss.device
             )
-        indexer_loss_backward_scale = IndexerLossAutoScaler.main_loss_backward_scale
+        indexer_loss_backward_scale = DSAIndexerLossAutoScaler.main_loss_backward_scale
         scaled_indexer_loss_grad = torch.ones_like(indexer_loss) * indexer_loss_backward_scale
         return grad_output, scaled_indexer_loss_grad
 
@@ -302,16 +302,16 @@ class IndexerLossAutoScaler(torch.autograd.Function):
         Args:
             scale: The scale value to set.
         """
-        if IndexerLossAutoScaler.main_loss_backward_scale is None:
-            IndexerLossAutoScaler.main_loss_backward_scale = scale
+        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
+            DSAIndexerLossAutoScaler.main_loss_backward_scale = scale
         else:
-            IndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
+            DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
 @dataclass
-class IndexerSubmodules:
+class DSAIndexerSubmodules:
     """
-    Configuration class for specifying the submodules of an Indexer.
+    Configuration class for specifying the submodules of an DSA Indexer.
 
     Args:
         linear_wq_b: Linear projection for query bottleneck expansion.
@@ -327,20 +327,20 @@ class IndexerSubmodules:
 
 
 @dataclass
-class SparseAttentionSubmodules:
+class DSAttentionSubmodules:
     """
-    Configuration class for specifying the submodules of SparseAttention.
+    Configuration class for specifying the submodules of DSAttention.
 
     Args:
-        indexer: Indexer module for computing sparse attention indices.
+        indexer: DSA Indexer module for computing sparse attention indices.
     """
 
     indexer: Union[ModuleSpec, type] = None
 
 
-class Indexer(MegatronModule):
+class DSAIndexer(MegatronModule):
     """
-    Lightning Indexer for DeepSeek Sparse Attention.
+    DSA Lightning Indexer for DeepSeek Sparse Attention.
 
     Computes index scores to identify the top-k most relevant key-value pairs for each query in
     sparse attention.
@@ -352,14 +352,14 @@ class Indexer(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: IndexerSubmodules,
+        submodules: DSAIndexerSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:
         """Initialize the indexer.
 
         Args:
             config (TransformerConfig): The configuration for the transformer model.
-            submodules (IndexerSubmodules): Indexer submodules specification.
+            submodules (DSAIndexerSubmodules): Indexer submodules specification.
             pg_collection (ProcessGroupCollection, optional): Process groups for the indexer.
         """
         super().__init__(config=config)
@@ -370,9 +370,11 @@ class Indexer(MegatronModule):
             if self.config.q_lora_rank is not None
             else self.config.hidden_size
         )
-        self.index_n_heads = self.config.index_n_heads
-        self.index_head_dim = self.config.index_head_dim
-        self.index_topk = self.config.index_topk
+
+        self.index_n_heads = self.config.dsa_indexer_n_heads
+        self.index_head_dim = self.config.dsa_indexer_head_dim
+        self.index_topk = self.config.dsa_indexer_topk
+
         self.softmax_scale: float = self.index_head_dim**-0.5
 
         if pg_collection is None:
@@ -522,7 +524,7 @@ class Indexer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass for Indexer that returns both index scores and top-k indices.
+        Forward pass for DSA Indexer that returns both index scores and top-k indices.
 
         This is used when KL loss is enabled to compare indexer scores with true attention scores.
 
@@ -536,7 +538,7 @@ class Indexer(MegatronModule):
             index_scores: Index scores [batch, seqlen, seqlen].
             topk_indices: Top-k indices [batch, seqlen, index_topk].
         """
-        assert packed_seq_params is None, "Packed sequence is not supported for SparseAttention"
+        assert packed_seq_params is None, "Packed sequence is not supported for DSAttention"
 
         # =========================================
         # Prepare RoPE params
@@ -619,7 +621,7 @@ class Indexer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
-        Forward pass for Indexer.
+        Forward pass for DSA Indexer.
 
         Args:
             x: hidden states [seqlen, batch, hidden_size].
@@ -634,7 +636,7 @@ class Indexer(MegatronModule):
         return topk_indices
 
 
-def unfused_sparse_attention_fn(query, key, value, topk_indices, softmax_scale):
+def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
     """
     Unfused sparse attention implementation.
     """
@@ -687,10 +689,10 @@ def unfused_sparse_attention_fn(query, key, value, topk_indices, softmax_scale):
     return output
 
 
-class SparseAttention(MegatronModule):
+class DSAttention(MegatronModule):
     """
-    This module implements sparse attention mechanism using an Indexer to compute top-k attention
-    indices for reducing computational complexity.
+    This module implements sparse attention mechanism using an DSA Indexer to compute top-k
+    attention indices for reducing computational complexity.
 
     Reference:
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L491-L597
@@ -699,7 +701,7 @@ class SparseAttention(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: SparseAttentionSubmodules,
+        submodules: DSAttentionSubmodules,
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
@@ -790,32 +792,32 @@ class SparseAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
-        output = unfused_sparse_attention_fn(query, key, value, topk_indices, self.softmax_scale)
+        output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
 
         # ===================================
         # Attach indexer loss
         # ===================================
         if self.training and torch.is_grad_enabled():
             # Compute KL divergence loss between indexer scores and true attention scores
-            indexer_loss_coeff = getattr(self.config, 'indexer_loss_coeff', 0.0)
-            indexer_loss = compute_indexer_loss(
+            indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+            indexer_loss = compute_dsa_indexer_loss(
                 index_scores,
                 topk_indices,
                 query.detach(),
                 key.detach(),
                 self.softmax_scale,
                 indexer_loss_coeff,
-                getattr(self.config, "use_sparse_indexer_loss", False),
+                getattr(self.config, "dsa_indexer_use_sparse_loss", False),
                 self.indexer.pg_collection,
             )
             # Save indexer loss for logging
             if indexer_loss_coeff > 0:
-                IndexerLossLoggingHelper.save_loss_to_tracker(
+                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                 )
             # Attach loss to output
-            output = IndexerLossAutoScaler.apply(output, indexer_loss)
+            output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
         return output

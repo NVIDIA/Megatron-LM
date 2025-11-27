@@ -225,20 +225,20 @@ class TransformerConfig(ModelParallelConfig):
     sparse_attention_type: Optional[str] = None
     """Type of sparse attention to use. Currently only supports dsa (DeepSeek Sparse Attention)."""
 
-    index_n_heads: Optional[int] = None
-    """Number of indexer heads for sparse attention. If None, defaults to num_attention_heads."""
+    dsa_indexer_n_heads: Optional[int] = None
+    """Number of DSA indexer heads for DSA."""
 
-    index_head_dim: Optional[int] = None
-    """Dimension per indexer head. If None, defaults to kv_channels."""
+    dsa_indexer_head_dim: Optional[int] = None
+    """Dimension per DSA indexer head."""
 
-    index_topk: Optional[int] = None
-    """Number of top-k tokens to select in sparse attention indexer."""
+    dsa_indexer_topk: Optional[int] = None
+    """Number of top-k tokens to select in DSA indexer."""
 
-    indexer_loss_coeff: Optional[float] = None
-    """Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss."""
+    dsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
-    use_sparse_indexer_loss: Optional[bool] = None
-    """Whether to use sparse indexer loss. If True, the indexer loss will be computed using the
+    dsa_indexer_use_sparse_loss: Optional[bool] = None
+    """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
     ####################
@@ -1682,8 +1682,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.sparse_attention_type is not None:
             assert (
                 self.context_parallel_size == 1
-            ), "Currently context parallelism is not supported by SparseAttention!"
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for SparseAttention"
+            ), "Currently context parallelism is not supported by DSAttention!"
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
 
 
 @dataclass

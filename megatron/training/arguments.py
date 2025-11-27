@@ -3271,15 +3271,15 @@ def _add_sparse_attention_args(parser):
     group = parser.add_argument_group(title="sparse_attention")
     group.add_argument('--sparse-attention-type', default=None, choices=['dsa'], type=str,
                        help="Type of sparse attention to use. Currently support dsa (DeepSeek Sparse Attention).")
-    group.add_argument('--index-n-heads', default=None, type=int,
+    group.add_argument('--dsa-indexer-n-heads', default=None, type=int,
                        help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
-    group.add_argument('--index-head-dim', default=None, type=int,
+    group.add_argument('--dsa-indexer-head-dim', default=None, type=int,
                        help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
-    group.add_argument('--index-topk', default=None, type=int,
+    group.add_argument('--dsa-indexer-topk', default=None, type=int,
                        help='Number of top-k tokens to select in sparse attention indexer.')
-    group.add_argument('--indexer-loss-coeff', default=0.0, type=float,
+    group.add_argument('--dsa-indexer-loss-coeff', default=0.0, type=float,
                        help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
-    group.add_argument('--use-sparse-indexer-loss', action='store_true',
+    group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
                        help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
     return parser
 

@@ -10,12 +10,12 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.sparse_attention import (
-    Indexer,
-    IndexerLossAutoScaler,
-    IndexerSubmodules,
-    SparseAttention,
-    SparseAttentionSubmodules,
-    compute_indexer_loss,
+    DSAIndexer,
+    DSAIndexerLossAutoScaler,
+    DSAIndexerSubmodules,
+    DSAttention,
+    DSAttentionSubmodules,
+    compute_dsa_indexer_loss,
     rotate_activation,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -29,6 +29,7 @@ except ImportError:
     HAVE_HADAMARD = False
 
 
+@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
 class TestRotateActivation:
     """Test rotate_activation function."""
 
@@ -40,8 +41,6 @@ class TestRotateActivation:
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
     def test_rotate_activation_shape(self):
         """Test that rotate_activation preserves shape."""
         batch_size = 2
@@ -54,8 +53,6 @@ class TestRotateActivation:
         assert output.shape == x.shape
         assert output.dtype == torch.bfloat16
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
     def test_rotate_activation_dtype_check(self):
         """Test that rotate_activation only accepts bfloat16."""
         x = torch.randn(16, 2, 128, dtype=torch.float32).cuda()
@@ -65,8 +62,8 @@ class TestRotateActivation:
 
 
 @pytest.mark.parametrize("seqlen_and_topk", [[16, 32], [64, 32]])
-class TestComputeIndexerLoss:
-    """Test compute_indexer_loss function."""
+class TestComputeDSAIndexerLoss:
+    """Test compute_dsa_indexer_loss function."""
 
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self):
@@ -78,7 +75,7 @@ class TestComputeIndexerLoss:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_loss_shape(self, seqlen_and_topk):
+    def test_dsa_indexer_loss_shape(self, seqlen_and_topk):
         """Test that indexer loss returns a scalar."""
         batch_size = 2
         seqlen = seqlen_and_topk[0]
@@ -107,14 +104,14 @@ class TestComputeIndexerLoss:
         key = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
         softmax_scale = head_dim**-0.5
 
-        loss = compute_indexer_loss(
+        loss = compute_dsa_indexer_loss(
             index_scores=index_scores,
             topk_indices=topk_indices,
             query=query,
             key=key,
             softmax_scale=softmax_scale,
-            indexer_loss_coeff=1.0,
-            use_sparse_indexer_loss=False,
+            loss_coeff=1.0,
+            sparse_loss=False,
             pg_collection=self.pg_collection,
         )
 
@@ -123,7 +120,7 @@ class TestComputeIndexerLoss:
         assert loss >= 0  # KL divergence should be non-negative
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_loss_sparse(self, seqlen_and_topk):
+    def test_dsa_indexer_loss_sparse(self, seqlen_and_topk):
         """Test sparse indexer loss computation."""
         batch_size = 2
         seqlen = seqlen_and_topk[0]
@@ -152,25 +149,25 @@ class TestComputeIndexerLoss:
         key = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
         softmax_scale = head_dim**-0.5
 
-        loss_sparse = compute_indexer_loss(
+        loss_sparse = compute_dsa_indexer_loss(
             index_scores=index_scores,
             topk_indices=topk_indices,
             query=query,
             key=key,
             softmax_scale=softmax_scale,
-            indexer_loss_coeff=1.0,
-            use_sparse_indexer_loss=True,
+            loss_coeff=1.0,
+            sparse_loss=True,
             pg_collection=self.pg_collection,
         )
 
-        loss_dense = compute_indexer_loss(
+        loss_dense = compute_dsa_indexer_loss(
             index_scores=index_scores,
             topk_indices=topk_indices,
             query=query,
             key=key,
             softmax_scale=softmax_scale,
-            indexer_loss_coeff=1.0,
-            use_sparse_indexer_loss=False,
+            loss_coeff=1.0,
+            sparse_loss=False,
             pg_collection=self.pg_collection,
         )
 
@@ -183,8 +180,8 @@ class TestComputeIndexerLoss:
         assert loss_dense >= 0
 
 
-class TestIndexerLossAutoScaler:
-    """Test IndexerLossAutoScaler autograd function."""
+class TestDSAIndexerLossAutoScaler:
+    """Test DSAIndexerLossAutoScaler autograd function."""
 
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self):
@@ -202,7 +199,7 @@ class TestIndexerLossAutoScaler:
         indexer_loss = torch.tensor(0.5).cuda()
         indexer_loss.requires_grad_(True)
 
-        result = IndexerLossAutoScaler.apply(output, indexer_loss)
+        result = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
         assert torch.allclose(result, output, atol=0, rtol=0)
 
@@ -213,17 +210,17 @@ class TestIndexerLossAutoScaler:
         output.requires_grad_(True)
 
         # Create indexer_loss with computation graph
-        # This simulates compute_indexer_loss which computes KL divergence
+        # This simulates compute_dsa_indexer_loss which computes KL divergence
         dummy_input = torch.randn(10).cuda()
         dummy_input.requires_grad_(True)
         indexer_loss = dummy_input.mean()
 
         # Set loss scale
         scale = torch.tensor(2.0).cuda()
-        IndexerLossAutoScaler.set_loss_scale(scale)
+        DSAIndexerLossAutoScaler.set_loss_scale(scale)
 
         # Apply the autograd function
-        result = IndexerLossAutoScaler.apply(output, indexer_loss)
+        result = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
         # Trigger backward
         main_loss = result.sum()
@@ -245,9 +242,10 @@ class TestIndexerLossAutoScaler:
         ), f"Gradient should be scaled by loss scale, expected {expected_grad_per_element}, got {dummy_input.grad[0].item()}"
 
 
+@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
 @pytest.mark.parametrize("seqlen", [16, 64])
-class TestIndexer:
-    """Test Indexer module basic functionality with TP=1."""
+class TestDSAIndexer:
+    """Test DSA Indexer module basic functionality with TP=1."""
 
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self):
@@ -272,20 +270,20 @@ class TestIndexer:
             qk_head_dim=64,
             qk_pos_emb_head_dim=32,
             v_head_dim=64,
-            # Sparse attention specific configs
-            index_n_heads=8,
-            index_head_dim=64,
-            index_topk=self.index_topk,
             rope_type='rope',
             rotary_base=10000,
             rotary_percent=1.0,
+            # Sparse attention specific configs
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=self.index_topk,
         )
 
         # Create indexer submodules spec
         from megatron.core.extensions.transformer_engine import TELinear, TENorm
         from megatron.core.transformer.spec_utils import ModuleSpec
 
-        indexer_submodules = IndexerSubmodules(
+        indexer_submodules = DSAIndexerSubmodules(
             linear_wq_b=ModuleSpec(module=TELinear),
             linear_wk=ModuleSpec(module=TELinear),
             k_norm=ModuleSpec(module=TENorm),
@@ -295,21 +293,21 @@ class TestIndexer:
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=['tp', 'cp']
         )
-        self.indexer = Indexer(self.config, indexer_submodules, self.pg_collection)
+        self.indexer = DSAIndexer(self.config, indexer_submodules, self.pg_collection)
 
         yield
         Utils.destroy_model_parallel()
 
-    def test_indexer_constructor(self, seqlen):
+    def test_dsa_indexer_constructor(self, seqlen):
         """Test indexer initialization."""
-        assert isinstance(self.indexer, Indexer)
+        assert isinstance(self.indexer, DSAIndexer)
         assert self.indexer.hidden_size == 256
         assert self.indexer.index_n_heads == 8
         assert self.indexer.index_head_dim == 64
         assert self.indexer.index_topk == 32
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_forward(self, seqlen):
+    def test_dsa_indexer_forward(self, seqlen):
         """Test indexer forward pass."""
         batch_size = 2
 
@@ -323,7 +321,7 @@ class TestIndexer:
         topk_indices = self.indexer(x, qr)
 
         # Check output shape
-        assert topk_indices.shape == (batch_size, seqlen, min(self.config.index_topk, seqlen))
+        assert topk_indices.shape == (batch_size, seqlen, min(self.config.dsa_indexer_topk, seqlen))
         assert topk_indices.dtype == torch.long
         assert torch.all((topk_indices >= 0) & (topk_indices < seqlen))
         # Make sure no duplicate indices are selected
@@ -333,7 +331,7 @@ class TestIndexer:
         )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_forward_with_scores(self, seqlen):
+    def test_dsa_indexer_forward_with_scores(self, seqlen):
         """Test indexer forward pass with scores."""
         batch_size = 2
 
@@ -348,7 +346,7 @@ class TestIndexer:
 
         # Check output shapes
         assert index_scores.shape == (batch_size, seqlen, seqlen)
-        assert topk_indices.shape == (batch_size, seqlen, min(self.config.index_topk, seqlen))
+        assert topk_indices.shape == (batch_size, seqlen, min(self.config.dsa_indexer_topk, seqlen))
         assert index_scores.dtype == torch.float32
         assert topk_indices.dtype == torch.long
         assert torch.all((topk_indices >= 0) & (topk_indices < seqlen))
@@ -359,7 +357,7 @@ class TestIndexer:
         )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_with_mask(self, seqlen):
+    def test_dsa_indexer_with_mask(self, seqlen):
         """Test indexer with attention mask."""
         batch_size = 2
 
@@ -384,8 +382,9 @@ class TestIndexer:
                 assert torch.all(topk_indices[b, i] <= max(self.index_topk, i))
 
 
-class TestSparseAttention:
-    """Test SparseAttention module basic functionality with TP=1."""
+@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
+class TestDSAttention:
+    """Test DSAttention module basic functionality with TP=1."""
 
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self):
@@ -409,35 +408,35 @@ class TestSparseAttention:
             qk_head_dim=64,
             qk_pos_emb_head_dim=32,
             v_head_dim=64,
-            # Sparse attention specific configs
-            index_n_heads=8,
-            index_head_dim=64,
-            index_topk=32,
             rope_type='rope',
             rotary_base=10000,
             rotary_percent=1.0,
-            indexer_loss_coeff=0.1,
-            use_sparse_indexer_loss=False,
+            # Sparse attention specific configs
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=False,
         )
 
         # Create sparse attention submodules spec
         from megatron.core.extensions.transformer_engine import TELinear, TENorm
         from megatron.core.transformer.spec_utils import ModuleSpec
 
-        indexer_submodules = IndexerSubmodules(
+        indexer_submodules = DSAIndexerSubmodules(
             linear_wq_b=ModuleSpec(module=TELinear),
             linear_wk=ModuleSpec(module=TELinear),
             k_norm=ModuleSpec(module=TENorm),
             linear_weights_proj=ModuleSpec(module=TELinear),
         )
-        indexer_spec = ModuleSpec(module=Indexer, submodules=indexer_submodules)
-        sparse_attention_submodules = SparseAttentionSubmodules(indexer=indexer_spec)
+        indexer_spec = ModuleSpec(module=DSAIndexer, submodules=indexer_submodules)
+        sparse_attention_submodules = DSAttentionSubmodules(indexer=indexer_spec)
 
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=['tp', 'cp']
         )
 
-        self.sparse_attention = SparseAttention(
+        self.sparse_attention = DSAttention(
             config=self.config,
             submodules=sparse_attention_submodules,
             layer_number=1,
@@ -449,14 +448,14 @@ class TestSparseAttention:
         yield
         Utils.destroy_model_parallel()
 
-    def test_sparse_attention_constructor(self):
+    def test_dsa_constructor(self):
         """Test sparse attention initialization."""
-        assert isinstance(self.sparse_attention, SparseAttention)
+        assert isinstance(self.sparse_attention, DSAttention)
         assert hasattr(self.sparse_attention, 'indexer')
-        assert isinstance(self.sparse_attention.indexer, Indexer)
+        assert isinstance(self.sparse_attention.indexer, DSAIndexer)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_sparse_attention_forward(self):
+    def test_dsa_forward(self):
         """Test sparse attention forward pass."""
         seq_len = 16
         batch_size = 2
@@ -506,7 +505,7 @@ class TestSparseAttention:
         assert output.dtype == torch.bfloat16
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_sparse_attention_backward(self):
+    def test_dsa_backward(self):
         """Test sparse attention backward pass with indexer loss."""
         seq_len = 16
         batch_size = 2
@@ -567,7 +566,7 @@ class TestSparseAttention:
                 assert param.grad is not None, f"Indexer parameter {name} has no gradient"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_sparse_attention_topk_selection(self):
+    def test_dsa_topk_selection(self):
         """Test that sparse attention correctly selects top-k indices."""
         seq_len = 16
         batch_size = 2
@@ -608,7 +607,7 @@ class TestSparseAttention:
         # Check that topk_indices are valid
         assert torch.all(topk_indices >= 0)
         assert torch.all(topk_indices < seq_len)
-        assert topk_indices.shape[2] == min(self.config.index_topk, seq_len)
+        assert topk_indices.shape[2] == min(self.config.dsa_indexer_topk, seq_len)
 
 
 # ======================================================================================
@@ -616,10 +615,11 @@ class TestSparseAttention:
 # ======================================================================================
 
 
+@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
 @pytest.mark.parametrize("tensor_model_parallel_size", [2, 4, 8])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 class TestIndexerTensorParallel:
-    """Test Indexer with different TP sizes and SP settings, compare with TP=1 baseline."""
+    """Test DSA Indexer with different TP sizes and SP settings, compare with TP=1 baseline."""
 
     def _create_config(self, sequence_parallel=False):
         """Helper to create MLA config."""
@@ -641,13 +641,13 @@ class TestIndexerTensorParallel:
             qk_head_dim=64,
             qk_pos_emb_head_dim=32,
             v_head_dim=64,
-            # Sparse attention specific configs
-            index_n_heads=8,
-            index_head_dim=64,
-            index_topk=32,
             rope_type='rope',
             rotary_base=10000,
             rotary_percent=1.0,
+            # Sparse attention specific configs
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
         )
 
     def _create_indexer(self, config, pg_collection):
@@ -655,17 +655,17 @@ class TestIndexerTensorParallel:
         from megatron.core.extensions.transformer_engine import TELinear, TENorm
         from megatron.core.transformer.spec_utils import ModuleSpec
 
-        indexer_submodules = IndexerSubmodules(
+        indexer_submodules = DSAIndexerSubmodules(
             linear_wq_b=ModuleSpec(module=TELinear),
             linear_wk=ModuleSpec(module=TELinear),
             k_norm=ModuleSpec(module=TENorm),
             linear_weights_proj=ModuleSpec(module=TELinear),
         )
 
-        return Indexer(config, indexer_submodules, pg_collection)
+        return DSAIndexer(config, indexer_submodules, pg_collection)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_weight_consistency(self, tensor_model_parallel_size, sequence_parallel):
+    def test_dsa_indexer_weight_consistency(self, tensor_model_parallel_size, sequence_parallel):
         """Test that indexer weights are identical across ALL GPUs."""
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
@@ -696,7 +696,7 @@ class TestIndexerTensorParallel:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_forward_consistency(self, tensor_model_parallel_size, sequence_parallel):
+    def test_dsa_indexer_forward_consistency(self, tensor_model_parallel_size, sequence_parallel):
         """Test that indexer gives consistent results across different TP sizes and SP settings."""
         # First run with TP=1 to get baseline
         Utils.initialize_model_parallel(
@@ -791,7 +791,7 @@ class TestIndexerTensorParallel:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_gradient_sync(self, tensor_model_parallel_size, sequence_parallel):
+    def test_dsa_indexer_gradient_sync(self, tensor_model_parallel_size, sequence_parallel):
         """Test that gradients are properly synchronized within TP group."""
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
@@ -853,11 +853,12 @@ class TestIndexerTensorParallel:
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
 @pytest.mark.parametrize("tensor_model_parallel_size", [2, 4])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 @pytest.mark.parametrize("use_sparse_indexer_loss", [False, True])
-class TestSparseAttentionTensorParallel:
-    """Test SparseAttention with different TP sizes, SP settings, and sparse indexer loss."""
+class TestDSAttentionTensorParallel:
+    """Test DSAttention with different TP sizes, SP settings, and sparse indexer loss."""
 
     def _create_config(self, sequence_parallel=False, use_sparse_indexer_loss=False):
         """Helper to create MLA config."""
@@ -879,15 +880,15 @@ class TestSparseAttentionTensorParallel:
             qk_head_dim=64,
             qk_pos_emb_head_dim=32,
             v_head_dim=64,
-            # Sparse attention specific configs
-            index_n_heads=8,
-            index_head_dim=64,
-            index_topk=32,
             rope_type='rope',
             rotary_base=10000,
             rotary_percent=1.0,
-            indexer_loss_coeff=0.1,
-            use_sparse_indexer_loss=use_sparse_indexer_loss,
+            # Sparse attention specific configs
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=use_sparse_indexer_loss,
         )
 
     def _create_sparse_attention(self, config, pg_collection):
@@ -895,16 +896,16 @@ class TestSparseAttentionTensorParallel:
         from megatron.core.extensions.transformer_engine import TELinear, TENorm
         from megatron.core.transformer.spec_utils import ModuleSpec
 
-        indexer_submodules = IndexerSubmodules(
+        indexer_submodules = DSAIndexerSubmodules(
             linear_wq_b=ModuleSpec(module=TELinear),
             linear_wk=ModuleSpec(module=TELinear),
             k_norm=ModuleSpec(module=TENorm),
             linear_weights_proj=ModuleSpec(module=TELinear),
         )
-        indexer_spec = ModuleSpec(module=Indexer, submodules=indexer_submodules)
-        sparse_attention_submodules = SparseAttentionSubmodules(indexer=indexer_spec)
+        indexer_spec = ModuleSpec(module=DSAIndexer, submodules=indexer_submodules)
+        sparse_attention_submodules = DSAttentionSubmodules(indexer=indexer_spec)
 
-        return SparseAttention(
+        return DSAttention(
             config=config,
             submodules=sparse_attention_submodules,
             layer_number=1,
@@ -914,7 +915,7 @@ class TestSparseAttentionTensorParallel:
         )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_sparse_attention_weight_consistency(
+    def test_dsa_weight_consistency(
         self, tensor_model_parallel_size, sequence_parallel, use_sparse_indexer_loss
     ):
         """Test that sparse attention indexer weights are identical across ALL GPUs."""
@@ -947,7 +948,7 @@ class TestSparseAttentionTensorParallel:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_sparse_attention_forward_consistency(
+    def test_dsa_forward_consistency(
         self, tensor_model_parallel_size, sequence_parallel, use_sparse_indexer_loss
     ):
         """Test that sparse attention gives consistent results across different TP, SP, and sparse loss settings."""
@@ -1146,7 +1147,7 @@ class TestSparseAttentionTensorParallel:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_sparse_attention_gradient_sync(
+    def test_dsa_gradient_sync(
         self, tensor_model_parallel_size, sequence_parallel, use_sparse_indexer_loss
     ):
         """Test that indexer gradients are properly synchronized within TP group."""
