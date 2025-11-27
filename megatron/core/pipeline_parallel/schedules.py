@@ -583,8 +583,7 @@ def forward_backward_no_pipelining(
 
     if not forward_only and config.fine_grained_activation_offloading:
         fine_grained_offloading_reset()
-    if not forward_only:
-        packed_moe_expert_offloading_reset(enabled=config.packed_moe_expert_offloading)
+    packed_moe_expert_offloading_reset(enabled=config.packed_moe_expert_offloading and not forward_only)
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -942,8 +941,7 @@ def forward_backward_pipelining_with_interleaving(
 
     if not forward_only and config.fine_grained_activation_offloading:
         fine_grained_offloading_reset()
-    if not forward_only and config.packed_moe_expert_offloading:
-        packed_moe_expert_offloading_reset()
+    packed_moe_expert_offloading_reset(enabled=config.packed_moe_expert_offloading and not forward_only)
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -1433,12 +1431,8 @@ def forward_backward_pipelining_with_interleaving(
     send_next_wait_handle = None
     send_prev_wait_handle = None
     recv_next_wait_handles = []
-    model_chunk_ids = {0: [1,3], 1:[2,4]}
-    print (f'{torch.distributed.get_rank()}: forward_backward_pipelining_with_interleaving num_warmup_microbatches {num_warmup_microbatches} num_microbatches_1f1b {num_microbatches_remaining} total_num_microbatches {total_num_microbatches}')
     for k in range(num_warmup_microbatches):
         cur_model_chunk_id = get_model_chunk_id(k, forward=True)
-        # if torch.distributed.get_rank() in [0, 2]:
-        #     print(f'{pipeline_parallel_rank}: +++++ warmup iteration {k}, fwd_model_chunk_id {model_chunk_ids[pipeline_parallel_rank][cur_model_chunk_id]}')
         if config.overlap_p2p_comm_warmup_flush:
             if (
                 not (
@@ -1610,9 +1604,6 @@ def forward_backward_pipelining_with_interleaving(
         if config.overlap_p2p_comm:
 
             backward_k = k
-            # if torch.distributed.get_rank() in [0, 2]:
-            #     print(f'{pipeline_parallel_rank}: +++++ steady iteration forward_k {forward_k} fwd_model_chunk_id {model_chunk_ids[pipeline_parallel_rank][cur_model_chunk_id]}, backward_k {backward_k} bwd_model_chunk_id {-model_chunk_ids[pipeline_parallel_rank][get_model_chunk_id(backward_k, forward=False)]}')
-
             # Sync forward recv
             def pp_pre_forward(vp_stage=None):
                 if vp_stage is None:
@@ -1830,8 +1821,6 @@ def forward_backward_pipelining_with_interleaving(
             )
         for k in range(num_microbatches_remaining, total_num_microbatches):
             cur_model_chunk_id = get_model_chunk_id(k, forward=False)
-            # if torch.distributed.get_rank() in [0, 2]:
-            #     print(f'{pipeline_parallel_rank}: cooldown iteration k {k} bwd_model_chunk_id {-model_chunk_ids[pipeline_parallel_rank][cur_model_chunk_id]}')
             if (
                 not (_is_vp_last_stage(vp_stage=cur_model_chunk_id) and is_pp_last_stage(pp_group))
                 and k != 0
@@ -2100,8 +2089,7 @@ def forward_backward_pipelining_without_interleaving(
 
     if not forward_only and config.fine_grained_activation_offloading:
         fine_grained_offloading_reset()
-    if not forward_only and config.packed_moe_expert_offloading:
-        packed_moe_expert_offloading_reset()
+    packed_moe_expert_offloading_reset(enabled=config.packed_moe_expert_offloading and not forward_only)
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
