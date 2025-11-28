@@ -102,16 +102,38 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     return Namespace(**args_dict)
 
 
-def _teacher_provider(config: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
+def _teacher_provider(config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
     """Teacher model factory (must be a non-local function to pickle)."""
     args = get_args()
 
-    # Convert to `TransformerConfig` here to avoid ModelOpt pickling issues (contains local functions)
-    config = core_transformer_config_from_args(config)
+    # Convert to TransformerConfig here to avoid ModelOpt pickling issues (contains local functions)
+    config = core_transformer_config_from_args(config_raw)
 
     if config.is_hybrid_model:
+        # These parameters are not part of the TransformerConfig and need to be passed separately.
+        if "hybrid_override_pattern" in config_raw:
+            model_kwargs["hybrid_override_pattern"] = config_raw.hybrid_override_pattern
+        if "hybrid_attention_ratio" in config_raw:
+            model_kwargs["hybrid_attention_ratio"] = config_raw.hybrid_attention_ratio
+        if "hybrid_mlp_ratio" in config_raw:
+            model_kwargs["hybrid_mlp_ratio"] = config_raw.hybrid_mlp_ratio
+
         teacher = MCoreMambaModel(config=config, **model_kwargs)
     else:
+        # GPT layer spec needs re-creation since it depends on number of model layers.
+        if config.heterogeneous_block_specs:
+            model_kwargs["transformer_layer_spec"] = get_gpt_heterogeneous_layer_spec(
+                config=config,
+                use_te=(args.transformer_impl == "transformer_engine"),
+            )
+        else:
+            model_kwargs["transformer_layer_spec"] = get_gpt_modelopt_spec(
+                config=config,
+                local_core_attention=False if config.context_parallel_size > 1 else args.export_force_local_attention,
+                remap_te_layernorm=args.export_te_mcore_model,
+                real_quant_cfg=args.export_real_quant_cfg,
+                use_arbitrary_attention_mask=False if config.context_parallel_size > 1 else True,
+            )
         teacher = MCoreGPTModel(config=config, **model_kwargs)
     _add_load_convert_hooks(teacher)
 
@@ -125,7 +147,7 @@ def _teacher_provider(config: Namespace, model_kwargs: Dict[str, Any]) -> MCoreG
         args.ckpt_format = args.export_kd_teacher_ckpt_format
     load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
     args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
-    print_rank_0("successfully loaded teacher...")
+    print_rank_0("...teacher loaded successfully.")
 
     return teacher
 
@@ -301,13 +323,6 @@ def modelopt_gpt_mamba_builder(
         distill_cfg = mtd_mcore.setup_distillation_config(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=core_transformer_config_from_args(teacher_config)
         )
-        if "hybrid_override_pattern" in teacher_config and args.is_hybrid_model:
-            model_kwargs["hybrid_override_pattern"] = teacher_config.hybrid_override_pattern
-        if "hybrid_attention_ratio" in teacher_config and args.is_hybrid_model:
-            model_kwargs["hybrid_attention_ratio"] = teacher_config.hybrid_attention_ratio
-        if "hybrid_mlp_ratio" in teacher_config and args.is_hybrid_model:
-            model_kwargs["hybrid_mlp_ratio"] = teacher_config.hybrid_mlp_ratio
-
         kd_config = {
             "teacher_model": (_teacher_provider, [teacher_config, model_kwargs], {}),
             "criterion": distill_cfg.criterion,
