@@ -392,12 +392,7 @@ def build_dynamic_engine_setup_prefix(
     """
     # CUDA graph config
     if args.cuda_graph_impl == "local":
-        cg_str = (
-            "graphs "
-            f"[{len(context.cuda_graph_token_counts)}] "
-            f"{context.cuda_graph_token_counts[0]}:"
-            f"{context.cuda_graph_token_counts[-1]}"
-        )
+        cg_str = f"graphs {len(context.cuda_graph_batch_dimensions_list)}"
     else:
         cg_str = "--"
 
