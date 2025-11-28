@@ -2344,6 +2344,9 @@ def train(
                 train_data_iterator = rl_utils.setup_grpo_data_iterator(
                     model, optimizer, iteration, ref_state_dict, buffered_rollouts
                 )
+                # Buffered rollouts are used as a state container for setups when
+                # we use previously-generated data for an update.
+                buffered_rollouts = train_data_iterator
 
         ft_integration.on_training_step_start()
         (
