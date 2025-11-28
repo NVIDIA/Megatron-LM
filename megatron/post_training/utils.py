@@ -1,6 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import os
 import torch
 from datasets import load_dataset
 
@@ -35,7 +34,7 @@ def get_mtbench_chat_data():
         example["conversations"] = conversations
         return example
 
-    dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train", token=os.environ.get("HF_TOKEN", None))
+    dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
     return dataset.map(mtbench_to_oai_chat)
 
 def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=True):

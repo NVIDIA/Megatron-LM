@@ -69,6 +69,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                     pretrained_model_name_or_path=tokenizer_path,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
+                    chat_template=chat_template,
                 )
             elif merges_file is None:
                 self.tokenizer = AutoTokenizer.from_pretrained(
@@ -76,6 +77,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                     vocab_file=vocab_file,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
+                    chat_template=chat_template,
                 )
             else:
                 self.tokenizer = AutoTokenizer.from_pretrained(
@@ -84,20 +86,13 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                     merge_files=merges_file,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
+                    chat_template=chat_template,
                 )
         except Exception as e:
             raise ValueError(
                 'Unable to instantiate HuggingFace AutoTokenizer '
                 f'for {tokenizer_path}. Exception: {e}'
             )
-
-        # Store the tokenizer's existing chat template if the user does not provide
-        # a custom chat template. Otherwise, override the default chat template with
-        # the user-provided template.
-        if chat_template is None:
-            chat_template = self.tokenizer.chat_template
-        else:
-            self.tokenizer.chat_template = chat_template
 
         self.include_special_tokens = include_special_tokens
         self.original_vocab_size = len(self.tokenizer)

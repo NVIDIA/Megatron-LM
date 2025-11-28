@@ -24,7 +24,7 @@ from wandb import wandb_run
 
 from megatron.core import mpu
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
-from megatron.core.utils import get_asyncio_loop
+from megatron.core.inference.utils import get_event_loop
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.optimizer import MegatronOptimizer
@@ -607,11 +607,11 @@ def get_environment_rollouts(
     ), "n_prompts must be divisible by data_parallel_world_size"
 
     with nvtx_range("rollout-collection"):
-        loop = get_asyncio_loop()
+        loop = get_event_loop()
         with megatron_rl_inference_mode(
             model,
             optimizer,
-            args.cuda_graph_impl,
+            args.enable_cuda_graph,
             args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
             args.rl_offload_kv_cache_during_training,
@@ -1006,7 +1006,7 @@ def prepare_trajectories(
     args = get_args()
     # Only process if we have inference_logprobs
     if inference_logprobs and any(lp is not None for lp in inference_logprobs):
-        if args.rl_use_sequence_packing:
+        if args.use_sequence_packing:
             # For sequence packing, we need to pad all logprobs to the same size
             padded_logprobs = []
             for logprobs in inference_logprobs:
@@ -1207,14 +1207,14 @@ def prepare_data_for_update(
         # [g, group_size]
         # Making an assumption that all groups are of the same size!
         # For packing mode, use all rollouts to compute rewards
-        rollouts_for_rewards = all_rollouts if args.rl_use_sequence_packing else rollouts
+        rollouts_for_rewards = all_rollouts if args.use_sequence_packing else rollouts
         rewards = torch.tensor(
             [[rollout.reward for rollout in group] for group in rollouts_for_rewards], device='cpu'
         )
 
         # We flatten them for logging.
         with nvtx_range("prepare_trajectories"):
-            if args.rl_use_sequence_packing:
+            if args.use_sequence_packing:
                 trajs, generation_masks, inference_logprobs = prepare_packed_trajectories(
                     all_rollouts, tokenizer, args
                 )
@@ -1228,14 +1228,14 @@ def prepare_data_for_update(
         # Sequence packing or standard processing
         packing_context = {}  # Store all packing-related data
 
-        if args.rl_use_sequence_packing:
+        if args.use_sequence_packing:
             with nvtx_range("sequence_packing"):
                 timers('sequence-packing-overhead', log_level=1).start()
 
-                bin_size = args.rl_sequence_packing_bin_size
+                bin_size = args.sequence_packing_bin_size
 
                 # Create packer with max sequences per bin limit to prevent extreme imbalance
-                max_sequences_per_bin = getattr(args, 'rl_sequence_packing_max_sequences_per_bin', 100)
+                max_sequences_per_bin = getattr(args, 'sequence_packing_max_sequences_per_bin', 100)
                 packer = SequencePacker(
                     bin_size=bin_size,
                     pad_token=tokenizer.pad,
@@ -1276,7 +1276,7 @@ def prepare_data_for_update(
                 world_size = mpu.get_expert_data_parallel_world_size()
 
                 # Choose distribution algorithm based on args.sequence_packing_algo
-                packing_algo = getattr(args, 'rl_sequence_packing_algo', 'fifo')
+                packing_algo = getattr(args, 'sequence_packing_algo', 'fifo')
 
                 if packing_algo == 'round-robin':
                     # Round-robin assignment: rank i gets bins [i, i+world_size, i+2*world_size, ...]
@@ -1596,7 +1596,7 @@ def prepare_data_for_update(
             )
             original_loss_mask[~generation_masks] = 0.0
 
-        if not args.rl_use_sequence_packing:
+        if not args.use_sequence_packing:
             # Use original masks if not packing
             attention_mask = original_attention_mask
             loss_mask = original_loss_mask
@@ -1606,7 +1606,7 @@ def prepare_data_for_update(
             timers('compute-logprobs', log_level=0).start()
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
             # Use packed sequences if packing is enabled for performance benefits
-            if args.rl_use_sequence_packing and 'packed_trajs' in packing_context:
+            if args.use_sequence_packing and 'packed_trajs' in packing_context:
                 compute_trajs = packing_context['packed_trajs']
                 compute_position_ids = packing_context['packed_position_ids']
                 compute_attention_mask = packing_context['packed_attention_mask']
@@ -1661,7 +1661,7 @@ def prepare_data_for_update(
         if (
             inference_logprobs is not None
             and args.rl_inference_logprobs_is_correction
-            and not args.rl_use_sequence_packing
+            and not args.use_sequence_packing
         ):
             inference_logprobs = align_unpacked_inference_logprobs(
                 inference_logprobs=inference_logprobs,
@@ -1670,14 +1670,14 @@ def prepare_data_for_update(
                 group_stats=group_stats,
             )
         else:
-            if not args.rl_use_sequence_packing:
+            if not args.use_sequence_packing:
                 # Keep inference_logprobs as None instead of zeros
                 inference_logprobs = None
             # For sequence packing, inference_logprobs will be handled separately
 
         # Handle packing of inference_logprobs for sequence packing mode
         if (
-            args.rl_use_sequence_packing
+            args.use_sequence_packing
             and inference_logprobs is not None
             and args.rl_inference_logprobs_is_correction
         ):
@@ -1687,7 +1687,7 @@ def prepare_data_for_update(
                     inference_logprobs=inference_logprobs,
                     packing_info=packing_context['packing_info'],
                     generation_masks=generation_masks,
-                    bin_size=args.rl_sequence_packing_bin_size,
+                    bin_size=args.sequence_packing_bin_size,
                 )
 
                 # Store packed inference logprobs in packing context
@@ -1754,7 +1754,7 @@ def prepare_data_for_update(
 
             timers('prepare-advantages').stop()
         with nvtx_range("create_dataloader"):
-            if args.rl_use_sequence_packing:
+            if args.use_sequence_packing:
                 # Store packing context in runtime state for forward_step
                 runtime_state = get_rl_runtime_state()
                 runtime_state.packing_context = packing_context
@@ -2049,14 +2049,14 @@ def evaluate_and_print_results_rl(
         with megatron_rl_inference_mode(
             model,
             optimizer,
-            args.cuda_graph_impl,
+            args.enable_cuda_graph,
             args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
             args.rl_offload_kv_cache_during_training,
             args.rl_remove_kv_cache_during_training,
         ) as inference_interface:
 
-            loop = get_asyncio_loop()
+            loop = get_event_loop()
 
             rank = torch.distributed.get_rank()
             if rank == 0:
@@ -2230,7 +2230,7 @@ def calculate_grpo_loss(
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
-    cuda_graph_impl: str,
+    enable_cuda_graph: bool,
     reset_cuda_graphs: bool,
     offload_optimizer_during_inference: bool,
     offload_kv_cache_during_training: bool,
@@ -2241,7 +2241,7 @@ def megatron_rl_inference_mode(
     Args:
         model: model to prepare.
         optimizer: optimizer used to train the model.
-        cuda_graph_impl: which cuda graph implementation to use.
+        enable_cuda_graph: use cuda graphs or not.
         reset_cuda_graphs: rebuild cuda graphs for each inference stage or not.
         offload_optimizer_during_inference: move optimizer to cpu during inference or not.
         offload_kv_cache_during_training: manually offload kv cache to host before training or not.
@@ -2252,7 +2252,7 @@ def megatron_rl_inference_mode(
 
     """
     args = get_args()
-    loop = get_asyncio_loop()
+    loop = get_event_loop()
     nvtx_range = get_nvtx_range()
 
     print(f"[{dist.get_rank()}:DP] Entering inference mode")
@@ -2275,9 +2275,8 @@ def megatron_rl_inference_mode(
             with nvtx_range("offload-optimizer-before-inference"):
                 optimizer.offload_to_cpu()
 
-        # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
-        if cuda_graph_impl != "none":
-            toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
+        if enable_cuda_graph:
+            toggle_cuda_graphs(lang_module, True, reset_cuda_graphs=reset_cuda_graphs)
 
         inference_interface = get_inference_interface(args, loop, model)
 
@@ -2287,28 +2286,25 @@ def megatron_rl_inference_mode(
                     reset_cuda_graphs
                 ), "reset_cuda_graphs must be True when offloading kv cache during training"
                 print(
-                    f"[{dist.get_rank()}:DP] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
+                    f"[{dist.get_rank()}:DP] Restoring kv cache ({inference_interface._coordinator.engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
+                kv_cache = inference_interface._coordinator.engine.context.memory_buffer
+                inference_interface._coordinator.engine.context.memory_buffer = kv_cache.cuda()
             elif remove_kv_cache_during_training:
-                if inference_interface._inference_engine.context.memory_buffer is None:
-                    inference_interface._inference_engine.context.build_memory_buffer()
+                if inference_interface._coordinator.engine.context.memory_buffer is None:
+                    inference_interface._coordinator.engine.context.build_memory_buffer()
 
-        # TODO: Improve this if statement once a change is made to CUDA graph handling.
-        cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
-        if cuda_graph_impl != "none" and not cuda_graph_exists:
+        if enable_cuda_graph and not _CudagraphGlobalRecord.cudagraph_created:
             with nvtx_range("wait-for-decode-only"):
-                while not inference_interface._inference_engine.context.is_decode_only():
+                while not inference_interface._coordinator.engine.context.is_decode_only():
                     active_requests, finished_requests, step_time = loop.run_until_complete(
-                        inference_interface._inference_engine.async_step()
+                        inference_interface._coordinator.engine.async_step()
                     )
             with nvtx_range("build-cuda-graphs"):
-                inference_interface._inference_engine.create_cuda_graphs(reset_context=True)
+                inference_interface._coordinator.engine.build_cuda_graphs(reset_context=False)
 
-        loop.run_until_complete(inference_interface.resume())
+        inference_interface.resume()
 
-        print(f"[{dist.get_rank()}:DP] Entered inference mode")
         yield inference_interface
 
         with nvtx_range("suspend-engine"):
@@ -2316,17 +2312,16 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("offload-kv-cache-after-inference"):
             if offload_kv_cache_during_training:
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
+                kv_cache = inference_interface._coordinator.engine.context.memory_buffer
                 print(
                     f"[{dist.get_rank()}:DP] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
                 )
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
+                inference_interface._coordinator.engine.context.memory_buffer = kv_cache.cpu()
             elif remove_kv_cache_during_training:
-                inference_interface._inference_engine.context.memory_buffer = None
+                inference_interface._coordinator.engine.context.memory_buffer = None
 
-        # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
-        if cuda_graph_impl != "none":
-            toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
+        if enable_cuda_graph:
+            toggle_cuda_graphs(lang_module, False, reset_cuda_graphs=reset_cuda_graphs)
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):
@@ -2353,7 +2348,7 @@ def get_iteration_sequence_count(args):
 
 def update_sequence_packing_metrics(args):
     """Update bin tracking for sequence packing mode."""
-    if args.rl_use_sequence_packing:
+    if args.use_sequence_packing:
         bin_count = (
             mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
         )

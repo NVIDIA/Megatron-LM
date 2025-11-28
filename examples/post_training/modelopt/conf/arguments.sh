@@ -1,6 +1,3 @@
-#!/bin/bash
-set -e
-
 MLM_MODEL_CFG=$1
 
 # Bash coloring

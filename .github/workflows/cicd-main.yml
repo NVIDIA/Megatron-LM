@@ -40,6 +40,7 @@ env:
 jobs:
   is-not-external-contributor:
     runs-on: ubuntu-latest
+    environment: nemo-ci
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
@@ -387,6 +388,7 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
+    environment: nemo-ci
     if: |
       (
         success()
@@ -566,6 +568,7 @@ jobs:
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
+    environment: nemo-ci
     steps:
       - name: Generate fake coverage report
         uses: actions/github-script@v6
