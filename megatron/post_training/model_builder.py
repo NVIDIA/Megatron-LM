@@ -102,12 +102,9 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     return Namespace(**args_dict)
 
 
-def _teacher_provider(config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
-    """Teacher model factory (must be a non-local function to pickle)."""
+def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
+    """Teacher model creator."""
     args = get_args()
-
-    # Convert to TransformerConfig here to avoid ModelOpt pickling issues (contains local functions)
-    config = core_transformer_config_from_args(config_raw)
 
     if config.is_hybrid_model:
         # These parameters are not part of the TransformerConfig and need to be passed separately.
@@ -137,7 +134,7 @@ def _teacher_provider(config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MC
         teacher = MCoreGPTModel(config=config, **model_kwargs)
     _add_load_convert_hooks(teacher)
 
-    print_rank_0("Loading teacher {} checkpoint...".format("MCoreMambaModel" if config.is_hybrid_model else "MCoreGPTModel"))
+    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
     # [WAR]: load checkpoint will check checkpoint's saved args and rng state if not finetune.
     # To avoid error out on loading teacher's checkpoint, we temporarily set args.finetune to
     # True while loading the teacher checkpoint.
@@ -319,12 +316,14 @@ def modelopt_gpt_mamba_builder(
                 args.virtual_pipeline_model_parallel_size is None
             ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
-        teacher_config = _load_teacher_model_config(args.export_kd_teacher_load)
+        teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
+        teacher_config = core_transformer_config_from_args(teacher_config_raw)  # convert to TransformerConfig
+
         distill_cfg = mtd_mcore.setup_distillation_config(
-            args.export_kd_cfg, student_cfg=config, teacher_cfg=core_transformer_config_from_args(teacher_config)
+            args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config
         )
         kd_config = {
-            "teacher_model": (_teacher_provider, [teacher_config, model_kwargs], {}),
+            "teacher_model": _load_teacher_model(teacher_config, teacher_config_raw, model_kwargs),
             "criterion": distill_cfg.criterion,
             "loss_balancer": distill_cfg.loss_balancer,
         }
