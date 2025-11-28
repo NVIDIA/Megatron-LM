@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+import gc
 import os
 import sys
 
@@ -55,6 +56,7 @@ class TestPartialCudaGraphedA2AOverlap:
             'CUDA_DEVICE_MAX_CONNECTIONS': os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS'),
             'NVTE_ALLOW_NONDETERMINISTIC_ALGO': os.environ.get('NVTE_ALLOW_NONDETERMINISTIC_ALGO'),
         }
+        self.cuda_graph_helper = None
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
 
@@ -68,6 +70,11 @@ class TestPartialCudaGraphedA2AOverlap:
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+            self.cuda_graph_helper.delete_cuda_graphs()
+            self.cuda_graph_helper = None
+
+        gc.collect()
 
     def model_provider(
         self,
@@ -175,9 +182,7 @@ class TestPartialCudaGraphedA2AOverlap:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
-    def _run_1f1b_helper(
-        self, cuda_graph_helper, gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps
-    ):
+    def _run_1f1b_helper(self, gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps):
         from megatron.core.models.common.model_chunk_schedule_plan import (
             TransformerModelChunkSchedulePlan,
         )
@@ -192,8 +197,8 @@ class TestPartialCudaGraphedA2AOverlap:
         assert cuda_graph_warmup_steps > 0, "cuda_graph_warmup_steps must be greater than 0"
         for fwd_mb_idx in range(num_iters + 1):
             # Capture CUDA graphs after warmup if helper is provided
-            if cuda_graph_helper is not None and fwd_mb_idx == cuda_graph_warmup_steps:
-                cuda_graph_helper.create_cudagraphs()
+            if self.cuda_graph_helper is not None and fwd_mb_idx == cuda_graph_warmup_steps:
+                self.cuda_graph_helper.create_cudagraphs()
 
             if fwd_mb_idx < cuda_graph_warmup_steps:
                 gpt_model[0].zero_grad_buffer()
@@ -271,11 +276,10 @@ class TestPartialCudaGraphedA2AOverlap:
 
         loss_list = []
 
-        cuda_graph_helper = None
         if cuda_graph_impl == "transformer_engine":
             from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 
-            cuda_graph_helper = TECudaGraphHelper(
+            self.cuda_graph_helper = TECudaGraphHelper(
                 model=gpt_model,
                 config=gpt_model[0].config,
                 seq_length=self.seq_length,
@@ -297,8 +301,8 @@ class TestPartialCudaGraphedA2AOverlap:
                 optimizer.zero_grad()
 
                 # Capture CUDA graphs after warmup if helper is provided
-                if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
-                    cuda_graph_helper.create_cudagraphs()
+                if self.cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
+                    self.cuda_graph_helper.create_cudagraphs()
 
                 output = unwrap_model(gpt_model[0]).forward(**data)
                 output = float16_to_fp32(output)
@@ -318,14 +322,15 @@ class TestPartialCudaGraphedA2AOverlap:
                 loss_list.append(output)
         else:
             loss_list = self._run_1f1b_helper(
-                cuda_graph_helper, gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps
+                gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps
             )
 
         return loss_list
 
     @pytest.mark.skipif(
-        not (HAVE_TE and is_te_min_version("1.14.0")),
-        reason="Partial CUDA graph support requires TransformerEngine version >= 1.14.0",
+        # not (HAVE_TE and is_te_min_version("2.10.0")),
+        not (HAVE_TE and is_te_min_version("1.10.0")),
+        reason="Partial CUDA graph support requires TransformerEngine version >= 2.10.0",
     )
     @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep"])
     def test_moe_partial_cudagraph_with_ep_overlap(self, moe_dispatcher_type):
