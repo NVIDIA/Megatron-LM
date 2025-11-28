@@ -87,7 +87,7 @@ dev = [
     "onnxscript",
     "flash-linear-attention~=0.3.2",
     "emerging_optimizers",
-    "fast_hadamard_transform==1.0.4post1",
+    "fast_hadamard_transform~=1.0.4post1",
 ]
 
 lts = [
@@ -153,6 +153,7 @@ no-build-isolation-package = [
     "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",
+    "fast-hadamard-transform",
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
