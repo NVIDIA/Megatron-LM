@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import types
-import warnings
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +34,7 @@ from megatron.core.utils import (
 )
 from megatron.core.activations import squared_relu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.dist_signal_handler import SIGNAL_MAP
 from megatron.training.utils import (
     get_device_arch_version,
     update_use_dist_ckpt,
@@ -1062,8 +1062,6 @@ def validate_args(args, defaults={}):
     # MoE Spec check
     if args.num_experts == 0:
         args.num_experts = None
-    if args.num_experts is not None:
-        assert args.spec is None, "Model Spec must be None when using MoEs"
     if args.num_experts is not None and args.moe_ffn_hidden_size is None:
         args.moe_ffn_hidden_size = args.ffn_hidden_size
         print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
@@ -1107,6 +1105,20 @@ def validate_args(args, defaults={}):
            bool(args.data_path) + \
            any([args.train_data_path, args.valid_data_path, args.test_data_path]) \
            <= 1, "A single data source must be provided in training mode, else None"
+
+    if args.fim_data:
+        extra_tokens = [
+            args.fim_prefix_token,
+            args.fim_middle_token,
+            args.fim_suffix_token,
+            args.fim_pad_token,
+            args.fim_eod_token,
+        ]
+        assert not args.mock_data, "Mock dataset is not supported with FIM dataset."
+        assert not args.legacy_tokenizer, "FIM dataset is not supported with legacy tokenizers."
+        assert args.fim_rate, "--fim-rate should be specified."
+        assert args.fim_spm_rate, "--fim-spm-rate should be specified."
+        assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
 
     # Deterministic mode
     if args.deterministic_mode:
@@ -1182,7 +1194,6 @@ def validate_args(args, defaults={}):
     if args.inference_dynamic_batching:
         assert args.inference_dynamic_batching_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
-        assert args.inference_dynamic_batching_buffer_guaranteed_fraction is not None
 
     # MoE upcycling check
     if args.moe_use_upcycling:
@@ -1415,7 +1426,7 @@ def _add_transformer_engine_args(parser):
                        help='Execute wgrad in higher precision even for FP8 runs',
                        dest='fp8_wgrad')
     group.add_argument('--transformer-impl', default='transformer_engine',
-                       choices=['local', 'transformer_engine'],
+                       choices=['local', 'transformer_engine', 'inference_optimized'],
                        help='Which Transformer implementation to use.')
     group.add_argument('--fallback-to-eager-attn', action='store_true',
                        help='Fallback to eager attention in TE implementation. '
@@ -1524,34 +1535,22 @@ def _add_inference_args(parser):
                        help='Enable dynamic batching mode.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
-                       help='Total buffer size (GB) allocated for the block-level KV '
-                       'memory.')
+                       help='Amount of on-GPU memory allocated for the KV cache. '
+                       'The total amount of memory allocated for the KV cache '
+                       '(CPU + GPU memory) depends on the value set for the '
+                       'unified virtual memory (UVM) level (via '
+                       '`--inference-dynamic-batching-unified-memory-level`).'
+                       'If the UVM level is 0, then only GPU memory is used and '
+                       'the total memory equals `buffer_size_gb`. If the UVM '
+                       'level is 1, then additional memory is utilized on the '
+                       'CPU and the total memory equals `2 * buffer_size_gb`.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
                        'It should be a multiple of 256')
-    group.add_argument('--inference-dynamic-batching-buffer-guaranteed-fraction',
-                       type=float, default=0.2,
-                       help='Space is reserved within the inference context '
-                       'memory buffer to guarantee that a minimum number of '
-                       'active requests will always be able to run to '
-                       'completion. This is to avoid the context being deadlocked '
-                       'by paused requests.')
-    group.add_argument('--inference-dynamic-batching-buffer-overflow-factor',
-                       type=float, default=None,
-                       help='Scaling factor over the memory buffer size for auto '
-                       'computing `max_requests` and `max_tokens`. This scaling '
-                       'factor is used for fitting more requests and tokens in '
-                       'the memory buffer than it can safely hold, which in turn '
-                       'increases throughput.')
-    group.add_argument('--inference-dynamic-batching-max-requests-override',
+    group.add_argument('--inference-dynamic-batching-max-tokens',
                        type=int, default=None,
-                       help='If set, this overrides the max requests as computed '
-                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
-    group.add_argument('--inference-dynamic-batching-max-tokens-override',
-                       type=int, default=None,
-                       help='If set, this overrides the max tokens as computed '
-                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+                       help='Override the inference context\'s default `max_tokens`.')
     group.add_argument('--inference-dynamic-batching-num-cuda-graphs',
                        type=int, default=16,
                        help='Maximum number of cuda graphs to capture, where the '
@@ -1568,7 +1567,7 @@ def _add_inference_args(parser):
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
-                       type=int, default=0, choices=[0, 1],
+                       type=int, default=1, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
                        'inference context. The levels are: 0) no unified memory, '
                        '1) allocate `memory_buffer` in unified memory. '
@@ -1588,7 +1587,8 @@ def _add_inference_args(parser):
     group.add_argument('--inference-wandb-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics to wandb. '
                             'Default to 0 to disable inference wandb logging.')
-
+    group.add_argument("--inference-coordinator-port", type=int, default=12346,
+                       help="This port will be used to setup the inference coordinator on node-0")
     return parser
 
 
@@ -2281,7 +2281,10 @@ def _add_training_args(parser):
                        help='Exit the program after this many minutes.')
     group.add_argument('--exit-signal-handler', action='store_true',
                        help='Dynamically save the checkpoint and shutdown the '
-                       'training if SIGTERM is received')
+                       'training if signal is received')
+    group.add_argument('--exit-signal', type=str, default='SIGTERM',
+                       choices=list(SIGNAL_MAP.keys()),
+                       help='Signal to use for exit signal handler. If not specified, defaults to SIGTERM.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
@@ -3051,6 +3054,27 @@ def _add_data_args(parser):
                        'If instead this argument is set, the training flow will treat all tokens '
                        'that share the same id as the pad token as true pad tokens, potentially '
                        'causing severe training instability.')
+    group.add_argument('--fim-data', action='store_true', help='Whether to use the FIM dataset.')
+    group.add_argument('--fim-rate', type=float, default=0.5,
+                       help='Probability to convert a training sample into a FIM format.')
+    group.add_argument('--fim-spm-rate', type=float, default=0.5,
+                       help='Probability that the a FIM sample uses the SPM format over the PSM format.')
+    group.add_argument('--fim-split-sample', type=str, default=None,
+                       help='String around which to split the sample for FIM.')
+    group.add_argument('--fim-fragment-rate', type=float, default=None,
+                       help='Rate of FIM on each fragment when --fim-split-sample is not None.')
+    group.add_argument('--fim-no-prefix', type=str, default=None,
+                       help='Do not apply FIM to fragments that start with this prefix')
+    group.add_argument('--fim-prefix-token', type=str, default='<fim_prefix>',
+                       help='FIM prefix token')
+    group.add_argument('--fim-middle-token', type=str, default='<fim_middle>',
+                       help='FIM middle token')
+    group.add_argument('--fim-suffix-token', type=str, default='<fim_suffix>',
+                       help='FIM suffix token')
+    group.add_argument('--fim-pad-token', type=str, default='<fim_pad>',
+                       help='FIM PAD token')
+    group.add_argument('--fim-eod-token', type=str, default='<|endoftext|>',
+                       help='FIM EOD token')
     return parser
 
 
