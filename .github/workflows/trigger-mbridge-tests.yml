@@ -42,6 +42,7 @@ jobs:
       sha: ${{ steps.mcore_info.outputs.sha }}
       short_sha: ${{ steps.mcore_info.outputs.short_sha }}
       branch: ${{ steps.mcore_info.outputs.branch }}
+      repo_url: ${{ steps.mcore_info.outputs.repo_url }}
     steps:
       - name: Checkout MCore
         uses: actions/checkout@v4
