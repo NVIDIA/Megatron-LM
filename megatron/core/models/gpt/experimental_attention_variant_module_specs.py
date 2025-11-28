@@ -11,6 +11,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
@@ -37,6 +38,7 @@ def get_gated_delta_net_module_spec_for_backend(
 
 def get_dsa_module_spec_for_backend(
     backend: BackendSpecProvider,
+    qk_layernorm: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     mla_down_proj_use_column_parallel: Optional[bool] = False,
@@ -48,10 +50,6 @@ def get_dsa_module_spec_for_backend(
     assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
     assert fallback_to_eager_attn is False, "Fallback to eager attention is not supported with DSA."
 
-    # Adjust for RMS norm.
-    rms_norm = normalization == "RMSNorm"
-    qk_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=True)
-
     linear_q_down_proj = (
         backend.column_parallel_linear() if mla_down_proj_use_column_parallel else backend.linear()
     )
@@ -60,7 +58,6 @@ def get_dsa_module_spec_for_backend(
     )
     linear_q_up_proj = backend.column_parallel_linear()
     linear_kv_up_proj = backend.column_parallel_linear()
-    qk_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=True)
 
     # Because TransformerEngine does not support sparse attention yet, we use local
     # implementation whether the backend is TransformerEngine or not.
@@ -78,6 +75,10 @@ def get_dsa_module_spec_for_backend(
             )
         ),
     )
+
+    # Adjust for RMS norm.
+    rms_norm = normalization == "RMSNorm"
+    qk_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=True) if qk_layernorm else IdentityOp
 
     attention = ModuleSpec(
         module=MLASelfAttention,
@@ -118,6 +119,7 @@ def get_experimental_attention_variant_module_spec_for_backend(
     elif experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(
             backend=backend,
+            qk_layernorm=qk_layernorm,
             qk_l2_norm=qk_l2_norm,
             multi_latent_attention=multi_latent_attention,
             mla_down_proj_use_column_parallel=mla_down_proj_use_column_parallel,
