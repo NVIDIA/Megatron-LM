@@ -54,9 +54,14 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "branch=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
+          
+          # Get repo URL from origin remote, fallback to constructing from github context
+          REPO_URL=$(git remote get-url origin 2>/dev/null || echo "${{ github.server_url }}/${{ github.repository }}.git")
+          echo "repo_url=${REPO_URL}" >> $GITHUB_OUTPUT
 
           echo "📦 MCore commit: $(git rev-parse --short HEAD)"
           echo "🌿 Branch: ${GITHUB_REF#refs/heads/}"
+          echo "📍 Repo: ${REPO_URL}"
 
   # Matrix job: Trigger and monitor MBridge workflows in parallel
   trigger-and-monitor:
@@ -99,6 +104,7 @@ jobs:
             --repo NVIDIA-NeMo/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
             --field mcore_commit=${{ needs.get-mcore-info.outputs.sha }} \
             --field mcore_branch=${{ needs.get-mcore-info.outputs.branch }} \
+            --field mcore_repo=${{ needs.get-mcore-info.outputs.repo_url }} \
             --field test_suite=${{ inputs.test_suite }} \
             --field triggered_by=mcore-ci
       
