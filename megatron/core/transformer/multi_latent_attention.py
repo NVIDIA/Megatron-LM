@@ -243,7 +243,7 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        if self.config.sparse_attention_type is None:
+        if self.config.experimental_attention_variant is None:
             query, key, value = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
@@ -251,14 +251,18 @@ class MultiLatentAttention(Attention):
                 packed_seq_params,
                 inference_context=inference_context,
             )
-        else:
-            # TODO(kunlunl): Is this a universal usage of sparse attention?
+        elif self.config.experimental_attention_variant == "dsa":
             query, key, value, q_compressed, _ = self.get_query_key_value_and_compressed_tensors(
                 hidden_states,
                 key_value_states,
                 position_ids,
                 packed_seq_params,
                 inference_context=inference_context,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported experimental attention variant: "
+                f"{self.config.experimental_attention_variant}"
             )
 
         # ===================================================
@@ -291,7 +295,7 @@ class MultiLatentAttention(Attention):
 
             if inference_context is None or inference_context.is_static_batching():
                 with get_fine_grained_offloading_context(self.offload_core_attention):
-                    if self.config.sparse_attention_type is None:
+                    if self.config.experimental_attention_variant is None:
                         core_attn_out = self.core_attention(
                             query,
                             key,
@@ -300,9 +304,9 @@ class MultiLatentAttention(Attention):
                             packed_seq_params=packed_seq_params,
                             attn_mask_type=attn_mask_type,
                         )
-                    else:
-                        # For sparse attention, use a specialized forward.
-                        # TODO(kunlunl): Is there a unified interface for sparse attention?
+                    elif self.config.experimental_attention_variant == "dsa":
+                        # For dsa we need to pass in the original hidden states and the compressed
+                        # query representation.
                         core_attn_out = self.core_attention(
                             query,
                             key,
@@ -313,6 +317,11 @@ class MultiLatentAttention(Attention):
                             attn_mask_type=attn_mask_type,
                             attention_bias=None,
                             packed_seq_params=packed_seq_params,
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unsupported attention variant: "
+                            f"{self.config.experimental_attention_variant}"
                         )
             elif self.cache_mla_latents:
                 # Dynamic batching attention kernel.

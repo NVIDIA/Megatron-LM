@@ -233,33 +233,14 @@ class TransformerConfig(ModelParallelConfig):
     16 SMs can generally achieve good bandwidth."""
 
     ####################
-    # sparse attention
+    # attention variant
     ####################
-    sparse_attention_type: Optional[str] = None
-    """Type of sparse attention to use. Currently only supports dsa (DeepSeek Sparse Attention)."""
-
-    dsa_indexer_n_heads: Optional[int] = None
-    """Number of DSA indexer heads for DSA."""
-
-    dsa_indexer_head_dim: Optional[int] = None
-    """Dimension per DSA indexer head."""
-
-    dsa_indexer_topk: Optional[int] = None
-    """Number of top-k tokens to select in DSA indexer."""
-
-    dsa_indexer_loss_coeff: Optional[float] = None
-    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
-
-    dsa_indexer_use_sparse_loss: Optional[bool] = None
-    """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
-    top-k indices."""
+    experimental_attention_variant: Optional[str] = None
+    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
 
     ####################
-    # linear attention
+    # attention variant: gated_delta_net
     ####################
-    linear_attention_type: Optional[str] = None
-    """Type of linear attention to use. Currently support gated_delta_net."""
-
     linear_attention_freq: Optional[Union[int, List[int]]] = None
     """Frequency between LA (linear attention) layers 
     and SDPA (scaled dot-product attention) layers.
@@ -281,6 +262,25 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = None
     """Number of value and gate heads for the gated delta net."""
+
+    ####################
+    # attention variant: dsa
+    ####################
+    dsa_indexer_n_heads: Optional[int] = None
+    """Number of DSA indexer heads."""
+
+    dsa_indexer_head_dim: Optional[int] = None
+    """Dimension per DSA indexer head."""
+
+    dsa_indexer_topk: Optional[int] = None
+    """Number of top-k tokens to select in DSA indexer."""
+
+    dsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+
+    dsa_indexer_use_sparse_loss: Optional[bool] = None
+    """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
+    top-k indices."""
 
     ####################
     # initialization
@@ -877,17 +877,12 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.linear_attention_type is not None:
-            supported_la_types = ["gated_delta_net"]
-            assert self.linear_attention_type in supported_la_types, (
-                f"linear_attention_type ({self.linear_attention_type}) only support"
-                f" one of {supported_la_types}."
-            )
+        if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
             ), f"linear_attention_freq must be set for linear attention."
 
-            if self.linear_attention_type == "gated_delta_net":
+            if self.experimental_attention_variant == "gated_delta_net":
                 # Check required parameters
                 assert (
                     self.linear_conv_kernel_dim is not None
@@ -922,6 +917,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"Gated delta net does not support context parallel for now,"
                     f" but got {self.context_parallel_size=}."
                 )
+        elif self.experimental_attention_variant == "dsa":
+            assert (
+                self.context_parallel_size == 1
+            ), "Currently context parallelism is not supported by DSAttention!"
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1895,12 +1895,6 @@ class TransformerConfig(ModelParallelConfig):
                         f"fallback_to_eager_attn only supports all_gather communication type "
                         f"for context parallelism, but got {self.cp_comm_type=} instead."
                     )
-
-        if self.sparse_attention_type is not None:
-            assert (
-                self.context_parallel_size == 1
-            ), "Currently context parallelism is not supported by DSAttention!"
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
 
 
 @dataclass

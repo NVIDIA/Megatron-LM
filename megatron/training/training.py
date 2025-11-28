@@ -91,7 +91,7 @@ from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
-from megatron.core.transformer.sparse_attention import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -376,7 +376,8 @@ def num_floating_point_operations(args, batch_size):
                 )
             )
 
-        if args.linear_attention_type is not None:
+        linear_attention_variants = ["gated_delta_net"]
+        if args.experimental_attention_variant in linear_attention_variants:
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
@@ -401,7 +402,7 @@ def num_floating_point_operations(args, batch_size):
             num_linear_attention_layers = sum(linear_attention_pattern)
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if args.linear_attention_type == "gated_delta_net":
+            if args.experimental_attention_variant == "gated_delta_net":
                 # Calculate the FLOPs for the gated delta net attention.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
