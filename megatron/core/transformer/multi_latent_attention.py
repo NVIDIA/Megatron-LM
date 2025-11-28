@@ -252,12 +252,13 @@ class MultiLatentAttention(Attention):
                 inference_context=inference_context,
             )
         elif self.config.experimental_attention_variant == "dsa":
-            query, key, value, q_compressed, _ = self.get_query_key_value_and_compressed_tensors(
+            query, key, value, q_compressed, _ = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 position_ids,
                 packed_seq_params,
                 inference_context=inference_context,
+                return_compressed_tensors=True,
             )
         else:
             raise ValueError(
@@ -519,7 +520,7 @@ class MLASelfAttention(MultiLatentAttention):
             eps=self.config.layernorm_epsilon,
         )
 
-    def get_query_key_value_and_compressed_tensors(
+    def get_query_key_value_tensors(
         self,
         hidden_states,
         key_value_states=None,
@@ -528,6 +529,7 @@ class MLASelfAttention(MultiLatentAttention):
         inference_context=None,
         *,
         inference_params=None,
+        return_compressed_tensors=False,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -862,17 +864,10 @@ class MLASelfAttention(MultiLatentAttention):
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
 
-        return query, key, value, q_compressed, kv_compressed
-
-    def get_query_key_value_tensors(self, *args, **kwargs):
-        """
-        Derives `query`, `key` and `value` tensors from `hidden_states`.
-        """
-        query, key, value, q_compressed, kv_compressed = (
-            self.get_query_key_value_and_compressed_tensors(*args, **kwargs)
-        )
-        # Only return query, key and value.
-        return query, key, value
+        if return_compressed_tensors:
+            return query, key, value, q_compressed, kv_compressed
+        else:
+            return query, key, value
 
     def uncompress_kv_from_cache(self, kv_cached):
         """

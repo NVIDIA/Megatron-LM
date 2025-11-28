@@ -440,7 +440,6 @@ class DSAIndexer(MegatronModule):
             eps=self.config.layernorm_epsilon,
         )
 
-        # TODO(kunlunl): The dtype of this module should be torch.get_default_dtype().
         self.linear_weights_proj = build_module(
             submodules.linear_weights_proj,
             self.hidden_size,
