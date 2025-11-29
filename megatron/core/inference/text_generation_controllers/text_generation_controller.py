@@ -20,11 +20,7 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_last_stage,
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
-from megatron.core.inference.inference_request import (
-    DynamicInferenceRequest,
-    InferenceRequest,
-    Status,
-)
+from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
@@ -571,11 +567,7 @@ class TextGenerationController:
         return logits
 
     def _dynamic_step_sample_bookkeeping(
-        self,
-        *,
-        backend: str = "torch",
-        request_metadata: Optional[Tensor] = None,
-        request_metadata_labels: Dict[str, int] = None,
+        self, *, backend: str = "torch", request_metadata: Optional[Dict[str, Tensor]] = None
     ):
         """Perform bookkeeping necessary to sample logits for dynamic batching.
 
@@ -584,51 +576,51 @@ class TextGenerationController:
 
         Args:
             backend (str): The sampling backend to use.
-            request_metadata (Optional[Tensor]): An override for the tensor that manages all
-                request metadata, such as sampling parameters. By default, this metadata is
-                retrieved from the context.
-            request_metadata_labels (Optional[Dict]): An override for the map of metadata labels
-                to their index in the request_metadata tensor. By default, this metadata is
-                retrieved from the request object.
+            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
+                that manage request metadata, such as sampling parameters. By default, this
+                metadata is retrieved from the context.
         """
         assert backend in ["torch"]
         context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
 
         if request_metadata is None:
-            request_metadata = context.request_metadata[
-                context.paused_request_count : context.total_request_count, :
-            ]
-        if request_metadata_labels is None:
-            request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
-        active_request_count = request_metadata.size(0)
-
-        # Shorthand these, because the torch backend needs them.
-        temp = request_metadata[:, request_metadata_labels["temperature"]]
-        top_k = request_metadata[:, request_metadata_labels["top_k"]]
-        top_p = request_metadata[:, request_metadata_labels["top_p"]]
+            request_metadata = {
+                label: tensor[context.paused_request_count : context.total_request_count]
+                for label, tensor in context.request_metadata.items()
+            }
 
         # Copy data into relevant tensors.
-        self.temperature_cuda[:active_request_count].copy_(temp, non_blocking=True)
-        self.top_k_cuda[:active_request_count] = top_k.to(
+        self.temperature_cuda[:active_request_count].copy_(
+            request_metadata["temperature"], non_blocking=True
+        )
+        self.top_k_cuda[:active_request_count] = request_metadata["top_k"].to(
             dtype=torch.int32, copy=True, non_blocking=True
         )
-        self.top_p_cuda[:active_request_count].copy_(top_p, non_blocking=True)
-        self.termination_id_cuda[:active_request_count] = request_metadata[
-            :, request_metadata_labels["termination_id"]
-        ].to(dtype=torch.int64, copy=True, non_blocking=True)
-        self.return_log_probs_cuda[:active_request_count] = request_metadata[
-            :, request_metadata_labels["return_log_probs"]
-        ].to(dtype=torch.bool, copy=True, non_blocking=True)
+        self.top_p_cuda[:active_request_count].copy_(request_metadata["top_p"], non_blocking=True)
+        self.termination_id_cuda[:active_request_count] = request_metadata["termination_id"].to(
+            dtype=torch.int64, copy=True, non_blocking=True
+        )
+        self.return_log_probs_cuda[:active_request_count] = request_metadata["return_log_probs"].to(
+            dtype=torch.bool, copy=True, non_blocking=True
+        )
         self.skip_prompt_log_probs_cuda[:active_request_count] = request_metadata[
-            :, request_metadata_labels["skip_prompt_log_probs"]
+            "skip_prompt_log_probs"
         ].to(dtype=torch.bool, copy=True, non_blocking=True)
         self.top_n_logprobs_cuda[:active_request_count] = request_metadata[
-            :, request_metadata_labels["top_n_logprobs"]
+            "top_n_logprobs"
         ].to(dtype=torch.int32, copy=True, non_blocking=True)
 
         if backend == "torch":
             # Bucketize the core sampling parameters.
-            core_params = torch.stack((temp, top_k, top_p), dim=1)
+            core_params = torch.stack(
+                (
+                    request_metadata["temperature"],
+                    request_metadata["top_k"],
+                    request_metadata["top_p"],
+                ),
+                dim=1,
+            )
             _, inv_indices, cnts = torch.unique(
                 core_params, dim=0, return_inverse=True, return_counts=True
             )

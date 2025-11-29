@@ -258,16 +258,11 @@ class TestTextGenerationController:
                 rev_sampling_dict[idx] = sampling_params
 
         # Prepare metadata for sample bookkeeping.
-        request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
-        request_metadata = torch.empty(
-            (batch_size, len(request_metadata_labels)), dtype=torch.float32
-        ).cuda()
-        top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).cuda()
-        request_metadata[:, request_metadata_labels["top_k"]] = top_k_values
-        top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict]).cuda()
-        request_metadata[:, request_metadata_labels["top_p"]] = top_p_values
-        temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict]).cuda()
-        request_metadata[:, request_metadata_labels["temperature"]] = temp_values
+        request_metadata = {
+            "temperature": torch.Tensor([s.temperature for s in rev_sampling_dict]).cuda(),
+            "top_k": torch.Tensor([s.top_k for s in rev_sampling_dict]).cuda(),
+            "top_p": torch.Tensor([s.top_p for s in rev_sampling_dict]).cuda(),
+        }
 
         # Bookkeeping.
         self.text_generation_controller._dynamic_step_sample_bookkeeping(
