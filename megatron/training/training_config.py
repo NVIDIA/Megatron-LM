@@ -338,6 +338,11 @@ class CheckpointConfig:
     save_dgrads_interval: int | None = None
     """Number of iterations between dgrad saves."""
 
+    save_retain_interval: int | None = None
+    """Number of iterations between retained checkpoints
+    (other checkpoints except the last checkpoint are automatically deleted).
+    """
+
     most_recent_k: int | None = -1
     """Number of latest checkpoint to be saved."""
 
@@ -394,6 +399,12 @@ class CheckpointConfig:
     use_checkpoint_args: bool = False
     """Override model-related command-line arguments with arguments from checkpoint"""
 
+    use_mp_args_from_checkpoint_args: bool = False
+    """Copy model parallelism command-line arguments from checkpoint"""
+
+    use_tokenizer_model_from_checkpoint_args: bool = True
+    """If set, do not use tokenizer model path from checkpoint"""
+
     exit_on_missing_checkpoint: bool = False
     """If 'load' is set, but checkpoint is not found (e.g., path typo), then exit instead of random initialization."""
 
@@ -404,11 +415,23 @@ class CheckpointConfig:
     fsdp_dtensor is a torch DCP native, Megatron FSDP training-specific checkpoint format.
     """
 
+    auto_detect_ckpt_format: bool = False
+    """Determine if the checkpoint format is in legacy or distributed format. If False,
+    expects distributed checkpoint iff args.ckpt_format != "torch". Might slow down 
+    loading a bit (double rank0 ckpt load).
+    """
+
     ckpt_convert_format: Literal["torch", "torch_dist"] | None = None
     """Checkpoint format for conversion."""
 
     ckpt_convert_save: str | None = None
     """Save directory for converted checkpoint."""
+
+    ckpt_convert_update_legacy_dist_opt_format: bool = False
+    """When loading a checkpoint, update the legacy format for the distributed optimizer,
+    which previously used a merged param/grad buffer and a different bucket mapping.
+    The legacy format was deprecated on Feb 13, 2024.
+    """
 
     ckpt_fully_parallel_save: bool = True
     """Disable applying full save parallelization across DP for distributed checkpoints.

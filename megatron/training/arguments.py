@@ -2516,9 +2516,6 @@ def _add_checkpointing_args(parser):
     ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
 
-    group.add_argument('--save-retain-interval', type=int, default=None,
-                       help='Number of iterations between retained checkpoints (other'
-                       'checkpoints _except the last checkpoint_ are automatically deleted).')
     group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,
@@ -2532,27 +2529,13 @@ def _add_checkpointing_args(parser):
                        'can reduce startup time when definitely loading from a '
                        'checkpoint',
                        dest='perform_initialization')
-    group.add_argument('--use-mp-args-from-checkpoint-args', action='store_true',
-                       help='Copy model parallelism command-line arguments from checkpoint')
-    group.add_argument('--no-use-tokenizer-model-from-checkpoint-args', action='store_false',
-                       dest='use_tokenizer_model_from_checkpoint_args',
-                       help='If set, do not use tokenizer model path from checkpoint')
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')
 
-    group.add_argument('--auto-detect-ckpt-format', action='store_true',
-                       help='Determine if the checkpoint format is in legacy or distributed format.'
-                            ' If False, expects distributed checkpoint iff args.ckpt_format != "torch".'
-                            ' Might slow down loading a bit (double rank0 ckpt load).')
     group.add_argument('--dist-ckpt-format',
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
-    group.add_argument('--ckpt-convert-update-legacy-dist-opt-format', action='store_true',
-                       help='When loading a checkpoint, update the legacy format '
-                       'for the distributed optimizer, which previously used a '
-                       'merged param/grad buffer and a different bucket mapping. '
-                       'The legacy format was deprecated on Feb 13, 2024.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
