@@ -20,11 +20,7 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_last_stage,
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
-from megatron.core.inference.inference_request import (
-    DynamicInferenceRequest,
-    InferenceRequest,
-    Status,
-)
+from megatron.core.inference.inference_request import DynamicInferenceRequest, InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
@@ -95,7 +91,6 @@ class TextGenerationController:
 
         # Keep track of request metadata.
         self._request_metadata: Tensor = None
-        self._request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
 
         # Initialize bookkeeping tensors.
         self._sampling_logits_cuda = torch.empty(
@@ -532,7 +527,10 @@ class TextGenerationController:
                 unwrapped_model.set_symmetric_ar(None)
 
         # Get request metadata for this step.
-        self._request_metadata = context.request_metadata[active_request_slice, :]
+        self._request_metadata = {
+            label: tensor[active_request_slice]
+            for label, tensor in context.request_metadata.items()
+        }
 
         # Get flat tokens, position ids.
         if construct_graph_dimensions is not None:
@@ -595,33 +593,37 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Shorthand these, because the torch backend needs them.
-        temp = self._request_metadata[:, self._request_metadata_labels["temperature"]]
-        top_k = self._request_metadata[:, self._request_metadata_labels["top_k"]]
-        top_p = self._request_metadata[:, self._request_metadata_labels["top_p"]]
-
         # Copy data into relevant tensors.
-        self.temperature_cuda[:active_request_count].copy_(temp, non_blocking=True)
-        self.top_k_cuda[:active_request_count] = top_k.to(
+        self.temperature_cuda[:active_request_count].copy_(
+            self._request_metadata["temperature"], non_blocking=True
+        )
+        self.top_k_cuda[:active_request_count] = self._request_metadata["top_k"].to(
             dtype=torch.int32, copy=True, non_blocking=True
         )
-        self.top_p_cuda[:active_request_count].copy_(top_p, non_blocking=True)
-        self.termination_id_cuda[:active_request_count] = self._request_metadata[
-            :, self._request_metadata_labels["termination_id"]
-        ].to(dtype=torch.int64, copy=True, non_blocking=True)
-        self.return_log_probs_cuda[:active_request_count] = self._request_metadata[
-            :, self._request_metadata_labels["return_log_probs"]
-        ].to(dtype=torch.bool, copy=True, non_blocking=True)
+        self.top_p_cuda[:active_request_count].copy_(self._request_metadata["top_p"], non_blocking=True)
+        self.termination_id_cuda[:active_request_count] = self._request_metadata["termination_id"].to(
+            dtype=torch.int64, copy=True, non_blocking=True
+        )
+        self.return_log_probs_cuda[:active_request_count] = self._request_metadata["return_log_probs"].to(
+            dtype=torch.bool, copy=True, non_blocking=True
+        )
         self.skip_prompt_log_probs_cuda[:active_request_count] = self._request_metadata[
-            :, self._request_metadata_labels["skip_prompt_log_probs"]
+            "skip_prompt_log_probs"
         ].to(dtype=torch.bool, copy=True, non_blocking=True)
         self.top_n_logprobs_cuda[:active_request_count] = self._request_metadata[
-            :, self._request_metadata_labels["top_n_logprobs"]
+            "top_n_logprobs"
         ].to(dtype=torch.int32, copy=True, non_blocking=True)
 
         if self._sampling_backend == "torch":
             # Bucketize the core sampling parameters.
-            core_params = torch.stack((temp, top_k, top_p), dim=1)
+            core_params = torch.stack(
+                (
+                    self._request_metadata["temperature"],
+                    self._request_metadata["top_k"],
+                    self._request_metadata["top_p"],
+                ),
+                dim=1,
+            )
             _, inv_indices, cnts = torch.unique(
                 core_params, dim=0, return_inverse=True, return_counts=True
             )
