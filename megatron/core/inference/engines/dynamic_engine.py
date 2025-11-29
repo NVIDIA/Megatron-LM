@@ -298,6 +298,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # Forward pass -> logits.
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
+            # Sampling.
+            if controller._sampling_backend not in ["torch"]:
+                controller._dynamic_step_sample_logits()
+
             context.reset()
 
         # Memory usage.
