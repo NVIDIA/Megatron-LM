@@ -97,7 +97,6 @@ class TextGenerationController:
         # Keep track of request metadata.
         self._active_request_count = None
         self._request_metadata: Dict[str, Tensor] = {}
-        context.update_request_metadata(DynamicInferenceRequest.get_metadata_types())
 
         # Initialize bookkeeping tensors.
         self._sampling_logits_cuda = torch.empty(
@@ -105,9 +104,15 @@ class TextGenerationController:
         )
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
 
-        # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
+            context.update_request_metadata(
+                DynamicInferenceRequest.torch_sampling_metadata_types()
+            )
             self._torch_sampling_buckets: List[Tuple] = []
+        elif self._sampling_backend == "flashinfer":
+            context.update_request_metadata(
+                DynamicInferenceRequest.flashinfer_sampling_metadata_types()
+            )
 
     def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.

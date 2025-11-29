@@ -1516,6 +1516,8 @@ def _add_inference_args(parser):
                             'Default to 0 to disable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int, default=12346,
                        help="This port will be used to setup the inference coordinator on node-0")
+    group.add_argument('--sampling-backend', choices=['torch', 'flashinfer'], default='torch',
+                       help='Sampling backend to use for sampling.')
     return parser
 
 
