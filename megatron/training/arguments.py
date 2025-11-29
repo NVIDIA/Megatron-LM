@@ -2527,8 +2527,6 @@ def _add_checkpointing_args(parser):
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
-    group.add_argument('--no-strict-fsdp-dtensor-load', action='store_false', dest='strict_fsdp_dtensor_load',
-                       help='Do not strict loading for fsdp_dtensor checkpoint format.')
     group.add_argument('--no-initialization', action='store_false',
                        help='Do not perform initialization when building model, '
                        'can reduce startup time when definitely loading from a '
@@ -2542,8 +2540,6 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')
-    group.add_argument('--use-persistent-ckpt-worker', action='store_true',
-                       help='Enables a persitent checkpoint worker for async save')
 
     group.add_argument('--auto-detect-ckpt-format', action='store_true',
                        help='Determine if the checkpoint format is in legacy or distributed format.'
@@ -2560,15 +2556,6 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
-    group.add_argument('--no-ckpt-fully-parallel-save', action='store_false',
-                       dest='ckpt_fully_parallel_save',
-                       help='Disable applying full save parallelization across DP for'
-                            ' distributed checkpoints. Depending on ckpt format'
-                            ' might decrease the number of files in the checkpoint.'
-                            ' Makes DistributedOptimizer checkpoint non-reshardable.')
-    group.add_argument('--ckpt-fully-parallel-load', action='store_true',
-                       help='Apply full load parallelization across DP for'
-                            ' distributed checkpoints.')
     return parser
 
 

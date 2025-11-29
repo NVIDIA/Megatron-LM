@@ -410,7 +410,7 @@ class CheckpointConfig:
     ckpt_convert_save: str | None = None
     """Save directory for converted checkpoint."""
 
-    fully_parallel_save: bool = True
+    ckpt_fully_parallel_save: bool = True
     """Disable applying full save parallelization across DP for distributed checkpoints.
     Depending on ckpt format might decrease the number of files in the checkpoint.
     Makes DistributedOptimizer checkpoint non-reshardable."""
@@ -418,18 +418,18 @@ class CheckpointConfig:
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
 
-    use_persistent_ckpt_worker: bool = True
+    use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
     worker thread/process for handling async saves. When disabled, uses temporal workers that are
     created and destroyed for each save operation."""
 
-    fully_parallel_load: bool = False
+    ckpt_fully_parallel_load: bool = False
     """Apply full load parallelization across DP for distributed checkpoints."""
 
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
-    strict_fsdp_dtensor_load: bool = False
+    strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
 
     dist_ckpt_strictness: Literal[
