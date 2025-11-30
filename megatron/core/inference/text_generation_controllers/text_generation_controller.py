@@ -80,6 +80,7 @@ class TextGenerationController:
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
+        self._materialize_only_last = context.materialize_only_last_token_logits
         max_requests = context.max_total_requests
 
         device = torch.cuda.current_device()
@@ -87,14 +88,21 @@ class TextGenerationController:
         # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
         vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
 
+        self._sampling_backend = "torch"
+
+        # Keep track of request metadata.
+        self._active_request_count = None
+        self._request_metadata: Dict[str, Tensor] = {}
+
         # Initialize bookkeeping tensors.
-        self.sampling_logits_cuda = torch.empty(
+        self._sampling_logits_cuda = torch.empty(
             max_requests, vocab_size, dtype=logits_dtype, device=device
         )
-        self.sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
 
         # Used for inefficient torch sampling.
-        self.torch_sampling_buckets: List[Tuple] = []
+        if self._sampling_backend == "torch":
+            self._torch_sampling_buckets: List[Tuple] = []
 
     def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -511,6 +519,13 @@ class TextGenerationController:
                 # Turn off symmetric all reduces for prefill
                 unwrapped_model.set_symmetric_ar(None)
 
+        # Get request metadata for this step.
+        self._active_request_count = context.total_request_count - context.paused_request_count
+        self._request_metadata = {
+            label: tensor[context.paused_request_count : context.total_request_count]
+            for label, tensor in context.request_metadata.items()
+        }
+
         # Get flat tokens, position ids.
         if construct_graph_dimensions is not None:
             return context.current_input_and_position_ids(
@@ -531,9 +546,6 @@ class TextGenerationController:
         inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
 
         context = self.inference_wrapped_model.inference_context
-        materialize_only_last_token_logits = context.materialize_only_last_token_logits
-
-        active_request_count = context.total_request_count - context.paused_request_count
 
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
@@ -542,7 +554,7 @@ class TextGenerationController:
 
         if self.model_is_pipeline_parallel:
             logits_seq_len = (
-                active_request_count if materialize_only_last_token_logits else input_ids.shape[1]
+                self._active_request_count if self._materialize_only_last else input_ids.shape[1]
             )
             vocab_size = inference_wrapper_config.padded_vocab_size
             logits_shape = [1, logits_seq_len, vocab_size]
@@ -556,31 +568,22 @@ class TextGenerationController:
                 tensor=logits,
                 pp_group=self.pp_group,
             )
+
+        # Last token logits.
+        if self._materialize_only_last:
+            # When materialize_only_last_token_logits is true, last_token_logits is
+            # already called in the forward pass of GPT.
+            last_token_logits = logits.squeeze(0)
+        else:
+            last_token_logits = context.last_token_logits(logits)
+        # Copy last_token_logits to contiguous buffer.
+        self._sampling_logits_cuda[:self._active_request_count].copy_(last_token_logits, non_blocking=True)
+
         return logits
 
-    def _dynamic_step_sample_bookkeeping(
-        self, *, backend: str = "torch", request_metadata: Optional[Dict[str, Tensor]] = None
-    ):
-        """Perform bookkeeping necessary to sample logits for dynamic batching.
-
-        The ability to override the context's data is solely intended for
-            standalone use or testing, and should never be used in a running system.
-
-        Args:
-            backend (str): The sampling backend to use.
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is retrieved from the context.
-        """
-        assert backend in ["torch"]
-        context = self.inference_wrapped_model.inference_context
-        if request_metadata is None:
-            request_metadata = {
-                label: tensor[context.paused_request_count : context.total_request_count]
-                for label, tensor in context.request_metadata.items()
-            }
-
-        if backend == "torch":
+    def _dynamic_step_sample_bookkeeping(self):
+        """Perform bookkeeping necessary to sample logits for dynamic batching."""
+        if self._sampling_backend == "torch":
             # Bucketize the core sampling parameters.
             # Doing so via list comprehension is orders of magnitude faster than via torch.
             temp_hash = {}
@@ -600,54 +603,28 @@ class TextGenerationController:
             del temp_hash, bucket_cnt
 
             # Get representatives for each equivalence class.
-            temp_reps = request_metadata["temperature"][bucket_reps]
-            top_k_reps = request_metadata["top_k"][bucket_reps]
-            top_p_reps = request_metadata["top_p"][bucket_reps]
+            temp_reps = self._request_metadata["temperature"][bucket_reps]
+            top_k_reps = self._request_metadata["top_k"][bucket_reps]
+            top_p_reps = self._request_metadata["top_p"][bucket_reps]
 
             # Store the buckets and their equivalence class representatives.
-            self.torch_sampling_buckets = (
+            self._torch_sampling_buckets = (
                 (sampling_buckets[idx], temp_reps[idx], top_k_reps[idx], top_p_reps[idx])
                 for idx in range(len(sampling_buckets))
             )
 
-        return request_metadata
-
-    def _dynamic_step_sample_logits(self, logits: Tensor, backend: str = "torch") -> Tensor:
-        """Sample tokens from logits for dynamic batching.
-
-        Args:
-            logits (Tensor): The logits to sample from.
-            backend (str): The sampling backend to use.
-
-        Returns:
-            new_sample (Tensor): The sampled tokens.
-        """
+    def _dynamic_step_sample_logits(self):
+        """Sample tokens from logits for dynamic batching."""
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
         # and then broadcast the sampled tokens rather than broadcasting the raw logits.
-        assert backend in ["torch"]
-
-        context = self.inference_wrapped_model.inference_context
-        materialize_only_last_token_logits = context.materialize_only_last_token_logits
-
-        # Last token logits.
-        if materialize_only_last_token_logits:
-            # When materialize_only_last_token_logits is true, last_token_logits is
-            # already called in the forward pass of GPT.
-            last_token_logits = logits.squeeze(0)
-        else:
-            last_token_logits = context.last_token_logits(logits)
-        active_request_count = last_token_logits.size(0)
-        # Copy last_token_logits to contiguous buffer.
-        self.sampling_logits_cuda[:active_request_count].copy_(last_token_logits, non_blocking=True)
-
-        if backend == "torch":
+        if self._sampling_backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
             token_list = []
             indices_list = []
 
-            for indices, temp, top_k, top_p in self.torch_sampling_buckets:
+            for indices, temp, top_k, top_p in self._torch_sampling_buckets:
                 sampled_tokens = self._torch_sampling_func(
-                    self.sampling_logits_cuda[indices, :], temp.item(), top_k.item(), top_p.item()
+                    self._sampling_logits_cuda[indices, :], temp.item(), top_k.item(), top_p.item()
                 )
                 token_list.append(sampled_tokens)
                 indices_list.append(indices)
@@ -655,89 +632,36 @@ class TextGenerationController:
             # Single write to the output tensor.
             sampled_tokens = torch.cat(token_list, dim=0)
             sampled_indices = torch.cat(indices_list, dim=0)
-            self.sampled_tokens_cuda.index_copy_(0, sampled_indices, sampled_tokens)
-        return self.sampled_tokens_cuda[:active_request_count].clone()
+            self._sampled_tokens_cuda.index_copy_(0, sampled_indices, sampled_tokens)
 
-    def _dynamic_step_log_probs_bookkeeping(
-        self, *, request_metadata: Optional[Dict[str, Tensor]] = None
-    ) -> bool:
+    def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
-
-        Args:
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is passed in from `_dynamic_step_sample_bookkeeping`.
 
         Returns:
             return_log_probs (bool): Whether to return the sampled log_probs.
         """
-        context = self.inference_wrapped_model.inference_context
-        if request_metadata is None:
-            request_metadata = {
-                label: tensor[context.paused_request_count : context.total_request_count]
-                for label, tensor in context.request_metadata.items()
-            }
-        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+        return_log_probs = self._request_metadata["return_log_probs"]
+        skip_prompt_log_probs = self._request_metadata["skip_prompt_log_probs"]
+        top_n_log_probs = self._request_metadata["top_n_logprobs"] > 0
 
-        return_log_probs = request_metadata["return_log_probs"]
-        skip_prompt_log_probs = request_metadata["skip_prompt_log_probs"]
-        top_n_log_probs = request_metadata["top_n_logprobs"] > 0
+        to_check_prompt = (return_log_probs | top_n_log_probs) & ~skip_prompt_log_probs
 
-        to_check_prompt = return_log_probs & ~skip_prompt_log_probs
-
-        assert not (to_check_prompt.any() and materialize_only_last_token_logits), (
+        assert not (to_check_prompt.any() and self._materialize_only_last), (
             "Prompt log probs cannot be calculated if only last token logits are materialized. "
             "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
             "or skip_prompt_log_probs to True in SamplingParams."
         )
 
-        return return_log_probs.any()
-
-    def _dynamic_step_top_n_logprobs_bookkeeping(
-        self, *, request_metadata: Optional[Dict[str, Tensor]] = None
-    ) -> bool:
-        """Perform bookkeeping necessary to compute top-n log probs for dynamic batching.
-
-        Args:
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is passed in from `_dynamic_step_sample_bookkeeping`.
-
-        Returns:
-            return_top_n_logprobs (bool): Whether to return the sampled top-n log_probs.
-        """
-        context = self.inference_wrapped_model.inference_context
-        if request_metadata is None:
-            request_metadata = {
-                label: tensor[context.paused_request_count : context.total_request_count]
-                for label, tensor in context.request_metadata.items()
-            }
-
-        return_log_probs = request_metadata["return_log_probs"]
-        skip_prompt_log_probs = request_metadata["skip_prompt_log_probs"]
-        top_n_log_probs = request_metadata["top_n_logprobs"] > 0
-
-        to_check_prompt = top_n_log_probs & ~skip_prompt_log_probs
-
-        assert not (to_check_prompt.any() and materialize_only_last_token_logits), (
-            "Prompt log probs cannot be calculated if only last token logits are materialized. "
-            "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
-            "or skip_prompt_log_probs to True in SamplingParams."
-        )
-
-        return top_n_log_probs.any()
+        return return_log_probs.any(), top_n_log_probs.any()
 
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
-        materialize_only_last_token_logits = context.materialize_only_last_token_logits
-
-        active_request_count = context.total_request_count - context.paused_request_count
 
         return context.calculate_log_probs(
             logits,
-            self.sampled_tokens_cuda[:active_request_count],
-            only_last_token_logits=materialize_only_last_token_logits,
+            self._sampled_tokens_cuda[:self._active_request_count],
+            only_last_token_logits=self._materialize_only_last,
         )
 
     def _dynamic_step_calculate_top_n_logprobs(
@@ -761,18 +685,15 @@ class TextGenerationController:
         )
 
         context = self.inference_wrapped_model.inference_context
-        materialize_only_last_token_logits = context.materialize_only_last_token_logits
-
-        active_request_count = context.total_request_count - context.paused_request_count
 
         # Handle decode-only mode (only last token)
-        if materialize_only_last_token_logits or context.is_decode_only():
+        if self._materialize_only_last or context.is_decode_only():
             # In decode mode or when only last token logits are materialized,
             # logits already represent only the last tokens
-            log_probs = log_probs_tensor[:active_request_count]
+            log_probs = log_probs_tensor[:self._active_request_count]
 
             top_n_results = {}
-            for req_idx in range(active_request_count):
+            for req_idx in range(self._active_request_count):
                 top_n = int(self.top_n_logprobs_cuda[req_idx].item())
                 if top_n > 0:
                     # Get top-n logprobs and indices for this request (single token)
@@ -796,7 +717,7 @@ class TextGenerationController:
         log_probs_per_request = log_probs.split(active_query_lengths.tolist(), dim=0)
 
         top_n_results = {}
-        for req_idx in range(active_request_count):
+        for req_idx in range(self._active_request_count):
             top_n = int(self.top_n_logprobs_cuda[req_idx].item())
             if top_n > 0:
                 request_log_probs = log_probs_per_request[
@@ -823,16 +744,8 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
-    def _dynamic_step_context_bookkeeping(
-        self, new_sample: Tensor, request_metadata: Optional[Dict[str, Tensor]] = None
-    ) -> Dict[str, Tensor]:
+    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
-
-        Args:
-            new_sample (Tensor): The newly sampled tokens.
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is retrieved from the context.
 
         Return:
             Dict [str, Tensor]: A dictionary containing:
@@ -840,14 +753,6 @@ class TextGenerationController:
                 newly_paused_request_ids (Tensor): Newly paused request IDs.
                 finished_request_ids (Tensor): Finished request IDs.
         """
-        context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
-        if request_metadata is None:
-            request_metadata = {
-                label: tensor[context.paused_request_count : context.total_request_count]
-                for label, tensor in context.request_metadata.items()
-            }
-
         # Active sequence lengths.
         active_request_ids = context.request_ids[
             context.paused_request_count : context.total_request_count
@@ -859,7 +764,7 @@ class TextGenerationController:
         # Request finished if termination_id or length >= max_sequence_length.
         # Note: termination_id tensor has per-request termination IDs from mixed sampling
         active_request_mask = (
-            self.sampled_tokens_cuda[:active_request_count] != request_metadata["termination_id"]
+            self._sampled_tokens_cuda[:self._active_request_count] != self._request_metadata["termination_id"]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
@@ -867,7 +772,7 @@ class TextGenerationController:
         finished_request_ids = context.request_ids[finished_idxs]
 
         # New sample gets updated in update_requests, so we pass in a clone
-        new_sample_copy = new_sample.clone()
+        new_sample_copy = self._sampled_tokens_cuda[:self._active_request_count].clone()
 
         # Update requests.
         newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
@@ -919,11 +824,10 @@ class TextGenerationController:
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
-        request_metadata = self._dynamic_step_sample_bookkeeping()
-        new_sample = self._dynamic_step_sample_logits(logits)
+        self._dynamic_step_sample_bookkeeping()
+        self._dynamic_step_sample_logits()
 
-        return_log_probs = self._dynamic_step_log_probs_bookkeeping(request_metadata)
-        return_top_n_logprobs = self._dynamic_step_top_n_logprobs_bookkeeping(request_metadata)
+        return_log_probs, return_top_n_log_probs = self._dynamic_step_log_probs_bookkeeping()
 
         log_probs = None
         top_n_logprobs = None
@@ -937,10 +841,10 @@ class TextGenerationController:
         if skip_bookkeeping:
             request_bookkeeping = {}
         else:
-            request_bookkeeping = self._dynamic_step_context_bookkeeping(new_sample)
+            request_bookkeeping = self._dynamic_step_context_bookkeeping()
 
         ret = {
-            "sample": new_sample,
+            "sample": self._sampled_tokens_cuda[:self._active_request_count]
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
             "cuda_graph_request_count": cuda_graph_request_count,
