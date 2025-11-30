@@ -236,9 +236,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
             If None, defaults to using flash-infer if available.
         metrics_writer (Optional['WandbModule']): Wandb module for writing metrics.
-        request_metadata_types (Optional[List[Tuple[str, torch.dtype, bool]]]): A list of the
-            per-request metadata types to track. Each entry is a tuple consisting of the string
-            label, the target dtype, and whether to store the data on GPU.
     """
 
     DEFAULT_MAX_TOKENS = 16384
@@ -269,7 +266,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         cuda_graph_max_tokens: Optional[int] = None,
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
-        request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -394,9 +390,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Track request metadata.
-        if request_metadata_types is None:
-            request_metadata_types = DynamicInferenceRequest.get_metadata_types()
-        self.request_metadata_types = request_metadata_types
+        self.request_metadata_types = []
 
         # Initialize context state.
         self.params_dtype = params_dtype
@@ -532,14 +526,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Track request metadata.
-        self.request_metadata = {
-            label: torch.empty(
-                (self.max_total_requests,),
-                dtype=dtype,
-                device=torch.cuda.current_device() if on_gpu else torch.device("cpu"),
-            )
-            for label, dtype, on_gpu in self.request_metadata_types
-        }
+        self.request_metadata: Dict[str, torch.Tensor] = {}
+        self.update_request_metadata(self.request_metadata_types)
 
         # Per-token state.
         self.token_to_input_ids = torch.full(
@@ -642,6 +630,28 @@ class DynamicInferenceContext(BaseInferenceContext):
             value = getattr(self, key)
             if isinstance(value, torch.Tensor):
                 delattr(self, key)
+
+    def update_request_metadata(self, request_metadata_types: List[Tuple[str, torch.dtype, bool]]):
+        """Update the tracked per-request metadata and allocate new tensors.
+
+        Args:
+            request_metadata_types (Optional[List[Tuple[str, torch.dtype, bool]]]): A list of the
+                per-request metadata types to track. Each entry is a tuple consisting of the string
+                label, the target dtype, and whether to store the data on GPU.
+        """
+        for label, dtype, on_gpu in request_metadata_types:
+            # Make sure to trigger torch garbage-collection on overriden tensors.
+            if label in self.request_metadata:
+                del self.request_metadata[label]
+
+            tensor = torch.empty(
+                (self.max_total_requests,),
+                dtype=dtype,
+                device=torch.cuda.current_device() if on_gpu else torch.device("cpu"),
+            )
+            self.request_metadata[label] = tensor
+
+        self.request_metadata_types.update(request_metadata_types)
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
@@ -1018,7 +1028,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=self.token_to_input_ids.device, dtype=self.token_to_input_ids.dtype
                 )
             )
-            for i, m in enumerate(req.tracked_metadata):
+            for i, m in enumerate(req.get_tracked_metadata(self.request_metadata_types))
                 metadata_cols[i].append(m)
 
         total_new_tokens = sum(lengths)
@@ -1487,13 +1497,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.request_ids[current_id] = req.request_id
 
-        # Handle request metadata.
-        assert (
-            req.get_metadata_types() == self.request_metadata_types
-        ), "Request added to context with invalid metadata types"
-        metadata = req.tracked_metadata
-        metadata_types = req.get_metadata_types()
-        for m, m_type in zip(metadata, metadata_types):
+        metadata = req.get_tracked_metadata(self.request_metadata_types)
+        for m, m_type in zip(metadata, self.request_metadata_types)
             label, _, _ = m_type
             self.request_metadata[label][current_id] = m
 

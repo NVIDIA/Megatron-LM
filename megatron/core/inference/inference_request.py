@@ -295,8 +295,9 @@ class DynamicInferenceRequest(InferenceRequest):
         request.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
         return request
 
-    @property
-    def tracked_metadata(self) -> List[Any]:
+    def get_tracked_metadata(
+        self, request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]]
+    ): -> List[Any]:
         """Obtain an ordered list of all request metadata to be tracked by the context.
 
         This consists of metadata that is used to inform text generation.
@@ -304,8 +305,18 @@ class DynamicInferenceRequest(InferenceRequest):
 
         Note that while the general request object is mutable, this metadata is
         inherently assumed to remain immutable once the request becomes active.
+
+        Args:
+            request_metadata_types (Optional[List[Tuple[str, torch.dtype, bool]]]): A list of the
+                per-request metadata types to track. Each entry is a tuple consisting of the string
+                label, the target dtype, and whether to store the data on GPU.
         """
+        # If metadata types are not provided, use the request's defaults.
+        if request_metadata_types is None:
+            request_metadata_types = self.get_metadata_types()
+
         sp = self.sampling_params
+        # Special handling for termination ID.
         if sp.termination_id is None:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 warnings.warn(
@@ -313,8 +324,11 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
+
+        # Hardcoded special handling for non-straightforward metadata.
+        # TODO TDE: Figure out how to pass this in with callables.
         extras = {"core_hash": hash((sp.temperature, sp.top_k, sp.top_p))}
-        return [getattr(sp, field, extras.get(field)) for field, _, _ in self.get_metadata_types()]
+        return [getattr(sp, field, extras.get(field)) for field, _, _ in request_metadata_types]
 
     @staticmethod
     def get_metadata_types() -> List[Tuple[str, torch.dtype, bool]]:

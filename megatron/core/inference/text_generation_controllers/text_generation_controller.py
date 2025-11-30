@@ -20,7 +20,11 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_last_stage,
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
-from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    InferenceRequest,
+    Status,
+)
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
@@ -93,6 +97,7 @@ class TextGenerationController:
         # Keep track of request metadata.
         self._active_request_count = None
         self._request_metadata: Dict[str, Tensor] = {}
+        context.update_request_metadata(DynamicInferenceRequest.get_metadata_types())
 
         # Initialize bookkeeping tensors.
         self._sampling_logits_cuda = torch.empty(
