@@ -849,18 +849,25 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_log_probs
                     )
 
-                    # For each log prob in the current batch
-                    for log_prob in request_log_probs:
-                        # If skip_prompt_log_probs is False and we haven't reached prompt end,
-                        # append to prompt_log_probs. Otherwise append to generated_log_probs.
-                        if (
-                            not request.sampling_params.skip_prompt_log_probs
-                            and total_accumulated < prompt_length - 1
-                        ):
-                            request.prompt_log_probs.append(log_prob)
-                        else:
-                            request.generated_log_probs.append(log_prob)
-                        total_accumulated += 1
+                    # Handle skip_prompt_log_probs during prefill
+                    # If skip_prompt_log_probs is True and we have multiple log probs (prefill),
+                    # only process the last one (first generated token)
+                    if request.sampling_params.skip_prompt_log_probs and len(request_log_probs) > 1:
+                        # Only append the last log prob (first generated token) to generated_log_probs
+                        request.generated_log_probs.append(request_log_probs[-1])
+                    else:
+                        # For each log prob in the current batch
+                        for log_prob in request_log_probs:
+                            # If skip_prompt_log_probs is False and we haven't reached prompt end,
+                            # append to prompt_log_probs. Otherwise append to generated_log_probs.
+                            if (
+                                not request.sampling_params.skip_prompt_log_probs
+                                and total_accumulated < prompt_length - 1
+                            ):
+                                request.prompt_log_probs.append(log_prob)
+                            else:
+                                request.generated_log_probs.append(log_prob)
+                            total_accumulated += 1
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
