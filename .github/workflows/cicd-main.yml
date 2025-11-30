@@ -176,15 +176,18 @@ jobs:
 
   trigger:
     name: Invoke workflow in another repo with inputs
-    uses: the-actions-org/workflow-dispatch@v4
-    with:
-      workflow: Approve Test Queue
-      repo: NVIDIA-NeMo/Megatron-Bridge
-      ref: main
-      token: ${{ secrets.PAT }}
-      inputs: '{ "mcore_commit": "${{ github.sha }}", "mcore_branch": "${{ github.ref }}" }'
-      display-workflow-run-url: true
-      wait-for-completion: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger workflow
+        uses: the-actions-org/workflow-dispatch@v4
+        with:
+          workflow: Approve Test Queue
+          repo: NVIDIA-NeMo/Megatron-Bridge
+          ref: main
+          token: ${{ secrets.PAT }}
+          inputs: '{ "mcore_commit": "${{ github.sha }}", "mcore_branch": "${{ github.ref }}" }'
+          display-workflow-run-url: true
+          wait-for-completion: true
 
   # cicd-wait-in-queue:
   #   runs-on: ubuntu-latest
