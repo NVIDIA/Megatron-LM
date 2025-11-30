@@ -179,7 +179,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger workflow
-        uses: the-actions-org/workflow-dispatch@v4
+        uses: the-actions-org/workflow-dispatch@v2.1.1
         with:
           workflow: Approve Test Queue
           repo: NVIDIA-NeMo/Megatron-Bridge
