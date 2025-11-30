@@ -185,7 +185,6 @@ jobs:
           repo: NVIDIA-NeMo/Megatron-Bridge
           ref: main
           token: ${{ secrets.PAT }}
-          inputs: '{ "mcore_commit": "${{ github.sha }}", "mcore_branch": "${{ github.ref }}" }'
           display-workflow-run-url: true
           wait-for-completion: true
 
