@@ -114,3 +114,21 @@ class ValidationConfig:
        separate loss for each dataset in the list. This argument requires that no weights are 
        included in the list.
     """
+
+
+@dataclass
+class StragglerDetectionConfig:
+    """Configuration settings for detecting and logging GPU stragglers."""
+
+    log_straggler: bool = False
+    """If set, tracks and logs straggler per GPU."""
+
+    straggler_ctrlr_port: int = 65535
+    """Port number to toggle StragglerDetector on/off at runtime"""
+
+    straggler_minmax_count: int = 1
+    """Number of ranks to report with high/low estimated throughput"""
+
+    disable_straggler_on_startup: bool = False
+    """If set, StragglerDetector is disabled on startup."""
+
