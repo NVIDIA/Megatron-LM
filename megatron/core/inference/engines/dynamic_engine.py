@@ -856,18 +856,20 @@ class DynamicInferenceEngine(AbstractEngine):
                         # Only append the last log prob (first generated token) to generated_log_probs
                         request.generated_log_probs.append(request_log_probs[-1])
                     else:
-                        # For each log prob in the current batch
-                        for log_prob in request_log_probs:
-                            # If skip_prompt_log_probs is False and we haven't reached prompt end,
-                            # append to prompt_log_probs. Otherwise append to generated_log_probs.
-                            if (
-                                not request.sampling_params.skip_prompt_log_probs
-                                and total_accumulated < prompt_length - 1
-                            ):
-                                request.prompt_log_probs.append(log_prob)
-                            else:
-                                request.generated_log_probs.append(log_prob)
-                            total_accumulated += 1
+                        # Vectorized approach: calculate split point and use list slicing
+                        if not request.sampling_params.skip_prompt_log_probs:
+                            # Calculate how many log probs go to prompt vs generated
+                            remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                            split_idx = min(remaining_prompt_slots, len(request_log_probs))
+
+                            # Batch extend instead of individual appends
+                            if split_idx > 0:
+                                request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                            if split_idx < len(request_log_probs):
+                                request.generated_log_probs.extend(request_log_probs[split_idx:])
+                        else:
+                            # All log probs go to generated
+                            request.generated_log_probs.extend(request_log_probs)
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
