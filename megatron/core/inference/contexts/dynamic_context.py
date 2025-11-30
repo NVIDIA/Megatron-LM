@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -22,7 +22,7 @@ from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
 )
-from megatron.core.inference.utils import tensor_swap
+from megatron.core.inference.utils import tensor_swap, use_cuda_graph
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
@@ -609,6 +609,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.active_sequence_lengths = torch.empty_like(self.request_query_lengths)
         self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
+        self.cu_active_sequence_lengths = torch.empty_like(self.request_query_lengths)
+        self.active_log_prob_mask = torch.empty(
+            self.max_requests, dtype=torch.bool, device=torch.cuda.current_device()
+        )
+
+        # CUDA graph caches for log-prob kernels.
+        # _log_prob_graphs: graph_key -> CUDAGraph
+        # _log_prob_graph_outputs: graph_key -> tuple of output tensor references
+        self._log_prob_graphs: Dict = {}
+        self._log_prob_graph_outputs: Dict = {}
 
         # Memory buffer.
         def allocate_memory_buffer():
@@ -2136,76 +2146,213 @@ class DynamicInferenceContext(BaseInferenceContext):
             "evict_request_ids": evict_request_ids,
         }
 
-    def calculate_log_probs(
-        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> Tuple[List[List[float]], Tensor]:
-        """Calculate log probs for all active requests and return them.
+    # ──────────────────────────────────────────────────────────────────────
+    # Log-prob calculation, decomposed into three CUDA-graph domains.
+    #
+    # Domain A  (req cnt graph):  active_log_prob_mask population
+    #   Inlined into text_generation_controller._dynamic_step_active_params_count.
+    #   Operates on tensors sized by padded_active_request_count.
+    #   Produces: active_log_prob_mask (bool), log_prob_request_count (scalar Tensor).
+    #
+    # ── CPU Sync 1: log_prob_request_count.item() ──
+    #
+    # Domain B  (req* cnt graph):  calculate_log_probs_decode
+    #   Operates on tensors sized by the (padded) count of requests wanting log probs.
+    #   Used when only_last_token_logits or decode-only.
+    #
+    # ── CPU Sync 2 (prefill only): selected_token_count.item() ──
+    #
+    # Domain C  (tok* cnt graph):  calculate_log_probs_prefill
+    #   Operates on tensors sized by the (padded) total token count of filtered requests.
+    #   Used when prefill requests are present.
+    # ──────────────────────────────────────────────────────────────────────
 
-        TODO: @wdykas support top-n log probs.
+    def calculate_log_probs_decode(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        log_prob_request_count: int,
+        log_probs: Tensor,
+    ) -> Tuple[List[Optional[List[float]]], Tensor]:
+        """Domain B: log-prob calculation for decode-only / last-token-only mode.
+
+        All GPU operations are sized by log_prob_request_count (req* cnt) and
+        are captured as a CUDA graph when graphing is active.
 
         Args:
-            logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
-            new_tokens (Tensor): The newly sampled tokens.
-            only_last_token_logits (bool): If set, the logits are from only the last token in each request
+            logits (Tensor): Shape [1, padded_active_request_count, vocab_size].
+            new_tokens (Tensor): Sampled tokens, shape [padded_active_request_count].
+            log_prob_request_count (int): Number of requests wanting log probs.
+            log_probs (Tensor): Output buffer, shape [padded_active_request_count, vocab_size].
 
         Returns:
-            List of lists where each inner list contains log probs for a request in the
-            same order as the active requests (from paused_request_count to total_request_count).
-            log_probs (Tensor): Used to compute top n logprobs later if required.
+            (List[Optional[List[float]]], Tensor): Per-request log probs list (one entry per
+                active request; None for requests not wanting log probs) and the log_probs tensor.
         """
+        active_request_count = self.total_request_count - self.paused_request_count
+        padded_count = self.padded_active_request_count
+        graph_key = ("log_probs_decode", padded_count, log_prob_request_count)
 
-        # Calculate log_probs (sequence_length x vocab_size)
-        logits_squeezed = logits.squeeze(0).float()
+        def kernels():
+            request_indices = torch.nonzero_static(
+                self.active_log_prob_mask[:padded_count],
+                size=log_prob_request_count,
+            ).squeeze(1)
+            logits_indices = self.active_request_last_token_idxs[request_indices]
+            selected_tokens = new_tokens[request_indices]
+            selected_logits = logits.squeeze(0)[logits_indices].float()
+            log_softmax_result = F.log_softmax(selected_logits, dim=-1)
+            log_probs[logits_indices] = log_softmax_result
+            selected_log_probs = log_softmax_result[
+                torch.arange(log_prob_request_count, device=logits.device), selected_tokens
+            ]
+            self._log_prob_graph_outputs[graph_key] = (request_indices, selected_log_probs)
 
-        if only_last_token_logits or self.is_decode_only():
-            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
-            selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.tolist()], log_probs
+        if self._using_cuda_graph_this_step:
+            use_cuda_graph(self._log_prob_graphs, graph_key, kernels)
+        else:
+            kernels()
 
-        log_probs = F.log_softmax(logits_squeezed, dim=-1)
-        # Get the selected token ids for all tokens.
-        # We shift the active token window left by one to remove the first prompt token for
-        # prefill requests and then set the token ids explicitly for the newly generated tokens.
-        # This is necessary because we calculate the log probs *before* updating the request metadata.
-        #
-        # Example (decode & prefill mix):
-        #
-        #   active_query_lengths: [ 1 | 1 | 2 | 5 ]
-        #
-        #   new_tokens          : [ 52 | 12 | 3 | 86 ]
-        #
-        #   seq_idx             : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
-        #
-        #   new_token_idx       : [ 0 | 1 | 3 | 8 ]
-        #
-        #   active_token_ids before left shift:
-        #                       : [ 31 | 75 | 45 16 | 90 12 72 24 88 ]
-        #
-        #   active_token_ids after shift:
-        #                       : [ XX | XX | 16 XX | 12 72 24 88 XX ]   (XX = undefined)
-        #
-        #   active_token_ids[new_token_idx] = new_tokens
-        #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
-        active_token_ids = self.token_to_input_ids[: self.active_token_count].roll(-1, 0)
-        active_query_lengths = self.request_query_lengths[
-            self.paused_request_count : self.total_request_count
-        ]
-        new_token_idx = active_query_lengths.cumsum(0) - 1
-        active_token_ids[new_token_idx] = new_tokens
+        # CPU extraction — reads graph-internal tensors (stable addresses on replay).
+        request_indices, selected_log_probs = self._log_prob_graph_outputs[graph_key]
+        result: List[Optional[List[float]]] = [None] * active_request_count
+        for i, req_idx in enumerate(request_indices.tolist()):
+            result[req_idx] = [selected_log_probs[i].item()]
+        return result, log_probs
 
-        # Extract the log probs for only the selected tokens.
-        # (sequence_length x vocab_size) -> (sequence_length)
-        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        selected_log_probs = log_probs[seq_idx, active_token_ids]
+    def calculate_log_probs_prefill(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        log_prob_request_count: int,
+        log_probs: Tensor,
+    ) -> Tuple[List[Optional[List[float]]], Tensor]:
+        """Domain B+C: log-prob calculation for prefill mode (multiple tokens per request).
 
-        # Split the log probs across request boundaries
-        selected_log_probs_list = selected_log_probs.cpu().split(
-            active_query_lengths.tolist(), dim=0
+        Domain B (req* cnt) is graphable with key (padded_count, log_prob_request_count).
+        After CPU sync 2, Domain C (tok* cnt) is graphable with key that also
+        includes selected_token_count.
+
+        Args:
+            logits (Tensor): Shape [1, padded_active_token_count, vocab_size].
+            new_tokens (Tensor): Sampled tokens, shape [padded_active_request_count].
+            log_prob_request_count (int): Number of requests wanting log probs.
+            log_probs (Tensor): Output buffer, shape [padded_active_token_count, vocab_size].
+
+        Returns:
+            (List[Optional[List[float]]], Tensor): Per-request log probs list (one entry per
+                active request; None for requests not wanting log probs) and the log_probs tensor.
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+        padded_count = self.padded_active_request_count
+
+        # ── Domain B graph (req* cnt) ──
+        graph_key_b = ("log_probs_prefill_b", padded_count, log_prob_request_count)
+
+        def domain_b_kernels():
+            request_indices = torch.nonzero_static(
+                self.active_log_prob_mask[:padded_count],
+                size=log_prob_request_count,
+            ).squeeze(1)
+            last_token_idxs = self.active_request_last_token_idxs[:padded_count]
+            active_query_lengths = self.active_request_query_lengths[:padded_count]
+            masked_lengths = active_query_lengths[request_indices]
+            cu_masked_lengths = masked_lengths.cumsum(0)
+            masked_ends = last_token_idxs[request_indices]
+            selected_token_count_tensor = masked_lengths.sum()
+            self._log_prob_graph_outputs[graph_key_b] = (
+                request_indices, masked_lengths, cu_masked_lengths,
+                masked_ends, selected_token_count_tensor,
+            )
+
+        if self._using_cuda_graph_this_step:
+            use_cuda_graph(self._log_prob_graphs, graph_key_b, domain_b_kernels)
+        else:
+            domain_b_kernels()
+
+        (request_indices, masked_lengths, cu_masked_lengths,
+         masked_ends, selected_token_count_tensor) = self._log_prob_graph_outputs[graph_key_b]
+
+        # ── CPU Sync 2: need total token count for repeat_interleave output_size ──
+        selected_token_count = selected_token_count_tensor.item()
+
+        # ── Domain C graph (tok* cnt) ──
+        graph_key_c = (
+            "log_probs_prefill_c", padded_count, log_prob_request_count, selected_token_count,
         )
 
-        # Convert each log prob tensor into a list
-        return [lp.tolist() for lp in selected_log_probs_list], log_probs
+        def domain_c_kernels():
+            logit_indices_offset = torch.repeat_interleave(
+                masked_ends - cu_masked_lengths + 1,
+                masked_lengths,
+                output_size=selected_token_count,
+            )
+            logit_indices_range = torch.arange(
+                selected_token_count, device=logits.device
+            )
+            logit_indices = logit_indices_offset + logit_indices_range
+            masked_tokens = self.token_to_input_ids[logit_indices].roll(-1, 0)
+            masked_tokens[cu_masked_lengths - 1] = new_tokens[request_indices]
+            selected_logits = logits.squeeze(0)[logit_indices].float()
+            log_softmax_result = F.log_softmax(selected_logits, dim=-1)
+            log_probs[logit_indices] = log_softmax_result
+            token_log_probs = log_softmax_result[logit_indices_range, masked_tokens]
+            self._log_prob_graph_outputs[graph_key_c] = token_log_probs
+
+        if self._using_cuda_graph_this_step:
+            use_cuda_graph(self._log_prob_graphs, graph_key_c, domain_c_kernels)
+        else:
+            domain_c_kernels()
+
+        token_log_probs = self._log_prob_graph_outputs[graph_key_c]
+
+        # CPU extraction — not graphable.
+        per_request = token_log_probs.cpu().split(masked_lengths.tolist(), dim=0)
+        result: List[Optional[List[float]]] = [None] * active_request_count
+        for i, req_idx in enumerate(request_indices.tolist()):
+            result[req_idx] = per_request[i].tolist()
+        return result, log_probs
+
+    def calculate_log_probs(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        only_last_token_logits: bool = False,
+        log_prob_request_count: int = 0,
+        log_probs: Optional[Tensor] = None,
+    ) -> Tuple[List[List[float]], Tensor]:
+        """Calculate log probs for active requests that want them.
+
+        Dispatches to the decode path (Domain B) or prefill path (Domain B+C)
+        based on the current batch composition.
+
+        Args:
+            logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
+            new_tokens (Tensor): Newly sampled tokens for active requests.
+            only_last_token_logits (bool): Whether logits contain only last-token outputs.
+            log_prob_request_count (int): Number of requests wanting log probs
+                (from the earlier Domain A .sum()).
+            log_probs (Optional[Tensor]): Output buffer. Allocated if None.
+
+        Returns:
+            (List[List[float]], Tensor): Per-request log probs and the full log_probs tensor.
+        """
+        if log_probs is None:
+            log_probs = torch.zeros(
+                (logits.size(1), logits.size(2)), device=logits.device, dtype=torch.float32
+            )
+
+        if log_prob_request_count == 0:
+            return [], log_probs
+
+        if only_last_token_logits or self.is_decode_only():
+            return self.calculate_log_probs_decode(
+                logits, new_tokens, log_prob_request_count, log_probs
+            )
+        else:
+            return self.calculate_log_probs_prefill(
+                logits, new_tokens, log_prob_request_count, log_probs
+            )
 
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.
