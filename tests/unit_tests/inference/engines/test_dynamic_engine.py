@@ -3,7 +3,7 @@
 import asyncio
 import random
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -41,6 +41,7 @@ from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     check_mamba_sequence_packing_support,
@@ -103,7 +104,9 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
-    cuda_graph_scope: List[str] = None
+    cuda_graph_scope: List[CudaGraphScope] = field(
+        default_factory=lambda: [CudaGraphScope.full_iteration]
+    )
     force_build_cuda_graphs: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
@@ -135,9 +138,6 @@ class DynamicEngineTestConfig:
             # Enough room for all tokens.
             if self.context_max_tokens_override is None:
                 self.context_max_tokens_override = self.num_requests * self.max_sequence_length
-
-        if self.cuda_graph_scope is None:
-            self.cuda_graph_scope = ["full_iteration"]
 
 
 @dataclass
@@ -514,7 +514,7 @@ class TestDynamicInferenceEngine:
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", [[], ["full_iteration"]])
+    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)

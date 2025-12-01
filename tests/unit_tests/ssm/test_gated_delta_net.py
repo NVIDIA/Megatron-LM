@@ -88,7 +88,7 @@ class TestGatedDeltaNet:
             context_parallel_size=cp_size,
         )
         gdn_submodules = get_gpt_layer_with_transformer_engine_spec(
-            linear_attention_type="gated_delta_net", normalization="RMSNorm"
+            experimental_attention_variant="gated_delta_net", normalization="RMSNorm"
         ).submodules.self_attention.submodules
 
         self.gdn = GatedDeltaNet(
@@ -157,7 +157,7 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
     # Model initialization function
     def initialize_gpt_model(config, pre_process=True, post_process=True, vp_stage=None):
         layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            linear_attention_type="gated_delta_net", normalization=normalization
+            experimental_attention_variant="gated_delta_net", normalization=normalization
         )
         gpt_model = GPTModel(
             config=config,
