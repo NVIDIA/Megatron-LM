@@ -24,7 +24,7 @@ class ModuleSpec:
 
     module: Union[Tuple, type]
     params: dict = field(default_factory=lambda: {})
-    submodules: type = None
+    submodules: object = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Builds an instance of the module from the spec.
