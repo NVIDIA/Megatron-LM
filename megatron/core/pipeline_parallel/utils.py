@@ -232,7 +232,7 @@ class ScheduleNode:
                 if g is not None:
                     g.record_stream(self.stream)
                     if not self.delay_grads_release:
-                        g.untyped_storage().resize_(0) 
+                        g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
         self._release_state()
