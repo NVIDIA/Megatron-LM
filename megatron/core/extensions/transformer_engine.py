@@ -854,8 +854,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         softmax_scale: Optional[float] = None,
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
-        cp_comm_type: str = "p2p",
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = "p2p",
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1018,9 +1018,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType,
-        attention_bias: Tensor = None,
-        packed_seq_params: PackedSeqParams = None,
-    ):
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> Tensor:
         """Forward."""
         packed_seq_kwargs = (
             {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}

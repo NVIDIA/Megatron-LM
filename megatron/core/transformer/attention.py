@@ -137,6 +137,40 @@ class LinearQKVBuilder(Protocol):
     ) -> LinearQKV: ...
 
 
+class CoreAttention(Protocol):
+    """Protocol for the core_attention layer."""
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        /,
+        *,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> torch.Tensor: ...
+
+
+class CoreAttentionBuilder(Protocol):
+    """Protocol for building core attention layers."""
+
+    def __call__(
+        self,
+        /,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        cp_comm_type: Optional[str],
+        softmax_scale: Optional[float],
+        pg_collection: ProcessGroupCollection,
+    ) -> CoreAttention: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
@@ -144,7 +178,7 @@ class SelfAttentionSubmodules:
     """
 
     linear_qkv: LinearQKVBuilder
-    core_attention: Union[ModuleSpec, type] = None
+    core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
     k_layernorm: Union[ModuleSpec, type] = None
@@ -156,9 +190,9 @@ class CrossAttentionSubmodules:
     Configuration class for specifying the submodules of a cross-attention.
     """
 
-    linear_q: Union[ModuleSpec, type] = None
-    linear_kv: Union[ModuleSpec, type] = None
-    core_attention: Union[ModuleSpec, type] = None
+    linear_q: Union[ModuleSpec, type]
+    linear_kv: Union[ModuleSpec, type]
+    core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -215,8 +249,7 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
-        self.core_attention = build_module(
-            submodules.core_attention,
+        self.core_attention = submodules.core_attention(
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
@@ -284,7 +317,7 @@ class Attention(MegatronModule, ABC):
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
+            output_ = typed_torch.apply_module(self.core_attention)(
                 query,
                 key,
                 value,
@@ -952,7 +985,7 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                core_attn_out = self.core_attention(
+                core_attn_out = typed_torch.apply_module(self.core_attention)(
                     query,
                     key,
                     value,

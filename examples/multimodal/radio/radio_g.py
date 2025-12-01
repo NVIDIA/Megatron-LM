@@ -28,6 +28,7 @@ try:
     HAVE_TE = True
 except ImportError:
     TELayerNormColumnParallelLinear = None
+    TEDotProductAttention = None
     HAVE_TE = False
 
 try:
@@ -111,6 +112,7 @@ def get_radio_g_layer_spec_te() -> ModuleSpec:
 
     mlp = get_norm_mlp_module_spec_te()
     assert TELayerNormColumnParallelLinear is not None
+    assert TEDotProductAttention is not None
     return ModuleSpec(
         module=LayerScalingTransformerLayer,
         submodules=TransformerLayerSubmodules(
