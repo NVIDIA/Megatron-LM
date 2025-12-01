@@ -73,7 +73,10 @@ def _multimem_all_gather_kernel(
 
 
 def multimem_all_gather(
-    output_tensor: torch.Tensor, input_tensor: torch.Tensor, symm_mem_hdl: _SymmetricMemory
+    output_tensor: torch.Tensor, 
+    input_tensor: torch.Tensor, 
+    symm_mem_hdl: _SymmetricMemory,
+    **kwargs
 ) -> torch.Tensor:
     """
     Calls a multicast all-gather triton kernel on the given tensor.
@@ -88,42 +91,32 @@ def multimem_all_gather(
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
 
-    WARP_SIZE = 32
-    MAX_NUM_BLOCKS = 4
-    MAX_BLOCK_SIZE = 1024
-    BYTES_PER_THREAD = 16
-
+    config = {
+        "max_num_blocks": kwargs.get("max_num_blocks", 24),
+        "num_warps": kwargs.get("num_warps", 32),
+        "BLOCK_SIZE": kwargs.get("BLOCK_SIZE", 1024),
+    }
     assert input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
     assert output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
-    numel_per_thread = BYTES_PER_THREAD // input_tensor.element_size()
+    numel_per_thread = 128 // (input_tensor.element_size() * 8)
 
     assert (
         output_tensor.numel() % numel_per_thread == 0
     ), "The number of elements must be 128-bit aligned."
 
     num_threads = triton.cdiv(output_tensor.numel() // numel_per_thread, symm_mem_hdl.world_size)
-
-    if num_threads < MAX_BLOCK_SIZE:
-        block_size = 1
-        while block_size < num_threads:
-            block_size *= 2
-        num_warps = max(block_size // WARP_SIZE, 1)
-        num_blocks = 1
-    else:
-        block_size = MAX_BLOCK_SIZE
-        num_warps = max(MAX_BLOCK_SIZE // WARP_SIZE, 1)
-        num_blocks = min(triton.cdiv(num_threads, MAX_BLOCK_SIZE), MAX_NUM_BLOCKS)
+    num_blocks = min(triton.cdiv(num_threads, config["BLOCK_SIZE"]), config["max_num_blocks"])
 
     _multimem_all_gather_kernel[(num_blocks, 1, 1)](
         input_tensor.data_ptr(),
         symm_mem_hdl.multicast_ptr,
         symm_mem_hdl.signal_pad_ptrs_dev,
         numel=output_tensor.numel(),
-        BLOCK_SIZE=block_size,
+        BLOCK_SIZE=config["BLOCK_SIZE"],
         NUMEL_PER_THREAD=numel_per_thread,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
-        num_warps=num_warps,
+        num_warps=config["num_warps"],
     )
 
     return output_tensor
@@ -170,7 +163,10 @@ def _multimem_reduce_scatter_kernel(
 
 
 def multimem_reduce_scatter(
-    output_tensor: torch.Tensor, input_tensor: torch.Tensor, symm_mem_hdl: _SymmetricMemory
+    output_tensor: torch.Tensor, 
+    input_tensor: torch.Tensor, 
+    symm_mem_hdl: _SymmetricMemory,
+    **kwargs
 ) -> torch.Tensor:
     """
     Calls a multicast reduce-scatter triton kernel on the given tensor.
@@ -180,48 +176,44 @@ def multimem_reduce_scatter(
         output_tensor: torch.Tensor - output tensor to be reduce-scattered into
         input_tensor: torch.Tensor - input tensor to be reduce-scattered from
         symm_mem_hdl: _SymmetricMemory - handle to the symmetric memory buffer for input_tensor
+        **kwargs: Additional keyword arguments for kernel configuration:
+            max_num_blocks (int, optional): The maximum number of blocks to launch.
+            num_warps (int, optional): The number of warps per block.
+            BLOCK_SIZE (int, optional): The BLOCK_SIZE parameter for the kernel.
     Returns:
         torch.Tensor - reduce-scattered tensor, which is output_tensor
     """
 
     assert HAVE_TRITON, "Triton is required for multimem reduce-scatter."
 
-    WARP_SIZE = 32
-    MAX_NUM_BLOCKS = 4
-    MAX_BLOCK_SIZE = 1024
-    BYTES_PER_THREAD = 16
+    config = {
+        "max_num_blocks": kwargs.get("max_num_blocks", 24),
+        "num_warps": kwargs.get("num_warps", 32),
+        "BLOCK_SIZE": kwargs.get("BLOCK_SIZE", 1024),
+    }
 
     assert input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
     assert output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
-    numel_per_thread = BYTES_PER_THREAD // output_tensor.element_size()
+    numel_per_thread = 128 // ( output_tensor.element_size() * 8 )
 
     assert (
         input_tensor.numel() % numel_per_thread == 0
     ), "The number of elements must be 128-bit aligned."
 
-    num_threads = triton.cdiv(input_tensor.numel() // numel_per_thread, symm_mem_hdl.world_size)
 
-    if num_threads < MAX_BLOCK_SIZE:
-        block_size = 1
-        while block_size < num_threads:
-            block_size *= 2
-        num_warps = max(block_size // WARP_SIZE, 1)
-        num_blocks = 1
-    else:
-        block_size = MAX_BLOCK_SIZE
-        num_warps = max(MAX_BLOCK_SIZE // WARP_SIZE, 1)
-        num_blocks = min(triton.cdiv(num_threads, MAX_BLOCK_SIZE), MAX_NUM_BLOCKS)
+    num_threads = triton.cdiv(input_tensor.numel() // numel_per_thread, symm_mem_hdl.world_size)    
+    num_blocks = min(triton.cdiv(num_threads, config["BLOCK_SIZE"]), config["max_num_blocks"])
 
     _multimem_reduce_scatter_kernel[(num_blocks, 1, 1)](
         output_tensor.data_ptr(),
         symm_mem_hdl.multicast_ptr,
         symm_mem_hdl.signal_pad_ptrs_dev,
         numel=input_tensor.numel(),
-        BLOCK_SIZE=block_size,
+        BLOCK_SIZE=config["BLOCK_SIZE"],
         NUMEL_PER_THREAD=numel_per_thread,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
-        num_warps=num_warps,
+        num_warps=config["num_warps"],
     )
 
     return output_tensor
