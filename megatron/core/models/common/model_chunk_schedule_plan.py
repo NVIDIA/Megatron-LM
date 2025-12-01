@@ -75,6 +75,7 @@ class TransformerLayerSchedulePlan:
         """
         from megatron.core.models.gpt.fine_grained_callables import TransformerLayerState
 
+        self.config = layer.config
         self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
         self.layer = layer
@@ -216,6 +217,10 @@ class TransformerLayerSchedulePlan:
             b_layer.mlp.backward_dw()
             b_grad = b_layer.moe_dispatch.backward(b_grad)
 
+        if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
+            b_grad = b_layer.post_attn.backward(b_grad)
+            b_grad = b_layer.attn.backward(b_grad)
+
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.mlp.forward(f_input)
@@ -225,7 +230,7 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.moe_combine.forward(f_input)
                 f_input = f_layer.mtp_post_process.forward(f_input)
 
-        if b_layer is not None:
+        if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.post_attn.backward(b_grad)
             b_grad = b_layer.attn.backward(b_grad)
 

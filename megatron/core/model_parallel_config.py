@@ -246,6 +246,10 @@ class ModelParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    ep_overlap_early_attn_memory_release: bool = False
+    """Release the memory of the attention module early in EP overlap. Note this flag has 
+    performance impacts, the moe_combine_fwd and moe_dispatch_bwd will be exposed."""
+
     ###################
     # Pipeline Parallel
     ###################
