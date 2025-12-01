@@ -47,8 +47,8 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
-    _CudagraphGlobalRecord,
     TECudaGraphHelper,
+    _CudagraphGlobalRecord,
 )
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
