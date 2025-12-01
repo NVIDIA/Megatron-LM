@@ -1740,20 +1740,27 @@ class TECudaGraphHelper:
         Delete all CUDA graphs.
         """
         assert self._graphs_created, "CUDA Graphs have not been created."
-        graphs_deleted, graphs_not_deleted = 0, 0
-        for _, layers in enumerate(self.callables_per_chunk):
+
+        graph_resettable = is_te_min_version("2.10.0")
+        graphs_reset, graphs_not_reset = 0, 0
+        for layers in self.callables_per_chunk:
             for layer in layers:
                 for graph in layer.cuda_graphs:
-                    if is_te_min_version("2.10.0"):
+                    if graph_resettable:
                         graph.reset()
-                        graphs_deleted += 1
+                        graphs_reset += 1
                     else:
-                        graphs_not_deleted += 1
+                        graphs_not_reset += 1
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
-        log_single_rank(
-            logger,
-            logging.INFO,
-            f'{graphs_deleted} graphs deleted, {graphs_not_deleted} graphs not deleted.',
+
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=None,
+            dp_cp_group=None,
+            level=logging.INFO,
+            msg=f'Rank {torch.distributed.get_rank()}: '
+            f'{graphs_reset} graphs deleted with explicit reset, '
+            f'{graphs_not_reset} graphs deleted without explicit reset.',
         )
         self._graphs_created = False

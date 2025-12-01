@@ -1075,7 +1075,9 @@ class _HybridEPManager(_DispatchManager):
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
-        # Release the used handle/num_permuted_tokens which could change in each iteration
+        # Release the used handle/num_permuted_tokens which could change in each iteration.
+        # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
+        # num_dispatched_tokens, because their values never change.
         self.handle = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None
