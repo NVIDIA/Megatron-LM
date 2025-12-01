@@ -27,7 +27,6 @@ from megatron.core.parallel_state import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
@@ -223,6 +222,18 @@ class LinearProjBuilder(Protocol):
     ) -> LinearProj: ...
 
 
+class LayerNorm(Protocol):
+    """Protocol for a layernorm layer."""
+
+    def forward(self, input: Tensor, /) -> Tensor: ...
+
+
+class LayerNormBuilder(Protocol):
+    """Protocol for building layernorm layers."""
+
+    def __call__(self, *, hidden_size: int, config: TransformerConfig, eps: float) -> LayerNorm: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
@@ -232,8 +243,8 @@ class SelfAttentionSubmodules:
     linear_qkv: LinearQKVBuilder
     core_attention: CoreAttentionBuilder
     linear_proj: LinearProjBuilder
-    q_layernorm: Union[ModuleSpec, type] = None
-    k_layernorm: Union[ModuleSpec, type] = None
+    q_layernorm: Optional[LayerNormBuilder] = None
+    k_layernorm: Optional[LayerNormBuilder] = None
 
 
 @dataclass
@@ -1126,8 +1137,7 @@ class SelfAttention(Attention):
         )
 
         if submodules.q_layernorm is not None:
-            self.q_layernorm = build_module(
-                submodules.q_layernorm,
+            self.q_layernorm = submodules.q_layernorm(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
@@ -1136,8 +1146,7 @@ class SelfAttention(Attention):
             self.q_layernorm = None
 
         if submodules.k_layernorm is not None:
-            self.k_layernorm = build_module(
-                submodules.k_layernorm,
+            self.k_layernorm = submodules.k_layernorm(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
@@ -1159,6 +1168,17 @@ class SelfAttention(Attention):
 
         if not self.config.qk_layernorm:
             return
+
+        assert (
+            self.q_layernorm is not None
+            and hasattr(self.q_layernorm, 'weight')
+            and hasattr(self.q_layernorm, 'bias')
+        )
+        assert (
+            self.k_layernorm is not None
+            and hasattr(self.k_layernorm, 'weight')
+            and hasattr(self.k_layernorm, 'bias')
+        )
 
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
@@ -1263,10 +1283,10 @@ class SelfAttention(Attention):
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.q_layernorm is not None:
-            query = self.q_layernorm(query)
+            query = typed_torch.apply_module(self.q_layernorm)(query)
 
         if self.k_layernorm is not None:
-            key = self.k_layernorm(key)
+            key = typed_torch.apply_module(self.k_layernorm)(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()

@@ -36,6 +36,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
+from megatron.legacy.model.rms_norm import RMSNorm
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -135,6 +136,8 @@ def get_gpt_layer_with_inference_spec(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
+        from transformer_engine import pytorch as te_pytorch
+
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(

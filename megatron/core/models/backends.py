@@ -2,7 +2,7 @@
 
 import warnings
 from abc import abstractmethod
-from typing import Optional, Protocol, Tuple
+from typing import Optional, Protocol, Tuple, Union
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -101,7 +101,9 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return None
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(
+        self, rms_norm: bool = False, for_qk: bool = False
+    ) -> Union[type['FusedLayerNorm'], type[WrappedTorchNorm]]:
         """Which module to use for layer norm"""
         if rms_norm:
             # Matching get_gpt_layer_local_spec.
@@ -157,7 +159,9 @@ class InferenceSpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return InferenceLayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(
+        self, rms_norm: bool = False, for_qk: bool = False
+    ) -> Union[type['FusedLayerNorm'], type[TENorm]]:
         """Which module to use for layer norm"""
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used

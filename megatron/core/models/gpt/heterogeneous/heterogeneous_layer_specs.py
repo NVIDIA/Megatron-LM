@@ -116,10 +116,13 @@ def _get_heterogenous_attention_spec(
             linear_qkv = TELayerNormColumnParallelLinear
             core_attention = TEDotProductAttention
             linear_proj = TERowParallelLinear
+
         else:
             linear_qkv = ColumnParallelLinear
             core_attention = DotProductAttention
             linear_proj = RowParallelLinear
+        from transformer_engine import pytorch as te_pytorch
+
         self_attention = ModuleSpec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},

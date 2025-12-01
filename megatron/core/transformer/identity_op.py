@@ -1,4 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+from typing import Any
+
 import torch
 
 
@@ -7,10 +9,10 @@ class IdentityOp(torch.nn.Module):
     This is a placeholder for IdentityOp(x) -> x
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any):
         super().__init__()
 
-    def forward(self, x, *args, **kwargs):
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         return x
 
 
@@ -21,8 +23,8 @@ class IdentityFuncOp(IdentityOp):
     return a function at runtime based on passed arguments
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any):
         super().__init__()
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any):
         return super().forward

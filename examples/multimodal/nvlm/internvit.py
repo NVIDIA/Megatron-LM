@@ -63,7 +63,7 @@ class InternViTRMSNorm(MegatronModule):
 
     def __init__(
         self,
-        config,
+        config: TransformerConfig,
         hidden_size: int,
         eps: float = 1e-6,
         sequence_parallel: bool = False,
@@ -95,7 +95,7 @@ class InternViTRMSNorm(MegatronModule):
 
         return x * torch.rsqrt(var + self.eps)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run RMSNorm with an option to compute custom statistic."""
         var = None
         if self._compute_var:
@@ -199,20 +199,18 @@ class InternViTSelfAttention(SelfAttention):
             self.hidden_size_per_attention_head * self.num_attention_heads_per_partition
         )  # 512 for internvit
 
-        self.q_layernorm = build_module(
-            submodules.q_layernorm,
+        assert submodules.q_layernorm is not None
+        self.q_layernorm = submodules.q_layernorm(
             hidden_size=qk_layernorm_hidden_size,
             config=self.config,
             eps=self.config.layernorm_epsilon,
-            compute_var=True,
         )
 
-        self.k_layernorm = build_module(
-            submodules.k_layernorm,
+        assert submodules.k_layernorm is not None
+        self.k_layernorm = submodules.k_layernorm(
             hidden_size=qk_layernorm_hidden_size,
             config=self.config,
             eps=self.config.layernorm_epsilon,
-            compute_var=True,
         )
 
 
@@ -252,8 +250,8 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
                     linear_qkv=TEColumnParallelLinear if use_te else ColumnParallelLinear,
                     core_attention=TEDotProductAttention if use_te else DotProductAttention,
                     linear_proj=TERowParallelLinear if use_te else RowParallelLinear,
-                    q_layernorm=InternViTRMSNorm,
-                    k_layernorm=InternViTRMSNorm,
+                    q_layernorm=partial(InternViTRMSNorm, compute_var=True),
+                    k_layernorm=partial(InternViTRMSNorm, compute_var=True),
                 ),
             ),
             self_attn_bda=get_bias_dropout_add_layer_scaling,
