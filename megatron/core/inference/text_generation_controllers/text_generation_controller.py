@@ -550,7 +550,7 @@ class TextGenerationController:
 
         active_request_count = context.total_request_count - context.paused_request_count
 
-        with torch.inference_mode():
+        with torch.no_grad():
             logits = self.inference_wrapped_model.run_one_forward_step(
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
