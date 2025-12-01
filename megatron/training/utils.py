@@ -635,7 +635,7 @@ def get_batch_on_this_tp_rank(data_iterator):
             1,
             dtype=torch.int32,
             device=torch.cuda.current_device(),
-        ) if not args.hybrid_context_parallel else None
+        ) if args.hybrid_context_parallel else None
         local_cp_size = torch.empty(
             1,
             dtype=torch.int32,
