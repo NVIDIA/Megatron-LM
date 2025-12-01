@@ -8,6 +8,7 @@ from pydantic import PrivateAttr
 import torch.distributed as dist
 
 from megatron.core import parallel_state
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -227,6 +228,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     async def launch(cls, model: GPTModel, **kwargs):
         args = get_args()
         tokenizer = get_tokenizer()
+        rank = dist.get_rank()
 
         if tokenizer.bos is None:
             log_single_rank(
@@ -246,7 +248,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             if metrics_writer is None:
                 log_single_rank(logger, logging.WARNING, "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
                            "wandb module is available. Inference logging will be disabled.")
-        # TODO(Peter) We need to pass the pg_collection to the coordinator, but like where is the coordinator even defined
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model, inference_logging_step_interval, metrics_writer)
         await inference_engine.start_listening_to_data_parallel_coordinator(inference_coordinator_port=41521, launch_inference_coordinator=True)
         if dist.get_rank() == 0:

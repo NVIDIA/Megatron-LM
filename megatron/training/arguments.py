@@ -1986,10 +1986,9 @@ def _add_rl_args(parser):
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
     group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
                        help='Degree of tensor model parallelism for inference for RL.')     
-    group.add_argument('--refit-method', type=str, default='naive',
-                       choices=['naive', 'nccl'],
+    group.add_argument('--refit-method', type=str, default='nccl',
+                       choices=['nccl', 'gloo'],
                        help=('Method to refit the model weights between training and inference models during RL. '
-                             'naive: naive method to refit the model weights between training and inference models during RL. '
                              'nccl: use NCCLCopyService to refit the model weights between training and inference models during RL.'))
     return parser
 

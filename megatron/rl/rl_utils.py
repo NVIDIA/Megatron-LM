@@ -55,7 +55,7 @@ from megatron.training.global_vars import (
 )
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
-
+from megatron.training.utils import unwrap_model
 logger = logging.getLogger(__name__)
 
 # Global variable to store packing context for forward_step
@@ -1983,7 +1983,7 @@ def setup_grpo_data_iterator(
     args = get_args()
 
     if inference_model is not None:
-        inference_mpu = inference_model.pg_collection
+        inference_mpu = unwrap_model(inference_model[0]).pg_collection
     else:
         inference_mpu = mpu
 
@@ -2274,7 +2274,6 @@ def megatron_rl_inference_mode(
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
-    print(f"[{dist.get_rank()}:DP] Entering inference mode")
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
@@ -2326,8 +2325,6 @@ def megatron_rl_inference_mode(
                 inference_interface._inference_engine.create_cuda_graphs(reset_context=True)
 
         loop.run_until_complete(inference_interface.resume())
-
-        print(f"[{dist.get_rank()}:DP] Entered inference mode")
         yield inference_interface
 
         with nvtx_range("suspend-engine"):
@@ -2405,11 +2402,11 @@ def get_sequence_packing_tensorboard_metrics(args):
         metrics['consumed-bins'] = args.consumed_train_bins
     return metrics
 
-def swap_train_to_inference_model(train_model: LanguageModule, inference_model: LanguageModule, refit_method: str):
+def swap_train_to_inference_model(train_model: LanguageModule, inference_model: list[LanguageModule], refit_method: str):
     """Swap the train model to the inference model.
 
     Args:
         train_model: The train model to swap to the inference model.
-        inference_model: The inference model to swap to the train model.
+        inference_model: The inference model (list) to swap to the train model.
     """
     swap_model_weights(train_model, inference_model, refit_method)

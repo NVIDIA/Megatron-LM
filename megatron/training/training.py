@@ -694,7 +694,7 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
 
-        # Build a separate inference model for RL if requested.
+    # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
         pg_collection = None
@@ -708,17 +708,45 @@ def pretrain(
             assert dp_size >= 1 and (tp_size * cp_size * pp_size * dp_size) == args.world_size, \
                 "World size must be divisible by tp*cp*pp for inference PG layout"
 
+            # TODO(Peter) We need to pass the expert parallel correctly here
             grid = HyperCommGrid([tp_size, cp_size, 1, pp_size, dp_size], ["tp", "cp", "ep", "pp", "dp"])
             tp_group = grid.create_pg("tp")
             cp_group = grid.create_pg("cp")
             pp_group = grid.create_pg("pp")
             ep_group = grid.create_pg("ep")
             dp_group = grid.create_pg("dp")
+            # Composite groups required by MoE/router and some utilities
+            tp_cp_group = grid.create_pg(["tp", "cp"])
+            mp_group = grid.create_pg(["tp", "cp", "ep", "pp"])
+            tp_ep_group = grid.create_pg(["tp", "ep"])
+            tp_ep_pp_group = grid.create_pg(["tp", "ep", "pp"])
+            dp_cp_group = grid.create_pg(["cp", "dp"])
+            tp_dp_cp_group = grid.create_pg(["tp", "cp", "dp"])
             embd_group_ranks = mpu.default_embedding_ranks(
                 torch.distributed.get_process_group_ranks(pp_group)
             )
             embd_group = torch.distributed.new_group(ranks=embd_group_ranks)
-            inference_pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group, embd=embd_group, dp=dp_group)
+            pos_embd_group_ranks = mpu.default_position_embedding_ranks(
+                torch.distributed.get_process_group_ranks(pp_group)
+            )
+            pos_embd_group = torch.distributed.new_group(ranks=pos_embd_group_ranks)
+            inference_pg_collection = ProcessGroupCollection(
+                tp=tp_group,
+                cp=cp_group,
+                pp=pp_group,
+                ep=ep_group,
+                embd=embd_group,
+                pos_embd=pos_embd_group,
+                dp=dp_group,
+                tp_cp=tp_cp_group,
+                mp=mp_group,
+                expt_tp=tp_group,
+                expt_dp=dp_group,
+                tp_ep=tp_ep_group,
+                tp_ep_pp=tp_ep_pp_group,
+                dp_cp=dp_cp_group,
+                tp_dp_cp=tp_dp_cp_group,
+            )
 
             # Build an isolated inference config so training config remains unchanged
             inference_config = copy.deepcopy(config)
@@ -922,7 +950,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
-        pg_collection = mpu
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
 
     if has_nvidia_modelopt:

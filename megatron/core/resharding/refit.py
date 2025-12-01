@@ -12,6 +12,7 @@ from megatron.core import parallel_state
 from . import build_centralized_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
+from .copy_services.gloo_copy_service import GlooCopyService
 
 
 def _unwrap_module(module: LanguageModule) -> Any:
@@ -39,6 +40,10 @@ def swap_model_weights(
     elif isinstance(refit_method, str):
         if refit_method == "nccl":
             service = NCCLCopyService()
+            reshard_model_weights(src_model, target_model, service=service)
+        elif refit_method == "gloo":
+            # Debug / fallback backend: run refit over CPU/Gloo instead of NCCL.
+            service = GlooCopyService()
             reshard_model_weights(src_model, target_model, service=service)
         else:
             raise ValueError(f"Unknown refit_method '{refit_method}'")
@@ -81,6 +86,7 @@ def reshard_model_weights(
         setattr(tgt_core, "_cached_reshard_plan", plan)
     else:
         plan = cached_plan
+    
     execute_reshard_plan(plan, src_core, tgt_core, service=service)
 
 
