@@ -424,7 +424,7 @@ class TELinear(te.pytorch.Linear):
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
@@ -1994,7 +1994,10 @@ except ImportError:
     pass
 
 try:
-    from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding  # pylint: disable=unused-import
+    from transformer_engine.pytorch import (  # pylint: disable=unused-import
+        Fp8Padding,
+        Fp8Unpadding,
+    )
 
 except ImportError:
     Fp8Padding = None

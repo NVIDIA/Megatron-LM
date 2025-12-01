@@ -89,7 +89,7 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which column parallel linear module the backend uses"""
         return ColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> type[RowParallelLinear]:
         """Which row parallel linear module the backend uses"""
         return RowParallelLinear
 
@@ -145,7 +145,7 @@ class InferenceSpecProvider(BackendSpecProvider):
         """Which column parallel linear module TE backend uses"""
         return TEColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> type[InferenceRowParallelLinear]:
         """Which row parallel linear module TE backend uses"""
         return InferenceRowParallelLinear
 

@@ -1225,7 +1225,7 @@ class RowParallelLinear(torch.nn.Module):
         else:
             return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
-    def forward(self, input_):
+    def forward(self, input_: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of RowParallelLinear
 
         Args:
@@ -1304,3 +1304,6 @@ class RowParallelLinear(torch.nn.Module):
             f"{type(self).__name__}(in_features={self.input_size}, "
             f"out_features={self.output_size}, bias={use_bias}, TP={tp})"
         )
+
+    def backward_dw(self) -> None:
+        pass

@@ -28,6 +28,7 @@ try:
 except ImportError:
     TELayerNormColumnParallelLinear = None
     TEDotProductAttention = None
+    TERowParallelLinear = None
     HAVE_TE = False
 
 try:
@@ -101,6 +102,7 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
     mlp = get_norm_mlp_module_spec_te()
     assert TELayerNormColumnParallelLinear is not None
     assert TEDotProductAttention is not None
+    assert TERowParallelLinear is not None
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -131,6 +133,7 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
 
     assert TELayerNormColumnParallelLinear is not None
     assert TEDotProductAttention is not None
+    assert TERowParallelLinear is not None
     return ModuleSpec(
         module=MambaStack,
         submodules=MambaStackSubmodules(

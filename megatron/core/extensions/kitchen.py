@@ -23,7 +23,11 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import (
+    GroupedMLP,
+    SequentialMLP,
+    TEGroupedMLP,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
@@ -1037,7 +1041,7 @@ class KitchenSpecProvider(BackendSpecProvider):
         """Which column parallel linear module kitchen backend uses"""
         return KitchenColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> type[KitchenRowParallelLinear]:
         """Which row parallel linear module kitchen backend uses"""
         return KitchenRowParallelLinear
 

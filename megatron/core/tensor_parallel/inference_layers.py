@@ -108,7 +108,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         output_size: int,
         *,
         config: ModelParallelConfig,
-        init_method: Callable,
+        init_method: Callable[[torch.Tensor], None],
         bias: bool,
         input_is_parallel: bool,
         skip_bias_add: bool,
@@ -141,7 +141,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass.
         """

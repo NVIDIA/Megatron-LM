@@ -24,6 +24,7 @@ try:
 except ImportError:
     TELayerNormColumnParallelLinear = None
     TEDotProductAttention = None
+    TERowParallelLinear = None
     HAVE_TE = False
 
 try:
@@ -53,6 +54,7 @@ def get_bert_layer_with_transformer_engine_spec():
         )
     assert TELayerNormColumnParallelLinear is not None
     assert TEDotProductAttention is not None
+    assert TERowParallelLinear is not None
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(

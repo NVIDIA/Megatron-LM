@@ -195,6 +195,34 @@ class CoreAttentionBuilder(Protocol):
     ) -> CoreAttention: ...
 
 
+class LinearProj(Protocol):
+    """Protocol for a linear_proj layer."""
+
+    def forward(self, hidden_states: Tensor, /) -> Tuple[Tensor, Optional[Tensor]]: ...
+
+    def backward_dw(self) -> None: ...
+
+
+class LinearProjBuilder(Protocol):
+    """Protocol for building linear_proj layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[Tensor], None],
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: Optional[dist.ProcessGroup],
+    ) -> LinearProj: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
@@ -203,7 +231,7 @@ class SelfAttentionSubmodules:
 
     linear_qkv: LinearQKVBuilder
     core_attention: CoreAttentionBuilder
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_proj: LinearProjBuilder
     q_layernorm: Union[ModuleSpec, type] = None
     k_layernorm: Union[ModuleSpec, type] = None
 
@@ -217,7 +245,7 @@ class CrossAttentionSubmodules:
     linear_q: LinearBuilder
     linear_kv: LinearBuilder
     core_attention: CoreAttentionBuilder
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_proj: LinearProjBuilder
 
 
 class Attention(MegatronModule, ABC):
@@ -234,8 +262,8 @@ class Attention(MegatronModule, ABC):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
 
@@ -289,12 +317,11 @@ class Attention(MegatronModule, ABC):
         )
 
         # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
+        self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=cast(Callable[[torch.Tensor], None], self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -900,7 +927,7 @@ class Attention(MegatronModule, ABC):
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
-            output, bias = self.linear_proj(context_layer)
+            output, bias = typed_torch.apply_module(self.linear_proj)(context_layer)
             return output, bias
 
         if (
@@ -1049,7 +1076,7 @@ class Attention(MegatronModule, ABC):
         # =================
 
         nvtx_range_push(suffix="linear_proj")
-        output, bias = self.linear_proj(core_attn_out)
+        output, bias = typed_torch.apply_module(self.linear_proj)(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
