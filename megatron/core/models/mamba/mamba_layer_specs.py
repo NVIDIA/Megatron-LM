@@ -18,7 +18,6 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlockSubmodules,
@@ -36,7 +35,6 @@ moe = get_moe_module_spec(
 )
 
 try:
-    from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
     HAVE_TE = True
@@ -117,7 +115,10 @@ def get_mamba_mtp_block_spec(
     vp_stage: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """Mamba Multi-Token Prediction (MTP) block spec."""
+    assert HAVE_KITCHEN, "Kitchen needs to be installed."
+    
     if use_transformer_engine:
+        assert HAVE_TE, "TransformerEngine needs to be installed."
         backend: BackendSpecProvider = (
             KitchenSpecProvider(fallback=TESpecProvider())
             if config.use_kitchen
@@ -156,7 +157,7 @@ def get_mamba_mtp_block_spec_for_backend(
     if len(mtp_layer_specs) > 0:
         assert (
             len(mtp_layer_specs) == config.mtp_num_layers
-        ), +f"currently all of the mtp layers must stage in the same pipeline stage."
+        ), f"currently all of the mtp layers must stage in the same pipeline stage."
         mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
     else:
         mtp_block_spec = None
