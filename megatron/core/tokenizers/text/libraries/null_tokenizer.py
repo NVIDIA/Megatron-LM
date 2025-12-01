@@ -25,14 +25,6 @@ class NullTokenizer:
         text = [str(x) for x in ids]
         return ' '.join(text)
 
-    def tokens_to_ids(self, tokens):
-        """Converts tokens to ids."""
-        return [int(x) for x in tokens]
-
-    def ids_to_tokens(self, ids):
-        """Converts ids to tokens."""
-        return [str(x) for x in ids]
-
     def offsets(self, ids: list[int], text: str) -> list[int]:
         """Returns offsets."""
         offsets, start_idx = [], 0

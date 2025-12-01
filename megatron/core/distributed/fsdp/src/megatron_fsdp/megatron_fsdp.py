@@ -898,10 +898,9 @@ class MegatronFSDP(torch.nn.Module):
 
         # Register pre state_dict hook to ensure that the module parameters are
         # distributed before saving the state_dict.
-        for name, module in self.named_modules():
-            module.register_state_dict_pre_hook(
-                lambda *args, **kwargs: self._replace_param_with_distributed_if_needed()
-            )
+        self._state_dict_pre_hook = self.module.register_state_dict_pre_hook(
+            lambda *args, **kwargs: self._replace_param_with_distributed_if_needed()
+        )
 
     @contextmanager
     def no_sync(self):

@@ -191,7 +191,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     seq_lengths = None
     attention_mask = None
 
-    if args.rl_use_sequence_packing:
+    if args.use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
         bin_idx = bin_tensor.item()

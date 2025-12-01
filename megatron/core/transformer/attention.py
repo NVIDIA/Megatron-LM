@@ -35,7 +35,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
-    get_pg_rank,
     get_pg_size,
     is_fa_min_version,
     is_te_min_version,
@@ -159,7 +158,6 @@ class Attention(MegatronModule, ABC):
 
         self.config = config
         self.layer_number = layer_number
-
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
 
@@ -309,19 +307,6 @@ class Attention(MegatronModule, ABC):
             device=torch.cuda.current_device(),
         )
 
-    def _get_pp_layer_offset_for_inference(self):
-        """Return the pipeline parallel layer offset for inference."""
-        assert (
-            self.config.virtual_pipeline_model_parallel_size is None
-        ), "Virtual pipeline parallelism is not supported for inference"
-
-        # Import here to avoid circular imports
-        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-
-        return get_transformer_layer_offset(
-            self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
-        )
-
     def _adjust_key_value_for_inference(
         self,
         inference_context: BaseInferenceContext,
@@ -387,15 +372,9 @@ class Attention(MegatronModule, ABC):
                     inference_context.key_value_memory_dict[self.layer_number]
                 )
 
-        if (
-            not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0
-        ) and (not self.training or not is_te_min_version("2.2.0")):
+        if not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0:
             # This should mean that we are past the prompt forward_step
             # and so we need to turn off masking
-            # Note: in ModelOpt, we may use inference_context for speculative decoding
-            # in training. In that case, we do not want to turn off masking as we need
-            # customized attention mask for speculative decoding.
-
             attn_mask_type = AttnMaskType.no_mask
 
         if inference_context.is_static_batching():
@@ -466,8 +445,6 @@ class Attention(MegatronModule, ABC):
             key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
             value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
         else:
-            pp_layer_offset = self._get_pp_layer_offset_for_inference()
-
             # Apply rotary embeddings before appending KV cache.
             if inference_context.use_flashinfer_fused_rope and (rotary_pos_cos_sin is not None):
                 query, key = inference_context.apply_fused_qk_rotary_emb(
@@ -482,23 +459,17 @@ class Attention(MegatronModule, ABC):
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
 
             # Append key/value data tensors to cache.
-            inference_context.append_key_value_cache(
-                self.layer_number - pp_layer_offset, key, value
-            )
+            inference_context.append_key_value_cache(self.layer_number, key, value)
 
             _, max_seqlen_q = inference_context.cu_query_lengths()
             if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
                 # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
-                kv_cache, _, block_table = inference_context.key_value_cache(
-                    self.layer_number - pp_layer_offset
-                )
+                kv_cache, _, block_table = inference_context.key_value_cache(self.layer_number)
                 # Uncompress the KV cache for prefill/mixed mode
                 key, value = self.uncompress_kv_from_cache(kv_cache)
             else:
                 # Read key/value *pointer* tensors from cache.
-                key, value, block_table = inference_context.key_value_cache(
-                    self.layer_number - pp_layer_offset
-                )
+                key, value, block_table = inference_context.key_value_cache(self.layer_number)
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
     @abstractmethod

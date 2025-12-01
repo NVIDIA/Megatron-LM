@@ -37,17 +37,13 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         self._tokenizer = self._restore_model(**kwargs)
         self.additional_args = kwargs
         self.path = path
-
-        config_template = config.get("chat_template", None)
-        tokenizer_template = getattr(self._tokenizer, "chat_template", None)
-        kwargs_template = kwargs.get("chat_template", None)
-
-        if config_template is not None:
-            self.chat_template = config_template
-        elif tokenizer_template is not None:
-            self.chat_template = tokenizer_template
+        if (
+            config.get("chat_template", None) is None
+            and kwargs.get("chat_template", None) is not None
+        ):
+            self.chat_template = kwargs.get("chat_template", None)
         else:
-            self.chat_template = kwargs_template
+            self.chat_template = config.get("chat_template", None)
 
     def _restore_model(self, **kwargs) -> MegatronTokenizerTextAbstract:
         """Returns tokenizer library object."""
