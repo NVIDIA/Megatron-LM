@@ -109,6 +109,8 @@ class DataParallelInferenceCoordinator:
             self.identities_of_data_parallel_ranks.append(identity)
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
         self.data_parallel_rank_iterator = cycle(self.identities_of_data_parallel_ranks)
+        self.data_parallel_pause_acks = set()
+        self.data_parallel_stop_acks = set()
 
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
@@ -151,7 +153,7 @@ class DataParallelInferenceCoordinator:
                 # print(f"New client connected: {sender_identity}")
                 known_clients.add(sender_identity)
                 self.router_socket.send_multipart(
-                    [sender_identity, msgpack.packb([Headers.ACK.value], use_bin_type=True)]
+                    [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
                 )
 
             elif header == Headers.SUBMIT_REQUEST:
@@ -208,6 +210,50 @@ class DataParallelInferenceCoordinator:
                     self.router_socket.send_multipart(
                         [data_parallel_rank_id, msgpack.packb([header.value], use_bin_type=True)]
                     )
+                if header == Headers.UNPAUSE:
+                    self.data_parallel_pause_acks = set()
+            elif header == Headers.PAUSE_ACK:
+                # control signal ack from the engine
+                assert sender_identity in self.identities_of_data_parallel_ranks
+                assert sender_identity not in self.data_parallel_pause_acks
+                self.data_parallel_pause_acks.add(sender_identity)
+                # route to all clients only once we have gotten an ack from all data parallel ranks
+                if len(self.data_parallel_pause_acks) == self.data_parallel_size:
+                    for client_id in known_clients:
+                        self.router_socket.send_multipart(
+                            [
+                                client_id,
+                                msgpack.packb([header.value, sender_identity], use_bin_type=True),
+                            ]
+                        )
+                    for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
+                        self.router_socket.send_multipart(
+                            [
+                                data_parallel_rank_id,
+                                msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True),
+                            ]
+                        )
+            elif header == Headers.STOP_ACK:
+                # control signal ack from the engine
+                assert sender_identity in self.identities_of_data_parallel_ranks
+                assert sender_identity not in self.data_parallel_stop_acks
+                self.data_parallel_stop_acks.add(sender_identity)
+                # route to all clients only once we have gotten an ack from all data parallel ranks
+                if len(self.data_parallel_stop_acks) == self.data_parallel_size:
+                    for client_id in known_clients:
+                        self.router_socket.send_multipart(
+                            [
+                                client_id,
+                                msgpack.packb([header.value, sender_identity], use_bin_type=True),
+                            ]
+                        )
+                    for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
+                        self.router_socket.send_multipart(
+                            [
+                                data_parallel_rank_id,
+                                msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True),
+                            ]
+                        )
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
@@ -224,7 +270,7 @@ class DataParallelInferenceCoordinator:
                         [
                             client_identity,
                             msgpack.packb(
-                                [client_request_identity, finished_request_record],
+                                [header.value, client_request_identity, finished_request_record],
                                 use_bin_type=True,
                             ),
                         ]
