@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -22,14 +24,35 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    from fast_hadamard_transform import hadamard_transform
+    from fast_hadamard_transform import hadamard_transform as _hadamard_transform
 
     HAVE_HADAMARD = True
 except ImportError:
     HAVE_HADAMARD = False
+    _hadamard_transform = None
 
 
-@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
+def mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Mock implementation of hadamard_transform for testing without the library installed.
+
+    This is a simple identity-like transformation that preserves shape and applies scaling.
+    """
+    return x * scale
+
+
+@pytest.fixture(autouse=True)
+def patch_hadamard_if_needed():
+    """Automatically patch hadamard_transform in dsa module if not installed."""
+    if not HAVE_HADAMARD:
+        with patch(
+            'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
+            mock_hadamard_transform,
+        ):
+            yield
+    else:
+        yield
+
+
 class TestRotateActivation:
     """Test rotate_activation function."""
 
@@ -242,7 +265,6 @@ class TestDSAIndexerLossAutoScaler:
         ), f"Gradient should be scaled by loss scale, expected {expected_grad_per_element}, got {dummy_input.grad[0].item()}"
 
 
-@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
 @pytest.mark.parametrize("seqlen", [16, 64])
 class TestDSAIndexer:
     """Test DSA Indexer module basic functionality with TP=1."""
@@ -382,7 +404,6 @@ class TestDSAIndexer:
                 assert torch.all(topk_indices[b, i] <= max(self.index_topk, i))
 
 
-@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
 class TestDSAttention:
     """Test DSAttention module basic functionality with TP=1."""
 
@@ -615,7 +636,6 @@ class TestDSAttention:
 # ======================================================================================
 
 
-@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
 @pytest.mark.parametrize("tensor_model_parallel_size", [2, 4, 8])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 class TestIndexerTensorParallel:
@@ -853,7 +873,6 @@ class TestIndexerTensorParallel:
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.skipif(not HAVE_HADAMARD, reason="fast_hadamard_transform not installed")
 @pytest.mark.parametrize("tensor_model_parallel_size", [2, 4])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 @pytest.mark.parametrize("use_sparse_indexer_loss", [False, True])
