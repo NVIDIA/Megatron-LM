@@ -212,7 +212,9 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
-                        True,  # synchronize_ranks, default behavior to build on rank-0 first
+                        (
+                            False if self.config.fast_cache_load else True
+                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load
                         megatron_datasets[i],
                         weights_i,
                         size_i,
@@ -289,7 +291,9 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
-                        True,  # synchronize_ranks, default behavior to build on rank-0 first
+                        (
+                            False if self.config.fast_cache_load else True
+                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load
                         megatron_datasets,
                         weights,
                         size,
@@ -347,7 +351,8 @@ class BlendedMegatronDatasetBuilder(object):
         megatron_datasets = [[] for _ in range(len(Split))]
         num_dataset_builder_threads = self.config.num_dataset_builder_threads
 
-        if torch.distributed.is_initialized():
+        # NOTE(asolergi-nv): Skip rank-0 first dataset building if we are using --dataloader-fast-cache-load
+        if torch.distributed.is_initialized() and not self.config.fast_cache_load:
             rank = torch.distributed.get_rank()
             # First, build on rank 0
             if rank == 0:
@@ -403,6 +408,9 @@ class BlendedMegatronDatasetBuilder(object):
         Returns:
             List[Optional[MidLevelDataset]]: The MidLevelDataset (or None) per split
         """
+        synchronize_ranks = (
+            False if (synchronize_ranks and self.config.fast_cache_load) else synchronize_ranks
+        )  # NOTE(asolergi-nv): Set synchronize_ranks to False if we are using --dataloader-fast-cache-load
         # short-cut if we are not building on this rank
         if torch.distributed.is_initialized() and not self.is_built_on_rank():
             for i in range(len(Split)):
@@ -415,14 +423,6 @@ class BlendedMegatronDatasetBuilder(object):
 
         # Build the split indices for the low level dataset
         num_elements = self.cls.numel_low_level_dataset(low_level_dataset)
-        split_indices = []
-        for i, _ in enumerate(Split):
-            if split[i] is not None:
-                beg = int(round(split[i][0] * float(num_elements)))
-                end = int(round(split[i][1] * float(num_elements)))
-                split_indices.append(numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32))
-            else:
-                split_indices.append(None)
 
         # Build the mid level dataset
         mid_level_datasets = []
@@ -430,6 +430,14 @@ class BlendedMegatronDatasetBuilder(object):
             if split[i] is None:
                 mid_level_datasets.append(None)
             else:
+                indexed_indices = None
+                if (
+                    not self.config.fast_cache_load
+                ):  # NOTE(asolergi-nv): Skip indexed_indices building if we are using --dataloader-fast-cache-load
+                    beg = int(round(split[i][0] * float(num_elements)))
+                    end = int(round(split[i][1] * float(num_elements)))
+                    indexed_indices = numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32)
+
                 mid_level_datasets.append(
                     self.build_generic_dataset(
                         self.cls,
@@ -437,7 +445,7 @@ class BlendedMegatronDatasetBuilder(object):
                         synchronize_ranks,
                         low_level_dataset,
                         dataset_path,
-                        split_indices[i],
+                        indexed_indices,
                         sizes[i],
                         _split,
                         self.config,

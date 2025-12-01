@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain and SFT Mamba."""
-
+import json
 import torch
 from functools import partial
 from typing import List, Optional, Tuple
@@ -222,6 +222,11 @@ def core_gpt_dataset_config_from_args(args):
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
+    sequences_per_dataset = None
+    if args.per_dataset_sequences_path is not None:
+        with open(args.per_dataset_sequences_path, "r") as f:
+            sequences_per_dataset = json.load(f)
+
     return GPTDatasetConfig(
         random_seed=args.seed,
         sequence_length=args.seq_length,
@@ -238,6 +243,9 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        fast_cache_load=args.dataloader_fast_cache_load,
+        sequences_per_dataset=sequences_per_dataset,
+        defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
     )
 
 
