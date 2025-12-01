@@ -62,14 +62,14 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             q_term = args.hidden_size * args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
         else:
             ## q lora + rope + q norm
-            q_term = args.q_lora_rank * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) + 1) 
+            q_term = args.q_lora_rank * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) + 2) 
         
         self_attn_term = (
             q_term
 
             ## kv lora + rope + kv norm
             + args.kv_lora_rank
-            * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) + 1)
+            * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) + 2)
             + args.hidden_size * args.qk_pos_emb_head_dim
 
             ## o proj
