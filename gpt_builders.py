@@ -5,6 +5,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_inference_spec,
     get_gpt_mtp_block_spec,
     get_gpt_decoder_layer_specs,
 )
@@ -43,6 +44,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
             use_te = args.transformer_impl == "transformer_engine"
 
             if args.num_experts or (args.linear_attention_type is not None):
+                assert not (config.transformer_impl == "inference_optimized")
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,
@@ -52,12 +54,14 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
                     vp_stage=vp_stage,
                 )
             elif args.heterogeneous_layers_config_path is not None:
+                assert not (config.transformer_impl == "inference_optimized")
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
             else:
                 # Define the decoder layer spec
                 transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
+            assert not (config.transformer_impl == "inference_optimized")
             # Get GPT decoder layer specs for the model.
             if args.spec is not None:
                 mtp_transformer_layer_spec = import_module(args.spec)
@@ -119,6 +123,12 @@ def _get_transformer_layer_spec(use_te, config):
             qk_l2_norm=args.qk_l2_norm,
             use_kitchen=config.use_kitchen,
             fallback_to_eager_attn=config.fallback_to_eager_attn,
+        )
+    elif config.transformer_impl == "inference_optimized":
+        return get_gpt_layer_with_inference_spec(
+            args.qk_layernorm,
+            args.multi_latent_attention,
+            qk_l2_norm=args.qk_l2_norm,
         )
     else:
         return get_gpt_layer_local_spec(
