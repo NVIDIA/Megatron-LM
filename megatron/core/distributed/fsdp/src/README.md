@@ -73,8 +73,6 @@ optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 model, optimizer = fully_shard(
     model,
     optimizer,
-    device_mesh=device_mesh, # Your global DeviceMesh.
-    dp_shard_dim="dp_shard_cp", # Sharding across the flattened DP-CP mesh.
     fsdp_unit_modules=[YourTransformerBlock], # Modules to shard.
 )
 

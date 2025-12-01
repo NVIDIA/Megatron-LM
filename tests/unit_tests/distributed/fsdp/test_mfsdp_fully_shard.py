@@ -41,11 +41,16 @@ def destroy_device_mesh(device_mesh):
 
     # Teardown device mesh.
     del device_mesh
-    _mesh_resources.mesh_stack.clear()
-    _mesh_resources.child_to_root_mapping.clear()
-    _mesh_resources.root_to_flatten_mapping.clear()
-    _mesh_resources.flatten_name_to_root_dims.clear()
-    _mesh_resources.mesh_dim_group_options.clear()
+    try:
+        _mesh_resources.child_to_root_mapping.clear()
+        _mesh_resources.root_to_flatten_mapping.clear()
+        _mesh_resources.mesh_stack.clear()
+        _mesh_resources.mesh_dim_group_options.clear()
+        _mesh_resources.flatten_name_to_root_dims.clear()
+    except:
+        # Global _MeshEnv is on a convoluted deprecation path.
+        # Attempt to clean the global state, otherwise skip.
+        pass
 
 
 class ToyCNN(torch.nn.Module):
@@ -591,3 +596,41 @@ class TestMegatronFsdpFullyShard:
 
         # Destroy device mesh.
         destroy_device_mesh(device_mesh)
+
+    @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS_PARAMS, OPTIM_GRADS, OPTIM, NO_SHARD])
+    def test_fully_shard_ez(self, shard_strategy):
+        """
+        Test fully_shard(device_mesh=None). Represents the easiest entrypoint to Megatron-FSDP.
+        """
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+            fully_shard_model,
+            fully_shard_optimizer,
+        )
+
+        # Construct toy model.
+        toy_model, toy_adam, fsdp_unit_modules = build_toy_model_and_optimizer(TRANSFORMER, False)
+
+        # Fully-shard the model and optimizer.
+        model = fully_shard_model(
+            module=toy_model, fsdp_unit_modules=fsdp_unit_modules, zero_dp_strategy=shard_strategy
+        )
+        optimizer = fully_shard_optimizer(model=model, optimizer=toy_adam)
+
+        # Mock input and target.
+        toy_input = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+        toy_target = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+
+        for step in range(NUM_STEPS):
+
+            # Forward pass.
+            output = model(toy_input, toy_input)
+
+            # Loss.
+            loss = mse_loss(output, toy_target)
+
+            # Backward pass.
+            loss.backward()
+
+            # Optimizer step.
+            optimizer.step()
+            optimizer.zero_grad()
