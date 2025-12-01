@@ -49,6 +49,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
+    fast_cache: bool = False
+    """Option to use the fast cache path. Requires all the dataset caches to be built."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -59,6 +62,10 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
 
+        if self.fast_cache:
+            assert self.path_to_cache is not None, "--data-cache-path must be provided when using --fast-cache"
+            assert os.path.exists(self.path_to_cache), f"--data-cache-path {self.path_to_cache} does not exist"
+            assert os.listdir(self.path_to_cache), f"--data-cache-path {self.path_to_cache} exists but is empty"
 
 class GPTDataset(MegatronDataset):
     """The base GPT dataset
@@ -143,7 +150,7 @@ class GPTDataset(MegatronDataset):
                     path_to_idx_cache=config.object_storage_cache_path
                 ),
             )
-        return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
+        return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files, fast_cache=config.fast_cache)
 
     def __len__(self) -> int:
         """Abstract method implementation
@@ -331,7 +338,7 @@ class GPTDataset(MegatronDataset):
             path_to_document_index = get_path_to("document_index.npy")
             path_to_sample_index = get_path_to("sample_index.npy")
             path_to_shuffle_index = get_path_to("shuffle_index.npy")
-            cache_hit = all(
+            cache_hit = True if self.config.fast_cache else all(
                 map(
                     os.path.isfile,
                     [

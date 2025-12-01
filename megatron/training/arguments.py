@@ -2872,6 +2872,8 @@ def _add_data_args(parser):
                        'json file with `train`, `valid, `test` keys')
     group.add_argument('--data-cache-path', default=None,
                        help='Path to a directory to hold cached index files.')
+    group.add_argument('--fast-cache', action='store_true',
+                       help='Option to use the fast cache path. Requires all the dataset caches to be built and stored in --data-cache-path.')
     group.add_argument('--no-mmap-bin-files', action='store_false',
                        help='Disable mmap-ing of .bin files.',
                        dest='mmap_bin_files')

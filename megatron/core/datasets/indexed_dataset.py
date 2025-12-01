@@ -582,6 +582,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         mmap: bool = True,
         object_storage_config: Optional[ObjectStorageConfig] = None,
         s3_config: Optional[S3Config] = None,
+        fast_cache: bool = False,
     ) -> None:
         super().__init__()
         self.path_prefix: str
@@ -601,7 +602,7 @@ class IndexedDataset(torch.utils.data.Dataset):
             cache_idx_path = get_index_cache_path(idx_path, object_storage_config)
             cache_index_file(idx_path, cache_idx_path)
 
-        self.initialize(path_prefix, multimodal, mmap, object_storage_config)
+        self.initialize(path_prefix, multimodal, mmap, object_storage_config, fast_cache)
 
     def initialize(
         self,
@@ -609,6 +610,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         multimodal: bool,
         mmap: bool,
         object_storage_config: Optional[ObjectStorageConfig],
+        fast_cache: bool,
     ) -> None:
         """Initialize the dataset
 
@@ -627,7 +629,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         """
         idx_path = get_idx_path(path_prefix)
         bin_path = get_bin_path(path_prefix)
-        if object_storage_config is None:
+        if object_storage_config is None and not fast_cache:
             assert os.path.exists(idx_path) and os.path.exists(
                 bin_path
             ), "One or both of the .idx and .bin files cannot be found at the "
