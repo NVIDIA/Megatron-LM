@@ -1205,6 +1205,14 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
 
+    if args.linear_attention_type is not None:
+        print_rank_0(
+            '--linear-attention-type is deprecated, use --experimental-attention-variant instead.',
+            args.rank,
+        )
+        args.experimental_attention_variant = args.linear_attention_type
+        del args.linear_attention_type
+
     # Muon optimizercheck
     if 'muon' in args.optimizer:
         assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
@@ -1279,14 +1287,6 @@ def validate_args(args, defaults={}):
     
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
-
-    if args.linear_attention_type is not None:
-        print_rank_0(
-            '--linear-attention-type is deprecated, use --experimental-attention-variant instead.',
-            args.rank,
-        )
-        args.experimental_attention_variant = args.linear_attention_type
-        del args.linear_attention_type
 
     # Print arguments.
     _print_args("arguments", args)
