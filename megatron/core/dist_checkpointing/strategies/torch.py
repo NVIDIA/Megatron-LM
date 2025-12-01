@@ -492,10 +492,6 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         self.allow_shape_mismatch_sharded_tensors = allow_shape_mismatch_sharded_tensors
         self._intermediate_read_item_and_target: Optional[Tuple[ReadItem, torch.Tensor]] = None
 
-    @staticmethod
-    def _expected_shape(sh_ten):
-        return sh_ten.global_shape
-
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
             if sh_ten.key not in metadata.state_dict_metadata:
@@ -504,7 +500,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
                     f" {sorted(metadata.state_dict_metadata.keys())}"
                 )
             loaded_shape = metadata.state_dict_metadata[sh_ten.key].size
-            expected_shape = self._expected_shape(sh_ten)
+            expected_shape = sh_ten.global_shape
             if loaded_shape != expected_shape:
                 _msg = (
                     f'Global shape mismatch for loaded ({loaded_shape})'
@@ -531,7 +527,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         try:
             # Temporarily set sizes to expected shapes
             for md, _, sharded_tensor in metadata_with_sizes:
-                md.size = self._expected_shape(sharded_tensor)
+                md.size = sharded_tensor.global_shape
             yield
         finally:
             # Restore original sizes after yield
