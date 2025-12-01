@@ -2518,6 +2518,15 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-load', action='store_true',
                        help='Apply full load parallelization across DP for'
                             ' distributed checkpoints.')
+    group.add_argument('--ckpt-fully-parallel-load-exchange-algo', type=str, default='broadcast',
+                       choices=['broadcast', 'gather_rounds', 'gather_object'],
+                       help='Algorithm for fully parallel load of distributed checkpoints.')
+    group.add_argument('--ckpt-fully-parallel-save-process-group', type=str, default='dp',
+                       choices=['dp', 'ep_dp'],
+                       help='Process group for fully parallel save of distributed checkpoints.')
+    group.add_argument('--ckpt-fully-parallel-load-process-group', type=str, default='dp',
+                       choices=['dp', 'ep_dp'],
+                       help='Process group for fully parallel load of distributed checkpoints.')
     group.add_argument('--ckpt-assume-constant-structure', action='store_true',
                        help='If the model and optimizer state dict structure is'
                             'constant throughout a *single training job*, it allows for'
