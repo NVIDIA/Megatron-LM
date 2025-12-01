@@ -457,8 +457,6 @@ class GroupedMLP(MegatronModule):
                             replica_id=replica_id,
                             prepend_axis_num=prepend_axis_num,
                         )
-            else:
-                raise RuntimeError('unreachable')
             return sub_states
 
         @torch.no_grad()
