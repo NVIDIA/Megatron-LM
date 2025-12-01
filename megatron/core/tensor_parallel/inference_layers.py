@@ -92,7 +92,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
 
     def _all_gather(self, x: torch.Tensor) -> None:
         """
-        Attempt a NVLS all-gather into symmetric memory. If not possible,
+        Attempt an NVLS all-gather into symmetric memory. If not possible,
         revert to torch dist (NCCL) all-gather.
         """
         if self.tp_size == 1:
