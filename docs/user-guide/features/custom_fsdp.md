@@ -13,6 +13,8 @@ Add these flag to enable MCore custom FSDP.
 --use-distributed-optimizer
 ```
 
+For a practical guide covering required configurations, checkpoint conversion, and example scripts, see the [Megatron-FSDP User Guide](../../discussions/megatron-fsdp-user-guide/megatron-fsdp-user-guide.md).
+
 ## Key Features
 
 - **Sharding Strategy**: Efficiently shards optimizer states, gradients, and parameters to reduce memory consumption.
