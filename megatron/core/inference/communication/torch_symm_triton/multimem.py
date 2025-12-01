@@ -22,7 +22,7 @@ except ImportError:
     _SymmetricMemory = MagicMock()
 
 from .asm_utils import ld_128, st_128
-from .triton_barrier import blockwise_barrier
+from .triton_barrier import symm_mem_sync
 from .triton_utils import get_flat_tid, sync_threads
 
 
@@ -69,7 +69,12 @@ def _multimem_all_gather_kernel(
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
 
     sync_threads()
-    blockwise_barrier(signal_pad_ptrs, None, RANK, WORLD_SIZE, sem="acq_rel")
+    symm_mem_sync(signal_pad_ptrs, 
+                  None, 
+                  RANK, 
+                  WORLD_SIZE, 
+                  hasPreviousMemAccess=True, 
+                  hasSubsequentMemAccess=True)
 
 
 def multimem_all_gather(
@@ -136,7 +141,12 @@ def _multimem_reduce_scatter_kernel(
     """
     Triton kernel to perform multicast reduce-scatter over nvlink using multimem instructions.
     """
-    blockwise_barrier(signal_pad_ptrs, None, RANK, WORLD_SIZE, sem="relaxed")
+    symm_mem_sync(signal_pad_ptrs, 
+                  None, 
+                  RANK, 
+                  WORLD_SIZE, 
+                  hasPreviousMemAccess=False, 
+                  hasSubsequentMemAccess=False)
     sync_threads()
 
     pid = tl.program_id(axis=0)
