@@ -36,6 +36,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
+        --no-install-package transformer-engine-cu12 \
         --no-install-package nvidia-cublas-cu12 \
         --no-install-package nvidia-cuda-cupti-cu12 \
         --no-install-package nvidia-cuda-nvrtc-cu12 \
