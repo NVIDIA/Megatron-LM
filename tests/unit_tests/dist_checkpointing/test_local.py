@@ -80,7 +80,7 @@ class TestLocalCheckpointing:
         rng_state = None
         iteration = None
         metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
-        optim_sd_kwargs = dict(sharding_type='fully_reshardable', metadata=metadata)
+        optim_sd_kwargs = dict(metadata=metadata)
         mock_args = parse_args(ignore_unknown_args=True)
         mock_args.no_save_optim = False
         mock_args.no_save_rng = True
