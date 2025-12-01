@@ -254,7 +254,7 @@ class LanguageModule(MegatronModule):
             LanguageModule.embedding_warning_printed = True
 
     def shared_embedding_or_output_weight(self) -> Tensor:
-        """Gets the emedding weight or output logit weights when share embedding and output weights set to True
+        """Gets the embedding weight or output logit weights when share embedding and output weights set to True
           or when use Multi-Token Prediction (MTP).
 
         Returns:
