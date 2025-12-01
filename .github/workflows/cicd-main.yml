@@ -20,8 +20,8 @@ on:
     branches:
       - dev
       - main
-      - "pull-request/[0-9]+"
-      - "deploy-release/*"
+      - 'pull-request/[0-9]+'
+      - 'deploy-release/*'
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
@@ -43,6 +43,8 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
+      is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
+      selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || 'nvidia-ci-aws-gpu-x8-ephemeral' }}
     permissions:
       issues: write
       pull-requests: write
@@ -60,45 +62,29 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
 
-      - name: Check membership
+      - name: Check NVIDIA SSO membership
+        id: check-sso
+        uses: ./.github/actions/check-nvidia-sso-membership
+        with:
+          username: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
+          github_token: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
+
+      - name: Set maintainer status
         id: check-membership
         env:
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
         run: |
-          PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
-
+          # Skip SSO check for scheduled jobs, main branch, or merge groups
           if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "Checking if $PR_AUTHOR is a repo collaborator..."
-          API_URL="https://api.github.com/repos/$REPO/collaborators/$PR_AUTHOR"
-          REPO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            $API_URL)
-
-          echo "Checking if $PR_AUTHOR is an org collaborator to NVIDIA-NeMo..."
-          API_URL="https://api.github.com/orgs/NVIDIA-NeMo/members/$PR_AUTHOR"
-          ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            $API_URL)
-
-          echo "Checking if $PR_AUTHOR is an org collaborator to NVIDIA..."
-          API_URL="https://api.github.com/orgs/NVIDIA/members/$PR_AUTHOR"
-          ORG_NVIDIA_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            $API_URL)
-
-          if [ "$REPO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_MEMBERSHIP_RESPONSE" -eq 204 ]; then
+          # Use SSO membership check result
+          IS_MEMBER="${{ steps.check-sso.outputs.is_member }}"
+          if [ "$IS_MEMBER" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
           else
             echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
@@ -111,7 +97,7 @@ jobs:
         with:
           issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           repository: ${{ github.repository }}
-          body-includes: "<!--external-contributor-comment-->"
+          body-includes: '<!--external-contributor-comment-->'
 
       - name: Delete comment
         uses: actions/github-script@v7
@@ -139,14 +125,6 @@ jobs:
             NVIDIA Megatron-LM is currently transitioning to development on Github. We will aim to review your PR after we complete our transition and stabilize our Github development process.
 
             Thank you for your understanding.
-
-      - name: exit
-        run: |
-          if [ "${{ steps.check-membership.outputs.is_maintainer }}" == "true" ]; then
-            exit 0
-          else
-            exit 1
-          fi
 
   pre-flight:
     needs: [is-not-external-contributor]
@@ -211,8 +189,8 @@ jobs:
           echo "is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}"
 
   cicd-container-build:
-    needs: [pre-flight, cicd-wait-in-queue]
-    runs-on: nvidia-ci-aws-gpu-x8
+    needs: [is-not-external-contributor, pre-flight, cicd-wait-in-queue]
+    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
     if: |
       (
         success()
@@ -222,6 +200,11 @@ jobs:
       && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
+      - name: Taint node for job isolation
+        if: contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
+        shell: bash
+        run: taint-node.sh
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -252,11 +235,9 @@ jobs:
 
       - name: Download test data
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           echo "::group::Download test data"
-          pip install --no-cache-dir pygithub click
+          pip install --no-cache-dir click requests
           python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
           echo "::endgroup::"
 
@@ -361,12 +342,13 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.cicd-parse-unit-tests.outputs.unit-tests) }}
     needs:
+      - is-not-external-contributor
       - pre-flight
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
-    runs-on: nvidia-ci-aws-gpu-x8
-    name: "${{ matrix.bucket }} - latest"
+    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    name: '${{ matrix.bucket }} - latest'
     if: |
       (
         success()
@@ -380,6 +362,11 @@ jobs:
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
     steps:
+      - name: Taint node for job isolation
+        if: contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
+        shell: bash
+        run: taint-node.sh
+
       - name: Checkout
         uses: actions/checkout@v4
       - name: main
@@ -388,7 +375,7 @@ jobs:
           test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: "true"
+          is_unit_test: 'true'
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
@@ -427,10 +414,20 @@ jobs:
           HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
           echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
+      - name: Has Run functional tests label
+        id: has-run-functional-tests-label
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "false"
+          echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
+
       - name: Parse functional tests
         id: main
         env:
           HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL: ${{ steps.has-run-functional-tests-label.outputs.main }}
         run: |
           export PYTHONPATH=$(pwd)
 
@@ -439,10 +436,13 @@ jobs:
               --scope mr-github
               --enable-lightweight-mode
             )
+          elif [ "$HAS_RUN_FUNCTIONAL_TESTS_LABEL" == "true" ]; then
+            ARGS=(
+              --scope mr-github
+            )
           else
             ARGS=(
-              --scope mr-slim
-              --enable-lightweight-mode
+              --scope mr-github-slim
             )
           fi
 
@@ -473,12 +473,13 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.cicd-parse-integration-tests.outputs.integration-tests) }}
     needs:
+      - is-not-external-contributor
       - pre-flight
       - cicd-wait-in-queue
       - cicd-parse-integration-tests
       - cicd-unit-tests-latest
-    runs-on: nvidia-ci-aws-gpu-x8
-    name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
+    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    name: '${{ matrix.model }}/${{ matrix.test_case }} - latest'
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
@@ -492,6 +493,11 @@ jobs:
       && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
+      - name: Taint node for job isolation
+        if: contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
+        shell: bash
+        run: taint-node.sh
+
       - name: Checkout
         uses: actions/checkout@v4
       - name: main
@@ -501,7 +507,7 @@ jobs:
           model: ${{ matrix.model }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: "false"
+          is_unit_test: 'false'
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
