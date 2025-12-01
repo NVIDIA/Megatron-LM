@@ -457,7 +457,7 @@ class GroupedMLP(MegatronModule):
                             replica_id=replica_id,
                             prepend_axis_num=prepend_axis_num,
                         )
-            return sub_states
+            return sub_states  # pylint: disable=possibly-used-before-assignment
 
         @torch.no_grad()
         def sh_ten_merge_fn(sub_state_dict, tp_axis: int, with_glu: bool):
