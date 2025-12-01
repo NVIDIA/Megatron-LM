@@ -553,10 +553,19 @@ class MultiTokenPredictionLayer(MegatronModule):
                     self_attention_spec = self_attention_spec.submodules.self_attention
                     attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
                     assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-                        f"Multi-Token Prediction (MTP) is not jet supported with "
+                        f"Multi-Token Prediction (MTP) is not yet supported with "
                         + f"{attn_mask_type} attention mask type."
                         + f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
                     )
+        elif hasattr(self.submodules.mtp_model_layer.submodules, 'self_attention'):
+            self_attention_spec = self.submodules.mtp_model_layer.submodules.self_attention
+            if self_attention_spec is not None:
+                attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
+                assert attn_mask_type in SUPPORTED_ATTN_MASK, (
+                    f"Multi-Token Prediction (MTP) is not yet supported with "
+                    + f"{attn_mask_type} attention mask type."
+                    + f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
+                )
 
         self.enorm = build_module(
             self.submodules.enorm,
