@@ -19,6 +19,7 @@ from typing import Optional, Sequence, Type
 
 import torch
 from torch.distributed import DeviceMesh
+from torch.distributed.device_mesh import init_device_mesh
 
 from .megatron_fsdp import MegatronFSDP
 from .uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
@@ -59,8 +60,8 @@ class ShardingStrategy(IntEnum):
 
 def fully_shard_model(
     module: torch.nn.Module,
-    device_mesh: DeviceMesh,
-    dp_shard_dim: str,
+    device_mesh: Optional[DeviceMesh] = None,
+    dp_shard_dim: Optional[str] = None,
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -94,6 +95,21 @@ def fully_shard_model(
     Returns:
         model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
     """
+    # If no DeviceMesh or FSDP dimension is provided, then build an FSDP DeviceMesh.
+    # Modify arguments into arguments necessary for vanilla FSDP.
+    if device_mesh is None:
+        if dp_shard_dim is None:
+            dp_shard_dim = "fsdp"
+        # Deactivate DP-Outer, which needs to be consistent with Expert DeviceMesh.
+        dp_outer_dim = None
+        hybrid_fsdp_group = None
+        outer_dp_sharding_strategy = ShardingStrategy.NO_SHARD
+        device_mesh = init_device_mesh(
+            device_type="cuda",
+            mesh_shape=(torch.distributed.get_world_size(),),
+            mesh_dim_names=(dp_shard_dim,),
+        )
+
     # Parse zero_dp_strategy and outer_dp_sharding_strategy.
     # TODO(@cspades): Integrate this Enum into MegatronFSDP.
     if zero_dp_strategy == ShardingStrategy.NO_SHARD:
@@ -245,6 +261,9 @@ def fully_shard_optimizer(
 
         preproc_state_dict_for_dcp_ckpt (bool):
             Whether to preprocess the state dict for DCP checkpointing. Defaults to True.
+
+    Returns:
+        optimizer (torch.optim.Optimizer): The in-place modified optimizer for Megatron-FSDP.
     """
     # Swap to the model distributed parameters for the optimizer state.
     # MegatronFSDP.__init__() will call this method upon completion, but
@@ -324,12 +343,15 @@ def fully_shard_optimizer(
             lambda *args, **kwargs: preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
         )
 
+    # Return the in-place modified optimizer.
+    return optimizer
+
 
 def fully_shard(
     module: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device_mesh: DeviceMesh,
-    dp_shard_dim: str,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    device_mesh: Optional[DeviceMesh] = None,
+    dp_shard_dim: Optional[str] = None,
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -370,14 +392,13 @@ def fully_shard(
             the user is expected to utilize fully_shard_optimizer() or the MegatronFSDP API to
             manually configure the model for optimization. Defaults to None.
 
-        device_mesh (DeviceMesh):
+        device_mesh (Optional[DeviceMesh]):
             Device mesh object defining the topology for distributed training.
 
-        dp_shard_dim (str):
+        dp_shard_dim (Optional[str]):
             Name of the data parallel sharding sub-mesh in the device_mesh. Supports
             a flattened DP-CP sub-mesh, in which case parameters, gradients, and
             optimizer state will be sharded across both DP and CP ranks.
-            Required to enable the core functionality of Megatron-FSDP.
 
         dp_outer_dim (Optional[str]):
             Name of the "outer" DP sub-mesh in the device_mesh for hybrid-sharding (HSDP),
@@ -397,6 +418,7 @@ def fully_shard(
 
         expt_device_mesh (Optional[DeviceMesh]):
             Expert parallel device mesh object defining the topology for MoE distributed training.
+            Utilizes the mesh dimension names specified by the *_dim arguments.
 
         fsdp_unit_modules (Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]]):
             List of (sub-)module classes or (sub-)module class import paths that are "units",
