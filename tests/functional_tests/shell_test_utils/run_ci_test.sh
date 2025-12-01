@@ -314,6 +314,24 @@ for i in $(seq 1 $N_REPEAT); do
             fi
         fi
 
+        # For rl jobs
+        if [[ "$MODE" == "rl" && ("$TRAINING_EXIT_CODE" -eq 0 || "$TEST_TYPE" == "release") ]]; then
+            if [[ "$TEST_TYPE" == "frozen-start" ]]; then
+                TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+                    /usr/local/bin/yq '.MODEL_ARGS."--exit-interval" // "50"')
+                uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+                    --logs-dir $TENSORBOARD_PATH \
+                    --train-iters $TRAIN_ITERS \
+                    --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+                    "${EXTRACT_ARGS[@]}"
+                uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_grpo_training_loop.py \
+                    --golden-values-path $GOLDEN_VALUES_PATH \
+                    --test-values-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+                    --model-config-path ${TRAINING_PARAMS_PATH} \
+                    $ALLOW_NONDETERMINISTIC_ALGO_ARG
+            fi
+        fi
+
         # Abort if training failed
         if [[ "$TRAINING_EXIT_CODE" -ne 0 && "$TEST_TYPE" != "release" ]]; then
             echo "Training failed. Aborting."

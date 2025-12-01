@@ -85,6 +85,7 @@ dev = [
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
+    "datasets",
 ]
 
 lts = [
@@ -103,6 +104,7 @@ lts = [
     "wget",
     "onnxscript",
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
+    "datasets",
 ]
 
 [dependency-groups]
