@@ -53,6 +53,7 @@ try:
     HAVE_TE = True
 except ImportError:
     TEDotProductAttention = None
+    TEColumnParallelLinear = None
     HAVE_TE = False
 
 
@@ -77,6 +78,7 @@ def get_retro_decoder_layer_te_spec(
     spec = get_gpt_layer_with_transformer_engine_spec()
     spec.submodules.pre_cross_attn_layernorm = TENorm
     assert TEDotProductAttention is not None
+    assert TEColumnParallelLinear is not None
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
         params={"encoder_block_spec": encoder_block_spec},

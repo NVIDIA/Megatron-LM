@@ -109,6 +109,30 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+class Linear(Protocol):
+    """Protocol for a linear_q or linear_kv layer."""
+
+    def forward(self, hidden_states: Tensor, /) -> Tuple[Tensor, Optional[Tensor]]: ...
+
+
+class LinearBuilder(Protocol):
+    """Protocol for building linear_q or linear_kv layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+    ) -> Linear: ...
+
+
 class LinearQKV(Protocol):
     """Protocol for a linear QKV layer."""
 
@@ -190,8 +214,8 @@ class CrossAttentionSubmodules:
     Configuration class for specifying the submodules of a cross-attention.
     """
 
-    linear_q: Union[ModuleSpec, type]
-    linear_kv: Union[ModuleSpec, type]
+    linear_q: LinearBuilder
+    linear_kv: LinearBuilder
     core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
 
@@ -356,9 +380,7 @@ class Attention(MegatronModule, ABC):
         ), "Virtual pipeline parallelism is not supported for inference"
 
         # Import here to avoid circular imports
-        from megatron.core.transformer.transformer_layer import (
-            get_transformer_layer_offset,
-        )
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
         return get_transformer_layer_offset(
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
@@ -1257,8 +1279,8 @@ class CrossAttention(Attention):
         submodules: CrossAttentionSubmodules,
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(
             config=config,
@@ -1274,24 +1296,22 @@ class CrossAttention(Attention):
             raise ValueError("Group query attention is not currently supported in cross attention.")
         assert self.query_projection_size == self.kv_projection_size
 
-        self.linear_q = build_module(
-            submodules.linear_q,
+        self.linear_q = submodules.linear_q(
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=cast(Callable[[torch.Tensor], None], self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
         )
 
-        self.linear_kv = build_module(
-            submodules.linear_kv,
+        self.linear_kv = submodules.linear_kv(
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=cast(Callable[[torch.Tensor], None], self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
@@ -1305,7 +1325,7 @@ class CrossAttention(Attention):
         """
         assert split_qkv, "split_qkv must be True for CrossAttention"
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-        mixed_kv, _ = self.linear_kv(key_value_states)
+        mixed_kv, _ = typed_torch.apply_module(self.linear_kv)(key_value_states)
 
         # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
         new_tensor_shape = mixed_kv.size()[:-1] + (
@@ -1318,7 +1338,7 @@ class CrossAttention(Attention):
         (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
-        query, _ = self.linear_q(hidden_states)
+        query, _ = typed_torch.apply_module(self.linear_q)(hidden_states)
 
         # [sq, b, hp] --> [sq, b, np, hn]
         new_tensor_shape = query.size()[:-1] + (
