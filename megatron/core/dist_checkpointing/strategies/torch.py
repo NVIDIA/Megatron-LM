@@ -83,6 +83,12 @@ MSC_PREFIX = "msc://"
 _metadata_fn: str = ".metadata"
 
 
+# dummy class needed to load old checkpoint weights
+class MCoreSavePlan:
+    """ """
+    pass
+
+
 def register_default_torch_strategies():
     """Register default strategies related to PyT Distributed backend."""
     register_default_strategy(
