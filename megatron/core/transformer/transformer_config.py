@@ -192,6 +192,19 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    qk_clip: bool = False
+    """Whether to clip the query and key weights. Needed for Muon MLA Model training."""
+
+    qk_clip_alpha: float = 0.5
+    """The balancing alpha for qk-clip. Q = Q * (eta ** alpha)"""
+
+    qk_clip_threshold: float = 100
+    """The balancing threshold for qk-clip. eta = min(threshold / max_attention_logits, 1.0)"""
+
+    log_max_attention_logit: bool = False
+    """Whether to log the max attention logit across whole model. Decoupled from qk_clip,
+    defualts to False. Setting qk_clip will automatically log the max logit"""
+
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
@@ -779,6 +792,10 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    fallback_to_eager_attn: bool = False
+    """Whether to fallback to eager attention in TE implementation.
+    Suggested for when desired features are not available in TE implementation."""
+
     #####################################
     # Fine-grained Activation Offloading
     #####################################
@@ -839,7 +856,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.linear_attention_type is not None:
-            supported_la_types = ["gated_delta_net", "mamba"]
+            supported_la_types = ["gated_delta_net"]
             assert self.linear_attention_type in supported_la_types, (
                 f"linear_attention_type ({self.linear_attention_type}) only support"
                 f" one of {supported_la_types}."
@@ -883,8 +900,6 @@ class TransformerConfig(ModelParallelConfig):
                     f"Gated delta net does not support context parallel for now,"
                     f" but got {self.context_parallel_size=}."
                 )
-            elif self.linear_attention_type == "mamba":
-                raise NotImplementedError("Mamba is not supported yet.")
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -964,6 +979,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
+            if self.moe_flex_dispatcher_backend == "hybridep":
+                raise ValueError("Only one backend is supported for flex token dispatcher.")
+            self.moe_flex_dispatcher_backend = "deepep"
             warnings.warn(
                 "moe_enable_deepep is deprecated."
                 "Please use --moe-flex-dispatcher-backend=deepep instead."
@@ -1646,7 +1664,7 @@ class TransformerConfig(ModelParallelConfig):
                         ), 'moe cuda graph is only supported with drop-padding MoE.'
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
-                            or self.moe_router_padding_for_fp8
+                            or self.moe_router_padding_for_quantization
                         ):
                             assert 'moe_preprocess' not in self.cuda_graph_scope, (
                                 'moe_preprocess cuda graph is not supported when there are '
@@ -1836,6 +1854,25 @@ class TransformerConfig(ModelParallelConfig):
                     f"Length of no_rope list ({len(self.no_rope_freq)}) must match "
                     f"the number of layers ({self.num_layers})"
                 )
+
+        if self.fallback_to_eager_attn:
+            assert self.transformer_impl == "transformer_engine", (
+                f"fallback_to_eager_attn is only available with transformer_engine implementation,"
+                f" but got {self.transformer_impl=}."
+            )
+
+        if self.fallback_to_eager_attn or self.transformer_impl == "local":
+            if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+                all_cp_comm_types_are_all_gather = (
+                    all(item == "all_gather" for item in self.cp_comm_type)
+                    if isinstance(self.cp_comm_type, list)
+                    else self.cp_comm_type == "all_gather"
+                )
+                if not all_cp_comm_types_are_all_gather:
+                    raise ValueError(
+                        f"fallback_to_eager_attn only supports all_gather communication type "
+                        f"for context parallelism, but got {self.cp_comm_type=} instead."
+                    )
 
 
 @dataclass

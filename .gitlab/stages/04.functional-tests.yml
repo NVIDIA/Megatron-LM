@@ -231,7 +231,7 @@ functional:x_notify:
     paths:
       - scripts
   rules:
-    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
+    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
 
