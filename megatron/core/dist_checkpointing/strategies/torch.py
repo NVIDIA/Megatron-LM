@@ -86,6 +86,7 @@ _metadata_fn: str = ".metadata"
 # dummy class needed to load old checkpoint weights
 class MCoreSavePlan:
     """ """
+
     pass
 
 
