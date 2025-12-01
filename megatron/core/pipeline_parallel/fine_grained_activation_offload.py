@@ -3,13 +3,15 @@
 import warnings
 from collections import deque
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, Dict, List, Tuple
 
 import torch
 
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
 DEBUG_RANK = 0
+
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
 
 def debug_rank(message):
@@ -20,6 +22,250 @@ def debug_rank(message):
     assert torch.distributed.is_initialized()
     if torch.distributed.get_rank() == DEBUG_RANK:
         print(message)
+
+
+class GPUTensorPool:
+    """
+    GPU memory pool for efficient allocation and deallocation of tensors.
+    
+    Features:
+    - Supports multiple tensor shapes and dtypes, each with its own pool
+    - Dynamic allocation: tensors are created on-demand during allocation
+    - Efficient reuse: freed tensors are returned to the pool for reuse
+    - Uses queue-based management for O(1) allocation and deallocation
+    
+    Example:
+        pool = GPUTensorPool(device='cuda:0')
+        tensor = pool.allocate((128, 512), dtype=torch.float32)
+        # ... use tensor ...
+        pool.free(tensor, (128, 512), dtype=torch.float32)
+    """
+    
+    def __init__(
+        self, 
+        device: str = 'cuda',
+        pin_memory: bool = False
+    ):
+        """
+        Initialize GPU tensor pool.
+        
+        Args:
+            device: GPU device, default 'cuda'
+            pin_memory: Whether to use pinned memory (mainly for CPU tensors)
+        """
+        self.device = torch.device(device)
+        self.pin_memory = pin_memory
+        
+        # Maintain a separate pool for each (shape, dtype) combination
+        # Structure: {(shape, dtype): {'free': deque, 'all': list, 'allocated_count': int}}
+        self._pools: Dict[Tuple, Dict[str, Any]] = {}
+        
+        # Statistics
+        self._stats = {
+            'total_allocated': 0,       # Total number of tensors ever allocated
+            'current_in_use': 0,        # Number of tensors currently in use
+            'allocation_requests': 0,   # Number of allocation requests
+            'free_requests': 0,         # Number of free requests
+            'pool_hits': 0,             # Number of times a tensor was reused from pool
+            'pool_misses': 0,           # Number of times a new tensor was created
+        }
+        
+        debug_rank("GPUTensorPool: Initialized with dynamic allocation")
+    
+    def _get_pool_key(self, shape: Tuple, dtype: torch.dtype) -> Tuple:
+        """Generate a unique key for the pool based on shape and dtype."""
+        return (shape, dtype)
+    
+    @staticmethod
+    def _calculate_memory_size(shape: Tuple, dtype: torch.dtype) -> int:
+        """Calculate memory size in bytes."""
+        element_size = torch.tensor([], dtype=dtype).element_size()
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        return numel * element_size
+    
+    def allocate(self, shape: Tuple, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        """
+        Allocate a tensor with the specified shape and dtype.
+        
+        Args:
+            shape: Shape of the tensor
+            dtype: Data type of the tensor, default torch.float32
+            
+        Returns:
+            Allocated tensor
+        """
+        self._stats['allocation_requests'] += 1
+        
+        pool_key = self._get_pool_key(shape, dtype)
+        
+        # Create pool for this (shape, dtype) if it doesn't exist
+        if pool_key not in self._pools:
+            self._pools[pool_key] = {
+                'free': deque(),      # Queue of available tensors
+                'all': [],            # List of all tensors (for tracking)
+                'allocated_count': 0, # Number of allocated tensors
+            }
+        
+        pool = self._pools[pool_key]
+        
+        # Try to reuse a tensor from the pool
+        if len(pool['free']) > 0:
+            tensor = pool['free'].popleft()
+            self._stats['pool_hits'] += 1
+            debug_rank(
+                f"GPUTensorPool.allocate: Reused tensor from pool, "
+                f"shape={shape}, dtype={dtype}, "
+                f"remaining in pool={len(pool['free'])}"
+            )
+        else:
+            # Allocate a new tensor
+            tensor = torch.empty(
+                shape,
+                dtype=dtype,
+                device=self.device,
+                pin_memory=self.pin_memory
+            )
+            pool['all'].append(tensor)
+            self._stats['total_allocated'] += 1
+            self._stats['pool_misses'] += 1
+            
+            memory_mb = self._calculate_memory_size(shape, dtype) / (1024 ** 2)
+            debug_rank(
+                f"GPUTensorPool.allocate: Created new tensor, "
+                f"shape={shape}, dtype={dtype}, "
+                f"memory={memory_mb:.2f} MB, "
+                f"total_created={len(pool['all'])}"
+            )
+        
+        pool['allocated_count'] += 1
+        self._stats['current_in_use'] += 1
+        
+        return tensor
+    
+    def free(self, tensor: torch.Tensor):
+        """
+        Return a tensor to the pool for reuse.
+        
+        Args:
+            tensor: Tensor to free
+            
+        Raises:
+            ValueError: If tensor doesn't belong to this pool
+        """
+        self._stats['free_requests'] += 1
+
+        shape = tensor.shape
+        dtype = tensor.dtype
+        
+        pool_key = self._get_pool_key(shape, dtype)
+        
+        if pool_key not in self._pools:
+            raise ValueError(
+                f"No pool exists for shape={shape}, dtype={dtype}. "
+                f"Available pools: {list(self._pools.keys())}"
+            )
+        
+        pool = self._pools[pool_key]
+        
+        # Verify tensor belongs to this pool (use identity check, not value comparison)
+        tensor_found = any(tensor is t for t in pool['all'])
+        if not tensor_found:
+            raise ValueError(
+                f"Attempting to free a tensor that doesn't belong to this pool "
+                f"(shape={shape}, dtype={dtype})"
+            )
+        
+        # Return tensor to the free queue
+        pool['free'].append(tensor)
+        pool['allocated_count'] -= 1
+        self._stats['current_in_use'] -= 1
+        
+        debug_rank(
+            f"GPUTensorPool.free: shape={shape}, dtype={dtype}, "
+            f"available in pool={len(pool['free'])}"
+        )
+    
+    def get_pool_status(self, shape: Tuple = None, dtype: torch.dtype = None) -> Dict[str, Any]:
+        """
+        Get the status of the memory pool.
+        
+        Args:
+            shape: If specified along with dtype, return status for that specific pool
+            dtype: Data type (required if shape is specified)
+            
+        Returns:
+            Dictionary containing status information
+        """
+        if shape is not None:
+            if dtype is None:
+                raise ValueError("dtype must be specified when shape is provided")
+            
+            pool_key = self._get_pool_key(shape, dtype)
+            
+            if pool_key not in self._pools:
+                raise ValueError(f"No pool exists for shape={shape}, dtype={dtype}")
+            
+            pool = self._pools[pool_key]
+            total_count = len(pool['all'])
+            
+            return {
+                'shape': shape,
+                'dtype': dtype,
+                'total_count': total_count,
+                'allocated_count': pool['allocated_count'],
+                'free_count': len(pool['free']),
+                'utilization': pool['allocated_count'] / total_count * 100 if total_count > 0 else 0,
+            }
+        else:
+            # Return status for all pools
+            status = {
+                'global_stats': self._stats.copy(),
+                'pools': {}
+            }
+            
+            for pool_key in self._pools:
+                shape, dtype = pool_key
+                status['pools'][pool_key] = self.get_pool_status(shape, dtype)
+            
+            return status
+    
+    def reset(self):
+        """Reset the pool, marking all tensors as available."""
+        debug_rank("GPUTensorPool: Resetting pool...")
+        
+        for pool_key, pool in self._pools.items():
+            # Clear and refill the free queue
+            pool['free'].clear()
+            for tensor in pool['all']:
+                pool['free'].append(tensor)
+            pool['allocated_count'] = 0
+        
+        self._stats['current_in_use'] = 0
+        debug_rank("GPUTensorPool: Reset complete")
+    
+    def clear(self):
+        """Clear the pool and release all GPU memory."""
+        debug_rank("GPUTensorPool: Clearing pool...")
+        
+        for pool_key, pool in self._pools.items():
+            # Clear all references, allowing PyTorch GC to reclaim memory
+            pool['free'].clear()
+            pool['all'].clear()
+        
+        self._pools.clear()
+        self._stats['current_in_use'] = 0
+        
+        # Trigger GPU cache cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        debug_rank("GPUTensorPool: Clear complete")
+    
+    def __del__(self):
+        """Destructor to ensure resources are released."""
+        self.clear()
 
 
 def set_ideal_affinity_for_current_gpu():
@@ -80,6 +326,8 @@ class PipelineOffloadManager:
         # allocate streams and events for synchronization
         self._d2h_stream = torch.cuda.Stream()
         self._h2d_stream = torch.cuda.Stream()
+        # Shared CPU tensor pool for all chunks to improve reuse efficiency
+        self._cpu_tensor_pool = GPUTensorPool(device="cpu", pin_memory=True)
         self.reset()
 
     @property
@@ -92,6 +340,11 @@ class PipelineOffloadManager:
         """Get the host-to-device (CPU to GPU) transfer stream."""
         return self._h2d_stream
 
+    @property
+    def cpu_tensor_pool(self):
+        """Get the shared CPU tensor pool."""
+        return self._cpu_tensor_pool
+
     def reset(self):
         """Reset manager state for a new training iteration."""
         set_ideal_affinity_for_current_gpu()
@@ -100,6 +353,9 @@ class PipelineOffloadManager:
         self._cur_backward_chunk = None
         # Track the first microbatch of the last virtual pipeline stage
         self._is_first_last_vpp_chunk = True
+        # Reset CPU tensor pool to reuse all CPU tensors for next iteration
+        if hasattr(self, '_cpu_tensor_pool'):
+            self._cpu_tensor_pool.reset()
 
     def flush(self):
         """Flush all staged chunks to the backward queue in reverse order."""
@@ -154,8 +410,8 @@ class PipelineOffloadManager:
             vp_stage: Virtual pipeline stage index (None means stage 0)
             min_offloaded_tensor_size: Minimum tensor size (in elements) to offload
         """
+        vp_size = 1 if vp_size is None else vp_size
         if self._stages is None:
-            vp_size = 1 if vp_size is None else vp_size
             self._vpp = vp_size
             self._stages = [[] for _ in range(vp_size)]
 
@@ -171,11 +427,16 @@ class PipelineOffloadManager:
         # Determine if this is the first microbatch of the last virtual pipeline stage
         is_first_last_vpp_chunk = is_first_last_vpp_chunk and (cur_vpp_rank == self._vpp - 1)
 
-        cur_chunk = ChunkOffloadHandler(is_first_last_vpp_chunk, min_offloaded_tensor_size)
+        # Use shared CPU tensor pool for better reuse across chunks
+        cur_chunk = ChunkOffloadHandler(
+            is_first_last_vpp_chunk, min_offloaded_tensor_size, self._cpu_tensor_pool
+        )
+        debug_rank(f"init_model_chunk_offload_handler {cur_chunk}")
         self._stages[cur_vpp_rank].append(cur_chunk)
         # For the last stage, push immediately and flush
         if cur_vpp_rank == self._vpp - 1:
-            self._is_first_last_vpp_chunk = False
+            if vp_size > 1:
+                self._is_first_last_vpp_chunk = False
             self.push(cur_chunk)
             self.flush()
         self._cur_forward_chunk = cur_chunk
@@ -183,6 +444,7 @@ class PipelineOffloadManager:
 
     def set_last_layer(self, is_last_layer):
         """Mark whether the current forward chunk is processing the last layer."""
+        debug_rank(f"set_last_layer {is_last_layer}")
         self._cur_forward_chunk.is_last_layer = is_last_layer
 
     def cur_forward_chunk(self):
@@ -196,6 +458,8 @@ class PipelineOffloadManager:
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
         debug_rank("----__enter__")
+        if not self.cur_forward_chunk().do_offload:
+            return
         from megatron.core.extensions.transformer_engine import cpu_offload
 
         if cpu_offload is not None:
@@ -209,6 +473,8 @@ class PipelineOffloadManager:
     def __exit__(self, *args: Any):
         """Exit context manager and restore original tensor saving behavior."""
         debug_rank("----__exit__")
+        if not self.cur_forward_chunk().do_offload:
+            return
         from megatron.core.extensions.transformer_engine import cpu_offload
 
         if cpu_offload is not None:
@@ -240,42 +506,41 @@ class ChunkOffloadHandler:
     Manages tensor groups, coordinates asynchronous GPU-CPU transfers, and handles synchronization.
     """
 
-    @staticmethod
-    def offload(src_tensor, pin_memory=True):
+    def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True):
         """Offload."""
         debug_rank("--------offload")
-        from megatron.core.extensions.transformer_engine import Float8Tensor
-
-        fp8_offload = isinstance(src_tensor, Float8Tensor) if Float8Tensor is not None else False
 
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
 
-        cpu_backup = torch.empty(
-            src_tensor.size(),
-            dtype=torch.uint8 if fp8_offload else src_tensor.dtype,
-            layout=src_tensor.layout,
-            device="cpu",
-            pin_memory=pin_memory,
-        )
-
-        if fp8_offload:
-            cpu_backup = Float8Tensor.make_like(src_tensor, data=cpu_backup)
+        if use_cpu_pool:
+            cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
+        else:
+            cpu_backup = torch.empty(src_tensor.shape, dtype=src_tensor.dtype, device="cpu", pin_memory=pin_memory)
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
-        state = (src_tensor.device, cpu_backup)
+        state = (src_tensor.device, cpu_backup, use_cpu_pool)
         return state
 
-    @staticmethod
-    def reload(state, non_blocking=None):
+    def reload(self, state, non_blocking=None):
         """Reload."""
         debug_rank("------reload")
-        dev, cpu_backup = state
+        dev, cpu_backup, use_cpu_pool = state
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
-        return cpu_backup.to(dev, non_blocking=non_blocking)
+        gpu_tensor = torch.empty(
+            cpu_backup.size(),
+            dtype=cpu_backup.dtype,
+            layout=cpu_backup.layout,
+            device=dev,
+        )
+        gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
+        if use_cpu_pool:
+            self.cpu_tensor_pool.free(cpu_backup)
+        return gpu_tensor
 
-    def __init__(self, is_first_last_vpp_chunk, min_offloaded_tensor_size):
+    def __init__(self, is_first_last_vpp_chunk, min_offloaded_tensor_size, cpu_tensor_pool):
+        self.do_offload = True
         # Data Structure to maintain reference to activation tensors
         self._tensor_tag_to_state = {}
         # Mark the first microbatch of the last virtual pipeline stage
@@ -295,6 +560,8 @@ class ChunkOffloadHandler:
         self._reload_events = {}
         self.min_offloaded_tensor_size = min_offloaded_tensor_size
         self.is_last_layer = False
+        self.cpu_tensor_pool = cpu_tensor_pool
+
 
     def is_empty_chunk(self):
         """Check if this chunk has no tensors to manage."""
@@ -358,8 +625,13 @@ class ChunkOffloadHandler:
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
         assert not self.is_first_last_layer(), "Should not offload first-last layer"
-        group_id_to_offload, name = group_to_offload
+        group_id_to_offload, name, fake_offload = group_to_offload
+        if fake_offload:
+            return False
         torch.cuda.nvtx.range_push("activation offloading " + name)
+        use_cpu_pool = True
+        if name == "expert_fc1" or name == "moe_act":
+            use_cpu_pool = False
         with torch.cuda.stream(self.d2h_stream):
             for tensor_tag, state in self._tensor_tag_to_state.items():
                 group_id, _ = tensor_tag
@@ -369,13 +641,14 @@ class ChunkOffloadHandler:
                     assert not isinstance(state, tuple), "Tensor already offloaded"
                     tensor_on_device = state
                     if self.tensor_need_offloading_checker(tensor_on_device):
-                        state = self.offload(tensor_on_device)
+                        state = self.offload(tensor_on_device, use_cpu_pool=use_cpu_pool)
                         event = torch.cuda.Event()
                         event.record(self.d2h_stream)
                         self._offload_events[name] = event
                         tensor_on_device.record_stream(self.d2h_stream)
                         self._tensor_tag_to_state[tensor_tag] = state
         torch.cuda.nvtx.range_pop()
+        return True
 
     def get_offload_event(self, name):
         """Get the CUDA event for a named offload operation."""
@@ -388,8 +661,10 @@ class ChunkOffloadHandler:
     def bulk_reload_group(self, group_to_reload):
         """Bulk reload group."""
         debug_rank("----bulk_reload_group")
+        group_id_to_reload, name, fake_reload = group_to_reload
+        if fake_reload:
+            return True
         found_reload_group = False
-        group_id_to_reload, name = group_to_reload
         torch.cuda.nvtx.range_push("activation reloading " + name)
         with torch.cuda.stream(self.h2d_stream):
             for tensor_label, state in self._tensor_tag_to_state.items():
@@ -401,7 +676,8 @@ class ChunkOffloadHandler:
                     # Only reload if tensor was offloaded (stored as tuple)
                     if isinstance(state, tuple):
                         # Wait for offload to complete before reloading
-                        torch.cuda.current_stream().wait_event(event)
+                        if not is_graph_capturing():
+                            torch.cuda.current_stream().wait_event(event)
                         recovered_tensor = self.reload(state)
                         event.record(self.h2d_stream)
                         self._reload_events[name] = event
@@ -440,8 +716,13 @@ class ChunkOffloadHandler:
         debug_rank("----bulk_offload")
         if self.should_bulk_offload():
             group_to_offload = self._groups_to_offload.pop()
+            # if group_to_offload[0] == 8:
+            #     # print("rank", torch.distributed.get_rank(), "group_to_offload", group_to_offload)
+            #     return
             self._groups_to_reload.append(group_to_offload)
-            self.bulk_offload_group(group_to_offload)
+            ret = self.bulk_offload_group(group_to_offload)
+            if not ret:
+                return
             # Manually release tensors not auto-freed by torch GC
             if len(forced_released_tensors) > 0:
                 cur_stream = torch.cuda.current_stream()
@@ -453,6 +734,8 @@ class ChunkOffloadHandler:
 
     def on_group_commit_forward(self, forced_released_tensors):
         """Called at the end of a layer group's forward pass to trigger offloading."""
+        if not self.do_offload:
+            return
         debug_rank("--on_group_commit_forward")
         # Wait for compute to finish before starting offload
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
@@ -477,6 +760,8 @@ class ChunkOffloadHandler:
         Called at the end of a layer group's backward pass.
         Ensures correct chunk is active and synchronizes reloads.
         """
+        if not self.do_offload:
+            return
         debug_rank("--on_group_commit_backward")
         cur_backward_chunk = PipelineOffloadManager.get_instance().cur_backward_chunk()
         # Switch to this chunk if it's not already current
@@ -486,30 +771,43 @@ class ChunkOffloadHandler:
         assert cur_backward_chunk is self, "Chunk mismatch"
         # Wait for reload to complete before using tensors
         event = self.get_reload_event(name)
-        if event is not None:
+        if event is not None and not is_graph_capturing():
             torch.cuda.current_stream().wait_event(event)
         self._offloaded_group_index = self._offloaded_group_index - 1
 
-    def on_group_start_forward(self, name):
+    def on_group_start_forward(self, name, fake_offload=False):
         """
         Called at the start of a layer group's forward pass.
         Increments group index and prepares for offloading.
         """
+        if not self.do_offload:
+            return
         debug_rank(f"--on_group_start_forward")
         self._offloaded_group_index = self._offloaded_group_index + 1
         self._tensor_count_current_group = 0
-        self._groups_to_offload.append((self._offloaded_group_index, name))
+        self._groups_to_offload.append((self._offloaded_group_index, name, fake_offload))
 
     def on_group_start_backward(self):
         """
         Called at the start of a layer group's backward pass.
         Triggers reloading of tensors from CPU.
         """
+        if not self.do_offload:
+            return
         debug_rank("--on_group_start_backward")
         # Wait for compute to finish before starting reload
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_reload()
 
+def fine_grained_offloading_disable_offload():
+    """Disable the offload."""
+    debug_rank("fine_grained_offloading_disable_offload")
+    PipelineOffloadManager.get_instance().cur_forward_chunk().do_offload = False
+
+def fine_grained_offloading_enable_offload():
+    """Enable the offload."""
+    debug_rank("fine_grained_offloading_enable_offload")
+    PipelineOffloadManager.get_instance().cur_forward_chunk().do_offload = True
 
 class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
     """
@@ -563,12 +861,12 @@ class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, tensor, cpu_offload_handler, name):
+    def forward(ctx, tensor, cpu_offload_handler, name, fake_offload):
         # pylint: disable=missing-function-docstring
         ctx.cpu_offload_handler = cpu_offload_handler
         debug_rank("FineGrainedOffloadingGroupStartFunction forward")
 
-        cpu_offload_handler.on_group_start_forward(name)
+        cpu_offload_handler.on_group_start_forward(name, fake_offload)
         # return the identical tensor
         return tensor
 
@@ -578,13 +876,13 @@ class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
         debug_rank("FineGrainedOffloadingGroupStartFunction backward")
         cpu_offload_handler = ctx.cpu_offload_handler
         cpu_offload_handler.on_group_start_backward()
-        return grad_output, None, None
+        return grad_output, None, None, None
 
 
-def fine_grained_offloading_group_start(tensor, name=None):
+def fine_grained_offloading_group_start(tensor, name=None, fake_offload=False):
     """Mark the start of a layer group and prepare for offload/reload."""
     cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
-    return FineGrainedOffloadingGroupStartFunction.apply(tensor, cur_forward_chunk, name)
+    return FineGrainedOffloadingGroupStartFunction.apply(tensor, cur_forward_chunk, name, fake_offload)
 
 
 def get_fine_grained_offloading_context(flag):
@@ -603,7 +901,39 @@ def fine_grained_offloading_init_chunk_handler(vp_size, vp_stage, min_offloaded_
         vp_size, vp_stage, min_offloaded_tensor_size
     )
 
-
 def fine_grained_offloading_reset():
     """Reset the chunk handler, called at the start of a training iteration."""
     PipelineOffloadManager.get_instance().reset()
+
+def fine_grained_offloading_forward_record(event: torch.cuda.Event) -> None:
+    d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
+    torch.cuda.current_stream().record_event(event)
+    torch.cuda.current_stream().wait_stream(d2h_stream)
+
+class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
+    """
+    Identity operation that marks the end of a layer group for offload synchronization.
+    Triggers offload during forward and synchronizes reload during backward.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, event: torch.cuda.Event) -> torch.Tensor:
+        ctx.event = event
+        return tensor
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        h2d_stream = PipelineOffloadManager.get_instance().h2d_stream
+        torch.cuda.current_stream().record_event(ctx.event)
+        torch.cuda.current_stream().wait_stream(h2d_stream)
+        return grad_output, None
+
+def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> torch.Tensor:
+    return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
+
+def fine_grained_offloading_fake_offload(tensor):
+    """Fake offload."""
+    tensor = fine_grained_offloading_group_start(tensor, name="fake_offload", fake_offload=True)
+    (tensor,) = fine_grained_offloading_group_commit(tensor, name="fake_offload", forced_released_tensors=[])
+    return tensor
+    
