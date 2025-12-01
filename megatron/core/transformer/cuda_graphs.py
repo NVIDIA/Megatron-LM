@@ -1634,9 +1634,18 @@ class TECudaGraphHelper:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 fine_grained_offloading_disable_offload,
                 fine_grained_offloading_enable_offload,
+                fine_grained_offloading_init_chunk_handler,
             )
-            kwargs['pre_warmup_hook'] = fine_grained_offloading_disable_offload
-            kwargs['post_warmup_hook'] = fine_grained_offloading_enable_offload
+            from functools import partial
+            # if self.config.offload_module_in_cuda_graph:
+            if self.config.fine_grained_activation_offloading:
+                kwargs['pre_warmup_hook'] = fine_grained_offloading_disable_offload
+                kwargs['post_warmup_hook'] = fine_grained_offloading_enable_offload
+                kwargs['init_chunk_handler'] = partial(
+                    fine_grained_offloading_init_chunk_handler,
+                    vp_size=self.config.virtual_pipeline_model_parallel_size,
+                    min_offloaded_tensor_size=self.config.min_offloaded_tensor_size
+                )
             return kwargs
 
         kwargs = get_make_graphed_callables_kwargs()

@@ -949,6 +949,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
+        self.layers[-1].is_last_layer = True
         self.cp_group = pg_collection.cp
 
     def _build_layers(self, pg_collection):
@@ -1006,8 +1007,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hidden_states = hidden_states_list[offset]
         for layer_number in range(len(self.layers)):
-            if self.config.fine_grained_activation_offloading:
-                fine_grained_offloading_set_last_layer(layer_number == len(self.layers) - 1)
             (hidden_states, input_ids, position_ids) = self.layers[layer_number](
                 input_ids=input_ids,
                 position_ids=position_ids,
