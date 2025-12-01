@@ -9,7 +9,6 @@ import types
 
 import pytest
 import torch
-from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
@@ -26,7 +25,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -43,8 +41,6 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
-from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
@@ -57,8 +53,6 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
-
-fp8_available, _ = check_fp8_support()
 
 
 class TestParallelTransformerBlockCudagraphs:
@@ -753,9 +747,6 @@ class TestPartialCudaGraph:
     def setup_method(self, method):
         self.seq_length = 512
         self.micro_batch_size = 2
-        self.tp_size = 2
-        self.cp_size = 2
-        self.cuda_graph_helper = None
         # Store original environment variable values
         self.original_env = {
             'CUDA_DEVICE_MAX_CONNECTIONS': os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS'),
@@ -771,28 +762,22 @@ class TestPartialCudaGraph:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
-        if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
-            self.cuda_graph_helper.delete_cuda_graphs()
-            self.cuda_graph_helper = None
         gc.collect()
 
     def model_provider(
         self,
         pre_process=True,
         post_process=True,
-        layer_spec_fn=get_gpt_decoder_block_spec,
+        layer_spec_fn=get_gpt_layer_with_transformer_engine_spec,
         **config_kwargs,
     ):
+        model_parallel_cuda_manual_seed(123)
         args = get_args()
         config = core_transformer_config_from_args(args)
-        transformer_layer_spec = layer_spec_fn(
-            config,
-            use_transformer_engine=True,
-            normalization=args.normalization,
-            qk_l2_norm=args.qk_l2_norm,
-        )
+        transformer_layer_spec = layer_spec_fn()
         if args.mtp_num_layers:
             mtp_block_spec = get_gpt_mtp_block_spec(
                 config, transformer_layer_spec, use_transformer_engine=True
@@ -825,17 +810,18 @@ class TestPartialCudaGraph:
         args.num_layers = 4
         args.mtp_num_layers = 1
         args.vocab_size = 1024
-        args.hidden_size = 512
+        args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
-        args.global_batch_size = self.micro_batch_size * 8 // self.tp_size // self.cp_size
+        args.global_batch_size = self.micro_batch_size * 8
         args.micro_batch_size = self.micro_batch_size
         args.create_attention_mask_in_dataloader = True
         args.seq_length = self.seq_length
-        args.tensor_model_parallel_size = self.tp_size
-        args.sequence_parallel = True if self.tp_size > 1 else False
+        args.tensor_model_parallel_size = 2
+        args.sequence_parallel = True
         args.pipeline_model_parallel_size = 1
-        args.context_parallel_size = self.cp_size
+        args.context_parallel_size = 1
+        args.expert_model_parallel_size = ep_size
         args.train_iters = 10
         args.lr = 3e-5
         args.bf16 = True
@@ -850,26 +836,17 @@ class TestPartialCudaGraph:
         # MoE settings
         args.num_experts = 4
         args.expert_model_parallel_size = ep_size
-        args.expert_tensor_parallel_size = 1 if ep_size > 1 else self.tp_size
         args.moe_shared_expert_intermediate_size = 1024
-        args.moe_layer_freq = [0, 0, 1, 1]
+        args.moe_layer_freq = "[0,0,1,1]"
         args.moe_permute_fusion = True
         args.moe_router_fusion = True
         args.moe_router_topk = 2
-        args.moe_router_dtype = "fp32"
 
         # CUDA graph settings
         args.cuda_graph_impl = cuda_graph_impl
         args.cuda_graph_scope = cuda_graph_scope
         args.cuda_graph_warmup_steps = cuda_graph_warmup_steps
-
-        # fp8 settings
-        if fp8_available:
-            args.fp8 = "e4m3"
-            args.fp8_recipe = "tensorwise"
-            args.first_last_layers_bf16 = True
-            args.num_layers_at_start_in_bf16 = 1
-            args.num_layers_at_end_in_bf16 = 1
+        args.use_te_rng_tracker = cuda_graph_impl != "none"
 
         for key, value in kwargs.items():
             assert hasattr(args, key)
@@ -879,15 +856,15 @@ class TestPartialCudaGraph:
         set_global_variables(args, False)
         return args
 
-    def get_batch(self, seq_length, micro_batch_size, cp_size):
-        data = list(range(seq_length // cp_size))
+    def get_batch(self, seq_length, micro_batch_size):
+        data = list(range(seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         labels = 1 + torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         attention_mask = torch.ones(
-            (micro_batch_size, 1, seq_length // cp_size, seq_length), dtype=bool
+            (micro_batch_size, 1, seq_length, seq_length), dtype=bool
         ).cuda()
-        loss_mask = torch.ones(seq_length // cp_size).repeat((micro_batch_size, 1)).cuda()
+        loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def _run_test_helper(
@@ -900,10 +877,12 @@ class TestPartialCudaGraph:
 
         set_args(args)
         torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, expert_model_parallel_size=ep_size
+        )
 
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
-            self.seq_length, self.micro_batch_size, self.cp_size
+            self.seq_length, self.micro_batch_size
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
@@ -911,10 +890,13 @@ class TestPartialCudaGraph:
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
+        loss_list = []
+
+        cuda_graph_helper = None
         if cuda_graph_impl == "transformer_engine":
             from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 
-            self.cuda_graph_helper = TECudaGraphHelper(
+            cuda_graph_helper = TECudaGraphHelper(
                 model=gpt_model,
                 config=gpt_model[0].config,
                 seq_length=self.seq_length,
@@ -922,17 +904,14 @@ class TestPartialCudaGraph:
                 optimizers=[optimizer],
             )
 
-        loss_list = []
-
         for i in range(100):
             gpt_model[0].zero_grad_buffer()
             optimizer.zero_grad()
 
             # Capture CUDA graphs after warmup if helper is provided
-            if self.cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
-                self.cuda_graph_helper.create_cudagraphs()
+            if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
+                cuda_graph_helper.create_cudagraphs()
 
-            gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -943,7 +922,7 @@ class TestPartialCudaGraph:
 
             # Check output shapes
             assert output.shape[0] == self.micro_batch_size
-            assert output.shape[1] == self.seq_length // self.cp_size
+            assert output.shape[1] == self.seq_length
 
             # Verify gradients
             loss = output.mean()
@@ -957,29 +936,16 @@ class TestPartialCudaGraph:
 
             loss_list.append(loss.item())
 
-        if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
-            self.cuda_graph_helper.delete_cuda_graphs()
-            self.cuda_graph_helper = None
-
         return torch.tensor(loss_list)
 
     @pytest.mark.skipif(
-        not (HAVE_TE and is_te_min_version("2.10.0")),
-        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+        not (HAVE_TE and is_te_min_version("1.14.0")),
+        reason="Partial CUDA graph support requires TransformerEngine version >= 1.14.0",
     )
     @pytest.mark.parametrize("ep_size", [1, 4])
     @pytest.mark.parametrize("moe_dropless_dispatcher", [False, True])
     @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep"])
     def test_moe_partial_cudagraph(self, ep_size, moe_dropless_dispatcher, moe_dispatcher_type):
-        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=self.tp_size,
-            context_parallel_size=self.cp_size,
-            pipeline_model_parallel_size=1,
-            expert_tensor_parallel_size=1 if ep_size > 1 else self.tp_size,
-            expert_model_parallel_size=ep_size,
-        )
-
         extra_kwargs = {}
         if moe_dispatcher_type == "deepep":
             if not is_deep_ep_available():
@@ -996,28 +962,19 @@ class TestPartialCudaGraph:
         if not moe_dropless_dispatcher:
             if moe_dispatcher_type == "deepep":
                 pytest.skip("Deep EP doesn't support drop&pad MoE")
-            if moe_dispatcher_type == "hybridep" and ep_size == 1:
-                pytest.skip("Hybrid EP doesn't support drop&pad MoE with ep_size == 1")
             extra_kwargs["moe_expert_capacity_factor"] = 1.0
             extra_kwargs["moe_pad_expert_input_to_capacity"] = True
 
         loss_list_ref = self._run_test_helper(ep_size, "none", None, 0, **extra_kwargs)
         for cuda_graph_scope in [
             None,
-            [CudaGraphScope.attn],
-            [CudaGraphScope.moe],
-            [CudaGraphScope.mlp, CudaGraphScope.moe_router],
-            [
-                CudaGraphScope.attn,
-                CudaGraphScope.mlp,
-                CudaGraphScope.moe_router,
-                CudaGraphScope.moe_preprocess,
-            ],
+            ["attn"],
+            ["moe"],
+            ["mlp", "moe_router"],
+            ["attn", "mlp", "moe_router", "moe_preprocess"],
         ]:
-            if (moe_dropless_dispatcher or moe_dispatcher_type == "hybridep") and (
-                cuda_graph_scope is None or CudaGraphScope.moe in cuda_graph_scope
-            ):
-                # Dropless MoE or Hybrid EP doesn't work with "moe" scope cudagraph. Skip.
+            if moe_dropless_dispatcher and (cuda_graph_scope is None or "moe" in cuda_graph_scope):
+                # Dropless MoE doesn't work with "moe" scope cudagraph. Skip.
                 continue
             cuda_graph_warmup_steps = 3
             loss_list = self._run_test_helper(
@@ -1028,10 +985,6 @@ class TestPartialCudaGraph:
                 **extra_kwargs,
             )
             assert torch.equal(loss_list, loss_list_ref)
-
-        if moe_dispatcher_type == "hybridep":
-            reset_hybrid_ep_buffer()
-        Utils.destroy_model_parallel()
 
 
 if __name__ == "__main__":

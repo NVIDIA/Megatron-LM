@@ -16,7 +16,6 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
     fused_dispatch,
@@ -437,7 +436,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         }
         if (
             config.cuda_graph_impl == "transformer_engine"
-            and CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+            and 'moe_preprocess' in config.cuda_graph_scope
         ):
             self.cuda_dtoh_point = "before_ep_alltoall"
         else:
@@ -1076,13 +1075,10 @@ class _HybridEPManager(_DispatchManager):
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
-        # Release the used handle/num_permuted_tokens which could change in each iteration.
-        # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
-        # num_dispatched_tokens, because their values never change.
+        # Release the used handle/num_permuted_tokens which could change in each iteration
         self.handle = None
-        if not self.drop_and_pad:
-            self.num_permuted_tokens = None
-            self.num_dispatched_tokens = None
+        self.num_permuted_tokens = None
+        self.num_dispatched_tokens = None
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
