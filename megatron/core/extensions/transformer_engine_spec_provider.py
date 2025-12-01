@@ -41,7 +41,7 @@ class TESpecProvider(BackendSpecProvider):
         """TE backend chooses a single module for layernorm and linear"""
         return True
 
-    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+    def column_parallel_layer_norm_linear(self) -> type[TELayerNormColumnParallelLinear]:
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear
 

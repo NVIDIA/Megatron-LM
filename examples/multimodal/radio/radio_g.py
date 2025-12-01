@@ -3,6 +3,10 @@ from functools import partial
 
 import torch
 
+from examples.multimodal.layer_scaling import (
+    LayerScalingTransformerLayer,
+    get_bias_dropout_add_layer_scaling,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -11,7 +15,6 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from examples.multimodal.layer_scaling import LayerScalingTransformerLayer, get_bias_dropout_add_layer_scaling
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -24,6 +27,7 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    TELayerNormColumnParallelLinear = None
     HAVE_TE = False
 
 try:
@@ -106,6 +110,7 @@ def get_radio_g_layer_spec_te() -> ModuleSpec:
     attn_mask_type = AttnMaskType.no_mask
 
     mlp = get_norm_mlp_module_spec_te()
+    assert TELayerNormColumnParallelLinear is not None
     return ModuleSpec(
         module=LayerScalingTransformerLayer,
         submodules=TransformerLayerSubmodules(

@@ -6,7 +6,7 @@ import io
 import os
 import pickle
 import warnings
-from typing import Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, assert_never
 
 import torch
 import torch.nn.functional as F
@@ -55,14 +55,19 @@ from megatron.core.utils import (
 )
 
 try:
-    import transformer_engine as te
-
     HAVE_TE = True
-except ImportError:
-    from unittest.mock import MagicMock
 
-    te = MagicMock()
-    HAVE_TE = False
+    import transformer_engine as te
+except ImportError:
+    if TYPE_CHECKING:
+        import transformer_engine as te
+
+        # Force type checking to treat TE as available
+    else:
+        from unittest.mock import MagicMock
+
+        te = MagicMock()
+        HAVE_TE = False
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -461,7 +466,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         output_size: int,
         *,
         config: TransformerConfig,
-        init_method: Callable,
+        init_method: Callable[[torch.Tensor], None],
         gather_output: bool,
         bias: bool,
         skip_bias_add: bool,
@@ -607,7 +612,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch

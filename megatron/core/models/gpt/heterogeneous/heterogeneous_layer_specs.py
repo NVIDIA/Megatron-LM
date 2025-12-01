@@ -44,6 +44,7 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    TELayerNormColumnParallelLinear = None
     HAVE_TE = False
 
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
@@ -106,11 +107,16 @@ def _get_heterogenous_attention_spec(
         )
     else:
         ln = _get_qk_layernorm(use_te, normalization) if qk_layernorm else IdentityOp
+        if use_te:
+            assert TELayerNormColumnParallelLinear is not None
+            linear_qkv = TELayerNormColumnParallelLinear
+        else:
+            linear_qkv = ColumnParallelLinear
         self_attention = ModuleSpec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
-                linear_qkv=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
+                linear_qkv=linear_qkv,
                 core_attention=TEDotProductAttention if use_te else DotProductAttention,
                 linear_proj=TERowParallelLinear if use_te else RowParallelLinear,
                 q_layernorm=ln,

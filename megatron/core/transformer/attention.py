@@ -1,13 +1,15 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Tuple, Union
+from typing import NoReturn, Optional, Protocol, Tuple, Union, cast
 
 import torch
 from torch import Tensor
+from torch import distributed as dist
 
-from megatron.core import tensor_parallel
+from megatron.core import tensor_parallel, typed_torch
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -107,13 +109,41 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+class LinearQKV(Protocol):
+    """Protocol for a linear QKV layer."""
+
+    def forward(self, hidden_states: Tensor, /) -> Tuple[Tensor, Optional[Tensor]]: ...
+
+    def backward_dw(self) -> None: ...
+
+
+class LinearQKVBuilder(Protocol):
+    """Protocol for building linear QKV layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: Optional[dist.ProcessGroup],
+    ) -> LinearQKV: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
     Configuration class for specifying the submodules of a self-attention.
     """
 
-    linear_qkv: Union[ModuleSpec, type] = None
+    linear_qkv: LinearQKVBuilder
     core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
@@ -293,7 +323,9 @@ class Attention(MegatronModule, ABC):
         ), "Virtual pipeline parallelism is not supported for inference"
 
         # Import here to avoid circular imports
-        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+        from megatron.core.transformer.transformer_layer import (
+            get_transformer_layer_offset,
+        )
 
         return get_transformer_layer_offset(
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
@@ -998,12 +1030,11 @@ class SelfAttention(Attention):
             pg_collection=pg_collection,
         )
 
-        self.linear_qkv = build_module(
-            submodules.linear_qkv,
+        self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=cast(Callable[[torch.Tensor], None], self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
             skip_bias_add=False,
@@ -1109,7 +1140,7 @@ class SelfAttention(Attention):
         the unsplit mixed_qkv tensor is returned.
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
-        mixed_qkv, _ = self.linear_qkv(hidden_states)
+        mixed_qkv, _ = typed_torch.apply_module(self.linear_qkv)(hidden_states)
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
