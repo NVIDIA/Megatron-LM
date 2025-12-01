@@ -191,7 +191,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     seq_lengths = None
     attention_mask = None
 
-    if args.use_sequence_packing:
+    if args.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
         bin_idx = bin_tensor.item()
@@ -370,9 +370,9 @@ if __name__ == "__main__":
             return _gpt_builder(args, pre_process, post_process, vp_stage)
 
     pretrain(
-        train_valid_test_datasets_provider,  # This is currently a mock dataset that will be overriden inside of the train_step call for rl.
+        None,  # we don't need to build any datasets for RL training
         partial(model_provider, _model_builder),
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        args_defaults={}, 
     )
