@@ -41,6 +41,7 @@ class Platform:
 
         self._initialized = True
 
+
 @lru_cache(maxsize=1)
 def _get_platform() -> Platform:
     """

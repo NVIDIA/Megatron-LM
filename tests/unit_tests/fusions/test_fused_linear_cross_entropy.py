@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.a2a_overlap.utils import (
     deterministic_mode,
     get_test_config,
@@ -256,6 +257,9 @@ class TestFusedLinearCrossEntropyOnGptModel:
 
 @pytest.mark.skipif(
     "WORLD_SIZE" in os.environ and os.environ["WORLD_SIZE"] != "1", reason="Requires single GPU"
+)
+@pytest.mark.skipif(
+    get_device_arch_version() != 10, reason="Requires GPU architecture = 10"
 )
 class TestFusedLinearCrossEntropyDataParallel:
     def cleanup(self):
@@ -558,6 +562,9 @@ class TestFusedLinearCrossEntropyDataParallel:
     ("WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2),  # or True,
     reason="Requires torchrun with multiple GPUs",
 )
+@pytest.mark.skipif(
+    get_device_arch_version() != 10, reason="Requires GPU architecture = 10"
+)
 @pytest.mark.usefixtures("distributed_context")
 class TestFusedLinearCrossEntropyTensorParallel:
     @pytest.fixture(autouse=True)
@@ -684,6 +691,7 @@ class TestFusedLinearCrossEntropyTensorParallel:
     @pytest.mark.parametrize("problem", [(4096, 129280, 8192)])
     def test_torch_tp_vs_single_gpu(self, dtype, reduction, problem):
         num_tokens, vocabsize, dim = problem
+        vocabsize = vocabsize // self.tp_world_size
 
         hidden = (
             torch.empty((num_tokens, dim), dtype=dtype, device="cuda")
@@ -997,6 +1005,9 @@ class TestFusedLinearCrossEntropyTensorParallel:
     "WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2,
     reason="Requires torchrun with multiple GPUs",
 )
+@pytest.mark.skipif(
+    get_device_arch_version() != 10, reason="Requires GPU architecture = 10"
+)
 @pytest.mark.usefixtures("distributed_context")
 class TestFusedLinearCrossEntropySequenceParallel:
     @pytest.fixture(autouse=True)
@@ -1152,9 +1163,10 @@ class TestFusedLinearCrossEntropySequenceParallel:
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("reduction", ["mean", "sum", "none"])
-    @pytest.mark.parametrize("problem", [(256, 12928, 8192)])
+    @pytest.mark.parametrize("problem", [(256, 129280, 8192)])
     def test_torch_sp_vs_single_gpu(self, dtype, reduction, problem):
         num_tokens, vocabsize, dim = problem
+        vocabsize = vocabsize // self.tp_world_size
 
         hidden = (
             torch.empty((num_tokens, dim), dtype=dtype, device="cuda")

@@ -267,6 +267,11 @@ class MambaModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
+        if labels is None:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
             assert (
@@ -277,9 +282,6 @@ class MambaModel(LanguageModule):
             self.output_layer.sequence_parallel = True
 
         if labels is None:
-            logits, _ = self.output_layer(
-                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-            )
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 

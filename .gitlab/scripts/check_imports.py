@@ -49,6 +49,7 @@ class ImportChecker:
             ".git",
             "test_",
             "_test",
+            "blackwell",
         }
 
         # Add current directory to Python path if not already there
