@@ -49,18 +49,45 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr):
     # 3. Operands:
     #    - {$0, $1, $2, $3}: Destination registers (Output).
     #    - [$4]: Source memory address (Input).
-    return tl.inline_asm_elementwise(
-        f"@$5 {'multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2' if multicast_op else 'ld.global.relaxed.sys.v4.u32'} {{$0, $1, $2, $3}}, [$4];",
-        "=r,=r,=r,=r,l,b",  # Constraints: 4 outputs (=r), 1 ptr (l), 1 bool predicate (b)
-        args=[ptr, mask.to(tl.int1)],
+    if multicast_op: 
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.eq.s32 %p0, $5, 1;
+                @!%p0 bra end;
+                multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {$0, $1, $2, $3}, [$4];
+                end:
+            }
+            """,
+            "=r,=r,=r,=r,l,r",
+            args=[ptr, mask.to(tl.int32)],
+            dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
+            is_pure=True,
+            pack=1,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $5, 1;
+            @!%p0 bra end;
+            ld.global.relaxed.sys.v4.u32 {$0, $1, $2, $3}, [$4];
+            end:
+        }
+        """,
+        "=r,=r,=r,=r,l,r",
+        args=[ptr, mask.to(tl.int32)],
         dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
         is_pure=True,
         pack=1,
     )
 
 
+
 @triton.jit
-def st_128(ptr, x, y, z, w, mask, multicast_op: tl.constexpr):
+def st_128(ptr, x, y, z, w, mask, multicast_op):
     """
     Stores 128 bits (8 x bf16) from registers to memory.
 
@@ -92,11 +119,37 @@ def st_128(ptr, x, y, z, w, mask, multicast_op: tl.constexpr):
     # 3. Operands:
     #    - [$1]: Destination memory address.
     #    - {$2, $3, $4, $5}: Source registers containing data.
-    return tl.inline_asm_elementwise(
-        f"@$6 {'multimem.st.relaxed.sys.global.v4.f32' if multicast_op else 'st.global.relaxed.sys.v4.u32'} [$1], {{$2, $3, $4, $5}};",   
-        "=r,l,r,r,r,r,b", # Constraints: 1 unused output (=r), 1 ptr (l), 4 data (r), 1 bool predicate (b)
-        args=[ptr, x, y, z, w, mask.to(tl.int1)],
-        dtype=tl.uint32,
+    if multicast_op:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.eq.s32 %p0, $6, 1;
+                @!%p0 bra end;
+                multimem.st.relaxed.sys.global.v4.f32 [$1], {$2, $3, $4, $5};
+                end:
+            }
+            """,
+            "=r,l,r,r,r,r,r",
+            args=[ptr, x, y, z, w, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $6, 1;
+            @!%p0 bra end;
+            st.global.relaxed.sys.v4.f32 [$1], {$2, $3, $4, $5};
+            end:
+        }
+        """,
+        "=r,l,r,r,r,r,r",
+        args=[ptr, x, y, z, w, mask.to(tl.int32)],
+        dtype=(tl.uint32),
         is_pure=False,
         pack=1,
     )
