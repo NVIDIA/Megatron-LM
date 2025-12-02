@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
 from typing import List, Optional, Union
@@ -6,7 +6,11 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.fp4_utils import get_fp4_align_size
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -905,12 +909,16 @@ class RandomSTE(torch.autograd.Function):
     """
 
     generator = None
+    random_logits = None
 
     @staticmethod
     def forward(ctx, logits):
         """
         Forward pass returns random logits with rank-specific seed.
         """
+        if is_graph_capturing() and RandomSTE.random_logits is not None:
+            return RandomSTE.random_logits
+
         if RandomSTE.generator is None:
             global_rank = torch.distributed.get_rank()
             base_seed = 42
@@ -918,8 +926,8 @@ class RandomSTE(torch.autograd.Function):
             RandomSTE.generator = torch.Generator(device=logits.device)
             RandomSTE.generator.manual_seed(seed)
 
-        random_logits = logits.clone().normal_(generator=RandomSTE.generator)
-        return random_logits
+        RandomSTE.random_logits = logits.clone().normal_(generator=RandomSTE.generator)
+        return RandomSTE.random_logits
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -1006,6 +1014,15 @@ def router_gating_linear(
     It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
     """
     return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+
+
+def get_align_size_for_quantization(config: TransformerConfig):
+    """Get the alignment size for quantization."""
+    if config.fp8:
+        return get_fp8_align_size(config.fp8_recipe)
+    elif config.fp4:
+        return get_fp4_align_size(config.fp4_recipe)
+    return 16
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
