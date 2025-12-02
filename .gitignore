@@ -16,3 +16,5 @@ onelogger.err
 runs/
 /test_cases/
 **/dist/
+*.swp
+*.swo
