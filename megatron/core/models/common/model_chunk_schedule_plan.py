@@ -89,34 +89,30 @@ class TransformerLayerSchedulePlan:
         self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
 
     def __del__(self):
-        try:
-            if hasattr(self, 'attn') and self.attn is not None:
-                del self.attn
-                self.attn = None
-            if hasattr(self, 'post_attn') and self.post_attn is not None:
-                del self.post_attn
-                self.post_attn = None
-            if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
-                del self.moe_dispatch
-                self.moe_dispatch = None
-            if hasattr(self, 'mlp') and self.mlp is not None:
-                del self.mlp
-                self.mlp = None
-            if hasattr(self, 'moe_combine') and self.moe_combine is not None:
-                del self.moe_combine
-                self.moe_combine = None
-            if hasattr(self, 'mtp_post_process') and self.mtp_post_process is not None:
-                del self.mtp_post_process
-                self.mtp_post_process = None
-            if hasattr(self, 'layer_state') and self.layer_state is not None:
-                del self.layer_state
-                self.layer_state = None
+        if hasattr(self, 'attn') and self.attn is not None:
+            del self.attn
+            self.attn = None
+        if hasattr(self, 'post_attn') and self.post_attn is not None:
+            del self.post_attn
+            self.post_attn = None
+        if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
+            del self.moe_dispatch
+            self.moe_dispatch = None
+        if hasattr(self, 'mlp') and self.mlp is not None:
+            del self.mlp
+            self.mlp = None
+        if hasattr(self, 'moe_combine') and self.moe_combine is not None:
+            del self.moe_combine
+            self.moe_combine = None
+        if hasattr(self, 'mtp_post_process') and self.mtp_post_process is not None:
+            del self.mtp_post_process
+            self.mtp_post_process = None
+        if hasattr(self, 'layer_state') and self.layer_state is not None:
+            del self.layer_state
+            self.layer_state = None
+        if hasattr(self, 'layer'):
+            del self.layer
 
-            if hasattr(self, 'layer'):
-                del self.layer
-
-        except Exception:
-            pass
 
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
