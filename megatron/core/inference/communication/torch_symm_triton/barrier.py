@@ -1,6 +1,8 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from unittest.mock import MagicMock
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 
+# Adapted from: https://github.com/meta-pytorch/kraken.git
+
+from unittest.mock import MagicMock
 from megatron.core.utils import null_decorator
 
 try:
@@ -11,7 +13,7 @@ except ImportError:
     tl = MagicMock()
     triton.jit = null_decorator
 
-from .triton_utils import get_flat_bid, get_flat_tid
+from .utils import get_flat_bid, get_flat_tid
 
 
 @triton.jit

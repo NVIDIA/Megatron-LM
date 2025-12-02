@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from unittest.mock import MagicMock
 from megatron.core.utils import null_decorator
 

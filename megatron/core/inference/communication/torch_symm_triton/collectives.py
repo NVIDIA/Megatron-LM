@@ -21,9 +21,9 @@ try:
 except ImportError:
     _SymmetricMemory = MagicMock()
 
-from .asm_utils import ld_128, st_128
-from .triton_barrier import symm_mem_sync
-from .triton_utils import get_flat_tid, sync_threads
+from .multimem_asm import ld_128, st_128
+from .barrier import symm_mem_sync
+from .utils import get_flat_tid, sync_threads
 
 
 

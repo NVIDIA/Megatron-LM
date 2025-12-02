@@ -1,6 +1,8 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from unittest.mock import MagicMock
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 
+# Adapted from: https://github.com/meta-pytorch/kraken.git
+
+from unittest.mock import MagicMock
 from megatron.core.utils import null_decorator
 
 try:
@@ -78,5 +80,3 @@ def sync_threads():
     """
     tl.inline_asm_elementwise("bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
 
-
-triton_kernels = {}
