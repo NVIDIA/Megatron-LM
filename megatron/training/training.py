@@ -616,7 +616,7 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
-    if getattr(args, "batch_invariant_mode", False):
+    if args.batch_invariant_mode:
         print_rank_0("Enabling batch invariant mode globally",flush=True)
         enable_batch_invariant_mode()
 
