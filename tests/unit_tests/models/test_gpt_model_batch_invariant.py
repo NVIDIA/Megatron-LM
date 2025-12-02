@@ -23,9 +23,18 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from megatron.rl.rl_utils import selective_log_softmax
 from tests.unit_tests.test_utilities import Utils
+try:
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    from flash_attn_3.flash_attn_interface import (
+        flash_attn_with_kvcache as flash_attn3_with_kvcache,
+    )
 
+    HAVE_FA3 = True
+except ImportError:
+    HAVE_FA3 = False
 
 class DummyTokenizer:
     def __init__(self, vocab_size: int, bos: int | None = None, eod: int = 0, pad: int = 0):
@@ -105,6 +114,10 @@ def _train_forward_logprobs(model: torch.nn.Module, tokens: torch.Tensor) -> tor
     return logprobs
 
 
+@pytest.mark.skipif(
+    not (is_te_min_version("2.10.0") and HAVE_FA3),
+    reason="TestGPTModelBatchInvariant requires TE >= 2.10.0 and FlashAttention-3",
+)
 class TestGPTModelBatchInvariant:
     """End-to-end batch-invariance tests for GPT."""
 

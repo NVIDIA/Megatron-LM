@@ -17,10 +17,17 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import init_method_normal
+from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 te_cpp = importlib.import_module("transformer_engine.pytorch.cpp_extensions")
+
+try:
+    import flash_attn_3
+
+    HAVE_FA3 = True
+except ImportError:
+    HAVE_FA3 = False
 
 
 # ============================================================================
@@ -304,6 +311,10 @@ def test_column_parallel_linear_batch_invariant_randomized():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(
+    not (is_te_min_version("2.10.0") and HAVE_FA3),
+    reason="TE attention BIK tests require TE >= 2.10.0 and FlashAttention-3",
+)
 def test_te_attention_layer_batch_invariant_randomized():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
