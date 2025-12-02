@@ -1159,6 +1159,66 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_chunked_prefill_with_log_probs(self):
+        """
+        Test that chunked prefill correctly handles log probs with materialize_only_last_token_logits.
+        This verifies that intermediate log probs are properly discarded during chunked prefill.
+        When materialize_only_last_token_logits=True, skip_prompt_log_probs must be True.
+        """
+        prompt_length = 1200
+        num_tokens_to_generate = 8
+
+        # Run with chunked prefill, materialize_only_last_token_logits=True, and skip_prompt_log_probs=True
+        # This is the only valid combination for chunked prefill with last-token-only logits
+        env = self._run_test(
+            num_requests=1,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=num_tokens_to_generate,
+            materialize_only_last_token_logits=True,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            model_provider="gpt",
+            context_block_size_tokens=256,
+            context_max_tokens=1000,
+        )
+
+        # Validate results
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # Validate generated log probs
+            assert (
+                request.generated_log_probs is not None
+            ), f"Request {request.request_id}: generated_log_probs should not be None"
+            assert len(request.generated_log_probs) == len(request.generated_tokens), (
+                f"Request {request.request_id}: Expected {len(request.generated_tokens)} "
+                f"generated log probs, got {len(request.generated_log_probs)}"
+            )
+
+            # When skip_prompt_log_probs is True, prompt_log_probs should be empty
+            assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
+                f"Request {request.request_id}: prompt_log_probs should be empty when "
+                f"skip_prompt_log_probs=True, but got {len(request.prompt_log_probs) if request.prompt_log_probs else 0} items"
+            )
+
+            # Validate each generated log prob
+            for i, log_prob in enumerate(request.generated_log_probs):
+                assert not math.isnan(log_prob) and not math.isinf(log_prob), (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} is invalid"
+                )
+                assert -50.0 <= log_prob <= 0.0, (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
+                )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
     def test_top_n_logprobs_dynamic(self, skip_prompt_log_probs: bool):
