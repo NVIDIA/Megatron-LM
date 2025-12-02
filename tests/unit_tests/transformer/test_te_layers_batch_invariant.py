@@ -308,13 +308,11 @@ def test_column_parallel_linear_batch_invariant_randomized():
 def test_te_attention_layer_batch_invariant_randomized():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    # Reaffirm backend env for this specific test and clear TE's attention backend cache so that
-    # FlashAttention is re-selected with the latest env settings.
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
     os.environ["NVTE_FUSED_ATTN"] = "0"
     os.environ["NVTE_FLASH_ATTN"] = "1"
     os.environ["NVTE_UNFUSED_ATTN"] = "0"
-    Utils.initialize_model_parallel(1, 1)
-    model_parallel_cuda_manual_seed(123)
 
     cfg = TransformerConfig(
         num_layers=1,
