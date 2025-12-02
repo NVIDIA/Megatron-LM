@@ -1554,6 +1554,7 @@ class TECudaGraphHelper:
         # Get the PP and VPP scheduling order.
         from megatron.core.pipeline_parallel.schedules import (
             convert_schedule_table_to_order,
+            get_overlap_moe_expert_parallel_comm_order,
             get_pp_rank_microbatches,
             get_schedule_table,
         )
@@ -1579,6 +1580,25 @@ class TECudaGraphHelper:
             level=logging.DEBUG,
             msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
+        if self.config.overlap_moe_expert_parallel_comm:
+            wgrad_in_graph_scope = "attn" in self.config.cuda_graph_scope or (
+                "moe_router" in self.config.cuda_graph_scope
+                and self.config.moe_shared_expert_intermediate_size is not None
+                and not self.config.moe_shared_expert_overlap
+            )
+            capture_wgrad_graph = self.config.delay_wgrad_compute and wgrad_in_graph_scope
+            order = get_overlap_moe_expert_parallel_comm_order(
+                order, self.num_layers_per_chunk, capture_wgrad_graph
+            )
+            self.num_layers_per_chunk = [1] * sum(self.num_layers_per_chunk)
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=None,
+                dp_cp_group=None,
+                level=logging.DEBUG,
+                msg=f'Rank {torch.distributed.get_rank()}: '
+                f'ORDER after overlap_moe_expert_parallel_comm {order}',
+            )
 
         def get_make_graphed_callables_kwargs():
             kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
@@ -1692,13 +1712,17 @@ class TECudaGraphHelper:
             for layer_number, layer in enumerate(layers):
                 layer.cuda_graphs = []
                 for batch_number in range(get_num_microbatches()):
-                    layer.cuda_graphs.append(
-                        graphs[
+                    if self.config.overlap_moe_expert_parallel_comm:
+                        graph_idx = (
+                            num_layers_accumulated + layer_number
+                        ) * get_num_microbatches() + batch_number
+                    else:
+                        graph_idx = (
                             num_layers_accumulated * get_num_microbatches()
                             + batch_number * len(layers)
                             + layer_number
-                        ]
-                    )
+                        )
+                    layer.cuda_graphs.append(graphs[graph_idx])
             num_layers_accumulated += len(layers)
 
         self._finish_capturing(start_time)
@@ -1712,3 +1736,33 @@ class TECudaGraphHelper:
             model_chunk = self.model[chunk_number]
             for layer in layers:
                 layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
+
+    def delete_cuda_graphs(self):
+        """
+        Delete all CUDA graphs.
+        """
+        assert self._graphs_created, "CUDA Graphs have not been created."
+
+        graph_resettable = is_te_min_version("2.10.0")
+        graphs_reset, graphs_not_reset = 0, 0
+        for layers in self.callables_per_chunk:
+            for layer in layers:
+                for graph in layer.cuda_graphs:
+                    if graph_resettable:
+                        graph.reset()
+                        graphs_reset += 1
+                    else:
+                        graphs_not_reset += 1
+                layer.cuda_graphs = []
+                layer.cuda_graph_manual_hooks = []
+
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=None,
+            dp_cp_group=None,
+            level=logging.INFO,
+            msg=f'Rank {torch.distributed.get_rank()}: '
+            f'{graphs_reset} graphs deleted with explicit reset, '
+            f'{graphs_not_reset} graphs deleted without explicit reset.',
+        )
+        self._graphs_created = False
