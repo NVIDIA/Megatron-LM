@@ -3,11 +3,10 @@
 import random
 from typing import Any, Iterable
 
+from megatron.rl.agent.huggingface_dataset_agent import HFDatasetAgent
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 
 from .countdown import compute_score
-
-from megatron.rl.agent.huggingface_dataset_agent import HFDatasetAgent
 
 
 class CountdownAgent(RewardOnlyAgent, HFDatasetAgent):
