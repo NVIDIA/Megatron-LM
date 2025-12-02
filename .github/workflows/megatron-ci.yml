@@ -3,8 +3,7 @@ name: Megatron-LM CI
 on:
   push:
     branches:
-      - main
-      - 'release*'
+      - rocm_dev
   pull_request:
     branches:
       - '**'
