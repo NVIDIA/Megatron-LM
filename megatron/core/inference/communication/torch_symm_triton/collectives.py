@@ -21,10 +21,9 @@ try:
 except ImportError:
     _SymmetricMemory = MagicMock()
 
-from .multimem_asm import ld_128, st_128
 from .barrier import symm_mem_sync
+from .multimem_asm import ld_128, st_128
 from .utils import get_flat_tid, sync_threads
-
 
 
 @triton.jit
@@ -69,19 +68,21 @@ def _multimem_all_gather_kernel(
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
 
     sync_threads()
-    symm_mem_sync(signal_pad_ptrs, 
-                  None, 
-                  RANK, 
-                  WORLD_SIZE, 
-                  hasPreviousMemAccess=True, 
-                  hasSubsequentMemAccess=True)
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=True,
+        hasSubsequentMemAccess=True,
+    )
 
 
 def multimem_all_gather(
-    output_tensor: torch.Tensor, 
-    input_tensor: torch.Tensor, 
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
     symm_mem_hdl: _SymmetricMemory,
-    **kwargs
+    **kwargs,
 ) -> torch.Tensor:
     """
     Calls a multicast all-gather triton kernel on the given tensor.
@@ -141,12 +142,14 @@ def _multimem_reduce_scatter_kernel(
     """
     Triton kernel to perform multicast reduce-scatter over nvlink using multimem instructions.
     """
-    symm_mem_sync(signal_pad_ptrs, 
-                  None, 
-                  RANK, 
-                  WORLD_SIZE, 
-                  hasPreviousMemAccess=False, 
-                  hasSubsequentMemAccess=False)
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=False,
+        hasSubsequentMemAccess=False,
+    )
     sync_threads()
 
     pid = tl.program_id(axis=0)
@@ -173,10 +176,10 @@ def _multimem_reduce_scatter_kernel(
 
 
 def multimem_reduce_scatter(
-    output_tensor: torch.Tensor, 
-    input_tensor: torch.Tensor, 
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
     symm_mem_hdl: _SymmetricMemory,
-    **kwargs
+    **kwargs,
 ) -> torch.Tensor:
     """
     Calls a multicast reduce-scatter triton kernel on the given tensor.
@@ -204,14 +207,13 @@ def multimem_reduce_scatter(
 
     assert input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
     assert output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
-    numel_per_thread = 128 // ( output_tensor.element_size() * 8 )
+    numel_per_thread = 128 // (output_tensor.element_size() * 8)
 
     assert (
         input_tensor.numel() % numel_per_thread == 0
     ), "The number of elements must be 128-bit aligned."
 
-
-    num_threads = triton.cdiv(input_tensor.numel() // numel_per_thread, symm_mem_hdl.world_size)    
+    num_threads = triton.cdiv(input_tensor.numel() // numel_per_thread, symm_mem_hdl.world_size)
     num_blocks = min(triton.cdiv(num_threads, config["BLOCK_SIZE"]), config["max_num_blocks"])
 
     _multimem_reduce_scatter_kernel[(num_blocks, 1, 1)](

@@ -3,6 +3,7 @@
 # Adapted from: https://github.com/meta-pytorch/kraken.git
 
 from unittest.mock import MagicMock
+
 from megatron.core.utils import null_decorator
 
 try:
@@ -103,14 +104,10 @@ def symm_mem_sync(
 
     remote_ranks = tl.arange(0, world_size)
     signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
-    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(
-        tl.pointer_type(tl.uint32)
-    )
+    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(tl.pointer_type(tl.uint32))
     send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
 
-    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(
-        tl.pointer_type(tl.uint32)
-    )
+    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
     wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
 
     if flat_tid < world_size:

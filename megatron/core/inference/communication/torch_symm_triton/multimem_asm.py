@@ -1,6 +1,7 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 
 from unittest.mock import MagicMock
+
 from megatron.core.utils import null_decorator
 
 try:
@@ -16,18 +17,18 @@ except ImportError:
 def ld_128(ptr, mask, multicast_op: tl.constexpr):
     """
     Loads 128 bits (8 x bf16) from memory into registers.
-    
+
     This function abstracts two distinct hardware behaviors based on `multicast_op`:
-    
-    1.  **Standard Load (`multicast_op=False`)**: 
+
+    1.  **Standard Load (`multicast_op=False`)**:
         -   **Semantics:** Local Global Memory Load.
         -   **Action:** Reads 128 bits from `ptr` in global memory into the local register file.
         -   **Use Case:** Standard tensor processing.
 
     2.  **Multicast Reduce-Load (`multicast_op=True`)**:
         -   **Semantics:** "Pull" Reduction over NVLink.
-        -   **Action:** Simultaneously reads 128 bits from the *same* address across all peer GPUs 
-            in the multicast group, sums them (add reduction), and loads the result into the 
+        -   **Action:** Simultaneously reads 128 bits from the *same* address across all peer GPUs
+            in the multicast group, sums them (add reduction), and loads the result into the
             local register file.
         -   **Hardware:** Uses `multimem.ld_reduce` (Hopper+).
         -   **Use Case:** The "Reduce" step in collective operations.
@@ -35,7 +36,8 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr):
     Args:
         ptr: Memory pointer to the source buffer.
         mask: Boolean predicate. If False, the operation is skipped (no-op).
-        multicast_op (tl.constexpr): Toggles between standard load (False) and multicast-reduce (True).
+        multicast_op (tl.constexpr): Toggles between standard load (False)
+        and multicast-reduce (True).
 
     Returns:
         Four 32-bit registers (tl.uint32), representing 128 bits of loaded data.
@@ -49,13 +51,13 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr):
     # 3. Operands:
     #    - {$0, $1, $2, $3}: Destination registers (Output).
     #    - [$4]: Source memory address (Input).
-    if multicast_op: 
+    if multicast_op:
         return tl.inline_asm_elementwise(
             """
             {
                 .reg .pred %p0;
-                setp.eq.s32 %p0, $5, 1;
-                @!%p0 bra end;
+                setp.ne.s32 %p0, $5, 1;
+                @%p0 bra end;
                 multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {$0, $1, $2, $3}, [$4];
                 end:
             }
@@ -68,22 +70,21 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr):
         )
     else:
         return tl.inline_asm_elementwise(
-        """
+            """
         {
             .reg .pred %p0;
-            setp.eq.s32 %p0, $5, 1;
-            @!%p0 bra end;
+            setp.ne.s32 %p0, $5, 1;
+            @%p0 bra end;
             ld.global.relaxed.sys.v4.u32 {$0, $1, $2, $3}, [$4];
             end:
         }
         """,
-        "=r,=r,=r,=r,l,r",
-        args=[ptr, mask.to(tl.int32)],
-        dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
-        is_pure=True,
-        pack=1,
-    )
-
+            "=r,=r,=r,=r,l,r",
+            args=[ptr, mask.to(tl.int32)],
+            dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
+            is_pure=True,
+            pack=1,
+        )
 
 
 @triton.jit
@@ -99,7 +100,7 @@ def st_128(ptr, x, y, z, w, mask, multicast_op):
 
     2.  **Multicast Store (`multicast_op=True`)**:
         -   **Semantics:** "Push" Broadcast over NVLink.
-        -   **Action:** Writes 128 bits from local registers to the `ptr` address in 
+        -   **Action:** Writes 128 bits from local registers to the `ptr` address in
             the global memory of **all** peer GPUs in the multicast group simultaneously.
         -   **Hardware:** Uses `multimem.st` (Hopper+).
         -   **Use Case:** The "Broadcast" or "All-Gather" step in collective operations.
@@ -108,7 +109,8 @@ def st_128(ptr, x, y, z, w, mask, multicast_op):
         ptr: Memory pointer to the destination buffer.
         x, y, z, w: Four 32-bit registers containing the data to store.
         mask: Boolean predicate. If False, the store is skipped.
-        multicast_op (tl.constexpr): Toggles between standard store (False) and multicast broadcast (True).
+        multicast_op (tl.constexpr): Toggles between standard store (False)
+        and multicast broadcast (True).
     """
     # PTX Assembly Logic:
     # 1. @$6: Predication. Only execute if argument 6 (mask) is True.
@@ -124,8 +126,8 @@ def st_128(ptr, x, y, z, w, mask, multicast_op):
             """
             {
                 .reg .pred %p0;
-                setp.eq.s32 %p0, $6, 1;
-                @!%p0 bra end;
+                setp.ne.s32 %p0, $6, 1;
+                @%p0 bra end;
                 multimem.st.relaxed.sys.global.v4.f32 [$1], {$2, $3, $4, $5};
                 end:
             }
@@ -138,18 +140,18 @@ def st_128(ptr, x, y, z, w, mask, multicast_op):
         )
     else:
         return tl.inline_asm_elementwise(
-        """
+            """
         {
             .reg .pred %p0;
-            setp.eq.s32 %p0, $6, 1;
-            @!%p0 bra end;
+            setp.ne.s32 %p0, $6, 1;
+            @%p0 bra end;
             st.global.relaxed.sys.v4.f32 [$1], {$2, $3, $4, $5};
             end:
         }
         """,
-        "=r,l,r,r,r,r,r",
-        args=[ptr, x, y, z, w, mask.to(tl.int32)],
-        dtype=(tl.uint32),
-        is_pure=False,
-        pack=1,
-    )
+            "=r,l,r,r,r,r,r",
+            args=[ptr, x, y, z, w, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
