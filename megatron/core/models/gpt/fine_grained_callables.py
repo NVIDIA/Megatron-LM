@@ -60,9 +60,10 @@ def should_free_input(name, is_moe, enable_deepep, enable_hybridep):
     free_input_nodes = {
         "mlp": not enable_hybridep,
         "moe_combine": True,
-        # For DeepEP and HybridEP dispatcher mode, the input is the un-dispatched tokens and probs
-        # before dispatch A2A and it's not needed anymore after the forward pass
-        # For DeepEP and HybridEP dispatcher mode, they are both needed in backward pass, so they cannot be freed.
+        # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
+        # and probs before dispatch A2A and it's not needed anymore after the forward pass
+        # For DeepEP and HybridEP dispatcher mode, they are both needed in backward pass
+        # and cannot be freed.
         "moe_dispatch": not (enable_deepep or enable_hybridep),
     }
 
@@ -279,7 +280,9 @@ class TransformerLayerNode(ScheduleNode):
         detached_grad = tuple([e.grad for e in self.detached])
         grads = output_grad + detached_grad
         self.default_backward_func(outputs + self.before_detached, grads)
-        # release the output grad memory after use
+        # release the output grad memory after backward finishes,
+        # except when delay_wgrad_comptue is enabled, the grad should be
+        # kept until all modules' backward_dw has been invoked.
         if self.delay_wgrad_compute:
             self.output_grads = grads
             self.delay_grads_release = True
