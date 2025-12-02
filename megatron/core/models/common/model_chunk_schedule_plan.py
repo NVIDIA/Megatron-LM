@@ -113,7 +113,6 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'layer'):
             del self.layer
 
-
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
