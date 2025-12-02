@@ -52,6 +52,13 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] BF16 training - no quantization modi
 # =============================================================================
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] Starting training execution..."
+# Modify linear layer quantization
+sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/\1'bf16'/" \
+    megatron/core/tensor_parallel/layers.py
+
+# Modify attention quantization
+sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/\1'bf16'/" \
+    megatron/core/transformer/dot_product_attention.py
 
 # Execute the training script with timestamped logging
 bash examples/llama/train_llama32_1b_h100_fp8.sh \
