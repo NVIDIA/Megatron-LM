@@ -25,6 +25,8 @@ from torch.distributed.checkpoint.metadata import (
 from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 
+from .utils import get_mesh_names
+
 
 def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     """
@@ -272,7 +274,14 @@ def gather_uneven_dtensor_to_full_tensor(
     if not device_mesh.mesh_dim_names:
         process_group = device_mesh.get_group()
     else:
-        process_group = device_mesh._flatten().get_group()
+        # Check if the fully-flattened mesh exists first.
+        full_flattened_mesh_dim_name = "_".join(device_mesh.mesh_dim_names)
+        if full_flattened_mesh_dim_name in get_mesh_names(device_mesh):
+            # Retrieve the existing flattened DeviceMesh ProcessGroup.
+            process_group = device_mesh[full_flattened_mesh_dim_name].get_group()
+        else:
+            # Create the _-separated flattened DeviceMesh ProcessGroup.
+            process_group = device_mesh._flatten().get_group()
 
     # Collect chunk metadata for uneven shards (update if missing)
     if not hasattr(dtensor._local_tensor, "__create_chunk_list__"):

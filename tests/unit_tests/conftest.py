@@ -1,5 +1,6 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -8,9 +9,7 @@ import torch.distributed
 
 from megatron.core import config
 from megatron.core.utils import is_te_min_version
-from tests.test_utils.python_scripts.download_unit_tests_dataset import (
-    get_oldest_release_and_assets,
-)
+from tests.test_utils.python_scripts.download_unit_tests_dataset import download_and_extract_asset
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -83,7 +82,7 @@ def ensure_test_data():
 
         try:
             # Download assets to /opt/data
-            get_oldest_release_and_assets(assets_dir=str(data_path))
+            download_and_extract_asset(assets_dir=str(data_path))
 
             print("Test data downloaded successfully.")
 
