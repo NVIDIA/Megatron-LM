@@ -20,6 +20,7 @@ from ..inference import (
 
 from megatron.core.utils import trace_async_exceptions
 
+
 class AgentBaseModel(BaseModel, extra='allow'):
     pass
 
