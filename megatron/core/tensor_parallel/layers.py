@@ -841,9 +841,9 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         }
         
         # 使用集成了tensor保存功能的算子
-        from quant.mxfp import mxfp_matmul
-        from quant.hifp import hifp_matmul
-        from quant.bf16_operators import bf16_matmul
+        from fake_quant_ops.quant.mxfp import mxfp_matmul
+        from fake_quant_ops.quant.hifp import hifp_matmul
+        from fake_quant_ops.quant.bf16_operators import bf16_matmul
         
         if custom_quant_type == 'mxfp4':
             output = mxfp_matmul(
@@ -963,8 +963,8 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
                 }
             )
         
-        from quant.mxfp import mxfp_matmul
-        from quant.hifp import hifp_matmul
+        from fake_quant_ops.quant.mxfp import mxfp_matmul
+        from fake_quant_ops.quant.hifp import hifp_matmul
         custom_quant_type = 'bf16'
         if custom_quant_type == 'mxfp4':
             grad_input = mxfp_matmul(grad_output,weight,'fp4_e2m1').to(torch.bfloat16)
@@ -1070,7 +1070,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             }
             
             # 使用BF16算子计算梯度并自动保存
-            from quant.bf16_operators import bf16_matmul
+            from fake_quant_ops.quant.bf16_operators import bf16_matmul
             grad_weight = bf16_matmul(
                 grad_output.t(), total_input,
                 **tensor_save_params

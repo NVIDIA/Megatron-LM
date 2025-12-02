@@ -100,7 +100,7 @@ def get_layer_and_pass(filename: str) -> tuple:
     return layer, pass_type
 
 def remove_scaling(tensor: torch.Tensor,elem_format: str) -> torch.Tensor:
-    from quant.mxfp_scaling_test import remove_scaling
+    from fake_quant_ops.utils.mxfp_scaling_test import remove_scaling
     if elem_format == 'hifp8':
         return tensor
     elif elem_format == 'mxfp8e4m3':

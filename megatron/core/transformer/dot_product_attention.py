@@ -163,9 +163,9 @@ class DotProductAttention(MegatronModule):
 
         # Raw attention scores. [b * np, sq, sk]
         # import pdb;pdb.set_trace()
-        from quant.mxfp import mxfp_baddbmm
-        from quant.hifp import hifp_baddbmm
-        from quant.bf16_operators import bf16_baddbmm
+        from fake_quant_ops.quant.mxfp import mxfp_baddbmm
+        from fake_quant_ops.quant.hifp import hifp_baddbmm
+        from fake_quant_ops.quant.bf16_operators import bf16_baddbmm
         # 从环境变量获取量化类型，默认为hifp8
         import os
         custom_quant_type = 'bf16'
@@ -292,9 +292,9 @@ class DotProductAttention(MegatronModule):
         attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
 
         # matmul: [b * np, sq, hn]
-        from quant.mxfp import mxfp_matmul
-        from quant.hifp import hifp_matmul
-        from quant.bf16_operators import bf16_matmul
+        from fake_quant_ops.quant.mxfp import mxfp_matmul
+        from fake_quant_ops.quant.hifp import hifp_matmul
+        from fake_quant_ops.quant.bf16_operators import bf16_matmul
         # 使用相同的量化类型
         # custom_quant_type 已在上面定义
         
