@@ -243,7 +243,7 @@ class TestParallelTransformerLayer:
 
         for (pipeline_rank, vp_stage), expected_offset in expected_offsets.items():
             original_get_pipeline_rank = parallel_state.get_pipeline_model_parallel_rank
-            parallel_state.get_pipeline_model_parallel_rank = lambda: pipeline_rank
+            parallel_state.set_pipeline_model_parallel_rank(pipeline_rank)
 
             try:
                 actual_offset = get_transformer_layer_offset(config, vp_stage)
@@ -252,7 +252,7 @@ class TestParallelTransformerLayer:
                     f"VP stage {vp_stage}, but got {actual_offset}"
                 )
             finally:
-                parallel_state.get_pipeline_model_parallel_rank = original_get_pipeline_rank
+                parallel_state.set_pipeline_model_parallel_rank(original_get_pipeline_rank)
 
     @pytest.mark.parametrize('order', ['tp-pp-dp', 'tp-dp-pp'])
     @pytest.mark.parametrize('tp_pp', [(4, 2), (1, 1), (8, 1), (2, 2)])

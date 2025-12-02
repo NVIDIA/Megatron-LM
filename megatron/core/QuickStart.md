@@ -2,13 +2,13 @@
 
 This guide for Megatron Core walks you through the following tasks:
 
-* Initialize Megatron Core on two GPUS. 
+* Initialize Megatron Core on two GPUS.
 * Build a GPT model with a tensor model parallel size of two and a pipeline parallel size of one.
 * Train the model for five iterations using Megatron Core schedules.
 * Save the model using the distributed checkpoint format.
-* Load the model. 
+* Load the model.
 
-**NOTE:** The following sample was tested using Megatron Core version 0.8.0 and NGC PyTorch Container version 24.02. 
+**NOTE:** The following sample was tested using Megatron Core version 0.8.0 and NGC PyTorch Container version 24.02.
 
 ### Set Up Your Environment
 
@@ -16,16 +16,22 @@ This guide for Megatron Core walks you through the following tasks:
 
 1. Clone the Megatron GitHub repo in it.
 
-    ```
+    ```bash
     docker run --ipc=host --shm-size=512m --gpus 2 -it nvcr.io/nvidia/pytorch:24.02-py3
 
-    git clone https://github.com/NVIDIA/Megatron-LM.git && cd Megatron-LM
+    git clone https://github.com/NVIDIA/Megatron-LM.git
+    cd Megatron-LM
+    pip install -U setuptools packaging
+    pip install --no-build-isolation .[dev]
     ```
+
     <br>
+
+For a more comprehensive overview of different installation methods, refer to the [Installation Guide](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/Installation_Guide.md)
 
 ### Write Your First Training Loop
 
-In this task, you create a sample GPT model split across tensors (Tensor model parallel) on two GPUS, and run a forward pass through it using a MockGPT dataset helper class that was created in Megatron Core. 
+In this task, you create a sample GPT model split across tensors (Tensor model parallel) on two GPUS, and run a forward pass through it using a MockGPT dataset helper class that was created in Megatron Core.
 
 <br>
 
@@ -34,7 +40,6 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
     ```
     PYTHONPATH=$PYTHON_PATH:./megatron torchrun --nproc-per-node 2 examples/run_simple_mcore_train_loop.py
     ```
-
 
 1. Initialize the distributed training and set up the model parallel:
 
@@ -55,6 +60,7 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
         # Megatron core distributed training initialization
         parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
     ```
+
     <br>
 
 1. Set up the GPT model:
@@ -84,6 +90,7 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
 
         return gpt_model
     ```
+
     <br>
 
 1. Set up the GPT mock dataset:
@@ -133,6 +140,7 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
         return train_iterator
 
     ```
+
     <br>
 
 1. Add a forward step function:
@@ -166,13 +174,13 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
 
         return output_tensor, partial(loss_func, loss_mask)   
     ```
+
     <br>
 
 1. Define your load and save distributed checkpoints:
 
-    Megatron Core uses distributed checkpoints for loading and saving models. This allows you to convert the model from one parallel setting to another when you load it. 
+    Megatron Core uses distributed checkpoints for loading and saving models. This allows you to convert the model from one parallel setting to another when you load it.
     For example, a model trained with tensor parallel size `2`, can be loaded again as a tensor model with parallel size `4`.
-
 
     ```python
     from megatron.core import dist_checkpointing
@@ -187,6 +195,7 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
         gpt_model.load_state_dict(checkpoint)
         return gpt_model
     ```
+
     <br>
 
 1. Add the main function:
@@ -239,9 +248,8 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
         gpt_model.to(device)
         print('Successfully loaded the model')  
     ```
+
     <br>
-
-
 
 ### Review Advanced Examples
 

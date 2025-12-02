@@ -160,11 +160,18 @@ class TestLocalCheckpointing:
         )  # FIXME: fails with additional arguments (e.g.,'weight_decay')
         if use_ramdisk:
             tmp_path_dist_ckpt = Path("/dev/shm")
+
+        original_empty = torch.empty
+
+        def deterministic_empty(*args, **kwargs):
+            return original_empty(*args, **kwargs).zero_()
+
         with (
             TempNamedDir(tmp_path_dist_ckpt / "test_local", sync=True) as local_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
             mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
             mock.patch("megatron.training.checkpointing.update_num_microbatches"),
+            mock.patch('torch.empty', new=deterministic_empty),
         ):
             local_ckpt_dir = local_ckpt_dir / "subdir"  # Test handling of non-existent directories
             init_basic_mock_args(mock_args, tp, pp)
@@ -248,6 +255,7 @@ class TestLocalCheckpointing:
     @pytest.mark.parametrize(('use_ramdisk'), [True, False])
     @pytest.mark.parametrize(('async_save'), [True, False])
     @pytest.mark.parametrize(('algo'), ['atomic', 'fully_parallel'])
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_failed_save(self, caplog, tmp_path_dist_ckpt, tp, pp, use_ramdisk, async_save, algo):
         Utils.initialize_model_parallel(tp, pp)

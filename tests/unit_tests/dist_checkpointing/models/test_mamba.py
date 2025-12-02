@@ -18,7 +18,7 @@ from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -47,13 +47,13 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
     submodules = MambaMixerSubmodules(
         in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
     )
-    model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
     model = MambaMixer(
         transformer_config,
         submodules,
         transformer_config.hidden_size,
         rmsnorm=True,
-        model_comm_pgs=model_comm_pgs,
+        pg_collection=pg_collection,
     )
     return model
 

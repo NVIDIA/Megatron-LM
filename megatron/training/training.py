@@ -2,15 +2,17 @@
 
 """Pretrain utilities."""
 
+import copy
 import dataclasses
-from datetime import datetime
+from datetime import datetime, timedelta
 import functools
 import gc
+import inspect
 import logging
 import math
 import os
 import sys
-from typing import List, Optional
+from typing import Any, Optional
 
 import torch.distributed
 
@@ -27,7 +29,12 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 try:
-    from megatron.post_training.algos.distillation import (
+    from megatron.rl import rl_utils
+    has_rl_utils = True
+except ImportError:
+    has_rl_utils = False
+try:
+    from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
     )
 
@@ -44,20 +51,19 @@ except ImportError:
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
-    get_attr_wrapped_model,
     get_model_config,
     StragglerDetector,
-    is_te_min_version,
 )
-from megatron.core.fp8_utils import correct_amax_history_if_needed, get_fp8_recipe
+from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 
 try:
@@ -69,7 +75,7 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -80,29 +86,24 @@ from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
-from megatron.legacy.data.data_samplers import build_pretraining_data_loader
+from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
-    get_amax_reduction_group,
-    model_parallel_is_initialized,
+    update_pg_timeout
 )
+
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.pipeline_parallel.schedules import (
-    convert_schedule_table_to_order,
-    get_pp_rank_microbatches,
-    get_schedule_table,
-)
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
     get_current_running_global_batch_size,
     get_num_microbatches,
-    update_num_microbatches,
+    update_num_microbatches
 )
 
 from .async_utils import maybe_finalize_async_save
@@ -118,6 +119,7 @@ from .utils import (
     report_memory,
     unwrap_model,
     update_use_dist_ckpt,
+    to_empty_if_meta_device,
 )
 from .global_vars import (
     destroy_global_vars,
@@ -127,6 +129,7 @@ from .global_vars import (
     get_tensorboard_writer,
     get_wandb_writer,
     get_one_logger,
+    get_tokenizer,
     get_energy_monitor,
 )
 from . import one_logger_utils
@@ -157,21 +160,31 @@ def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
-            counts = {'M': 0, '*': 0, '-': 0}
+            counts = {'M': 0, '*': 0, '-': 0, 'E':0}
             for layer_type in args.hybrid_override_pattern:
                 if layer_type in counts:
                     counts[layer_type] += 1
-            return counts['*'], counts['M'], counts['-']
+            return counts['*'], counts['M'], counts['-'], counts['E']
         else:
             num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
             num_mlp_layers = round(args.num_layers * args.hybrid_mlp_ratio)
             num_mamba_layers = args.num_layers - num_attn_layers - num_mlp_layers
-            return num_attn_layers, num_mamba_layers, num_mlp_layers
+            num_moe_layers = 0
+            return num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers
 
     def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
         return 4 * expansion * scale_factor * batch_size * seq_len * hidden_size**2
+
+    def moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                        shared_expert_ffn_hidden_size, num_experts_routed_to, swiglu=False):
+        """Calculate FLOPs for an MoE layer."""
+        scale_factor = 3.0 / 2.0 if swiglu else 1.0
+        routed_flops = (4 * batch_size * seq_len * hidden_size *
+                        moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+        shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+        return routed_flops + shared_flops
 
     def attn_layer_flops(
         batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
@@ -211,12 +224,13 @@ def num_floating_point_operations(args, batch_size):
         )
 
     def hybrid_flops(batch_size, seq_len, hidden_size,
-                     num_attn_layers, num_mamba_layers, num_mlp_layers,
+                     num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
-                     num_attn_heads=32,gqa=True,
+                     num_attn_heads=32, gqa=True,
                      gqa_groups=8, kv_channels=None,
                      mlp_expansion=4.0, swiglu=False,
+                     moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
                      vocab_size=256000):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
@@ -227,6 +241,8 @@ def num_floating_point_operations(args, batch_size):
                 num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
                                                      mamba_state_dim, mamba_head_dim,
                                                      mamba_num_groups, mamba_num_heads) +
+                num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                                                 shared_expert_ffn_hidden_size, num_experts_routed_to, swiglu) +
                 (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
         )
         return flops_fwd * 3
@@ -410,7 +426,7 @@ def num_floating_point_operations(args, batch_size):
     # Main entrypoint for FLOPs calculation.
     if args.is_hybrid_model:
         # Calculate the number of each type of layer.
-        num_attn_layers, num_mamba_layers, num_mlp_layers = calculate_layer_counts()
+        num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = calculate_layer_counts()
 
         # Compute hybrid model FLOPs.
         return hybrid_flops(
@@ -420,6 +436,7 @@ def num_floating_point_operations(args, batch_size):
             num_attn_layers=num_attn_layers,
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
+            num_moe_layers=num_moe_layers,
             mamba_state_dim=args.mamba_state_dim,
             mamba_head_dim=args.mamba_head_dim,
             mamba_num_groups=args.mamba_num_groups,
@@ -430,6 +447,11 @@ def num_floating_point_operations(args, batch_size):
             kv_channels=args.kv_channels,
             mlp_expansion=args.ffn_hidden_size / args.hidden_size,
             swiglu=args.swiglu,
+            moe_ffn_hidden_size=(args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None
+                                 else args.ffn_hidden_size),
+            shared_expert_ffn_hidden_size=(0 if args.moe_shared_expert_intermediate_size is None
+                                           else args.moe_shared_expert_intermediate_size),
+            num_experts_routed_to=args.moe_router_topk,
             vocab_size=args.padded_vocab_size,
         )
     else:
@@ -523,257 +545,6 @@ def preprocess_common_state_dict(common_state_dict):
                     reorder_inner_param_groups(optimizer_state_dict[i])
 
     return preprocessed_common_state_dict
-
-
-def layer_is_graphable(layer, config):
-    """
-    Check if a layer is graphable.
-    """
-    from megatron.core.transformer.identity_op import IdentityOp
-    from megatron.core.transformer.transformer_layer import TransformerLayer
-
-    if isinstance(layer, TransformerLayer):
-        if config.cuda_graph_scope == 'attn':
-            if not (
-                isinstance(layer.self_attention, IdentityOp)
-                and isinstance(layer.cross_attention, IdentityOp)
-            ):
-                return True
-        else:
-            return True
-    return False
-
-
-def get_cuda_graph_input_data(
-    model,
-    callables,
-    config,
-    num_microbatches,
-    num_model_chunks,
-    num_layers_per_chunk,
-    seq_length,
-    micro_batch_size,
-):
-    """
-    Create the CUDA Graph capturing input data. The data is organized per-chunk per-microbatch per-layer.
-    """
-
-    rotary_pos_emb_cache = {}
-
-    def get_rotary_pos_emb(transformer_module, transformer_input):
-        if (
-            transformer_module.position_embedding_type == 'rope'
-            and not config.multi_latent_attention
-        ):
-            rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
-                None, transformer_module.decoder, transformer_input, config, None
-            )
-            if rotary_seq_len not in rotary_pos_emb_cache:
-                rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                    rotary_seq_len
-                )
-            return rotary_pos_emb_cache[rotary_seq_len]
-        else:
-            return None
-
-    # Generate sample arguments and keyword arguments for capturing.
-    sample_args = []
-    sample_kwargs = []
-    num_layers_per_chunk_prefix_sum = [0]
-    for n in num_layers_per_chunk:
-        num_layers_per_chunk_prefix_sum.append(num_layers_per_chunk_prefix_sum[-1] + n)
-    for chunk_number in range(num_model_chunks):
-        model_chunk = model[chunk_number]
-        try:
-            chunk_with_decoder = get_attr_wrapped_model(
-                model_chunk, 'decoder', allow_none=False, return_model_obj=True
-            )
-        except RuntimeError:
-            continue
-        layers = callables[
-            num_layers_per_chunk_prefix_sum[chunk_number] : num_layers_per_chunk_prefix_sum[
-                chunk_number + 1
-            ]
-        ]
-        for _ in range(num_microbatches):
-            for layer in layers:
-                static_inputs = layer.get_layer_static_inputs(seq_length, micro_batch_size)
-                if is_te_min_version("1.10.0"):
-                    # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
-                    hidden_states = static_inputs.pop("hidden_states")
-                    sample_args.append((hidden_states,))
-                    rotary_pos_emb = get_rotary_pos_emb(chunk_with_decoder, hidden_states)
-                    if rotary_pos_emb is not None:
-                        static_inputs["rotary_pos_emb"] = rotary_pos_emb
-                    sample_kwargs.append(static_inputs)
-                else:
-                    sample_args.append(
-                        (static_inputs.pop("hidden_states"), static_inputs.pop("attention_mask"))
-                    )
-
-    # Get the PP and VPP scheduling order.
-    _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
-        num_microbatches, num_model_chunks, config.microbatch_group_size_per_vp_stage, False
-    )
-    schedule_table = get_schedule_table(
-        num_microbatches, num_model_chunks, config.microbatch_group_size_per_vp_stage
-    )
-    order = convert_schedule_table_to_order(
-        num_warmup_microbatches, num_model_chunks, schedule_table
-    )
-    print_rank_0(f'ORDER {order}')
-
-    def get_make_graphed_callables_kwargs():
-        kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
-
-        if is_te_min_version("2.6.0"):
-            # Starting from TE 2.6.0, make_graphed_callables() accepts different number
-            # of layers per chunk and optimizes the graph memory usage.
-            kwargs['_num_layers_per_chunk'] = num_layers_per_chunk
-            kwargs['_reuse_graph_input_output_buffers'] = True
-
-        if sample_kwargs:
-            kwargs['sample_kwargs'] = sample_kwargs
-
-        if config.fp8:
-            kwargs['fp8_enabled'] = True
-            kwargs['fp8_recipe'] = get_fp8_recipe(config)
-            # fp8 weight caching will be ignored by TE if cudagraph doesn't capture the attn part,
-            # even if we set it to True in the arguments. So we just pass a False in this case.
-            kwargs['fp8_weight_caching'] = 'attn' in config.cuda_graph_scope
-            if is_te_min_version("1.14.0") and model_parallel_is_initialized():
-                kwargs['fp8_group'] = get_amax_reduction_group(with_context_parallel=True)
-        else:
-            kwargs['fp8_enabled'] = False
-        return kwargs
-
-    kwargs = get_make_graphed_callables_kwargs()
-    return sample_args, kwargs
-
-
-def cuda_graph_capture(model, config, seq_length, micro_batch_size):
-    """
-    Capture CUDA Graphs per TransformerLayer per microbatch.
-    """
-    from megatron.core.transformer.cuda_graphs import _set_capture_start, _set_capture_end
-
-    _set_capture_start()
-    assert config.external_cuda_graph, "Option --external-cuda-graph not enabled."
-    assert config.cuda_graph_scope in [
-        'full',
-        'attn',
-    ], f"--cuda-graph-scope should be full or attn, got {config.cuda_graph_scope}."
-
-    # Set back to the default stream. Graph will still be captured on a side stream in
-    # make_graphed_callables().
-    torch.cuda.set_stream(torch.cuda.default_stream())
-    torch.distributed.barrier()
-    start = time.time()
-    print_rank_0(f'Start cuda_graph_capture on rank{torch.distributed.get_rank()}')
-
-    # Get the number of models chunks and microbatches.
-    num_model_chunks = len(model)
-    num_microbatches = get_num_microbatches()
-    print_rank_0(f'num_model_chunks {num_model_chunks}, num_microbatches {num_microbatches}')
-
-    # Get callables.
-    callables = []
-    num_layers_per_chunk = []
-    for chunk_number in range(num_model_chunks):
-        model_chunk = model[chunk_number]
-        try:
-            chunk_with_decoder = get_attr_wrapped_model(
-                model_chunk, 'decoder', allow_none=False, return_model_obj=True
-            )
-        except RuntimeError:
-            continue
-        num_layers = len(chunk_with_decoder.decoder.layers)
-        if hasattr(chunk_with_decoder, 'mtp'):
-            num_mtp_layers = len(chunk_with_decoder.mtp.layers)
-        else:
-            num_mtp_layers = 0
-        num_graphable_layers = 0
-        for layer_number in range(num_layers):
-            layer = chunk_with_decoder.decoder.layers[layer_number]
-            if layer_is_graphable(layer, config):
-                num_graphable_layers += 1
-                callables.append(layer)
-        for layer_number in range(num_mtp_layers):
-            layer = chunk_with_decoder.mtp.layers[layer_number].transformer_layer
-            if layer_is_graphable(layer, config):
-                num_graphable_layers += 1
-                callables.append(layer)
-        num_layers_per_chunk.append(num_graphable_layers)
-        print_rank_0(
-            f'{num_layers} layers and {num_mtp_layers} mtp layers in model chunk {chunk_number}. {num_graphable_layers} graphable layers.'
-        )
-    print_rank_0(f'Total #layers {len(callables)}')
-
-    # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-    sample_args, kwargs = get_cuda_graph_input_data(
-        model,
-        callables,
-        config,
-        num_microbatches,
-        num_model_chunks,
-        num_layers_per_chunk,
-        seq_length,
-        micro_batch_size,
-    )
-
-    import transformer_engine  # To keep out TE dependency when not using CUDA Graph
-
-    graphs = transformer_engine.pytorch.make_graphed_callables(
-        tuple(callables), sample_args, **kwargs
-    )
-
-    # Push the captured graphs to the corresponding TransformerBlock.
-    num_layers_per_chunk_prefix_sum = [0]
-    for n in num_layers_per_chunk:
-        num_layers_per_chunk_prefix_sum.append(num_layers_per_chunk_prefix_sum[-1] + n)
-    for chunk_number in range(num_model_chunks):
-        layers = callables[
-            num_layers_per_chunk_prefix_sum[chunk_number] : num_layers_per_chunk_prefix_sum[
-                chunk_number + 1
-            ]
-        ]
-        for layer_number, layer in enumerate(layers):
-            layer.cuda_graphs = []
-            for batch_number in range(num_microbatches):
-                layer.cuda_graphs.append(
-                    graphs[
-                        num_layers_per_chunk_prefix_sum[chunk_number] * num_microbatches
-                        + batch_number * num_layers_per_chunk[chunk_number]
-                        + layer_number
-                    ]
-                )
-
-    # Finish CUDA Graph capturing.
-    torch.distributed.barrier()
-    print_rank_0(
-        f'Time spent in cuda_graph_capture on rank{torch.distributed.get_rank()}: {time.time() - start}s'
-    )
-    _set_capture_end()
-
-
-def cuda_graph_set_manual_hooks(model, config):
-    """
-    Set CUDA Graph manual hooks for the modules that contain direct parameters and are covered by cudagraphs.
-    """
-    for model_chunk in model:
-        try:
-            chunk_with_decoder = get_attr_wrapped_model(
-                model_chunk, 'decoder', allow_none=False, return_model_obj=True
-            )
-        except RuntimeError:
-            continue
-        for layer in chunk_with_decoder.decoder.layers:
-            if layer_is_graphable(layer, config):
-                layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
-        if hasattr(chunk_with_decoder, 'mtp'):
-            for layer in chunk_with_decoder.mtp.layers:
-                if layer_is_graphable(layer, config):
-                    layer.transformer_layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
 
 
 def pretrain(
@@ -927,8 +698,17 @@ def pretrain(
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
-        for i in range(len(model)):
-            iterators = build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+        for vp_stage in range(len(model)):
+            dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+            assert "vp_stage" in dataset_provider_parameters, \
+                "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+            vp_stage_train_valid_test_dataset_provider = \
+                functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                vp_stage_train_valid_test_dataset_provider.is_distributed = True
+            iterators = build_train_valid_test_data_iterators(
+                vp_stage_train_valid_test_dataset_provider
+            )
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
             test_data_iterator.append(iterators[2])
@@ -958,6 +738,11 @@ def pretrain(
 
     one_logger = get_one_logger()
     one_logger and one_logger.log_metrics(app_metrics)
+
+    wandb_writer = get_wandb_writer()
+    if wandb_writer:
+        # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
+        wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
     if not args.skip_train:
         print_rank_0('training ...')
@@ -1007,18 +792,19 @@ def pretrain(
 
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
-        evaluate_and_print_results(
-            prefix,
-            forward_step_func,
-            valid_data_iterator,
-            model,
-            iteration,
-            process_non_loss_data_func,
-            config,
-            verbose=True,
-            write_to_tensorboard=not args.skip_train,
-            non_loss_data_func=non_loss_data_func,
-        )
+        if getattr(args, 'perform_rl_step', False):
+            rl_utils.evaluate_and_print_results_rl(
+                valid_data_iterator, model, optimizer,
+                iteration, write_to_tensorboard=not args.skip_train
+            )
+        else:
+            evaluate_and_print_results(
+                prefix, forward_step_func,
+                valid_data_iterator, model,
+                iteration, process_non_loss_data_func, config,
+                verbose=True, write_to_tensorboard=not args.skip_train,
+                non_loss_data_func=non_loss_data_func
+            )
 
     if args.do_test:
         prefix = f'iteration {iteration} on test set'
@@ -1046,6 +832,9 @@ def pretrain(
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
+
+    if getattr(args, 'perform_rl_step', False):
+        rl_utils.rl_inference_interface_shutdown()
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -1088,6 +877,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     """Build the model."""
     args = get_args()
     args.model_type = model_type
+
+    if has_nvidia_modelopt:
+        from megatron.post_training.checkpointing import has_modelopt_state
+        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
+        # set a flag to use our model provider if so.
+        if args.load is not None and has_modelopt_state(args.load):
+            print_rank_0(f'ModelOpt checkpoint detected')
+            args.modelopt_enabled = True
+        elif getattr(args, "export_kd_teacher_load", None):
+            # For distillation ckpts without ModelOpt state
+            args.modelopt_enabled = True
+
 
     # Build model.
     def build_model():
@@ -1159,6 +960,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = get_model_config(model[0])
         model = [Float16Module(config, model_module) for model_module in model]
 
+    # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
+    if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
+        #for model_module in model:
+        model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
+
+
+
+
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
     #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
     #               from the current fp8 param) to its amax_history. The below function will correct
@@ -1170,8 +979,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         if args.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
-        elif args.use_custom_fsdp:
-            DP = custom_FSDP
+        elif args.use_megatron_fsdp:
+            DP = megatron_FSDP
         else:
             DP = DDP
 
@@ -1197,12 +1006,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             else:
                 kwargs['bucket_size'] = args.ddp_bucket_size
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
+            kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['average_in_collective'] = args.ddp_average_in_collective
-            if args.use_custom_fsdp and args.use_precision_aware_optimizer:
+            if args.use_megatron_fsdp and args.use_precision_aware_optimizer:
                 kwargs["preserve_fp32_weights"] = False
             ddp_config = DistributedDataParallelConfig(**kwargs)
 
-            # In the custom FSDP and DDP use path, we need to initialize the bucket size.
+            # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             # If bucket_size is not provided as an input, use sane default.
             # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
             # ring-reduce implementations are large enough to remain bandwidth-bound rather than
@@ -1293,12 +1103,43 @@ def get_optimizer_param_scheduler(optimizer):
     return opt_param_scheduler
 
 
+def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
+    """Return a Megatron optimizer config object from Megatron's arguments."""
+
+    config = None
+    if args.optimizer == 'adam':
+        kwargs = {}
+        for f in dataclasses.fields(AdamOptimizerConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        config = AdamOptimizerConfig(**kwargs)
+    elif args.optimizer == 'sgd':
+        kwargs = {}
+        for f in dataclasses.fields(SGDOptimizerConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        config = SGDOptimizerConfig(**kwargs)
+    else:
+        raise ValueError("Invalid optimizer type!")
+
+    # Construct the appropriate config_overrides object.
+    # TODO: add more logic here as needed down the road.
+    if args.decoupled_lr is not None:
+        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
+        decoupled_optimizer_config = copy.deepcopy(config)
+        decoupled_optimizer_config.lr = args.decoupled_lr
+        if args.decoupled_min_lr is not None:
+            decoupled_optimizer_config.min_lr = args.decoupled_min_lr
+        config_overrides = {decoupled_param_key: decoupled_optimizer_config}
+    else:
+        config_overrides = None
+
+    return config, config_overrides
+
+
 def setup_model_and_optimizer(
     model_provider_func,
     model_type,
-    no_wd_decay_cond=None,
-    scale_lr_cond=None,
-    lr_mult=1.0,
     checkpointing_context=None,
 ):
     """Setup model and optimizer."""
@@ -1310,22 +1151,18 @@ def setup_model_and_optimizer(
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
+    config, config_overrides = get_megatron_optimizer_config(args)
     config.timers = timers
+
+    # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
+    # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
+    # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
     optimizer = get_megatron_optimizer(
         config,
         model,
-        no_wd_decay_cond,
-        scale_lr_cond,
-        lr_mult,
+        config_overrides=config_overrides,
         use_gloo_process_groups=args.enable_gloo_process_groups,
-        # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
-        #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
-        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+        dump_param_to_param_group_map=args.dump_param_to_param_group_map,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
@@ -1456,22 +1293,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
 
-    # CUDA Graph capturing only executes once, when it's the first training iteration.
-    if args.curr_iteration == args.iteration and args.external_cuda_graph:
-        cuda_graph_capture(model, config, args.seq_length, args.micro_batch_size)
-
-        # Set grad to zero.
-        for model_chunk in model:
-            model_chunk.zero_grad_buffer()
-        optimizer.zero_grad()
-
-        # Clear aux loss tracker.
-        clear_aux_losses_tracker()
-
-        # Collect garbage and empty unused memory.
-        gc.collect()
-        torch.cuda.empty_cache()
-
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
@@ -1482,7 +1303,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if has_nvidia_modelopt:
             # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
-                model, args.seq_length, args.micro_batch_size, args.decoder_seq_length
+                model,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
             )
         else:
             adjust_tensor_shapes_fn = None
@@ -1552,11 +1376,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    # Set the manual hooks when CUDA Graphs are enabled.
-    if args.curr_iteration == args.iteration and args.external_cuda_graph:
-        if args.use_distributed_optimizer and args.overlap_param_gather:
-            cuda_graph_set_manual_hooks(model, config)
-
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
         loss_reduced = {}
@@ -1608,7 +1427,6 @@ def training_log(
     loss_dict,
     total_loss_dict,
     learning_rate,
-    decoupled_learning_rate,
     iteration,
     loss_scale,
     report_memory_flag,
@@ -1652,32 +1470,47 @@ def training_log(
     total_loss_dict[nan_iters_key] = total_loss_dict.get(nan_iters_key, 0) + int(got_nan)
 
     # Logging.
-    timers_to_log = [
-        'forward-backward',
-        'forward-compute',
-        'backward-compute',
-        'batch-generator',
-        'forward-recv',
-        'forward-send',
-        'backward-recv',
-        'backward-send',
-        'forward-send-forward-recv',
-        'forward-send-backward-recv',
-        'backward-send-forward-recv',
-        'backward-send-backward-recv',
-        'forward-backward-send-forward-backward-recv',
-        'layernorm-grads-all-reduce',
-        'embedding-grads-all-reduce',
-        'all-grads-sync',
-        'params-all-gather',
-        'optimizer-copy-to-main-grad',
-        'optimizer-unscale-and-check-inf',
-        'optimizer-clip-main-grad',
-        'optimizer-count-zeros',
-        'optimizer-inner-step',
-        'optimizer-copy-main-to-model-params',
-        'optimizer',
-    ]
+    timers_to_log = []
+    if args.timing_log_level >= 1:
+        timers_to_log.extend([
+            'forward-backward',
+            'layernorm-grads-all-reduce',
+            'embedding-grads-all-reduce',
+            'all-grads-sync',
+            'params-all-gather',
+            'optimizer-copy-to-main-grad',
+            'optimizer-unscale-and-check-inf',
+            'optimizer-clip-main-grad',
+            'optimizer-count-zeros',
+            'optimizer-inner-step',
+            'optimizer-copy-main-to-model-params',
+            'optimizer',
+        ])
+    if args.timing_log_level >= 2:
+        timers_to_log.extend([
+            'batch-generator',
+            'forward-compute',
+            'backward-compute',
+            'forward-recv',
+            'forward-send',
+            'backward-recv',
+            'backward-send',
+            'forward-send-forward-recv',
+            'forward-send-backward-recv',
+            'backward-send-forward-recv',
+            'backward-send-backward-recv',
+            'forward-backward-send-forward-backward-recv',
+        ])
+    # Add timers from RL loop if needed.
+    if getattr(args, 'perform_rl_step', False):
+        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
+                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
+                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
+                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
+                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
+                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
+                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
+                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -1690,9 +1523,6 @@ def training_log(
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate = reduce_max_stat_across_model_parallel_group(learning_rate)
     # Tensorboard values.
-    # Timer requires all the ranks to call.
-    if args.log_timers_to_tensorboard and (iteration % args.tensorboard_log_interval == 0):
-        timers.write(timers_to_log, writer, iteration, normalizer=total_iterations)
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
@@ -1700,8 +1530,6 @@ def training_log(
         writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'learning-rate': learning_rate}, iteration)
-        if args.decoupled_lr is not None:
-            writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
         if args.skipped_train_samples > 0:
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
@@ -1710,6 +1538,13 @@ def training_log(
         writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
+        # Log bins for packed mode
+        if has_rl_utils and args.rl_use_sequence_packing:
+            packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(args)
+            for metric_name, metric_value in packing_metrics.items():
+                writer.add_scalar(metric_name, metric_value, iteration)
+            if wandb_writer and packing_metrics:
+                wandb_writer.log(packing_metrics, iteration)
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
@@ -1742,6 +1577,11 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
+        if getattr(args, 'perform_rl_step', False):
+            grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
+            writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
+            if wandb_writer:
+                wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -1761,8 +1601,16 @@ def training_log(
             track_names.append("load_balancing_loss")
         if "seq_aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("seq_load_balancing_loss")
+        if "global_aux_loss" in args.moe_router_load_balancing_type:
+            track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
+
+        if args.is_hybrid_model:
+            layers = args.hybrid_override_pattern.count('E')
+        else:
+            layers = args.num_layers
+
         track_moe_metrics(
             loss_scale=moe_loss_scale,
             iteration=iteration,
@@ -1772,7 +1620,7 @@ def training_log(
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
-            num_layers=args.num_layers,
+            num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
         )
@@ -1806,6 +1654,8 @@ def training_log(
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
+        if has_rl_utils and args.rl_use_sequence_packing:
+            log_string += rl_utils.get_sequence_packing_log_info(args)
         if args.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(args.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
@@ -1831,14 +1681,6 @@ def training_log(
                 wandb_writer.log({'power/gpu': power}, iteration)
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f' learning rate: {learning_rate:.6E} |'
-        if args.decoupled_lr is not None and (
-            mpu.is_pipeline_first_stage(ignore_virtual=True)
-            or mpu.is_pipeline_last_stage(ignore_virtual=True)
-        ):
-            assert decoupled_learning_rate is not None
-            log_string += f' decoupled learning rate: {decoupled_learning_rate:.6E} |'
-        else:
-            assert decoupled_learning_rate is None
         log_string += f' global batch size: {batch_size:5d} |'
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
@@ -1870,6 +1712,11 @@ def training_log(
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
             report_memory_flag = False
+        # Write timers to wandb, don't reset the counts
+        if args.log_timers_to_tensorboard:
+            timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
+            timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
+        # Log timers to stdout
         timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag
@@ -1989,6 +1836,7 @@ def post_training_step_callbacks(
     iteration,
     prof,
     num_floating_point_operations_since_last_log_event,
+    nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
@@ -2032,7 +1880,9 @@ def post_training_step_callbacks(
             assert prof is not None
             prof.stop()
         else:
-            torch.cuda.cudart().cudaProfilerStop()
+            torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
+            if nsys_nvtx_context is not None:
+                nsys_nvtx_context.__exit__(None, None, None)
 
     # Manual garbage collection.
     if args.manual_gc:
@@ -2164,6 +2014,66 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+
+    if getattr(args, 'perform_rl_step', False):
+        assert has_rl_utils, "RL cannot run without the megatron.rl package"
+
+    # Additional variable initialization for RL training
+    if getattr(args, 'perform_rl_step', False):
+        print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
+        load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
+        args.no_load_optim = True
+
+        # Load pretrained checkpoint
+        args.load = None
+        args.finetune = True
+        load_checkpoint(
+                model,
+                None,  # Don't load optimizer state
+                None,  # Don't load scheduler state
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and getattr(args, "use_torch_fsdp2", False)
+                and args.ckpt_format == "torch_dist",
+            )
+        ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+
+        # Reload RL training checkpoint weights
+        args.load = load
+        args.finetune = finetune
+        print_rank_0("> Reloading RL training checkpoint...")
+        load_checkpoint(
+                model,
+                None,
+                None,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and getattr(args, "use_torch_fsdp2", False)
+                and args.ckpt_format == "torch_dist",
+            )
+
+        args.no_load_optim = no_load_optim
+
+    # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
+    if getattr(args, 'perform_rl_step', False):
+        print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
+        from megatron.core.num_microbatches_calculator import (
+            destroy_num_microbatches_calculator,
+            init_num_microbatches_calculator
+        )
+        # First destroy the existing calculator
+        destroy_num_microbatches_calculator()
+        # Then initialize with the correct perform_rl_step=True context
+        init_num_microbatches_calculator(
+            args.rank,
+            args.rampup_batch_size,
+            args.global_batch_size,
+            args.micro_batch_size,
+            mpu.get_data_parallel_world_size(),
+            args.decrease_batch_size_if_needed
+        )
+        print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
+
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
@@ -2215,7 +2125,7 @@ def train(
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
-    if isinstance(model[0], (custom_FSDP, DDP)) and args.overlap_grad_reduce:
+    if isinstance(model[0], (megatron_FSDP, DDP)) and args.overlap_grad_reduce:
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
@@ -2273,7 +2183,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
-    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+    if args.cuda_graph_impl == "local" and args.cuda_graph_scope=="full_iteration":
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     def get_e2e_base_metrics():
@@ -2299,6 +2209,7 @@ def train(
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     prof = None
+    nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
         args.profile
         and torch.distributed.get_rank() in args.profile_ranks
@@ -2336,46 +2247,90 @@ def train(
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
+    # Initialize CUDA Graphs helper.
+    if args.cuda_graph_impl == "transformer_engine":
+        cuda_graph_helper = TECudaGraphHelper(
+            model=model,
+            config=config,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            optimizers=[optimizer],
+        )
+
     # Run training iterations till done.
+    buffered_rollouts = None
     while iteration < args.train_iters:
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
-                torch.cuda.cudart().cudaProfilerStart()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
+                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
+                nsys_nvtx_context.__enter__()
 
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
         ft_integration.on_checkpointing_end(is_async_finalization=True)
-
+        # Update the timeout for all process groups after initialization
+        # We update the timeout after the first successful iteration,
+        # which takes longer than others usually
+        if args.distributed_timeout_seconds_after_init is not None and iteration == start_iteration+1:
+            # TODO: some dynamic timeout setting is required
+            # based on the iteration time considering interval-based steps (e.g. eval, checkpoint)
+            # e.g. timeout for normal iterations vs timeout for iterations with checkpoint
+            # this timeout is triggered when there's no collective communication
+            # for the duration of timeout
+            update_pg_timeout(timedelta(seconds=args.distributed_timeout_seconds_after_init))
         # Update number of microbatches first without consistency check to decide if a
         # checkpoint should be saved. If the number of microbatches is different
         # from the previous iteration, save a checkpoint. Then run consistency check
         # to make sure training configuration is still valid.
+        # Standard microbatch update (sequence packing overrides this in rl_utils.py)
         update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
+        # Skip automatic checkpoint on microbatch changes when sequence packing is active
+        # as it intentionally reconfigures microbatches
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            assert get_num_microbatches() > num_microbatches, (
-                f"Number of microbatches should be increasing due to batch size rampup; "
-                f"instead going from {num_microbatches} to {get_num_microbatches()}"
-            )
-            if args.save is not None:
-                save_checkpoint_and_time(
-                    iteration,
-                    model,
-                    optimizer,
-                    opt_param_scheduler,
-                    num_floating_point_operations_so_far,
-                    checkpointing_context,
-                    train_data_iterator=train_data_iterator,
+            if args.rl_use_sequence_packing:
+                print_rank_0(
+                    f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
+                    f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
                 )
+            else:
+                assert get_num_microbatches() > num_microbatches, (
+                    f"Number of microbatches should be increasing due to batch size rampup; "
+                    f"instead going from {num_microbatches} to {get_num_microbatches()}"
+                )
+                if args.save is not None:
+                    save_checkpoint_and_time(
+                        iteration,
+                        model,
+                        optimizer,
+                        opt_param_scheduler,
+                        num_floating_point_operations_so_far,
+                        checkpointing_context,
+                        train_data_iterator=train_data_iterator,
+                    )
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
+
+        # Capture CUDA Graphs.
+        if (
+            args.cuda_graph_impl == "transformer_engine"
+            and iteration == args.cuda_graph_warmup_steps
+        ):
+            if iteration > start_iteration and should_disable_forward_pre_hook(args):
+                disable_forward_pre_hook(model, param_sync=False)
+            cuda_graph_helper.create_cudagraphs()
+            if iteration > start_iteration and should_disable_forward_pre_hook(args):
+                enable_forward_pre_hook(model)
+                cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         # Completely skip iteration if needed.
         if iteration in args.iterations_to_skip:
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
+            if iteration == start_iteration:
+                start_iteration = iteration + 1
             iteration += 1
             batch_size = (
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
@@ -2384,8 +2339,19 @@ def train(
             args.skipped_train_samples += batch_size
             continue
 
-        # Run training step.
         args.curr_iteration = iteration
+        # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
+        # It is similar to a PPO epoch.
+
+        if getattr(args, 'perform_rl_step', False):
+            with torch.no_grad():
+                train_data_iterator = rl_utils.setup_grpo_data_iterator(
+                    model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                )
+                # Buffered rollouts are used as a state container for setups when
+                # we use previously-generated data for an update.
+                buffered_rollouts = train_data_iterator
+
         ft_integration.on_training_step_start()
         (
             loss_dict,
@@ -2429,12 +2395,31 @@ def train(
                     enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
+                    # Set the manual hooks here since it's not set right after the capturing.
+                    if (
+                        args.cuda_graph_impl == "transformer_engine"
+                        and iteration == args.cuda_graph_warmup_steps
+                    ):
+                        cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
-        batch_size = (
-            mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
-        )
-        args.consumed_train_samples += batch_size
+
+        if getattr(args, 'perform_rl_step', False) and args.rl_use_sequence_packing:
+            iteration_sequences = rl_utils.get_iteration_sequence_count(args)
+            # Track bins separately for packed mode
+            rl_utils.update_sequence_packing_metrics(args)
+        else:
+            batch_size = (
+                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            )
+            iteration_sequences = batch_size
+
+        # Update consumed samples (always means sequences now)
+        args.consumed_train_samples += iteration_sequences
+
+        # Use iteration_sequences as batch_size for floating point operations
+        batch_size = iteration_sequences
+
         num_skipped_samples_in_batch = (
             get_current_global_batch_size() - get_current_running_global_batch_size()
         )
@@ -2457,19 +2442,15 @@ def train(
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
         learning_rate = None
-        decoupled_learning_rate = None
         for param_group in optimizer.param_groups:
             if len(param_group['params']) == 0:
                 continue
-            if param_group['is_decoupled_lr']:
-                decoupled_learning_rate = param_group['lr']
-            else:
+            if param_group['default_config']:
                 learning_rate = param_group['lr']
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
             learning_rate,
-            decoupled_learning_rate,
             iteration,
             loss_scale,
             report_memory_flag,
@@ -2492,18 +2473,16 @@ def train(
                 gc.collect()
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
-            evaluate_and_print_results(
-                prefix,
-                forward_step_func,
-                valid_data_iterator,
-                model,
-                iteration,
-                process_non_loss_data_func,
-                config,
-                verbose=False,
-                write_to_tensorboard=True,
-                non_loss_data_func=non_loss_data_func,
-            )
+            if getattr(args, 'perform_rl_step', False):
+                rl_utils.evaluate_and_print_results_rl(valid_data_iterator, model, optimizer,
+                                       iteration, write_to_tensorboard=True)
+            else:
+                evaluate_and_print_results(prefix, forward_step_func,
+                                       valid_data_iterator, model,
+                                       iteration, process_non_loss_data_func,
+                                       config, verbose=False, write_to_tensorboard=True,
+                                       non_loss_data_func=non_loss_data_func)
+
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
             timers('eval-time').stop()
@@ -2529,6 +2508,7 @@ def train(
             iteration,
             prof,
             num_floating_point_operations_since_last_log_event,
+            nsys_nvtx_context,
         )
 
         # Checkpoint and decide whether to exit.
@@ -2576,6 +2556,8 @@ def train(
             wandb_writer.finish()
         ft_integration.shutdown()
         one_logger_utils.finish()
+        if getattr(args, 'perform_rl_step', False):
+            rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
 
     return iteration, num_floating_point_operations_so_far
@@ -2617,7 +2599,7 @@ def evaluate(
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
-    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+    if args.cuda_graph_impl == "local" and args.cuda_graph_scope=="full_iteration":
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     if eval_iters is None:
@@ -2760,12 +2742,13 @@ def evaluate_and_print_results(
     wandb_writer = get_wandb_writer()
 
     data_iterators = data_iterator if args.multiple_validation_sets else [data_iterator]
-    if args.full_validation:
-        if not args.multiple_validation_sets:
-            eval_iters = [args.eval_iters]
-        else:
-            eval_iters = args.eval_iters
 
+    if not args.multiple_validation_sets:
+        eval_iters = [args.eval_iters]
+    else:
+        eval_iters = args.eval_iters
+        
+    if args.full_validation:
         assert len(eval_iters) == len(data_iterators)
 
         # with full validation we need to distribute eval_iters to all ranks
@@ -2776,6 +2759,10 @@ def evaluate_and_print_results(
         torch.distributed.broadcast(eval_iters, 0)
         eval_iters = eval_iters.tolist()
         args.eval_iters = eval_iters[0] if not args.multiple_validation_sets else eval_iters
+    elif not args.multiple_validation_sets:
+        eval_iters = [args.eval_iters]
+    else:
+        eval_iters = args.eval_iters
     
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
@@ -2851,9 +2838,10 @@ def get_train_valid_test_num_samples():
     return (train_samples, eval_samples, test_iters * args.global_batch_size)
 
 
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
+def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
     """Build pretraining datasets."""
-    train_valid_test_num_samples = get_train_valid_test_num_samples()
+    if train_valid_test_num_samples is None:
+        train_valid_test_num_samples = get_train_valid_test_num_samples()
     print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
@@ -2888,33 +2876,36 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     # Construct the data pipeline
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
-        # Build datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            build_train_valid_test_datasets_provider
-        )
-        valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-        
-        # Build dataloders.
-        train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+        # Build datasets and dataloders.
+        if getattr(args, 'perform_rl_step', True):
+            # we don't need to build any dataloaders for RL training
+            train_dataloader = None
+            valid_dataloaders = None
+            test_dataloader = None
+            do_train = args.train_iters > 0
+            do_valid = (args.full_validation or args.eval_iters > 0)
+            do_test = (args.full_validation or args.eval_iters > 0)
+        else:
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+            train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+            valid_dataloaders = []
+            for valid_d in valid_ds:
+                if args.skip_train or args.full_validation:
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                else:
+                    if args.multiple_validation_sets:
+                        # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                        # correct and needs to be calculated/set per validation set
+                        raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+            if not args.multiple_validation_sets:
+                assert len(valid_dataloaders) == 1
+            test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            do_train = train_dataloader is not None and args.train_iters > 0
+            do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
+            do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 
-        valid_dataloaders = []
-        for valid_d in valid_ds:
-            if args.skip_train or args.full_validation:
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
-            else:
-                if args.multiple_validation_sets:
-                    # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                    # correct and needs to be calculated/set per validation set
-                    raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
-        if not args.multiple_validation_sets:
-            assert len(valid_dataloaders) == 1
-        test_dataloader = build_pretraining_data_loader(test_ds, 0)
-
-        # Flags to know if we need to do training/validation/testing.
-        do_train = train_dataloader is not None and args.train_iters > 0
-        do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
-        do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
         )
@@ -2926,6 +2917,8 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
     args.do_test = getattr(args, "do_test", False) or flags[2].item()
+    if getattr(args, 'perform_rl_step', False):
+        args.to_test = False
 
     return train_dataloader, valid_dataloaders, test_dataloader
 
@@ -2964,32 +2957,35 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     else:
         train_data_iterator = None
 
-    # when using full validation, we need to override eval iters with the correct
-    # number of iterations on tp rank 0 so that it can be distributed to the other 
-    # ranks later
-    if args.full_validation:
+    if valid_dataloaders is not None:
+        # when using full validation, we need to override eval iters with the correct
+        # number of iterations on tp rank 0 so that it can be distributed to the other 
+        # ranks later
+        if args.full_validation:
+            if args.multiple_validation_sets:
+                if valid_dataloaders[0] is None:
+                    args.eval_iters = [None]*len(valid_dataloaders)
+                else:
+                    args.eval_iters = [len(dl) for dl in valid_dataloaders]
+            else:
+                args.eval_iters = len(valid_dataloaders[0])
+
         if args.multiple_validation_sets:
             if valid_dataloaders[0] is None:
-                args.eval_iters = [None]*len(valid_dataloaders)
+                valid_data_iterators = [None] * len(valid_dataloaders)
             else:
-                args.eval_iters = [len(dl) for dl in valid_dataloaders]
+                valid_dl_type = "cyclic" if args.full_validation else dl_type
+                print(
+                    f"[VALID DATA LOADER LENGTHS] "
+                    ", ".join(f"{idx}: {len(dl)}" for idx, dl in enumerate(valid_dataloaders))
+                )
+                valid_data_iterators = [
+                    _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
+                ]
+        elif valid_dataloaders[0] is not None:
+            valid_data_iterators = _get_iterator(dl_type, valid_dataloaders[0])
         else:
-            args.eval_iters = len(valid_dataloaders[0])
-
-    if args.multiple_validation_sets:
-        if valid_dataloaders[0] is None:
-            valid_data_iterators = [None] * len(valid_dataloaders)
-        else:
-            valid_dl_type = "cyclic" if args.full_validation else dl_type
-            print(
-                f"[VALID DATA LOADER LENGTHS] "
-                ", ".join(f"{idx}: {len(dl)}" for idx, dl in enumerate(valid_dataloaders))
-            )
-            valid_data_iterators = [
-                _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
-            ]
-    elif valid_dataloaders[0] is not None:
-        valid_data_iterators = _get_iterator(dl_type, valid_dataloaders[0])
+            valid_data_iterators = None
     else:
         valid_data_iterators = None
 
@@ -3003,4 +2999,4 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
 def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
-    return not args.use_custom_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
+    return not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather

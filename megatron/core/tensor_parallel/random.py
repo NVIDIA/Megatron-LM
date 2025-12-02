@@ -522,11 +522,14 @@ class CheckpointWithoutOutput(object):
     """
     Checkpoint a model or part of the model and release the output.
 
-    For the normal 'checkpoint` function, the outputs of it may be cached by the following
-    operations for its backward computation. However, the output of the checkpointed function is
+    For the normal 'checkpoint` function, the outputs of it may be saved by the following
+    modules for their backward computation. However, the output of the checkpointed function is
     re-generated at recomputation, so the output store is not technically needed. This method can
     manually discard the output in the forward pass and restore it by recomputation in the
     backward pass to reduce the memory usage.
+
+    Due to the reason above, to save memory with this method, the caller should make sure that the
+    discarded output tensors are directly saved in the following modules for backward computation.
     """
 
     def __init__(self, fp8=False):

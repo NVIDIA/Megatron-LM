@@ -47,6 +47,7 @@ def mcore_gpt_load_te_state_dict_pre_hook(
         ("self_attention.linear_kv_up_proj.layer_norm_bias", "self_attention.kv_layernorm.bias"),
         ("mlp.linear_fc1.layer_norm_weight", "pre_mlp_layernorm.weight"),
         ("mlp.linear_fc1.layer_norm_bias", "pre_mlp_layernorm.bias"),
+        ("mixer.in_proj.layer_norm_weight", "norm.weight"),
     ]
 
     key_rewrite_list = []

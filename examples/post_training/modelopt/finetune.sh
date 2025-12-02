@@ -29,7 +29,7 @@ if [ -z ${MLM_DATA_ARGS} ]; then
         --lr-decay-samples 128000 \
         --lr-warmup-samples 0 \
         --split 100,0,0 \
-        --finetune-hf-dataset nvidia/Daring-Anteater \
+        --finetune-hf-dataset Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered \
     "
 fi
 
@@ -68,12 +68,15 @@ if [ -z ${MLM_EVAL_ARGS} ]; then
     "
 fi
 
+export HF_TOKEN=${HF_TOKEN}
+
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/finetune.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
     --expert-tensor-parallel-size ${ETP} \
     --expert-model-parallel-size ${EP} \
     --pipeline-model-parallel-size ${PP} \
+    --context-parallel-size ${CP} \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --load ${MLM_MODEL_CKPT} \
     --save ${MLM_MODEL_SAVE} \

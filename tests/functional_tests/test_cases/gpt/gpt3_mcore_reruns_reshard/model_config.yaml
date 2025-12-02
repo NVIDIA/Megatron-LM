@@ -1,0 +1,85 @@
+ENV_VARS:
+  SKIP_PYTEST: 1
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+MODEL_ARGS:
+  # generic training settings
+  --deterministic-mode: true
+  --bf16: true
+  --train-iters: 50
+  --eval-iters: 0
+  --manual-gc: true
+  --use-mcore-models: true
+  --distributed-backend: nccl
+  # parallelism settings
+  --sequence-parallel: true
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 2
+  --micro-batch-size: 1
+  --global-batch-size: 128
+  # embedding settings
+  --untie-embeddings-and-output-weights: true
+  --position-embedding-type: rope
+  --rotary-percent: 1.0
+  --max-position-embeddings: 4096
+  # transformer settings
+  --num-layers: 32
+  --hidden-size: 3072
+  --ffn-hidden-size: 8192
+  --num-attention-heads: 32
+  --num-query-groups: 8
+  --seq-length: 4096
+  --kv-channels: 128
+  --ffn-hidden-size: 8192
+  --group-query-attention: true
+  --normalization: RMSNorm
+  --swiglu: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --no-create-attention-mask-in-dataloader: true
+  --transformer-impl: transformer_engine
+  --disable-bias-linear: true
+  # gradient & optimizer settings
+  --clip-grad: 1.0
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --lr: 3e-4
+  --lr-warmup-samples: 0
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  --adam-eps: 1e-8
+  --use-distributed-optimizer: true
+  --split: 949,50,1
+  --no-gradient-accumulation-fusion: true
+  # checkpoint settings
+  --save-interval: 10000
+  --eval-interval: 1000
+  --ckpt-format: torch_dist
+  --dist-ckpt-optim-fully-reshardable: true
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  # data settings
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  # logging settings
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --timing-log-level: 0
+  --log-interval: 1
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  # rerun settings
+  --rerun-mode: validate_results
+AFTER_SCRIPT: |
+  check_log() { if [[ -z $(grep -r $1 "$2" $LOG_DIR) ]]; then exit 1; else echo OK; fi }
+  check_log -F "WARNING:megatron.core.rerun_state_machine:Result validation enabled"
+  check_log -F "Job sharding has changed: Rerun state will be ignored"
+  EXIT_CODE=0
+TEST_TYPE: frozen-start

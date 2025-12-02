@@ -77,9 +77,9 @@ class ZarrSaveShardedStrategy(SaveShardedStrategy):
 
     def __init__(self, backend: str, version: int):
         super().__init__(backend, version)
-        logger.warning(
-            f"`zarr` distributed checkpoint backend is deprecated."
-            " Please switch to PyTorch Distributed format (`torch_dist`)."
+        raise CheckpointingException(
+            "`zarr` distributed checkpoint backend is no longer supported. "
+            "Please switch to PyTorch Distributed format (`torch_dist`)."
         )
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
@@ -175,6 +175,11 @@ def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
             compressor=None,
             fill_value=None,
             write_empty_chunks=True,
+            synchronizer=(
+                zarr.ProcessSynchronizer(str(checkpoint_dir / f'{sharded_tensor.key}.sync'))
+                if sharded_tensor.flattened_range is not None
+                else None
+            ),
         )
         logger.debug(f"Created a new Zarr array at {checkpoint_dir / sharded_tensor.key}")
     except zarr.errors.ContainsArrayError as e:
@@ -191,6 +196,13 @@ def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
 
 class ZarrLoadShardedStrategy(LoadShardedStrategy):
     """Load strategy for the Zarr backend."""
+
+    def __init__(self, backend: str, version: int):
+        super().__init__(backend, version)
+        raise CheckpointingException(
+            "`zarr` distributed checkpoint backend is no longer supported. "
+            "Please switch to PyTorch Distributed format (`torch_dist`)."
+        )
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         if isinstance(checkpoint_dir, str):
@@ -305,7 +317,7 @@ def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
         return torch.nn.functional.pad(x, pad_args)
 
     # unsqueeze and squeeze to get shapes supported by cudnn
-    print(f"Replicating last row for {expected_sharded_ten.key}")
+    logger.info(f"Replicating last row for {expected_sharded_ten.key}")
     if x.dtype == torch.bfloat16:
         return (
             torch.nn.functional.pad(x.float().unsqueeze(0), pad_args, mode="replicate")
@@ -328,7 +340,7 @@ def load_zarr_based_sharded_metadata(
 
     sharded_state_dict = {}
     for subdir in checkpoint_dir.iterdir():
-        if not subdir.is_dir() or not (subdir / ".zarray").exists():
+        if not subdir.is_dir() or not (subdir / ".zarray").exists() or subdir.suffix == ".sync":
             continue
         key = subdir.name
         arr_shape, arr_dtype = get_shape_dtype_fn(str(subdir))

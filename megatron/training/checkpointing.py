@@ -8,45 +8,53 @@ import random
 import shutil
 import sys
 import threading
+import types
 from argparse import Namespace
 from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
-
-import numpy as np
 from time import time
 
+import numpy as np
 import torch
+from torch.distributed.checkpoint import FileSystemReader, default_planner
 
-from megatron.core import mpu, tensor_parallel, dist_checkpointing
+from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
-from megatron.core.dist_checkpointing.strategies.fully_parallel import \
-    FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
-from megatron.core.num_microbatches_calculator import update_num_microbatches
-from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
-from megatron.core.rerun_state_machine import get_rerun_state_machine
-from .async_utils import schedule_async_save, is_empty_async_queue
-from .global_vars import get_args
-from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
-from ..core.dist_checkpointing.serialization import \
-    get_default_save_sharded_strategy
-from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
-from . import wandb_utils
-
-from . import ft_integration
-
+from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+    FullyParallelLoadStrategyWrapper,
+    FullyParallelSaveStrategyWrapper,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core.num_microbatches_calculator import update_num_microbatches
+from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import get_torch_version, is_torch_min_version
+
+from ..core.dist_checkpointing.serialization import get_default_save_sharded_strategy
+from . import ft_integration, wandb_utils
+from .async_utils import is_empty_async_queue, schedule_async_save
+from .global_vars import get_args
+from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
+from .utils import append_to_progress_log, is_last_rank, print_rank_0, unwrap_model
+
+try:
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
+    from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+        print_diff_in_state_dicts,
+        handle_fp8_extra_state_case,
+        handle_swiglu_in_state_dict,
+        handle_experts_in_state_dict,
+    )
+    HAVE_MEGATRON_FSDP = True
+except ImportError:
+    HAVE_MEGATRON_FSDP = False
 
 
 # [ModelOpt]: Import
 try:
-    from modelopt.torch.opt.plugins import (
-        save_modelopt_state,
-        save_sharded_modelopt_state,
-        restore_modelopt_state,
-        restore_sharded_modelopt_state,
-    )
+    from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
@@ -169,6 +177,23 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
     return os.path.join(common_path, basename)
 
 
+def get_load_checkpoint_path_by_args(args, load_arg="load"):
+    """Get the checkpoint path based on the arguments."""
+    load_dir = getattr(args, load_arg)
+    iteration, release = -1, False
+    tracker_filename = 'because load directory is not defined'
+    if load_dir is not None:
+        tracker_filename = get_checkpoint_tracker_filename(load_dir)
+        if isfile(tracker_filename):
+            iteration, release = read_metadata(tracker_filename)
+
+    # Allow user to specify the loaded iteration.
+    if getattr(args, "ckpt_step", None):
+        iteration = args.ckpt_step
+
+    return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
+
+
 def get_distributed_optimizer_checkpoint_name(model_checkpoint_name):
     return os.path.join(os.path.dirname(model_checkpoint_name),
                         "distrib_optim.pt")
@@ -242,7 +267,7 @@ def checkpoint_exists(checkpoints_path):
 def read_metadata(tracker_filename):
     # Read the tracker file and either set the iteration or
     # mark it as a release checkpoint.
-    iteration = 0
+    iteration = -1
     release = False
 
     with open_file(tracker_filename, 'r') as f:
@@ -255,7 +280,10 @@ def read_metadata(tracker_filename):
                 print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
                     tracker_filename))
                 sys.exit()
-    assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+            else:
+                # Set iteration to 0 for release checkpoints
+                iteration = 0
+    assert iteration > -1 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
 
     # Get the max iteration retrieved across the ranks.
@@ -310,6 +338,12 @@ def get_rng_state(ckpt_format: str):
         tp_size = mpu.get_tensor_model_parallel_world_size()
         rng_state_list = ShardedObject('rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
                                        replica_id=mpu.get_data_parallel_rank(with_context_parallel=True))
+    elif ckpt_format == "fsdp_dtensor":
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        rng_state_list = {
+            f"({pp_rank}, {tp_rank})": rng_state_list
+        }
 
     return rng_state_list
 
@@ -318,6 +352,7 @@ class CheckpointType(Enum):
     LOCAL = auto()
     GLOBAL = auto()
     TORCH_DCP = auto()
+    FSDP_DTENSOR = auto()
 
 def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
     """Builds metadata used for sharded_state_dict versioning.
@@ -331,18 +366,37 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
     impossible to enforce a linearly increasing versioning for this whole space.
     """
     metadata = {}
-    if args.use_distributed_optimizer:
-        if args.ckpt_fully_parallel_save:
-            metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
-        else:
-            metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
-    metadata['chained_optim_avoid_prefix'] = True
+
+    if args.use_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
+        metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
+
+    # Force pre-mcore 0.14 behavior for PyTorch versions below 2.6a0
+    force_pre_mcore_014 = not is_torch_min_version("2.6a0")
+    if force_pre_mcore_014 and not args.dist_ckpt_save_pre_mcore_014:
+        logger.warning(f"PyTorch version {get_torch_version()} below 2.6 detected."
+                       f" Forcing dist_ckpt_save_pre_mcore_014 behavior.")
+
+    if args.dist_ckpt_save_pre_mcore_014 or force_pre_mcore_014:
+        if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
+            if args.ckpt_fully_parallel_save:
+                metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
+            else:
+                metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
+    else:
+        if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
+            if args.dist_ckpt_optim_fully_reshardable:
+                metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
+                metadata['distrib_optim_fully_reshardable_mem_efficient'] = args.distrib_optim_fully_reshardable_mem_efficient
+            else:
+                metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
+
     metadata['singleton_local_shards'] = False
+    metadata['chained_optim_avoid_prefix'] = True
     return metadata
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -409,7 +463,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Checkpoint name.
     return_base_dir = (ckpt_type != CheckpointType.LEGACY)
-    checkpoint_name = get_checkpoint_name(save_dir, iteration, release=False, pipeline_parallel=pipeline_parallel,
+    checkpoint_name = get_checkpoint_name(save_dir, iteration, release=release, pipeline_parallel=pipeline_parallel,
         tensor_rank=tensor_rank, pipeline_rank=pipeline_rank, expert_parallel=expert_parallel, expert_rank=expert_rank, return_base_dir=return_base_dir)
 
     # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
@@ -498,10 +552,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
-        elif ckpt_type == CheckpointType.GLOBAL and ckpt_format == "torch_dcp":
+        elif ckpt_type == CheckpointType.GLOBAL and ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
                 ensure_directory_exists(checkpoint_name, check_parent=False)
+
+            if ckpt_format == "fsdp_dtensor":
+                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
             fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
             torch.distributed.checkpoint.save(
@@ -524,7 +581,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 except ModuleNotFoundError:
                     raise RuntimeError("The 'nvidia_resiliency_ext' module is required for local "
                                        "checkpointing but was not found. Please ensure it is installed.")
-
+                if (sharded_sd_metadata or {}).get('distrib_optim_sharding_type') in ['fully_reshardable', 'dp_zero_gather_scatter']:
+                    # Note: Currently full reshardabilty is not supported when local checkpoints are used.
+                    raise RuntimeError(
+                        f"Local checkpointing does not support optimizer sharding type '{sharded_sd_metadata['distrib_optim_sharding_type']}'. "
+                        "Don't use '--dist-ckpt-optim-fully-reshardable' when saving local checkpoints."
+                    )
                 algo = args.non_persistent_local_ckpt_algo
                 cached_metadata = None
                 if args.ckpt_assume_constant_structure and 'local_checkpoint_cache' in checkpointing_context:
@@ -571,7 +633,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         with open_file(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
                 with open_file(tracker_filename, 'w') as f:
-                    f.write(str(iteration))
+                    f.write("release" if release else str(iteration))
                 tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
                 pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
                 print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
@@ -721,9 +783,17 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
     torch.save(dataloader_save_dict, data_state_save_path)
 
 
-def generate_state_dict(args, model, optimizer, opt_param_scheduler,
-                        rng_state, iteration=None,
-                        optim_sd_kwargs=None, model_sd_kwargs=None, rerun_state=None):
+def generate_state_dict(
+    args,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    rng_state,
+    iteration=None,
+    optim_sd_kwargs=None,
+    model_sd_kwargs=None,
+    rerun_state=None,
+):
     """Generate a state dict from given model, optimizer, scheduler, rng state and others. """
 
     # Arguments, iteration, and model.
@@ -740,7 +810,7 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
 
         if args.ckpt_format == "torch_dist":
             model_sd = model[i].sharded_state_dict(**(model_sd_kwargs or {}))
-        else:   # torch, torch_dcp
+        else:   # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
 
         state_dict[key] = model_sd
@@ -752,6 +822,13 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
 
             if args.ckpt_format == "torch_dist":
                 optimizer_sd = optimizer.sharded_state_dict(state_dict, **(optim_sd_kwargs or {}))
+            elif args.ckpt_format == "fsdp_dtensor":
+                if optim_sd_kwargs is None:
+                    optim_sd_kwargs = {}
+                if "metadata" not in optim_sd_kwargs:
+                    optim_sd_kwargs["metadata"] = {}
+                optim_sd_kwargs['metadata'].update(_build_sharded_state_dict_metadata(args))
+                optimizer_sd = optimizer.sharded_state_dict(state_dict, **optim_sd_kwargs)
             else:
                 optimizer_sd = optimizer.state_dict()
 
@@ -768,6 +845,29 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
     # RNG states.
     if not args.no_save_rng and rng_state:
         state_dict["rng_state"] = rng_state
+
+    return state_dict
+
+
+def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
+    state_dict = raw_state_dict.copy()
+    handle_fp8_extra_state_case(state_dict["model"])
+    if args.swiglu:
+        if "optimizer" in state_dict:
+            model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
+                model, state_dict["model"], state_dict["optimizer"]
+            )
+            state_dict["model"] = model_state_dict
+            state_dict["optimizer"] = optimizer_state_dict
+        else:
+            model_state_dict, _ = handle_swiglu_in_state_dict(
+                model, state_dict["model"], None
+            )
+            state_dict["model"] = model_state_dict
+    if args.num_experts:
+        state_dict["model"] = handle_experts_in_state_dict(state_dict["model"], args.num_experts)
+    preprocess_state_dict_for_uneven_dtensor(state_dict)
+
     return state_dict
 
 
@@ -928,7 +1028,7 @@ def _load_global_dist_base_checkpoint(
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 
-def _get_checkpoint_format(checkpoint_name):
+def _get_checkpoint_format(checkpoint_name, args):
     """Get the format of an existing checkpoint."""
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
@@ -946,6 +1046,8 @@ def _get_checkpoint_format(checkpoint_name):
         ckpt_format = "torch"
     elif is_torch_dcp:
         ckpt_format = "torch_dcp"
+        if getattr(args, "use_megatron_fsdp", False):
+            ckpt_format = "fsdp_dtensor"
     else:
         raise NotImplementedError(f"unknown checkpoint format in {checkpoint_name}")
 
@@ -1013,7 +1115,7 @@ def _load_base_checkpoint(
 
     # Determine the type of the checkpoint on disk.
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
-    ckpt_format = _get_checkpoint_format(checkpoint_name)
+    ckpt_format = _get_checkpoint_format(checkpoint_name, args)
 
     if not rank0:
         dist_infix = "distributed " if ckpt_format == "torch_dist" else ""
@@ -1039,7 +1141,7 @@ def _load_base_checkpoint(
         else:
             checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
         try:
-            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+            state_dict = torch.load(checkpoint_name, map_location='cpu')
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler
 
@@ -1051,7 +1153,7 @@ def _load_base_checkpoint(
                 'megatron.legacy.fp16_deprecated.loss_scaler'
             ]
             sys.modules['megatron.model'] = sys.modules['megatron.legacy.model']
-            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+            state_dict = torch.load(checkpoint_name, map_location='cpu')
             sys.modules.pop('fp16.loss_scaler', None)
             sys.modules.pop('megatron.fp16.loss_scaler', None)
             sys.modules.pop('megatron.model', None)
@@ -1080,6 +1182,39 @@ def _load_base_checkpoint(
                 state_dict=state_dict,
                 storage_reader=fs_storage_reader,
             )
+    elif ckpt_format == "fsdp_dtensor":
+        assert HAVE_MEGATRON_FSDP, "Should not be called if Megatron-FSDP is not available."
+        if rank0:
+            return {}, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
+
+        state_dict = sharded_state_dict
+        raw_optimizer_state_dict = state_dict["optimizer"].copy() if "optimizer" in state_dict else None
+        raw_model_state_dict = state_dict["model"].copy() if "model" in state_dict else None
+        model = state_dict.pop("_model")
+        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+
+        ckpt_type = CheckpointType.FSDP_DTENSOR
+        fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
+        allow_partial_load = not getattr(args, 'strict_fsdp_dtensor_load', False)
+        if allow_partial_load:
+            state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
+            rank = torch.distributed.get_rank()
+            import time as _time
+            _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
+            print_diff_in_state_dicts(state_dict_metadata, state_dict)
+
+        planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
+        torch.distributed.checkpoint.load_state_dict(
+            state_dict=state_dict,
+            storage_reader=fs_storage_reader,
+            planner=planner,
+        )
+
+        if raw_optimizer_state_dict is not None:
+            state_dict["optimizer"] = raw_optimizer_state_dict
+
+        if raw_model_state_dict is not None:
+            state_dict["model"] = raw_model_state_dict
     else:
         raise NotImplementedError(f"checkpoint format {ckpt_format} not supported")
 
@@ -1187,7 +1322,7 @@ def load_args_from_checkpoint(
     else:
         setattr(args, 'moe_ffn_hidden_size', None)
     _set_arg('moe_router_topk', force=True)
-    _set_arg('moe_token_dispatcher_type', force=True)
+    _set_arg('moe_token_dispatcher_type', force=False)
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
@@ -1241,35 +1376,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     args = get_args()
     load_dir = getattr(args, load_arg)
 
-    # Check for model-opt format loading
-    if hasattr(args, 'load_model_opt_format') and args.load_model_opt_format:
-        print_rank_0(f'Loading checkpoint using ModelOpt format from {load_dir}')
-        from megatron.post_training.checkpointing import load_modelopt_checkpoint
-
-        # Call the ModelOpt checkpoint loading function
-        load_modelopt_checkpoint(
-            ddp_model,
-            optimizer=optimizer,
-            opt_param_scheduler=opt_param_scheduler,
-            strict=strict,
-            load_arg=load_arg
-        )
-        
-        # Since load_modelopt_checkpoint doesn't return iteration count, we need to get it
-        if torch.distributed.is_initialized():
-            tracker_filename = get_checkpoint_tracker_filename(load_dir)
-            if os.path.isfile(tracker_filename):
-                iteration, release = read_metadata(tracker_filename)
-                if release:
-                    iteration = 0
-            else:
-                iteration = 0
-        else:
-            iteration = 0
-        
-        # We don't have a reliable way to get num_floating_point_operations_so_far from ModelOpt format
-        return iteration, 0
-
     # Finetuning directories
     pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
     if pretrained_dir is not None and not checkpoint_exists(load_dir):
@@ -1295,6 +1401,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         ckpt_format = None
         if ckpt_type == CheckpointType.TORCH_DCP:
             ckpt_format = "torch_dcp"
+        elif ckpt_type == CheckpointType.FSDP_DTENSOR:
+            ckpt_format = "fsdp_dtensor"
         elif ckpt_type == CheckpointType.LEGACY:
             ckpt_format = "torch"
         elif ckpt_type in [CheckpointType.LOCAL, CheckpointType.GLOBAL]:
@@ -1308,18 +1416,27 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     ignore_rng_state = False
     ignore_rerun_state = True
     if ckpt_format == "torch_dist":
+        ckpt_args = types.SimpleNamespace()
+        if state_dict is not None and "args" in state_dict:
+            ckpt_args = state_dict.get("args")
+
+        if not hasattr(ckpt_args, "tensor_model_parallel_size"):
+            print_rank_0("WARNING: TP size not found in checkpoint args, using 0 as default.")
+        if not hasattr(ckpt_args, "pipeline_model_parallel_size"):
+            print_rank_0("WARNING: PP size not found in checkpoint args, using 0 as default.")
+
         ckpt_tp_pp = (
-            state_dict['args'].tensor_model_parallel_size,
-            state_dict['args'].pipeline_model_parallel_size,
+            getattr(ckpt_args, "tensor_model_parallel_size", 0),
+            getattr(ckpt_args, "pipeline_model_parallel_size", 0),
         )
         run_tp_pp = (
             args.tensor_model_parallel_size,
             args.pipeline_model_parallel_size,
         )
 
-        ckpt_world_size = getattr(state_dict['args'], 'world_size', 0)
+        ckpt_world_size = getattr(ckpt_args, 'world_size', 0)
         run_world_size = getattr(args, 'world_size', 0)
-        ckpt_dp = getattr(state_dict['args'], 'data_parallel_size', 0)
+        ckpt_dp = getattr(ckpt_args, 'data_parallel_size', 0)
         run_dp = getattr(args, 'data_parallel_size', 0)
         mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(
             run_tp_pp, ckpt_tp_pp
@@ -1327,7 +1444,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         # Determine if RNG state will be loaded
         if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune and not args.no_load_rng
-                and not getattr(state_dict['args'], 'no_save_rng', False)):
+                and not getattr(ckpt_args, 'no_save_rng', False)):
             gen_sd_rng_state = get_rng_state(args.ckpt_format)  # we can load the rng state
         else:
             ignore_rng_state = True
@@ -1335,11 +1452,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             if ckpt_tp_pp != run_tp_pp:
                 print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
 
-        sharded_sd_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict)
+        if ckpt_type == CheckpointType.LOCAL:
+            sharded_sd_metadata = _build_sharded_state_dict_metadata(args)
+        else:
+            sharded_sd_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict)
         print_rank_0(f'sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}')
         # Determine if optimizer state will be loaded
         if (not release and not args.finetune and not args.no_load_optim
-                and not getattr(state_dict['args'], 'no_save_optim', False)):
+                and not getattr(ckpt_args, 'no_save_optim', False)):
             gen_sd_optim = optimizer
             gen_sd_opt_param_scheduler = opt_param_scheduler
 
@@ -1350,13 +1470,22 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     # (for MCore v0.13+ checkpoints `sharded_sd_metadata is not None`)
                     sharded_sd_metadata = {
                         'distrib_optim_sharding_type': ('fully_sharded_model_space'
-                                                        if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
+                                                        if getattr(ckpt_args, 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter'),
                     }
-                if ckpt_tp_pp != run_tp_pp and sharded_sd_metadata['distrib_optim_sharding_type'] != 'fully_sharded_model_space':
+                if (
+                    ckpt_tp_pp != run_tp_pp
+                    and sharded_sd_metadata['distrib_optim_sharding_type']
+                    not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+                ):
                     raise RuntimeError(f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type"
                                        f" {sharded_sd_metadata['distrib_optim_sharding_type']}."
                                        f" Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.")
+
+                # Check if fully parallel load is compatible with sharding type
+                if args.ckpt_fully_parallel_load and sharded_sd_metadata['distrib_optim_sharding_type'] == 'dp_zero_gather_scatter':
+                    raise RuntimeError("Fully parallel load is not supported for dp_zero_gather_scatter checkpoints. "
+                                       "Please remove --ckpt-fully-parallel-load flag")
         else:
             gen_sd_optim = None
             gen_sd_opt_param_scheduler = None
@@ -1387,16 +1516,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         ):
             print_rank_0("Job sharding has changed: Rerun state will be ignored")
 
-        # [ModelOpt]: IMPORTANT! Restoring modelopt_state (sharded or not) must be performed
-        # after the model instance has been created and before _load_base_checkpoint is called.
-        if has_nvidia_modelopt:
-            if ckpt_type == CheckpointType.LOCAL:
-                print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
-            elif ckpt_type == CheckpointType.GLOBAL:
-                restore_modelopt_state(model, state_dict)
-            else:
-                restore_sharded_modelopt_state(model, checkpoint_name)
-
         # [ModelOpt]: Initial loading from non-resume sharded checkpoint to a Distillation Model
         # will result in key mismatch with loss modules potentially containing parameters, since
         # it requires generating a state_dict before loading. Here we hide those modules if present.
@@ -1423,6 +1542,42 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             "num_floating_point_operations_so_far": 0,
         }
         load_kwargs["sharded_state_dict"] = sharded_state_dict
+    elif args.ckpt_format == "fsdp_dtensor":
+        reader = FileSystemReader(get_load_checkpoint_path_by_args(args))
+        try:
+            state_dict_metadata = reader.read_metadata().state_dict_metadata
+        except FileNotFoundError:
+            state_dict_metadata = {}
+
+        gen_sd_rerun_state = {}
+        gen_sd_opt_param_scheduler = None
+        gen_sd_rng_state = None
+        gen_sd_optim = None
+        if not args.finetune:
+            if "rerun_state_machine" in state_dict_metadata:
+                gen_sd_rerun_state = get_rerun_state_machine().state_dict(
+                    data_iterator=None, ckpt_format=ckpt_format, force=True,
+                )
+            if not args.no_load_rng:
+                gen_sd_rng_state = get_rng_state(args.ckpt_format)
+            if not args.no_load_optim:
+                gen_sd_optim = optimizer
+                gen_sd_opt_param_scheduler = opt_param_scheduler
+
+        optim_sd_kwargs = dict(metadata=_build_sharded_state_dict_metadata(args), is_loading=True)
+
+        state_dict = generate_state_dict(
+            args,
+            model=model,
+            optimizer=gen_sd_optim,
+            opt_param_scheduler=gen_sd_opt_param_scheduler,
+            rng_state=gen_sd_rng_state,
+            optim_sd_kwargs=optim_sd_kwargs,
+            rerun_state=gen_sd_rerun_state,
+            iteration=1,
+        )
+        state_dict["_model"] = model
+        load_kwargs["sharded_state_dict"] = state_dict
 
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
         load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
@@ -1458,9 +1613,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    assert args.consumed_train_samples == 0
-    assert args.skipped_train_samples == 0
-    assert args.consumed_valid_samples == 0
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
         check_checkpoint_args(checkpoint_args)
@@ -1510,7 +1662,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
             is_torch_dist = ckpt_format == "torch_dist"
-            if args.use_distributed_optimizer and not is_torch_dist:
+            if args.use_distributed_optimizer and not is_torch_dist and ckpt_format not in ["torch_dcp", "fsdp_dtensor"]:
                 # NOTE: this is a manual read of the tracker file.
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_torch_dist
@@ -1555,11 +1707,23 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not release and not args.finetune and not args.no_load_rng and not ignore_rng_state:
         try:
             if 'rng_state' in state_dict:
+                if args.ckpt_format == "fsdp_dtensor":
+                    # FSDP DTensor checkpoints store rng_state in a different format.
+                    tp_rank = mpu.get_tensor_model_parallel_rank()
+                    pp_rank = mpu.get_pipeline_model_parallel_rank()
+                    if f"({pp_rank}, {tp_rank})" in state_dict['rng_state']:
+                        rng_state = state_dict['rng_state'][f"({pp_rank}, {tp_rank})"]
+                    else:
+                        print("WARNING: RNG state not found for current TP/PP rank")
+                        rng_state = next(iter(state_dict['rng_state'].values()))
+                else:
+                    rng_state = state_dict['rng_state']
+
                 # access rng_state for data parallel rank
                 if args.data_parallel_random_init:
-                    rng_state = state_dict['rng_state'][mpu.get_data_parallel_rank()]
+                    rng_state = rng_state[mpu.get_data_parallel_rank()]
                 else:
-                    rng_state = state_dict['rng_state'][0]
+                    rng_state = rng_state[0]
                 random.setstate(rng_state['random_rng_state'])
                 np.random.set_state(rng_state['np_rng_state'])
                 torch.set_rng_state(rng_state['torch_rng_state'])
@@ -1607,6 +1771,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         is_local_chkpt = (ckpt_type == CheckpointType.LOCAL)
         ft_integration.on_checkpoint_loaded(is_local_chkpt=is_local_chkpt)
 
+    # Patch checkpoint as needed if required field is not found.
+    if optimizer is not None:
+        log_printed = False
+        for param_group in optimizer.param_groups:
+            if 'default_config' not in param_group:
+                param_group['default_config'] = True
+                if not log_printed:
+                    print_rank_0(">>> Inserting 'default_config' field into optimizer.param_groups...")
+                log_printed = True
+
     return iteration, num_floating_point_operations_so_far
 
 
@@ -1650,7 +1824,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
-    state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+    state_dict = torch.load(checkpoint_name, map_location='cpu')
     ret_state_dict = state_dict['model']
 
     if only_query_model:

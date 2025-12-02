@@ -14,7 +14,7 @@ FROM main as jet
 ARG JET_API_VERSION
 RUN --mount=type=secret,id=JET_INDEX_URLS \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \
-    pip install --no-cache-dir jet-api==$JET_API_VERSION "jet-client~=2.0" --upgrade $JET_INDEX_URLS
+    pip install --no-cache-dir jet-api==$JET_API_VERSION "jet-client~=3.0" --upgrade $JET_INDEX_URLS
 
 ENV PATH="$PATH:/opt/jet/bin"
 ###

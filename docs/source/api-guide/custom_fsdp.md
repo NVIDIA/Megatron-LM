@@ -1,3 +1,5 @@
+**NOTE: In M-Core 0.14, the custom FSDP refactored its checkpoint implementation to use DTensor-based torch distributed checkpointing. The custom FSDP was also renamed Megatron FSDP. The relevant sections of this document are no longer applicable.**
+
 # MCore Custom Fully Sharded Data Parallel (FSDP)
 
 ## How to use ?
@@ -5,7 +7,7 @@
 Add these flag to enable MCore custom FSDP.
 
 ```bash
---use-custom-fsdp
+--use-megatron-fsdp
 --data-parallel-sharding-strategy optim_grads_params
 --no-gradient-accumulation-fusion
 --use-distributed-optimizer
@@ -88,7 +90,7 @@ The custom FSDP provides the same programming interface as PyTorch's Distributed
 
 ```python
 # Initialize model and optimizer
-ddp_config.use_custom_fsdp = True
+ddp_config.use_megatron_fsdp = True
 ddp_config.data_parallel_sharding_strategy = "optim_grads_params"
 model = GPTModel(transformer_config)
 model = FullyShardedDataParallel(

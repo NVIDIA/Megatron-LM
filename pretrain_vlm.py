@@ -224,6 +224,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         image_w=args.img_w,
         preprocess_func=_preprocess_data_for_llava,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
 
     print_rank_0("> building train, validation, and test datasets for multimodal ...")

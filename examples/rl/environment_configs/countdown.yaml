@@ -1,0 +1,3 @@
+- agent_type: examples.rl.environments.countdown.countdown_agent.CountdownAgent
+  agent_args: {}
+  weight: 1.0

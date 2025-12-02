@@ -286,17 +286,19 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
 
         encoder_input = numpy.array(encoder_input, dtype=numpy.int64)
         encoder_input = numpy.pad(
-            encoder_input, (0, length_pads_encoder), constant_values=self.config.tokenizer.pad
+            encoder_input, (0, length_pads_encoder), constant_values=self._pad_token_id
         )
 
         decoder_input = numpy.array(decoder_input, dtype=numpy.int64)
         decoder_input = numpy.pad(
-            decoder_input, (0, length_pads_decoder), constant_values=self.config.tokenizer.pad
+            decoder_input, (0, length_pads_decoder), constant_values=self._pad_token_id
         )
 
         # Create attention and history masks
-        mask_encoder = numpy.array([1] * length_toks_encoder + [0] * length_pads_encoder)
-        mask_decoder = numpy.array([1] * length_toks_decoder + [0] * length_pads_decoder)
+        mask_encoder = numpy.ones(self.config.sequence_length_encoder, dtype=numpy.int64)
+        mask_encoder[encoder_input == self._pad_token_id] = 0
+        mask_decoder = numpy.ones(self.config.sequence_length_decoder, dtype=numpy.int64)
+        mask_decoder[decoder_input == self._pad_token_id] = 0
         mask_encoder_decoder = None
 
         # Mask the labels
@@ -306,6 +308,11 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         # Get the loss mask
         loss_mask = numpy.zeros(self.config.sequence_length_decoder, dtype=numpy.int64)
         loss_mask[:length_toks_decoder] = 1
+
+        # For padded sequences, ensure the embedding layer can map the token ID
+        encoder_input[encoder_input == self._pad_token_id] = 0
+        decoder_input[decoder_input == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = 0
 
         return {
             "text_enc": encoder_input,

@@ -1,7 +1,6 @@
 The following applies to all files unless otherwise noted:
 
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-#
+# Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
 # are met:
@@ -37,7 +36,7 @@ Below are licenses used in those files, as indicated.
 
 
 --------------------------------------------------------------------------------------
--- LICENSE FOR Facebook, huggingface, Google Research, LLaVA, Mamba, and vLLM code  --
+-- LICENSE FOR Facebook, huggingface, Google Research, LLaVA, Mamba, TinyZero and vLLM code  --
 
 
                                  Apache License

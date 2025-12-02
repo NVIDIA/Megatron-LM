@@ -170,9 +170,9 @@ class TestMambaModel:
         )
 
         # Create model with custom process groups
-        from megatron.core.process_groups_config import ModelCommProcessGroups
+        from megatron.core.process_groups_config import ProcessGroupCollection
 
-        model_comm_pgs = ModelCommProcessGroups(
+        pg_collection = ProcessGroupCollection(
             tp=tp_group, cp=cp_group, pp=pp_group, embd=embd_group
         )
 
@@ -195,7 +195,7 @@ class TestMambaModel:
             max_sequence_length=4,
             hybrid_attention_ratio=0.3,
             hybrid_mlp_ratio=0.3,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         # Basic forward test

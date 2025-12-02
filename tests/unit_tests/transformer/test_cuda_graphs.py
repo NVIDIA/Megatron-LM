@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
 import torch
@@ -6,17 +6,18 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.pipeline_parallel.schedules import set_current_microbatch
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -37,7 +38,7 @@ class TestParallelTransformerBlockCudagraphs:
             hidden_size=hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,
+            cuda_graph_impl="local",
         )
         self.parallel_transformer_block = TransformerBlock(
             self.transformer_config, get_gpt_layer_with_transformer_engine_spec()
@@ -47,6 +48,7 @@ class TestParallelTransformerBlockCudagraphs:
         Utils.destroy_model_parallel()
         _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -74,6 +76,11 @@ class TestParallelTransformerBlockCudagraphs:
             assert hasattr(parallel_transformer_block.layers[0], "cudagraph_manager")
             assert (
                 len(parallel_transformer_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
+            )
+            del (
+                parallel_transformer_block.layers[_]
+                .cudagraph_manager.cudagraph_runners[0]
+                .fwd_graph
             )
 
 
@@ -170,7 +177,7 @@ def test_cuda_graph_determine_first_last_layer_logic(
         virtual_pipeline_model_parallel_size=vpp,
         pipeline_model_parallel_size=pp,
         deallocate_pipeline_outputs=True,
-        enable_cuda_graph=True,
+        cuda_graph_impl="local",
         use_te_rng_tracker=True,
         account_for_embedding_in_pipeline_split=account_for_embedding_in_pipeline_split,
         account_for_loss_in_pipeline_split=account_for_loss_in_pipeline_split,
@@ -214,10 +221,28 @@ def test_cuda_graph_determine_first_last_layer_logic(
             assert runner.is_first_layer == (l.layer_number in first_layer_numbers_golden)
             assert runner.is_last_layer == (l.layer_number in last_layer_numbers_golden)
 
-    # teardown
+            del l.cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+    # Destroy all captured graphs deterministically
+    for m in model:
+        for l in m.decoder.layers:
+            for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
+                # Safely delete both graphs if present
+                if hasattr(runner, "fwd_graph"):
+                    del runner.fwd_graph
+                if hasattr(runner, "bwd_graph"):
+                    del runner.bwd_graph
+
+    # Ensure all pending work is complete and graph destruction runs now
+    torch.cuda.synchronize()
+
+    # Teardown
     Utils.destroy_model_parallel()
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
+    CudaGraphManager.global_mempool = None
+    CudaGraphManager.fwd_mempools = None
+    CudaGraphManager.bwd_mempools = None
 
 
 class TestLLaVACudaGraph:
@@ -248,7 +273,7 @@ class TestLLaVACudaGraph:
             hidden_size=self.language_hidden_size,
             num_attention_heads=self.language_num_attention_heads,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,  # Enable CUDA graphs
+            cuda_graph_impl="local",  # Enable CUDA graphs
         )
 
         # Create vision transformer config
@@ -257,7 +282,7 @@ class TestLLaVACudaGraph:
             hidden_size=16,
             num_attention_heads=2,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,  # Enable CUDA graphs for vision model too
+            cuda_graph_impl="local",  # Enable CUDA graphs for vision model too
         )
 
         # Create vision projection config
@@ -313,6 +338,9 @@ class TestLLaVACudaGraph:
         # Move model to CUDA
         self.llava_model.cuda()
 
+        set_current_microbatch(self.llava_model.vision_model, 1)
+        set_current_microbatch(self.llava_model.language_model, 1)
+
         # Create test inputs
         batch_size = 2
         seq_length = 1024
@@ -365,6 +393,11 @@ class TestLLaVACudaGraph:
                         layer.cudagraph_manager is not None
                     ), "Language model layers should have CUDA graph managers"
 
+                    # Verify that CUDA graphs were created successfully
+                    for runner in layer.cudagraph_manager.cudagraph_runners:
+                        assert hasattr(runner, 'fwd_graph')
+                        assert hasattr(runner, 'bwd_graph')
+
         # Perform backward pass to trigger backward graph recording
         if isinstance(output1, tuple):
             loss = output1[0].sum()
@@ -381,6 +414,20 @@ class TestLLaVACudaGraph:
         # Verify that CUDA graphs were created successfully
         assert _CudagraphGlobalRecord.cudagraph_created, "CUDA graphs should be created"
 
+        if hasattr(self.llava_model.vision_model, 'decoder') and hasattr(
+            self.llava_model.vision_model.decoder, 'layers'
+        ):
+            for layer in self.llava_model.vision_model.decoder.layers:
+                del layer.cudagraph_manager.cudagraph_runners[0].fwd_graph
+                del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
+
+        if hasattr(self.llava_model.language_model, 'decoder') and hasattr(
+            self.llava_model.language_model.decoder, 'layers'
+        ):
+            for layer in self.llava_model.language_model.decoder.layers:
+                del layer.cudagraph_manager.cudagraph_runners[0].fwd_graph
+                del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
+
 
 class TestParallelMambaBlockCudagraphs:
     def setup_method(self, method):
@@ -389,8 +436,11 @@ class TestParallelMambaBlockCudagraphs:
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
         model_parallel_cuda_manual_seed(123)
 
-        def get_model_comm_pgs():
-            return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+        # Ensure that this test is capturing to a fresh memory pool.
+        CudaGraphManager.global_mempool = None
+
+        def get_pg_collection():
+            return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
         def get_mamba_block(hybrid_override_pattern):
             transformer_config = TransformerConfig(
@@ -400,14 +450,14 @@ class TestParallelMambaBlockCudagraphs:
                 num_layers=len(hybrid_override_pattern),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
-                enable_cuda_graph=True,
+                cuda_graph_impl="local",
             )
             modules = mamba_stack_spec.submodules
             return MambaStack(
                 transformer_config,
                 modules,
                 hybrid_override_pattern=hybrid_override_pattern,
-                model_comm_pgs=get_model_comm_pgs(),
+                pg_collection=get_pg_collection(),
             )
 
         self.mamba_block = get_mamba_block(hybrid_override_pattern="M-M*-")
@@ -444,8 +494,11 @@ class TestParallelMambaBlockCudagraphs:
             assert hasattr(parallel_mamba_block.layers[0], "cudagraph_manager")
             assert len(parallel_mamba_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
 
+            del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
+
 
 if __name__ == "__main__":
+
     test = TestParallelTransformerBlockCudagraphs()
     test.setup_method(method=None)
     test.test_gpu_cudagraph()

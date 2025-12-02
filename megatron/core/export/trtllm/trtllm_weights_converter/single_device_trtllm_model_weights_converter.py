@@ -152,6 +152,16 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                     self._cast_value(val, layer_name).detach().contiguous()
                 )
 
+        def _duplicate_kv_head(val: torch.Tensor, rep: int, dim: int):
+            """Duplicates a kv tensor along specified dimension.
+            [hidden_dim, num_kv_heads, 1, size_per_head] -> [hidden_dim, num_kv_heads, rep, size_per_head]
+            or [num_kv_heads, 1, size_per_head] -> [num_kv_heads, rep, size_per_head]
+            """
+            shapes = list(val.shape)
+            shapes[dim] = rep
+
+            return val.expand(*shapes)
+
         if val.ndim == 2:
             val = val.T
 
@@ -222,16 +232,21 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             # We first concat all sub weights per tp rank together.
             val = val.reshape(self.num_kv_heads, q_num + 2, size_per_head)
 
-            qkv = torch.split(val, [q_num, 1, 1], dim=1)
-            q_split = torch.chunk(qkv[0], self.export_config.inference_tp_size, axis=0)
-            k_split = torch.chunk(qkv[1], self.export_config.inference_tp_size, axis=0)
-            v_split = torch.chunk(qkv[2], self.export_config.inference_tp_size, axis=0)
+            q_bias, k_bias, v_bias = torch.split(val, [q_num, 1, 1], dim=1)
+
+            if self.num_kv_heads < self.export_config.inference_tp_size:
+                rep = self.export_config.inference_tp_size // self.num_kv_heads
+                k_bias = _duplicate_kv_head(k_bias, rep, dim=1)
+                v_bias = _duplicate_kv_head(v_bias, rep, dim=1)
+
+            # Reshape before splitting for num_kv_heads < tp_size
+            q_split = torch.chunk(q_bias.reshape(-1), self.export_config.inference_tp_size, axis=0)
+            k_split = torch.chunk(k_bias.reshape(-1), self.export_config.inference_tp_size, axis=0)
+            v_split = torch.chunk(v_bias.reshape(-1), self.export_config.inference_tp_size, axis=0)
 
             # Concatenate Q, K, and V together
             split_vals = [
-                torch.concatenate(
-                    [q_split[i].reshape(-1), k_split[i].reshape(-1), v_split[i].reshape(-1)], dim=0
-                )
+                torch.concatenate([q_split[i], k_split[i], v_split[i]], dim=0)
                 for i in range(self.export_config.inference_tp_size)
             ]
             _add_to_trtllm_model_weights(
@@ -252,31 +267,39 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             val = val.reshape(hidden_dim, self.num_kv_heads, q_num + 2, size_per_head)
 
             # Split the QKV to separate variables.
-            qkv = torch.split(val, [q_num, 1, 1], dim=2)
+            q_weight, k_weight, v_weight = torch.split(val, [q_num, 1, 1], dim=2)
 
-            query_groups_shape = qkv[0].shape
-            if len(query_groups_shape) > 1:
-                if (query_groups_shape[1] % self.export_config.inference_tp_size) != 0:
+            if self.num_kv_heads < self.export_config.inference_tp_size:
+                if self.export_config.inference_tp_size % self.num_kv_heads != 0:
                     raise Exception(
                         "Number of query groups of the models is {0}. Please select tensor parallelism size "
-                        "that can split the number of query groups to equal number of query matrices in the "
-                        "each GPU.".format(query_groups_shape[1])
+                        "that can duplicate or split the number of query groups to equal number of query matrices in the "
+                        "each GPU.".format(self.num_kv_heads)
                     )
+                rep = self.export_config.inference_tp_size // self.num_kv_heads
+                k_weight = _duplicate_kv_head(k_weight, rep, dim=2)
+                v_weight = _duplicate_kv_head(v_weight, rep, dim=2)
+            elif (self.num_kv_heads % self.export_config.inference_tp_size) != 0:
+                raise Exception(
+                    "Number of query groups of the models is {0}. Please select tensor parallelism size "
+                    "that can duplicate or split the number of query groups to equal number of query matrices in the "
+                    "each GPU.".format(self.num_kv_heads)
+                )
 
-            q_split = torch.chunk(qkv[0], self.export_config.inference_tp_size, axis=1)
-            k_split = torch.chunk(qkv[1], self.export_config.inference_tp_size, axis=1)
-            v_split = torch.chunk(qkv[2], self.export_config.inference_tp_size, axis=1)
+            # Reshape before splitting for num_kv_heads < tp_size
+            q_split = torch.chunk(
+                q_weight.reshape(hidden_dim, -1), self.export_config.inference_tp_size, axis=1
+            )
+            k_split = torch.chunk(
+                k_weight.reshape(hidden_dim, -1), self.export_config.inference_tp_size, axis=1
+            )
+            v_split = torch.chunk(
+                v_weight.reshape(hidden_dim, -1), self.export_config.inference_tp_size, axis=1
+            )
 
             # Concatenate Q, K, and V together
             split_vals = [
-                torch.concatenate(
-                    [
-                        q_split[i].reshape(hidden_dim, -1),
-                        k_split[i].reshape(hidden_dim, -1),
-                        v_split[i].reshape(hidden_dim, -1),
-                    ],
-                    dim=1,
-                )
+                torch.concatenate([q_split[i], k_split[i], v_split[i]], dim=1)
                 for i in range(self.export_config.inference_tp_size)
             ]
             _add_to_trtllm_model_weights(

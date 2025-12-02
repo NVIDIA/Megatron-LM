@@ -4,6 +4,7 @@
 
 
 import math
+from .utils import print_rank_0
 
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
@@ -259,6 +260,80 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     return activation_memory / args.tensor_model_parallel_size
 
 
+def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
+    """Compute activation memory without sequence parallelism"""
+
+    # 4. Compute per-layer memory
+    per_layer_memory = args.seq_length * args.micro_batch_size * args.hidden_size * (10 + (24 / args.tensor_model_parallel_size))
+
+    if verbose:
+        print(
+            f"Activation memory footprint per transformer layer (precise, without SP): "
+            f"{per_layer_memory / NUM_BYTES_IN_MEGABYTE:.1f} MB"
+        )
+
+    # 5. Multiply by number of layers
+    total_activation_memory = per_layer_memory * args.num_layers
+
+    # 6. Add embedding activations
+    # Input to embedding (pp_size microbatches in flight)
+    total_activation_memory += (
+        8 * args.seq_length * args.micro_batch_size * args.pipeline_model_parallel_size
+    )
+    # Dropout in embedding layer (pp_size microbatches in flight)
+    total_activation_memory += (
+        args.seq_length
+        * args.micro_batch_size
+        * args.hidden_size
+        * args.pipeline_model_parallel_size
+    )
+
+    # 7. Handle pipeline parallelism schedules
+    # Multiply by interleaved PP memory factor
+    if args.virtual_pipeline_model_parallel_size is not None:
+        interleaved_schedule_memory_penalty = 1 + (
+            (args.pipeline_model_parallel_size - 1)
+            / (args.pipeline_model_parallel_size * args.virtual_pipeline_model_parallel_size)
+        )
+        in_flight_microbatches = math.ceil(
+            interleaved_schedule_memory_penalty * args.pipeline_model_parallel_size
+        )
+        if verbose:
+            print(
+                f"Memory penalty from interleaved schedule: {interleaved_schedule_memory_penalty:.2f}"
+            )
+            print(f"Number of in-flight microbatches: {in_flight_microbatches}")
+        total_activation_memory *= interleaved_schedule_memory_penalty
+
+    # If using non-interleaved schedule, number of microbatches in pipeline can be less than pp_size
+    if args.virtual_pipeline_model_parallel_size is None and args.pipeline_model_parallel_size > 1:
+        if num_microbatches is not None:
+            total_activation_memory *= min(1, num_microbatches / args.pipeline_model_parallel_size)
+            in_flight_microbatches = min(num_microbatches, args.pipeline_model_parallel_size)
+        else:
+            in_flight_microbatches = args.pipeline_model_parallel_size
+        if verbose:
+            print(f"Number of in-flight microbatches: {in_flight_microbatches}")
+
+    # 8. Add output layer memory if needed
+    if args.pipeline_model_parallel_size == 1:
+        # Logits calculation
+        logits_size = args.seq_length * args.micro_batch_size * args.padded_vocab_size
+        # The output projection is partitioned across TP
+        logits_size /= args.tensor_model_parallel_size
+
+        # Outputs from final layer norm
+        final_ln_output = args.seq_length * args.micro_batch_size * args.hidden_size
+
+        total_activation_memory += (logits_size + final_ln_output) * 2  # multiply by 2 for bytes
+
+    # 9. Add buffer for optimizer and miscellaneous temporaries (5% overhead)
+    overhead_factor = 1.05
+    total_activation_memory *= overhead_factor
+
+    return total_activation_memory
+
+
 def report_theoretical_memory(args, num_microbatches=None, verbose=False):
     if args.is_hybrid_model:
         print("Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models.")
@@ -268,20 +343,25 @@ def report_theoretical_memory(args, num_microbatches=None, verbose=False):
         compute_weight_and_optimizer_memory(args, verbose=verbose) / NUM_BYTES_IN_MEGABYTE
     )
 
-    # Formulae here assume sequence parallelism and selective activation recomputation.
-    if not args.sequence_parallel or args.recompute_granularity != 'selective':
-        print(
-            f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} MB"
+    # Choose the appropriate activation memory calculation based on parallelism strategy
+    if args.sequence_parallel and args.recompute_granularity == 'selective':
+        print_rank_0("compute_activation_memory with SP")
+        activation_memory = (
+            compute_activation_memory(args, num_microbatches=num_microbatches, verbose=verbose)
+            / NUM_BYTES_IN_MEGABYTE
         )
-        return
+    else:
+        print_rank_0("compute_activation_memory_without_sp")
+        activation_memory = (
+            compute_activation_memory_without_sp(args, num_microbatches=num_microbatches, verbose=verbose)
+            / NUM_BYTES_IN_MEGABYTE
+        )
 
-    activation_memory = (
-        compute_activation_memory(args, num_microbatches=num_microbatches, verbose=verbose)
-        / NUM_BYTES_IN_MEGABYTE
-    )
     total_memory = weight_and_optimizer_memory + activation_memory
 
     print(
         f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} MB, "
         f"activation={activation_memory:.2f} MB, total={total_memory:.2f} MB\n"
     )
+
+    return weight_and_optimizer_memory, activation_memory, total_memory

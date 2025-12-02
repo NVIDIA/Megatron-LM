@@ -7,9 +7,16 @@ from megatron.core.packed_seq_params import PackedSeqParams
 
 
 def get_padding(
-    seq_len, cp_size, tp_size, has_sp, decoder_tp_comm_overlap=False, decoder_seq_len=None
+    seq_len,
+    cp_size,
+    tp_size,
+    has_sp,
+    decoder_tp_comm_overlap=False,
+    decoder_seq_len=None,
+    fp8_enabled=False,
+    fp8_recipe=None,
 ):
-    """Calculate padding needed for SP and/or CP.
+    """Calculate padding needed for SP, CP, TP comm overlap, and FP8.
 
     Args:
         seq_len (int): Model sequence length.
@@ -18,6 +25,8 @@ def get_padding(
         has_sp (bool): Model uses sequence parallelism.
         decoder_tp_comm_overlap (bool): Decoder (LLM) uses tensor parallel communication overlap.
         decoder_seq_len (int): Decoder (LLM) maximum sequence length.
+        fp8_enabled (bool): FP8 is enabled.
+        fp8_recipe (str): FP8 recipe. Affects required padding.
 
     Returns:
         padding (int): Padding needed given model configuration.
@@ -32,17 +41,20 @@ def get_padding(
             decoder_seq_len is not None
         ), "Please provide decoder seq length when using TP comm overlap for LM backbone"
         padding = decoder_seq_len - seq_len
-    elif has_sp or cp_size > 1:
-        padding_factor = 1
-        if has_sp and cp_size > 1:
-            # Padding to multiple of tp_size * cp_size * 2 when using CP + SP.
-            padding_factor = tp_size * cp_size * 2
-        elif cp_size > 1:
-            padding_factor = cp_size * 2
-        elif has_sp:
-            padding_factor = tp_size
+        return padding
 
-        padding = int((seq_len + padding_factor - 1) // padding_factor * padding_factor) - seq_len
+    padding_factor = 1
+    if has_sp and cp_size > 1:
+        # Padding to multiple of tp_size * cp_size * 2 when using CP + SP.
+        padding_factor = tp_size * cp_size * 2
+    elif cp_size > 1:
+        padding_factor = cp_size * 2
+    elif has_sp:
+        padding_factor = tp_size
+    elif fp8_enabled:
+        padding_factor = 32 if fp8_recipe == "mxfp8" else 16
+
+    padding = int((seq_len + padding_factor - 1) // padding_factor * padding_factor) - seq_len
 
     return padding
 

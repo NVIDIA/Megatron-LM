@@ -6,7 +6,12 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}/conf/arguments.sh"
 
 # Default arguments of this script
-MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format --export-te-mcore-model --use-cpu-initialization"
+MLM_DEFAULT_ARGS="
+    --distributed-timeout-minutes 60 \
+    --finetune \
+    --auto-detect-ckpt-format \
+    --export-te-mcore-model \
+"
 
 if [ -z ${HF_TOKEN} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}HF_TOKEN${WHITE} is not set! HF snapshot download may fail!\n"
@@ -27,7 +32,7 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
         --tensor-model-parallel-size ${TP} \
         --expert-tensor-parallel-size ${ETP} \
         --pipeline-model-parallel-size ${PP} \
-	--expert-model-parallel-size ${EP} \
+        --expert-model-parallel-size ${EP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --pretrained-model-path ${HF_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \
@@ -38,7 +43,7 @@ else
         --tensor-model-parallel-size ${TP} \
         --expert-tensor-parallel-size ${ETP} \
         --pipeline-model-parallel-size ${PP} \
-	--expert-model-parallel-size ${EP} \
+        --expert-model-parallel-size ${EP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --load ${MLM_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \

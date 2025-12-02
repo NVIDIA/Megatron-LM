@@ -22,7 +22,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
-from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
+from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -34,7 +34,7 @@ fp8_available, reason_for_no_fp8 = check_fp8_support()
 def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False, **config_kwargs):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
-    model_comm_pgs = get_default_model_comm_pgs()
+    pg_collection = get_default_pg_collection()
 
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     num_moe_experts = 8
@@ -52,7 +52,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
     if expert_type == 'grouped':
-        model = GroupedMLP(num_local_experts, transformer_config, model_comm_pgs)
+        model = GroupedMLP(num_local_experts, transformer_config, pg_collection)
     elif expert_type == 'te_grouped':
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=True
@@ -61,7 +61,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
             num_local_experts,
             transformer_config,
             transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
-            model_comm_pgs,
+            pg_collection,
         )
     elif expert_type == 'sequential':
         transformer_layer_spec = get_gpt_layer_local_spec(
@@ -71,7 +71,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
             num_local_experts,
             transformer_config,
             transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
-            model_comm_pgs,
+            pg_collection,
         )
     elif expert_type == 'te_sequential':
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -81,7 +81,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
             num_local_experts,
             transformer_config,
             transformer_layer_spec.submodules.mlp.submodules.experts.submodules,
-            model_comm_pgs,
+            pg_collection,
         )
     else:
         raise ValueError(

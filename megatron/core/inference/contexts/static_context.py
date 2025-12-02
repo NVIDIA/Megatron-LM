@@ -16,7 +16,9 @@ class StaticInferenceContext(BaseInferenceContext):
         max_sequence_length (int): Max supported sequence length.
     """
 
-    def __init__(self, max_batch_size: int, max_sequence_length: int):
+    def __init__(
+        self, max_batch_size: int, max_sequence_length: int, use_flashinfer_fused_rope: bool = None
+    ):
         super().__init__(materialize_only_last_token_logits=True)
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size

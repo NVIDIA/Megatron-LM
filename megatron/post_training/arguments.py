@@ -68,6 +68,14 @@ def add_modelopt_args(parser):
         default=None,
         help='Path to distillation configuration yaml file.',
     )
+
+    group.add_argument(
+        '--teacher-model-config',
+        type=str,
+        default=None,
+        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
+    )
+
     group.add_argument(
         '--export-kd-teacher-load',
         type=str,
@@ -80,7 +88,6 @@ def add_modelopt_args(parser):
         choices=['torch', 'torch_dist', 'zarr', 'torch_dcp'],
         help="Checkpoint format of teacher model, if different from student's.",
     )
-
 
     # Finetuning
     group.add_argument(
@@ -102,19 +109,26 @@ def add_modelopt_args(parser):
         help='Use Llama-4 expert scaling on input instead of output.',
     )
 
+    # Speculative decoding
+    group.add_argument(
+        '--export-offline-model',
+        action="store_true",
+        help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',
+    )
+
+    # Global state
+    group.add_argument(
+        '--modelopt-enabled',
+        action="store_true",
+        help='Will be set automatically when loading a ModelOpt checkpoint.',
+    )
+    
+    # GPT-OSS YaRN RoPE support
+    group.add_argument(
+        '--enable-gpt-oss',
+        action="store_true",
+        help='Enable GPT-OSS mode with YaRN RoPE configuration. When enabled, automatically '
+             'configures all YaRN parameters with GPT-OSS defaults.',
+    )
+
     return parser
-
-
-def modelopt_args_enabled(args):
-    """Check if any modelopt-related arguments are provided."""
-    key_args_and_defaults = {
-        "export_real_quant_cfg": "None",
-        "export_quant_cfg": None,
-        "export_kd_teacher_load": None,
-        "export_num_medusa_heads": 0,
-        "export_num_eagle_layers": 0,
-    }
-    for key, default in key_args_and_defaults.items():
-        if hasattr(args, key) and getattr(args, key) != default:
-            return True
-    return False
