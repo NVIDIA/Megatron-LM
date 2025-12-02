@@ -327,7 +327,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
-        self.layers[-1].is_last_layer = True
+        if len(self.layers) > 0:
+            self.layers[-1].is_last_layer = True
 
     def _build_layers(self):
         # Transformer layers.

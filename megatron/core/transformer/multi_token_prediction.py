@@ -949,7 +949,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
-        self.layers[-1].is_last_layer = True
+        self.layers[-1].transformer_layer.is_last_layer = True
         self.cp_group = pg_collection.cp
 
     def _build_layers(self, pg_collection):

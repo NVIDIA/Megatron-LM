@@ -684,6 +684,12 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    if args.fine_grained_activation_offloading:
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            set_ideal_affinity_for_current_gpu
+        )
+        set_ideal_affinity_for_current_gpu()
+
     if args.log_progress:
         append_to_progress_log("Starting job")
 

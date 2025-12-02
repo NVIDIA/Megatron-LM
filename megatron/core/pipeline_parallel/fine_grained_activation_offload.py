@@ -347,7 +347,6 @@ class PipelineOffloadManager:
 
     def reset(self):
         """Reset manager state for a new training iteration."""
-        set_ideal_affinity_for_current_gpu()
         self._inside_context = False
         self._cur_forward_chunk = None
         self._cur_backward_chunk = None
@@ -607,6 +606,7 @@ class ChunkOffloadHandler:
         assert tensor_tag in self._tensor_tag_to_state, f"Tag {tensor_tag} not found"
         tensor = self._tensor_tag_to_state.pop(tensor_tag)
         # If tensor is offloaded (stored as tuple), reload it
+        # assert isinstance(tensor, torch.Tensor), "Tensor is not a tensor"
         if isinstance(tensor, tuple):
             tensor = self.reload(tensor)
         debug_rank(f"--------tensor_pop {tensor.shape}")
