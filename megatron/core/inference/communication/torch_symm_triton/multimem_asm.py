@@ -1,5 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+# Adapted from https://github.com/yifuwang/symm-mem-recipes.git
+
 from unittest.mock import MagicMock
 
 from megatron.core.utils import null_decorator
