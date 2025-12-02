@@ -10,7 +10,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.extensions.kitchen import KitchenDotProductAttention, KitchenFlashAttention
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -53,7 +53,7 @@ model_parallel_cuda_manual_seed(123)
 tp_group = parallel_state.get_tensor_model_parallel_group()
 cp_group = parallel_state.get_context_parallel_group()
 
-model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
 
 
 def get_attention_implementation(
@@ -75,7 +75,7 @@ def get_attention_implementation(
             attention_dropout,
             softmax_scale,
             cp_comm_type,
-            model_comm_pgs,
+            pg_collection,
         )
     elif impl == "te-fa" or impl == "te-unfused":
         if attention_type == "self_attention":
@@ -88,7 +88,7 @@ def get_attention_implementation(
             attention_dropout,
             softmax_scale,
             cp_comm_type=cp_comm_type,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
     elif impl == "kitchen":
         attn = KitchenDotProductAttention(
@@ -99,7 +99,7 @@ def get_attention_implementation(
             attention_dropout,
             softmax_scale,
             cp_comm_type,
-            model_comm_pgs,
+            pg_collection,
         )
         attn.finish_init(
             get_quant_config_or_none("self_attention.core_attention", config.quant_recipe)
@@ -116,7 +116,7 @@ def get_attention_implementation(
             attention_dropout,
             softmax_scale,
             cp_comm_type,
-            model_comm_pgs,
+            pg_collection,
         )
         attn.finish_init(
             get_quant_config_or_none("self_attention.core_attention", config.quant_recipe)
