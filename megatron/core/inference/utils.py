@@ -2,6 +2,7 @@
 
 import asyncio
 import multiprocessing
+import sys
 
 import torch
 
@@ -161,3 +162,57 @@ async def await_process_event(
             raise RuntimeError(
                 f"Process {process.name} (pid {process.pid}) has exited unexpectedly."
             )
+
+
+# Compatibility for Python < 3.13 asyncio Queue functionality.
+# This is necessary because asyncio Queues are broken in Python < 3.13.
+if sys.version_info < (3, 13):
+
+    _SHUTDOWN_SENTINEL = object()
+
+    class asyncio_QueueShutDown(Exception):
+        """Compatibility exception for Python < 3.13."""
+
+        pass
+
+    class asyncio_Queue(asyncio.Queue):
+        """An asyncio.Queue with Python 3.13 compatibility features for Python < 3.13."""
+
+        def __init__(self, maxsize: int = 0):
+            super().__init__(maxsize)
+            self._is_shutdown = False
+
+        async def get(self):
+            """Get an item from the queue with Python < 3.13 compatibility."""
+            if self._is_shutdown and self.empty():
+                raise asyncio_QueueShutDown
+            ret = await super().get()
+            if ret is _SHUTDOWN_SENTINEL:
+                super().put_nowait(_SHUTDOWN_SENTINEL)
+                super().task_done()
+                raise asyncio_QueueShutDown
+            return ret
+
+        def put_nowait(self, item):
+            """Put an item into the queue without blocking"""
+            if self._is_shutdown:
+                raise asyncio_QueueShutDown
+            if item is _SHUTDOWN_SENTINEL:
+                raise ValueError(f"{item} is reserved for shutdown purposes for Python < 3.13")
+            super().put_nowait(item)
+
+        def shutdown(self):
+            """Shutdown the queue for Python < 3.13.
+
+            Note that the listening side of the queue can continue to get old data
+            off the queue even after it has already been shutdown. The listener only
+            shutdowns when the queue is BOTH shutdown AND empty.
+            """
+            if not self._is_shutdown:
+                super().put_nowait(_SHUTDOWN_SENTINEL)
+                super().task_done()
+                self._is_shutdown = True
+
+else:
+    asyncio_QueueShutDown = asyncio.QueueShutDown
+    asyncio_Queue = asyncio.Queue

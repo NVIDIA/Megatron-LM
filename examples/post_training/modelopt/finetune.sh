@@ -14,6 +14,7 @@ MLM_DEFAULT_ARGS=" \
     --distributed-timeout-minutes 30 \
     --auto-detect-ckpt-format \
     --export-te-mcore-model \
+    --finetune \
 "
 
 
@@ -66,6 +67,8 @@ if [ -z ${MLM_EVAL_ARGS} ]; then
         --log-interval 100 \
     "
 fi
+
+export HF_TOKEN=${HF_TOKEN}
 
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/finetune.py \
     ${MODEL_ARGS} \

@@ -23,23 +23,27 @@ MLM_DEFAULT_ARGS="
 # Example: export LAYERS_TO_DROP="1 5 10"
 
 # Define pruning argument mappings: "env_var:cli_arg"
-PRUNE_ARG_MAPPINGS=(
-    "TARGET_FFN_HIDDEN_SIZE:--target-ffn-hidden-size"
-    "TARGET_HIDDEN_SIZE:--target-hidden-size"
-    "TARGET_NUM_ATTENTION_HEADS:--target-num-attention-heads"
-    "TARGET_NUM_QUERY_GROUPS:--target-num-query-groups"
-    "TARGET_MAMBA_NUM_HEADS:--target-mamba-num-heads"
-    "TARGET_MAMBA_HEAD_DIM:--target-mamba-head-dim"
-    "TARGET_NUM_LAYERS:--target-num-layers"
-    "LAYERS_TO_DROP:--layers-to-drop"
+# List of environment variables we want to check for pruning CLI args
+PRUNE_ENV_VARS=(
+    TARGET_FFN_HIDDEN_SIZE
+    TARGET_HIDDEN_SIZE
+    TARGET_NUM_ATTENTION_HEADS
+    TARGET_NUM_QUERY_GROUPS
+    TARGET_MAMBA_NUM_HEADS
+    TARGET_MAMBA_HEAD_DIM
+    TARGET_NUM_MOE_EXPERTS
+    TARGET_MOE_FFN_HIDDEN_SIZE
+    TARGET_MOE_SHARED_EXPERT_INTERMEDIATE_SIZE
+    TARGET_NUM_LAYERS
+    LAYERS_TO_DROP
 )
 
-# Build arguments from environment variables
-PRUNE_ARGS=""
-for mapping in "${PRUNE_ARG_MAPPINGS[@]}"; do
-    env_var="${mapping%%:*}"
-    cli_arg="${mapping##*:}"
+# Build arguments from environment variables (TARGET_NUM_LAYERS -> --target-num-layers, etc.)
+PRUNE_ARGS=${PRUNE_ARGS:-""}
+for env_var in "${PRUNE_ENV_VARS[@]}"; do
     if [ ! -z "${!env_var}" ]; then
+        # prepend --, convert to lowercase, replace _ with -
+        cli_arg="--$(echo "${env_var}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
         PRUNE_ARGS="${PRUNE_ARGS} ${cli_arg} ${!env_var}"
     fi
 done
@@ -59,6 +63,9 @@ else
     LOAD_ARGS="--load ${MLM_MODEL_CKPT}"
 fi
 
+
+set -ex
+
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/prune.py \
     ${MODEL_ARGS} \
     ${LOAD_ARGS} \
@@ -67,6 +74,5 @@ ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/prune.py \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --save ${MLM_MODEL_SAVE} \
     --references "${MLM_REF_LABEL}" \
-    --calib-size 1024 \
     ${PRUNE_ARGS} \
     ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}

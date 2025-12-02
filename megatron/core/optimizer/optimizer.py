@@ -3,6 +3,7 @@
 """Megatron optimizer."""
 
 import copy
+import logging
 import math
 import warnings
 from abc import ABC, abstractmethod

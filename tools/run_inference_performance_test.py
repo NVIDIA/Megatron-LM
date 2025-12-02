@@ -24,9 +24,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import get_mamba_inference_state_config_from_model
 from model_provider import model_provider
 
 sys.path.append(
@@ -89,14 +88,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         moe_pad_experts_for_cuda_graph_inference=args.moe_pad_experts_for_cuda_graph_inference,
     )
 
-    # Layer type list for hybrid models
-    decoder = get_attr_wrapped_model(model, "decoder")
-    layer_type_list = getattr(decoder, "layer_type_list", None)
-    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
-    else:
-        mamba_conv_states_shape = None
-        mamba_ssm_states_shape = None
+    mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
     if args.engine_type == "static":
         inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
@@ -129,9 +121,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             block_size_tokens=args.inference_dynamic_batching_block_size,
             tensor_model_parallel_size=args.tensor_model_parallel_size,
             materialize_only_last_token_logits=not args.return_log_probs,
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=mamba_conv_states_shape,
-            mamba_ssm_states_shape=mamba_ssm_states_shape,
+            mamba_inference_state_config=mamba_inference_state_config,
             cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
             kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
             qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
