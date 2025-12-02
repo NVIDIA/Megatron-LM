@@ -947,12 +947,22 @@ def disable_batch_invariant_mode():
 @contextlib.contextmanager
 def set_batch_invariant_mode(enabled: bool = True):
     global _batch_invariant_MODE, _batch_invariant_LIB
-    old_data = (_batch_invariant_MODE, _batch_invariant_LIB)
-    if enabled:
+    # Save the previous on/off state so we can correctly restore it, even under
+    # nested usage or when toggling from True->False inside an outer True scope.
+    prev_enabled = _batch_invariant_MODE
+
+    # Apply the requested state only if it differs from the current one.
+    if enabled and not prev_enabled:
         enable_batch_invariant_mode()
-    else:
+    elif not enabled and prev_enabled:
         disable_batch_invariant_mode()
-    yield
-    if _batch_invariant_LIB is not None:
-        _batch_invariant_LIB._destroy()
-    _batch_invariant_MODE, _batch_invariant_LIB = old_data
+
+    try:
+        yield
+    finally:
+        # Restore the previous state. If we turned BIK on at entry, turn it off here.
+        # If we turned it off at entry (inside an outer True scope), turn it back on.
+        if enabled and not prev_enabled:
+            disable_batch_invariant_mode()
+        elif not enabled and prev_enabled:
+            enable_batch_invariant_mode()
