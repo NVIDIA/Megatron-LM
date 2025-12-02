@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from typing import Callable, List, Optional
 
 import torch
@@ -16,6 +17,9 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+logger = logging.getLogger(__name__)
+
 
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
     "quant_cfg": {
@@ -229,7 +233,7 @@ class RealQuantTransformerLayer(TransformerLayer):
                 if not isinstance(v, torch.Tensor):
                     continue
                 original_dtype, original_shape = self._original_tensor_info.get(k, ("-", "-"))
-                print(
+                logger.info(
                     "{:<64} {:<16} {:<32} {:<16} {:<32}".format(
                         k, original_dtype, original_shape, str(v.dtype), str(v.shape)
                     )
