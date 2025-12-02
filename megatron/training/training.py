@@ -91,6 +91,7 @@ from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -375,7 +376,8 @@ def num_floating_point_operations(args, batch_size):
                 )
             )
 
-        if args.linear_attention_type is not None:
+        linear_attention_variants = ["gated_delta_net"]
+        if args.experimental_attention_variant in linear_attention_variants:
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
@@ -400,7 +402,7 @@ def num_floating_point_operations(args, batch_size):
             num_linear_attention_layers = sum(linear_attention_pattern)
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if args.linear_attention_type == "gated_delta_net":
+            if args.experimental_attention_variant == "gated_delta_net":
                 # Calculate the FLOPs for the gated delta net attention.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
@@ -1698,6 +1700,16 @@ def training_log(
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
+    # Track sparse attention indexer loss
+    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+        indexer_loss_scale = 1 / get_num_microbatches()
+        DSAIndexerLossLoggingHelper.track_indexer_metrics(
+            loss_scale=indexer_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
+        )
     if iteration % args.log_interval == 0:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
@@ -1929,6 +1941,7 @@ def post_training_step_callbacks(
 
     # Straggler detector.
     if iteration % args.log_interval == 0 and args.log_straggler:
+        # Use FLOPs accumulated since last log event and then reset the counter
         stimer.report(num_floating_point_operations_since_last_log_event, args.log_interval)
         num_floating_point_operations_since_last_log_event = 0.0
 
@@ -1969,6 +1982,9 @@ def post_training_step_callbacks(
     if args.manual_gc:
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
             gc.collect()
+
+    # Return updated FLOPs accumulator so caller can persist the reset
+    return num_floating_point_operations_since_last_log_event
 
 
 def checkpoint_and_decide_exit(
@@ -2585,8 +2601,9 @@ def train(
                 energy_monitor.resume()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
-        # Some of these only happen at specific iterations.
-        post_training_step_callbacks(
+        # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
+        # (it is reset inside the callback after logging).
+        num_floating_point_operations_since_last_log_event = post_training_step_callbacks(
             model,
             optimizer,
             opt_param_scheduler,
