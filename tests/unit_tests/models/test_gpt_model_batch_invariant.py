@@ -26,6 +26,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
+
 class DummyTokenizer:
     def __init__(self, vocab_size: int, bos: int | None = None, eod: int = 0, pad: int = 0):
         self.vocab_size = vocab_size

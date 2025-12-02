@@ -17,12 +17,10 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
-os.environ['NVTE_FUSED_ATTN'] = '0'
-os.environ['NVTE_FLASH_ATTN'] = '1'
-os.environ['NVTE_UNFUSED_ATTN'] = '0'
 te_cpp = importlib.import_module("transformer_engine.pytorch.cpp_extensions")
 
 
@@ -107,6 +105,7 @@ def test_te_column_parallel_linear_batch_invariant_randomized():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     layer = (
@@ -152,6 +151,7 @@ def test_te_row_parallel_linear_batch_invariant_randomized():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     layer = (
@@ -197,6 +197,7 @@ def test_te_layernorm_column_parallel_linear_batch_invariant_randomized():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     layer = (
@@ -242,6 +243,7 @@ def test_te_norm_batch_invariant_randomized():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     layer = TENorm(config=cfg, hidden_size=cfg.hidden_size, eps=cfg.layernorm_epsilon).cuda().eval()
@@ -274,6 +276,7 @@ def test_column_parallel_linear_batch_invariant_randomized():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     layer = (
@@ -305,9 +308,11 @@ def test_column_parallel_linear_batch_invariant_randomized():
 def test_te_attention_layer_batch_invariant_randomized():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    os.environ['NVTE_FUSED_ATTN'] = '0'
-    os.environ['NVTE_FLASH_ATTN'] = '1'
-    os.environ['NVTE_UNFUSED_ATTN'] = '0'
+    # Reaffirm backend env for this specific test and clear TE's attention backend cache so that
+    # FlashAttention is re-selected with the latest env settings.
+    os.environ["NVTE_FUSED_ATTN"] = "0"
+    os.environ["NVTE_FLASH_ATTN"] = "1"
+    os.environ["NVTE_UNFUSED_ATTN"] = "0"
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
 
@@ -322,6 +327,7 @@ def test_te_attention_layer_batch_invariant_randomized():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     attn = TEDotProductAttention(
@@ -411,6 +417,7 @@ def test_te_column_parallel_linear_parity():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     cfg_regular = TransformerConfig(
@@ -424,6 +431,7 @@ def test_te_column_parallel_linear_parity():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     # Create layers with same weights
@@ -504,6 +512,7 @@ def test_te_rmsnorm_parity():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     cfg_regular = TransformerConfig(
@@ -517,6 +526,7 @@ def test_te_rmsnorm_parity():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     # Create layers with same weights
@@ -581,6 +591,7 @@ def test_te_layernorm_linear_parity():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     cfg_regular = TransformerConfig(
@@ -594,6 +605,7 @@ def test_te_layernorm_linear_parity():
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
+        attention_backend=AttnBackend.flash,
     )
 
     torch.manual_seed(321)
