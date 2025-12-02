@@ -38,6 +38,7 @@ class DistContext:
     group: dist.ProcessGroup
     is_chief: bool
 
+
 # 2. Create a module-scoped fixture
 # This runs ONE time per file, no matter how many test classes you have.
 @pytest.fixture(scope="module")
@@ -48,7 +49,7 @@ def distributed_context():
 
     # --- SETUP ---
     is_external_init = dist.is_initialized()
-    
+
     if not is_external_init:
         # Initialize only if not already done (e.g., by another test runner)
         dist.init_process_group(
@@ -67,15 +68,10 @@ def distributed_context():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     group = dist.group.WORLD
-    
+
     print(f"[INFO]: Initialized Rank: {rank} / {world_size}")
 
-    context = DistContext(
-        rank=rank,
-        world_size=world_size,
-        group=group,
-        is_chief=(rank == 0)
-    )
+    context = DistContext(rank=rank, world_size=world_size, group=group, is_chief=(rank == 0))
 
     # Yield control to the tests
     yield context
@@ -194,6 +190,7 @@ def init_gpt_dataloader(
     dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
     return dataloader
 
+
 # skip it for good
 @pytest.mark.skipif(
     ("WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2) or True,
@@ -258,9 +255,7 @@ class TestFusedLinearCrossEntropyOnGptModel:
 @pytest.mark.skipif(
     "WORLD_SIZE" in os.environ and os.environ["WORLD_SIZE"] != "1", reason="Requires single GPU"
 )
-@pytest.mark.skipif(
-    get_device_arch_version() != 10, reason="Requires GPU architecture = 10"
-)
+@pytest.mark.skipif(get_device_arch_version() != 10, reason="Requires GPU architecture = 10")
 class TestFusedLinearCrossEntropyDataParallel:
     def cleanup(self):
         torch.cuda.empty_cache()
@@ -562,9 +557,7 @@ class TestFusedLinearCrossEntropyDataParallel:
     ("WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2),  # or True,
     reason="Requires torchrun with multiple GPUs",
 )
-@pytest.mark.skipif(
-    get_device_arch_version() != 10, reason="Requires GPU architecture = 10"
-)
+@pytest.mark.skipif(get_device_arch_version() != 10, reason="Requires GPU architecture = 10")
 @pytest.mark.usefixtures("distributed_context")
 class TestFusedLinearCrossEntropyTensorParallel:
     @pytest.fixture(autouse=True)
@@ -576,7 +569,6 @@ class TestFusedLinearCrossEntropyTensorParallel:
         self.tp_rank = distributed_context.rank
         self.tp_world_size = distributed_context.world_size
         self.is_chief = distributed_context.is_chief
-    
 
     def cleanup(self):
         torch.cuda.empty_cache()
@@ -1005,9 +997,7 @@ class TestFusedLinearCrossEntropyTensorParallel:
     "WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2,
     reason="Requires torchrun with multiple GPUs",
 )
-@pytest.mark.skipif(
-    get_device_arch_version() != 10, reason="Requires GPU architecture = 10"
-)
+@pytest.mark.skipif(get_device_arch_version() != 10, reason="Requires GPU architecture = 10")
 @pytest.mark.usefixtures("distributed_context")
 class TestFusedLinearCrossEntropySequenceParallel:
     @pytest.fixture(autouse=True)

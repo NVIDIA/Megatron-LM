@@ -1,8 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-try:
-    from typing import Optional, Tuple, Type
+import logging
+from typing import Optional, Tuple, Type
 
+try:
     import cuda.bindings.driver as cuda  # type: ignore
     import cutlass
     import cutlass.cute as cute
@@ -13,7 +14,6 @@ try:
 
     SM100_TMEM_CAPACITY_COLUMNS: int = 512
 
-
     def make_thread_cooperative_group(size: int, alignment: Optional[int] = None):
         """
         Create a thread cooperative group.
@@ -21,7 +21,6 @@ try:
         return pipeline.CooperativeGroup(
             pipeline.Agent.Thread, size, alignment=alignment if alignment is not None else size
         )
-
 
     class BwdPartialDlogits:
         """
@@ -109,10 +108,14 @@ try:
             mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
             # it requires k-mode to be 128B aligned
             mma_inst_tile_k: int = 4
-            self.mma_tiler = (self.mma_tiler[0], self.mma_tiler[1], mma_inst_shape_k * mma_inst_tile_k)
+            self.mma_tiler = (
+                self.mma_tiler[0],
+                self.mma_tiler[1],
+                mma_inst_shape_k * mma_inst_tile_k,
+            )
 
-            self.num_acc_stage, self.num_ab_stage, self.num_epi_stage_per_tile = self._compute_stages(
-                tiled_mma, self.mma_tiler, a_dtype, b_dtype
+            self.num_acc_stage, self.num_ab_stage, self.num_epi_stage_per_tile = (
+                self._compute_stages(tiled_mma, self.mma_tiler, a_dtype, b_dtype)
             )
             self.tmem_alloc_cols = self.num_acc_stage * self.mma_tiler[1]
             assert self.tmem_alloc_cols <= SM100_TMEM_CAPACITY_COLUMNS
@@ -205,9 +208,13 @@ try:
 
             # -------- tensor partition ------------ #
             # swizzle o [(tileM, tileK), loopM, loopK, stage]
-            sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
+            sA = storage.sA.get_tensor(
+                a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
+            )
             # swizzle o [(tileN, tileK), loopN, loopK, stage]
-            sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+            sB = storage.sB.get_tensor(
+                b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
+            )
 
             # FIXME: if 2 CTAs, modify here
             thr_mma = tiled_mma.get_slice(0)
@@ -336,10 +343,14 @@ try:
                     tCtC[((None, None), 0, None)],
                     (self.epi_tile[0], self.epi_tile[1] // self.num_epi_stage_per_tile),
                 )
-                tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)])
+                tiled_copy_t2r = tcgen05.make_tmem_copy(
+                    copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)]
+                )
                 thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
                 tTMEM_load_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
-                tTMEM_load_tAcc = cute.group_modes(tTMEM_load_tAcc, 3, cute.rank(tTMEM_load_tAcc) - 1)
+                tTMEM_load_tAcc = cute.group_modes(
+                    tTMEM_load_tAcc, 3, cute.rank(tTMEM_load_tAcc) - 1
+                )
 
                 # predicates
                 cAcc = cute.make_identity_tensor(self.mma_tiler[:2])
@@ -379,7 +390,9 @@ try:
                 tMCAcc_mask = cute.make_fragment(tMCAcc.shape, cutlass.Boolean)
                 # to align shape with gMax and gAccu
                 tMCAcc_mask = cute.append_ones(tMCAcc_mask)
-                tMCAcc_mask[0] = cute.elem_less(pidm * self.epi_tile[0] + tidx, cute.size(mA, mode=[0]))
+                tMCAcc_mask[0] = cute.elem_less(
+                    pidm * self.epi_tile[0] + tidx, cute.size(mA, mode=[0])
+                )
                 # [(1, 1), 1, 1]
                 tMgLabels = thr_copy_g2r_int64.partition_S(cute.append_ones(gLabels))
                 tMrLabels = cute.make_fragment(tMgLabels.shape, tMgLabels.element_type)
@@ -416,7 +429,9 @@ try:
                 )
                 # blackwell supports STG.256
                 copy_atom_r2g = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), gDlogits_partial.element_type, num_bits_per_copy=256
+                    cute.nvgpu.CopyUniversalOp(),
+                    gDlogits_partial.element_type,
+                    num_bits_per_copy=256,
                 )
                 tiled_copy_r2g = cute.make_tiled_copy_tv(
                     copy_atom_r2g, epilogue_thread_layout, copy_atom_r2g.layout_dst_tv
@@ -430,7 +445,8 @@ try:
                     for row in cutlass.range(cute.size(tR2GCAcc_pred, mode=[1])):
                         for col in cutlass.range(cute.size(tR2GCAcc_pred, mode=[2])):
                             tR2GCAcc_pred[elem, row, col] = cute.elem_less(
-                                pidm * self.epi_tile[0] + tR2GCAcc[elem, row, col][0], problem_mnk[0]
+                                pidm * self.epi_tile[0] + tR2GCAcc[elem, row, col][0],
+                                problem_mnk[0],
                             ) and cute.elem_less(
                                 split_idx * self.vocab_per_split
                                 + pidn * self.epi_tile[1]
@@ -442,7 +458,9 @@ try:
 
                 # for type conversion
                 dLogits_half = cute.make_fragment(tTMEM_load_rAcc.shape, tR2GgDlogits.element_type)
-                dLogits_half = cute.tiled_divide(dLogits_half, (cute.size(tR2GgDlogits, mode=[0]), 1))
+                dLogits_half = cute.tiled_divide(
+                    dLogits_half, (cute.size(tR2GgDlogits, mode=[0]), 1)
+                )
                 dLogits_half = cute.group_modes(dLogits_half, 2, cute.rank(dLogits_half))
 
                 mma_pipeline.consumer_wait(mma_consumer_state)
@@ -455,7 +473,8 @@ try:
                     min((split_idx + 1) * self.vocab_per_split, problem_mnk[1]),
                 )
                 num_n_subtiles: cutlass.Int64 = cute.ceil_div(
-                    (block_vocab_right_idx - block_vocab_left_idx), cute.size(tTMEM_load_rAcc, mode=[0])
+                    (block_vocab_right_idx - block_vocab_left_idx),
+                    cute.size(tTMEM_load_rAcc, mode=[0]),
                 )
                 for n_subtile in cutlass.range(num_n_subtiles):
                     cute.copy(
@@ -464,7 +483,9 @@ try:
                         tTMEM_load_rAcc,
                     )
 
-                    for idx in cutlass.range(cute.size(tTMEM_load_rAcc, mode=[0]), unroll_full=True):
+                    for idx in cutlass.range(
+                        cute.size(tTMEM_load_rAcc, mode=[0]), unroll_full=True
+                    ):
                         # exp_logits
                         tTMEM_load_rAcc[idx] = cute.exp(tTMEM_load_rAcc[idx] - tMrMaximum[0])
 
@@ -499,7 +520,9 @@ try:
             self.cta_sync_barrier.arrive_and_wait()
             if warp_idx == self.empty_warp_ids[0]:
                 cute.arch.relinquish_tmem_alloc_permit()
-                cute.arch.dealloc_tmem(tmem_ptr, self.tmem_alloc_cols, is_two_cta=self.use_2cta_instrs)
+                cute.arch.dealloc_tmem(
+                    tmem_ptr, self.tmem_alloc_cols, is_two_cta=self.use_2cta_instrs
+                )
 
         @cute.jit
         def __call__(
@@ -545,7 +568,12 @@ try:
             b_major_mode = utils.LayoutEnum.from_tensor(weight).mma_major_mode()
 
             tiled_mma = sm100_utils.make_trivial_tiled_mma(
-                a_dtype, a_major_mode, b_major_mode, self.acc_dtype, self.cta_group, self.mma_tiler[:2]
+                a_dtype,
+                a_major_mode,
+                b_major_mode,
+                self.acc_dtype,
+                self.cta_group,
+                self.mma_tiler[:2],
             )
             self._setup_attributes(tiled_mma, a_dtype, b_dtype)
 
@@ -634,5 +662,6 @@ try:
                 cluster=self.cluster_shape_mnk,
                 stream=stream,
             )
+
 except ImportError:
-    pass
+    logging.warning("Cutlass or CUDA bindings not found. BwdPartialDlogits will not be available.")

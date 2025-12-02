@@ -569,9 +569,19 @@ class GPTModel(LanguageModule):
                 loss_mask = torch.ones_like(mtp_labels)
             for mtp_layer_number in range(self.config.mtp_num_layers):
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
-                mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group)
+                mtp_labels, _ = roll_tensor(
+                    mtp_labels,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
                 loss_mask, num_tokens = roll_tensor(
-                    loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
+                    loss_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
                 )
 
                 # Compute mtp loss without storing logits to save memory.
