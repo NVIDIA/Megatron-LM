@@ -598,7 +598,7 @@ class TopKRouter(Router):
         Args:
             logits (torch.Tensor): Logits tensor after gating.
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape = [seq_length, bsz]. True = padding (exclude),
+                                                   Shape = [seq_length, bsz]. True = padding,
                                                    False = valid (include). Defaults to None.
 
         Returns:
@@ -688,7 +688,7 @@ class TopKRouter(Router):
         Args:
             input (torch.Tensor): Input tensor.
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape = [seq_length, bsz]. True = padding (exclude),
+                                                   Shape = [seq_length, bsz]. True = padding,
                                                    False = valid (include). Defaults to None.
         """
         self._maintain_float32_expert_bias()

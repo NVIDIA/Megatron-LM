@@ -54,7 +54,7 @@ def compute_tokens_per_expert(
         This is consistent with common attention mask conventions in transformer models.
 
     Workflow:
-        1. If padding_mask is provided, create an inverted mask (~padding_mask) to select valid tokens
+        1. If padding_mask is provided, create an inverted mask (~padding_mask) for valid tokens
         2. Apply the valid mask to routing_map to exclude padding tokens
         3. Sum the masked routing_map to get tokens_per_expert
         4. Count valid tokens by summing the inverted mask

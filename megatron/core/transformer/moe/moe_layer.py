@@ -307,7 +307,7 @@ class MoELayer(BaseMoELayer):
             - Exclude padding tokens from z-loss computation
 
         Args:
-            hidden_states (torch.Tensor): The input tensor with shape [seq_length, bsz, hidden_size].
+            hidden_states (torch.Tensor): The input tensor shape is [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
                 Shape = [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Defaults to None (all tokens are valid).

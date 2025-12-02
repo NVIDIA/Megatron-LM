@@ -642,12 +642,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         def get_mlp_forward_fn():
             """Return the appropriate MLP forward function based on layer type."""
             if self.is_moe_layer and padding_mask is not None:
+
                 def mlp_forward(hidden_states):
                     return self.mlp(hidden_states, padding_mask=padding_mask)
+
                 return mlp_forward
             elif self.is_moe_layer:
+
                 def mlp_forward(hidden_states):
                     return self.mlp(hidden_states)
+
                 return mlp_forward
             else:
                 return self.mlp
