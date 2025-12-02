@@ -177,8 +177,10 @@ def load_modelopt_checkpoint(
         model_state_dict = state_dict["model"]
         unwrapped_model[0].load_state_dict(model_state_dict, strict=False)
     elif sharded_load_dir is not None and optimizer is None and opt_param_scheduler is None:
-
-        sharded_state_dict = unwrapped_model[0].sharded_state_dict(prefix=additional_sharded_prefix)
+        sharded_state_dict_metadata = dist_checkpointing.load_content_metadata(sharded_load_dir)
+        sharded_state_dict = unwrapped_model[0].sharded_state_dict(
+            prefix=additional_sharded_prefix, metadata=sharded_state_dict_metadata
+        )
 
         if additional_sharded_prefix:
             unwrapped_model[0]._register_load_state_dict_pre_hook(
