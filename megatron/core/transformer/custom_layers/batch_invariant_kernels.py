@@ -3,13 +3,18 @@ import importlib
 import importlib.util
 from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import triton
 import triton.language as tl
 
-__all__ = ["set_batch_invariant_mode", "is_batch_invariant_mode_enabled", "disable_batch_invariant_mode", "enable_batch_invariant_mode"]
+__all__ = [
+    "set_batch_invariant_mode",
+    "is_batch_invariant_mode_enabled",
+    "disable_batch_invariant_mode",
+    "enable_batch_invariant_mode",
+]
 
 
 def _matmul_launch_metadata(
@@ -121,6 +126,7 @@ def matmul_kernel_persistent(
         c = accumulator.to(c_ptr.dtype.element_ty)
         tl.store(c_ptrs, c, mask=c_mask)
 
+
 def get_compute_units():
     """
     Returns the number of streaming multiprocessors (SMs) or equivalent compute units
@@ -149,10 +155,9 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert bias is None or bias.dim() == 1, (
-        "Currently assuming bias is 1D, let Horace know if you run into this"
-    )
-
+    assert (
+        bias is None or bias.dim() == 1
+    ), "Currently assuming bias is 1D, let Horace know if you run into this"
 
     NUM_SMS = get_compute_units()
     M, K = a.shape
@@ -221,12 +226,7 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
 
 @triton.jit
 def _log_softmax_kernel(
-    input_ptr,
-    output_ptr,
-    input_row_stride,
-    output_row_stride,
-    n_cols,
-    BLOCK_SIZE: tl.constexpr,
+    input_ptr, output_ptr, input_row_stride, output_row_stride, n_cols, BLOCK_SIZE: tl.constexpr
 ):
     """
     Compute log_softmax along the last dimension of a 2D tensor.
@@ -311,12 +311,7 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     # Launch kernel with one block per row
     grid = (n_rows,)
     _log_softmax_kernel[grid](
-        input_2d,
-        output,
-        input_2d.stride(0),
-        output.stride(0),
-        n_cols,
-        BLOCK_SIZE=BLOCK_SIZE,
+        input_2d, output, input_2d.stride(0), output.stride(0), n_cols, BLOCK_SIZE=BLOCK_SIZE
     )
     # Reshape output back to original shape
     return output.reshape(original_shape)
@@ -387,9 +382,9 @@ def mean_dim(
     """
     # Validate inputs
     assert input.is_cuda, "Input must be a CUDA tensor"
-    assert -input.ndim <= dim < input.ndim, (
-        f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
-    )
+    assert (
+        -input.ndim <= dim < input.ndim
+    ), f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
 
     # Handle negative dim
     if dim < 0:
@@ -478,18 +473,23 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
     else:
-        assert input.dtype in {torch.float16, torch.bfloat16, torch.float32}, (
-            "only float types supported for now"
-        )
+        assert input.dtype in {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        }, "only float types supported for now"
         n_elems = 1
         for d in dim:
             n_elems *= input.shape[d]
         return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32) / n_elems
 
+
 AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])
+
 
 def get_batch_invariant_attention_block_size() -> AttentionBlockSize:
     return AttentionBlockSize(block_m=16, block_n=16)
+
 
 # Everything above is from the blog https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
 # and its github repo https://github.com/thinking-machines-lab/batch_invariant_ops
@@ -517,8 +517,8 @@ def _te_patch_for_batch_invariant():
     Safe no-op if TE is unavailable.
     """
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
-    import transformer_engine.pytorch.cpp_extensions as te_cpp  # type: ignore
     import transformer_engine.pytorch as te  # type: ignore
+    import transformer_engine.pytorch.cpp_extensions as te_cpp  # type: ignore
 
     # Patch general_gemm once
     if _TE_GENERAL_GEMM_ORIG is None and hasattr(te_cpp, "general_gemm"):
@@ -527,6 +527,7 @@ def _te_patch_for_batch_invariant():
 
     # Also patch the symbol imported inside TE's module.linear (from ..cpp_extensions import general_gemm)
     import transformer_engine.pytorch.module.linear as te_linear_mod  # type: ignore
+
     if hasattr(te_linear_mod, "general_gemm"):
         if "module.linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
             _TE_GEMM_FUNC_ORIGS["module.linear.general_gemm"] = te_linear_mod.general_gemm
@@ -534,13 +535,17 @@ def _te_patch_for_batch_invariant():
 
     # Also patch the symbol imported inside TE's module.layernorm_linear
     import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod  # type: ignore
+
     if hasattr(te_layernorm_linear_mod, "general_gemm"):
         if "module.layernorm_linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
-            _TE_GEMM_FUNC_ORIGS["module.layernorm_linear.general_gemm"] = te_layernorm_linear_mod.general_gemm
+            _TE_GEMM_FUNC_ORIGS["module.layernorm_linear.general_gemm"] = (
+                te_layernorm_linear_mod.general_gemm
+            )
             te_layernorm_linear_mod.general_gemm = _te_general_gemm_patched  # type: ignore[attr-defined]
 
         # Also patch the symbol imported into Megatron's TE wrapper module
     import megatron.core.extensions.transformer_engine as meg_te  # type: ignore
+
     if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
         _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
         meg_te.general_gemm = _te_general_gemm_patched  # type: ignore[attr-defined]
@@ -568,11 +573,7 @@ def _te_patch_for_batch_invariant():
             # Extract x, weight, eps from args/kwargs per TE signatures
             x = args[0] if len(args) > 0 else kwargs.get("x")
             weight = args[1] if len(args) > 1 else kwargs.get("weight")
-            eps = (
-                (args[2] if len(args) > 2 else None)
-                if "eps" not in kwargs
-                else kwargs.get("eps")
-            )
+            eps = (args[2] if len(args) > 2 else None) if "eps" not in kwargs else kwargs.get("eps")
             if eps is None:
                 eps = 1e-5
             if x is None or weight is None:
@@ -615,7 +616,11 @@ def _te_unpatch_for_batch_invariant():
         _TE_RMSNORM_ORIG_FWD = None
 
     meg_te = _import_module_if_available("megatron.core.extensions.transformer_engine")
-    if meg_te is not None and _MEG_TE_GENERAL_GEMM_ORIG is not None and hasattr(meg_te, "general_gemm"):
+    if (
+        meg_te is not None
+        and _MEG_TE_GENERAL_GEMM_ORIG is not None
+        and hasattr(meg_te, "general_gemm")
+    ):
         meg_te.general_gemm = _MEG_TE_GENERAL_GEMM_ORIG  # type: ignore[assignment]
         _MEG_TE_GENERAL_GEMM_ORIG = None
     elif meg_te is None:
@@ -634,14 +639,20 @@ def _te_unpatch_for_batch_invariant():
     # Restore TE module.linear imported symbol for general_gemm if patched
     te_linear_mod = _import_module_if_available("transformer_engine.pytorch.module.linear")
     key = "module.linear.general_gemm"
-    if te_linear_mod is not None and key in _TE_GEMM_FUNC_ORIGS and hasattr(te_linear_mod, "general_gemm"):
+    if (
+        te_linear_mod is not None
+        and key in _TE_GEMM_FUNC_ORIGS
+        and hasattr(te_linear_mod, "general_gemm")
+    ):
         te_linear_mod.general_gemm = _TE_GEMM_FUNC_ORIGS[key]  # type: ignore[assignment]
         _TE_GEMM_FUNC_ORIGS.pop(key, None)
     else:
         _TE_GEMM_FUNC_ORIGS.pop(key, None)
 
     # Restore TE module.layernorm_linear imported symbol for general_gemm if patched
-    te_layernorm_linear_mod = _import_module_if_available("transformer_engine.pytorch.module.layernorm_linear")
+    te_layernorm_linear_mod = _import_module_if_available(
+        "transformer_engine.pytorch.module.layernorm_linear"
+    )
     key = "module.layernorm_linear.general_gemm"
     if (
         te_layernorm_linear_mod is not None
@@ -697,7 +708,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         elif opA.dim() < 2:
             raise ValueError(f"opA has insufficient dimensions: {opA.shape}")
         assert opA.dim() == 2, f"opA must be 2D for matmul_persistent, got shape {opA.shape}"
-        
+
         # Flatten all leading dims of opB except the last feature dim to match TE behavior
         if opB.dim() >= 2:
             leading_shape = opB.shape[:-1]
@@ -709,10 +720,10 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
 
         # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O)
         base_2d = matmul_persistent(opB_2d, opA, bias=None)
-        
+
         # Reshape back to original leading dims with output features at the end
         out = base_2d.reshape(*leading_shape, base_2d.shape[-1])
-        
+
         # Add bias after reshaping to match output structure
         if bias is not None:
             out = out + bias
@@ -753,7 +764,11 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         d_opA = opB.reshape(-1, opB.shape[-1]).transpose(0, 1).contiguous().matmul(grad_out_2d)
 
         # Reshape d_opB back to original opB shape
-        d_opB = d_opB_2d.reshape(*leading_shape, d_opB_2d.shape[-1]) if grad_output.dim() >= 2 else d_opB_2d
+        d_opB = (
+            d_opB_2d.reshape(*leading_shape, d_opB_2d.shape[-1])
+            if grad_output.dim() >= 2
+            else d_opB_2d
+        )
 
         # Map back to dA, dB based on trans flags
         if transa:
@@ -809,7 +824,7 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
 
     # Compute via autograd-aware function matching TE's layout semantics
     result = BatchInvariantTEGemmFn.apply(A, B, bias if not grad else None, out_dtype, layout)
-    
+
     # Compute bias gradient if needed (for wgrad GEMM)
     # TODO: Note (Peter): I dont get this at all. This seems very wrong.
     # In wgrad: general_gemm(x, dy, layout="NT", grad=True, bias=bias)
@@ -820,7 +835,7 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         # Flatten B to 2D and sum over batch/sequence dimension (first dim)
         B_flat = B.reshape(-1, B.shape[-1]) if B.dim() > 2 else B
         bias_grad = B_flat.sum(dim=0)  # Sum over batch/sequence, keeping output dim
-    
+
     if out is not None:
         out.copy_(result)
         # TE expects (gemm_out, bias_grad, gelu_input, extra_output)
@@ -836,13 +851,12 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         if not _is_supported_dtype_for_bik(x.dtype):
             raise RuntimeError(f"Unsupported dtype for batch-invariant RMSNorm: {x.dtype}")
         weight_eff = weight + 1.0 if zero_centered_gamma else weight
-        
 
         # We do everything in rmsnorm_batch_invariant manually here so that we can
         # save rsigma in full precision for backward to match the TE behavior.
         x_dtype = x.dtype
-        x_fp32  = x.float()
-        w_fp32  = weight.to(device=x.device, dtype=torch.float32)
+        x_fp32 = x.float()
+        w_fp32 = weight.to(device=x.device, dtype=torch.float32)
         ms = mean_dim(x_fp32 * x_fp32, dim=-1, keepdim=True)
         rsigma = torch.rsqrt(ms + eps)
         out_fp32 = (x_fp32 * rsigma) * w_fp32
@@ -862,8 +876,8 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         w_eff = (weight + 1.0) if ctx.zero_centered_gamma else weight
 
         go_fp32 = grad_output.float()
-        x_fp32  = x.float()
-        w_fp32  = w_eff.to(device=x.device, dtype=torch.float32)
+        x_fp32 = x.float()
+        w_fp32 = w_eff.to(device=x.device, dtype=torch.float32)
         r = rsigma
         r3 = r * r * r
         D = x.shape[-1]
@@ -873,7 +887,7 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         g_w = (go_fp32 * x_fp32 * r).sum(dim=red_dims).to(weight.dtype)
 
         # dx = g ⊙ (w r) − (w r^3) * x * Σ(g ⊙ x ⊙ w) / D
-        s  = (go_fp32 * x_fp32 * w_fp32).sum(dim=-1, keepdim=True)
+        s = (go_fp32 * x_fp32 * w_fp32).sum(dim=-1, keepdim=True)
         dx = go_fp32 * (w_fp32 * r) - (w_fp32 * r3) * (s * x_fp32) / D
         dx = dx.to(x.dtype)
 
@@ -882,7 +896,7 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
 
 def rmsnorm_batch_invariant(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Batch-invariant RMSNorm wrapper that delegates to autograd-aware implementation.
-    
+
     This provides a simple functional interface while using the optimized BatchInvariantRMSNormFn
     which has better numerics (fp32 precision in forward/backward).
     """
@@ -895,7 +909,7 @@ def _te_rmsnorm_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
     weight = getattr(self, "weight", None)
     if weight is None:
         raise RuntimeError("Batch-invariant RMSNorm requires affine weight.")
-    #TODO(peter): Should I even allow defaults here like this?
+    # TODO(peter): Should I even allow defaults here like this?
     eps = getattr(self, "eps", 1e-5)
     zero_centered_gamma = getattr(self, "zero_centered_gamma", False)
     return BatchInvariantRMSNormFn.apply(x, weight, eps, zero_centered_gamma)
@@ -913,11 +927,12 @@ def enable_batch_invariant_mode():
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
     _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key )
-    _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key )
-    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key )
+    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+    _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
+    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available
     _te_patch_for_batch_invariant()
+
 
 def disable_batch_invariant_mode():
     global _batch_invariant_MODE, _batch_invariant_LIB
@@ -941,6 +956,3 @@ def set_batch_invariant_mode(enabled: bool = True):
     if _batch_invariant_LIB is not None:
         _batch_invariant_LIB._destroy()
     _batch_invariant_MODE, _batch_invariant_LIB = old_data
-
-
-

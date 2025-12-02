@@ -26,7 +26,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-
 class DummyTokenizer:
     def __init__(self, vocab_size: int, bos: int | None = None, eod: int = 0, pad: int = 0):
         self.vocab_size = vocab_size
@@ -58,12 +57,14 @@ class DummyTokenizer:
             cursor += len(str(tok)) + 1
         return offsets
 
+
 def _configure_flash_attention_env():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     os.environ['NVTE_FUSED_ATTN'] = '0'
     os.environ['NVTE_FLASH_ATTN'] = '1'
     os.environ['NVTE_UNFUSED_ATTN'] = '0'
+
 
 def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int = 128) -> GPTModel:
     cfg = TransformerConfig(
@@ -91,7 +92,9 @@ def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int 
 
 def _train_forward_logprobs(model: torch.nn.Module, tokens: torch.Tensor) -> torch.Tensor:
     batch_size, seq_len = tokens.shape
-    position_ids = torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand(batch_size, seq_len)
+    position_ids = (
+        torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand(batch_size, seq_len)
+    )
     attention_mask = torch.ones(
         batch_size, 1, seq_len, seq_len, dtype=torch.bool, device=tokens.device
     )
@@ -99,9 +102,7 @@ def _train_forward_logprobs(model: torch.nn.Module, tokens: torch.Tensor) -> tor
     with set_batch_invariant_mode(True):
         with torch.no_grad():
             logits = model(
-                input_ids=tokens,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
+                input_ids=tokens, position_ids=position_ids, attention_mask=attention_mask
             ).to(torch.float32)
         shifted_logits = logits[:, :-1, :]
         shifted_targets = tokens[:, 1:].unsqueeze(-1)
@@ -132,11 +133,18 @@ class TestGPTModelBatchInvariant:
         input_ids = torch.randint(
             low=0, high=self.vocab_size, size=(batch_size, self.sequence_length), device=self.device
         )
-        position_ids = torch.arange(self.sequence_length, device=self.device).unsqueeze(0).repeat(
-            batch_size, 1
+        position_ids = (
+            torch.arange(self.sequence_length, device=self.device)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
         )
         attention_mask = torch.ones(
-            batch_size, 1, self.sequence_length, self.sequence_length, dtype=torch.bool, device=self.device
+            batch_size,
+            1,
+            self.sequence_length,
+            self.sequence_length,
+            dtype=torch.bool,
+            device=self.device,
         )
 
         with set_batch_invariant_mode(True):
@@ -172,7 +180,7 @@ class TestGPTModelBatchInvariant:
             kv_channels=base_model.config.kv_channels,
             num_attention_heads=base_model.config.num_attention_heads,
             max_sequence_length=seq_len,
-            active_buffer_size_gb=0.125,
+            buffer_size_gb=0.125,
             block_size_tokens=16,
             num_cuda_graphs=None,
             materialize_only_last_token_logits=False,
@@ -222,23 +230,26 @@ class TestGPTModelBatchInvariant:
         with set_batch_invariant_mode(True):
             while engine.has_unfinished_requests():
                 result = engine.step_modern()
-                finished_requests.extend(result["finished_requests"])
+                finished_requests.extend(
+                    r.merge(engine.controller.tokenizer) for r in result["finished_request_records"]
+                )
 
-        assert finished_requests, "Dynamic engine did not produce any completed requests."
+            assert finished_requests, "Dynamic engine did not produce any completed requests."
 
-        for req in finished_requests:
-            prompt_tokens = req.prompt_tokens.tolist()
-            generated_tokens = req.generated_tokens
-            full_sequence = torch.tensor(
-                prompt_tokens + generated_tokens, dtype=torch.long, device=self.device
-            ).unsqueeze(0)
-            baseline_log_probs = _train_forward_logprobs(inference_model, full_sequence).squeeze(0)
-            inference_log_probs = torch.tensor(
-                (req.prompt_log_probs or []) + (req.generated_log_probs or []),
-                dtype=baseline_log_probs.dtype,
-                device=self.device,
-            )
-            assert torch.equal(
-                inference_log_probs, baseline_log_probs
-            ), "Log probabilities from dynamic engine did not match batched forward."
-
+            for req in finished_requests:
+                prompt_tokens = req.prompt_tokens.tolist()
+                generated_tokens = req.generated_tokens
+                full_sequence = torch.tensor(
+                    prompt_tokens + generated_tokens, dtype=torch.long, device=self.device
+                ).unsqueeze(0)
+                baseline_log_probs = _train_forward_logprobs(
+                    inference_model, full_sequence
+                ).squeeze(0)
+                inference_log_probs = torch.tensor(
+                    (req.prompt_log_probs or []) + (req.generated_log_probs or []),
+                    dtype=baseline_log_probs.dtype,
+                    device=self.device,
+                )
+                assert torch.equal(
+                    inference_log_probs, baseline_log_probs
+                ), "Log probabilities from dynamic engine did not match batched forward."
