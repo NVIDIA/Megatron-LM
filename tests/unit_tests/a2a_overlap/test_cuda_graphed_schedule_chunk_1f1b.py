@@ -328,8 +328,7 @@ class TestPartialCudaGraphedA2AOverlap:
         return loss_list
 
     @pytest.mark.skipif(
-        # not (HAVE_TE and is_te_min_version("2.10.0")),
-        not (HAVE_TE and is_te_min_version("1.10.0")),
+        not (HAVE_TE and is_te_min_version("2.10.0")),
         reason="Partial CUDA graph support requires TransformerEngine version >= 2.10.0",
     )
     @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep"])
