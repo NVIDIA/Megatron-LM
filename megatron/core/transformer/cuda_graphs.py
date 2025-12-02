@@ -99,6 +99,7 @@ class ArgMetadata:
             self.shape = arg.shape
             self.dtype = arg.dtype
             self.device = arg.device
+            self.value = arg.data_ptr()
         else:
             self.value = arg
 
