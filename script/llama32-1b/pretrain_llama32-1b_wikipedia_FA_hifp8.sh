@@ -48,7 +48,7 @@ mkdir -p "$(dirname "$TENSORBOARD_LOGS_PATH")"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] Modifying quantization types to hifp8..."
 
 # Modify linear layer quantization
-sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/\1'hifp8'/" \
+sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/\1'bf16'/" \
     megatron/core/tensor_parallel/layers.py
 
 # Modify attention quantization

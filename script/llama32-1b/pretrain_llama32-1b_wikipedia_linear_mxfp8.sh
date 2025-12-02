@@ -52,7 +52,7 @@ sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/\1'
     megatron/core/tensor_parallel/layers.py
 
 # Modify attention quantization
-sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/\1'mxfp8'/" \
+sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/\1'bf16'/" \
     megatron/core/transformer/dot_product_attention.py
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] Quantization type modifications completed"
