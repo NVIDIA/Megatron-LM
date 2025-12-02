@@ -139,7 +139,7 @@ else
     ${GPT_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}"
   else
-    nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o /workspace/logs/nsys/output uv run python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py  --profile \
+    torchrun ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \

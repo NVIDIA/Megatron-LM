@@ -71,16 +71,6 @@ class PartitionConfig:
             return get_tensor_model_parallel_rank()
         return 0
 
-    @runtime_checkable
-    class _ParallelAttrs(Protocol):
-        context_parallel_lm: int
-        tensor_model_parallel_size_lm: int
-        sequence_parallel_lm: bool
-        tp_comm_overlap_lm: bool
-        _language_max_sequence_length: int
-        _kv_format: str
-        cp_group: Optional[ProcessGroup]
-
     @classmethod
     def from_mp_config(
         cls,

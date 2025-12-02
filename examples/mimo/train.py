@@ -19,7 +19,7 @@ from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_data_parallel_group,
 )
-# torch.autograd.set_detect_anomaly(True)
+
 # Add the parent directory to the path to import from megatron
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -33,10 +33,10 @@ from model_providers.llava_avlm import model_provider_llava_avlm
 from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder
 from utils.data_helpers import broadcast_nested_data_batch
+from examples.mimo.data.energon_vlm_task_encoder import MeshConfig
 
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
-# from megatron.core.models.mimo.partition.utils import CPPaddingAdapter
 
 _MODEL_PROVIDERS = {
     "mock": model_provider_mock_vlm_single_encoder,
@@ -80,7 +80,6 @@ def add_mimo_args(parser):
     # checkpoint related args
     group.add_argument('--language-model-checkpoint', type=str, default=None, help='Path to language model checkpoint to load')
     # energon dataloader related args
-    # group.add_argument('--pack_sequence', action='store_true', help='If true, do sequence packing.')
     group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
     
     return parser
@@ -210,9 +209,7 @@ def train_valid_test_datasets_provider(*provider_args, **provider_kwargs):
             max_seq_length = runtime_args.total_seq_length
             print(f"MIMO Training: Using max_seq_length = {max_seq_length} "
                 f"(total_seq_length: {runtime_args.total_seq_length})")
-
-            # Create ParallelConfig from runtime_args
-            from examples.mimo.data.energon_vlm_task_encoder import MeshConfig
+            
             mesh_config = MeshConfig(
                 cp_size=getattr(runtime_args, 'context_parallel_size', 1),
                 tensor_model_parallel_size=getattr(runtime_args, 'tensor_model_parallel_size', 1),
