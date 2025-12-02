@@ -653,9 +653,10 @@ class TestPaddingMaskAuxLoss:
                 (seq_len, batch_size, hidden_size), dtype=torch.bfloat16, device='cuda'
             )
 
-            # Create padding mask: first half valid, second half padding
-            padding_mask = torch.ones((seq_len, batch_size), dtype=torch.bool, device='cuda')
-            padding_mask[seq_len // 2 :, :] = False
+            # Create padding mask: first half valid (False), second half padding (True)
+            # Convention: True = padding (exclude), False = valid (include)
+            padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')
+            padding_mask[seq_len // 2 :, :] = True
 
             # Test with padding mask
             router.weight.grad = None
@@ -685,10 +686,8 @@ class TestPaddingMaskAuxLoss:
             grad_without_mask = router.weight.grad.clone()
 
             # The aux loss with mask should be close to the aux loss without mask
-            torch.testing.assert_close(
-                aux_loss_with_mask, aux_loss_without_mask, rtol=1e-2, atol=1e-3
-            )
-            torch.testing.assert_close(grad_with_mask, grad_without_mask, rtol=1e-2, atol=1e-3)
+            assert torch.equal(aux_loss_with_mask, aux_loss_without_mask)
+            assert torch.equal(grad_with_mask, grad_without_mask)
 
             clear_aux_losses_tracker()
         finally:
@@ -724,9 +723,10 @@ class TestPaddingMaskAuxLoss:
                 (seq_len, batch_size, hidden_size), dtype=torch.bfloat16, device='cuda'
             )
 
-            # Create padding mask: first half valid, second half padding
-            padding_mask = torch.ones((seq_len, batch_size), dtype=torch.bool, device='cuda')
-            padding_mask[seq_len // 2 :, :] = False
+            # Create padding mask: first half valid (False), second half padding (True)
+            # Convention: True = padding (exclude), False = valid (include)
+            padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')
+            padding_mask[seq_len // 2 :, :] = True
 
             # Test with padding mask
             router.weight.grad = None
@@ -748,8 +748,8 @@ class TestPaddingMaskAuxLoss:
             grad_without_mask = router.weight.grad.clone()
 
             # The z_loss with mask should be close to the z_loss without mask
-            torch.testing.assert_close(z_loss_with_mask, z_loss_without_mask, rtol=1e-2, atol=1e-3)
-            torch.testing.assert_close(grad_with_mask, grad_without_mask, rtol=1e-2, atol=1e-3)
+            assert torch.equal(z_loss_with_mask, z_loss_without_mask)
+            assert torch.equal(grad_with_mask, grad_without_mask)
 
             clear_aux_losses_tracker()
         finally:

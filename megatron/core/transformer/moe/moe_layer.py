@@ -184,11 +184,15 @@ class MoELayer(BaseMoELayer):
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
 
+        Note: The padding_mask transformation from [bsz, seq_length] to [seq_length, bsz]
+        is done in the forward() method before calling this method.
+
         Args:
-            hidden_states (torch.Tensor): Input tensor.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape = [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            hidden_states (torch.Tensor): Input tensor with shape [seq_length, bsz, hidden_size].
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                Shape = [seq_length, bsz] (after transformation in forward()).
+                True = padding (exclude), False = valid (include).
+                Defaults to None (all tokens are valid).
         """
         probs, routing_map = self.router(hidden_states, padding_mask=padding_mask)
         return probs, routing_map
@@ -285,11 +289,28 @@ class MoELayer(BaseMoELayer):
         3. Expert Computation: Experts process the dispatched tokens.
         4. Combine: The outputs from the experts are combined and returned.
 
+        Padding Mask Handling:
+            The padding_mask indicates which positions should be excluded from MoE routing
+            and auxiliary loss computation. This is useful when training with variable-length
+            sequences that are padded to a fixed length.
+
+            Convention: True = padding (exclude), False = valid (include)
+
+            Input Shape Transformation:
+                - Input padding_mask from GPTModel/TransformerLayer: [bsz, seq_length]
+                - Internal MoE processing expects: [seq_length, bsz]
+                - The transformation is done internally in this method
+
+            The mask is passed through to the router, which uses it to:
+            - Exclude padding tokens from auxiliary loss calculations
+            - Exclude padding tokens from expert bias updates
+            - Exclude padding tokens from z-loss computation
+
         Args:
-            hidden_states (torch.Tensor): The input tensor to the MoE layer.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape = [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            hidden_states (torch.Tensor): The input tensor with shape [seq_length, bsz, hidden_size].
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                Shape = [bsz, seq_length]. True = padding (exclude), False = valid (include).
+                Defaults to None (all tokens are valid).
 
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
@@ -299,6 +320,11 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+
+        # Transform padding_mask from [bsz, seq_length] to [seq_length, bsz] if provided
+        # This aligns the mask shape with hidden_states shape [seq_length, bsz, hidden_size]
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, padding_mask=None):

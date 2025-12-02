@@ -14,7 +14,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
-    compute_tokens_per_expert_with_padding,
+    compute_tokens_per_expert,
     router_gating_linear,
     save_to_aux_losses_tracker,
     sinkhorn,
@@ -281,17 +281,22 @@ class TopKRouter(Router):
             return probs
 
         # Use unified function to compute tokens_per_expert and num_tokens
-        tokens_per_expert, num_tokens = compute_tokens_per_expert_with_padding(
+        tokens_per_expert, num_tokens = compute_tokens_per_expert(
             routing_map=routing_map, padding_mask=padding_mask, reshape_for_seq_aux=False
         )
 
         tokens_per_expert = reduce_from_tensor_model_parallel_region(
             tokens_per_expert, self.tp_cp_group
         )
-        # When padding_mask is not None, total_num_tokens should be the sum across all ranks.
-        # After all_reduce, tokens_per_expert.sum() gives total token-expert assignments.
-        # Since each token is assigned to topk experts, we divide by topk to get actual token count.
-        # This avoids an extra all_reduce operation for num_tokens.
+        # When padding_mask is not None, we need the global count of valid tokens across all ranks.
+        # Naively, this would require an extra all_reduce on num_valid_tokens.
+        #
+        # Optimization: We derive total_num_tokens from the already all-reduced tokens_per_expert:
+        #   - tokens_per_expert.sum() = total valid token-expert assignments (global)
+        #   - Each valid token is assigned to exactly `topk` experts
+        #   - Therefore: total_valid_tokens = tokens_per_expert.sum() / topk
+        #
+        # This avoids an extra all_reduce operation.
         if padding_mask is not None:
             total_num_tokens = tokens_per_expert.sum() / self.topk
         else:
@@ -340,7 +345,7 @@ class TopKRouter(Router):
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
 
         # Use unified function to compute tokens_per_expert and num_tokens
-        tokens_per_expert, num_tokens = compute_tokens_per_expert_with_padding(
+        tokens_per_expert, num_tokens = compute_tokens_per_expert(
             routing_map=routing_map,
             padding_mask=padding_mask,
             reshape_for_seq_aux=True,
@@ -376,9 +381,10 @@ class TopKRouter(Router):
             )
             / bsz
         )
-        # Calculate valid token count: seq_length for each batch element
+        # Calculate valid token count: number of non-padding tokens
         if padding_mask is not None:
-            valid_token_count = padding_mask.sum()
+            # Invert padding_mask: count positions where padding_mask is False
+            valid_token_count = (~padding_mask).sum()
         else:
             valid_token_count = seq_length * bsz
 
@@ -405,7 +411,7 @@ class TopKRouter(Router):
             return probs
 
         # Use unified function to compute tokens_per_expert and num_tokens
-        tokens_per_expert, num_tokens = compute_tokens_per_expert_with_padding(
+        tokens_per_expert, num_tokens = compute_tokens_per_expert(
             routing_map=routing_map, padding_mask=padding_mask, reshape_for_seq_aux=False
         )
 
@@ -417,10 +423,15 @@ class TopKRouter(Router):
         self.ga_steps += 1
         averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
 
-        # When padding_mask is not None, total_num_tokens should be the sum across all ranks.
-        # After all_reduce, tokens_per_expert.sum() gives total token-expert assignments.
-        # Since each token is assigned to topk experts, we divide by topk to get actual token count.
-        # This avoids an extra all_reduce operation for num_tokens.
+        # When padding_mask is not None, we need the global count of valid tokens across all ranks.
+        # Naively, this would require an extra all_reduce on num_valid_tokens.
+        #
+        # Optimization: We derive total_num_tokens from the already all-reduced tokens_per_expert:
+        #   - tokens_per_expert.sum() = total valid token-expert assignments (global)
+        #   - Each valid token is assigned to exactly `topk` experts
+        #   - Therefore: total_valid_tokens = tokens_per_expert.sum() / topk
+        #
+        # This avoids an extra all_reduce operation.
         if padding_mask is not None:
             total_num_tokens = tokens_per_expert.sum() / self.topk
         else:
@@ -502,9 +513,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): The logits of the router.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape in [num_tokens]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape [num_tokens]. True = padding (exclude),
+                                                   False = valid (include). Defaults to None.
 
         Returns:
             torch.Tensor: The logits after applying the z-loss.
@@ -522,7 +533,8 @@ class TopKRouter(Router):
                 # which scales both the main_loss gradient and z_loss gradient by
                 # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
                 # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
-                num_tokens = padding_mask.sum() if padding_mask is not None else logits.shape[0]
+                # Count valid tokens: sum of inverted mask (False -> True = valid)
+                num_tokens = (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss * num_tokens)
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
@@ -566,14 +578,14 @@ class TopKRouter(Router):
 
         Args:
             routing_map (torch.Tensor): Token to expert routing map, [num_tokens, num_experts].
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                Shape [num_tokens]. True for valid tokens, False for padding tokens.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                Shape [num_tokens]. True = padding (exclude), False = valid (include).
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
                 if padding_mask is not None:
                     # Only count valid tokens, exclude padding tokens
-                    # This logic is consistent with compute_tokens_per_expert_with_padding
+                    # This logic is consistent with compute_tokens_per_expert
                     mask_expanded = padding_mask.unsqueeze(-1)
                     routing_map_masked = routing_map & mask_expanded
                     self.local_tokens_per_expert += routing_map_masked.sum(dim=0)
@@ -585,9 +597,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape = [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape = [seq_length, bsz]. True = padding (exclude),
+                                                   False = valid (include). Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -675,9 +687,9 @@ class TopKRouter(Router):
 
         Args:
             input (torch.Tensor): Input tensor.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape = [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape = [seq_length, bsz]. True = padding (exclude),
+                                                   False = valid (include). Defaults to None.
         """
         self._maintain_float32_expert_bias()
 

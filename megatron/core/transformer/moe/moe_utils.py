@@ -34,7 +34,7 @@ except ImportError:
 _MOE_LAYER_WISE_LOGGING_TRACKER = {}
 
 
-def compute_tokens_per_expert_with_padding(
+def compute_tokens_per_expert(
     routing_map: torch.Tensor,
     padding_mask: Optional[torch.Tensor] = None,
     reshape_for_seq_aux: bool = False,
@@ -42,15 +42,30 @@ def compute_tokens_per_expert_with_padding(
     bsz: Optional[int] = None,
     num_experts: Optional[int] = None,
 ):
-    """Compute tokens_per_expert and total_num_tokens with optional padding mask.
-    This function provides a unified way to compute token counts across different aux loss types.
+    """Compute tokens_per_expert and num_valid_tokens with optional padding mask.
+
+    This function provides a unified way to compute token counts for MoE auxiliary losses.
+    It supports both standard aux_loss/global_aux_loss and sequence-level aux_loss.
+
+    Padding Mask Semantics:
+        The padding_mask follows the standard masking convention where:
+        - True  = padding position (should be EXCLUDED from computation)
+        - False = valid position (should be INCLUDED in computation)
+        This is consistent with common attention mask conventions in transformer models.
+
+    Workflow:
+        1. If padding_mask is provided, create an inverted mask (~padding_mask) to select valid tokens
+        2. Apply the valid mask to routing_map to exclude padding tokens
+        3. Sum the masked routing_map to get tokens_per_expert
+        4. Count valid tokens by summing the inverted mask
 
     Args:
         routing_map (torch.Tensor): Token to expert routing map.
             - For aux_loss/global_aux_loss: shape [num_tokens, num_experts]
             - For seq_aux_loss: shape [num_tokens, num_experts] but will be reshaped
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-            Shape [num_tokens]. True for valid tokens, False for padding tokens.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+            Shape [num_tokens]. True = padding (exclude), False = valid (include).
+            Defaults to None (all tokens are valid).
         reshape_for_seq_aux (bool): If True, reshape routing_map for seq_aux_loss computation.
         seq_length (int, optional): Sequence length, required when reshape_for_seq_aux=True.
         bsz (int, optional): Batch size, required when reshape_for_seq_aux=True.
@@ -69,30 +84,34 @@ def compute_tokens_per_expert_with_padding(
         ), "seq_length, bsz, and num_experts must be provided when reshape_for_seq_aux=True"
 
         if padding_mask is not None:
-            # Reshape padding_mask to [seq_length, bsz]
-            padding_mask_reshaped = padding_mask.reshape(seq_length, bsz)
+            # Invert padding_mask: True (padding) -> False, False (valid) -> True
+            valid_mask = ~padding_mask
+            # Reshape valid_mask to [seq_length, bsz]
+            valid_mask_reshaped = valid_mask.reshape(seq_length, bsz)
             # Expand to match routing_map after reshape [seq_length, bsz * num_experts]
             mask_expanded = (
-                padding_mask_reshaped.unsqueeze(-1)
+                valid_mask_reshaped.unsqueeze(-1)
                 .expand(-1, -1, num_experts)
                 .reshape(seq_length, -1)
             )
             routing_map_masked = routing_map.reshape(seq_length, -1) & mask_expanded
             tokens_per_expert = routing_map_masked.sum(dim=0)
-            # Count valid tokens only
-            num_valid_tokens = padding_mask.sum()
+            # Count valid tokens only (where padding_mask is False)
+            num_valid_tokens = valid_mask.sum()
         else:
             tokens_per_expert = routing_map.reshape(seq_length, -1).sum(dim=0)
             num_valid_tokens = routing_map.shape[0]
     else:
         # aux_loss or global_aux_loss
         if padding_mask is not None:
-            # routing_map: [num_tokens, num_experts], padding_mask: [num_tokens]
-            mask_expanded = padding_mask.unsqueeze(-1)
+            # Invert padding_mask: True (padding) -> False, False (valid) -> True
+            valid_mask = ~padding_mask
+            # routing_map: [num_tokens, num_experts], valid_mask: [num_tokens]
+            mask_expanded = valid_mask.unsqueeze(-1)
             routing_map_masked = routing_map & mask_expanded
             tokens_per_expert = routing_map_masked.sum(dim=0)
-            # Count valid tokens only
-            num_valid_tokens = padding_mask.sum()
+            # Count valid tokens only (where padding_mask is False)
+            num_valid_tokens = valid_mask.sum()
         else:
             tokens_per_expert = routing_map.sum(dim=0)
             num_valid_tokens = routing_map.shape[0]
@@ -159,17 +178,17 @@ def switch_load_balancing_loss_func(
         topk (int): The number of experts selected for each token.
         num_experts (int): The number of experts.
         moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                               Shape in [num_tokens]. True for valid tokens,
-                                               False for padding tokens. Defaults to None.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
     """
     # Apply padding mask to probs if provided
     if padding_mask is not None:
-        # padding_mask: [num_tokens], probs: [num_tokens, num_experts]
-        mask_expanded = padding_mask.unsqueeze(-1)
-        probs = probs * mask_expanded
+        # Invert padding_mask: True (padding) -> 0, False (valid) -> 1
+        valid_mask = (~padding_mask).unsqueeze(-1)
+        probs = probs * valid_mask
 
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
@@ -197,9 +216,9 @@ def z_loss_func(logits, z_loss_coeff, padding_mask: Optional[torch.Tensor] = Non
     Args:
         logits (torch.Tensor): The logits of the router.
         z_loss_coeff (float): The coefficient for the z-loss.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                               Shape in [num_tokens]. True for valid tokens,
-                                               False for padding tokens. Defaults to None.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
 
     Returns:
         torch.Tensor: The logits after applying the z-loss.
@@ -208,10 +227,12 @@ def z_loss_func(logits, z_loss_coeff, padding_mask: Optional[torch.Tensor] = Non
     z_loss_values = torch.square(logsum)
 
     if padding_mask is not None:
-        # Only compute z_loss for non-padding tokens
-        z_loss_values = z_loss_values * padding_mask
+        # Invert padding_mask: True (padding) -> 0, False (valid) -> 1
+        valid_mask = ~padding_mask
+        # Only compute z_loss for valid (non-padding) tokens
+        z_loss_values = z_loss_values * valid_mask
         # Compute mean over valid tokens only
-        num_valid_tokens = padding_mask.sum()
+        num_valid_tokens = valid_mask.sum()
         z_loss = z_loss_values.sum() / torch.clamp(num_valid_tokens, min=1.0) * z_loss_coeff
     else:
         z_loss = torch.mean(z_loss_values) * z_loss_coeff
@@ -723,9 +744,9 @@ def compute_routing_scores_for_aux_loss(
 
     Args:
         logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                               Shape in [num_tokens]. True for valid tokens,
-                                               False for padding tokens. Defaults to None.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: routing_map and scores.
     """
@@ -756,8 +777,9 @@ def compute_routing_scores_for_aux_loss(
 
     # Apply padding mask to scores if provided
     if padding_mask is not None:
-        mask_expanded = padding_mask.unsqueeze(-1).to(scores.dtype)
-        scores = scores * mask_expanded
+        # Invert padding_mask: True (padding) -> 0, False (valid) -> 1
+        valid_mask = (~padding_mask).unsqueeze(-1).to(scores.dtype)
+        scores = scores * valid_mask
     return routing_map, scores
 
 

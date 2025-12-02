@@ -137,10 +137,11 @@ class TestTop2Router:
         # Create input with shape [seq_len, batch_size, hidden_size]
         hidden_states = torch.randn((seq_len, batch_size, hidden_size)).cuda().bfloat16()
 
-        # Create padding mask: first half valid, second half padding
+        # Create padding mask: first half valid (False), second half padding (True)
         # padding_mask shape: [seq_len, batch_size]
-        padding_mask = torch.ones((seq_len, batch_size), dtype=torch.bool, device='cuda')
-        padding_mask[seq_len // 2 :, :] = False  # Second half is padding
+        # Convention: True = padding (exclude), False = valid (include)
+        padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')
+        padding_mask[seq_len // 2 :, :] = True  # Second half is padding
 
         # Test forward pass with padding mask
         with torch.no_grad():
@@ -169,7 +170,7 @@ class TestTop2Router:
             )
 
             # Verify that probs for valid tokens are similar
-            torch.testing.assert_close(probs_valid_part, probs_without_mask, rtol=1e-3, atol=1e-3)
+            assert torch.equal(probs_valid_part, probs_without_mask)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
