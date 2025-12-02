@@ -21,7 +21,7 @@ from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import MatchContext, QuantizationConfig
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
@@ -1351,7 +1351,7 @@ class KitchenFlashAttention(MegatronModule):
         attention_dropout: Optional[float] = None,
         softmax_scale: Optional[float] = None,
         cp_comm_type: Optional[str] = None,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
 
@@ -1376,14 +1376,14 @@ class KitchenFlashAttention(MegatronModule):
         projection_size = kv_channels * self.config.num_attention_heads
 
         # Per attention head and per partition values.
-        if model_comm_pgs is None:
-            raise ValueError("DotProductAttention was called without ModelCommProcessGroups")
+        if pg_collection is None:
+            raise ValueError("DotProductAttention was called without ProcessGroupCollection")
         else:
             assert hasattr(
-                model_comm_pgs, 'tp'
-            ), "DotProductAttention model_comm_pgs must have tp process group"
+                pg_collection, 'tp'
+            ), "DotProductAttention pg_collection must have tp process group"
 
-        world_size = model_comm_pgs.tp.size()
+        world_size = pg_collection.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
         self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
@@ -1509,7 +1509,7 @@ class KitchenDotProductAttention(MegatronModule):
         attention_dropout: Optional[float] = None,
         softmax_scale: Optional[float] = None,
         cp_comm_type: Optional[str] = None,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
 
@@ -1532,14 +1532,14 @@ class KitchenDotProductAttention(MegatronModule):
         projection_size = kv_channels * self.config.num_attention_heads
 
         # Per attention head and per partition values.
-        if model_comm_pgs is None:
-            raise ValueError("DotProductAttention was called without ModelCommProcessGroups")
+        if pg_collection is None:
+            raise ValueError("DotProductAttention was called without ProcessGroupCollection")
         else:
             assert hasattr(
-                model_comm_pgs, 'tp'
-            ), "DotProductAttention model_comm_pgs must have tp process group"
+                pg_collection, 'tp'
+            ), "DotProductAttention pg_collection must have tp process group"
 
-        world_size = model_comm_pgs.tp.size()
+        world_size = pg_collection.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
         self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
@@ -1763,14 +1763,24 @@ class KitchenSpecProvider(BackendSpecProvider):
     def core_attention(self) -> type:
         """Which module to use for attention"""
         if not self.use_kitchen_attention:
-            log_single_rank(logger, logging.WARNING, "KitchenSpecProvider: Using fallback (likely TE) as core attention.")
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "KitchenSpecProvider: Using fallback (likely TE) as core attention.",
+            )
             return self.fallback.core_attention()
 
         if self.kitchen_attention_backend == "sdpa":
-            log_single_rank(logger, logging.WARNING, "KitchenSpecProvider: Using Kitchen SDPA as core attention.")
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "KitchenSpecProvider: Using Kitchen SDPA as core attention.",
+            )
             return KitchenDotProductAttention
         elif self.kitchen_attention_backend == "fa":
-            log_single_rank(logger, logging.WARNING, "KitchenSpecProvider: Using Kitchen FA as core attention.")
+            log_single_rank(
+                logger, logging.WARNING, "KitchenSpecProvider: Using Kitchen FA as core attention."
+            )
             return KitchenFlashAttention
         else:
             raise ValueError(
