@@ -21,6 +21,7 @@ from megatron.core.tensor_parallel.random import (
     get_all_rng_states,
     get_cuda_rng_tracker,
 )
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1344,24 +1345,24 @@ def _layer_is_graphable(layer, config):
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    if isinstance(layer, MambaLayer) and 'mamba' in config.cuda_graph_scope:
+    if isinstance(layer, MambaLayer) and CudaGraphScope.mamba in config.cuda_graph_scope:
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if 'attn' in config.cuda_graph_scope and not (
+        if CudaGraphScope.attn in config.cuda_graph_scope and not (
             isinstance(layer.self_attention, IdentityOp)
             and isinstance(layer.cross_attention, IdentityOp)
         ):
             # attn layer.
             return True
         if (
-            'moe' in config.cuda_graph_scope
-            or 'moe_router' in config.cuda_graph_scope
-            or 'moe_preprocess' in config.cuda_graph_scope
+            CudaGraphScope.moe in config.cuda_graph_scope
+            or CudaGraphScope.moe_router in config.cuda_graph_scope
+            or CudaGraphScope.moe_preprocess in config.cuda_graph_scope
         ) and isinstance(layer.mlp, MoELayer):
             # moe layer.
             return True
-        if 'mlp' in config.cuda_graph_scope and isinstance(layer.mlp, MLP):
+        if CudaGraphScope.mlp in config.cuda_graph_scope and isinstance(layer.mlp, MLP):
             # mlp layer.
             return True
     return False
@@ -1388,7 +1389,7 @@ class TECudaGraphHelper:
             "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
             "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
-        assert "full_iteration" not in config.cuda_graph_scope, (
+        assert CudaGraphScope.full_iteration not in config.cuda_graph_scope, (
             "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
             "Please use cuda_graph_impl=local instead."
         )
@@ -1529,7 +1530,7 @@ class TECudaGraphHelper:
                         and not isinstance(layer.self_attention, IdentityOp)
                         and (
                             not self.config.cuda_graph_scope
-                            or 'attn' in self.config.cuda_graph_scope
+                            or CudaGraphScope.attn in self.config.cuda_graph_scope
                         )
                     )
                     if is_te_min_version("1.10.0"):
@@ -1712,3 +1713,33 @@ class TECudaGraphHelper:
             model_chunk = self.model[chunk_number]
             for layer in layers:
                 layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
+
+    def delete_cuda_graphs(self):
+        """
+        Delete all CUDA graphs.
+        """
+        assert self._graphs_created, "CUDA Graphs have not been created."
+
+        graph_resettable = is_te_min_version("2.10.0")
+        graphs_reset, graphs_not_reset = 0, 0
+        for layers in self.callables_per_chunk:
+            for layer in layers:
+                for graph in layer.cuda_graphs:
+                    if graph_resettable:
+                        graph.reset()
+                        graphs_reset += 1
+                    else:
+                        graphs_not_reset += 1
+                layer.cuda_graphs = []
+                layer.cuda_graph_manual_hooks = []
+
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=None,
+            dp_cp_group=None,
+            level=logging.INFO,
+            msg=f'Rank {torch.distributed.get_rank()}: '
+            f'{graphs_reset} graphs deleted with explicit reset, '
+            f'{graphs_not_reset} graphs deleted without explicit reset.',
+        )
+        self._graphs_created = False
