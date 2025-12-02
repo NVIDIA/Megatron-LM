@@ -141,8 +141,16 @@ class TransformerLayerSchedulePlan:
             else isinstance(self.layer.mlp, MoELayer)
         )
 
-        use_flex_dispatcher = self.layer.config.moe_token_dispatcher_type == "flex"
-        extra_args["use_flex_dispatcher"] = use_flex_dispatcher
+        enable_deepep = (
+            self.layer.config.moe_token_dispatcher_type == "flex"
+            and self.layer.config.moe_flex_dispatcher_backend == "deepep"
+        )
+        enable_hybridep = (
+            self.layer.config.moe_token_dispatcher_type == "flex"
+            and self.layer.config.moe_flex_dispatcher_backend == "hybridep"
+        )
+        extra_args["enable_deepep"] = enable_deepep
+        extra_args["enable_hybridep"] = enable_hybridep
         extra_args["is_moe"] = is_moe
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
         extra_args["is_mtp"] = is_mtp
