@@ -528,8 +528,8 @@ def _te_patch_for_batch_invariant():
     Safe no-op if TE is unavailable.
     """
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
-    import transformer_engine.pytorch as te  # type: ignore
-    import transformer_engine.pytorch.cpp_extensions as te_cpp  # type: ignore
+    import transformer_engine.pytorch as te
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
 
     # Patch general_gemm once
     if _TE_GENERAL_GEMM_ORIG is None and hasattr(te_cpp, "general_gemm"):
@@ -555,7 +555,7 @@ def _te_patch_for_batch_invariant():
             )
             te_layernorm_linear_mod.general_gemm = _te_general_gemm_patched
 
-        # Also patch the symbol imported into Megatron's TE wrapper module
+    # Also patch the symbol imported into Megatron's TE wrapper module
     import megatron.core.extensions.transformer_engine as meg_te
 
     if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
@@ -616,7 +616,7 @@ def _te_unpatch_for_batch_invariant():
         return
 
     if _TE_GENERAL_GEMM_ORIG is not None and hasattr(te_cpp, "general_gemm"):
-        te_cpp.general_gemm = _TE_GENERAL_GEMM_ORIG  # type: ignore[assignment]
+        te_cpp.general_gemm = _TE_GENERAL_GEMM_ORIG
         _TE_GENERAL_GEMM_ORIG = None
 
     rms_cls = getattr(te, "RMSNorm", None)
@@ -624,7 +624,7 @@ def _te_unpatch_for_batch_invariant():
         rms_cls = getattr(te, "pytorch", None)
         rms_cls = getattr(rms_cls, "RMSNorm", None)
     if rms_cls is not None and _TE_RMSNORM_ORIG_FWD is not None:
-        rms_cls.forward = _TE_RMSNORM_ORIG_FWD  # type: ignore[assignment]
+        rms_cls.forward = _TE_RMSNORM_ORIG_FWD
         _TE_RMSNORM_ORIG_FWD = None
 
     meg_te = _import_module_if_available("megatron.core.extensions.transformer_engine")

@@ -1026,6 +1026,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # Default to constructor-provided num_splits unless explicitly overridden
         if num_splits is None:
             num_splits = self.num_splits
+        if num_splits is not None:
+            assert is_te_min_version("2.10.0"), (
+                f"Transformer-Engine v{get_te_version()} must be >= 2.10.0 to support" "num_splits."
+            )
 
         packed_seq_kwargs = (
             {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}

@@ -114,7 +114,6 @@ class TestGPTModelBatchInvariant:
         model_parallel_cuda_manual_seed(321)
         self.sequence_length = 32
         self.vocab_size = 96
-        self.device = torch.device("cuda")
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -126,12 +125,10 @@ class TestGPTModelBatchInvariant:
         batch_size = 6
         splits = [2, 1, 3]
         input_ids = torch.randint(
-            low=0, high=self.vocab_size, size=(batch_size, self.sequence_length), device=self.device
+            low=0, high=self.vocab_size, size=(batch_size, self.sequence_length), device="cuda"
         )
         position_ids = (
-            torch.arange(self.sequence_length, device=self.device)
-            .unsqueeze(0)
-            .repeat(batch_size, 1)
+            torch.arange(self.sequence_length, device="cuda").unsqueeze(0).repeat(batch_size, 1)
         )
         attention_mask = torch.ones(
             batch_size,
@@ -139,7 +136,7 @@ class TestGPTModelBatchInvariant:
             self.sequence_length,
             self.sequence_length,
             dtype=torch.bool,
-            device=self.device,
+            device="cuda",
         )
 
         with set_batch_invariant_mode(True):
@@ -235,7 +232,7 @@ class TestGPTModelBatchInvariant:
                 prompt_tokens = req.prompt_tokens.tolist()
                 generated_tokens = req.generated_tokens
                 full_sequence = torch.tensor(
-                    prompt_tokens + generated_tokens, dtype=torch.long, device=self.device
+                    prompt_tokens + generated_tokens, dtype=torch.long, device="cuda"
                 ).unsqueeze(0)
                 baseline_log_probs = _train_forward_logprobs(
                     inference_model, full_sequence
@@ -243,7 +240,7 @@ class TestGPTModelBatchInvariant:
                 inference_log_probs = torch.tensor(
                     req.prompt_log_probs + req.generated_log_probs,
                     dtype=baseline_log_probs.dtype,
-                    device=self.device,
+                    device="cuda",
                 )
                 assert torch.equal(
                     inference_log_probs, baseline_log_probs
