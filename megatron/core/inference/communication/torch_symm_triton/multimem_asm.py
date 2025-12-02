@@ -75,7 +75,7 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr):
             .reg .pred %p0;
             setp.ne.s32 %p0, $5, 1;
             @%p0 bra end;
-            ld.global.relaxed.sys.v4.u32 {$0, $1, $2, $3}, [$4];
+            ld.global.v4.u32 {$0, $1, $2, $3}, [$4];
             end:
         }
         """,
@@ -145,7 +145,7 @@ def st_128(ptr, x, y, z, w, mask, multicast_op):
             .reg .pred %p0;
             setp.ne.s32 %p0, $6, 1;
             @%p0 bra end;
-            st.global.relaxed.sys.v4.f32 [$1], {$2, $3, $4, $5};
+            st.global.v4.f32 [$1], {$2, $3, $4, $5};
             end:
         }
         """,
