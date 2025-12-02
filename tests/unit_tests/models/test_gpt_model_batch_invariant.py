@@ -27,7 +27,6 @@ from megatron.rl.rl_utils import selective_log_softmax
 from tests.unit_tests.test_utilities import Utils
 
 
-
 class DummyTokenizer:
     def __init__(self, vocab_size: int, bos: int | None = None, eod: int = 0, pad: int = 0):
         self.vocab_size = vocab_size
@@ -101,9 +100,7 @@ def _train_forward_logprobs(model: torch.nn.Module, tokens: torch.Tensor) -> tor
         batch_size, 1, seq_len, seq_len, dtype=torch.bool, device=tokens.device
     )
     with torch.no_grad():
-        logits = model(
-            input_ids=tokens, position_ids=position_ids, attention_mask=attention_mask
-        )
+        logits = model(input_ids=tokens, position_ids=position_ids, attention_mask=attention_mask)
     logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
     return logprobs
 

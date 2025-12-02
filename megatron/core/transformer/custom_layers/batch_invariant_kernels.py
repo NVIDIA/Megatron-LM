@@ -1,6 +1,12 @@
+# Copyright 2025 Thinking Machines Lab
+# The following code has been adapted
+# from the following repo: https://github.com/thinking-machines-lab/batch_invariant_ops
+
+
 import contextlib
 import importlib
 import importlib.util
+import logging
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, Dict, List, Optional
@@ -17,9 +23,13 @@ __all__ = [
 ]
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
 def _matmul_launch_metadata(
     grid: Callable[..., Any], kernel: Any, args: Dict[str, Any]
 ) -> Dict[str, Any]:
+    """Build launch metadata for Triton matmul kernels used in BIK matmul."""
     ret = {}
     m, n, k = args["M"], args["N"], args["K"]
     ret["name"] = f"{kernel.name} [M={m}, N={n}, K={k}]"
@@ -144,7 +154,7 @@ def get_compute_units():
             device_properties = torch.xpu.get_device_properties(0)
             NUM_SMS = device_properties.max_compute_units
         case _:
-            print("No CUDA or XPU device available. Using CPU.")
+            _LOGGER.warning("No CUDA or XPU device available. Using CPU.")
             # For CPU, you might want to use the number of CPU cores
             NUM_SMS = torch.get_num_threads()
 
@@ -152,6 +162,7 @@ def get_compute_units():
 
 
 def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
+    """Persistent matmul kernel used by batch-invariant GEMM."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -168,11 +179,9 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
-        return (
-            min(
-                NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
-            ),
-        )
+        blocks_m = triton.cdiv(M, META["BLOCK_SIZE_M"])
+        blocks_n = triton.cdiv(N, META["BLOCK_SIZE_N"])
+        return (min(NUM_SMS, blocks_m * blocks_n),)
 
     configs = {
         torch.bfloat16: {
@@ -456,10 +465,12 @@ def mean_dim(
 
 
 def mm_batch_invariant(a, b):
+    """Batch-invariant replacement for `aten::mm` using a persistent matmul kernel."""
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
+    """Batch-invariant replacement for `aten::addmm` using a persistent matmul kernel."""
     return matmul_persistent(a, b, bias=bias)
 
 
@@ -469,6 +480,7 @@ def _log_softmax_batch_invariant(input, dim, _half_to_float):
 
 
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
+    """Batch-invariant replacement for `aten::mean.dim` over one or more dimensions."""
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
@@ -488,11 +500,8 @@ AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])
 
 
 def get_batch_invariant_attention_block_size() -> AttentionBlockSize:
+    """Return the (block_m, block_n) tiling used for batch-invariant attention."""
     return AttentionBlockSize(block_m=16, block_n=16)
-
-
-# Everything above is from the blog https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
-# and its github repo https://github.com/thinking-machines-lab/batch_invariant_ops
 
 
 _batch_invariant_MODE = False
@@ -512,8 +521,10 @@ def _import_module_if_available(name: str):
 
 
 def _te_patch_for_batch_invariant():
-    """
-    Monkey-patch Transformer Engine to route GEMM and RMSNorm to batch-invariant kernels.
+    """Patch Transformer Engine modules to use batch-invariant GEMM and RMSNorm.
+
+    This monkey-patches TE's GEMM and RMSNorm entry points to dispatch to the
+    batch-invariant implementations when batch-invariant mode is enabled.
     Safe no-op if TE is unavailable.
     """
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
@@ -523,32 +534,33 @@ def _te_patch_for_batch_invariant():
     # Patch general_gemm once
     if _TE_GENERAL_GEMM_ORIG is None and hasattr(te_cpp, "general_gemm"):
         _TE_GENERAL_GEMM_ORIG = te_cpp.general_gemm
-        te_cpp.general_gemm = _te_general_gemm_patched  # type: ignore[attr-defined]
+        te_cpp.general_gemm = _te_general_gemm_patched
 
-    # Also patch the symbol imported inside TE's module.linear (from ..cpp_extensions import general_gemm)
-    import transformer_engine.pytorch.module.linear as te_linear_mod  # type: ignore
+    # Also patch the symbol imported inside TE's module.linear
+    # (from ..cpp_extensions import general_gemm)
+    import transformer_engine.pytorch.module.linear as te_linear_mod
 
     if hasattr(te_linear_mod, "general_gemm"):
         if "module.linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
             _TE_GEMM_FUNC_ORIGS["module.linear.general_gemm"] = te_linear_mod.general_gemm
-            te_linear_mod.general_gemm = _te_general_gemm_patched  # type: ignore[attr-defined]
+            te_linear_mod.general_gemm = _te_general_gemm_patched
 
     # Also patch the symbol imported inside TE's module.layernorm_linear
-    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod  # type: ignore
+    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
 
     if hasattr(te_layernorm_linear_mod, "general_gemm"):
         if "module.layernorm_linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
             _TE_GEMM_FUNC_ORIGS["module.layernorm_linear.general_gemm"] = (
                 te_layernorm_linear_mod.general_gemm
             )
-            te_layernorm_linear_mod.general_gemm = _te_general_gemm_patched  # type: ignore[attr-defined]
+            te_layernorm_linear_mod.general_gemm = _te_general_gemm_patched
 
         # Also patch the symbol imported into Megatron's TE wrapper module
-    import megatron.core.extensions.transformer_engine as meg_te  # type: ignore
+    import megatron.core.extensions.transformer_engine as meg_te
 
     if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
         _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
-        meg_te.general_gemm = _te_general_gemm_patched  # type: ignore[attr-defined]
+        meg_te.general_gemm = _te_general_gemm_patched
 
     # Patch RMSNorm.forward once (class may be on te or te.pytorch)
     rms_cls = getattr(te, "RMSNorm", None)
@@ -557,10 +569,10 @@ def _te_patch_for_batch_invariant():
         rms_cls = getattr(rms_cls, "RMSNorm", None)
     if rms_cls is not None and _TE_RMSNORM_ORIG_FWD is None and hasattr(rms_cls, "forward"):
         _TE_RMSNORM_ORIG_FWD = rms_cls.forward
-        rms_cls.forward = _te_rmsnorm_forward_patched  # type: ignore[attr-defined]
+        rms_cls.forward = _te_rmsnorm_forward_patched
 
     # Patch TE module-level RMSNorm functions used by fused LayerNormLinear
-    import transformer_engine.pytorch.module.layernorm as te_layernorm_mod  # type: ignore
+    import transformer_engine.pytorch.module.layernorm as te_layernorm_mod
 
     def _make_rmsnorm_patched(orig_func):
         # Module-level helpers (e.g. transformer_engine.pytorch.module.layernorm.rmsnorm)
@@ -621,7 +633,7 @@ def _te_unpatch_for_batch_invariant():
         and _MEG_TE_GENERAL_GEMM_ORIG is not None
         and hasattr(meg_te, "general_gemm")
     ):
-        meg_te.general_gemm = _MEG_TE_GENERAL_GEMM_ORIG  # type: ignore[assignment]
+        meg_te.general_gemm = _MEG_TE_GENERAL_GEMM_ORIG
         _MEG_TE_GENERAL_GEMM_ORIG = None
     elif meg_te is None:
         _MEG_TE_GENERAL_GEMM_ORIG = None
@@ -644,7 +656,7 @@ def _te_unpatch_for_batch_invariant():
         and key in _TE_GEMM_FUNC_ORIGS
         and hasattr(te_linear_mod, "general_gemm")
     ):
-        te_linear_mod.general_gemm = _TE_GEMM_FUNC_ORIGS[key]  # type: ignore[assignment]
+        te_linear_mod.general_gemm = _TE_GEMM_FUNC_ORIGS[key]
         _TE_GEMM_FUNC_ORIGS.pop(key, None)
     else:
         _TE_GEMM_FUNC_ORIGS.pop(key, None)
@@ -659,7 +671,7 @@ def _te_unpatch_for_batch_invariant():
         and key in _TE_GEMM_FUNC_ORIGS
         and hasattr(te_layernorm_linear_mod, "general_gemm")
     ):
-        te_layernorm_linear_mod.general_gemm = _TE_GEMM_FUNC_ORIGS[key]  # type: ignore[assignment]
+        te_layernorm_linear_mod.general_gemm = _TE_GEMM_FUNC_ORIGS[key]
         _TE_GEMM_FUNC_ORIGS.pop(key, None)
     else:
         _TE_GEMM_FUNC_ORIGS.pop(key, None)
@@ -685,6 +697,8 @@ def _is_supported_dtype_for_bik(t: torch.dtype) -> bool:
 
 
 class BatchInvariantTEGemmFn(torch.autograd.Function):
+    """Autograd function implementing batch-invariant TE GEMM."""
+
     @staticmethod
     def forward(
         ctx,
@@ -703,7 +717,6 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
 
         # Flatten opA to 2D if needed (weight tensors should be 2D, but validate)
         if opA.dim() > 2:
-            # If A has extra dims, flatten all but last to match matmul_persistent expectations
             opA = opA.reshape(-1, opA.shape[-1])
         elif opA.dim() < 2:
             raise ValueError(f"opA has insufficient dimensions: {opA.shape}")
@@ -777,8 +790,6 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             dA = d_opA
 
         if transb:
-            # For transposed original B, map gradient accordingly; B was transposed before forward
-            # Here d_opB matches the shape of (B after possible transpose); reverse it
             dB = d_opB.transpose(0, 1).contiguous()
         else:
             dB = d_opB
@@ -819,17 +830,13 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
     # Disallow GEMM-comm overlap in batch-invariant mode
     if extra_output is not None or ub is not None or ub_type is not None or bulk_overlap:
         raise RuntimeError(
-            "Batch-invariant GEMM does not support Userbuffers/overlap (extra_output/ub/ub_type/bulk_overlap)."
+            "Batch-invariant GEMM does not support Userbuffers/overlap "
+            "(extra_output/ub/ub_type/bulk_overlap)."
         )
 
     # Compute via autograd-aware function matching TE's layout semantics
     result = BatchInvariantTEGemmFn.apply(A, B, bias if not grad else None, out_dtype, layout)
 
-    # Compute bias gradient if needed (for wgrad GEMM)
-    # TODO: Note (Peter): I dont get this at all. This seems very wrong.
-    # In wgrad: general_gemm(x, dy, layout="NT", grad=True, bias=bias)
-    # - Computes: dw = dy^T @ x (this is 'result')
-    # - Should also compute: db = sum(dy) where dy is B (grad_output)
     bias_grad = None
     if grad and bias is not None:
         # Flatten B to 2D and sum over batch/sequence dimension (first dim)
@@ -844,6 +851,8 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
 
 
 class BatchInvariantRMSNormFn(torch.autograd.Function):
+    """Autograd function implementing batch-invariant RMSNorm."""
+
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float, zero_centered_gamma: bool):
         if not x.is_cuda:
@@ -882,11 +891,9 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         r3 = r * r * r
         D = x.shape[-1]
 
-        # dγ = Σ (g ⊙ x ⊙ r)   over all leading dims
         red_dims = tuple(range(0, go_fp32.ndim - 1))
         g_w = (go_fp32 * x_fp32 * r).sum(dim=red_dims).to(weight.dtype)
 
-        # dx = g ⊙ (w r) − (w r^3) * x * Σ(g ⊙ x ⊙ w) / D
         s = (go_fp32 * x_fp32 * w_fp32).sum(dim=-1, keepdim=True)
         dx = go_fp32 * (w_fp32 * r) - (w_fp32 * r3) * (s * x_fp32) / D
         dx = dx.to(x.dtype)
@@ -905,21 +912,24 @@ def rmsnorm_batch_invariant(x: torch.Tensor, weight: torch.Tensor, eps: float) -
 
 
 def _te_rmsnorm_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
-    """Patched TE RMSNorm.forward that routes to batch-invariant implementation with autograd support."""
+    """Patched TE RMSNorm.forward that routes to batch-invariant
+    implementation with autograd support.
+    """
     weight = getattr(self, "weight", None)
     if weight is None:
         raise RuntimeError("Batch-invariant RMSNorm requires affine weight.")
-    # TODO(peter): Should I even allow defaults here like this?
     eps = getattr(self, "eps", 1e-5)
     zero_centered_gamma = getattr(self, "zero_centered_gamma", False)
     return BatchInvariantRMSNormFn.apply(x, weight, eps, zero_centered_gamma)
 
 
 def is_batch_invariant_mode_enabled():
+    """Return True if global batch-invariant mode is currently enabled."""
     return _batch_invariant_MODE
 
 
 def enable_batch_invariant_mode():
+    """Enable global batch-invariant mode and patch Aten/TE kernels."""
     global _batch_invariant_MODE, _batch_invariant_LIB
     if _batch_invariant_MODE:
         return
@@ -935,6 +945,7 @@ def enable_batch_invariant_mode():
 
 
 def disable_batch_invariant_mode():
+    """Disable global batch-invariant mode and restore original kernels."""
     global _batch_invariant_MODE, _batch_invariant_LIB
     if _batch_invariant_LIB is not None:
         _batch_invariant_LIB._destroy()
@@ -946,6 +957,12 @@ def disable_batch_invariant_mode():
 
 @contextlib.contextmanager
 def set_batch_invariant_mode(enabled: bool = True):
+    """Context manager to toggle global batch-invariant mode.
+
+    When `enabled` is True, batch-invariant kernels are enabled for the duration of
+    the context; when False, they are disabled for the duration. This implementation
+    is re-entrant and correctly restores the previous state even under nesting.
+    """
     global _batch_invariant_MODE, _batch_invariant_LIB
     # Save the previous on/off state so we can correctly restore it, even under
     # nested usage or when toggling from True->False inside an outer True scope.

@@ -669,7 +669,9 @@ class Attention(MegatronModule, ABC):
                 if HAVE_FA3:
                     output_total = flash_attn3_with_kvcache(**flash_attn_args)
                 else:
-                    assert not self.batch_invariant_mode, "Batch invariant mode is not supported for flash attention 2"
+                    assert (
+                        not self.batch_invariant_mode
+                    ), "Batch invariant mode is not supported for flash attention 2"
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 

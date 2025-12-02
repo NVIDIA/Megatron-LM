@@ -1613,9 +1613,10 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_qkv_bias
             assert not self.use_kitchen
 
-        # TODO(Peter): Add check for TE version for batch invariant mode
         if self.batch_invariant_mode:
-            assert self.attention_backend == AttnBackend.flash, "Batch invariant mode only supports FlashAttention"
+            assert (
+                self.attention_backend == AttnBackend.flash
+            ), "Batch invariant mode only supports FlashAttention"
 
 
 @dataclass
