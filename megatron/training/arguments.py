@@ -1050,7 +1050,8 @@ def validate_args(args, defaults={}):
     #     assert args.spec is None, "Model Spec must be None when using MoEs"
     if args.num_experts is not None and args.moe_ffn_hidden_size is None:
         args.moe_ffn_hidden_size = args.ffn_hidden_size
-        print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
+        if args.rank == 0:
+            print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
     # Context parallel
     if args.context_parallel_size > 1:
@@ -1135,12 +1136,13 @@ def validate_args(args, defaults={}):
               ' Use --ckpt-format to select the checkpoint format.')
     if args.use_dist_ckpt and args.async_save:
         if not args.use_persistent_ckpt_worker:
-            print(
-                'Warning: --async-save is not supported without --use-persistent-ckpt-worker. '
-                'Disabling --async-save.'
-            )
+            if args.rank == 0:
+                print(
+                    'Warning: --async-save is not supported without --use-persistent-ckpt-worker. '
+                    'Disabling --async-save.'
+                )
             args.async_save = False
-        elif args.dist_ckpt_workers > 1:
+        elif args.dist_ckpt_workers > 1 and args.rank == 0:
             print(
                 'Warning: async ckpt forks processes for parallel writing which may introduce '
                 'instability on checkpoints. Consider using --dist-ckpt-workers=1 in case of '
@@ -1163,10 +1165,18 @@ def validate_args(args, defaults={}):
         assert args.save is not None, "When using upcycling, the --save option must be specified."
         if not args.no_load_optim:
             args.no_load_optim = True
-            print('Warning: disabling --no-load-optim for upcycling.')
+            if args.rank == 0:
+                print('Warning: enabling --no-load-optim for upcycling.')
         if not args.no_load_rng:
             args.no_load_rng = True
-            print('Warning: disabling --no-load-rng for upcycling.')
+            if args.rank == 0:
+                print('Warning: enabling --no-load-rng for upcycling.')
+
+    # --skip-train checks.
+    if args.skip_train and not args.no_load_optim:
+        args.no_load_optim = True
+        if args.rank == 0:
+            print('Warning: enabling --no-load-optim when skipping training.')
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
