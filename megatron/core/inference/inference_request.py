@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.tokenizers import MegatronTokenizer
 
 
 def serialize_tensor(tensor: torch.Tensor) -> bytes:
