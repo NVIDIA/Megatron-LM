@@ -410,7 +410,7 @@ def is_last_rank():
 
 def print_rank_last(message):
     """If distributed is initialized, print only on last rank."""
-    if torch.distributed.is_initialized():
+    if torch.distributed.is_initialized() and torch.distributed.get_backend() != 'fake':
         if is_last_rank():
             print(message, flush=True)
     else:
