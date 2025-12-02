@@ -447,7 +447,10 @@ class Float16Module(MegatronModule):
             is_vp_last_stage,
         )
 
-        pp_group = self.pg_collection.pp
+        if self.pg_collection is None:
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+        else:
+            pp_group = self.pg_collection.pp
         if is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(pp_group):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
