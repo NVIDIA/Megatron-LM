@@ -830,18 +830,17 @@ class TextGenerationController:
 
     def dummy_forward(self):
         context = self.inference_wrapped_model.inference_context
-        # if context.cuda_graph_batch_dimensions_list is None:
-        #     return self.inference_wrapped_model.dummy_forward()
-        # else:
-        input_ids, position_ids = self._dynamic_step_context_init(
-            construct_graph_dimensions=InferenceBatchDimensions(
-                token_count=1,
-                prefill_req_count=0,
-                decode_req_count=1
+        if context.cuda_graph_batch_dimensions_list is None:
+            # dummy non-cuda graphed forward
+            return self.inference_wrapped_model.dummy_forward()
+        else:
+            # dummy cuda graphed forward 
+            input_ids, position_ids = self._dynamic_step_context_init(
+                # use the smallest cuda-graph config for dummy forward
+                construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list)
             )
-        )
-        self._dynamic_step_forward_logits(input_ids, position_ids)
-        context.reset()
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+            context.reset()
 
 
     def _dynamic_step_context_bookkeeping(self, new_sample) -> Dict[str, Tensor]:

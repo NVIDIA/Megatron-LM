@@ -124,47 +124,37 @@ class InferenceBatchDimensions:
         """
         return self.prefill_req_count + self.decode_req_count
 
-    def adjust_for_expert_parallelism(self) -> "InferenceBatchDimensions":
-        """Adjust batch dimensions to be consistent across expert parallelism ranks.
-
-        Takes the maximum of token_count, prefill_req_count, and decode_req_count
-        across all expert parallel ranks to ensure consistent batch dimensions.
-
+    @staticmethod
+    def adjust_batch_dims_for_expert_parallelism(local_batch_dims) -> "InferenceBatchDimensions":
+        """Adjusted batch dimensions for expert parallelism. 
+            We take the max token count across expert model parallel group.
         Return:
             (InferenceBatchDimensions) A new InferenceBatchDimensions object with adjusted dimensions.
         """
         
         ep_size = parallel_state.get_expert_model_parallel_world_size()
         if ep_size <= 1:
-            return self
+            return local_batch_dims
 
         expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
         # all reduce local work across expert model parallel group
 
-        batch_dim_tensor = torch.tensor(
-            [self.token_count, self.prefill_req_count, self.decode_req_count], 
+        token_count_tensor = torch.tensor(
+            [local_batch_dims.token_count], 
             dtype=torch.int32,
             device=torch.cuda.current_device()
         )
         torch.distributed.all_reduce(
-            batch_dim_tensor,
+            token_count_tensor,
             op=torch.distributed.ReduceOp.MAX,
             group=expert_model_parallel_group,
+        )  
+        adjusted_batch_dim = InferenceBatchDimensions(
+            token_count=int(token_count_tensor[0].item()),
+            prefill_req_count=local_batch_dims.prefill_req_count,
+            decode_req_count=local_batch_dims.decode_req_count
         )
-        adjusted_token_count = int(batch_dim_tensor[0].item())
-        adjusted_prefill_req_count = int(batch_dim_tensor[1].item())
-        adjusted_decode_req_count = int(batch_dim_tensor[2].item())
-        
-        if torch.distributed.get_rank() == 0:
-            print(f"Adjusted batch dimensions from {self} to "
-                  f"[{adjusted_token_count}]: {adjusted_prefill_req_count} P + {adjusted_decode_req_count} D")
-        
-        return InferenceBatchDimensions(
-            token_count=adjusted_token_count,
-            prefill_req_count=adjusted_prefill_req_count,
-            decode_req_count=adjusted_decode_req_count
-        )
-
+        return adjusted_batch_dim
 
 class CUDAGraphBatchDimensionBuilder:
     """Builder for creating and managing CUDA graph batch dimensions.
@@ -410,7 +400,7 @@ class CUDAGraphBatchDimensionBuilder:
         # first filter out batch dimensions with smaller token count, prefill req count,
         # or decode req count, as they are not applicable
 
-        adjusted_batch_dim = real_batch_dim.adjust_for_expert_parallelism()
+        adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(real_batch_dim)
 
         graph_batch_dims_applicable = [
             graph_batch_dim

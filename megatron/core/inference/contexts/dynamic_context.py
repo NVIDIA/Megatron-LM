@@ -443,11 +443,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph config list
+        is_expert_parallel = parallel_state.get_expert_model_parallel_world_size() > 1
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=num_cuda_graphs,
-                cuda_graph_max_tokens=cuda_graph_max_tokens,
+                cuda_graph_max_tokens=self.max_active_requests if is_expert_parallel else cuda_graph_max_tokens,
                 cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
                 max_requests=self.max_active_requests,
                 max_tokens=self.max_tokens,
@@ -1201,12 +1202,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             batch_dimensions, self.cuda_graph_batch_dimensions_list
         )
         self._using_cuda_graph_this_step = best_graph is not None
-        # to do: disable this for a dummy forward...
-        # if construct_graph_dimensions is not None:
-        #     assert (
-        #         batch_dimensions == construct_graph_dimensions == best_graph
-        #     ), f"batch_dimensions: {batch_dimensions}, construct_graph_dimensions: {construct_graph_dimensions}, best_graph: {best_graph}"
-
+        
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
         else:

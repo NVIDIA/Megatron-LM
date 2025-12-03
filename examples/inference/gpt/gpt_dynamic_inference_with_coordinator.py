@@ -196,10 +196,6 @@ if __name__ == "__main__":
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
 
-        # Start Nsight profiler.
-        if os.environ.get("NSIGHT_PREFIX"):
-            torch.cuda.cudart().cudaProfilerStart()
-
         args = get_args()
         tokenizer = get_tokenizer()
 
@@ -246,6 +242,10 @@ if __name__ == "__main__":
             print(setup_prefix)
             print("~~~")
 
+        # Start Nsight profiler.
+        if os.environ.get("NSIGHT_PREFIX"):
+            torch.cuda.cudart().cudaProfilerStart()
+
         asyncio.run(
             main(
                 engine,
@@ -253,3 +253,7 @@ if __name__ == "__main__":
                 args.inference_coordinator_port,
             )
         )
+
+        # Stop Nsight profiler.
+        if os.environ.get("NSIGHT_PREFIX"):
+            torch.cuda.cudart().cudaProfilerStop()
