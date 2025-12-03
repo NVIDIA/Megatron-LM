@@ -76,4 +76,3 @@ MODEL_ARGS:
   --save-interval: 1000000
   --eval-interval: 1000000
   --finetune: true
-  --inference-dynamic-batching-num-cuda-graphs: 1
