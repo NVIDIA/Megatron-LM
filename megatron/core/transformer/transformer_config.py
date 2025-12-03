@@ -888,7 +888,7 @@ class TransformerConfig(ModelParallelConfig):
                 "linear_attention_type is deprecated, "
                 "use experimental_attention_variant instead."
             )
-            self.experimental_attention_variant = args.linear_attention_type
+            self.experimental_attention_variant = self.linear_attention_type
             self.is_linear_attention_model = True
             self.linear_attention_type = None
 
