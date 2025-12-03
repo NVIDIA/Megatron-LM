@@ -111,7 +111,7 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = self._loop.create_future()
+        self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
@@ -141,7 +141,10 @@ class InferenceClient:
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
-                    completion_future.set_result(DynamicInferenceRequestRecord.deserialize(reply))
+                    completed_request = DynamicInferenceRequestRecord.deserialize(reply)
+                    completion_future.get_loop().call_soon_threadsafe(
+                        completion_future.set_result, completed_request
+                    )
                 elif header == Headers.PAUSE_ACK:
                     self.paused.set()
                 elif header == Headers.STOP_ACK:
