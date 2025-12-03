@@ -311,5 +311,5 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
         # Also remove KD mode state to prevent issues with re-conversion after restore.
         mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
     
-     print_distributed_quant_summary(model)
+    print_distributed_quant_summary(model)
     return model

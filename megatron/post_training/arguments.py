@@ -36,7 +36,6 @@ def add_modelopt_args(parser):
     # Quantization
     group.add_argument(
         "--export-kv-cache-quant",
-        action="store_true",
         help="Type of KV cache quantization to perform.",
         choices=["none", "fp8", "fp8_affine", "nvfp4", "nvfp4_affine", "nvfp4_rotate"],
         default="none",

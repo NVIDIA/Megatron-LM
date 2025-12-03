@@ -7,6 +7,7 @@ import sys
 import warnings
 import datasets
 import logging
+import torch.distributed as dist
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
@@ -22,6 +23,9 @@ from megatron.training import get_args, get_model, get_tokenizer, initialize_meg
 from megatron.training.utils import print_rank_0, unwrap_model
 import modelopt.torch.quantization as mtq
 from model_provider import model_provider
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO) # set to debug if you need more logging
 
 warnings.filterwarnings('ignore')
 
@@ -183,14 +187,15 @@ if __name__ == "__main__":
         for idx, test_example in enumerate(test_data):
             if idx > args.fraction * len(test_data):
                 break
+            label = ["A", "B", "C", "D"][test_example["answer"]]
             prompt = generate_prompt(test_example, dev_data, few_shots=0, no_subject_prompt=args.no_subject_prompt)
             cache_key = f"{args.load}_{subject}_{prompt}" # model name, subject, prompt
 
             if cache_key in cache:
                 predict = cache[cache_key]
-                print_rank_0(f"Cache hit for {args.load}_{subject}")
+                if dist.get_rank() == 0:
+                    logger.debug(f"Cache hit for {args.load}_{subject}")
             else:
-                label = ["A", "B", "C", "D"][test_example["answer"]]
                 tokens = tokenizer(prompt, return_tensors="pt")
                 with torch.no_grad():
                     generated_ids = simple_generate(
