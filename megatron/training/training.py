@@ -1630,7 +1630,7 @@ def training_log(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
     if iteration % args.log_interval == 0:
-        if args.record_memory_history and is_last_rank():
+        if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
 
@@ -1711,7 +1711,9 @@ def training_log(
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
-            report_memory_flag = False
+            if iteration > 1:
+                # Make sure the memory after the second iteration is reported to include optimizer state memory.
+                report_memory_flag = False
         # Write timers to wandb, don't reset the counts
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
@@ -2344,6 +2346,9 @@ def train(
                 train_data_iterator = rl_utils.setup_grpo_data_iterator(
                     model, optimizer, iteration, ref_state_dict, buffered_rollouts
                 )
+                # Buffered rollouts are used as a state container for setups when
+                # we use previously-generated data for an update.
+                buffered_rollouts = train_data_iterator
 
         ft_integration.on_training_step_start()
         (
