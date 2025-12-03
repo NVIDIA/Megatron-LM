@@ -40,9 +40,10 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter, await_process_event
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import get_asyncio_loop, internal_api, trace_async_exceptions
-from megatron.core.process_groups_config import ProcessGroupCollection
+
 try:
     from tqdm import tqdm
 
@@ -401,7 +402,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if launch_inference_coordinator and self.is_dp_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
             coordinator_ready_event = spawn_context.Event()
-            #TODO(Peter) We need to pass the correct data parallel world size here
+            # TODO(Peter) We need to pass the correct data parallel world size here
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(

@@ -9,18 +9,21 @@ import torch.distributed as dist
 
 from .base import CopyService
 
-
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class SendOp:
+    """Simple container describing a single send operation."""
+
     tensor: torch.Tensor
     dest_rank: int
 
 
 @dataclass
 class RecvOp:
+    """Simple container describing a single receive operation."""
+
     tensor: torch.Tensor
     src_rank: int
 
@@ -80,5 +83,3 @@ class GlooCopyService(CopyService):
         logger.info("GlooCopyService: batched communication completed")
         self.send_ops.clear()
         self.recv_ops.clear()
-
-

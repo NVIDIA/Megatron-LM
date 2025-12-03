@@ -7,7 +7,6 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-
 # -----------------------------------------------------------------------------
 # Dataclasses used by the planner
 # -----------------------------------------------------------------------------
@@ -15,6 +14,8 @@ import torch.distributed as dist
 
 @dataclass
 class TransferOp:
+    """Single logical send/recv operation used in a reshard plan."""
+
     param_name: str
     peer_rank: int  # Who to send to / receive from
     is_send: bool  # True=send, False=recv
@@ -74,7 +75,13 @@ class ReshardPlan:
     send_ops: list[TransferOp]
     recv_ops: list[TransferOp]
     local_copy_ops: list[
-        tuple[str, torch.nn.Parameter | None, torch.nn.Parameter | None, tuple[slice, ...], tuple[slice, ...]]
+        tuple[
+            str,
+            torch.nn.Parameter | None,
+            torch.nn.Parameter | None,
+            tuple[slice, ...],
+            tuple[slice, ...],
+        ]
     ]  # (name, src_param, dst_param, src_slice, dst_slice)
 
     def __str__(self):
@@ -102,10 +109,14 @@ def _get_rank_in_group(global_rank: int, group_ranks: list[int]) -> int:
 def _detect_expert_index_from_param_name(param_name: str) -> Optional[int]:
     """Extract expert index from parameter name for TEGroupedMLP per-expert tensors."""
     for part in param_name.split('.'):
-        if part.startswith('weight') and len(part) > len('weight') and part[len('weight'):].isdigit():
-            return int(part[len('weight'):])
-        if part.startswith('bias') and len(part) > len('bias') and part[len('bias'):].isdigit():
-            return int(part[len('bias'):])
+        if (
+            part.startswith('weight')
+            and len(part) > len('weight')
+            and part[len('weight') :].isdigit()
+        ):
+            return int(part[len('weight') :])
+        if part.startswith('bias') and len(part) > len('bias') and part[len('bias') :].isdigit():
+            return int(part[len('bias') :])
     return None
 
 
@@ -134,9 +145,9 @@ def assign_resolved_name_inplace(meta: ParameterMetadata) -> None:
     parts = meta.name.split('.')
     new_parts = []
     for p in parts:
-        if (p.startswith('weight') and len(p) > len('weight') and p[len('weight'):].isdigit()):
+        if p.startswith('weight') and len(p) > len('weight') and p[len('weight') :].isdigit():
             new_parts.append('weight' + str(global_idx))
-        elif (p.startswith('bias') and len(p) > len('bias') and p[len('bias'):].isdigit()):
+        elif p.startswith('bias') and len(p) > len('bias') and p[len('bias') :].isdigit():
             new_parts.append('bias' + str(global_idx))
         else:
             new_parts.append(p)
@@ -227,5 +238,3 @@ def select_src_metadata_balanced(
 
 
 logger = logging.getLogger(__name__)
-
-

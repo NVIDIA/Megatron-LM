@@ -14,12 +14,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SendOp:
+    """Simple container describing a single NCCL send operation."""
+
     tensor: torch.Tensor
     dest_rank: int
 
 
 @dataclass
 class RecvOp:
+    """Simple container describing a single NCCL receive operation."""
+
     tensor: torch.Tensor
     src_rank: int
 
@@ -45,7 +49,12 @@ class NCCLCopyService(CopyService):
 
     def run(self):
         total_ops = len(self.send_ops) + len(self.recv_ops)
-        logger.info(f"Executing batched communication: {len(self.send_ops)} sends + {len(self.recv_ops)} recvs = {total_ops} ops")
+        logger.info(
+            "Executing batched communication: %d sends + %d recvs = %d ops",
+            len(self.send_ops),
+            len(self.recv_ops),
+            total_ops,
+        )
 
         p2p_ops = []
         for op in self.send_ops:
@@ -61,5 +70,3 @@ class NCCLCopyService(CopyService):
         logger.info("Batched communication completed")
         self.send_ops.clear()
         self.recv_ops.clear()
-
-

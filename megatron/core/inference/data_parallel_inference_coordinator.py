@@ -25,7 +25,7 @@ try:
 except:
     HAVE_MSGPACK = False
 
-#TODO We need to see where the process group collection is used.
+# TODO We need to see where the process group collection is used.
 # Register faulthandler to emit stack traces upon process kill.
 faulthandler.enable()
 faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)

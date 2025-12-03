@@ -2,28 +2,25 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Optional
 
 import torch
 import torch.distributed as dist
 
 from .utils import (
     ParameterMetadata,
+    ReshardPlan,
     ShardingDescriptor,
     TransferOp,
-    ReshardPlan,
     _get_rank_in_group,
     extract_param_metadata,
     select_src_metadata_balanced,
 )
 
-
 logger = logging.getLogger(__name__)
 
 
 def _build_descriptors_for_param(
-    src_metadata: ParameterMetadata,
-    dst_metadata: ParameterMetadata,
+    src_metadata: ParameterMetadata, dst_metadata: ParameterMetadata
 ) -> list[ShardingDescriptor]:
     """Construct sharding descriptors (currently TP) for this parameter based on actual layout.
     Guard TP descriptor with size conservation so we don't mis-classify replicated tensors.
@@ -83,7 +80,9 @@ def _plan_multi_dim_lcm(
     if not descriptors:
         return []
     if len(descriptors) != 1:
-        raise NotImplementedError(f"{param_name}: _plan_multi_dim_lcm supports TP-only (one descriptor)")
+        raise NotImplementedError(
+            f"{param_name}: _plan_multi_dim_lcm supports TP-only (one descriptor)"
+        )
     if descriptors[0].name != "tp":
         raise NotImplementedError(f"{param_name}: _plan_multi_dim_lcm expects TP descriptor")
     d = descriptors[0]
@@ -99,7 +98,8 @@ def _plan_multi_dim_lcm(
     if src_world * src_local != dst_world * dst_local:
         raise RuntimeError(
             f"{param_name}: size mismatch on TP dim{dim} "
-            f"(src_world={src_world}, src_local={src_local}, dst_world={dst_world}, dst_local={dst_local})"
+            f"(src_world={src_world}, src_local={src_local}, "
+            f"dst_world={dst_world}, dst_local={dst_local})"
         )
     # LCM tiling with strides
     Ns = src_world * max(1, d.src_stride)
@@ -138,6 +138,7 @@ def _plan_multi_dim_lcm(
             src_slice[dim] = slice(src_start, src_start + unit)
             dst_slice[dim] = slice(dst_start, dst_start + unit)
             ops.append((src_global_rank, tuple(src_slice), tuple(dst_slice)))
+
     # Stable order by destination offset
     def dst_key(op):
         _, _, dsl = op
@@ -207,9 +208,7 @@ def _determine_source_ranks_for_dst_param(
 
 
 def build_centralized_reshard_plan(
-    src_module: torch.nn.Module,
-    dst_module: torch.nn.Module,
-    num_experts: int = None,
+    src_module: torch.nn.Module, dst_module: torch.nn.Module, num_experts: int = None
 ) -> ReshardPlan:
     """
     Centralized planning: Rank 0 builds complete plan for all ranks, then scatters.
@@ -266,7 +265,8 @@ def build_centralized_reshard_plan(
                 src_meta_list = src_param_metadata.get(resolved_name)
                 if not src_meta_list:
                     raise RuntimeError(
-                        f"Destination parameter '{resolved_name}' on rank {dst_rank} not found in source model."
+                        f"Destination parameter '{resolved_name}' on rank {dst_rank} "
+                        "not found in source model."
                     )
                 # Choose a representative source metadata with DP round-robin balancing
                 src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
@@ -316,5 +316,3 @@ def build_centralized_reshard_plan(
     )
 
     return my_plan
-
-

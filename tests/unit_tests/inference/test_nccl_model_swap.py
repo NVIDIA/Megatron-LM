@@ -1,30 +1,31 @@
-import os
 import copy
+import os
 import types
+from typing import Optional, Tuple
+
 import pytest
 import torch
 import torch.distributed as dist
-import os
-import pytest
 
-from tests.unit_tests.test_utilities import Utils
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core import parallel_state as mpu
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-from megatron.core import parallel_state as mpu
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.model_parallel_config import ModelParallelConfig
-from typing import Tuple, Optional
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
 
 
-def _build_pg_collection(tp_size: int, pp_size: int = None, ep_size: int = 1) -> ProcessGroupCollection:
+def _build_pg_collection(
+    tp_size: int, pp_size: int = None, ep_size: int = 1
+) -> ProcessGroupCollection:
     cp_size = mpu.get_context_parallel_world_size()
     if pp_size is None:
         pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -32,7 +33,9 @@ def _build_pg_collection(tp_size: int, pp_size: int = None, ep_size: int = 1) ->
     dp_size = world_size // (tp_size * cp_size * ep_size * pp_size)
     assert dp_size >= 1 and (tp_size * cp_size * ep_size * pp_size * dp_size) == world_size
 
-    grid = HyperCommGrid([tp_size, cp_size, ep_size, pp_size, dp_size], ["tp", "cp", "ep", "pp", "dp"])
+    grid = HyperCommGrid(
+        [tp_size, cp_size, ep_size, pp_size, dp_size], ["tp", "cp", "ep", "pp", "dp"]
+    )
     tp_group = grid.create_pg("tp")
     cp_group = grid.create_pg("cp")
     pp_group = grid.create_pg("pp")
@@ -47,7 +50,9 @@ def _build_pg_collection(tp_size: int, pp_size: int = None, ep_size: int = 1) ->
     tp_dp_cp_group = grid.create_pg(["tp", "cp", "dp"])
     embd_group_ranks = mpu.default_embedding_ranks(dist.get_process_group_ranks(pp_group))
     embd_group = dist.new_group(ranks=embd_group_ranks)
-    pos_embd_group_ranks = mpu.default_position_embedding_ranks(dist.get_process_group_ranks(pp_group))
+    pos_embd_group_ranks = mpu.default_position_embedding_ranks(
+        dist.get_process_group_ranks(pp_group)
+    )
     pos_embd_group = dist.new_group(ranks=pos_embd_group_ranks)
     return ProcessGroupCollection(
         tp=tp_group,
@@ -79,8 +84,7 @@ def _build_gpt(
     model = GPTModel(
         config=config,
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_moe_experts,
-            moe_grouped_gemm=(num_moe_experts is not None),
+            num_experts=num_moe_experts, moe_grouped_gemm=(num_moe_experts is not None)
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_len,
@@ -113,7 +117,7 @@ def _set_pg_collection(module, tp_group, dp_group):
 @pytest.mark.parametrize(
     "src_tp,src_pp,src_ep,dst_tp,dst_pp,dst_ep,num_experts",
     [
-        #TP only changes
+        # TP only changes
         (2, 1, 1, 1, 1, 1, None),  # TP2 -> TP1
         (1, 1, 1, 2, 1, 1, None),  # TP1 -> TP2
         # PP only changes
@@ -124,22 +128,32 @@ def _set_pg_collection(module, tp_group, dp_group):
         (1, 1, 1, 2, 2, 1, None),  # TP1,PP1 -> TP2,PP2
         (2, 1, 1, 1, 2, 1, None),  # TP2,PP1 -> TP1,PP2
         (1, 2, 1, 2, 1, 1, None),  # TP1,PP2 -> TP2,PP1
-        (1, 1, 2, 1, 1, 4, 4),     # EP2 -> EP4
+        (1, 1, 2, 1, 1, 4, 4),  # EP2 -> EP4
         (1, 1, 2, 1, 1, 1, 4),
         (1, 1, 1, 1, 1, 2, 4),
         (1, 1, 2, 1, 2, 2, 4),
     ],
 )
 def test_nccl_swap_gpt_parametrized(
-    src_tp: int, src_pp: int, src_ep: int, dst_tp: int, dst_pp: int, dst_ep: int, num_experts: Optional[int]
+    src_tp: int,
+    src_pp: int,
+    src_ep: int,
+    dst_tp: int,
+    dst_pp: int,
+    dst_ep: int,
+    num_experts: Optional[int],
 ):
     # Initialize environment with source MP sizing
-    Utils.initialize_model_parallel(tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=src_pp)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=src_pp
+    )
     # Validate divisibility post-init using the default PG safely
     world = dist.get_world_size()
     if (world % (src_tp * src_pp * src_ep) != 0) or (world % (dst_tp * dst_pp * dst_ep) != 0):
         Utils.destroy_model_parallel()
-        pytest.skip("WORLD_SIZE must be divisible by both src_tp*src_pp*src_ep and dst_tp*dst_pp*dst_ep")
+        pytest.skip(
+            "WORLD_SIZE must be divisible by both src_tp*src_pp*src_ep and dst_tp*dst_pp*dst_ep"
+        )
     model_parallel_cuda_manual_seed(1234)
 
     torch.manual_seed(1234)
@@ -157,7 +171,7 @@ def test_nccl_swap_gpt_parametrized(
         hidden_dropout=0.0,
         attention_dropout=0.0,
         moe_router_dtype="fp64",
-        moe_token_dispatcher_type="alltoall"
+        moe_token_dispatcher_type="alltoall",
     )
 
     # Build PGs and models (always use unified PG builder so we can set EP)
@@ -186,13 +200,39 @@ def test_nccl_swap_gpt_parametrized(
             Utils.destroy_model_parallel()
             pytest.skip("Transformer Engine not available; skipping TE-grouped MoE test")
     # Use parallel_output=False to gather TP logits inside model and emit only on last PP stage
-    src_model = _build_gpt(src_cfg, vocab_size, seq_len, src_pgs, parallel_output=False, num_moe_experts=num_experts).to(device).eval()
-    dst_model = _build_gpt(dst_cfg, vocab_size, seq_len, dst_pgs, parallel_output=False, num_moe_experts=num_experts).to(device).eval()
+    src_model = (
+        _build_gpt(
+            src_cfg,
+            vocab_size,
+            seq_len,
+            src_pgs,
+            parallel_output=False,
+            num_moe_experts=num_experts,
+        )
+        .to(device)
+        .eval()
+    )
+    dst_model = (
+        _build_gpt(
+            dst_cfg,
+            vocab_size,
+            seq_len,
+            dst_pgs,
+            parallel_output=False,
+            num_moe_experts=num_experts,
+        )
+        .to(device)
+        .eval()
+    )
 
     # Inputs
     batch = 2
-    tokens = torch.randint(low=0, high=vocab_size, size=(batch, seq_len), device=device, dtype=torch.long)
-    position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+    tokens = torch.randint(
+        low=0, high=vocab_size, size=(batch, seq_len), device=device, dtype=torch.long
+    )
+    position_ids = (
+        torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+    )
     attention_mask = torch.ones((batch, 1, seq_len, seq_len), device=device, dtype=torch.bool)
 
     # Collect source reference logits (parallel_output=False ensures full vocab on last PP stage)
@@ -214,13 +254,17 @@ def test_nccl_swap_gpt_parametrized(
     dst_pp_ranks = dist.get_process_group_ranks(dst_pgs.pp)
     dst_last_pp_rank = dst_pp_ranks[-1]
     with torch.no_grad():
-        dst_out = dst_model(tokens, position_ids, attention_mask)  # last stage returns tensor, others return None
+        dst_out = dst_model(
+            tokens, position_ids, attention_mask
+        )  # last stage returns tensor, others return None
         if dist.get_rank() == dst_last_pp_rank:
             dst_logits.copy_(dst_out)  # [b, s, vocab]
     dist.broadcast(dst_logits, src=dst_last_pp_rank, group=dst_pgs.pp)
 
     # Compare
     assert ref_logits.shape == dst_logits.shape
-    assert torch.allclose(dst_logits, ref_logits, atol=1e-4, rtol=1e-4), f"Refit src(TP={src_tp},PP={src_pp})->dst(TP={dst_tp},PP={dst_pp}) GPT outputs differ"
+    assert torch.allclose(
+        dst_logits, ref_logits, atol=1e-4, rtol=1e-4
+    ), f"Refit src(TP={src_tp},PP={src_pp})->dst(TP={dst_tp},PP={dst_pp}) GPT outputs differ"
     dist.barrier()
     Utils.destroy_model_parallel()

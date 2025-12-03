@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """
 High-level refit/reshard orchestration:
 - swap_model_weights: public API; accepts a backend name or CopyService and delegates.
@@ -7,28 +8,25 @@ High-level refit/reshard orchestration:
 
 from typing import Any, Optional, Union
 
-from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core import parallel_state
+from megatron.core.models.common.language_module.language_module import LanguageModule
+
 from . import build_centralized_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
-from .copy_services.nccl_copy_service import NCCLCopyService
 from .copy_services.gloo_copy_service import GlooCopyService
+from .copy_services.nccl_copy_service import NCCLCopyService
 
 
 def _unwrap_module(module: LanguageModule) -> Any:
     return (
         module.module.module
         if hasattr(module, 'module') and hasattr(module.module, 'module')
-        else module.module
-        if hasattr(module, 'module')
-        else module
+        else module.module if hasattr(module, 'module') else module
     )
 
 
 def swap_model_weights(
-    src_model: LanguageModule,
-    target_model: LanguageModule,
-    refit_method: Union[str, CopyService],
+    src_model: LanguageModule, target_model: LanguageModule, refit_method: Union[str, CopyService]
 ):
     """
     Orchestrate weight swap/refit.
@@ -49,14 +47,12 @@ def swap_model_weights(
             raise ValueError(f"Unknown refit_method '{refit_method}'")
     else:
         raise TypeError("refit_method must be a str backend name or a CopyService instance")
-    
 
 
 def reshard_model_weights(
-    src_model: LanguageModule,
-    target_model: LanguageModule,
-    service: CopyService,
+    src_model: LanguageModule, target_model: LanguageModule, service: CopyService
 ):
+    """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``."""
     # Handle list-wrapped modules used throughout training utils
     src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
     tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
@@ -73,7 +69,7 @@ def reshard_model_weights(
     if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
         raise RuntimeError("Target model missing pg_collection required for NCCL reshard")
 
-    #TODO(Peter): We should figure out why this happens. Seems like a bug in Orthotope.
+    # TODO(Peter): We should figure out why this happens. Seems like a bug in Orthotope.
     # Fill missing DP group on the source using Megatron's parallel state if not provided
     if getattr(src_core.pg_collection, "dp", None) is None:
         src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
@@ -86,7 +82,5 @@ def reshard_model_weights(
         setattr(tgt_core, "_cached_reshard_plan", plan)
     else:
         plan = cached_plan
-    
+
     execute_reshard_plan(plan, src_core, tgt_core, service=service)
-
-

@@ -6,9 +6,8 @@ from typing import List, Tuple
 import torch
 import torch.distributed as dist
 
-from .utils import ReshardPlan
 from .copy_services.base import CopyService
-
+from .utils import ReshardPlan
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +27,7 @@ def execute_reshard_plan(
     src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
     dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
 
-    #TODO(Peter) do this on like a separate stream?
+    # TODO(Peter) do this on like a separate stream?
     # Execute local copies
     for param_name, src_param, dst_param, src_slice, dst_slice in plan.local_copy_ops:
         if src_param is None:
@@ -61,7 +60,7 @@ def execute_reshard_plan(
     # Execute
     logger.info(f"Executing {len(plan.send_ops)} sends + {len(plan.recv_ops)} recvs")
     service.run()
-    #TODO(Peter) remove this eventually?
+    # TODO(Peter) remove this eventually?
     dist.barrier()
 
     # Write back received buffers into their destination parameter slices
@@ -70,5 +69,3 @@ def execute_reshard_plan(
             dst_param.data[dst_slice].copy_(recv_buffer)
 
     logger.info("Reshard complete")
-
-
