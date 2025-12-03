@@ -222,8 +222,6 @@ def build_centralized_reshard_plan(
     dst_pg = getattr(dst_module, "pg_collection", None)
     if src_pg is None or dst_pg is None:
         raise ValueError("Both modules must have pg_collection")
-    if not hasattr(src_pg, 'dp'):
-        raise ValueError("src_pg must have dp process group")
 
     # Gather param metadata from all ranks
     my_src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
