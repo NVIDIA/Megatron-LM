@@ -532,7 +532,7 @@ def create_packed_seq_params_for_bin(
         device: Device to create tensors on
 
     Returns:
-        PackedSeqParams with cu_seqlens set for proper attention masking
+        PackedSeqParams with cu_seqlens set for proper attention masking (or None if empty)
     """
     seq_indices = packing_info['bin_seq_indices'][bin_idx]
 
@@ -755,7 +755,7 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, packed_seq_params=None):
+def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, packed_seq_params=None, packed_seq_len=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -767,6 +767,8 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, pac
         packed_seq_params: Optional PackedSeqParams for sequence packing with TE.
             When provided with qkv_format='thd', the input tokens are sliced to
             remove padding before the forward pass, and outputs are padded back.
+        packed_seq_len: Optional length of the packed sequence (excluding padding).
+            Required when packed_seq_params is provided to avoid CPU-GPU synchronization.
 
     Returns:
         Logprobs of input sequences.
@@ -785,7 +787,11 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, pac
             attention_mask_for_forward = attention_mask
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 # Get the actual token count (excluding padding)
-                actual_len = packed_seq_params.cu_seqlens_q[-1].item()
+                if packed_seq_len is not None:
+                    actual_len = packed_seq_len
+                else:
+                    actual_len = packed_seq_params.cu_seqlens_q[-1].item()
+                
                 if actual_len == 0:
                     # No real tokens, skip packed path
                     packed_seq_params = None
@@ -1562,6 +1568,22 @@ def prepare_data_for_update(
                 # Store my_bin_seq_indices for later use
                 packing_context['my_bin_seq_indices'] = my_bin_seq_indices
 
+                # Pre-compute all PackedSeqParams for all bins ONCE to avoid repeated
+                # tensor allocations that cause CUDA memory fragmentation and periodic spikes
+                cached_packed_seq_params = []
+                device = packing_context['packed_trajs'].device
+                for bin_idx in range(len(packing_context['packed_trajs'])):
+                    params = create_packed_seq_params_for_bin(
+                        packing_info=packing_info,
+                        bin_idx=bin_idx,
+                        bin_size=args.rl_sequence_packing_bin_size,
+                        device=device,
+                    )
+                    # Compute seq_len here (one-time .item() call during caching is fine)
+                    seq_len = params.cu_seqlens_q[-1].item() if params is not None else 0
+                    cached_packed_seq_params.append((params, seq_len))
+                packing_context['cached_packed_seq_params'] = cached_packed_seq_params
+
                 # Log packing efficiency (for this rank's bins)
                 total_tokens = sum(packing_info['seq_lengths'])  # All sequences
                 my_sequences = sum(len(indices) for indices in my_bin_seq_indices)
@@ -1733,20 +1755,16 @@ def prepare_data_for_update(
                 b_trajs = b_trajs.cuda()
                 b_posids = b_posids.cuda()
 
-                # Create packed_seq_params for proper attention masking in TE
+                # Get cached packed_seq_params for proper attention masking in TE
                 b_packed_seq_params = None
-                if use_packed_computation and 'packing_info' in packing_context:
-                    bin_idx = batch_idx
-                    b_packed_seq_params = create_packed_seq_params_for_bin(
-                        packing_info=packing_context['packing_info'],
-                        bin_idx=bin_idx,
-                        bin_size=args.rl_sequence_packing_bin_size,
-                        device=b_trajs.device,
-                    )
+                b_packed_seq_len = 0
+                if use_packed_computation and 'cached_packed_seq_params' in packing_context:
+                    b_packed_seq_params, b_packed_seq_len = packing_context['cached_packed_seq_params'][batch_idx]
 
                 logprobs = get_logprobs(
                     model, b_trajs, b_posids, b_attn_mask, no_grad=True,
-                    packed_seq_params=b_packed_seq_params
+                    packed_seq_params=b_packed_seq_params,
+                    packed_seq_len=b_packed_seq_len
                 )
                 old_logprobs.append(logprobs.detach().cpu())
 
@@ -1827,20 +1845,16 @@ def prepare_data_for_update(
                 b_trajs = b_trajs.cuda()
                 b_posids = b_posids.cuda()
 
-                # Create packed_seq_params for proper attention masking in TE
+                # Get cached packed_seq_params for proper attention masking in TE
                 b_packed_seq_params = None
-                if use_packed_computation and 'packing_info' in packing_context:
-                    bin_idx = batch_idx
-                    b_packed_seq_params = create_packed_seq_params_for_bin(
-                        packing_info=packing_context['packing_info'],
-                        bin_idx=bin_idx,
-                        bin_size=args.rl_sequence_packing_bin_size,
-                        device=b_trajs.device,
-                    )
+                b_packed_seq_len = 0
+                if use_packed_computation and 'cached_packed_seq_params' in packing_context:
+                    b_packed_seq_params, b_packed_seq_len = packing_context['cached_packed_seq_params'][batch_idx]
 
                 logprobs = get_logprobs(
                     model, b_trajs, b_posids, b_attn_mask, no_grad=True,
-                    packed_seq_params=b_packed_seq_params
+                    packed_seq_params=b_packed_seq_params,
+                    packed_seq_len=b_packed_seq_len
                 )
                 ref_logprobs.append(logprobs.detach().cpu())
 
