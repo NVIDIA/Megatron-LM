@@ -1801,14 +1801,16 @@ class ParamAndGradBuffer:
             self.weight_alloc = FixedPoolAllocator(
                 name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
             )
-            # TODO(mxfp8): Do we need separate alloc for transpose buffer?
+            self.transpose_weight_alloc = FixedPoolAllocator(
+                name="fsdp_fp8_transpose_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+            )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
             )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
             self.weight_alloc = StorageResizeBasedBucketAllocator()
-            # TODO(mxfp8): Do we need separate alloc for transpose buffer?
+            self.transpose_weight_alloc = StorageResizeBasedBucketAllocator()
             self.main_grad_alloc = None
             self.double_buf_units = []
 
@@ -1902,8 +1904,7 @@ class ParamAndGradBuffer:
                         device=self.device,
                         data_parallel_group=main_buf_dp_group,
                         is_transpose_buffer=True,
-                        # TODO(mxfp8): Do we need separate alloc for transpose buffer?
-                        temporary_bucket_allocator=self.weight_alloc,
+                        temporary_bucket_allocator=self.transpose_weight_alloc,
                         bucket_id=group_id,
                         chunk_size_factor=group.chunk_size_factor,
                         mem_alloc_context=self.mem_alloc_context,
@@ -3473,16 +3474,17 @@ class AllGatherPipeline:
             buf = self.buffer.parameter_groups[bucket_id].transpose_weight_buffer
         else:
             buf = self.buffer.parameter_groups[bucket_id].model_weight_buffer
-        buf.free_bucket_storage()
 
+        buf.free_bucket_storage()
         self.bucket_status[bucket_key] = BucketStatus.EMPTY
 
     def recycle_unused_buckets(self):
         """Recycle the unused buckets."""
-        for (bucket_id, bwd), can_be_released in self.bucket_can_be_released.items():
+        for bucket_key, can_be_released in self.bucket_can_be_released.items():
             if can_be_released:
-                self.release_bucket(bucket_id, bwd)
-                self.bucket_can_be_released[(bucket_id, bwd)] = False
+                bucket_id, is_transpose_weight = bucket_key[0], bucket_key[1]
+                self.release_bucket(bucket_id, is_transpose_weight)
+                self.bucket_can_be_released[bucket_key] = False
 
     def get_fsdp_buffer(self, bucket_id: int, bwd=False) -> DataParallelBuffer:
         """Get the FSDP buffer with the given bucket ID."""
