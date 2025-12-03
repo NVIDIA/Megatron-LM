@@ -142,6 +142,34 @@ class TopKRouter(Router):
         scores: The scores after score function used to select the experts and calculate aux loss.
         probs: The topk weights used to combined the experts' outputs.
         routing_map: The masked routing map between tokens and experts.
+
+    Padding Mask Support:
+    ====================
+    The router accepts an optional padding_mask to exclude padding tokens from
+    auxiliary loss calculations. This is important for variable-length sequences
+    where shorter sequences are padded.
+
+    When padding_mask is provided:
+    1. Z-loss is computed only over valid tokens (mean excludes padding)
+    2. Load balancing loss counts only valid token assignments
+    3. Expert bias updates exclude padding token routings
+
+    The mask does NOT affect the actual routing decisions - padding tokens are
+    still routed to experts, but they don't contribute to loss calculations.
+    This design choice ensures:
+    - Consistent output shapes regardless of padding
+    - No changes to inference behavior
+    - Only training loss computation is affected
+
+    Padding Mask Semantics (IMPORTANT):
+    -----------------------------------
+    - True  = padding position (should be EXCLUDED from computation)
+    - False = valid position (should be INCLUDED in computation)
+
+    Padding Mask Shape Convention:
+    -----------------------------
+    - Input to forward(): [seq_length, batch_size] (matches hidden_states layout)
+    - Internal usage: [num_tokens] (flattened for per-token operations)
     """
 
     def __init__(
@@ -598,8 +626,8 @@ class TopKRouter(Router):
         Args:
             logits (torch.Tensor): Logits tensor after gating.
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape = [seq_length, bsz]. True = padding,
-                                                   False = valid (include). Defaults to None.
+                                                   Shape = [seq_length, bsz]. True=padding(exclude),
+                                                   False=valid(include). Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -688,8 +716,8 @@ class TopKRouter(Router):
         Args:
             input (torch.Tensor): Input tensor.
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape = [seq_length, bsz]. True = padding,
-                                                   False = valid (include). Defaults to None.
+                                                   Shape = [seq_length, bsz]. True=padding(exclude),
+                                                   False=valid(include). Defaults to None.
         """
         self._maintain_float32_expert_bias()
 

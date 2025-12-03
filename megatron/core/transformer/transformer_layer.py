@@ -597,12 +597,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         Perform a forward pass through the feed-forward layer.
 
+        For MoE layers, this method handles padding mask forwarding to ensure
+        padding tokens are excluded from auxiliary loss calculations.
+
+        Padding Mask Flow:
+            1. User provides padding_mask to GPTModel.forward() with shape [bsz, seq_length]
+            2. TransformerBlock passes it through to each TransformerLayer
+            3. This method passes it to MoELayer.forward() (for MoE layers only)
+            4. MoELayer uses PaddingMaskInfo to transform shape and handle masking
+
+        Padding Mask Semantics:
+            - True  = padding position (should be EXCLUDED from computation)
+            - False = valid position (should be INCLUDED in computation)
+
         Args:
             hidden_states (Tensor): Transformed hidden states before the MLP layernorm.
+                Shape [seq_length, batch_size, hidden_size].
             inference_context: Inference context for optimizations.
             padding_mask (Tensor, optional): Padding mask for MoE routing.
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
-                Only used for MoE layers to exclude padding tokens from routing computations.
+                Only used for MoE layers to exclude padding tokens from aux loss computations.
+                The MoELayer will internally transform this to [seq_length, bsz] format.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].

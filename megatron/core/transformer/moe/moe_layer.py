@@ -12,6 +12,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
+    PaddingMaskInfo,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
 )
@@ -290,24 +291,30 @@ class MoELayer(BaseMoELayer):
         4. Combine: The outputs from the experts are combined and returned.
 
         Padding Mask Handling:
-            The padding_mask indicates which positions should be excluded from MoE routing
-            and auxiliary loss computation. This is useful when training with variable-length
-            sequences that are padded to a fixed length.
+        =====================
+        The padding_mask indicates which positions should be excluded from MoE routing
+        and auxiliary loss computation. This is useful when training with variable-length
+        sequences that are padded to a fixed length.
 
-            Convention: True = padding (exclude), False = valid (include)
+        Padding Mask Semantics:
+            - True  = padding position (should be EXCLUDED from computation)
+            - False = valid position (should be INCLUDED in computation)
 
-            Input Shape Transformation:
-                - Input padding_mask from GPTModel/TransformerLayer: [bsz, seq_length]
-                - Internal MoE processing expects: [seq_length, bsz]
-                - The transformation is done internally in this method
+        Shape Transformation:
+            - Input padding_mask from GPTModel/TransformerLayer: [bsz, seq_length]
+            - This method uses PaddingMaskInfo to transform to: [seq_length, bsz]
+            - This aligns with hidden_states shape [seq_length, bsz, hidden_size]
 
-            The mask is passed through to the router, which uses it to:
+        The mask is passed through to the router, which uses utility functions to:
             - Exclude padding tokens from auxiliary loss calculations
             - Exclude padding tokens from expert bias updates
             - Exclude padding tokens from z-loss computation
 
+        Note: The mask does NOT affect actual routing decisions - padding tokens are
+        still routed to experts, but they don't contribute to loss calculations.
+
         Args:
-            hidden_states (torch.Tensor): The input tensor shape is [seq_length, bsz, hidden_size].
+            hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
                 Shape = [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Defaults to None (all tokens are valid).
@@ -321,10 +328,11 @@ class MoELayer(BaseMoELayer):
                 "are enabled without also enabling sequence parallelism."
             )
 
-        # Transform padding_mask from [bsz, seq_length] to [seq_length, bsz] if provided
-        # This aligns the mask shape with hidden_states shape [seq_length, bsz, hidden_size]
-        if padding_mask is not None:
-            padding_mask = padding_mask.transpose(0, 1).bool()
+        # Use PaddingMaskInfo for unified mask handling
+        # Transform from [bsz, seq_length] to [seq_length, bsz] format
+        seq_length, bsz = hidden_states.shape[:2]
+        mask_info = PaddingMaskInfo.from_bsz_seq(padding_mask, seq_length, bsz)
+        padding_mask_seq_bsz = mask_info.seq_bsz
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, padding_mask=None):
@@ -353,14 +361,14 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
-                    padding_mask,
+                    padding_mask_seq_bsz,
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, padding_mask
+                    custom_forward, False, hidden_states, padding_mask_seq_bsz
                 )
         else:
-            outputs = custom_forward(hidden_states, padding_mask)
+            outputs = custom_forward(hidden_states, padding_mask_seq_bsz)
 
         return outputs
 
