@@ -57,6 +57,7 @@ class MambaMetadata:
         Resets all Mamba states and frees all allocated slots.
         """
         self.request_to_mamba_state_idx.fill_(-1)
+        self.request_to_mamba_state_idx_for_step.fill_(-1)
 
         # Re-initialize the free slot pool
         self.mamba_state_free_slots = torch.arange(
