@@ -62,12 +62,6 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
-# >>>
-from lutil import pax as _pax
-import builtins
-builtins.pax = _pax
-# <<<
-
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -620,15 +614,6 @@ def main():
             if engine.capture_stats else
             "--"
         )
-        # >>>
-        # print("peak_active_requests ... %s." % str(context.peak_active_requests))
-        print("par %d/%d ... " % (
-            max(context.peak_active_requests),
-            # context.block_allocator.active_count,
-            context.max_active_requests,
-        ), end="")
-        # print("~~~")
-        # <<<
         print(
             f"{setup_prefix} … "
             f"throughput: {throughput:.3f} tok/s … ",
