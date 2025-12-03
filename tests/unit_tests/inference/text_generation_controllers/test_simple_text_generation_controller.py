@@ -442,10 +442,10 @@ class TestTextGenerationController:
             assert len(request.generated_log_probs) == request.generated_length
 
     @pytest.mark.parametrize("num_tokens_to_generate", [0, 4])
-    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
+    @pytest.mark.parametrize("return_prompt_top_n_logprobs", [True, False])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_logprobs_and_topn_consistency(
-        self, num_tokens_to_generate, skip_prompt_log_probs, dtype
+        self, num_tokens_to_generate, return_prompt_top_n_logprobs, dtype
     ):
         """
         1.  Ensures that a batch request containing prompts of
@@ -489,7 +489,7 @@ class TestTextGenerationController:
                     temperature=0.0,
                     return_log_probs=True,
                     top_n_logprobs=5,
-                    skip_prompt_log_probs=skip_prompt_log_probs,
+                    return_prompt_top_n_logprobs=return_prompt_top_n_logprobs,
                 ),
                 arrival_time=time.time(),
                 status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
@@ -515,8 +515,8 @@ class TestTextGenerationController:
                 f"got {len(generated_log_probs)}"
             )
 
-            assert (skip_prompt_log_probs and prompt_top_n_logprobs is None) or (
-                not skip_prompt_log_probs
+            assert (not return_prompt_top_n_logprobs and prompt_top_n_logprobs is None) or (
+                return_prompt_top_n_logprobs
                 and prompt_top_n_logprobs is not None
                 and len(prompt_top_n_logprobs) == len(prompt_log_probs)
             )
@@ -671,7 +671,7 @@ class TestTextGenerationController:
                 top_k=1,
                 return_log_probs=True,
                 top_n_logprobs=5,
-                skip_prompt_log_probs=False,
+                return_prompt_top_n_logprobs=True,
             )
 
             inference_request = InferenceRequest(
@@ -732,16 +732,16 @@ class TestTextGenerationController:
                         == request_single.prompt_top_n_logprobs[i][token_str]
                     )
 
-    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
+    @pytest.mark.parametrize("return_prompt_top_n_logprobs", [True, False])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_dynamic_top_n_logprobs_calculation(
-        self, skip_prompt_log_probs: bool, materialize_only_last_token_logits: bool
+        self, return_prompt_top_n_logprobs: bool, materialize_only_last_token_logits: bool
     ):
         """
         Test the _dynamic_step_calculate_top_n_logprobs function directly.
         Verifies:
         1. top_n_logprobs are computed for all requests
-        2. skip_prompt_log_probs controls computation for prompt tokens
+        2. return_prompt_top_n_logprobs controls computation for prompt tokens
         3. Correct number of tokens are returned for each request
         """
         batch_size = 4
@@ -760,8 +760,8 @@ class TestTextGenerationController:
 
         # Set top_n_logprobs for all requests
         request_metadata[:, request_metadata_labels["top_n_logprobs"]] = top_n
-        request_metadata[:, request_metadata_labels["skip_prompt_log_probs"]] = float(
-            skip_prompt_log_probs
+        request_metadata[:, request_metadata_labels["return_prompt_top_n_logprobs"]] = float(
+            return_prompt_top_n_logprobs
         )
 
         # Bookkeeping
@@ -841,7 +841,7 @@ class TestTextGenerationController:
                 assert req_idx in top_n_results, f"Request {req_idx} missing from results"
                 top_n_list = top_n_results[req_idx]
 
-                if not skip_prompt_log_probs:
+                if return_prompt_top_n_logprobs:
                     # Should have top-n for all tokens
                     expected_count = query_lengths[req_idx]
                     assert (
@@ -851,7 +851,7 @@ class TestTextGenerationController:
                     # Should have top-n for only the last token (first generated token)
                     assert (
                         len(top_n_list) == 1
-                    ), f"Request {req_idx}: expected 1 token when skip_prompt_log_probs=True, got {len(top_n_list)}"
+                    ), f"Request {req_idx}: expected 1 token when return_prompt_top_n_logprobs=False, got {len(top_n_list)}"
 
                 # Validate each token's top-n
                 for token_idx, (top_n_values, top_n_indices) in enumerate(top_n_list):
