@@ -8,7 +8,6 @@ import sys
 import tempfile
 
 import requests
-
 import torch
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset

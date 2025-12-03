@@ -66,7 +66,6 @@ from tests.unit_tests.data.test_preprocess_data import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-
 ##
 # Mock boto3
 ##
