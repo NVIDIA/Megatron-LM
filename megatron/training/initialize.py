@@ -77,7 +77,8 @@ def initialize_megatron(
             "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
             "before initializing LocalCheckpointManager."
         )
-        load_args_from_checkpoint(args, load_arg='load' if args.load is not None else 'pretrained_checkpoint')
+        load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
+        load_args_from_checkpoint(args)
 
     if args.async_save and args.use_persistent_ckpt_worker:
         init_persistent_async_worker()
