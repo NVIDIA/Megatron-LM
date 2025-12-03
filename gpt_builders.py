@@ -42,8 +42,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
         else:
             use_te = args.transformer_impl == "transformer_engine"
 
-            linear_attention_variants = ["gated_delta_net"]
-            if args.num_experts or args.experimental_attention_variant in linear_attention_variants:
+            if args.num_experts or args.is_linear_attention_model:
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,

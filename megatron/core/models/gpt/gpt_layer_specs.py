@@ -536,20 +536,29 @@ def get_gpt_decoder_layer_specs(
                 num_experts = None
                 moe_grouped_gemm = None
             if attention_type == "linear_attention":
-                linear_attention_variants = ["gated_delta_net"]
-                if config.experimental_attention_variant not in linear_attention_variants:
+                multi_latent_attention = None
+                if config.is_linear_attention_model:
+                    # There exists linear attention layer in the model.
+                    experimental_attention_variant = config.experimental_attention_variant
+                else:
                     # Skip if there is no linear attention layer in the model.
                     continue
-                multi_latent_attention = None
             else:
                 multi_latent_attention = config.multi_latent_attention
+                if config.is_linear_attention_model:
+                    # experimental_attention_variant is a linear attention variant,
+                    # so softmax attention is regular attention layer.
+                    experimental_attention_variant = None
+                else:
+                    # Softmax attention is an experimental attention variant.
+                    experimental_attention_variant = config.experimental_attention_variant
 
             layer_spec_key = f"{mlp_type}_{attention_type}"
             layer_spec_dict[layer_spec_key] = get_layer_spec_fn(
                 num_experts=num_experts,
                 moe_grouped_gemm=moe_grouped_gemm,
                 multi_latent_attention=multi_latent_attention,
-                experimental_attention_variant=config.experimental_attention_variant,
+                experimental_attention_variant=experimental_attention_variant,
                 **get_layer_spec_kwargs,
             )
 
@@ -592,8 +601,7 @@ def get_gpt_decoder_layer_specs(
             f"current linear attention pattern: {config.linear_attention_freq}"
         )
     elif config.linear_attention_freq is None:
-        linear_attention_variants = ["gated_delta_net"]
-        if config.experimental_attention_variant not in linear_attention_variants:
+        if not config.is_linear_attention_model:
             linear_attention_pattern = [0] * config.num_layers
         else:
             linear_attention_pattern = [1] * config.num_layers
