@@ -33,7 +33,7 @@ megatron/core/parallel_state.py @NVIDIA/core-adlr @NVIDIA/core-nemo
 
 megatron/core/post_training/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/post-training
 
-megatron/post_training/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/post-training
+megatron/post_training/ @NVIDIA/post-training
 
 .gitlab/ @NVIDIA/ci
 .github/ @NVIDIA/ci
