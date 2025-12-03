@@ -20,7 +20,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch", "numpy<2.0.0", "packaging>=24.2"]
+dependencies = ["torch==2.8.0", "transformer_engine==2.9.0", "numpy<2.0.0", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -67,9 +67,11 @@ Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
 dev = [
-    "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
-    "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
-    "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
+    "torch>=2.8.0", # we verified both torch 2.8.0+cu128 and torch 2.9.1+cu128
+    "transformer_engine==2.9.0",
+    "nvidia-modelopt[torch]>=0.33.0,<0.34.0; sys_platform != 'darwin'", # "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
+    "transformer-engine[pytorch]>=2.9.0,<2.10.0", # "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
+    "nvidia-resiliency-ext>=0.4.0,<0.5.0", # "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
@@ -86,7 +88,7 @@ dev = [
     "wget",
     "onnxscript",
     "flash-linear-attention~=0.3.2",
-    "emerging_optimizers",
+    "emerging_optimizers@git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git",
 ]
 
 lts = [
@@ -131,7 +133,7 @@ build = [
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-mathdx",     # for TE
+    "nvidia-mathdx",     # for TE, NOTE (yiakwy) yes we have added dependency to TE 2.9 as it was removed recently in main branch
 ]
 linting = [
     "ruff~=0.9.0",

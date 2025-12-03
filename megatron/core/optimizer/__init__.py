@@ -479,7 +479,7 @@ def get_megatron_optimizer(
     no_weight_decay_cond: Optional[Callable] = None,
     scale_lr_cond: Optional[Callable] = None,
     lr_mult: float = 1.0,
-    use_gloo_process_groups: bool = True,
+    use_gloo_process_groups: bool = False, # NOTE(yiakwy) by default verl will use default value
     default_skip_embedding_weight_decay: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
     dump_param_to_param_group_map: Optional[str] = None,

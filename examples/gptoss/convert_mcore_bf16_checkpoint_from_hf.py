@@ -1,7 +1,17 @@
 from argparse import ArgumentParser
 
 from megatron.bridge import AutoBridge
-from megatron.bridge.utils.common_utils import get_last_rank, print_rank_0
+from megatron.bridge.utils.common_utils import print_rank_0
+
+try:
+    from megatron.bridge.utils.common_utils import get_last_rank
+except:
+    def get_last_rank() -> int:
+        """Get the last rank in the distributed group"""
+        if not torch.distributed.is_initialized():
+            return 0
+        return torch.distributed.get_world_size() - 1
+
 from megatron.bridge.training.model_load_save import load_megatron_model, save_megatron_model, load_tokenizer
 
 from megatron.bridge.training.tokenizers.tokenizer import _HuggingFaceTokenizer
@@ -257,7 +267,8 @@ if __name__ == "__main__":
 
         # sparse model
         provider.expert_model_parallel_size = EP
-
+        provider.expert_tensor_parallel_size = ETP
+        
         # provider.sequence_parallel = True
 
         provider.finalize()
