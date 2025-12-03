@@ -402,6 +402,9 @@ class MLASelfAttention(MultiLatentAttention):
         cp_comm_type: Optional[str] = None,
         pg_collection: ProcessGroupCollection = None,
     ):
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
         super().__init__(
             config=config,
             submodules=submodules,
