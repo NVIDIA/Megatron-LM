@@ -45,7 +45,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType
+from .enums import AttnMaskType, CudaGraphScope
 from .transformer_config import TransformerConfig
 
 try:
@@ -190,6 +190,7 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
+        # TODO: This is built twice when using MLA, should be refactored.
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -828,7 +829,7 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and "full_iteration" not in self.config.cuda_graph_scope
+            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")

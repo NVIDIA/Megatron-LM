@@ -23,7 +23,7 @@ from megatron.core.models.retro.utils import (
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
@@ -69,7 +69,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
-    parser = _add_linear_attention_args(parser)
+    parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
@@ -772,7 +772,7 @@ def validate_args(args, defaults={}):
             if args.rank == 0:
                 print('accumulate and all-reduce gradients in fp32 for '
                       'bfloat16 data type.', flush=True)
-    if args.cuda_graph_impl == "local" and "full_iteration" in args.cuda_graph_scope:
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         if not args.inference_dynamic_batching:
             assert not args.check_for_nan_in_loss_and_grad, \
             "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
@@ -1194,13 +1194,21 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
 
+    if args.linear_attention_type is not None:
+        print_rank_0(
+            '--linear-attention-type is deprecated, use --experimental-attention-variant instead.',
+            args.rank,
+        )
+        args.experimental_attention_variant = args.linear_attention_type
+        del args.linear_attention_type
+
     # Muon optimizercheck
     if 'muon' in args.optimizer:
         assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
-        assert args.linear_attention_type is None, "Muon optimizer does not support linear attention type for now."
+        assert args.experimental_attention_variant is None, "Muon optimizer does not support attention variant for now."
         assert not args.attention_output_gate, "Muon optimizer does not support attention output gate for now."
 
     # Optimizer CPU offload check
@@ -1265,6 +1273,15 @@ def validate_args(args, defaults={}):
         assert (
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
+    if args.cuda_graph_scope == "full" or (
+        isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
+    ):
+        if isinstance(args.cuda_graph_scope, list):
+            assert args.cuda_graph_scope == ["full"], "full scope cannot be used with other scopes."
+        args.cuda_graph_scope = []
+        warn_rank_0(
+            'full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.'
+        )
     
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
@@ -1486,7 +1503,7 @@ def _add_inference_args(parser):
                        '"none": no CUDA graph. '
                        '"local": capture the CUDA graph using MCore local implementation. --cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. '
                        '"transformer_engine": capture the CUDA graph using TE make_graphed_callables().')
-    group.add_argument('--cuda-graph-scope', nargs='+', type=str, default=[],
+    group.add_argument('--cuda-graph-scope', nargs='+', type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope, default=[],
                        help='Determines the CUDA graphs capturing scope. '
                        'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
                        '"attn": captures operations in TransformerLayer._forward_attention(). '
@@ -1498,7 +1515,8 @@ def _add_inference_args(parser):
                        '"mamba": captures the mamba layer. '
                        '"full_iteration": captures a whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
-                       'If not specified, the default scope is to capture the whole Transformer layer.')
+                       'If not specified, the default scope is to capture the whole Transformer layer. '
+                       'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')
@@ -3351,10 +3369,14 @@ def _add_mla_args(parser):
 
     return parser
 
-def _add_linear_attention_args(parser):
-    group = parser.add_argument_group(title="la")
+def _add_experimental_attention_variant_args(parser):
+    group = parser.add_argument_group(title="experimental_attention_variant")
+    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa'], type=str,
+                       help='Type of attention variant to use. Currently support gated_delta_net and dsa.')
+
+    # Linear attention
     group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net'], type=str,
-                       help='Type of linear attention to use. Currently support gated_delta_net.')
+                       help='(Deprecated, use --experimental-attention-variant instead) Type of linear attention to use. Currently support gated_delta_net.')
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
                        help='Frequency between LA (linear attention) layers and'
                             ' SDPA (scaled dot-product attention) layers. Accepts either: '
@@ -3374,6 +3396,19 @@ def _add_linear_attention_args(parser):
                        help='Number of query and key heads for the gated delta net.')
     group.add_argument('--linear-num-value-heads', default=32, type=int,
                        help='Number of value and gate heads for the gated delta net.')
+
+    # DSA
+    group.add_argument('--dsa-indexer-n-heads', default=None, type=int,
+                       help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
+    group.add_argument('--dsa-indexer-head-dim', default=None, type=int,
+                       help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
+    group.add_argument('--dsa-indexer-topk', default=None, type=int,
+                       help='Number of top-k tokens to select in sparse attention indexer.')
+    group.add_argument('--dsa-indexer-loss-coeff', default=0.0, type=float,
+                       help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
+    group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
+                       help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
+
     return parser
 
 def _add_heterogeneous_args(parser):
