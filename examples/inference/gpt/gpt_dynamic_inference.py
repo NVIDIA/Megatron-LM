@@ -383,6 +383,9 @@ def run_inference(
                         finished_request.prompt_log_probs = []
                     request.prompt_log_probs = finished_request.prompt_log_probs
                     request.generated_log_probs = finished_request.generated_log_probs
+                    request.logprobs = (
+                        finished_request.prompt_log_probs + finished_request.generated_log_probs
+                    )
                 if finished_request.sampling_params.top_n_logprobs > 0:
                     request.generated_top_n_logprobs = finished_request.generated_top_n_logprobs
                 if not finished_request.sampling_params.skip_prompt_log_probs:
@@ -568,6 +571,7 @@ def main():
                     if req.sampling_params.return_log_probs:
                         result_dict["prompt_logprobs"] = getattr(req, 'prompt_log_probs', None)
                         result_dict["generated_logprobs"] = getattr(req, 'generated_log_probs', None)
+                        result_dict["logprobs"] = getattr(req, 'logprobs', None)
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric
