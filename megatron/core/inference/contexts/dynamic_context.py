@@ -188,7 +188,6 @@ def get_mem_size_str(n_bytes: int) -> str:
 
 
 # pylint: disable=line-too-long
-@internal_api
 class DynamicInferenceContext(BaseInferenceContext):
     """Inference context that is passed to the main model in order
     to efficiently calculate and store the KV cache during inference.
@@ -247,6 +246,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
 
+    @internal_api
     def __init__(
         self,
         *,
