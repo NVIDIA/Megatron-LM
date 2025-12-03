@@ -398,19 +398,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"`max_active_requests` {self.max_active_requests}"
             )
             self.max_active_requests = max_requests
-            # >>>
-            # pax({
-            #     "max_total_requests" : self.max_total_requests,
-            #     "max_active_requests" : self.max_active_requests,
-            #     "max_tokens" : self.max_tokens,
-            # }, "max_requests")
-            # <<<
 
         assert self.max_tokens >= self.max_active_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
             f"max_active_requests ({self.max_active_requests}), "
             "to have consistency between cuda graph sizes and the block table size."
         )
+
+        # >>>
+        self.peak_active_requests = [] # track peak active requests.
+        # <<<
 
         # Track request metadata.
         if num_request_metadata is None:
@@ -1651,6 +1648,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Newly paused request IDs.
         """
+        # >>>
+        self.peak_active_requests.append(self.total_request_count - self.paused_request_count)
+        # <<<
 
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length

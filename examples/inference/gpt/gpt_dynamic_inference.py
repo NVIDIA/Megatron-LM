@@ -620,6 +620,15 @@ def main():
             if engine.capture_stats else
             "--"
         )
+        # >>>
+        # print("peak_active_requests ... %s." % str(context.peak_active_requests))
+        print("par %d/%d ... " % (
+            max(context.peak_active_requests),
+            # context.block_allocator.active_count,
+            context.max_active_requests,
+        ), end="")
+        # print("~~~")
+        # <<<
         print(
             f"{setup_prefix} … "
             f"throughput: {throughput:.3f} tok/s … ",
