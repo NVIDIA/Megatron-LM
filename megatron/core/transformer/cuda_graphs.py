@@ -1474,7 +1474,50 @@ class TECudaGraphHelper:
 
     def _get_sample_arguments(self, order):
         """
-        Get the sample arguments and keyword arguments for capturing.
+        Generate sample arguments and keyword arguments for CUDA Graph capturing with
+        memory-optimized buffer reuse.
+
+        This method creates static input tensors for each (layer, microbatch) pair needed
+        by TE's make_graphed_callables(). It optimizes memory usage by reusing input buffers
+        across non-overlapping forward passes based on the pipeline parallel schedule.
+        This optimization is essential for reducing peak memory during CUDA Graph capturing with
+        many microbatches, as it allows buffers to be reused instead of allocating new ones for
+        later microbatches.
+
+        Memory Optimization Strategy:
+            The 1F1B (one-forward-one-backward) interleaved schedule in pipeline parallelism
+            means that once a microbatch's backward pass completes, its input buffers are no
+            longer needed. This method tracks buffer lifecycle and reuses "consumed" buffers
+            (those whose backward has completed) for new forward passes with matching tensor
+            signatures (shape, dtype, layout).
+
+            Example schedule: [1, 1, 1, 2, 2, 2, -2, 1, -2, 1, -2, 2, -1, 2, -1, -1, -2, -2, -1, -1]
+            - Positive values indicate forward passes (chunk_id = value)
+            - Negative values indicate backward passes (chunk_id = -value)
+            - When processing -2 (backward of chunk 2), its buffers become available for reuse
+            - The next forward with matching signature can reuse those buffers
+
+        Args:
+            order (List[int]): The forward/backward execution order from
+                convert_schedule_table_to_order(). Positive integers represent forward passes
+                (1-indexed chunk ID), negative integers represent backward passes.
+
+        Returns:
+            Tuple[List[Tuple], List[Dict]]: A tuple containing:
+                - sample_args: List of positional argument tuples for each (layer, microbatch).
+                    Length = num_layers * num_microbatches. Elements with the same tensor
+                    signature may share references to reduce memory allocation.
+                - sample_kwargs: List of keyword argument dicts for each (layer, microbatch).
+                    Length = num_layers * num_microbatches. Elements with the same tensor
+                    signature may share references to reduce memory allocation.
+
+        Data Structures:
+            - fwd_sample_queues: Dict[chunk_id, List[Tuple[sample_keys, fwd_idx]]]
+                Queue of forward samples per chunk awaiting their backward pass.
+            - consumed_sample_queue: Dict[sample_keys, List[fwd_idx]]
+                Pool of buffer indices whose backward is complete, keyed by tensor signature.
+            - sample_keys: Tuple of (shape, dtype, layout) for args + (key, shape, dtype, layout)
+                for kwargs, used to match compatible buffers for reuse.
         """
         assert self.num_model_chunks == max(
             order
@@ -1543,41 +1586,41 @@ class TECudaGraphHelper:
 
         # Calculate the starting index of each chunk in callables for future use.
         prefix_num_layers = [0]
-        for m_chunk in range(self.num_model_chunks):
-            num_layers = self.num_layers_per_chunk[m_chunk]
+        for model_chunk_idx in range(self.num_model_chunks):
+            num_layers = self.num_layers_per_chunk[model_chunk_idx]
             prefix_num_layers.append(prefix_num_layers[-1] + num_layers)
 
         # Reorganize args and kwargs for input tensor reuse.
-        # fwd_sample_qs is keyed by model chunk index. The value is a queue of tuples.
+        # fwd_sample_queues is keyed by model chunk index. The value is a queue of tuples.
         # Each tuple contains the sample key signature and its fwd_idx. When we finish a backward
-        # chunk, we pop the corresponding fwd_idx and push to the consumed_sample_q.
-        # consumed_sample_q is keyed by the sample key signature. The value is a queue of the
+        # chunk, we pop the corresponding fwd_idx and push to the consumed_sample_queue.
+        # consumed_sample_queue is keyed by the sample key signature. The value is a queue of the
         # fwd_idx whose backward has been called so that we can reuse the same static buffers.
         # In this way, we can reuse the same static input buffers for the non-overlapping samples
         # with the same input signature.
-        fwd_sample_qs = {}
-        consumed_sample_q = {}
+        fwd_sample_queues = {}
+        consumed_sample_queue = {}
         fwd_idx = [0] * self.num_model_chunks
-        for c_id in order:
-            m_chunk = abs(c_id) - 1
+        for chunk_id in order:
+            model_chunk_idx = abs(chunk_id) - 1
 
-            if c_id > 0:
-                sample_start_idx = (prefix_num_layers[m_chunk] * get_num_microbatches()) + (
-                    fwd_idx[m_chunk] * self.num_layers_per_chunk[m_chunk]
+            if chunk_id > 0:
+                sample_start_idx = (prefix_num_layers[model_chunk_idx] * get_num_microbatches()) + (
+                    fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
                 )
                 fwd_sample_idx = [
-                    sample_start_idx + i for i in range(self.num_layers_per_chunk[m_chunk])
+                    sample_start_idx + i for i in range(self.num_layers_per_chunk[model_chunk_idx])
                 ]
-                if m_chunk not in fwd_sample_qs:
-                    fwd_sample_qs[m_chunk] = []
+                if model_chunk_idx not in fwd_sample_queues:
+                    fwd_sample_queues[model_chunk_idx] = []
                 for per_callable_fwd_idx in fwd_sample_idx:
                     if sample_args[per_callable_fwd_idx] is None:
                         sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
                             _get_layer_static_inputs(
-                                self.callables_per_chunk[m_chunk][
+                                self.callables_per_chunk[model_chunk_idx][
                                     per_callable_fwd_idx - sample_start_idx
                                 ],
-                                self.chunks_with_decoder[m_chunk],
+                                self.chunks_with_decoder[model_chunk_idx],
                             )
                         )
 
@@ -1590,27 +1633,30 @@ class TECudaGraphHelper:
                     )
                     sample_keys = sample_args_keys + sample_kwargs_keys
 
-                    fwd_sample_qs[m_chunk].append((sample_keys, per_callable_fwd_idx))
-                    if consumed_sample_q.get(sample_keys, []):
-                        reuse_fwd_idx = consumed_sample_q[sample_keys].pop(0)
+                    fwd_sample_queues[model_chunk_idx].append((sample_keys, per_callable_fwd_idx))
+                    if consumed_sample_queue.get(sample_keys, []):
+                        reuse_fwd_idx = consumed_sample_queue[sample_keys].pop(0)
                         assert (
                             sample_args[reuse_fwd_idx] is not None
                             and sample_kwargs[reuse_fwd_idx] is not None
                         ), "sample_args and sample_kwargs must not be None when reusing."
                         sample_args[per_callable_fwd_idx] = sample_args[reuse_fwd_idx]
                         sample_kwargs[per_callable_fwd_idx] = sample_kwargs[reuse_fwd_idx]
-                fwd_idx[m_chunk] += 1
+                fwd_idx[model_chunk_idx] += 1
             else:
                 num_consumed_samples = min(
-                    len(fwd_sample_qs[m_chunk]), self.num_layers_per_chunk[m_chunk]
+                    len(fwd_sample_queues[model_chunk_idx]),
+                    self.num_layers_per_chunk[model_chunk_idx],
                 )
-                for sample_keys, per_callable_fwd_idx in fwd_sample_qs[m_chunk][
+                for sample_keys, per_callable_fwd_idx in fwd_sample_queues[model_chunk_idx][
                     :num_consumed_samples
                 ]:
-                    if sample_keys not in consumed_sample_q:
-                        consumed_sample_q[sample_keys] = []
-                    consumed_sample_q[sample_keys].append(per_callable_fwd_idx)
-                fwd_sample_qs[m_chunk] = fwd_sample_qs[m_chunk][num_consumed_samples:]
+                    if sample_keys not in consumed_sample_queue:
+                        consumed_sample_queue[sample_keys] = []
+                    consumed_sample_queue[sample_keys].append(per_callable_fwd_idx)
+                fwd_sample_queues[model_chunk_idx] = fwd_sample_queues[model_chunk_idx][
+                    num_consumed_samples:
+                ]
 
         return sample_args, sample_kwargs
 
