@@ -739,6 +739,9 @@ class TransformerConfig(ModelParallelConfig):
     hetereogenous_dist_checkpoint: bool = False
     """Whether to use heterogenous layers in distributed checkpoint."""
 
+    sampling_backend: str = 'torch'
+    """Which type of kernels to use for sampling during inference."""
+
     ####################
     # Quantization
     ####################

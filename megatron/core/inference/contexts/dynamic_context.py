@@ -236,9 +236,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
             If None, defaults to using flash-infer if available.
         metrics_writer (Optional['WandbModule']): Wandb module for writing metrics.
-        num_request_metadata (Optional[int]): Number of metadata fields to track per request.
-            These represent metadata that is needed by the text generation controller,
-            and that must be kept in sync with active requests through update_requests.
     """
 
     DEFAULT_MAX_TOKENS = 16384
@@ -269,7 +266,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         cuda_graph_max_tokens: Optional[int] = None,
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
-        num_request_metadata: Optional[int] = None,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -394,9 +390,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Track request metadata.
-        if num_request_metadata is None:
-            num_request_metadata = len(DynamicInferenceRequest.get_metadata_labels())
-        self.num_request_metadata = num_request_metadata
+        self.request_metadata_types = []
 
         # Initialize context state.
         self.params_dtype = params_dtype
@@ -532,11 +526,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Track request metadata.
-        self.request_metadata = torch.empty(
-            (self.max_total_requests, self.num_request_metadata),
-            dtype=torch.float32,
-            device=torch.cuda.current_device(),
-        )
+        self.request_metadata: Dict[str, torch.Tensor] = {}
+        self.update_request_metadata(self.request_metadata_types)
 
         # Per-token state.
         self.token_to_input_ids = torch.full(
@@ -639,6 +630,28 @@ class DynamicInferenceContext(BaseInferenceContext):
             value = getattr(self, key)
             if isinstance(value, torch.Tensor):
                 delattr(self, key)
+
+    def update_request_metadata(self, request_metadata_types: List[Tuple[str, torch.dtype, bool]]):
+        """Update the tracked per-request metadata and allocate new tensors.
+
+        Args:
+            request_metadata_types (Optional[List[Tuple[str, torch.dtype, bool]]]): A list of the
+                per-request metadata types to track. Each entry is a tuple consisting of the string
+                label, the target dtype, and whether to store the data on GPU.
+        """
+        for label, dtype, on_gpu in request_metadata_types:
+            # Make sure to trigger torch garbage-collection on overriden tensors.
+            if label in self.request_metadata:
+                del self.request_metadata[label]
+
+            tensor = torch.empty(
+                (self.max_total_requests,),
+                dtype=dtype,
+                device=torch.cuda.current_device() if on_gpu else torch.device("cpu"),
+            )
+            self.request_metadata[label] = tensor
+
+        self.request_metadata_types.update(request_metadata_types)
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
@@ -994,7 +1007,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_tokens_to_generate: List[int] = []
         request_ids: List[int] = []
         prompt_tokens: List[Tensor] = []
-        metadata_rows: List[List[float]] = []
+        metadata_cols: List[List] = [[] * num_new_requests]
 
         for req in requests:
             assert isinstance(
@@ -1015,7 +1028,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=self.token_to_input_ids.device, dtype=self.token_to_input_ids.dtype
                 )
             )
-            metadata_rows.append(req.tracked_metadata)
+            for i, m in enumerate(req.get_tracked_metadata(self.request_metadata_types))
+                metadata_cols[i].append(m)
 
         total_new_tokens = sum(lengths)
         if self.active_token_count + total_new_tokens > self.max_tokens:
@@ -1029,9 +1043,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_tokens_to_generate, dtype=self.request_query_lengths.dtype, device=device
         )
         request_ids_tensor = torch.tensor(request_ids, dtype=self.request_ids.dtype, device=device)
-        metadata_tensor = torch.tensor(
-            metadata_rows, dtype=self.request_metadata.dtype, device=self.request_metadata.device
-        )
 
         block_counts = torch.div(
             lengths_tensor + (self.block_size_tokens - 1),
@@ -1048,7 +1059,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
-        self.request_metadata[request_slice] = metadata_tensor
+        for i, (label, dtype, on_gpu) in enumerate(self.request_metadata_types):
+            self.request_metadata[label][request_slice] = torch.tensor(
+                metadata_cols[i],
+                dtype=dtype,
+                device=torch.cuda.current_device() if on_gpu else torch.device("cpu"),
+            )
 
         dummy_block_idx = self.block_allocator.dummy_block_idx
         self.request_last_kv_block_id[request_slice] = dummy_block_idx
@@ -1320,7 +1336,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_id.fill_(-1)
         self.request_last_kv_block_offset.fill_(0)
         self.request_to_kv_block_ids.fill_(-1)
-        self.request_metadata.fill_(0)
+
+        # Reset request metadata.
+        for metadata_tensor in self.request_metadata.values():
+            metadata_tensor.fill_(0)
 
         # Reset token indexes.
         self.token_to_input_ids.fill_(0)
@@ -1372,16 +1391,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Last token logits.
         """
-
-        # todo: @lmcafee, remove these asserts?
-        assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
-        assert logits.size(1) == self.padded_active_token_count, (
-            f"logits.size(1) ({tuple(logits.shape)}) != "
-            f"padded_active_token_count ({self.padded_active_token_count})."
-        )
-
-        # Last token logits.
         logits = logits.squeeze(0)
+        if self.materialize_only_last_token_logits or self.is_decode_only():
+            return logits
+
         last_token_idxs = (
             torch.cumsum(
                 self.request_query_lengths[self.paused_request_count : self.total_request_count],
@@ -1477,14 +1490,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
-        # Handle request metadata.
-        metadata = req.tracked_metadata
-        assert (
-            len(metadata) == self.num_request_metadata
-        ), "Request added to context with invalid metadata length"
-        self.request_metadata[current_id] = torch.tensor(
-            metadata, dtype=torch.float32, device=self.request_metadata.device
-        )
+
+        metadata = req.get_tracked_metadata(self.request_metadata_types)
+        for m, m_type in zip(metadata, self.request_metadata_types)
+            label, _, _ = m_type
+            self.request_metadata[label][current_id] = m
+
         # Handle length and block assignments.
         self.request_query_lengths[current_id] = chunk_length
         self.request_output_lengths[current_id] = (
@@ -1551,7 +1562,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
-        self.request_metadata[dst_idxs] = self.request_metadata[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
         next_tokens[dst_idxs] = next_tokens[src_idxs]
 
@@ -1559,6 +1569,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[src_idxs]
         self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[src_idxs]
         self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[src_idxs]
+
+        for metadata_tensor in self.request_metadata.values():
+            metadata_tensor[dst_idxs] = metadata_tensor[src_idxs]
 
         if self.is_hybrid_model:
             self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
@@ -1572,13 +1585,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
-        tensor_swap(self.request_metadata, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
         tensor_swap(next_tokens, src_idxs, dst_idxs)
         tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
+
+        for metadata_tensor in self.request_metadata.values():
+            tensor_swap(metadata_tensor, src_idxs, dst_idxs)
 
         if self.is_hybrid_model:
             tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
@@ -1904,32 +1919,37 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return newly_paused_request_ids
 
-    def calculate_log_probs(
-        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> Tuple[List[List[float]], Tensor]:
-        """Calculate log probs for all active requests and return them.
+    def select_log_prob_indices(self, request_indices: Tensor = None) -> List[List[float]]:
+        """Helper method for the log_prob calculation.
 
-        TODO: @wdykas support top-n log probs.
+        This method selects the logits that are relevant for the log_prob calculation,
+        and returns all indices necessary for the tensorized log_prob calculation.
 
         Args:
-            logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
-            new_tokens (Tensor): The newly sampled tokens.
-            only_last_token_logits (bool): If set, the logits are from only the last token in each request
+            request_indices (Tensor): A boolean map indicating which requests to include.
 
         Returns:
-            List of lists where each inner list contains log probs for a request in the
-            same order as the active requests (from paused_request_count to total_request_count).
-            log_probs (Tensor): Used to compute top n logprobs later if required.
+            logit_indices (Tensor): Indices of logits corresponding to active requests,
+                masked by request_indices if provided.
+            active_lengths (Tensor): Number of active tokens per request,
+                masked by request_indices if provided.
+            active_ends (Tensor): End indices of active tokens per request,
+                masked by request_indices if provided.
+            active_tokens (Tensor): Sampled token ID for all active tokens,
+                masked by request_indices if provided.
+                Note that this only provides real data for prefill requests. That is because
+                the final index of each request in this Tensor is dummy data: since sampling
+                has not yet taken place, there is no way to get the real token ID.
+                This is a 1D flattened tensor in the same manner as logit_indices.
         """
 
-        # Calculate log_probs (sequence_length x vocab_size)
-        log_probs = F.log_softmax(logits.squeeze(0).float(), dim=-1)
-
-        if only_last_token_logits or self.is_decode_only():
-            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.flatten().tolist()], log_probs
-
+        if self.materialize_only_last_token_logits or self.is_decode_only():
+            return (
+                request_indices,
+                torch.ones_like(request_indices),
+                torch.arange(request_indices.size(0)),
+                torch.empty_like(request_indices),
+            )
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
         # prefill requests and then set the token ids explicitly for the newly generated tokens.
@@ -1941,7 +1961,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         #
         #   new_tokens          : [ 52 | 12 | 3 | 86 ]
         #
-        #   seq_idx             : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
+        #   request_indices     : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
         #
         #   new_token_idx       : [ 0 | 1 | 3 | 8 ]
         #
@@ -1958,14 +1978,74 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count : self.total_request_count
         ]
         new_token_idx = active_query_lengths.cumsum(0) - 1
-        active_token_ids[new_token_idx] = new_tokens
 
-        # Extract the log probs for only the selected tokens.
-        # (sequence_length x vocab_size) -> (sequence_length)
-        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        selected_log_probs = log_probs[seq_idx, active_token_ids]
+        masked_lengths = active_query_lengths[request_indices]
+        masked_ends = new_token_idx[request_indices]
+        masked_starts = masked_ends - (masked_lengths - 1)
+
+        batch_size = request_indices.size(0)
+        offsets = torch.cumsum(F.pad(masked_lengths, (1, 0)), dim=0)[:-1]
+        logit_segment_ids = torch.arange(batch_size, dtype=torch.long)
+        logit_segments = torch.repeat_interleave(logit_segment_ids, masked_lengths)
+
+        logit_indices_range = torch.cumsum(torch.ones_like(logit_segments), dim=0) - 1
+        logit_indices_relative = logit_indices_relative - torch.repeat_interleave(
+            offsets, masked_lengths
+        )
+        logit_indices_absolute = masked_starts[logit_segments] + logit_indices_relative
+
+        return (
+            logit_indices_absolute,
+            masked_lengths,
+            masked_ends,
+            active_token_ids[logit_indices_absolute],
+        )
+
+    def calculate_log_probs(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        request_indices: Optional[Tensor],
+        log_probs: Optional[Tensor],
+    ) -> Tuple[List[List[float]], Tensor]:
+        """Calculate log probs for all active requests and return them.
+
+        Args:
+            logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
+            new_tokens (Tensor): The newly sampled tokens.
+            request_indices (Optional[Tensor]): A boolean map indicating which requests to include.
+            log_probs (Optional[Tensor]): A tensor in which to store the result.
+
+        Returns:
+            List of lists where each inner list contains log probs for a request in the
+            same order as the active requests (from paused_request_count to total_request_count).
+            log_probs (Tensor): Used to compute top n logprobs later if required.
+        """
+        if request_indices is None:
+            request_indices = torch.ones(
+                self.total_request_count - self.paused_request_count,
+                dtype=torch.bool,
+            )
+        if log_probs is None:
+            log_probs = torch.empty(
+                (logits.size(1), logits.size(2)),
+                device=logits.device,
+                dtype=torch.float32,
+            )
+
+        (
+            logit_indices,
+            active_lengths,
+            active_ends,
+            active_tokens,
+        ) = self.select_log_prob_indices(logits, request_indices)
+
+        active_tokens[active_ends] = new_tokens
+        selected_logits_squeezed = logits.squeeze(0)[logit_indices, :].float()
+        log_probs[:, active_tokens] = F.log_softmax(selected_logits_squeezed, dim=-1)
 
         # Split the log probs across request boundaries
+        selected_log_probs = log_probs[request_indices, active_tokens]
         selected_log_probs_list = selected_log_probs.cpu().split(
             active_query_lengths.tolist(), dim=0
         )
