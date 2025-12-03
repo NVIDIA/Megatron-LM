@@ -1128,16 +1128,6 @@ class TestDynamicInferenceEngine:
     @torch.inference_mode()
     def test_max_requests(self, max_requests: int | None):
         """Test max requests."""
-        # >>>
-        # test_config = DynamicEngineTestConfig(context_max_requests=max_requests)
-        # env = self._build_test_env(test_config)
-        # context = env.engine.context
-        # if max_requests is None:
-        #     assert context.max_active_requests == 409
-        # else:
-        #     assert context.max_active_requests == 5
-        # assert context.block_allocator.active_count == 409
-        # +++
         env = self._run_test(
             context_max_requests=max_requests,
             num_tokens_to_generate=16,
@@ -1156,13 +1146,3 @@ class TestDynamicInferenceEngine:
             assert context.max_active_requests == 4
             assert step_count == 34
         assert context.block_allocator.active_count == 409
-
-        from lutil import pax
-        pax("env, step_count", {"num_requests": len(env.requests)})
-        # <<<
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-if __name__ == "__main__":
-    test = TestDynamicInferenceEngine()
-    test.test_max_requests(4) # None, 4
-    print("~~~\nsuccess.")
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
