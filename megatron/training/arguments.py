@@ -1115,6 +1115,14 @@ def validate_args(args, defaults={}):
                 assert not args.distrib_optim_fully_reshardable_mem_efficient, \
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
 
+    if args.fake_process_group:
+        assert args.moe_token_dispatcher_type != "flex", "Fake process group is not supported with flex token dispatcher."
+        # Disable nan check for fake process group
+        args.check_for_nan_in_loss_and_grad = False
+        warn_rank_0('check_for_nan_in_loss_and_grad is set to False for fake process group.')
+        # Disable gloo process groups for fake process group
+        args.enable_gloo_process_groups = False
+        warn_rank_0('enable_gloo_process_groups is set to False for fake process group.')
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
@@ -1504,7 +1512,13 @@ def _add_inference_args(parser):
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
-                       help='Disable chunked prefill (chunked prefill is enabled by default).')
+                       help='Disable chunked prefill (chunked prefill is enabled by default).')  
+    group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
+                       type=int, default=1024,
+                       help='Maximum number of tokens to capture in a cuda graph.')
+    group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
+                       type=int, default=16,
+                       help='Number of mixed prefill requests to capture in a cuda graph.')
     group.add_argument('--inference-wandb-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics to wandb. '
                             'Default to 0 to disable inference wandb logging.')
@@ -2764,6 +2778,10 @@ def _add_distributed_args(parser):
                        "and must be consistent across all ranks.")
     group.add_argument('--replication-factor', default=2, type=int,
                        help="Number of machines storing the replica of a given rank's data.")
+    group.add_argument('--fake-process-group', action='store_true', default=False,
+                       help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
+                       This is quite useful for profiling memory usage of distributed training with just one GPU. \
+                       Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
     return parser
 
 

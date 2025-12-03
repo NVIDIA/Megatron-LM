@@ -210,7 +210,7 @@ def test_grpo_loss_calculation_all_pi_eq():
     torch.testing.assert_close(loss, torch.zeros_like(loss))
     torch.testing.assert_close(kl_term, torch.zeros_like(kl_term))
     torch.testing.assert_close(ratios, torch.ones_like(ratios))
-    torch.testing.assert_close(entropy_term, torch.ones_like(ratios) * torch.e)
+    torch.testing.assert_close(entropy_term, -torch.ones_like(ratios) * torch.e)
 
 
 def test_grpo_loss_calculation_2x_ratios():
@@ -255,7 +255,7 @@ def test_entropy_calculation():
         entropy_weight=1.0,
     )
     torch.testing.assert_close(loss, torch.ones_like(ratios) * torch.e)
-    torch.testing.assert_close(entropy_term, torch.ones_like(ratios) * torch.e)
+    torch.testing.assert_close(entropy_term, -torch.ones_like(ratios) * torch.e)
 
 
 def test_grpo_loss_truncation():
