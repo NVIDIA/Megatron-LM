@@ -49,7 +49,6 @@ spec:
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
-        "HF_DATASETS_CACHE=/mnt/artifacts/rl_environments"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -58,5 +57,10 @@ products:
   - test_case: [gpt_grpo_tp1_pp1_dp8_583m_throughputtest]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_grpo_tp1_pp1_dp8_583m_throughputtest_github]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
         platforms: [dgx_h100]
