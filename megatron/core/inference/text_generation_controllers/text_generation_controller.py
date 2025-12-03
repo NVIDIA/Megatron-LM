@@ -512,12 +512,9 @@ class TextGenerationController:
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
-            if context.is_decode_only():
-                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
-                set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
-            else:
-                set_decode_expert_padding(unwrapped_model, False)
-
+            capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
+            set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
+    
         if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
             if context.is_decode_only():
                 # Turn on symmetric all reduce when in decode mode
@@ -832,7 +829,20 @@ class TextGenerationController:
         return top_n_results if top_n_results else None
 
     def dummy_forward(self):
-        return self.inference_wrapped_model.dummy_forward()
+        context = self.inference_wrapped_model.inference_context
+        # if context.cuda_graph_batch_dimensions_list is None:
+        #     return self.inference_wrapped_model.dummy_forward()
+        # else:
+        input_ids, position_ids = self._dynamic_step_context_init(
+            construct_graph_dimensions=InferenceBatchDimensions(
+                token_count=1,
+                prefill_req_count=0,
+                decode_req_count=1
+            )
+        )
+        self._dynamic_step_forward_logits(input_ids, position_ids)
+        context.reset()
+
 
     def _dynamic_step_context_bookkeeping(self, new_sample) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
