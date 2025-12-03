@@ -290,11 +290,11 @@ class MambaMixer(MegatronModule):
             )
             setattr(self.conv1d.weight, "tensor_model_parallel", True)
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
-
-            if self.config.perform_initialization and self.conv_init is not None:
-                nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
-            else:
-                nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
+            if self.config.perform_initialization:
+                if self.conv_init is not None:
+                    nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+                else:
+                    nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
 
         self.activation = "silu"
         self.act = nn.SiLU()
