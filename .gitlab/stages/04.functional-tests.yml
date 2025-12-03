@@ -53,7 +53,7 @@ functional:configure:
     - |
       RECORD_CHECKPOINTS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Record checkpoints"* || "$FUNCTIONAL_TEST_RECORD_CHECKPOINTS" == "yes" ]] && echo "true" || echo "false")
     - |
-      if [[ "$FUNCTIONAL_TEST_SCOPE" == "release" || "$FUNCTIONAL_TEST_SCOPE" == "pre-release" ]]; then
+      if [[ "$FUNCTIONAL_TEST_SCOPE" == "release" || "$FUNCTIONAL_TEST_SCOPE" == "weekly" ]]; then
         FUNCTIONAL_TEST_NAME=$(eval echo $FUNCTIONAL_TEST_NAME)
         RELEASE_ARGS=(
           "--run-name"
@@ -172,15 +172,15 @@ functional:run_dev_dgx_h100:
 functional:run_nemo:
   extends: [.functional_tests_rules]
   trigger:
-    project: "dl/joc/nemo-ci"
+    project: 'dl/joc/nemo-ci'
     branch: main-mirror
     strategy: depend
   inherit:
     variables: true
   variables:
     MCORE_MR_COMMIT: $CI_COMMIT_SHA
-    TEST_NEMO2_MODULE: "True"
-    ALLOW_FAILURE_DEPENDENCY: "True"
+    TEST_NEMO2_MODULE: 'True'
+    ALLOW_FAILURE_DEPENDENCY: 'True'
     TESTS_TO_RUN_ON_THIS_COMMIT: nightly
   rules:
     - if: $FUNCTIONAL_TEST == "yes"
@@ -217,7 +217,7 @@ functional:x_notify:
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
-    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" == "dev" ]] && echo "1" || "0")
     - export TEAM_SLUG=$SLACK_ADMIN
     - |
       python tests/test_utils/python_scripts/notify.py \
@@ -231,7 +231,7 @@ functional:x_notify:
     paths:
       - scripts
   rules:
-    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
+    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
 
