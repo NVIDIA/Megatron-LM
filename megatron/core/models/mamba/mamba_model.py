@@ -399,11 +399,7 @@ class MambaModel(LanguageModule):
                 compute_language_model_loss=self.compute_language_model_loss,
             )
 
-        # logits and loss
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-
+        
         sequence_parallel_override = False
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
