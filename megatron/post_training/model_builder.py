@@ -266,9 +266,6 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
     # modelopt_state (which transforms the model to have additional parameters) before returning.
     if args.load is not None:
         load_modelopt_state(model=model)
-        # TODO check if this is necessary still, or how to fix bug
-        # Temporary fix for bug introduced by removing quant_config from modelopt state.
-        mtq.disable_quantizer(model, "*output_layer*")
 
     _add_load_convert_hooks(model)
 

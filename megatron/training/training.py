@@ -1146,10 +1146,6 @@ def setup_model_and_optimizer(
     timers = get_timers()
     one_logger = get_one_logger()
 
-<<<<<<< HEAD
-    
-=======
->>>>>>> main
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
 
