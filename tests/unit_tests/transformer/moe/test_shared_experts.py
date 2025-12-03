@@ -29,7 +29,7 @@ class TestSharedExperts:
     def setup_method(self, method):
         self.config = TransformerConfig(
             num_layers=1,
-            hidden_size=12,
+            hidden_size=32,
             num_attention_heads=4,
             num_moe_experts=16,
             moe_shared_expert_intermediate_size=32,
@@ -78,13 +78,13 @@ class TestSharedExperts:
         model_parallel_cuda_manual_seed(123)
         moe_layer_overlap = self.get_moe_layer(
             moe_shared_expert_overlap=True, moe_token_dispatcher_type=dispatcher_type
-        )
+        ).to(dtype=torch.bfloat16)
 
         # Create MoE layer with shared expert overlap disabled.
         model_parallel_cuda_manual_seed(123)
         moe_layer_no_overlap = self.get_moe_layer(
             moe_shared_expert_overlap=False, moe_token_dispatcher_type=dispatcher_type
-        )
+        ).to(dtype=torch.bfloat16)
         moe_layer_no_overlap.load_state_dict(moe_layer_overlap.state_dict())
 
         # Sanity check that the weights are identical.
@@ -107,16 +107,14 @@ class TestSharedExperts:
 
         # Create a dummy input tensor.
         hidden_states = torch.ones(
-            (32, 2, self.config.hidden_size), requires_grad=True, device="cuda"
+            (32, 2, self.config.hidden_size), requires_grad=True, device="cuda", dtype=torch.bfloat16
         )
         hidden_states_no_overlap = hidden_states.clone().detach().requires_grad_(True)
 
         # Forward pass.
         output_overlap, _ = moe_layer_overlap(hidden_states)
         output_no_overlap, _ = moe_layer_no_overlap(hidden_states_no_overlap)
-        assert torch.allclose(
-            output_overlap, output_no_overlap
-        ), f"max diff: {torch.max(torch.abs(output_overlap - output_no_overlap))}"
+        torch.testing.assert_close(output_overlap, output_no_overlap)
 
         # Backward pass.
         output_overlap.mean().backward()
