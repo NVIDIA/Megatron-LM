@@ -663,7 +663,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of tokens and probabilities after All-to-All.
         """
-        # Make sure the shared experts fc1 is not launched too early when CUDA_DEVICE_MAX_CONNECTIONS>1.
+        # Make sure the shared experts fc1 is overlapped with dispatch A2A
+        # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
         # Perform expert parallel AlltoAll communication
@@ -823,7 +824,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             Tokens after the All-to-All communication for combining.
         """
-        # Make sure the shared experts fc2 is not overlapped with routed experts fc1 
+        # Make sure the shared experts fc2 is not overlapped with routed experts fc1
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
@@ -1547,7 +1548,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             Combined tokens after fused un-permutation and communication.
         """
-        # Make sure the shared experts fc2 is not overlapped with routed experts GEMM 
+        # Make sure the shared experts fc2 is not overlapped with routed experts GEMM
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
