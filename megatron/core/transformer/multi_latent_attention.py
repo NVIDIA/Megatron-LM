@@ -15,7 +15,7 @@ except ImportError:
     HAVE_EINOPS = False
 
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,

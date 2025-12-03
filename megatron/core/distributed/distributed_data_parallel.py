@@ -6,7 +6,6 @@ from typing import Optional
 
 import torch
 
-from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
@@ -55,7 +54,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
         # ring-reduce implementations are large enough to remain bandwidth-bound rather than
         # latency-bound.
-        # Setup process groups using DDP-specific helper method (handles both None and provided pg_collection)
+        # Setup process groups, handling both None and provided pg_collection values.
         process_group_dict = ProcessGroupCollection.setup_process_groups_for_ddp(
             pg_collection, config, ddp_config
         )
