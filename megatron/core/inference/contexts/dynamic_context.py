@@ -31,7 +31,6 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
-from megatron.core.utils import internal_api
 
 from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -246,7 +245,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
 
-    @internal_api
     def __init__(
         self,
         *,
