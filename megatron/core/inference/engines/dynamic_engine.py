@@ -805,30 +805,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.tpot = []
                 request.tpot.append(step_time)
 
-                if request_log_probs is not None:
-                    if not request.prompt_log_probs:
-                        request.prompt_log_probs = []
-                    if not request.generated_log_probs:
-                        request.generated_log_probs = []
-                    # If the request log probs span > 1 token we are in prefill
-                    if len(request_log_probs) > 1:
-                        # Add all but the last logprob to prompt_log_probs (last is for first generated token)
-                        request.prompt_log_probs.extend(request_log_probs[:-1])
-                        # Add the last logprob to generated_log_probs (first generated token)
-                        request.generated_log_probs.extend(request_log_probs[-1:])
-                    else:
-                        if (
-                            # If it is a chunked prefill request
-                            len(request.prompt_log_probs) > 0
-                            # And we are missing the last token for prefill
-                            and len(request.prompt_log_probs) < len(request.prompt_tokens) - 1
-                            # And we need to track full prefill
-                            and not self.context.materialize_only_last_token_logits
-                        ):
-                            request.prompt_log_probs.extend(request_log_probs)
-                        else:
-                            request.generated_log_probs.extend(request_log_probs)
-
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
@@ -850,21 +826,50 @@ class DynamicInferenceEngine(AbstractEngine):
                 # The chunked prefill produces useless tokens
                 # so we are not appending them to the generated tokens.
                 # Additionally, chunked prefill request do not finish.
-                # However, the log probs are still needed.
-                if request_log_probs is not None:
-                    if self.context.materialize_only_last_token_logits:
-                        # Here we discard intermediate log probs
-                        # as we only materialize the last token log probs
-                        request.prompt_log_probs = []
-                        request.generated_log_probs = []
-                    else:
-                        # Otherwise, we gather log probs for all tokens
-                        if not request.prompt_log_probs:
-                            request.prompt_log_probs = []
-                        request.prompt_log_probs.extend(request_log_probs)
-                        request.generated_log_probs = []
-
                 active_request_ids.append(request_id)
+
+            # Process log_probs if available (unified for both regular and chunked prefill)
+            if request_log_probs is not None:
+                # Initialize lists if they don't exist
+                if not request.prompt_log_probs:
+                    request.prompt_log_probs = []
+                if not request.generated_log_probs:
+                    request.generated_log_probs = []
+
+                # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
+                if (
+                    request_id == self.context.chunked_prefill_request_id
+                    and self.context.materialize_only_last_token_logits
+                ):
+                    request.prompt_log_probs = []
+                    request.generated_log_probs = []
+                else:
+                    prompt_length = len(request.prompt_tokens)
+                    total_accumulated = len(request.prompt_log_probs) + len(
+                        request.generated_log_probs
+                    )
+
+                    # Handle skip_prompt_log_probs during prefill
+                    # If skip_prompt_log_probs is True and we have multiple log probs (prefill),
+                    # only process the last one (first generated token)
+                    if request.sampling_params.skip_prompt_log_probs and len(request_log_probs) > 1:
+                        # Only append the last log prob (first generated token) to generated_log_probs
+                        request.generated_log_probs.append(request_log_probs[-1])
+                    else:
+                        # Vectorized approach: calculate split point and use list slicing
+                        if not request.sampling_params.skip_prompt_log_probs:
+                            # Calculate how many log probs go to prompt vs generated
+                            remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                            split_idx = min(remaining_prompt_slots, len(request_log_probs))
+
+                            # Batch extend instead of individual appends
+                            if split_idx > 0:
+                                request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                            if split_idx < len(request_log_probs):
+                                request.generated_log_probs.extend(request_log_probs[split_idx:])
+                        else:
+                            # All log probs go to generated
+                            request.generated_log_probs.extend(request_log_probs)
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
@@ -891,10 +896,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_top_n_logprobs
                     )
 
-                    # If return_prompt_top_n_logprobs is True and we haven't reached prompt end,
+                    # If skip_prompt_log_probs is False and we haven't reached prompt end,
                     # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
                     if (
-                        request.sampling_params.return_prompt_top_n_logprobs
+                        not request.sampling_params.skip_prompt_log_probs
                         and total_accumulated < prompt_length - 1
                     ):
                         request.prompt_top_n_logprobs.append(logit_dict)
