@@ -1045,7 +1045,7 @@ def validate_args(args, defaults={}):
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
-    if not args.add_position_embedding and args.position_embedding_type != 'rope':
+    if not args.add_position_embedding and args.position_embedding_type not in ('rope', 'yarn'):
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
 
     # Relative position embeddings arguments
@@ -1140,7 +1140,7 @@ def validate_args(args, defaults={}):
 
             if args.dist_ckpt_optim_fully_reshardable:
                 assert not args.distrib_optim_fully_reshardable_mem_efficient, \
-                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+                    '--distrib-optim-fully-reshardable-mem-efficient requires --enable-gloo-process-groups'
 
     if args.fake_process_group:
         # Disable nan check for fake process group
@@ -1364,8 +1364,9 @@ def core_transformer_config_from_args(args, config_class=None):
         # Pop 'rope_type' to let the config class use the default value.
         kw_args.pop('rope_type', None)
     else:
-        assert (args.multi_latent_attention or args.rope_type == 'rope'), (
-            f'Common attention only support rope_type="rope", but got {args.rope_type}.'
+        # GptOSS defaults to yarn, but it possible to use many others and yarn has already been supported in Mcore
+        assert (not args.multi_latent_attention or args.rope_type != 'yarn'), (
+            f'If using MLA attention (sft deepseek V3), rope_type is expected to be "yarn", but got {args.rope_type}.'
         )
 
     if len(args.cp_comm_type) == 1:
@@ -1695,7 +1696,7 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
+                        choices=['learned_absolute', 'rope', 'yarn', 'mrope', 'relative', 'none'],
                         help='Position embedding type.')
     group.add_argument('--relative-attention-num-buckets', type=int, default=32,
                         help='Number of buckets for relative position embeddings.')
