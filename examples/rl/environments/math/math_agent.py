@@ -21,8 +21,7 @@ assert (
     MATHVERIFY_AVAILABLE
 ), "math_verify is not installed but now required. Install it using `pip install math-verify` to continue."
 
-NEGATIVE_REWARD = 0.0
-
+NEGATIVE_REWARD = 0.5
 
 class MathAgent(RewardOnlyAgent):
     def __init__(self, format_reward: float = 0.0, answer_format: str = "tagged", **kwargs):
@@ -37,32 +36,60 @@ class MathAgent(RewardOnlyAgent):
         Uses the final answer in the response string to compute the score.
         """
         # Allow <answer> tags or \boxed{} tags (this is a bit of cheating in favor of deepseek distilled models I think)
-        for pattern in [
-            r'<answer>(.*?)</answer>',
-            r"\\boxed\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}",
-        ]:
-            match = re.finditer(pattern, response, re.DOTALL)
-            matches = list(match)
-            if matches:
-                final_answer = matches[-1].group(1).strip()
-                break
-        else:
-            # Did not format the answer correctly
-            return NEGATIVE_REWARD
+        matched_format = None
+        end_of_text_token = "<|end_of_text|>"
 
-        try:
-            parsed_answer = parse(final_answer)
-        except ValueError as e:
-            print("Failed to parse the answer.")
-            traceback.print_stack()
-            return NEGATIVE_REWARD
+        # Only <answer>X</answer> immediately followed by <|end_of_text|> or <|endoftext|> yields 1.0 reward.
+        answer_tag_pattern = r'<answer>(.*?)</answer>'
+        answer_tag_match = list(re.finditer(answer_tag_pattern, response, re.DOTALL))
+        if answer_tag_match:
+            # Only consider the last occurrence
+            last_match = answer_tag_match[-1]
+            final_answer = last_match.group(1).strip()
+            after = response[last_match.end():].lstrip()  # strip whitespace between </answer> and token
 
-        correct_answer = verify(str(golden[golden_key]), parsed_answer)
-        if correct_answer:
-            return 1.0
+            try:
+                parsed_answer = parse(final_answer)
+            except ValueError as e:
+                print("Failed to parse the answer.")
+                traceback.print_stack()
+                return NEGATIVE_REWARD
+
+            correct_answer = verify(str(golden[golden_key]), parsed_answer)
+            if correct_answer:
+                # Accept either <|end_of_text|> or <|endoftext|> as valid terminators, for flexibility.
+                end_tokens = [end_of_text_token, "<|endoftext|>"]
+                for token in end_tokens:
+                    if after.startswith(token):
+                        return 1.0
+                # If a correct answer but missing immediate end, give format reward (not NEGATIVE_REWARD).
+                return self.format_reward
+            else:
+                # Incorrect answer, regardless of format/end-of-text
+                return self.format_reward
         else:
-            # Formatting is correct but the answer is incorrect
-            return self.format_reward
+            # Fallback: check boxed answer format for diagnostic/format reward as before, but never return 1.0
+            boxed_pattern = r"\\boxed\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}"
+            boxed_match = list(re.finditer(boxed_pattern, response, re.DOTALL))
+            if boxed_match:
+                final_answer = boxed_match[-1].group(1).strip()
+                try:
+                    parsed_answer = parse(final_answer)
+                except ValueError as e:
+                    print("Failed to parse the answer.")
+                    traceback.print_stack()
+                    return NEGATIVE_REWARD
+
+                correct_answer = verify(str(golden[golden_key]), parsed_answer)
+                if correct_answer:
+                    # Format doesn't meet new requirement, so don't give 1.0, just format reward if correct
+                    return self.format_reward
+                else:
+                    # Formatting is correct but the answer is incorrect
+                    return self.format_reward
+            else:
+                # Did not format the answer correctly
+                return NEGATIVE_REWARD
 
     def make_prefix(self, problem_key: str = "problem", **kwargs) -> str:
         """Take a string math problem and return the prompt. Supports requesting tagged or boxed answers. Supports chat mode prompts."""
