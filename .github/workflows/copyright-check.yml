@@ -17,8 +17,8 @@ name: Copyright check
 on:
   push:
     branches:
-      - "pull-request/[0-9]+"
-      - "deploy-release/*"
+      - 'pull-request/[0-9]+'
+      - 'deploy-release/*'
   merge_group:
     types: [checks_requested]
 
@@ -34,7 +34,7 @@ jobs:
       || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       && github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_copyright_check.yml@v0.65.13
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_copyright_check.yml@v0.66.7
 
   copyright-check-summary:
     needs: [pre-flight, copyright-check]
