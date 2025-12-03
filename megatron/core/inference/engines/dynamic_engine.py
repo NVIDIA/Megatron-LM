@@ -40,6 +40,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter, await_process_event
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import get_asyncio_loop, internal_api, trace_async_exceptions
 
@@ -136,6 +137,7 @@ class DynamicInferenceEngine(AbstractEngine):
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
         inference_logging_step_interval: int = 0,
+        process_group_collection: Optional[ProcessGroupCollection] = None,
     ):
 
         assert isinstance(
@@ -158,6 +160,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self.enable_cuda_graph = (
                 controller.inference_wrapped_model.model.config.enable_cuda_graph
             )
+
+        if process_group_collection is not None:
+            self.process_group_collection = process_group_collection
+        else:
+            self.process_group_collection = parallel_state
 
         # Initialization options.
         self.controller = controller
@@ -378,15 +385,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
         # Get world info.
-        dp_group = parallel_state.get_data_parallel_group()
-        dp_src = parallel_state.get_data_parallel_src_rank()
-        dp_size = parallel_state.get_data_parallel_world_size()
-        dp_rank = parallel_state.get_data_parallel_rank()
+        dp_group = self.process_group_collection.get_data_parallel_group()
+        dp_src = self.process_group_collection.get_data_parallel_src_rank()
+        dp_size = self.process_group_collection.get_data_parallel_world_size()
+        dp_rank = self.process_group_collection.get_data_parallel_rank()
 
-        mp_group = parallel_state.get_model_parallel_group()
-        mp_src = parallel_state.get_model_parallel_src_rank()
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        mp_group = self.process_group_collection.get_model_parallel_group()
+        mp_src = self.process_group_collection.get_model_parallel_src_rank()
+        tp_rank = self.process_group_collection.get_tensor_model_parallel_rank()
+        pp_rank = self.process_group_collection.get_pipeline_model_parallel_rank()
 
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
@@ -400,7 +407,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 args=(
                     coordinator_ready_event,
                     inference_coordinator_port,
-                    parallel_state.get_data_parallel_world_size(),
+                    self.process_group_collection.get_data_parallel_world_size(),
                 ),
             )
             self.inference_coordinator_process.start()

@@ -249,6 +249,152 @@ class ProcessGroupCollection:
 
         return cls(**init_dict)
 
+    def get_tensor_model_parallel_world_size(self) -> int:
+        """Return TP world size using the TP process group."""
+        return torch.distributed.get_world_size(self.tp)
+
+    def get_pipeline_model_parallel_world_size(self) -> int:
+        """Return PP world size using the PP process group."""
+        return torch.distributed.get_world_size(self.pp)
+
+    def get_tensor_model_parallel_rank(self) -> int:
+        """Return this rank's TP rank within the TP group."""
+        global_rank = torch.distributed.get_rank()
+        tp_ranks = torch.distributed.get_process_group_ranks(self.tp)
+        return tp_ranks.index(global_rank)
+
+    def get_pipeline_model_parallel_rank(self) -> int:
+        """Return this rank's PP rank within the PP group."""
+        global_rank = torch.distributed.get_rank()
+        pp_ranks = torch.distributed.get_process_group_ranks(self.pp)
+        return pp_ranks.index(global_rank)
+
+    def is_pipeline_first_stage(
+        self, ignore_virtual: bool = True, vp_stage: Optional[int] = None
+    ) -> bool:
+        """Return True if this rank is on the first PP stage.
+        By default, ignores virtual pipeline (matches legacy interface). If you need VP-aware
+        behavior, pass ignore_virtual=False and specify vp_stage.
+        """
+        pp_ranks = torch.distributed.get_process_group_ranks(self.pp)
+        global_rank = torch.distributed.get_rank()
+        is_pp_first = pp_ranks[0] == global_rank
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        if ignore_virtual or vp_size in (None, 1) or vp_stage is None:
+            return is_pp_first
+        is_vp_first = vp_stage == 0
+        return is_vp_first and is_pp_first
+
+    def is_pipeline_last_stage(
+        self, ignore_virtual: bool = True, vp_stage: Optional[int] = None
+    ) -> bool:
+        """Return True if this rank is on the last PP stage.
+        By default, ignores virtual pipeline (matches legacy interface). If you need VP-aware
+        behavior, pass ignore_virtual=False and specify vp_stage.
+        """
+        pp_ranks = torch.distributed.get_process_group_ranks(self.pp)
+        global_rank = torch.distributed.get_rank()
+        is_pp_last = pp_ranks[-1] == global_rank
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        if ignore_virtual or vp_size in (None, 1) or vp_stage is None:
+            return is_pp_last
+        is_vp_last = vp_stage == (vp_size - 1)
+        return is_vp_last and is_pp_last
+
+    def get_data_parallel_rank(self) -> int:
+        """Return this rank's DP rank within the DP group."""
+        global_rank = torch.distributed.get_rank()
+        dp_ranks = torch.distributed.get_process_group_ranks(self.dp)
+        return dp_ranks.index(global_rank)
+
+    def get_context_parallel_rank(self) -> int:
+        """Return this rank's CP rank within the CP group, or 0 if no CP."""
+        if not hasattr(self, 'cp') or self.cp is None:
+            return 0
+        global_rank = torch.distributed.get_rank()
+        cp_ranks = torch.distributed.get_process_group_ranks(self.cp)
+        return cp_ranks.index(global_rank)
+
+    def get_data_parallel_group(
+        self, with_context_parallel: bool = False, partial_data_parallel: bool = False
+    ):
+        """Return the DP/DP+CP process group, optionally partial."""
+        if with_context_parallel:
+            if partial_data_parallel:
+                # Prefer intra_dp_cp if available, else fallback to dp_cp
+                if hasattr(self, 'intra_dp_cp') and self.intra_dp_cp is not None:
+                    return self.intra_dp_cp
+                if hasattr(self, 'dp_cp') and self.dp_cp is not None:
+                    return self.dp_cp
+                return self.dp
+            else:
+                if hasattr(self, 'dp_cp') and self.dp_cp is not None:
+                    return self.dp_cp
+                return self.dp
+        return self.dp
+
+    def get_tensor_model_parallel_group(self):
+        """Return the tensor model parallel (TP) process group."""
+        return self.tp
+
+    def get_pipeline_model_parallel_group(self):
+        """Return the pipeline model parallel (PP) process group."""
+        return self.pp
+
+    def get_model_parallel_group(self):
+        """Return the combined model parallel (MP) process group."""
+        return self.mp
+
+    def get_model_parallel_world_size(self) -> int:
+        """Return MP world size using the MP process group."""
+        return torch.distributed.get_world_size(self.mp)
+
+    def get_model_parallel_src_rank(self) -> int:
+        """Return the source (leader) global rank for the MP group."""
+        ranks = torch.distributed.get_process_group_ranks(self.mp)
+        return ranks[0]
+
+    def get_context_parallel_group(self):
+        """Return the context parallel (CP) process group, if configured."""
+        return getattr(self, 'cp', None)
+
+    def get_expert_model_parallel_group(self):
+        """Return the expert model parallel (EP) process group, if configured."""
+        return getattr(self, 'ep', None)
+
+    def get_expert_data_parallel_group(self, partial_expert_data_parallel: bool = False):
+        """Return the expert data parallel (ExDP) process group."""
+        if partial_expert_data_parallel:
+            return getattr(self, 'intra_expt_dp', None)
+        return getattr(self, 'expt_dp', None)
+
+    def get_inter_distributed_optimizer_instance_group(self):
+        """Return the inter-node distributed optimizer instance process group, if configured."""
+        return getattr(self, 'inter_dist_opt', None)
+
+    def get_intra_distributed_optimizer_instance_group(self):
+        """Return the intra-node distributed optimizer instance process group, if configured."""
+        return getattr(self, 'intra_dist_opt', None)
+
+    def get_data_parallel_src_rank(
+        self, with_context_parallel: bool = False, partial_data_parallel: bool = False
+    ) -> int:
+        """Return the source (leader) global rank for the selected DP group."""
+        group = self.get_data_parallel_group(
+            with_context_parallel=with_context_parallel, partial_data_parallel=partial_data_parallel
+        )
+        ranks = torch.distributed.get_process_group_ranks(group)
+        return ranks[0]
+
+    def get_data_parallel_world_size(
+        self, with_context_parallel: bool = False, partial_data_parallel: bool = False
+    ) -> int:
+        """Return world size of the selected DP group."""
+        group = self.get_data_parallel_group(
+            with_context_parallel=with_context_parallel, partial_data_parallel=partial_data_parallel
+        )
+        return torch.distributed.get_world_size(group)
+
     @staticmethod
     def setup_process_groups_for_optimizer(
         pg_collection: Optional['ProcessGroupCollection'],
