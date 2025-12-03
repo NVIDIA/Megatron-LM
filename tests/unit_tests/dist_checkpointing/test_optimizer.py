@@ -18,7 +18,9 @@ from megatron.core.dist_checkpointing.optimizer import (
 )
 from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding, extract_sharded_tensors
 from megatron.core.dist_checkpointing.validation import StrictHandling
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
 )
@@ -276,6 +278,11 @@ def initialize_real_model(
     virtual_pipeline_model_parallel_size=None,
     **config_kwargs,
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
