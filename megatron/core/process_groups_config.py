@@ -250,21 +250,21 @@ class ProcessGroupCollection:
         return cls(**init_dict)
 
     def get_tensor_model_parallel_world_size(self) -> int:
-        """Return TP world size using the TP process group."""
+        """Return world size for the tensor-model-parallel group."""
         return torch.distributed.get_world_size(self.tp)
 
     def get_pipeline_model_parallel_world_size(self) -> int:
-        """Return PP world size using the PP process group."""
+        """Return world size for the pipeline-model-parallel group."""
         return torch.distributed.get_world_size(self.pp)
 
     def get_tensor_model_parallel_rank(self) -> int:
-        """Return this rank's TP rank within the TP group."""
+        """Return caller's rank for the tensor-model-parallel group."""
         global_rank = torch.distributed.get_rank()
         tp_ranks = torch.distributed.get_process_group_ranks(self.tp)
         return tp_ranks.index(global_rank)
 
     def get_pipeline_model_parallel_rank(self) -> int:
-        """Return this rank's PP rank within the PP group."""
+        """Return caller's rank for the pipeline-model-parallel group."""
         global_rank = torch.distributed.get_rank()
         pp_ranks = torch.distributed.get_process_group_ranks(self.pp)
         return pp_ranks.index(global_rank)
@@ -302,13 +302,13 @@ class ProcessGroupCollection:
         return is_vp_last and is_pp_last
 
     def get_data_parallel_rank(self) -> int:
-        """Return this rank's DP rank within the DP group."""
+        """Return caller's rank in the data-parallel group."""
         global_rank = torch.distributed.get_rank()
         dp_ranks = torch.distributed.get_process_group_ranks(self.dp)
         return dp_ranks.index(global_rank)
 
     def get_context_parallel_rank(self) -> int:
-        """Return this rank's CP rank within the CP group, or 0 if no CP."""
+        """Return caller's rank in the context-parallel group."""
         if not hasattr(self, 'cp') or self.cp is None:
             return 0
         global_rank = torch.distributed.get_rank()
@@ -318,7 +318,7 @@ class ProcessGroupCollection:
     def get_data_parallel_group(
         self, with_context_parallel: bool = False, partial_data_parallel: bool = False
     ):
-        """Return the DP/DP+CP process group, optionally partial."""
+        """Get the data-parallel group the caller rank belongs to."""
         if with_context_parallel:
             if partial_data_parallel:
                 # Prefer intra_dp_cp if available, else fallback to dp_cp
@@ -334,52 +334,57 @@ class ProcessGroupCollection:
         return self.dp
 
     def get_tensor_model_parallel_group(self):
-        """Return the tensor model parallel (TP) process group."""
+        """Get the tensor-model-parallel group the caller rank belongs to."""
         return self.tp
 
     def get_pipeline_model_parallel_group(self):
-        """Return the pipeline model parallel (PP) process group."""
+        """Get the pipeline-model-parallel group the caller rank belongs to."""
         return self.pp
 
     def get_model_parallel_group(self):
-        """Return the combined model parallel (MP) process group."""
+        """Get the model-parallel group the caller rank belongs to."""
         return self.mp
 
     def get_model_parallel_world_size(self) -> int:
-        """Return MP world size using the MP process group."""
+        """Return world size for the model-parallel group."""
         return torch.distributed.get_world_size(self.mp)
 
     def get_model_parallel_src_rank(self) -> int:
-        """Return the source (leader) global rank for the MP group."""
+        """Calculate the global rank corresponding to the first local rank
+        in the model parallel group."""
         ranks = torch.distributed.get_process_group_ranks(self.mp)
         return ranks[0]
 
     def get_context_parallel_group(self):
-        """Return the context parallel (CP) process group, if configured."""
+        """Get the context-parallel group the caller rank belongs to."""
         return getattr(self, 'cp', None)
 
     def get_expert_model_parallel_group(self):
-        """Return the expert model parallel (EP) process group, if configured."""
+        """Get the expert-model-parallel group the caller rank belongs to."""
         return getattr(self, 'ep', None)
 
     def get_expert_data_parallel_group(self, partial_expert_data_parallel: bool = False):
-        """Return the expert data parallel (ExDP) process group."""
+        """Get expert data parallel group."""
         if partial_expert_data_parallel:
             return getattr(self, 'intra_expt_dp', None)
         return getattr(self, 'expt_dp', None)
 
     def get_inter_distributed_optimizer_instance_group(self):
-        """Return the inter-node distributed optimizer instance process group, if configured."""
+        """Get the group spanning the different distributed optimizer instances.
+        Attention and MLP/Expert share same inter-instance group, so only built
+        inter_partial_expert_data_parallel_group, and return it at here.
+        """
         return getattr(self, 'inter_dist_opt', None)
 
     def get_intra_distributed_optimizer_instance_group(self):
-        """Return the intra-node distributed optimizer instance process group, if configured."""
+        """Get the group of all GPUs in a distributed optimizer instance."""
         return getattr(self, 'intra_dist_opt', None)
 
     def get_data_parallel_src_rank(
         self, with_context_parallel: bool = False, partial_data_parallel: bool = False
     ) -> int:
-        """Return the source (leader) global rank for the selected DP group."""
+        """Calculate the global rank corresponding to the first local rank
+        in the data parallel group."""
         group = self.get_data_parallel_group(
             with_context_parallel=with_context_parallel, partial_data_parallel=partial_data_parallel
         )
@@ -389,7 +394,7 @@ class ProcessGroupCollection:
     def get_data_parallel_world_size(
         self, with_context_parallel: bool = False, partial_data_parallel: bool = False
     ) -> int:
-        """Return world size of the selected DP group."""
+        """Return world size for the data parallel group."""
         group = self.get_data_parallel_group(
             with_context_parallel=with_context_parallel, partial_data_parallel=partial_data_parallel
         )
