@@ -56,9 +56,9 @@ def new_general_gemm(A, B, workspace, out=None, accumulate=False, bias=None, **k
     """
     cksum = [0, 0]
     for run_idx in range(2):
-        will_rerun = run_idx == 0
+        is_first_iter = run_idx == 0
         need_output_copy = out is not None and (bias is out or accumulate)
-        if need_output_copy and will_rerun:
+        if need_output_copy and is_first_iter:
             out_arg = out.clone().detach()
             if bias == out:
                 bias_arg = out_arg
@@ -72,13 +72,12 @@ def new_general_gemm(A, B, workspace, out=None, accumulate=False, bias=None, **k
             A, B, workspace, out=out_arg, accumulate=accumulate, bias=bias_arg, **kwargs
         )
         out_res = res[0]
-        is_rerun = run_idx == 1
-        if will_rerun or is_rerun:
-            cksum[run_idx] = out_res.sum(dtype=torch.float32).item()
-        if will_rerun:
+        is_second_iter = run_idx == 1
+        cksum[run_idx] = out_res.sum(dtype=torch.float32).item()
+        if is_first_iter:
             rerun_res = out_res
             continue
-        if is_rerun:
+        if is_second_iter:
             same_cksum = (
                 math.fabs(cksum[1] - cksum[0]) / (math.fabs(cksum[1]) + EPSILON) <= CKSUM_TOLERANCE
             )
@@ -108,33 +107,33 @@ def new_general_grouped_gemm(
     and compares results for consistency.
     """
     saved_output = None
-    out_will_rerun = None
-    bias_will_rerun = None
+    out_first_iter = None
+    bias_first_iter = None
     for run_idx in range(2):
-        is_rerun = run_idx == 1
-        if not is_rerun:
-            out_will_rerun = (
+        is_second_iter = run_idx == 1
+        if not is_second_iter:
+            out_first_iter = (
                 [t.clone().detach() for t in out]
                 if out is not None and (accumulate or out is bias)
                 else out
             )
-            bias_will_rerun = out_for_rerun if bias is not None and out is bias else bias
+            bias_first_iter = out_first_iter if bias is not None and out is bias else bias
         res = orig_general_grouped_gemm(
             A,
             B,
-            out_will_rerun if not is_rerun else out,
+            out_first_iter if not is_second_iter else out,
             out_dtype,
             workspaces,
-            grad=grad if is_rerun else False,
+            grad=grad if is_second_iter else False,
             accumulate=accumulate,
-            bias=bias_will_rerun if not is_rerun else bias,
+            bias=bias_first_iter if not is_second_iter else bias,
             **kwargs,
         )
         output = res[0]
-        if not is_rerun:
+        if not is_second_iter:
             saved_output = [t.clone().detach() for t in output]
             continue
-        if is_rerun:
+        if is_second_iter:
             for tidx in range(len(output)):
                 if not torch.equal(output[tidx], saved_output[tidx]):
                     logging.log(
@@ -160,11 +159,17 @@ def patch_te_gemms() -> None:
 
     for module in sys.modules:
         if 'general_gemm' in dir(sys.modules[module]):
-            log_single_rank(logger, logging.INFO, f"PATCHING general_gemm IN MODULE: {module}")
-            sys.modules[module].general_gemm = new_general_gemm
+            if sys.modules[module].general_gemm is orig_general_gemm:
+                log_single_rank(logger, logging.INFO, f"PATCHING general_gemm IN MODULE: {module}")
+                sys.modules[module].general_gemm = new_general_gemm
+            else:
+                log_single_rank(logger, logging.WARN, f"SKIP PATCHING general_gemm IN MODULE: {module}")
         if 'general_grouped_gemm' in dir(sys.modules[module]):
-            log_single_rank(
-                logger, logging.INFO, f"PATCHING general_grouped_gemm IN MODULE: {module}"
-            )
-            sys.modules[module].general_grouped_gemm = new_general_grouped_gemm
+            if sys.modules[module].general_grouped_gemm is orig_general_grouped_gemm:
+                log_single_rank(
+                    logger, logging.INFO, f"PATCHING general_grouped_gemm IN MODULE: {module}"
+                )
+                sys.modules[module].general_grouped_gemm = new_general_grouped_gemm
+            else:
+                log_single_rank(logger, logging.WARN, f"SKIP PATCHING general_gemm IN MODULE: {module}")
     _GLOBAL_IS_PATCHED_ = True

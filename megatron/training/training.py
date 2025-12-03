@@ -615,6 +615,8 @@ def pretrain(
     timers = get_timers()
 
     if args.repeat_te_gemms_check:
+        if args.transformer_impl != 'transformer_engine':
+            raise ValueError("Requested patching TE GEMMS with check, but not using TE backend.")
         from megatron.core.extensions.gemm_patch import patch_te_gemms
         patch_te_gemms()
 
