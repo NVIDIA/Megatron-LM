@@ -238,6 +238,9 @@ class TransformerConfig(ModelParallelConfig):
     experimental_attention_variant: Optional[str] = None
     """Type of attention variant to use. Currently support gated_delta_net and dsa."""
 
+    is_linear_attention_model: bool = False
+    """Whether the model is a linear attention model."""
+
     ####################
     # attention variant: gated_delta_net
     ####################

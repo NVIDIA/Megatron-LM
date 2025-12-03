@@ -379,8 +379,7 @@ def num_floating_point_operations(args, batch_size):
                 )
             )
 
-        linear_attention_variants = ["gated_delta_net"]
-        if args.experimental_attention_variant in linear_attention_variants:
+        if args.is_linear_attention_model:
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
