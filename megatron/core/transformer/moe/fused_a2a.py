@@ -391,10 +391,7 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x,
-            probs=grad_probs,
-            handle=handle,
-            pad_multiple=ctx.pad_multiple,
+            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
         )
         return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
 
@@ -405,16 +402,12 @@ class HybridEPCombine(torch.autograd.Function):
     '''
 
     @staticmethod
-    def forward(
-        ctx, x, handle, num_permuted_tokens=None, pad_multiple=None
-    ):
+    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x,
-            handle=handle,
-            pad_multiple=pad_multiple,
+            hidden=x, handle=handle, pad_multiple=pad_multiple
         )
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
@@ -506,9 +499,7 @@ if HAVE_HYBRIDEP:
                 The alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
         '''
-        return HybridEPCombine.apply(
-            x, handle, num_permuted_tokens, pad_multiple
-        )
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple)
 
 else:
     hybrid_ep_dispatch = None
