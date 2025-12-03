@@ -3342,6 +3342,9 @@ class AllGatherPipeline:
         # Wait for asynchronous / overlapped NCCL operations to complete.
         param_gather_event, mark_bucket_ready_to_use = self.param_gather_event_map.pop(bucket_id)
         param_gather_event.wait()
+        # debugmtl
+        if self.ag_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.ag_stream)
         mark_bucket_ready_to_use()
 
     @torch.no_grad()

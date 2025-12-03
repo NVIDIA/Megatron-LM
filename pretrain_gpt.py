@@ -29,6 +29,7 @@ from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_packed_seq_params_on_this_pp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
@@ -60,13 +61,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
     args = get_args()
     config = core_transformer_config_from_args(args)
-    args = get_args()
     
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+        # packed_seq_params = get_packed_seq_params_on_this_pp_rank()
+        # return None, None, None, None, None, packed_seq_params
         return None, None, None, None, None, None
-
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
         data_iterator,
@@ -80,11 +81,27 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
         max_seqlen = int(batch.pop('max_seqlen').item())
         # local_cp_size is None if we disable hybrid-cp
-        local_cp_size = int(batch.pop('local_cp_size').item()) if ('local_cp_size' in batch and args.hybrid_context_parallel) else None
+        local_cp_size = int(batch.pop('local_cp_size').item()) if ('local_cp_size' in batch) else None
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, 
                 cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size)
         
     else:
+        # #debugmtl
+        # sample_length = batch['tokens'].shape[1]
+        # if args.sft:
+        #     packed_seq_params = PackedSeqParams(
+        #     qkv_format="sbhd",
+        #     cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        #     cu_seqlens_kv=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        #     cu_seqlens_q_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        #     cu_seqlens_kv_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        #     max_seqlen_q=sample_length,
+        #     max_seqlen_kv=sample_length,
+        #     local_cp_size=None,
+        #     cp_group=None,
+        # )
+        # else:
+        #     packed_seq_params = None
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None

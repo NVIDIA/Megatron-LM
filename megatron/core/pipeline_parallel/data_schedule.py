@@ -10,6 +10,13 @@ import numpy as np
 import torch
 
 from megatron.core import parallel_state
+
+# from megatron.core.pipeline_parallel.utils import (
+#     is_pp_first_stage,
+#     is_pp_last_stage,
+#     is_vp_first_stage,
+#     is_vp_last_stage,
+# )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 
@@ -293,16 +300,23 @@ def wrap_dataloader(
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
         dp_group = parallel_state.get_data_parallel_group()
         tp_group = parallel_state.get_tensor_model_parallel_group()
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
     else:
         dp_cp_group = pg_collection.dp_cp
         dp_group = pg_collection.dp
         tp_group = pg_collection.tp
+        pp_group = pg_collection.pp
     assert (
         dp_cp_group is not None and dp_group is not None and tp_group is not None
     ), "dp_cp_group, dp_group, tp_group must not be None when using hybrid context parallel"
 
     total_hdp_gpus = dp_cp_group.size()
     dev = torch.cuda.current_device()
+
+    # if is_pp_first_stage(pp_group) or is_pp_last_stage(pp_group) and tp_group.rank() == 0:
+    #     # do what data_iterator is doing
+
+    #     # first stage tp-0 broadcast num_micro_batches cu_seqlens to
 
     if data_iterator is None:
         # TP-0 reads from data_iterator, others receive via broadcast.
@@ -328,6 +342,16 @@ def wrap_dataloader(
         )
 
         groups, sample_id_groups = scheduler.get_groups_and_subsamples(global_id_seqlens, config)
+
+        # debugmtl
+        set_gbs = set()
+        for group in sample_id_groups:
+            for sub in group:
+                set_gbs.update(sub)
+        assert len(set_gbs) == len(
+            global_id_seqlens
+        ), f"set_gbs length: {len(set_gbs)} \
+        != global_ids_this_rank length: {len(global_id_seqlens)}"
 
         batch = _unpack_batch(batch)
         samples_this_rank_with_id = _reroute_samples_to_hdp_ranks(
@@ -384,9 +408,10 @@ def wrap_dataloader(
             new_sample["labels"] = labels
             new_sample["loss_mask"] = loss_mask
             new_sample["position_ids"] = position_ids
-            new_sample["local_cp_size"] = torch.tensor(
-                partner_cp_size, dtype=torch.int32, device=dev
-            )
+            if scheduler_type is PackingScheduler.HYBRID_CP:
+                new_sample["local_cp_size"] = torch.tensor(
+                    partner_cp_size, dtype=torch.int32, device=dev
+                )
 
             # create cu_seqlens_padded
             lengths_padding = np.fromiter(
@@ -415,7 +440,9 @@ def wrap_dataloader(
             new_sample["cu_seqlens"] = cu_seqlens
 
             new_samples.append(new_sample)
-
+        # #debugmtl
+        # print(f"rank {parallel_state.get_data_parallel_rank
+        # (with_context_parallel=True)} new_samples length: {len(new_samples)}")
         new_data_iterator = RerunDataIterator(iter(new_samples))
 
         return (
@@ -460,15 +487,30 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         sum_seqlen = 0
         single_microbatch = []
 
+        # # debugmtl use 1 seq per microbatch
+        # num_micro_batches = len(sample_id_seqlens)//self.dp_size
+        # for i in range(num_micro_batches):
+        #     for j in range(self.dp_size):
+        #         packed_id_groups.append([i+j*num_micro_batches])
+
         for i in range(len(sample_id_seqlens)):
             if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
                 single_microbatch.append(i)
                 sum_seqlen += sample_id_seqlens[i][1]
             else:
-                groups.append(single_microbatch)
                 packed_id_groups.append(single_microbatch)
                 single_microbatch = [i]
                 sum_seqlen = sample_id_seqlens[i][1]
+        if len(single_microbatch) > 0:
+            packed_id_groups.append(single_microbatch)
+
+        # debugmtl
+        gbs_sum = 0
+        for i in packed_id_groups:
+            gbs_sum += len(i)
+        assert gbs_sum == len(
+            sample_id_seqlens
+        ), f"gbs_sum: {gbs_sum} != sample_id_seqlens length: {len(sample_id_seqlens)}"
 
         # we want the number of packed sequences to be multiple of dp_size
         # so we move few samples from previous microbatch
@@ -482,7 +524,7 @@ class NaiveSequencePackingScheduler(BaseScheduler):
                 assert i > 0, "Not enough samples to move"
                 if len(packed_id_groups[i]) > 1:
                     seq_id = packed_id_groups[i].pop()
-                    packed_id_groups[i].append(seq_id)
+                    packed_id_groups.append([seq_id])
                     num_to_move -= 1
                 else:
                     i -= 1
@@ -493,7 +535,9 @@ class NaiveSequencePackingScheduler(BaseScheduler):
             for j in range(self.cp_size * self.dp_size):
                 seq_id = int(i * self.dp_size + j / self.cp_size)
                 sample_id_groups[i].append(packed_id_groups[seq_id])
-
+        # debugmtl
+        # print(f"rank {parallel_state.get_data_parallel_rank(with_context_parallel=True)} \
+        # sample_id_groups: {len(sample_id_groups)}")
         return groups, sample_id_groups
 
 

@@ -664,12 +664,52 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
-        global_input_tokens = all_to_all(
-            self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
-        )
-        global_probs = all_to_all(
-            self.ep_group, permuted_probs, self.output_splits, self.input_splits
-        )
+        # debugmtl
+        # global_input_tokens = all_to_all(
+        #     self.ep_group, permutated_local_input_tokens,
+        # self.output_splits, self.input_splits
+        # )
+        # global_probs = all_to_all(
+        #     self.ep_group, permuted_probs, self.output_splits,
+        # self.input_splits
+        # )
+        try:
+            global_input_tokens = all_to_all(
+                self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
+            )
+            global_probs = all_to_all(
+                self.ep_group, permuted_probs, self.output_splits, self.input_splits
+            )
+        except RuntimeError as e:
+            # 获取 EP group 内的 rank（防止 group 还没初始化时报错）
+            try:
+                rank = torch.distributed.get_rank(self.ep_group)
+            except Exception:
+                rank = -1
+
+            print(f"[MoE all_to_all error] rank={rank}, err={e}")
+            print(
+                f"[MoE all_to_all debug] "
+                f"tokens_shape={getattr(permutated_local_input_tokens, 'shape', None)}, "
+                f"probs_shape={getattr(permuted_probs, 'shape', None)}"
+            )
+            print(
+                f"[MoE all_to_all debug] "
+                f"input_splits={self.input_splits}, sum={sum(self.input_splits) \
+                if self.input_splits is not None else None}, "
+                f"output_splits={self.output_splits}, sum={sum(self.output_splits) \
+                if self.output_splits is not None else None}"
+            )
+            print(
+                f"[MoE all_to_all debug] "
+                f"tokens_per_expert={self.tokens_per_expert}, "
+                f"sum={self.tokens_per_expert.sum() if \
+                hasattr(self.tokens_per_expert, 'sum') else None}"
+            )
+            torch.set_printoptions(profile="full")
+            print(f"hidden_states shape: {self.hidden_shape}")
+            print(f"routing_map: {self.routing_map}")
+            raise
 
         return global_input_tokens, global_probs
 

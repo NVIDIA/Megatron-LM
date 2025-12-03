@@ -37,6 +37,65 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
+# #debugmtl
+# _ACT_GRAD_DUMP_COUNTERS = {}
+
+# def _sanitize_name(name: str) -> str:
+#     return str(name).replace('/', '_').replace('\\', '_').replace('.', '_').replace(' ', '_')
+
+# def _next_act_dump_index(rank: int, layer_name: str) -> int:
+#     key = (rank, layer_name)
+#     cnt = _ACT_GRAD_DUMP_COUNTERS.get(key, 0) + 1
+#     _ACT_GRAD_DUMP_COUNTERS[key] = cnt
+#     return cnt
+
+# def get_debug_hook(layer_name: str):
+#     """
+#     Tensor-level grad hook: save activation grad by (rank, layer_name, index).
+#     """
+#     import os
+#     def hook(grad: torch.Tensor):
+#         if grad is None:
+#             return
+
+#         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+#         # 基础目录自行改成你想要的
+#         base_dir = "/home/tailaim/act_grad_dump"
+#         if not base_dir:
+#             return
+
+#         try:
+#             idx = _next_act_dump_index(rank, layer_name)
+#             layer_dir = os.path.join(
+#                 base_dir,
+#                 f"rank_{rank}",
+#                 _sanitize_name(layer_name),
+#             )
+#             os.makedirs(layer_dir, exist_ok=True)
+#             file_path = os.path.join(layer_dir, f"grad_{idx:06d}.pt")
+
+#             # 只前几次写盘，避免太多文件
+#             if idx <= 16:
+#                 torch.save(grad.detach().cpu(), file_path)
+
+#             # 只在第一次写时打印一行日志
+#             if idx == 1:
+#                 try:
+#                     g_shape = tuple(grad.shape)
+#                     g_dtype = str(grad.dtype)
+#                 except Exception:
+#                     g_shape = "unknown"
+#                     g_dtype = "unknown"
+#                 print(
+#                     f"[Rank {rank}] Saved act grad: layer={layer_name}, "
+#                     f"idx={idx:06d}, shape={g_shape}, dtype={g_dtype}, path={file_path}"
+#                 )
+#         except Exception as e:
+#             print(f"[Rank {rank}] act grad dump failed for {layer_name}: {e}")
+
+#     return hook
+
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -640,7 +699,6 @@ class GPTModel(LanguageModule):
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
 
-        # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
             assert (
                 in_inference_mode

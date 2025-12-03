@@ -43,6 +43,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.legacy.model.module import param_is_not_shared
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -514,6 +515,23 @@ def get_blend_and_blend_per_split(args):
 
     return blend, blend_per_split
 
+def get_packed_seq_params_on_this_pp_rank(batch = None):
+    """Get the sequence parameters on the current pipeline parallel rank."""
+    dev = torch.cuda.current_device()
+    if mpu.is_pipeline_first_stage():
+        cu_seqlens = batch['cu_seqlens']
+        cu_seqlens_padded = batch['cu_seqlens_padded']
+        max_seqlen = batch['max_seqlen']
+        local_cp_size = batch['local_cp_size'] if ('local_cp_size' in batch) else torch.tensor(
+                    -1, dtype=torch.int32, device=dev
+                )
+        packed_tensor = torch.cat([cu_seqlens, cu_seqlens_padded, max_seqlen, local_cp_size])
+        
+    elif mpu.is_pipeline_last_stage():
+        return None
+    else:
+        return P2PCommunicator.get_seq_param_on_this_pp_rank()
+    return P2PCommunicator.get_seq_param_on_this_pp_rank()
 
 def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 

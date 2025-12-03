@@ -480,7 +480,7 @@ def num_floating_point_operations(args, num_total_tokens_this_GB, sequence_squar
             )
             +                
             # Self Attention
-            standard_self_attn_term
+            self_attn_term
             
         )
         return total_floating_point_operations
@@ -1473,6 +1473,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     val,
                     group=mpu.get_data_parallel_group(with_context_parallel=True)
                 )
+                #debugmtl
+                print_rank_0(f"key: {key}, val: {val}")
                 loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
@@ -1781,6 +1783,9 @@ def training_log(
                 avg = total_loss_dict[key].item() / float(
                     max(1, total_loss_dict[advanced_iters_key])
                 )
+                #debugmtl
+                print_rank_0(f"in training_log, key: {key}, avg: {total_loss_dict[key].item()}, \
+                 advanced_iters_key: {total_loss_dict[advanced_iters_key]}")
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
@@ -2113,7 +2118,134 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+    # debugmtl
+    # def get_debug_hook(layer_name):
+    #     """
+    #     这是一个“生产 Hook 的工厂”。
+    #     调用它会返回一个已经记住了 layer_name 的 hook 函数。
+    #     """
+    #     def hook(module, grad_input, grad_output):
+    #         # 如果没梯度或者梯度为空，直接跳过
+    #         if not grad_output:
+    #             return
+            
+    #         g = grad_output[0]
+    #         if g is None:
+    #             return
+    #         if torch.distributed.is_initialized():
+    #             rank = torch.distributed.get_rank()
+    #             # 简单的统计
+    #         g_float = g.float()
+    #         g_max = g_float.max().item()
+    #         g_min = g_float.min().item()
+    #         g_mean = g_float.mean().item()
+    #         g_norm = torch.linalg.vector_norm(g_float, ord=2).item()
+    #         has_nan = torch.isnan(g_float).any().item()
+            
+    #         # 【关键】这里可以直接打印 layer_name
+    #         print(f"[Rank {rank}] [BWD] {layer_name:25s} | "
+    #                 f"Max: {g_max:.4e} | Min: {g_min:.4e} | Mean: {g_mean:.4e} | "
+    #                 f"Norm: {g_norm:.4e} | NaN: {has_nan}")
+            
+    #         # 如果发现 NaN，可以加个断点或者报错
+    #         # if has_nan:
+    #         #    raise RuntimeError(f"NaN found in {layer_name}")
 
+    #     return hook
+
+    # # 将每个参数（weight/bias 等）的梯度分别写入不同目录与文件
+    # def _sanitize_name(name: str) -> str:
+    #     return str(name).replace('/', '_').replace('\\', '_').replace('.', '_').replace(' ', '_')
+
+    # # 记录每个 (layer_name, param_name) 的输出次数
+    # _grad_dump_counters = {}
+
+    # def _next_dump_index(layer_name: str, param_name: str) -> int:
+    #     key = (layer_name, param_name)
+    #     count = _grad_dump_counters.get(key, 0) + 1
+    #     _grad_dump_counters[key] = count
+    #     return count
+
+    # def _dump_grad_to_file(grad: torch.Tensor, layer_name: str, param_name: str):
+    #     """
+    #     将梯度保存为 .pt 文件。目录结构：
+    #       {base_dir}/rank_{rank}/{layer_name}/{param_name}/grad_{k}.pt
+    #     其中 k 是此参数第 k 次写出的递增计数（从 1 开始，零填充）。
+    #     base_dir 优先读取 args.grad_dump_dir；否则读取环境变量 MEGATRON_GRAD_DUMP_DIR；
+    #     若都未设置，则不做任何保存。
+    #     """
+    #     base_dir = "/home/tailaim/grad_dump"
+    #     if not base_dir:
+    #         return
+    #     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    #     layer_dir = os.path.join(base_dir, f"rank_{rank}", _sanitize_name(layer_name), _sanitize_name(param_name))
+    #     try:
+    #         os.makedirs(layer_dir, exist_ok=True)
+    #         idx = _next_dump_index(layer_name, param_name)
+    #         file_path = os.path.join(layer_dir, f"grad_{idx:06d}.pt")
+    #         # 保存到 CPU，避免持有 GPU 内存
+    #         if idx < 16:
+    #             torch.save(grad.detach().cpu(), file_path)
+    #         # 打印保存信息与梯度形状
+    #         try:
+    #             g_shape = tuple(grad.shape)
+    #             g_dtype = str(grad.dtype)
+    #         except Exception:
+    #             g_shape = "unknown"
+    #             g_dtype = "unknown"
+    #         if idx == 1:
+    #             print(f"[Rank {rank}] Saved grad: layer={layer_name}, param={param_name}, idx={idx:06d}, "
+    #                 f"shape={g_shape}, dtype={g_dtype}, path={file_path}")
+    #     except Exception as e:
+    #         print(f"[Rank {rank}] grad dump failed for {layer_name}.{param_name}: {e}")
+
+    # def _register_param_grad_hooks(module: torch.nn.Module, layer_name: str):
+    #     """
+    #     为给定 module 的所有参数注册梯度 hook，逐个参数单独落盘。
+    #     """
+    #     for param_name, param in module.named_parameters(recurse=True):
+    #         if not isinstance(param, torch.Tensor) or not param.requires_grad:
+    #             continue
+    #         # 绑定默认参数，避免 late-binding
+    #         param.register_hook(lambda g, ln=layer_name, pn=param_name: _dump_grad_to_file(g, ln, pn))
+
+    # for chunk_id, model_chunk in enumerate(model):
+    #     prefix = f"Chunk{chunk_id}"
+    #     gpt_model = model_chunk.module.module
+    #     # --- 注册 Embedding ---
+    #     if hasattr(gpt_model, 'embedding'):
+    #         # 传入名字 "Embedding"
+    #         # gpt_model.embedding.register_full_backward_hook(
+    #         #     get_debug_hook(f"{prefix}.Embedding")
+    #         # )
+    #         # 为 Embedding 的每个参数注册梯度落盘
+    #         _register_param_grad_hooks(gpt_model.embedding, f"{prefix}.Embedding")
+            
+    #     if hasattr(gpt_model, 'output_layer'):
+    #         # 传入名字 "Embedding"
+    #         # gpt_model.output_layer.register_full_backward_hook(
+    #         #     get_debug_hook(f"{prefix}.OutputLayer")
+    #         # )
+    #         # 为 OutputLayer 的每个参数注册梯度落盘
+    #         _register_param_grad_hooks(gpt_model.output_layer, f"{prefix}.OutputLayer")
+
+    #     # --- 注册 Decoder Layers ---
+    #     if hasattr(gpt_model, 'decoder') and hasattr(gpt_model.decoder, 'layers'):
+    #         for i, layer in enumerate(gpt_model.decoder.layers):
+    #             # 传入名字 "Layer_0", "Layer_1" ...
+    #             # layer.register_full_backward_hook(
+    #             #     get_debug_hook(f"{prefix}.Layer_{i}")
+    #             # )
+    #             # 为该层的每个参数注册梯度落盘
+    #             _register_param_grad_hooks(layer, f"{prefix}.Layer_{i}")
+        
+    #     print_rank_0(f">>> {prefix} backward debug hook registered")
+    #     print_rank_0(f"model chunk is: {model_chunk.module.module}")
+    
+    #debugmtl
+    for chunk_id, model_chunk in enumerate(model): 
+        print_rank_0(f"model chunk is: {model_chunk.module.module}")
+        
     if getattr(args, 'perform_rl_step', False):
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
 

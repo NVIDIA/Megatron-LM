@@ -618,6 +618,12 @@ def topk_routing_with_score_function(
             (rows, top_indices), torch.ones_like(probs, dtype=routing_map.dtype), accumulate=False
         )
         routing_map = routing_map.bool()
+        # debugmtl
+        true_per_row = routing_map.sum(dim=1)  # tensor of shape [n]
+        assert torch.all(
+            true_per_row == 8
+        ), f"in topk routing_with_score_function row true counts not \
+        all 8, got: {true_per_row}, num_tokens: {num_tokens}, logits shape: {logits.shape}"
     else:
         # TODO Try using element-wise operations instead of scatter?
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
