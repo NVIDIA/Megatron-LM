@@ -107,7 +107,10 @@ class TestSharedExperts:
 
         # Create a dummy input tensor.
         hidden_states = torch.ones(
-            (32, 2, self.config.hidden_size), requires_grad=True, device="cuda", dtype=torch.bfloat16
+            (32, 2, self.config.hidden_size),
+            requires_grad=True,
+            device="cuda",
+            dtype=torch.bfloat16,
         )
         hidden_states_no_overlap = hidden_states.clone().detach().requires_grad_(True)
 

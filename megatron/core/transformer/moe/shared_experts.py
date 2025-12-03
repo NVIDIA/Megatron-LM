@@ -9,16 +9,6 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-
-class SharedExpertState(Enum):
-    """State machine states for SharedExpertMLP overlapped forward pass."""
-
-    IDLE = 0
-    PRE_FORWARD_COMM_DONE = 1
-    FC1_FORWARD_DONE = 2
-    FC2_FORWARD_DONE = 3
-    POST_FORWARD_COMM_DONE = 4
-
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
@@ -39,10 +29,17 @@ from megatron.core.utils import (
 )
 
 
-def overlap_state_check(
-    required_state: "SharedExpertState",
-    next_state: "SharedExpertState",
-):
+class SharedExpertState(Enum):
+    """State machine states for SharedExpertMLP overlapped forward pass."""
+
+    IDLE = 0
+    PRE_FORWARD_COMM_DONE = 1
+    FC1_FORWARD_DONE = 2
+    FC2_FORWARD_DONE = 3
+    POST_FORWARD_COMM_DONE = 4
+
+
+def overlap_state_check(required_state: "SharedExpertState", next_state: "SharedExpertState"):
     """
     Decorator to validate overlap state and cached variables before method execution,
     and update state after method execution.
@@ -56,9 +53,9 @@ def overlap_state_check(
         @wraps(method)
         def wrapper(self, *args, **kwargs):
             # Check overlap is enabled
-            assert self.config.moe_shared_expert_overlap, (
-                f"{method.__name__} requires --moe-shared-expert-overlap to be set"
-            )
+            assert (
+                self.config.moe_shared_expert_overlap
+            ), f"{method.__name__} requires --moe-shared-expert-overlap to be set"
             # Check state machine
             assert self._overlap_state == required_state, (
                 f"{method.__name__} must be called from {required_state.name} state, "
@@ -73,6 +70,7 @@ def overlap_state_check(
         return wrapper
 
     return decorator
+
 
 class _BackwardStreamWait(torch.autograd.Function):
     @staticmethod
@@ -213,9 +211,7 @@ class SharedExpertMLP(MLP):
         """Wait for the current stream to complete."""
         self.stream.wait_stream(torch.cuda.current_stream())
 
-    @overlap_state_check(
-        SharedExpertState.IDLE, SharedExpertState.PRE_FORWARD_COMM_DONE,
-    )
+    @overlap_state_check(SharedExpertState.IDLE, SharedExpertState.PRE_FORWARD_COMM_DONE)
     def pre_forward_comm(self, input, wait_current_stream=True):
         """
         All Gather for SP before forward.
@@ -237,7 +233,7 @@ class SharedExpertMLP(MLP):
             set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
 
     @overlap_state_check(
-        SharedExpertState.PRE_FORWARD_COMM_DONE, SharedExpertState.FC1_FORWARD_DONE,
+        SharedExpertState.PRE_FORWARD_COMM_DONE, SharedExpertState.FC1_FORWARD_DONE
     )
     def linear_fc1_forward_and_act(self, overlapped_comm_output=None):
         """
@@ -294,9 +290,7 @@ class SharedExpertMLP(MLP):
             # Make sure the shared expert fc1 backward is launched after the routed fc1 backward
             self.cached_fc2_input = _BackwardStreamWait.apply(intermediate_parallel, self.stream)
 
-    @overlap_state_check(
-        SharedExpertState.FC1_FORWARD_DONE, SharedExpertState.FC2_FORWARD_DONE,
-    )
+    @overlap_state_check(SharedExpertState.FC1_FORWARD_DONE, SharedExpertState.FC2_FORWARD_DONE)
     def linear_fc2_forward(self, overlapped_comm_output=None):
         """
         Do Linear FC2 forward.
@@ -311,7 +305,7 @@ class SharedExpertMLP(MLP):
             self.cached_fc2_input = None
 
     @overlap_state_check(
-        SharedExpertState.FC2_FORWARD_DONE, SharedExpertState.POST_FORWARD_COMM_DONE,
+        SharedExpertState.FC2_FORWARD_DONE, SharedExpertState.POST_FORWARD_COMM_DONE
     )
     def post_forward_comm(self):
         """
@@ -331,9 +325,7 @@ class SharedExpertMLP(MLP):
             self.cached_fc2_output = None
             set_tensor_grad_fn_sequence_sr(self.cached_output, torch.iinfo(torch.int).max)
 
-    @overlap_state_check(
-        SharedExpertState.POST_FORWARD_COMM_DONE, SharedExpertState.IDLE,
-    )
+    @overlap_state_check(SharedExpertState.POST_FORWARD_COMM_DONE, SharedExpertState.IDLE)
     def get_output(self):
         """
         Gets the module forward output.
