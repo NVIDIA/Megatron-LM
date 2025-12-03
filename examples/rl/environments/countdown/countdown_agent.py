@@ -3,14 +3,13 @@
 import random
 from typing import Any, Iterable
 
-from megatron.rl.agent.pass_at_evaluation_agent import PassAtEvaluationAgent
+from megatron.rl.agent.huggingface_dataset_agent import HFDatasetAgent
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 
-from .countdown import compute_score, test_dataset, train_dataset
+from .countdown import compute_score
 
 
-class CountdownAgent(RewardOnlyAgent):
-    env_id: str = "countdown"
+class CountdownAgent(RewardOnlyAgent, HFDatasetAgent):
 
     def make_prefix(self, target, nums) -> str:
         if self.chat_mode:
@@ -25,6 +24,12 @@ class CountdownAgent(RewardOnlyAgent):
         return prefix
 
     def get_dataset(self, validation: bool = False):
+        TRAIN_SIZE = 327680
+        TEST_SIZE = 1024
+
+        assert len(self.dataset) > TRAIN_SIZE + TEST_SIZE
+        train_dataset = self.dataset.select(range(TRAIN_SIZE))
+        test_dataset = self.dataset.select(range(TRAIN_SIZE, TRAIN_SIZE + TEST_SIZE))
         return train_dataset if not validation else test_dataset
 
     async def evaluation_prompts(
