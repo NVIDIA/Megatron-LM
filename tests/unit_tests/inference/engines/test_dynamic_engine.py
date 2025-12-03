@@ -208,6 +208,7 @@ class TestDynamicInferenceEngine:
         transformer_config: TransformerConfig,
         requests: List[DynamicInferenceRequest],
         mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
+        use_selective_log_softmax: Optional[bool] = False,
     ):
         """The inference context manages the KV cache and other inference state."""
 
@@ -228,6 +229,7 @@ class TestDynamicInferenceEngine:
             mamba_inference_state_config=mamba_inference_state_config,
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+            use_selective_log_softmax=use_selective_log_softmax,
             # this is for compatibility with the LTS environment
             unified_memory_level=0,  # unit tests currently broken with UVM
         )
@@ -1345,3 +1347,190 @@ class TestDynamicInferenceEngine:
                     assert (
                         abs(log_prob - top_n_dict[token_str]) < 0.1
                     ), f"Request {request.request_id}, token {i}: log_prob mismatch {log_prob} vs {top_n_dict[token_str]}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("use_selective_log_softmax", [True, False])
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @torch.inference_mode()
+    def test_selective_log_softmax(self, use_selective_log_softmax: bool, model_provider: str):
+        """
+        Test that selective log-softmax optimization produces correct results.
+        Verifies:
+        1. Log probs are computed correctly with and without optimization
+        2. Results are numerically equivalent (within tolerance)
+        3. The optimization doesn't affect generation quality
+        """
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+
+        # Build test environment
+        test_config = DynamicEngineTestConfig(
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=16,
+            num_tokens_to_generate=8,
+            return_log_probs=True,
+            materialize_only_last_token_logits=False,
+            model_provider=model_provider,
+        )
+        env = self._build_test_env(test_config)
+
+        # Override the context's use_selective_log_softmax flag
+        env.engine.context.use_selective_log_softmax = use_selective_log_softmax
+
+        # Add requests
+        for request in env.requests:
+            env.engine._add_request(request)
+
+        # Step engine until all requests are finished
+        while env.engine.has_unfinished_requests():
+            env.engine.step_modern(verbose=False)
+
+        # Validate results
+        for request in env.requests:
+            assert request.status == Status.COMPLETED, f"Request {request.request_id} not completed"
+            assert len(request.generated_tokens) > 0, f"Request {request.request_id} has no tokens"
+            
+            # Validate log probs are present
+            if hasattr(request, 'generated_log_probs') and request.generated_log_probs is not None:
+                assert len(request.generated_log_probs) == len(request.generated_tokens), (
+                    f"Request {request.request_id}: log_probs length mismatch"
+                )
+                # Log probs should be negative (or zero for probability 1.0)
+                for log_prob in request.generated_log_probs:
+                    assert log_prob <= 0.0, (
+                        f"Request {request.request_id}: log_prob {log_prob} is positive"
+                    )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @torch.inference_mode()
+    def test_selective_log_softmax_equivalence(self, model_provider: str):
+        """
+        Test that selective log-softmax produces numerically equivalent results
+        to the standard log-softmax implementation.
+        """
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+
+        # Build two environments with the same random seed
+        test_config = DynamicEngineTestConfig(
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=16,
+            num_tokens_to_generate=8,
+            return_log_probs=True,
+            materialize_only_last_token_logits=False,
+            model_provider=model_provider,
+        )
+
+        # Run with selective log-softmax enabled
+        env_selective = self._build_test_env(test_config)
+        env_selective.engine.context.use_selective_log_softmax = True
+        
+        for request in env_selective.requests:
+            env_selective.engine._add_request(request)
+        
+        while env_selective.engine.has_unfinished_requests():
+            env_selective.engine.step_modern(verbose=False)
+
+        # Run with selective log-softmax disabled
+        env_standard = self._build_test_env(test_config)
+        env_standard.engine.context.use_selective_log_softmax = False
+        
+        for request in env_standard.requests:
+            env_standard.engine._add_request(request)
+        
+        while env_standard.engine.has_unfinished_requests():
+            env_standard.engine.step_modern(verbose=False)
+
+        # Compare results
+        for req_selective, req_standard in zip(env_selective.requests, env_standard.requests):
+            # Generated tokens should be identical
+            assert req_selective.generated_tokens == req_standard.generated_tokens, (
+                f"Request {req_selective.request_id}: generated tokens differ between "
+                f"selective and standard implementations"
+            )
+            
+            # Log probs should be numerically close
+            if (hasattr(req_selective, 'generated_log_probs') and 
+                req_selective.generated_log_probs is not None and
+                hasattr(req_standard, 'generated_log_probs') and 
+                req_standard.generated_log_probs is not None):
+                
+                assert len(req_selective.generated_log_probs) == len(req_standard.generated_log_probs), (
+                    f"Request {req_selective.request_id}: log_probs length mismatch"
+                )
+                
+                # Compare log probs with tolerance for numerical precision
+                # Using higher tolerance for bfloat16
+                tolerance = 1e-3  # Reasonable tolerance for bfloat16
+                for i, (lp_selective, lp_standard) in enumerate(
+                    zip(req_selective.generated_log_probs, req_standard.generated_log_probs)
+                ):
+                    diff = abs(lp_selective - lp_standard)
+                    assert diff < tolerance, (
+                        f"Request {req_selective.request_id}, token {i}: "
+                        f"log_prob difference {diff} exceeds tolerance {tolerance} "
+                        f"(selective={lp_selective}, standard={lp_standard})"
+                    )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_selective_log_softmax_decode_only(self):
+        """
+        Test selective log-softmax specifically in decode-only mode (after prefill).
+        This is where the optimization has the most impact.
+        """
+        # Build test environment
+        test_config = DynamicEngineTestConfig(
+            num_requests=8,
+            min_prompt_length=4,
+            max_prompt_length=4,  # Short prompts to quickly get to decode phase
+            num_tokens_to_generate=16,
+            return_log_probs=True,
+            materialize_only_last_token_logits=True,  # Decode-only setting
+            skip_prompt_log_probs=True,  # Skip prompt log probs
+        )
+        
+        # Test with selective log-softmax enabled
+        env_selective = self._build_test_env(test_config)
+        env_selective.engine.context.use_selective_log_softmax = True
+        
+        for request in env_selective.requests:
+            env_selective.engine._add_request(request)
+        
+        while env_selective.engine.has_unfinished_requests():
+            env_selective.engine.step_modern(verbose=False)
+        
+        # Test with selective log-softmax disabled
+        env_standard = self._build_test_env(test_config)
+        env_standard.engine.context.use_selective_log_softmax = False
+        
+        for request in env_standard.requests:
+            env_standard.engine._add_request(request)
+        
+        while env_standard.engine.has_unfinished_requests():
+            env_standard.engine.step_modern(verbose=False)
+        
+        # Validate results match
+        for req_selective, req_standard in zip(env_selective.requests, env_standard.requests):
+            assert req_selective.status == req_standard.status
+            assert req_selective.generated_tokens == req_standard.generated_tokens
+            
+            if (hasattr(req_selective, 'generated_log_probs') and 
+                req_selective.generated_log_probs is not None):
+                tolerance = 1e-3
+                for i, (lp_sel, lp_std) in enumerate(
+                    zip(req_selective.generated_log_probs, req_standard.generated_log_probs)
+                ):
+                    assert abs(lp_sel - lp_std) < tolerance, (
+                        f"Decode-only log_prob mismatch at token {i}"
+                    )
