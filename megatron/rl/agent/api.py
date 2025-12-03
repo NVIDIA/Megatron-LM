@@ -8,8 +8,6 @@ from typing import Generic, TypeVar
 import numpy as np
 from pydantic import BaseModel
 
-from megatron.core.utils import trace_async_exceptions
-
 from ..__init__ import Request, TypeLookupable
 from ..inference import (
     ChatInferenceInterface,
@@ -19,6 +17,8 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
+
+from megatron.core.utils import trace_async_exceptions
 
 
 class AgentBaseModel(BaseModel, extra='allow'):

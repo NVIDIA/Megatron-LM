@@ -447,6 +447,7 @@ class SequencePacker:
         )
         loss_mask = torch.zeros((num_bins, self.bin_size), dtype=torch.float, device=device)
 
+        # TODO(jalbericiola): packing_info as a dataclass and not just a dict
         # Track packing information for unpacking later
         packing_info = {
             'bin_seq_indices': bin_seq_indices,  # Which original sequences are in each bin
@@ -545,11 +546,7 @@ def create_packed_seq_params_for_bin(
 
     # Build cumulative sequence lengths for actual sequences
     # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
-    cu_seqlens_list = [0]
-    cumsum = 0
-    for length in seq_lengths_in_bin:
-        cumsum += length
-        cu_seqlens_list.append(cumsum)
+    cu_seqlens_list = np.cumsum([0] + seq_lengths_in_bin)
 
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
 
@@ -797,6 +794,7 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, pac
                     packed_seq_params = None
                 else:
                     # Slice inputs to remove padding
+                    # dimension 0 is batch, with seq packing BS=1
                     tokens = tokens[:, :actual_len]
                     position_ids = position_ids[:, :actual_len]
                     # attention_mask is not used with THD format (cu_seqlens handles it)
