@@ -571,7 +571,7 @@ def main():
                     if req.sampling_params.return_log_probs:
                         result_dict["prompt_logprobs"] = getattr(req, 'prompt_log_probs', None)
                         result_dict["generated_logprobs"] = getattr(req, 'generated_log_probs', None)
-                        result_dict["log_probs"] = getattr(req, 'log_probs', None)
+                        result_dict["logprobs"] = getattr(req, 'log_probs', None)
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric
