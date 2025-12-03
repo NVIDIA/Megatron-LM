@@ -10,6 +10,7 @@ import torch
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 from megatron.core import mpu
+from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -21,6 +22,9 @@ from model_provider import model_provider
 
 stimer = StragglerDetector()
 
+
+import logging
+logging.basicConfig(level=logging.INFO, force=True)
 
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
@@ -278,30 +282,36 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
-        current_logprobs = get_logprobs(
+        logprobs_or_hidden_states = get_logprobs(
             model_to_use, tokens, position_ids, attention_mask, no_grad=False
         )
 
-        # Calculate loss using unified function
-        loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
-            calculate_grpo_loss(
-                current_logprobs=current_logprobs,
-                old_logprobs=old_logprobs,
-                ref_logprobs=ref_logprobs,
-                advantages=advantages,
-                clamp_eps_lower=args.grpo_clamp_eps_lower,
-                clamp_eps_upper=args.grpo_clamp_eps_upper,
-                kl_beta=args.grpo_kl_beta,
-                entropy_weight=args.grpo_entropy_term_weight,
-                inference_logprobs=inference_logprobs,
-                is_truncation_coef=args.rl_importance_sampling_truncation_coef,
-                seq_starts=seq_starts,
-                seq_lengths=seq_lengths,
+        if not is_pipeline_last_stage():
+            output_tensor = logprobs_or_hidden_states
+            kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = None, None, None, None, None
+        else:
+            # Calculate loss using unified function
+            current_logprobs = logprobs_or_hidden_states
+            loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+                calculate_grpo_loss(
+                    current_logprobs=current_logprobs,
+                    old_logprobs=old_logprobs,
+                    ref_logprobs=ref_logprobs,
+                    advantages=advantages,
+                    clamp_eps_lower=args.grpo_clamp_eps_lower,
+                    clamp_eps_upper=args.grpo_clamp_eps_upper,
+                    kl_beta=args.grpo_kl_beta,
+                    entropy_weight=args.grpo_entropy_term_weight,
+                    inference_logprobs=inference_logprobs,
+                    is_truncation_coef=args.rl_importance_sampling_truncation_coef,
+                    seq_starts=seq_starts,
+                    seq_lengths=seq_lengths,
+                )
             )
-        )
+            output_tensor = loss
 
     # loss_mask will not be applied to 0th token as we do not have a logprob for it.
-    return loss, partial(
+    return output_tensor, partial(
         loss_func,
         loss_mask,
         kl_term,

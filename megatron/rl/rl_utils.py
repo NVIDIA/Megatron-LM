@@ -23,12 +23,14 @@ from torch.utils.tensorboard import SummaryWriter
 from wandb import wandb_run
 
 from megatron.core import mpu
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.utils import get_asyncio_loop
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.optimizer import MegatronOptimizer
-from megatron.core.parallel_state import get_tensor_model_parallel_src_rank
+from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, is_pipeline_last_stage, get_pipeline_model_parallel_last_rank, get_pipeline_model_parallel_group
+from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
@@ -724,20 +726,24 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
             # This is a hack to fix megatron's behaviour when flash-decode affects the training code flow.
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
+            fp32_output = not (args.fp16 or args.bf16)
             with torch.no_grad() if no_grad else nullcontext():
-                logits = model(
+                logits_or_hidden_states = model(
                     tokens,
                     position_ids,
                     attention_mask,
                     runtime_gather_output=True,
-                    fp32_output=not (args.fp16 or args.bf16),
+                    fp32_output=fp32_output,
                 )
             model.config.flash_decode = flash_decode
             # We do not need logprobs for the n+1 token.
-        with nvtx_range("log-softmax", time=False):
-            logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
-
-    return logprobs
+        
+        if not is_pipeline_last_stage():
+            return logits_or_hidden_states
+        else:
+            with nvtx_range("log-softmax", time=False):
+                logprobs = selective_log_softmax(logits_or_hidden_states[:, :-1, :], tokens[:, 1:])
+            return logprobs
 
 
 def compute_group_stats(
@@ -1598,12 +1604,6 @@ def prepare_data_for_update(
             )
             original_loss_mask[~generation_masks] = 0.0
 
-        if not args.rl_use_sequence_packing:
-            # Use original masks if not packing
-            attention_mask = original_attention_mask
-            loss_mask = original_loss_mask
-            position_ids = original_position_ids
-
         with torch.no_grad(), nvtx_range("compute_logprobs"):
             timers('compute-logprobs', log_level=0).start()
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
@@ -1616,33 +1616,64 @@ def prepare_data_for_update(
             else:
                 compute_trajs = original_trajs
                 compute_position_ids = original_position_ids
-                compute_attention_mask = original_attention_mask
+                compute_attention_mask = None
                 use_packed_computation = False
+
+        # Wrap forward_backward_func for Full iteration CUDA graph
+        forward_backward_func = get_forward_backward_func()
+        if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+            forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+
+        def logprobs_forward_step(data_iterator, model):
+            batch_data = next(data_iterator)
+            if len(batch_data) == 2:
+                b_trajs, b_posids = batch_data
+                b_attn_mask = original_attention_mask
+            else:
+                b_trajs, b_posids, b_attn_mask = batch_data
+            return get_logprobs(model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask.cuda() if b_attn_mask is not None else None, no_grad=True), None
+
 
         with nvtx_range("create-logprobs-dataloader"):
             data_iter = DataLoader(
                 TensorDataset(compute_trajs, compute_position_ids), batch_size=args.micro_batch_size
             )
+            if compute_attention_mask is not None:
+                data_iter = DataLoader(
+                    TensorDataset(compute_trajs, compute_position_ids, compute_attention_mask), batch_size=args.micro_batch_size
+                )
+            else:
+                data_iter = DataLoader(
+                    TensorDataset(compute_trajs, compute_position_ids), batch_size=args.micro_batch_size
+                )
             old_logprobs = []
 
             # Compute logprobs
-            for batch_idx, (b_trajs, b_posids) in enumerate(data_iter):
-                # Get attention mask slice
-                if compute_attention_mask is not None:
-                    start_idx = batch_idx * args.micro_batch_size
-                    end_idx = min(
-                        start_idx + args.micro_batch_size, compute_attention_mask.shape[0]
-                    )
-                    b_attn_mask = compute_attention_mask[start_idx:end_idx].cuda()
-                else:
-                    b_attn_mask = None
-
-                logprobs = get_logprobs(
-                    model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask, no_grad=True
+            data_iterator = iter(data_iter)
+            for iteration, i in enumerate(range(len(data_iter))):
+                output_tensor = forward_backward_func(
+                    forward_step_func=logprobs_forward_step, 
+                    data_iterator=data_iterator, 
+                    model=model,
+                    num_microbatches=1,
+                    seq_length=args.seq_length,
+                    micro_batch_size=args.micro_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    forward_only=True,
+                    adjust_tensor_shapes_fn=None,
                 )
-                old_logprobs.append(logprobs.detach().cpu())
+                if is_pipeline_last_stage():
+                    old_logprobs.append(
+                        output_tensor[0].detach()
+                    )
 
-            old_logprobs = torch.concat(old_logprobs, dim=0)
+            if is_pipeline_last_stage():
+                old_logprobs = torch.concat(old_logprobs, dim=0)
+            else:
+                old_logprobs = torch.empty(len(compute_trajs), args.seq_length-1, dtype=torch.bfloat16, device=torch.cuda.current_device())
+
+            dist.broadcast(old_logprobs, src=get_pipeline_model_parallel_last_rank(), group=get_pipeline_model_parallel_group())
+            old_logprobs = old_logprobs.cpu()
 
             # Handle packed vs unpacked logprobs
             if use_packed_computation and 'packing_info' in packing_context:
@@ -1705,23 +1736,30 @@ def prepare_data_for_update(
             ref_logprobs = []
 
             # Compute reference logprobs
-            for batch_idx, (b_trajs, b_posids) in enumerate(data_iter):
-                # Get attention mask slice
-                if compute_attention_mask is not None:
-                    start_idx = batch_idx * args.micro_batch_size
-                    end_idx = min(
-                        start_idx + args.micro_batch_size, compute_attention_mask.shape[0]
-                    )
-                    b_attn_mask = compute_attention_mask[start_idx:end_idx].cuda()
-                else:
-                    b_attn_mask = None
-
-                logprobs = get_logprobs(
-                    model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask, no_grad=True
+            data_iterator = iter(data_iter)
+            for iteration, i in enumerate(range(len(data_iter))):
+                output_tensor = forward_backward_func(
+                    forward_step_func=logprobs_forward_step, 
+                    data_iterator=data_iterator, 
+                    model=model,
+                    num_microbatches=1,
+                    seq_length=args.seq_length,
+                    micro_batch_size=args.micro_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    forward_only=True,
+                    adjust_tensor_shapes_fn=None,
                 )
-                ref_logprobs.append(logprobs.detach().cpu())
+                if is_pipeline_last_stage():
+                    ref_logprobs.append(
+                        output_tensor[0].detach()
+                    )
 
-            ref_logprobs = torch.concat(ref_logprobs, dim=0)
+            if is_pipeline_last_stage():
+                ref_logprobs = torch.concat(ref_logprobs, dim=0)
+            else:
+                ref_logprobs = torch.empty(len(compute_trajs), args.seq_length-1, dtype=torch.bfloat16, device=torch.cuda.current_device())
+            dist.broadcast(ref_logprobs, src=get_pipeline_model_parallel_last_rank(), group=get_pipeline_model_parallel_group())
+            ref_logprobs = ref_logprobs.cpu()
 
             # Handle packed vs unpacked logprobs
             if use_packed_computation and 'packing_info' in packing_context:

@@ -135,6 +135,8 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         use_flashinfer_fused_rope=None,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
+        cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
     )
 
@@ -153,6 +155,8 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         context=inference_context,
         enable_cuda_graph=enable_cuda_graph,
         random_seed=args.seed,
+        track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+        enable_chunked_prefill=not args.disable_chunked_prefill,
         inference_logging_step_interval=inference_logging_step_interval,
     )
 
@@ -233,7 +237,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                            "wandb module is available. Inference logging will be disabled.")
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model, inference_logging_step_interval, metrics_writer)
-        await inference_engine.start_listening_to_data_parallel_coordinator(inference_coordinator_port=41521, launch_inference_coordinator=True)
+        await inference_engine.start_listening_to_data_parallel_coordinator(inference_coordinator_port=41521, launch_inference_coordinator=True, verbose=True)
         if dist.get_rank() == 0:
             # TODO: We have to do this only on the rank 0 process, should be fixed in the future when we have support for multiple inference clients. !2278
             client = InferenceClient(inference_coordinator_port=41521)
