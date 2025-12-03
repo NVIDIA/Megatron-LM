@@ -15,7 +15,9 @@ def build_tokenizer(args):
     if args.tokenizer_type in MEGATRON_TOKENIZERS:
         tokenizer_library = 'megatron'
         tokenizer_path = args.tokenizer_type
-        kwargs['additional_special_tokens'] = args.tokenizer_special_tokens if args.tokenizer_special_tokens else []
+        kwargs['additional_special_tokens'] = (
+            args.tokenizer_special_tokens if args.tokenizer_special_tokens else []
+        )
         if tokenizer_path == 'BertWordPieceCase':
             special_tokens = {}
             special_tokens['additional_special_tokens'] = [f'<extra_id_{i}>' for i in range(100)]
@@ -44,7 +46,9 @@ def build_tokenizer(args):
         tokenizer_path = args.tokenizer_model
         kwargs['vocab_file'] = args.vocab_file
         kwargs['merges_file'] = args.merge_file
-        kwargs['additional_special_tokens'] = args.tokenizer_special_tokens if args.tokenizer_special_tokens else []
+        kwargs['additional_special_tokens'] = (
+            args.tokenizer_special_tokens if args.tokenizer_special_tokens else []
+        )
         kwargs['use_fast'] = args.tokenizer_hf_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
         kwargs['include_special_tokens'] = args.tokenizer_hf_include_special_tokens
