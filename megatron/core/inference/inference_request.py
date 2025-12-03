@@ -326,6 +326,7 @@ class DynamicInferenceRequest(InferenceRequest):
             "return_log_probs",
             "skip_prompt_log_probs",
             "top_n_logprobs",
+            "return_prompt_top_n_logprobs",
         ]
         return {k: v for v, k in enumerate(ret)}
 
