@@ -624,7 +624,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of tokens and probabilities after All-to-All.
         """
-        # Make sure the shared experts fc1 is not launched before dispatch.
+        # Make sure the shared experts fc1 is not launched too early when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
         # Perform expert parallel AlltoAll communication
@@ -784,7 +784,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             Tokens after the All-to-All communication for combining.
         """
-        # Make sure the shared experts fc2 is not launched before combine.
+        # Make sure the shared experts fc2 is not overlapped with routed experts fc1 
+        # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
         # Perform expert parallel AlltoAll communication
@@ -796,6 +797,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits,
             use_nccl_stream=True,
         )
+        if self.shared_experts is not None:
+            self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
+            self.shared_experts.post_forward_comm()
         return permutated_local_input_tokens
 
     def combine_postprocess(self, permutated_local_input_tokens):
@@ -811,9 +815,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
-        if self.shared_experts is not None:
-            self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
-            self.shared_experts.post_forward_comm()
 
         # Unpermutation 1: AlltoAll output to output
         output = unpermute(
@@ -1418,8 +1419,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # Initialize metadata
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
-        if self.shared_experts is not None:
-            self.shared_experts.wait_current_stream()
         self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs
 
@@ -1447,7 +1446,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of dispatched tokens and probabilities.
         """
-        # Make sure the shared experts fc1 is not launched before dispatch.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
         dispatched_hidden_states = self._comm_manager.dispatch(
@@ -1505,7 +1503,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             Combined tokens after fused un-permutation and communication.
         """
-        # Make sure the shared experts fc2 is not launched before combine.
+        # Make sure the shared experts fc2 is not overlapped with routed experts GEMM 
+        # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
