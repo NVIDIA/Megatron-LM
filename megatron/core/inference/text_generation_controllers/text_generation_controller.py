@@ -104,6 +104,9 @@ class TextGenerationController:
         self.return_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
         self.skip_prompt_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
         self.top_n_logprobs_cuda = torch.empty(max_requests, dtype=torch.int32, device=device)
+        self.return_prompt_top_n_logprobs_cuda = torch.empty(
+            max_requests, dtype=torch.bool, device=device
+        )
 
         # Used for inefficient torch sampling.
         self.torch_sampling_buckets: List[Tensor] = []
@@ -344,18 +347,18 @@ class TextGenerationController:
                 top_n_logprobs_this_step = top_n_logits_this_step.values.cpu()
                 top_n_logprobs_indices = top_n_logits_this_step.indices.cpu()
 
-                # If we skip prompt log_probs then we only append for generated tokens.
-                # Otherwise we always append to the logprobs dict.
-                if sampling_params.skip_prompt_log_probs:
-                    mask = generation_started.cpu()
-                else:
+                # If we return prompt top_n_log_probs then we always append to the
+                # logprobs dict. Otherwise we only append for generated tokens.
+                if sampling_params.return_prompt_top_n_logprobs:
                     mask = torch.ones(batch_size, dtype=torch.bool)
+                else:
+                    mask = generation_started.cpu()
 
                 self._update_top_n_logprobs_dict(
                     top_n_logprobs_this_step, top_n_logprobs_indices, mask, top_n_logprobs_dict
                 )
             else:
-                assert not sampling_params.skip_prompt_log_probs
+                assert sampling_params.return_prompt_top_n_logprobs
 
                 # Compute the prompt logprobs
                 batch_size, seq_length, _ = logits.shape
@@ -625,6 +628,9 @@ class TextGenerationController:
         self.top_n_logprobs_cuda[:active_request_count] = request_metadata[
             :, request_metadata_labels["top_n_logprobs"]
         ].to(dtype=torch.int32, copy=True, non_blocking=True)
+        self.return_prompt_top_n_logprobs_cuda[:active_request_count] = request_metadata[
+            :, request_metadata_labels["return_prompt_top_n_logprobs"]
+        ].to(dtype=torch.bool, copy=True, non_blocking=True)
 
         if backend == "torch":
             # Bucketize the core sampling parameters.
@@ -717,14 +723,14 @@ class TextGenerationController:
 
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Check if any request wants prompt top-n logprobs (top_n > 0 AND skip_prompt_log_probs = False)
+        # Check if any request wants prompt top-n logprobs (top_n > 0 AND return_prompt_top_n = True)
         # Create a copy to avoid modifying the original tensor with in-place operations
         to_check = (self.top_n_logprobs_cuda[:active_request_count] > 0).clone()
-        to_check &= ~self.skip_prompt_log_probs_cuda[:active_request_count]
+        to_check &= self.return_prompt_top_n_logprobs_cuda[:active_request_count]
 
         assert not (
             to_check.any() and materialize_only_last_token_logits
-        ), "Prompt top-n logprobs cannot be calculated if only last token logits are materialized. Set materialize_only_last_token_logits to False in DynamicInferenceContext or set skip_prompt_log_probs to True in SamplingParams."
+        ), "Prompt top-n logprobs cannot be calculated if only last token logits are materialized. Set materialize_only_last_token_logits to False in DynamicInferenceContext or set return_prompt_top_n_logprobs to False in SamplingParams."
 
         # Check if any request has top_n_logprobs > 0
         return (self.top_n_logprobs_cuda[:active_request_count] > 0).any()
@@ -804,10 +810,10 @@ class TextGenerationController:
                 request_log_probs = log_probs_per_request[
                     req_idx
                 ]  # [num_tokens_for_request, vocab_size]
-                skip_prompt = bool(self.skip_prompt_log_probs_cuda[req_idx].item())
+                return_prompt_top_n = bool(self.return_prompt_top_n_logprobs_cuda[req_idx].item())
 
-                # If skip_prompt_log_probs is True, only compute for last token
-                if skip_prompt and request_log_probs.size(0) > 1:
+                # If return_prompt_top_n_logprobs is False, only compute for last token
+                if not return_prompt_top_n and request_log_probs.size(0) > 1:
                     # Only compute top-n for the last token (first generated token)
                     top_n_logits = torch.topk(request_log_probs[-1], k=top_n)
                     top_n_results[req_idx] = [
@@ -1253,7 +1259,7 @@ class TextGenerationController:
 
                 logits_for_top_n_prompt_logprobs = (
                     logits
-                    if context_start_position == 0 and not sampling_params.skip_prompt_log_probs
+                    if context_start_position == 0 and sampling_params.return_prompt_top_n_logprobs
                     else None
                 )
                 sampled_logits = self.sample_from_logits(
@@ -1411,7 +1417,7 @@ class TextGenerationController:
                     input_prompt_length - 1 : (input_prompt_length + required_sequence_length - 1),
                 ].tolist()
             if sampling_params.top_n_logprobs > 0:
-                if not sampling_params.skip_prompt_log_probs:
+                if sampling_params.return_prompt_top_n_logprobs:
                     assert (
                         len(top_n_logprobs_dict[idx])
                         >= input_prompt_length + required_sequence_length - 1
