@@ -301,9 +301,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert (
                 mamba_ssm_states_shape is not None
             ), "`mamba_ssm_states_shape` must be specified for hybrid models"
-            assert not (
-                num_cuda_graphs is not None and use_cuda_graphs_for_non_decode_steps
-            ), "Non-decode CUDA graphs not yet supported for hybrid models"
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
@@ -970,8 +967,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             attn_metadata.reset()
         self.active_attn_metadata = None
 
+        # TODO(ksanthanam): Check if this is actually necessary
         if self.is_hybrid_model:
-            self.mamba_metadata.reset_cudagraph_mapping()
+            self.mamba_metadata.request_to_mamba_state_idx_for_step.fill_(-1)
 
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
@@ -1198,7 +1196,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
-            batch_dimensions, self.cuda_graph_batch_dimensions_list
+            batch_dimensions, self.cuda_graph_batch_dimensions_list, strict=self.is_hybrid_model
         )
         self._using_cuda_graph_this_step = best_graph is not None
         if construct_graph_dimensions is not None:
@@ -1277,15 +1275,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             padded_batch_dimensions=self.padded_batch_dimensions,
         )
 
-        # Create Mamba state block table if it's a hybrid model
         if self.is_hybrid_model:
-            active_mamba_indices = self.mamba_metadata.request_to_mamba_state_idx[
-                self.paused_request_count : self.total_request_count
-            ]
-            if self.is_decode_only() or self.using_cuda_graph_this_step():
-                self.mamba_metadata.update_cudagraph_mapping(
-                    active_mamba_indices, self.total_request_count - self.paused_request_count
-                )
+            active_mamba_indices_view = self.mamba_metadata.request_to_mamba_state_idx[active_slice]
+            self.mamba_metadata.update(
+                active_mamba_indices_view,
+                batch_dimensions=attn_dimensions,
+                padded_batch_dimensions=self.padded_batch_dimensions,
+            )
 
     def reset(self) -> None:
         """Reset entire context.

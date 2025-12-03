@@ -5,6 +5,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+
 
 @dataclass
 class MambaInferenceStateConfig:
@@ -39,9 +41,8 @@ class MambaMetadata:
         self.request_to_mamba_state_idx = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
-
-        # Separate mapping used only for CUDA graph compatibility
-        self.request_to_mamba_state_idx_cudagraph_only = torch.full(
+        # Copy of the request to slot mapping to use fo the step. Includes padding tokens.
+        self.request_to_mamba_state_idx_for_step = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
@@ -56,7 +57,6 @@ class MambaMetadata:
         Resets all Mamba states and frees all allocated slots.
         """
         self.request_to_mamba_state_idx.fill_(-1)
-        self.request_to_mamba_state_idx_cudagraph_only.fill_(-1)
 
         # Re-initialize the free slot pool
         self.mamba_state_free_slots = torch.arange(
@@ -64,14 +64,11 @@ class MambaMetadata:
         )
         self.mamba_state_free_slot_count = self.max_requests
 
-    def reset_cudagraph_mapping(self) -> None:
-        """
-        Resets only the CUDA graph mapping tensor.
-        """
-        self.request_to_mamba_state_idx_cudagraph_only.fill_(-1)
-
-    def update_cudagraph_mapping(
-        self, active_mamba_indices: torch.Tensor, num_active_requests: int
+    def update(
+        self,
+        active_mamba_indices: torch.Tensor,
+        batch_dimensions: InferenceBatchDimensions,
+        padded_batch_dimensions: InferenceBatchDimensions,
     ) -> None:
         """
         Updates the dedicated CUDA graph mapping tensor with the indices
@@ -82,7 +79,35 @@ class MambaMetadata:
                                            for active requests.
             num_active_requests (int): The number of active requests.
         """
-        self.request_to_mamba_state_idx_cudagraph_only[0:num_active_requests] = active_mamba_indices
+        # TODO: Support chunked prefill in InferenceBatchDimensions
+
+        real_decode_count = batch_dimensions.decode_req_count
+        real_prefill_count = batch_dimensions.prefill_req_count
+
+        padded_decode_count = padded_batch_dimensions.decode_req_count
+
+        # Copy real decode indices to the start of the buffer.
+        if real_decode_count > 0:
+            self.request_to_mamba_state_idx_for_step[:real_decode_count] = active_mamba_indices[
+                :real_decode_count
+            ]
+
+        # Pad the rest of the decode section with -1
+        if padded_decode_count > real_decode_count:
+            self.request_to_mamba_state_idx_for_step[real_decode_count:padded_decode_count].fill_(
+                -1
+            )
+
+        # Copy real prefill indices after the decode indices.
+        if real_prefill_count > 0:
+            self.request_to_mamba_state_idx_for_step[
+                padded_decode_count : padded_decode_count + real_prefill_count
+            ] = active_mamba_indices[real_decode_count : real_decode_count + real_prefill_count]
+
+        # Pad the rest of the prefill section (if any remaining space in buffer)
+        total_used = padded_decode_count + real_prefill_count
+        if total_used < self.max_requests:
+            self.request_to_mamba_state_idx_for_step[total_used:].fill_(-1)
 
     def allocate_slot(self) -> Optional[int]:
         """
