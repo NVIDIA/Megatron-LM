@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import List
 
@@ -56,31 +55,6 @@ class NCCLCopyService(CopyService):
             len(self.recv_ops),
             total_ops,
         )
-
-        # Dump only lightweight tensor metadata for repro: shapes, dtypes, and ranks.
-        dump_filename = os.path.join(os.getcwd(), f"nccl_copy_service_rank{self.rank}.pt")
-        payload = {
-            "rank": self.rank,
-            "world_size": self.world_size,
-            "send_ops": [
-                {
-                    "shape": tuple(op.tensor.size()),
-                    "dtype": str(op.tensor.dtype).replace("torch.", ""),
-                    "dest_rank": op.dest_rank,
-                }
-                for op in self.send_ops
-            ],
-            "recv_ops": [
-                {
-                    "shape": tuple(op.tensor.size()),
-                    "dtype": str(op.tensor.dtype).replace("torch.", ""),
-                    "src_rank": op.src_rank,
-                }
-                for op in self.recv_ops
-            ],
-        }
-        torch.save(payload, dump_filename)
-        logger.info(f"NCCLCopyService dumped tensor metadata to {dump_filename}")
 
         p2p_ops = []
         for op in self.send_ops:
