@@ -408,7 +408,7 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
-    def suspend(self, tokenizer: MegatronTokenizer | None):
+    def suspend(self, tokenizer: MegatronTokenizer | None = None):
         """Suspend request by storing references to previous prompt, generations,
         and sampling params.
 
@@ -450,7 +450,7 @@ class DynamicInferenceRequestRecord:
         )
         self.requests.append(new_request)
 
-    def merge(self, tokenizer: MegatronTokenizer | None) -> DynamicInferenceRequest:
+    def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
         """Merge requests into a single suspend-agnostic request object.
 
         Args:
