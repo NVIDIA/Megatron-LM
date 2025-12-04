@@ -7,6 +7,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec_for_backend,
+    is_linear_attention_variant,
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -537,7 +538,7 @@ def get_gpt_decoder_layer_specs(
                 moe_grouped_gemm = None
             if attention_type == "linear_attention":
                 multi_latent_attention = None
-                if config.is_linear_attention_model:
+                if is_linear_attention_variant(config.experimental_attention_variant):
                     # There exists linear attention layer in the model.
                     experimental_attention_variant = config.experimental_attention_variant
                 else:
@@ -545,7 +546,7 @@ def get_gpt_decoder_layer_specs(
                     continue
             else:
                 multi_latent_attention = config.multi_latent_attention
-                if config.is_linear_attention_model:
+                if is_linear_attention_variant(config.experimental_attention_variant):
                     # experimental_attention_variant is a linear attention variant,
                     # so softmax attention is regular attention layer.
                     experimental_attention_variant = None
@@ -601,12 +602,13 @@ def get_gpt_decoder_layer_specs(
             f"current linear attention pattern: {config.linear_attention_freq}"
         )
     elif config.linear_attention_freq is None:
-        if not config.is_linear_attention_model:
+        if not is_linear_attention_variant(config.experimental_attention_variant):
             linear_attention_pattern = [0] * config.num_layers
         else:
             linear_attention_pattern = [1] * config.num_layers
             warnings.warn(
-                "Linear attention type is specified but linear_attention_freq is None. "
+                f"Linear attention type {config.experimental_attention_variant} is specified "
+                "but linear_attention_freq is None. "
                 "Setting linear_attention_pattern to [1] * config.num_layers as default."
             )
     else:

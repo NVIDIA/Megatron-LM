@@ -238,14 +238,12 @@ class TransformerConfig(ModelParallelConfig):
     experimental_attention_variant: Optional[str] = None
     """Type of attention variant to use. Currently support gated_delta_net and dsa."""
 
-    is_linear_attention_model: bool = False
-    """Whether the model is a linear attention model."""
-
     ####################
     # attention variant: gated_delta_net
     ####################
     linear_attention_type: Optional[str] = None
-    """Type of linear attention to use. Deprecated."""
+    """Type of linear attention to use.
+    Deprecated. Use experimental_attention_variant instead."""
 
     linear_attention_freq: Optional[Union[int, List[int]]] = None
     """Frequency between LA (linear attention) layers 
@@ -889,7 +887,6 @@ class TransformerConfig(ModelParallelConfig):
                 "use experimental_attention_variant instead."
             )
             self.experimental_attention_variant = self.linear_attention_type
-            self.is_linear_attention_model = True
             self.linear_attention_type = None
 
         if self.experimental_attention_variant in ["gated_delta_net"]:
