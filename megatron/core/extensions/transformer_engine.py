@@ -1943,21 +1943,33 @@ try:
         freqs: torch.Tensor,
         transpose_output_memory: bool = False,
         interleaved: bool = False,
+        start_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply rotary positional embedding to input tensor T in `sbhd` format."""
         if transpose_output_memory:
             warnings.warn(
                 "transpose_output_memory is not supported by TE's fused RoPE and will be ignored."
             )
+
+        conditional_kwargs = {}
+        if is_te_min_version("2.10.0.dev0"):
+            conditional_kwargs["start_positions"] = start_positions
+        else:
+            if start_positions is not None:
+                raise ValueError(
+                    "Only TE >= 2.10.0.dev0 supports offset RoPE application with "
+                    "`start_positions` argument."
+                )
+
         if is_te_min_version("2.3.0"):
-            return apply_rotary_pos_emb(
-                t, freqs, tensor_format="sbhd", interleaved=interleaved, fused=True
-            )
+            conditional_kwargs["interleaved"] = interleaved
         else:
             if interleaved:
                 raise ValueError("Only TE >= 2.3.0 supports interleaved fused RoPE.")
 
-            return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
+        return apply_rotary_pos_emb(
+            t, freqs, tensor_format="sbhd", fused=True, **conditional_kwargs
+        )
 
     def fused_apply_rotary_pos_emb_thd(
         t: torch.Tensor,
@@ -1965,25 +1977,31 @@ try:
         freqs: torch.Tensor,
         cp_size: int = 1,
         cp_rank: int = 0,
+        start_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
         """
-        if is_te_min_version("1.12.0", check_equality=True):
-            return apply_rotary_pos_emb(
-                t,
-                freqs,
-                tensor_format="thd",
-                fused=True,
-                cu_seqlens=cu_seqlens,
-                cp_size=cp_size,
-                cp_rank=cp_rank,
-            )
+        conditional_kwargs = {}
+        if is_te_min_version("2.10.0.dev0"):
+            conditional_kwargs["start_positions"] = start_positions
         else:
-            assert cp_size == 1, "Only TE >= 1.12 supports RoPE fusion for THD format with CP."
-            return apply_rotary_pos_emb(
-                t, freqs, tensor_format="thd", fused=True, cu_seqlens=cu_seqlens
-            )
+            if start_positions is not None:
+                raise ValueError(
+                    "Only TE >= 2.10.0.dev0 supports offset RoPE application with "
+                    "`start_positions` argument."
+                )
+
+        if is_te_min_version("1.12.0", check_equality=True):
+            conditional_kwargs["cp_size"] = cp_size
+            conditional_kwargs["cp_rank"] = cp_rank
+        else:
+            if cp_size > 1:
+                raise ValueError("Only TE >= 1.12.0 supports CP RoPE application for THD format.")
+
+        return apply_rotary_pos_emb(
+            t, freqs, tensor_format="thd", fused=True, cu_seqlens=cu_seqlens, **conditional_kwargs
+        )
 
 except ImportError:
     pass
