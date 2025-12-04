@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -1222,6 +1223,8 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "preprocess", **kwargs)
 
     def decorator(func):
+
+        @functools.wraps(func)
         def wrapped_func(moe_layer, *args, **kwargs):
             """
             Check if we should skip executing the original function based on the current
