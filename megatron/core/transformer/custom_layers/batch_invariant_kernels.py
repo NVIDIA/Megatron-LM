@@ -81,6 +81,7 @@ def matmul_kernel_persistent(
     C_LARGE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
+    """Persistent matmul Triton kernel backing `matmul_persistent`."""
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -708,6 +709,11 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         out_dtype: Optional[torch.dtype],
         layout: str,
     ):
+        """Forward pass computing batch-invariant TE GEMM.
+
+        Respects TE's flexible `layout` semantics, flattens leading dimensions of
+        the input as needed, applies optional bias, and casts to `out_dtype`.
+        """
         assert isinstance(layout, str) and len(layout) == 2, f"Unsupported layout: {layout}"
         transa = layout[0].upper() == "T"
         transb = layout[1].upper() == "T"
@@ -754,6 +760,11 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        """Backward pass for batch-invariant TE GEMM.
+
+        Computes gradients w.r.t. A, B, and optional bias while mirroring the
+        reshaping/layout logic used in the forward pass.
+        """
         A, B = ctx.saved_tensors
         transa = ctx.transa
         transb = ctx.transb
@@ -855,6 +866,11 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float, zero_centered_gamma: bool):
+        """Forward pass for batch-invariant RMSNorm.
+
+        Normalizes `x` using an RMSNorm-style statistic computed via `mean_dim`,
+        applies affine `weight`, and stores intermediate rsigma for backward.
+        """
         if not x.is_cuda:
             raise RuntimeError("Batch-invariant RMSNorm requires CUDA tensors.")
         if not _is_supported_dtype_for_bik(x.dtype):
@@ -881,6 +897,11 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        """Backward pass for batch-invariant RMSNorm.
+
+        Computes gradients w.r.t. input and weight while matching TE's fp32
+        accumulation and reduction behavior for numerical stability.
+        """
         x, weight, rsigma = ctx.saved_tensors
         w_eff = (weight + 1.0) if ctx.zero_centered_gamma else weight
 
