@@ -12,6 +12,7 @@ from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_reset,
 )
+from megatron.core.pipeline_parallel.modality_decoupled_parallelism import ModalityDecoupledParallelism
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -2130,8 +2131,15 @@ def forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
+    # For Modality-Decoupled Parallelism(MDP)
+    modality_decoupled_parallelism = ModalityDecoupledParallelism(forward_step_func, data_iterator, model, p2p_communicator.pp_group.rank())
+    global_batches = modality_decoupled_parallelism.get_global_batches(num_microbatches)
+    modality_decoupled_parallelism.balance_data()
+    vision_model_outputs = modality_decoupled_parallelism.vision_model_forward(global_batches, num_microbatches)
+    modality_decoupled_parallelism.modality_bridge()
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
+        modality_decoupled_parallelism.before_language_model_forward_step(global_batches, vision_model_outputs, i)
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
@@ -2177,6 +2185,7 @@ def forward_backward_pipelining_without_interleaving(
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
+        modality_decoupled_parallelism.before_language_model_forward_step(global_batches, vision_model_outputs, i + num_warmup_microbatches)
         last_iteration = i == (num_microbatches_remaining - 1)
 
         # Decide to checkpoint all layers' activations of the current micro-batch
@@ -2285,6 +2294,7 @@ def forward_backward_pipelining_without_interleaving(
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
 
+    modality_decoupled_parallelism.vision_model_backward(global_batches, vision_model_outputs)
     if config.finalize_model_grads_func is not None and not forward_only:
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
