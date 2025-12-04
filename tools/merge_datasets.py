@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 import sys
 import json
@@ -15,7 +17,7 @@ from megatron.core.datasets.indexed_dataset import (
 )
 
 
-def get_args():
+def get_args(args_list=None):
     parser = argparse.ArgumentParser()
 
     group = parser.add_argument_group(title="input data")
@@ -41,7 +43,7 @@ def get_args():
         help="Whether the datasets are assumed to be multimodal"
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(args_list)
 
     assert os.path.isdir(
         args.input
@@ -54,8 +56,8 @@ def get_args():
     return args
 
 
-def main():
-    args = get_args()
+def main(args_list=None):
+    args = get_args(args_list)
 
     prefixes = set()
     for basename in os.listdir(args.input):
@@ -89,5 +91,5 @@ def main():
 
 
 if __name__ == '__main__':
-
     main()
+
