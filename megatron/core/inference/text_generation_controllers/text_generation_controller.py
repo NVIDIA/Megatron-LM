@@ -6,7 +6,7 @@ import copy
 import functools
 import inspect
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, OrderedDict, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -107,7 +107,7 @@ class TextGenerationController:
 
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
-            self._torch_sampling_buckets: List[Tuple] = []
+            self._torch_sampling_buckets: Iterator[Tuple] = []
 
     def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -597,28 +597,26 @@ class TextGenerationController:
 
         if self._sampling_backend == "torch":
             # Bucketize the core sampling parameters.
-            core_params = torch.stack(
-                (
-                    self._request_metadata["temperature"][active_request_slice],
-                    self._request_metadata["top_k"][active_request_slice],
-                    self._request_metadata["top_p"][active_request_slice],
-                ),
-                dim=1,
-            )
-            _, inv_indices, cnts = torch.unique(
-                core_params, dim=0, return_inverse=True, return_counts=True
-            )
-            order = torch.argsort(inv_indices, stable=True)
-            sampling_buckets = torch.split(order, cnts.tolist())
-            group_reps = torch.stack([indices[0] for indices in sampling_buckets], dim=0)
-            temp_reps = self._request_metadata["temperature"][group_reps].tolist()
-            top_k_reps = self._request_metadata["top_k"][group_reps].tolist()
-            top_p_reps = self._request_metadata["top_p"][group_reps].tolist()
+            # Doing so via list comprehension is orders of magnitude faster than via torch.
+            bucket_map = {}
+
+            # Shorthands for the dictionary comprehension.
+            temp = self._request_metadata["temperature"][active_request_slice].tolist()
+            top_k = self._request_metadata["top_k"][active_request_slice].tolist()
+            top_p = self._request_metadata["top_p"][active_request_slice].tolist()
+
+            for i, (t, k, p) in enumerate(zip(temp, top_k, top_p)):
+                h = (t, k, p)
+                bucket = bucket_map.get(h, None)
+                if bucket is None:
+                    bucket_map[h] = ([i], i)
+                else:
+                    bucket[0].append(i)
 
             # Store the buckets and their equivalence class representatives.
             self._torch_sampling_buckets = (
-                (sampling_buckets[idx], temp_reps[idx], top_k_reps[idx], top_p_reps[idx])
-                for idx in range(len(sampling_buckets))
+                (indices, temp[rep], top_k[rep], top_p[rep])
+                for indices, rep in bucket_map.values()
             )
 
     def _dynamic_step_sample_logits(self):
@@ -636,7 +634,7 @@ class TextGenerationController:
                         self._sampling_logits_cuda[indices, :], temp, top_k, top_p
                     )
                 )
-                indices_list.append(indices)
+                indices_list.append(torch.tensor(indices))
 
             # Single write to the output tensor.
             sampled_tokens = torch.cat(token_list, dim=0)
