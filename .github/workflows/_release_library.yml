@@ -72,7 +72,7 @@ jobs:
   bump-next-version:
     runs-on: ubuntu-latest
     environment: main # ${{ inputs.dry-run == true && 'public' || 'main' }}
-    needs: build-test-publish-wheelsn-dry-run
+    needs: build-test-publish-wheels-dry-run
     if: |
       (
         success() || !failure()
