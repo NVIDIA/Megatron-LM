@@ -1209,8 +1209,6 @@ def validate_args(args, defaults={}):
         )
         args.experimental_attention_variant = args.linear_attention_type
         del args.linear_attention_type
-    linear_attention_variants = ["gated_delta_net"]
-    args.is_linear_attention_model = args.experimental_attention_variant in linear_attention_variants
 
     # Muon optimizer check
     if 'muon' in args.optimizer:

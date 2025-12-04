@@ -48,6 +48,9 @@ except ImportError:
 
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_linear_attention_variant,
+)
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_attr_wrapped_model,
@@ -379,7 +382,7 @@ def num_floating_point_operations(args, batch_size):
                 )
             )
 
-        if args.is_linear_attention_model:
+        if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
@@ -432,7 +435,10 @@ def num_floating_point_operations(args, batch_size):
                     )
                 )
             else:
-                raise ValueError(f"Invalid linear_attention_type: {args.linear_attention_type}")
+                raise ValueError(
+                    "Invalid experimental_attention_variant: "
+                    f"{args.experimental_attention_variant}"
+                )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
