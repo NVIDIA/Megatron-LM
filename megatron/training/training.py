@@ -52,6 +52,8 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_model_config,
+    get_pg_size,
+    get_pg_rank,
     StragglerDetector,
 )
 from megatron.core.fp8_utils import correct_amax_history_if_needed
