@@ -56,6 +56,7 @@ if [ -z ${MLM_OPTIM_ARGS} ]; then
         --adam-beta1 0.9 \
         --adam-beta2 0.95 \
         --init-method-std 0.010 \
+        --use-distributed-optimizer \
     "
 fi
 
