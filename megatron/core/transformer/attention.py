@@ -1,13 +1,15 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Tuple, Union
+from typing import NoReturn, Optional, Protocol, Tuple, Union, cast
 
 import torch
 from torch import Tensor
+from torch import distributed as dist
 
-from megatron.core import tensor_parallel
+from megatron.core import tensor_parallel, typed_torch
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -25,7 +27,6 @@ from megatron.core.parallel_state import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
@@ -107,17 +108,143 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+class Linear(Protocol):
+    """Protocol for a linear_q or linear_kv layer."""
+
+    def forward(self, hidden_states: Tensor, /) -> Tuple[Tensor, Optional[Tensor]]: ...
+
+
+class LinearBuilder(Protocol):
+    """Protocol for building linear_q or linear_kv layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+    ) -> Linear: ...
+
+
+class LinearQKV(Protocol):
+    """Protocol for a linear QKV layer."""
+
+    def forward(self, hidden_states: Tensor, /) -> Tuple[Tensor, Optional[Tensor]]: ...
+
+    def backward_dw(self) -> None: ...
+
+
+class LinearQKVBuilder(Protocol):
+    """Protocol for building linear QKV layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: Optional[dist.ProcessGroup],
+    ) -> LinearQKV: ...
+
+
+class CoreAttention(Protocol):
+    """Protocol for the core_attention layer."""
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        /,
+        *,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> torch.Tensor: ...
+
+
+class CoreAttentionBuilder(Protocol):
+    """Protocol for building core attention layers."""
+
+    def __call__(
+        self,
+        /,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        cp_comm_type: Optional[str],
+        softmax_scale: Optional[float],
+        pg_collection: ProcessGroupCollection,
+    ) -> CoreAttention: ...
+
+
+class LinearProj(Protocol):
+    """Protocol for a linear_proj layer."""
+
+    def forward(self, hidden_states: Tensor, /) -> Tuple[Tensor, Optional[Tensor]]: ...
+
+    def backward_dw(self) -> None: ...
+
+
+class LinearProjBuilder(Protocol):
+    """Protocol for building linear_proj layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[Tensor], None],
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: Optional[dist.ProcessGroup],
+    ) -> LinearProj: ...
+
+
+class LayerNorm(Protocol):
+    """Protocol for a layernorm layer."""
+
+    def forward(self, input: Tensor, /) -> Tensor: ...
+
+
+class LayerNormBuilder(Protocol):
+    """Protocol for building layernorm layers."""
+
+    def __call__(self, *, hidden_size: int, config: TransformerConfig, eps: float) -> LayerNorm: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
     Configuration class for specifying the submodules of a self-attention.
     """
 
-    linear_qkv: Union[ModuleSpec, type] = None
-    core_attention: Union[ModuleSpec, type] = None
-    linear_proj: Union[ModuleSpec, type] = None
-    q_layernorm: Union[ModuleSpec, type] = None
-    k_layernorm: Union[ModuleSpec, type] = None
+    linear_qkv: LinearQKVBuilder
+    core_attention: CoreAttentionBuilder
+    linear_proj: LinearProjBuilder
+    q_layernorm: Optional[LayerNormBuilder] = None
+    k_layernorm: Optional[LayerNormBuilder] = None
 
 
 @dataclass
@@ -126,10 +253,10 @@ class CrossAttentionSubmodules:
     Configuration class for specifying the submodules of a cross-attention.
     """
 
-    linear_q: Union[ModuleSpec, type] = None
-    linear_kv: Union[ModuleSpec, type] = None
-    core_attention: Union[ModuleSpec, type] = None
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_q: LinearBuilder
+    linear_kv: LinearBuilder
+    core_attention: CoreAttentionBuilder
+    linear_proj: LinearProjBuilder
 
 
 class Attention(MegatronModule, ABC):
@@ -146,8 +273,8 @@ class Attention(MegatronModule, ABC):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
 
@@ -185,8 +312,7 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
-        self.core_attention = build_module(
-            submodules.core_attention,
+        self.core_attention = submodules.core_attention(
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
@@ -202,12 +328,11 @@ class Attention(MegatronModule, ABC):
         )
 
         # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
+        self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=cast(Callable[[torch.Tensor], None], self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -254,7 +379,7 @@ class Attention(MegatronModule, ABC):
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
+            output_ = typed_torch.apply_module(self.core_attention)(
                 query,
                 key,
                 value,
@@ -813,7 +938,7 @@ class Attention(MegatronModule, ABC):
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
-            output, bias = self.linear_proj(context_layer)
+            output, bias = typed_torch.apply_module(self.linear_proj)(context_layer)
             return output, bias
 
         if (
@@ -920,7 +1045,7 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                core_attn_out = self.core_attention(
+                core_attn_out = typed_torch.apply_module(self.core_attention)(
                     query,
                     key,
                     value,
@@ -962,7 +1087,7 @@ class Attention(MegatronModule, ABC):
         # =================
 
         nvtx_range_push(suffix="linear_proj")
-        output, bias = self.linear_proj(core_attn_out)
+        output, bias = typed_torch.apply_module(self.linear_proj)(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
@@ -998,12 +1123,11 @@ class SelfAttention(Attention):
             pg_collection=pg_collection,
         )
 
-        self.linear_qkv = build_module(
-            submodules.linear_qkv,
+        self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=cast(Callable[[torch.Tensor], None], self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
             skip_bias_add=False,
@@ -1013,8 +1137,7 @@ class SelfAttention(Attention):
         )
 
         if submodules.q_layernorm is not None:
-            self.q_layernorm = build_module(
-                submodules.q_layernorm,
+            self.q_layernorm = submodules.q_layernorm(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
@@ -1023,8 +1146,7 @@ class SelfAttention(Attention):
             self.q_layernorm = None
 
         if submodules.k_layernorm is not None:
-            self.k_layernorm = build_module(
-                submodules.k_layernorm,
+            self.k_layernorm = submodules.k_layernorm(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
@@ -1046,6 +1168,17 @@ class SelfAttention(Attention):
 
         if not self.config.qk_layernorm:
             return
+
+        assert (
+            self.q_layernorm is not None
+            and hasattr(self.q_layernorm, 'weight')
+            and hasattr(self.q_layernorm, 'bias')
+        )
+        assert (
+            self.k_layernorm is not None
+            and hasattr(self.k_layernorm, 'weight')
+            and hasattr(self.k_layernorm, 'bias')
+        )
 
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
@@ -1109,7 +1242,7 @@ class SelfAttention(Attention):
         the unsplit mixed_qkv tensor is returned.
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
-        mixed_qkv, _ = self.linear_qkv(hidden_states)
+        mixed_qkv, _ = typed_torch.apply_module(self.linear_qkv)(hidden_states)
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
@@ -1150,10 +1283,10 @@ class SelfAttention(Attention):
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.q_layernorm is not None:
-            query = self.q_layernorm(query)
+            query = typed_torch.apply_module(self.q_layernorm)(query)
 
         if self.k_layernorm is not None:
-            key = self.k_layernorm(key)
+            key = typed_torch.apply_module(self.k_layernorm)(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()
@@ -1193,8 +1326,8 @@ class CrossAttention(Attention):
         submodules: CrossAttentionSubmodules,
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(
             config=config,
@@ -1210,24 +1343,22 @@ class CrossAttention(Attention):
             raise ValueError("Group query attention is not currently supported in cross attention.")
         assert self.query_projection_size == self.kv_projection_size
 
-        self.linear_q = build_module(
-            submodules.linear_q,
+        self.linear_q = submodules.linear_q(
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=cast(Callable[[torch.Tensor], None], self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
         )
 
-        self.linear_kv = build_module(
-            submodules.linear_kv,
+        self.linear_kv = submodules.linear_kv(
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=cast(Callable[[torch.Tensor], None], self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
@@ -1241,7 +1372,7 @@ class CrossAttention(Attention):
         """
         assert split_qkv, "split_qkv must be True for CrossAttention"
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-        mixed_kv, _ = self.linear_kv(key_value_states)
+        mixed_kv, _ = typed_torch.apply_module(self.linear_kv)(key_value_states)
 
         # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
         new_tensor_shape = mixed_kv.size()[:-1] + (
@@ -1254,7 +1385,7 @@ class CrossAttention(Attention):
         (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
-        query, _ = self.linear_q(hidden_states)
+        query, _ = typed_torch.apply_module(self.linear_q)(hidden_states)
 
         # [sq, b, hp] --> [sq, b, np, hn]
         new_tensor_shape = query.size()[:-1] + (

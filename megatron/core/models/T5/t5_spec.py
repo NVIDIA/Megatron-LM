@@ -28,6 +28,10 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    TELayerNormColumnParallelLinear = None
+    TEDotProductAttention = None
+    TEColumnParallelLinear = None
+    TERowParallelLinear = None
     HAVE_TE = False
 
 try:
@@ -49,7 +53,9 @@ except ImportError:
 
 def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     """T5 encoder TE spec (uses Transformer Engine components)."""
-
+    assert TELayerNormColumnParallelLinear is not None
+    assert TEDotProductAttention is not None
+    assert TERowParallelLinear is not None
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -78,7 +84,10 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
 
 def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     """T5 decoder TE spec (uses Transformer Engine components)."""
-
+    assert TELayerNormColumnParallelLinear is not None
+    assert TEDotProductAttention is not None
+    assert TEColumnParallelLinear is not None
+    assert TERowParallelLinear is not None
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(

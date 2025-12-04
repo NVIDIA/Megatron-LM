@@ -45,10 +45,10 @@ class DotProductAttention(MegatronModule):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        attention_dropout: float = None,
-        softmax_scale: float = None,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        attention_dropout: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
 
@@ -143,10 +143,10 @@ class DotProductAttention(MegatronModule):
         key: Tensor,
         value: Tensor,
         attention_mask: Tensor,
-        attn_mask_type: AttnMaskType = None,
-        attention_bias: Tensor = None,
+        attn_mask_type: Optional[AttnMaskType] = None,
+        attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
-    ):
+    ) -> Tensor:
         """Forward."""
         assert packed_seq_params is None, (
             "Packed sequence is not supported by DotProductAttention."

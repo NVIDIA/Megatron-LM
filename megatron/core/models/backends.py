@@ -2,7 +2,7 @@
 
 import warnings
 from abc import abstractmethod
-from typing import Optional, Protocol, Tuple
+from typing import Optional, Protocol, Tuple, Union
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -89,7 +89,7 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which column parallel linear module the backend uses"""
         return ColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> type[RowParallelLinear]:
         """Which row parallel linear module the backend uses"""
         return RowParallelLinear
 
@@ -97,11 +97,13 @@ class LocalSpecProvider(BackendSpecProvider):
         """Does the backend choose a single module for layernorm and linear"""
         return False
 
-    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+    def column_parallel_layer_norm_linear(self) -> None:
         """Which module for sequential layernorm and linear"""
         return None
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(
+        self, rms_norm: bool = False, for_qk: bool = False
+    ) -> Union[type['FusedLayerNorm'], type[WrappedTorchNorm]]:
         """Which module to use for layer norm"""
         if rms_norm:
             # Matching get_gpt_layer_local_spec.
@@ -110,7 +112,7 @@ class LocalSpecProvider(BackendSpecProvider):
             LNImpl = WrappedTorchNorm
         return LNImpl
 
-    def core_attention(self) -> type:
+    def core_attention(self) -> type[DotProductAttention]:
         """Which module to use for attention"""
         return DotProductAttention
 
@@ -145,7 +147,7 @@ class InferenceSpecProvider(BackendSpecProvider):
         """Which column parallel linear module TE backend uses"""
         return TEColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> type[InferenceRowParallelLinear]:
         """Which row parallel linear module TE backend uses"""
         return InferenceRowParallelLinear
 
@@ -153,11 +155,13 @@ class InferenceSpecProvider(BackendSpecProvider):
         """TE backend chooses a single module for layernorm and linear"""
         return True
 
-    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+    def column_parallel_layer_norm_linear(self) -> type[InferenceLayerNormColumnParallelLinear]:
         """Which module for sequential layernorm and linear"""
         return InferenceLayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(
+        self, rms_norm: bool = False, for_qk: bool = False
+    ) -> Union[type['FusedLayerNorm'], type[TENorm]]:
         """Which module to use for layer norm"""
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used
@@ -166,7 +170,7 @@ class InferenceSpecProvider(BackendSpecProvider):
             return FusedLayerNorm
         return TENorm
 
-    def core_attention(self) -> type:
+    def core_attention(self) -> type[TEDotProductAttention]:
         """Which module to use for attention"""
         return TEDotProductAttention
 

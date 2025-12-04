@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
@@ -33,7 +33,7 @@ class TESpecProvider(BackendSpecProvider):
         """Which column parallel linear module TE backend uses"""
         return TEColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> type[TERowParallelLinear]:
         """Which row parallel linear module TE backend uses"""
         return TERowParallelLinear
 
@@ -41,11 +41,13 @@ class TESpecProvider(BackendSpecProvider):
         """TE backend chooses a single module for layernorm and linear"""
         return True
 
-    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+    def column_parallel_layer_norm_linear(self) -> type[TELayerNormColumnParallelLinear]:
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(
+        self, rms_norm: bool = False, for_qk: bool = False
+    ) -> Union[type[FusedLayerNorm], type[TENorm]]:
         """Which module to use for layer norm"""
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used
@@ -54,7 +56,7 @@ class TESpecProvider(BackendSpecProvider):
             return FusedLayerNorm
         return TENorm
 
-    def core_attention(self) -> type:
+    def core_attention(self) -> type[TEDotProductAttention]:
         """Which module to use for attention"""
         return TEDotProductAttention
 

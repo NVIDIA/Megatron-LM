@@ -6,7 +6,7 @@ import io
 import os
 import pickle
 import warnings
-from typing import Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, assert_never
 
 import torch
 import torch.nn.functional as F
@@ -55,14 +55,19 @@ from megatron.core.utils import (
 )
 
 try:
-    import transformer_engine as te
-
     HAVE_TE = True
-except ImportError:
-    from unittest.mock import MagicMock
 
-    te = MagicMock()
-    HAVE_TE = False
+    import transformer_engine as te
+except ImportError:
+    if TYPE_CHECKING:
+        import transformer_engine as te
+
+        # Force type checking to treat TE as available
+    else:
+        from unittest.mock import MagicMock
+
+        te = MagicMock()
+        HAVE_TE = False
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -419,7 +424,7 @@ class TELinear(te.pytorch.Linear):
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
@@ -461,7 +466,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         output_size: int,
         *,
         config: TransformerConfig,
-        init_method: Callable,
+        init_method: Callable[[torch.Tensor], None],
         gather_output: bool,
         bias: bool,
         skip_bias_add: bool,
@@ -607,7 +612,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
@@ -849,8 +854,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         softmax_scale: Optional[float] = None,
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
-        cp_comm_type: str = "p2p",
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = "p2p",
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1013,9 +1018,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType,
-        attention_bias: Tensor = None,
-        packed_seq_params: PackedSeqParams = None,
-    ):
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> Tensor:
         """Forward."""
         packed_seq_kwargs = (
             {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
@@ -1989,7 +1994,10 @@ except ImportError:
     pass
 
 try:
-    from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding  # pylint: disable=unused-import
+    from transformer_engine.pytorch import (  # pylint: disable=unused-import
+        Fp8Padding,
+        Fp8Unpadding,
+    )
 
 except ImportError:
     Fp8Padding = None

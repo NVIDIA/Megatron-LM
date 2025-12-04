@@ -2,7 +2,7 @@
 
 import types
 from dataclasses import dataclass, field
-from typing import Tuple, Union
+from typing import Any, Tuple, Union
 
 
 @dataclass
@@ -24,7 +24,16 @@ class ModuleSpec:
 
     module: Union[Tuple, type]
     params: dict = field(default_factory=lambda: {})
-    submodules: type = None
+    submodules: object = None
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Builds an instance of the module from the spec.
+
+        Args:
+            *args: Positional arguments to be passed to the module init.
+            **kwargs: Keyword arguments to be passed to the module init.
+        """
+        return build_module(self, *args, **kwargs)
 
 
 def import_module(module_path: Tuple[str]):

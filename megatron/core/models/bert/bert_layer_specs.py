@@ -22,6 +22,9 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    TELayerNormColumnParallelLinear = None
+    TEDotProductAttention = None
+    TERowParallelLinear = None
     HAVE_TE = False
 
 try:
@@ -49,7 +52,9 @@ def get_bert_layer_with_transformer_engine_spec():
         raise ImportError(
             "Transformer Engine is not installed. Please use local Bert layer spec instead."
         )
-
+    assert TELayerNormColumnParallelLinear is not None
+    assert TEDotProductAttention is not None
+    assert TERowParallelLinear is not None
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
