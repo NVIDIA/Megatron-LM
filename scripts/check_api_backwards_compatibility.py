@@ -4,7 +4,7 @@
 Megatron Core API Compatibility Checker
 
 Simple checker using Griffe to find breaking changes between two versions.
-Objects decorated with @internal_api or @deprecated are excluded from checks.
+Objects decorated with @internal_api, @experimental_api, or @deprecated are excluded from checks.
 
 Usage:
     python scripts/check_api_backwards_compatibility.py --baseline core_v0.14.0
@@ -44,7 +44,7 @@ if sys.platform == 'win32':
 
 
 # Decorators that exempt objects from compatibility checks
-EXEMPT_DECORATORS = ['internal_api', 'deprecated']
+EXEMPT_DECORATORS = ['internal_api', 'deprecated', 'experimental_api']
 
 # Breakage kinds to ignore (not actual API signature changes)
 # AttributeChangedValueBreakage: Changing constant values (e.g., VERSION = "1.0" -> "2.0")
