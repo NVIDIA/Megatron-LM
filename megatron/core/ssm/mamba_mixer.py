@@ -434,6 +434,10 @@ class MambaMixer(MegatronModule):
 
         if in_inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
+            assert packed_seq_params is None, (
+                "Training with packed sequences is not supported "
+                "in the non-memory-efficient code path."
+            )
             y = self.ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
