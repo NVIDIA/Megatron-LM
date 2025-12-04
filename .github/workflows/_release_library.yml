@@ -166,7 +166,7 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$TMP_BRANCH"
           git add -A .
-          git commit -sS -m "beep boop 🤖: Bumping versions" || echo "No changes to commit"
+          git commit -m "beep boop 🤖: Bumping versions" || echo "No changes to commit"
           git push -u origin "$TMP_BRANCH"
           echo "TMP_BRANCH=$TMP_BRANCH" | tee -a $GITHUB_ENV
 
