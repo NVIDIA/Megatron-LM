@@ -50,6 +50,7 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import internal_api
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -69,6 +70,8 @@ class GroupedMLP(MegatronModule):
     Executes multiple experts in parallel to maximize computational efficiency.
     """
 
+    # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
+    @internal_api
     def __init__(
         self,
         num_local_experts: int,
@@ -732,6 +735,8 @@ class TEGroupedMLP(MegatronModule):
     Executes multiple experts in parallel to maximize computational efficiency.
     """
 
+    # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
+    @internal_api
     def __init__(
         self,
         num_local_experts,
@@ -1038,6 +1043,8 @@ class SequentialMLP(MegatronModule):
     This class executes each expert sequentially.
     """
 
+    # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
+    @internal_api
     def __init__(
         self,
         num_local_experts,
