@@ -59,7 +59,7 @@ myst_heading_anchors = 5  # Generates anchor links for headings up to level 5
 
 # TODO(ppetrakian): enable autodoc2.
 # -- Options for Autodoc2 ---------------------------------------------------
-# sys.path.insert(0, os.path.abspath(".."))
+sys.path.insert(0, os.path.abspath(".."))
 
 # autodoc2_packages = [
 #     {
