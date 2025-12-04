@@ -26,6 +26,7 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
     group.add_argument("--temperature", type=float, default=1.0, help='Sampling temperature.')
     group.add_argument("--top_k", type=int, default=1, help='Top k sampling.')
     group.add_argument("--top_p", type=float, default=0.0, help='Top p sampling.')
+    group.add_argument("--use-selective-log-softmax", action='store_true', default=False, help='Use selective log softmax optimization.')
     group.add_argument(
         "--return-log-probs",
         action='store_true',
