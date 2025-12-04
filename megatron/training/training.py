@@ -702,14 +702,15 @@ def pretrain(
             print_rank_0(f"Setting tensor model parallel size to {args.rl_inference_tensor_model_parallel_size} for inference model")
             # Build custom process groups for inference with a different TP size, keeping CP and PP the same as training
             tp_size = args.rl_inference_tensor_model_parallel_size
+            #TODO(peter): Get these from args when we want to support other parallelism changes
             cp_size = mpu.get_context_parallel_world_size()
             pp_size = mpu.get_pipeline_model_parallel_world_size()
+            ep_size = mpu.get_expert_model_parallel_world_size()
             dp_size = args.world_size // (tp_size * cp_size * pp_size)
             assert dp_size >= 1 and (tp_size * cp_size * pp_size * dp_size) == args.world_size, \
                 "World size must be divisible by tp*cp*pp for inference PG layout"
 
-            # TODO(Peter) We need to pass the expert parallel correctly here
-            grid = HyperCommGrid([tp_size, cp_size, 1, pp_size, dp_size], ["tp", "cp", "ep", "pp", "dp"])
+            grid = HyperCommGrid([tp_size, cp_size, ep_size, pp_size, dp_size], ["tp", "cp", "ep", "pp", "dp"])
             tp_group = grid.create_pg("tp")
             cp_group = grid.create_pg("cp")
             pp_group = grid.create_pg("pp")
