@@ -48,10 +48,10 @@ jobs:
   release:
     uses: ./.github/workflows/_release_library.yml
     with:
-      release-ref: pull-request/2507 # ${{ inputs.release-ref || github.sha }}
-      dry-run: true # ${{ inputs.dry-run || false }}
-      version-bump-branch: pull-request/2507 # ${{ inputs.version-bump-branch || github.ref_name }}
-      create-gh-release: false # ${{ inputs.create-gh-release || true }}
+      release-ref: ${{ inputs.release-ref || github.sha }}
+      dry-run: ${{ inputs.dry-run || false }}
+      version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
+      create-gh-release: ${{ inputs.create-gh-release || true }}
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}

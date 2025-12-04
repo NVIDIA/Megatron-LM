@@ -55,18 +55,18 @@ permissions:
   pull-requests: write # To create PR(s)
 
 jobs:
-  # build-test-publish-wheels-dry-run:
-  #   uses: ./.github/workflows/_build_test_publish_wheel.yml
-  #   with:
-  #     dry-run: true
-  #   secrets:
-  #     TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
-  #     TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+  build-test-publish-wheels-dry-run:
+    uses: ./.github/workflows/_build_test_publish_wheel.yml
+    with:
+      dry-run: true
+    secrets:
+      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
+      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
   bump-next-version:
     runs-on: ubuntu-latest
     environment: main # ${{ inputs.dry-run == true && 'public' || 'main' }}
-    # needs: build-test-publish-wheels-dry-run
+    needs: build-test-publish-wheels-dry-run
     if: |
       (
         success() || !failure()
@@ -300,123 +300,123 @@ jobs:
           cd ${{ github.run_id }}
           git push -d origin ${{ env.TMP_BRANCH }}
 
-  # build-test-publish-wheels:
-  #   needs: [bump-next-version]
-  #   uses: ./.github/workflows/_build_test_publish_wheel.yml
-  #   with:
-  #     dry-run: false
-  #   secrets:
-  #     TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
-  #     TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+  build-test-publish-wheels:
+    needs: [bump-next-version]
+    uses: ./.github/workflows/_build_test_publish_wheel.yml
+    with:
+      dry-run: false
+    secrets:
+      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
+      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
-  # create-gh-release:
-  #   needs: [build-test-publish-wheels]
-  #   runs-on: ubuntu-latest
-  #   environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
-  #   if: |
-  #     (
-  #       success() || !failure()
-  #     )
-  #     && inputs.create-gh-release == true
-  #     && !cancelled()
-  #   outputs:
-  #     is-release-candidate: ${{ steps.version-number.outputs.is-release-candidate }}
-  #   env:
-  #     REPOSITORY: ${{ github.repository }}
-  #     PROJECT_NAME: Megatron Core
-  #     VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
-  #     TAG_PREFIX: ${{ inputs.gh-release-tag-prefix || '' }}
-  #   steps:
-  #     - name: Checkout repository
-  #       uses: actions/checkout@v4
-  #       with:
-  #         path: ${{ github.run_id }}
-  #         ref: ${{ inputs.release-ref }}
-  #         token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+  create-gh-release:
+    needs: [build-test-publish-wheels]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
+    if: |
+      (
+        success() || !failure()
+      )
+      && inputs.create-gh-release == true
+      && !cancelled()
+    outputs:
+      is-release-candidate: ${{ steps.version-number.outputs.is-release-candidate }}
+    env:
+      REPOSITORY: ${{ github.repository }}
+      PROJECT_NAME: Megatron Core
+      VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
+      TAG_PREFIX: ${{ inputs.gh-release-tag-prefix || '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: ${{ github.run_id }}
+          ref: ${{ inputs.release-ref }}
+          token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
 
-  #     - name: Create release
-  #       id: version-number
-  #       env:
-  #         SHA: ${{ inputs.release-ref }}
-  #         GH_TOKEN: ${{ secrets.PAT }}
-  #         IS_DRY_RUN: ${{ inputs.dry-run }}
-  #       run: |
-  #         cd ${{ github.run_id }}
+      - name: Create release
+        id: version-number
+        env:
+          SHA: ${{ inputs.release-ref }}
+          GH_TOKEN: ${{ secrets.PAT }}
+          IS_DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          cd ${{ github.run_id }}
 
-  #         IS_RELEASE_CANDIDATE=$([[ "$VERSION" == *rc* ]] && echo "true" || echo "false")
-  #         IS_ALPHA=$([[ "$VERSION" == *a* ]] && echo "true" || echo "false")
-  #         IS_PRERELEASE=$([[ "$IS_RELEASE_CANDIDATE" == "true" || "$IS_ALPHA" == "true" ]] && echo "true" || echo "false")
-  #         NAME="NVIDIA $PROJECT_NAME ${VERSION}"
+          IS_RELEASE_CANDIDATE=$([[ "$VERSION" == *rc* ]] && echo "true" || echo "false")
+          IS_ALPHA=$([[ "$VERSION" == *a* ]] && echo "true" || echo "false")
+          IS_PRERELEASE=$([[ "$IS_RELEASE_CANDIDATE" == "true" || "$IS_ALPHA" == "true" ]] && echo "true" || echo "false")
+          NAME="NVIDIA $PROJECT_NAME ${VERSION}"
 
-  #         if [[ "$IS_RELEASE_CANDIDATE" == "true" ]]; then
-  #           DATE=$(date +"%Y-%m-%d")
-  #           CHANGELOG="Prerelease: $NAME ($DATE)"
-  #         else
-  #           CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
-  #           CHANGELOG=$(echo "$CHANGELOG" | sed '/./,$!d' | sed ':a;N;$!ba;s/\n$//')
-  #         fi
+          if [[ "$IS_RELEASE_CANDIDATE" == "true" ]]; then
+            DATE=$(date +"%Y-%m-%d")
+            CHANGELOG="Prerelease: $NAME ($DATE)"
+          else
+            CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
+            CHANGELOG=$(echo "$CHANGELOG" | sed '/./,$!d' | sed ':a;N;$!ba;s/\n$//')
+          fi
 
-  #         echo "is-release-candidate=$IS_RELEASE_CANDIDATE" | tee -a "$GITHUB_OUTPUT"
+          echo "is-release-candidate=$IS_RELEASE_CANDIDATE" | tee -a "$GITHUB_OUTPUT"
 
-  #         PAYLOAD=$(jq -nc \
-  #                     --arg TAG_NAME "${TAG_PREFIX}v${VERSION}" \
-  #                     --arg CI_COMMIT_BRANCH "$SHA" \
-  #                     --arg NAME "$NAME" \
-  #                     --arg BODY "$CHANGELOG" \
-  #                     --argjson PRERELEASE "$IS_PRERELEASE" \
-  #                     '{
-  #                       "tag_name": $TAG_NAME,
-  #                       "target_commitish": $CI_COMMIT_BRANCH,
-  #                       "name": $NAME,
-  #                       "body": $BODY,
-  #                       "draft": false,
-  #                       "prerelease": $PRERELEASE,
-  #                       "generate_release_notes": false
-  #                     }'
-  #                 )
-  #         echo -E "$PAYLOAD" > payload.txt
+          PAYLOAD=$(jq -nc \
+                      --arg TAG_NAME "${TAG_PREFIX}v${VERSION}" \
+                      --arg CI_COMMIT_BRANCH "$SHA" \
+                      --arg NAME "$NAME" \
+                      --arg BODY "$CHANGELOG" \
+                      --argjson PRERELEASE "$IS_PRERELEASE" \
+                      '{
+                        "tag_name": $TAG_NAME,
+                        "target_commitish": $CI_COMMIT_BRANCH,
+                        "name": $NAME,
+                        "body": $BODY,
+                        "draft": false,
+                        "prerelease": $PRERELEASE,
+                        "generate_release_notes": false
+                      }'
+                  )
+          echo -E "$PAYLOAD" > payload.txt
 
-  #         CMD=$(echo -E 'curl -L \
-  #           -X POST \
-  #           -H "Accept: application/vnd.github+json" \
-  #           -H "Authorization: Bearer '"$GH_TOKEN"'" \
-  #           -H "X-GitHub-Api-Version: 2022-11-28" \
-  #           https://api.github.com/repos/'"$REPOSITORY"'/releases \
-  #           -d @payload.txt
-  #         ')
+          CMD=$(echo -E 'curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer '"$GH_TOKEN"'" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/'"$REPOSITORY"'/releases \
+            -d @payload.txt
+          ')
 
-  #         if [[ "$IS_DRY_RUN" == "true" ]]; then
-  #           echo -E "$CMD"
-  #         else
-  #           eval "$CMD"
-  #         fi
+          if [[ "$IS_DRY_RUN" == "true" ]]; then
+            echo -E "$CMD"
+          else
+            eval "$CMD"
+          fi
 
-  # notify:
-  #   needs: [build-test-publish-wheels, create-gh-release]
-  #   runs-on: ubuntu-latest
-  #   environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
-  #   env:
-  #     GH_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-test-publish-wheels.outputs.version }}
-  #     PYPI_URL: https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/${{ needs.build-test-publish-wheels.outputs.pypi-name }}/${{ needs.build-test-publish-wheels.outputs.version }}/
-  #     PROJECT_NAME: Megatron Core
-  #     VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v4
-  #       with:
-  #         repository: NVIDIA-NeMo/FW-CI-templates
-  #         ref: v0.17.0
-  #         path: send-slack-alert
+  notify:
+    needs: [build-test-publish-wheels, create-gh-release]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
+    env:
+      GH_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-test-publish-wheels.outputs.version }}
+      PYPI_URL: https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/${{ needs.build-test-publish-wheels.outputs.pypi-name }}/${{ needs.build-test-publish-wheels.outputs.version }}/
+      PROJECT_NAME: Megatron Core
+      VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.17.0
+          path: send-slack-alert
 
-  #     - name: Send Slack alert
-  #       uses: ./send-slack-alert/.github/actions/send-slack-alert
-  #       env:
-  #         MESSAGE: |
-  #           ${{ inputs.dry-run == true && 'This is a dry-run, nothing actually happened: ' || '' }}We have released `${{ env.VERSION }}` of `NVIDIA ${{ env.PROJECT_NAME }}` 🚀✨🎉
+      - name: Send Slack alert
+        uses: ./send-slack-alert/.github/actions/send-slack-alert
+        env:
+          MESSAGE: |
+            ${{ inputs.dry-run == true && 'This is a dry-run, nothing actually happened: ' || '' }}We have released `${{ env.VERSION }}` of `NVIDIA ${{ env.PROJECT_NAME }}` 🚀✨🎉
 
-  #           • <${{ env.GH_URL }}|GitHub release>
-  #           • <${{ env.PYPI_URL }}|PyPi release>
+            • <${{ env.GH_URL }}|GitHub release>
+            • <${{ env.PYPI_URL }}|PyPi release>
 
-  #       with:
-  #         message: ${{ env.MESSAGE }}
-  #         webhook: ${{ secrets.SLACK_WEBHOOK }}
+        with:
+          message: ${{ env.MESSAGE }}
+          webhook: ${{ secrets.SLACK_WEBHOOK }}
