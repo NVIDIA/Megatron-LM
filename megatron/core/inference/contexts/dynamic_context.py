@@ -582,7 +582,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             """Allocate Mamba states. This function is called below within
             `with ctx_manager:`."""
             if self.is_hybrid_model:
-                self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
+                self.mamba_metadata = MambaMetadata(
+                    max_requests=self.max_total_requests, max_tokens=self.max_tokens
+                )
                 self.mamba_conv_states = torch.empty(
                     (self.num_mamba_layers, self.max_total_requests) + self.mamba_conv_states_shape,
                     dtype=self.params_dtype,
@@ -967,9 +969,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             attn_metadata.reset()
         self.active_attn_metadata = None
 
-        # TODO(ksanthanam): Check if this is actually necessary
         if self.is_hybrid_model:
-            self.mamba_metadata.request_to_mamba_state_idx_for_step.fill_(-1)
+            self.mamba_metadata.reset_varlen_metadata()
 
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
@@ -1277,8 +1278,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.is_hybrid_model:
             active_mamba_indices_view = self.mamba_metadata.request_to_mamba_state_idx[active_slice]
+            token_to_request_idx_view = self.token_to_request_idx[: self.active_token_count]
+            cu_seqlens = self.active_attn_metadata["mha_metadata"].state_data[
+                "cu_query_seq_lengths"
+            ]
             self.mamba_metadata.update(
                 active_mamba_indices_view,
+                token_to_request_idx_view,
+                cu_seqlens,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
             )

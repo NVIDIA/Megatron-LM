@@ -18,6 +18,10 @@ import torch.nn.functional as F
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
+from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
+    tensor_get_slice_after,
+    tensor_merge,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -439,52 +443,59 @@ class MambaMixer(MegatronModule):
         conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
 
         padded_dims = context.padded_batch_dimensions
-        batch_indices = context.mamba_metadata.request_to_mamba_state_idx_for_step
 
-        seq_idx, cu_seqlens, return_varlen_states = self._get_varlen_generation_state(context)
-
-        num_decode_requests = padded_dims.decode_req_count
-        num_prefill_requests = padded_dims.prefill_req_count
+        token_count = padded_dims.token_count
+        decode_req_count = padded_dims.decode_req_count
+        prefill_req_count = padded_dims.prefill_req_count
 
         zxBCdt, _ = self.in_proj(hidden_states)
 
-        y_decode = None
-        if num_decode_requests > 0:
-            zxBCdt_decode = zxBCdt[:num_decode_requests]
-            batch_indices_decode = batch_indices[:num_decode_requests]
-            y_decode = self.ssm_decode(
-                zxBCdt_decode.transpose(0, 1), conv_state, ssm_state, batch_indices_decode
+        if decode_req_count > 0 and prefill_req_count == 0:
+            y = self.ssm_decode(
+                zxBCdt.transpose(0, 1),
+                conv_state,
+                ssm_state,
+                context.mamba_metadata.batch_indices_decode,
             ).transpose(0, 1)
-
-        y_prefill = None
-        if padded_dims.prefill_req_count > 0:
-            zxBCdt_prefill = zxBCdt[num_decode_requests:]
-
-            batch_indices_prefill = batch_indices[
-                padded_dims.decode_req_count : padded_dims.decode_req_count
-                + padded_dims.prefill_req_count
-            ]
-
-            cu_seqlens_prefill = cu_seqlens[num_decode_requests : padded_dims.req_count + 1]
-            cu_seqlens_prefill = cu_seqlens_prefill - num_decode_requests
-
-            seq_idx_prefill = seq_idx[:, num_decode_requests:]
-
-            y_prefill = self.ssm_prefill(
-                zxBCdt_prefill,
+        elif decode_req_count == 0 and prefill_req_count > 0:
+            y = self.ssm_prefill(
+                zxBCdt,
                 conv_state=conv_state,
                 ssm_state=ssm_state,
-                seq_idx=seq_idx_prefill,
-                cu_seqlens=cu_seqlens_prefill,
-                return_varlen_states=return_varlen_states,
-                batch_indices=batch_indices_prefill,
+                seq_idx=context.mamba_metadata.seq_idx,
+                cu_seqlens=context.mamba_metadata.cu_seqlens,
+                return_varlen_states=True,
+                batch_indices=context.mamba_metadata.batch_indices_prefill,
             )
-
-        y = maybe_cat(y_decode, y_prefill, required=True)
-
-        total_computed_tokens = y.shape[0]
-        if (num_padding_tokens := context.padded_active_token_count - total_computed_tokens) > 0:
-            y = torch.cat((y, y.new_zeros(num_padding_tokens, *y.shape[1:])), dim=0)
+        else:
+            zxBCdt_prefill = torch.empty_like(zxBCdt)
+            tensor_get_slice_after(
+                zxBCdt,
+                zxBCdt_prefill,
+                context.mamba_metadata.device_decode_prefill,
+                check_bounds=False,
+            )
+            y_decode = self.ssm_decode(
+                zxBCdt[:decode_req_count].transpose(0, 1),
+                conv_state,
+                ssm_state,
+                context.mamba_metadata.batch_indices_decode,
+            ).transpose(0, 1)
+            y_prefill = self.ssm_prefill(
+                zxBCdt_prefill[: token_count - decode_req_count],
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                seq_idx=context.mamba_metadata.seq_idx,
+                cu_seqlens=context.mamba_metadata.cu_seqlens,
+                return_varlen_states=True,
+                batch_indices=context.mamba_metadata.batch_indices_prefill,
+            )
+            y = torch.empty(
+                [token_count, 1, y_prefill.shape[-1]],
+                dtype=y_prefill.dtype,
+                device=y_prefill.device,
+            )
+            tensor_merge(y_decode, y_prefill, y, context.mamba_metadata.device_decode_prefill)
 
         out, out_bias = self.out_proj(y)
         return out, out_bias
@@ -896,46 +907,6 @@ class MambaMixer(MegatronModule):
 
         # Restore sequence dimension
         return y.unsqueeze(0)
-
-    def _get_varlen_generation_state(
-        self, inference_context: Optional[BaseInferenceContext] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
-        """Constructs the variable length generation state for non-decode dynamic inference.
-
-        The returned state includes the following:
-            `seq_idx` (Tensor): A map from token idx to request idx.
-            `cu_seqlens` (Tensor): The cumulative sequence lengths.
-            `return_varlen_states` (bool): Whether to return a varlen states tensor for
-                `mamba_chunk_scan_combined`.
-
-        Returns empty state for training, static inference, or decode-only dynamic inference.
-
-        Args:
-            inference_context (InferenceContext): The inference context.
-
-        Returns:
-            A tuple of (`seq_idx`, `cu_seqlens`, `return_varlen_states`)
-        """
-
-        if (
-            inference_context is None
-            or not inference_context.is_dynamic_batching()
-            or inference_context.is_decode_only()
-        ):
-            return None, None, False
-
-        active_token_count = inference_context.padded_active_token_count
-        seq_idx = (
-            inference_context.token_to_request_idx[:active_token_count]
-            .clone()
-            .to(torch.int32)
-            .unsqueeze(0)
-        )
-
-        # Get the list of cumulative sequence lengths for active requests.
-        cu_seqlens, _ = inference_context.cu_query_lengths()
-
-        return seq_idx, cu_seqlens, True
 
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""

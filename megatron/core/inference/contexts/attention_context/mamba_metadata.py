@@ -28,7 +28,7 @@ class MambaInferenceStateConfig:
 class MambaMetadata:
     """Manages the metadata tensors required for Mamba layers during inference."""
 
-    def __init__(self, max_requests: int):
+    def __init__(self, max_requests: int, max_tokens: int):
         """
         Initializes the Mamba slot allocator.
 
@@ -36,14 +36,28 @@ class MambaMetadata:
             max_requests (int): The maximum number of concurrent requests.
         """
         self.max_requests = max_requests
+        self.max_tokens = max_tokens
+        self.device = torch.cuda.current_device()
 
         # Metadata for mapping requests to slots in the static Mamba state buffer
         self.request_to_mamba_state_idx = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        # Copy of the request to slot mapping to use fo the step. Includes padding tokens.
-        self.request_to_mamba_state_idx_for_step = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+
+        self._batch_indices_decode_buffer = torch.full(
+            (self.max_requests,), -1, dtype=torch.int32, device=self.device
+        )
+        self._batch_indices_prefill_buffer = torch.full(
+            (self.max_requests,), -1, dtype=torch.int32, device=self.device
+        )
+        self._seq_idx_buffer = torch.full(
+            (self.max_tokens,), -1, dtype=torch.int32, device=self.device
+        )
+        self._cu_seqlens_buffer = torch.zeros(
+            (self.max_requests + 1,), dtype=torch.int32, device=self.device
+        )
+        self._device_decode_prefill_buffer = torch.zeros(
+            (2,), dtype=torch.int32, device=self.device
         )
 
         # Allocator for Mamba state slots
@@ -57,7 +71,8 @@ class MambaMetadata:
         Resets all Mamba states and frees all allocated slots.
         """
         self.request_to_mamba_state_idx.fill_(-1)
-        self.request_to_mamba_state_idx_for_step.fill_(-1)
+
+        self.reset_varlen_metadata()
 
         # Re-initialize the free slot pool
         self.mamba_state_free_slots = torch.arange(
@@ -65,9 +80,19 @@ class MambaMetadata:
         )
         self.mamba_state_free_slot_count = self.max_requests
 
+    def reset_varlen_metadata(self) -> None:
+        """Resets varlen metadata."""
+        self.batch_indices_decode = None
+        self.batch_indices_prefill = None
+        self.cu_seqlens = None
+        self.seq_idx = None
+        self.device_decode_prefill = None
+
     def update(
         self,
         active_mamba_indices: torch.Tensor,
+        token_to_request_idx: torch.Tensor,
+        cu_seqlens: torch.Tensor,
         batch_dimensions: InferenceBatchDimensions,
         padded_batch_dimensions: InferenceBatchDimensions,
     ) -> None:
@@ -84,31 +109,61 @@ class MambaMetadata:
 
         real_decode_count = batch_dimensions.decode_req_count
         real_prefill_count = batch_dimensions.prefill_req_count
+        real_token_count = batch_dimensions.token_count
 
         padded_decode_count = padded_batch_dimensions.decode_req_count
+        padded_prefill_count = padded_batch_dimensions.prefill_req_count
+        padded_token_count = padded_batch_dimensions.token_count
 
-        # Copy real decode indices to the start of the buffer.
-        if real_decode_count > 0:
-            self.request_to_mamba_state_idx_for_step[:real_decode_count] = active_mamba_indices[
-                :real_decode_count
-            ]
-
-        # Pad the rest of the decode section with -1
-        if padded_decode_count > real_decode_count:
-            self.request_to_mamba_state_idx_for_step[real_decode_count:padded_decode_count].fill_(
-                -1
+        if padded_decode_count > 0:
+            # Update decode indices
+            self._batch_indices_decode_buffer[:real_decode_count].copy_(
+                active_mamba_indices[:real_decode_count]
             )
+            if padded_decode_count > real_decode_count:
+                self._batch_indices_decode_buffer[real_decode_count:padded_decode_count].fill_(-1)
+            self.batch_indices_decode = self._batch_indices_decode_buffer[:padded_decode_count]
 
-        # Copy real prefill indices after the decode indices.
-        if real_prefill_count > 0:
-            self.request_to_mamba_state_idx_for_step[
-                padded_decode_count : padded_decode_count + real_prefill_count
-            ] = active_mamba_indices[real_decode_count : real_decode_count + real_prefill_count]
+        if padded_prefill_count > 0:
+            # Update prefill indices
+            self._batch_indices_prefill_buffer[:real_prefill_count].copy_(
+                active_mamba_indices[real_decode_count : real_decode_count + real_prefill_count]
+            )
+            if padded_prefill_count > real_prefill_count:
+                self._batch_indices_prefill_buffer[real_prefill_count:padded_prefill_count].fill_(
+                    -1
+                )
 
-        # Pad the rest of the prefill section (if any remaining space in buffer)
-        total_used = padded_decode_count + real_prefill_count
-        if total_used < self.max_requests:
-            self.request_to_mamba_state_idx_for_step[total_used:].fill_(-1)
+            self.batch_indices_prefill = self._batch_indices_prefill_buffer[:padded_prefill_count]
+
+            # Update seq_idx
+            seq_len = real_token_count - real_decode_count
+            padded_seq_len = padded_token_count - padded_decode_count
+
+            self._seq_idx_buffer[:seq_len].copy_(
+                token_to_request_idx[real_decode_count:real_token_count] - real_decode_count
+            )
+            if padded_seq_len > seq_len:
+                self._seq_idx_buffer[seq_len:padded_seq_len].fill_(-1)
+            self.seq_idx = self._seq_idx_buffer[:padded_seq_len].unsqueeze(0)
+
+            # Update cu_seqlens
+            self._cu_seqlens_buffer[0] = 0
+            self._cu_seqlens_buffer[1 : real_prefill_count + 1].copy_(
+                cu_seqlens[real_decode_count + 1 : real_decode_count + real_prefill_count + 1]
+                - real_decode_count
+            )
+            # Pad the rest with the last value (effectively length 0 segments)
+            last_val = self._cu_seqlens_buffer[real_prefill_count]
+            self._cu_seqlens_buffer[real_prefill_count + 1 : padded_prefill_count + 1].fill_(
+                last_val
+            )
+            self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
+
+        if padded_decode_count > 0 and padded_prefill_count > 0:
+            self._device_decode_prefill_buffer[0] = padded_decode_count
+            self._device_decode_prefill_buffer[1] = padded_prefill_count
+            self.device_decode_prefill = self._device_decode_prefill_buffer
 
     def allocate_slot(self) -> Optional[int]:
         """
