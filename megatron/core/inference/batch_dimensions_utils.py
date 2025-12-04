@@ -170,6 +170,9 @@ class CUDAGraphBatchDimensionBuilder:
         # Make sure divisible by TP size
         cuda_graph_step_size = math.ceil(cuda_graph_step_size / tp_size) * tp_size
 
+        # round down cuda graph max tokens to be multiple of TP size
+        cuda_graph_max_tokens = (cuda_graph_max_tokens // tp_size) * tp_size
+
         # Cuda graph token counts.
         if num_cuda_graphs == 1:
             cuda_graph_token_counts = [cuda_graph_max_tokens]
