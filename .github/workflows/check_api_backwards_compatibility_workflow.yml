@@ -62,7 +62,9 @@ jobs:
           fi
 
           # Check for changes in megatron/core Python files (excluding tests and legacy)
+          # Note: Using both *.py and **/*.py to match files at root and in subdirectories
           CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD -- \
+            'megatron/core/*.py' \
             'megatron/core/**/*.py' \
             ':!megatron/core/tests/**' \
             ':!megatron/legacy/**' 2>/dev/null || echo "")
