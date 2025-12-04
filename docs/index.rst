@@ -3,7 +3,7 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Megatron Core User Guide
+Megatron User Guide
 ===================================
 
 **Megatron Core** is a Python library that has the core components required to build your language models. 
