@@ -39,13 +39,6 @@ RUN python -m pip install -U "nltk>=3.8.2"
 
 RUN pip3 install "huggingface_hub[cli]"
 
-ENV NLTK_DATA=/usr/share/nltk_data
-RUN python - <<'PY'
-import nltk
-ok = nltk.download('punkt_tab', download_dir='/usr/share/nltk_data', quiet=True)
-assert ok, "Failed to download punkt_tab"
-PY
-
 # Install Causal-Conv1d and its dependencies
 WORKDIR ${STAGE_DIR}
 ENV CAUSAL_CONV1D_FORCE_BUILD=TRUE
@@ -62,7 +55,7 @@ RUN git clone https://github.com/sudhu2k/mamba mamba &&\
     cd mamba &&\
     git checkout hipcub_warp_threads_deprecation &&\
     git show --oneline -s &&\
-    pip install --no-build-isolation --no-deps .
+    pip install --no-build-isolation .
 
 # Build flash-attention
 ARG BUILD_FA="1"
@@ -79,7 +72,7 @@ fi
 # Clone TE repo and submodules
 WORKDIR ${STAGE_DIR}
 
-ARG TE_COMMIT=release_v2.2_rocm
+ARG TE_COMMIT=c91bac54e9ff4992cdf2dbee9218d039986ebcd7
 ENV NVTE_FRAMEWORK=pytorch
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH_OVERRIDE}
 ENV NVTE_USE_HIPBLASLT=1
