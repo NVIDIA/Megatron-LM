@@ -322,7 +322,7 @@ jobs:
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
   create-gh-release:
-    needs: [build-test-publish-wheel]
+    needs: [build-test-publish-wheels]
     runs-on: ubuntu-latest
     environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
     if: |
@@ -336,7 +336,7 @@ jobs:
     env:
       REPOSITORY: ${{ github.repository }}
       PROJECT_NAME: Megatron Core
-      VERSION: ${{ needs.build-test-publish-wheel.outputs.version }}
+      VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
       TAG_PREFIX: ${{ inputs.gh-release-tag-prefix || '' }}
     steps:
       - name: Checkout repository
@@ -404,14 +404,14 @@ jobs:
           fi
 
   notify:
-    needs: [build-test-publish-wheel, create-gh-release]
+    needs: [build-test-publish-wheels, create-gh-release]
     runs-on: ubuntu-latest
     environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
     env:
-      GH_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-test-publish-wheel.outputs.version }}
-      PYPI_URL: https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/${{ needs.build-test-publish-wheel.outputs.pypi-name }}/${{ needs.build-test-publish-wheel.outputs.version }}/
+      GH_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-test-publish-wheels.outputs.version }}
+      PYPI_URL: https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/${{ needs.build-test-publish-wheels.outputs.pypi-name }}/${{ needs.build-test-publish-wheels.outputs.version }}/
       PROJECT_NAME: Megatron Core
-      VERSION: ${{ needs.build-test-publish-wheel.outputs.version }}
+      VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
