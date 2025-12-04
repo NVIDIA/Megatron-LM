@@ -313,7 +313,7 @@ jobs:
           git push -d origin ${{ env.TMP_BRANCH }}
 
   build-test-publish-wheels:
-    needs: [pre-flight]
+    needs: [bump-next-version]
     uses: ./.github/workflows/_build_test_publish_wheel.yml
     with:
       dry-run: false
