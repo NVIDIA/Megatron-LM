@@ -12,6 +12,7 @@ from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TENorm,
     TERowParallelLinear,
+    te_general_gemm,
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -20,8 +21,6 @@ from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
-
-te_cpp = importlib.import_module("transformer_engine.pytorch.cpp_extensions")
 
 try:
     import flash_attn_3
@@ -683,9 +682,11 @@ def _device(dtype=torch.float16):
     return dict(device="cuda", dtype=dtype)
 
 
-# Helper to get the proper general_gemm function from transformer_engine.pytorch.cpp_extensions
+# Helper to call TE general_gemm via Megatron's wrapper that manages workspace, etc.
 def _te_general_gemm(*args, **kwargs):
-    return getattr(te_cpp, "general_gemm")(*args, **kwargs)
+    if te_general_gemm is None:
+        pytest.skip("TransformerEngine general_gemm is not available in this environment.")
+    return te_general_gemm(*args, **kwargs)
 
 
 # ============================================================================
@@ -696,7 +697,7 @@ def _te_general_gemm(*args, **kwargs):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_bik_te_general_gemm_chunking_deterministic(dtype):
     torch.manual_seed(123)
-    M1, M2, K, N = 37, 23, 128, 128  # ensure TE shape constraints with layout 'TN': K == N
+    M1, M2, K, N = 37, 23, 128, 128
     A1 = torch.randn(M1, K, **_device(dtype))
     A2 = torch.randn(M2, K, **_device(dtype))
     A = torch.cat([A1, A2], dim=0)
@@ -705,10 +706,10 @@ def test_bik_te_general_gemm_chunking_deterministic(dtype):
     layout = "TN"
     with set_batch_invariant_mode(True):
         # Full batch
-        C_full = _te_general_gemm(A, B, dtype, layout=layout)[0]
+        C_full = _te_general_gemm(A, B, out_dtype=dtype, layout=layout)[0]
         # Chunked batches
-        C_part1 = _te_general_gemm(A1, B, dtype, layout=layout)[0]
-        C_part2 = _te_general_gemm(A2, B, dtype, layout=layout)[0]
+        C_part1 = _te_general_gemm(A1, B, out_dtype=dtype, layout=layout)[0]
+        C_part2 = _te_general_gemm(A2, B, out_dtype=dtype, layout=layout)[0]
         # For TN, output is [N, M]; concatenation should be along dim=1
         cat_dim = 1 if layout == "TN" else 0
         C_cat = torch.cat([C_part1, C_part2], dim=cat_dim)
@@ -727,11 +728,10 @@ def test_bik_te_general_gemm_numerical_parity(dtype):
     A = torch.randn(M, K, **_device(dtype))
     B = torch.randn(K, N, **_device(dtype))
 
-    # Baseline (TE) outside of BIK context using TE's typical layout
-    C_ref = _te_general_gemm(A, B, dtype, layout="TN")[0]
+    C_ref = _te_general_gemm(A, B, out_dtype=dtype, layout="TN")[0]
 
     # Batch-invariant inside context
     with set_batch_invariant_mode(True):
-        C_bik = _te_general_gemm(A, B, dtype, layout="TN")[0]
+        C_bik = _te_general_gemm(A, B, out_dtype=dtype, layout="TN")[0]
 
     torch.testing.assert_close(C_bik, C_ref, **_tols(dtype))
