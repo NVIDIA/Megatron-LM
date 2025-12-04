@@ -10,6 +10,8 @@ ENV https_proxy=$https_proxy
 ENV no_proxy=$no_proxy
 ENV WORKSPACE_DIR=/workspace
 ENV STAGE_DIR=/workspace/installs
+ENV PIP_DEFAULT_TIMEOUT=120
+ENV PIP_RETRIES=10
 RUN mkdir -p $WORKSPACE_DIR
 RUN mkdir -p ${STAGE_DIR}
 WORKDIR $WORKSPACE_DIR
