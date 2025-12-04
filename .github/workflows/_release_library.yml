@@ -33,10 +33,6 @@ on:
         type: string
         required: true
         description: Branch to target for version bump
-      app-id:
-        required: true
-        description: GitHub App ID
-        type: string
       create-gh-release:
         required: false
         description: Create a GitHub release
@@ -86,17 +82,11 @@ jobs:
     env:
       IS_DRY_RUN: ${{ inputs.dry-run }}
     steps:
-      - uses: actions/create-github-app-token@v2
-        id: app-token
-        with:
-          app-id: ${{ inputs.app-id }}
-          private-key: ${{ secrets.BOT_KEY }}
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           path: ${{ github.run_id }}
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ secrets.PAT }}
           fetch-depth: 0
           fetch-tags: true
           ref: ${{ inputs.release-ref }}
@@ -188,7 +178,7 @@ jobs:
 
       - name: Create and push deployment branch
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           cd ${{ github.run_id }}
 
@@ -211,7 +201,7 @@ jobs:
         uses: actions/github-script@v7
         id: wait-status
         with:
-          github-token: ${{ steps.app-token.outputs.token }}
+          github-token: ${{ secrets.PAT }}
           script: |
             const branch = process.env.TMP_BRANCH;
             const owner = context.repo.owner;
