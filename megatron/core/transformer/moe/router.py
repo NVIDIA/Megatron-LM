@@ -512,19 +512,6 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
             )
 
-        # debugmtl
-        # true_per_row = routing_map.sum(dim=1)  # tensor of shape [n]
-        # torch.set_printoptions(threshold=torch.inf)
-        # assert torch.all(true_per_row == 8), \
-        #     f"in class topkrouter routing_map row true counts not all 8,
-        #  got: {true_per_row}, logits is:{logits}, topk is:{self.topk},
-        # use_pre_softmax is:{self.config.moe_router_pre_softmax}, num_groups
-        # is:{self.config.moe_router_num_groups}, group_topk is:
-        # {self.config.moe_router_group_topk}, scaling_factor is:
-        # {self.config.moe_router_topk_scaling_factor}, score_function
-        # is:{self.score_function}, expert_bias is:{self.expert_bias},
-        # fused is:{self.config.moe_router_fusion}"
-
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(

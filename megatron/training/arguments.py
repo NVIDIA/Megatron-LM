@@ -2912,6 +2912,14 @@ def _add_distributed_args(parser):
                        help='Enables hybrid context parallel. This is used to balance the workload '
                        'of each CP rank when we use packed samples with variable sequence lengths. '
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
+    group.add_argument('--min-hybrid-context-parallel-size', type=int, default=1,
+                        help='Minimum size of the hybrid context parallel groups.')
+    group.add_argument('--hybrid-context-parallel-scheduler', type=str, default='balanced',
+                        choices=['balanced', 'only_packing_no_scheduling'],
+                        help='Scheduler for hybrid context parallel. '
+                        'balanced: balanced scheduler for hybrid context parallel. '
+                        'only_packing_no_scheduling: scheduling is already handled by the data sampler, '
+                        'this scheduler only performs packing.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '

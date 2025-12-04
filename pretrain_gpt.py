@@ -63,10 +63,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
     
     # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage) and (
-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        # packed_seq_params = get_packed_seq_params_on_this_pp_rank()
-        # return None, None, None, None, None, packed_seq_params
+    if (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)):
         return None, None, None, None, None, None
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -74,6 +71,25 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
         )
     
+    if not is_first_or_last_pipeline_stage(vp_stage):
+        if args.args.hybrid_context_parallel:
+            local_cp_size=batch['local_cp_size'].item()
+            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=local_cp_size)
+        else:
+            local_cp_size, cp_group = None, None
+                     
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=batch['cu_seqlens_padded'],
+            cu_seqlens_kv=batch['cu_seqlens_padded'],
+            cu_seqlens_q_padded=batch['cu_seqlens_padded'],
+            cu_seqlens_kv_padded=batch['cu_seqlens_padded'],
+            max_seqlen_q=batch['cu_seqlens_padded'],
+            max_seqlen_kv=batch['cu_seqlens_padded'],
+            local_cp_size=local_cp_size,
+            cp_group=cp_group,
+        )
+        return None, None, None, None, None, packed_seq_params
     
     if args.sft_sequence_packing:
         cu_seqlens = batch.pop('cu_seqlens')
@@ -86,23 +102,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size)
         
     else:
-        # #debugmtl
-        # sample_length = batch['tokens'].shape[1]
-        # if args.sft:
-        #     packed_seq_params = PackedSeqParams(
-        #     qkv_format="sbhd",
-        #     cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        #     cu_seqlens_kv=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        #     cu_seqlens_q_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        #     cu_seqlens_kv_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        #     max_seqlen_q=sample_length,
-        #     max_seqlen_kv=sample_length,
-        #     local_cp_size=None,
-        #     cp_group=None,
-        # )
-        # else:
-        #     packed_seq_params = None
-        # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
     return (*batch.values(), packed_seq_params)
@@ -258,6 +257,7 @@ def core_gpt_dataset_config_from_args(args):
         allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
         sft_mock_dataset_config_json=args.sft_mock_dataset_config_json,
         sft_sequence_packing=args.sft_sequence_packing,
+        hybrid_context_parallel_scheduler=args.hybrid_context_parallel_scheduler,
     )
 
 

@@ -69,6 +69,14 @@ class ModelParallelConfig:
     When enabling hybrid_context_parallel, sft_sequence_packing must be true.
     """
 
+    hybrid_context_parallel_scheduler: str = 'balanced'
+    """
+    Scheduler for hybrid context parallel.
+    balanced: balanced scheduler for hybrid context parallel.
+    only_packing_no_scheduling: scheduling is already handled by the data sampler,
+    this scheduler only performs packing.
+    """
+
     sft_sequence_packing: bool = False
     """
     If true, enables sft sequence packing.

@@ -147,8 +147,7 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     if (out is None) or (not deallocate_pipeline_outputs):
         return
     assert isinstance(out, torch.Tensor), "expected Tensor, found %s." % type(out).__name__
-    # debugmtl
-    # assert out._base is None, "counter-productive to free a view of another tensor."
+    assert out._base is None, "counter-productive to free a view of another tensor."
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
 
 
@@ -512,14 +511,32 @@ def wrap_iterator_helper(
     if config.sft_sequence_packing:
         num_total_tokens_this_GB, sequence_square_sum_this_GB = None, None
         if config.hybrid_context_parallel:
-            (
-                data_iterator,
-                num_microbatches,
-                num_total_tokens_this_GB,
-                sequence_square_sum_this_GB,
-            ) = wrap_dataloader(
-                data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
-            )
+            if config.hybrid_context_parallel_scheduler == 'balanced':
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
+                    data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
+                )
+            elif config.hybrid_context_parallel_scheduler == 'only_packing_no_scheduling':
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
+                    data_iterator,
+                    config,
+                    PackingScheduler.ONLY_PACKING_NO_SCHEDULING,
+                    pg_collection=None,
+                )
+            else:
+                raise ValueError(
+                    f"Invalid hybrid context parallel scheduler: \
+                    {config.hybrid_context_parallel_scheduler}"
+                )
         else:
             if config.balanced_sequence_packing:
                 # enable balanced sequence packing scheduler, will be implemented later

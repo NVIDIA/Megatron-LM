@@ -664,6 +664,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
+        # TODO(tailaim): remove this after testing
         # debugmtl
         # global_input_tokens = all_to_all(
         #     self.ep_group, permutated_local_input_tokens,

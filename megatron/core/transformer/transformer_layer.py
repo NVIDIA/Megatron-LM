@@ -457,25 +457,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        # debugmtl
-        # if torch.isnan(hidden_states).any():
-        #     bad_mask = torch.isnan(hidden_states)
-        #     bad_idx = bad_mask.nonzero(as_tuple=False)[:10]
-        #     raise RuntimeError(
-        #         f"[transformerlayer] hidden_states contains NaN after attention,
-        # first indices: {bad_idx.tolist()}, "
-        #         f"shape={tuple(hidden_states.shape)}"
-        #     )
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
-        # debugmtl
-        # if torch.isnan(hidden_states).any():
-        #     bad_mask = torch.isnan(hidden_states)
-        #     bad_idx = bad_mask.nonzero(as_tuple=False)[:10]
-        #     raise RuntimeError(
-        #         f"[transformerlayer] hidden_states contains NaN after mlp,
-        # first indices: {bad_idx.tolist()}, "
-        #         f"shape={tuple(hidden_states.shape)}"
-        #     )
         return output, context
 
     def _forward_attention(
@@ -628,9 +610,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        # #debugmtl  barrier here works
-        # torch.distributed.barrier()
-
         if self.offload_mlp_norm:
             hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
         # Optional Layer norm post the cross-attention.
@@ -698,19 +677,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
-        # debugmtl nan here
-        # for x in mlp_output_with_bias:
-        #     if x is None:
-        #         continue
-        #     if torch.isnan(x).any():
-        #         bad_mask = torch.isnan(x)
-        #         bad_idx = bad_mask.nonzero(as_tuple=False)[:10]
-        #         raise RuntimeError(
-        #             f"[transformerlayer] mlp_output_with_bias contains
-        # NaN after attention, first indices: {bad_idx.tolist()}, "
-        #             f"shape={tuple(x.shape)}"
-        #         )
-
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of mlp_output_with_bias[0]
@@ -744,16 +710,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
-
-        # #debugmtl  nan here
-        # if torch.isnan(hidden_states).any():
-        #     bad_mask = torch.isnan(hidden_states)
-        #     bad_idx = bad_mask.nonzero(as_tuple=False)[:10]
-        #     raise RuntimeError(
-        #         f"[transformerlayer] hidden_states contains NaN
-        # after attention, first indices: {bad_idx.tolist()}, "
-        #         f"shape={tuple(hidden_states.shape)}"
-        #     )
 
         nvtx_range_pop(suffix="mlp_bda")
         if self.offload_mlp_norm:

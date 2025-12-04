@@ -185,10 +185,6 @@ class MoELayer(BaseMoELayer):
         producing routing probabilities and a mapping.
         """
         probs, routing_map = self.router(hidden_states)
-        # #debugmtl
-        # true_per_row = routing_map.sum(dim=1)  # tensor of shape [n]
-        # assert torch.all(true_per_row == 8), \
-        #     f"routing_map row true counts not all 8, got: {true_per_row}"
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -294,14 +290,6 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
-        # # debugmtl
-        # if torch.isnan(hidden_states).any():
-        #     bad_mask = torch.isnan(hidden_states)
-        #     bad_idx = bad_mask.nonzero(as_tuple=False)[:10]
-        #     raise RuntimeError(
-        #         f"[MoE] hidden_states contains NaN, first indices: {bad_idx.tolist()}, "
-        #         f"shape={tuple(hidden_states.shape)}"
-        #     )
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
