@@ -525,8 +525,7 @@ class TextGenerationController:
             if not on_gpu:
                 # We need a D2H copy from the context to the pinned memory buffer.
                 self._request_metadata[label].copy_(
-                    context.request_metadata[label],
-                    non_blocking=True,
+                    context.request_metadata[label], non_blocking=True
                 )
 
         # Get flat tokens, position ids.
@@ -558,7 +557,9 @@ class TextGenerationController:
 
         if self.model_is_pipeline_parallel:
             logits_seq_len = (
-                active_request_count if context.materialize_only_last_token_logits else input_ids.shape[1]
+                active_request_count
+                if context.materialize_only_last_token_logits
+                else input_ids.shape[1]
             )
             vocab_size = inference_wrapper_config.padded_vocab_size
             logits_shape = [1, logits_seq_len, vocab_size]
@@ -703,7 +704,9 @@ class TextGenerationController:
 
             top_n_results = {}
             for req_idx in range(active_request_count):
-                top_n = int(self._request_metadata["top_n_logprobs"][active_request_slice][req_idx].item())
+                top_n = int(
+                    self._request_metadata["top_n_logprobs"][active_request_slice][req_idx].item()
+                )
                 if top_n > 0:
                     # Get top-n logprobs and indices for this request (single token)
                     top_n_logits = torch.topk(log_probs[req_idx], k=top_n)
@@ -725,7 +728,9 @@ class TextGenerationController:
 
         top_n_results = {}
         for req_idx in range(active_request_count):
-            top_n = int(self._request_metadata["top_n_logprobs"][active_request_slice][req_idx].item())
+            top_n = int(
+                self._request_metadata["top_n_logprobs"][active_request_slice][req_idx].item()
+            )
             if top_n > 0:
                 request_log_probs = log_probs_per_request[
                     req_idx

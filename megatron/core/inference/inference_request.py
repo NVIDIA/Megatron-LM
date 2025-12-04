@@ -12,6 +12,7 @@ import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.utils import experimental_api
 
 
 def serialize_tensor(tensor: torch.Tensor) -> bytes:
@@ -228,6 +229,7 @@ class DynamicInferenceEvent:
         return event
 
 
+@experimental_api
 @dataclass(kw_only=True)
 class DynamicInferenceRequest(InferenceRequest):
     """Class for one inference request
@@ -332,7 +334,7 @@ class DynamicInferenceRequest(InferenceRequest):
             ("termination_id", torch.int64, True),
             ("return_log_probs", torch.bool, False),  # CPU for non-selective logprobs
             ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("top_n_logprobs", torch.int32, False), # CPU for torch sampling
+            ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
         ]
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:

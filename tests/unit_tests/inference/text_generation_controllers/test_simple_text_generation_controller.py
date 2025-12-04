@@ -265,7 +265,9 @@ class TestTextGenerationController:
         top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).to(torch.int32)
         top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict])
         request_metadata = {
-            "temperature": temp_values, "top_k": top_k_values, "top_p": top_p_values,
+            "temperature": temp_values,
+            "top_k": top_k_values,
+            "top_p": top_p_values,
         }
         self.text_generation_controller._request_metadata = request_metadata
         self.text_generation_controller._sampling_backend = backend
