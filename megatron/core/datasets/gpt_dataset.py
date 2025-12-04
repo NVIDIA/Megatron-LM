@@ -70,7 +70,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.eod_mask_loss is not None
 
         if self.fast_cache:
-            assert self.path_to_cache is not None, "--data-cache-path must be provided when using --fast-cache"
+            assert self.path_to_cache is not None, "--data-cache-path must be provided when using --dataloader-fast-cache-load"
         
         self.token_dtype_code = None if self.tokenizer.vocab_size is None else (4 if self.tokenizer.vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8)
         if self.sequences_per_dataset is not None:
@@ -361,7 +361,7 @@ class GPTDataset(MegatronDataset):
             self.path_to_sample_index = get_path_to("sample_index.npy")
             self.path_to_shuffle_index = get_path_to("shuffle_index.npy")
             return None, None, None
-            
+
         path_to_cache = self.config.path_to_cache
         if path_to_cache is None and not self.config.mock:
             path_to_cache = os.path.join(

@@ -246,10 +246,9 @@ class _IndexReader(object):
         log_single_rank(logger, logging.INFO, f"Load the {type(self).__name__} from {idx_path}")
 
         if sequences_per_dataset:
-            # NOTE(asolergi-nv): We only enter this block when using --fast-cache
             self.dtype = DType.dtype_from_code(dtype_code)
             self.dtype_size = DType.size(self.dtype)
-            # NOTE(asolergi-nv): For 12/1978 the number of documents is the number of sequences +1, the rest is number of documents == number of sequences"
+            
             self.sequence_count = sequences_per_dataset[0]
             self.document_count = sequences_per_dataset[1]
             offset = 34
