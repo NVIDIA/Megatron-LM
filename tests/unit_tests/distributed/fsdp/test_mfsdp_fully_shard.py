@@ -1,5 +1,6 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import shutil
-from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 
@@ -326,27 +327,19 @@ class TestMegatronFsdpFullyShard:
                 # Because of uneven sharding, we need to gather the result from all ranks
                 # to verify if any gradients exist or not at this step of training.
                 grads_exist_gathered = [None] * sharding_group.size()
-                torch.distributed.gather_object(
-                    grads_exist,
-                    object_gather_list=grads_exist_gathered if sharding_group.rank() == 0 else None,
-                    group=sharding_group,
-                    group_dst=0,
+                torch.distributed.all_gather_object(
+                    object_list=grads_exist_gathered, obj=grads_exist, group=sharding_group
                 )
-                if sharding_group.rank() == 0:
-                    # Gradients exist on at least one of the optimizer sharding ranks.
-                    # Update grads_exist on Rank 0 only.
-                    grads_exist = any(grads_exist_gathered)
-                torch.distributed.barrier()
+                # Gradients exist on at least one of the optimizer sharding ranks.
+                grads_exist = any(grads_exist_gathered)
 
             # Gradients do not exist until synchronization is activated.
-            # Use collected result on Rank 0 only.
-            if sharding_group.rank() == 0:
-                if step == NUM_STEPS - 1:
-                    assert grads_exist, "Root module gradients should exist on final microbatch."
-                else:
-                    assert (
-                        not grads_exist
-                    ), "Root module gradients should not exist prior to optimization step."
+            if step == NUM_STEPS - 1:
+                assert grads_exist, "Root module gradients should exist on final microbatch."
+            else:
+                assert (
+                    not grads_exist
+                ), "Root module gradients should not exist prior to optimization step."
             torch.distributed.barrier()
 
             # Optimizer step. Apply accumulated gradients to the model weights.

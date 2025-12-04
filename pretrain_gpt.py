@@ -18,6 +18,7 @@ from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -172,26 +173,49 @@ def core_gpt_dataset_config_from_args(args):
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
-    return GPTDatasetConfig(
-        random_seed=args.seed,
-        sequence_length=args.seq_length,
-        blend=blend,
-        blend_per_split=blend_per_split,
-        split=args.split,
-        multiple_validation_sets=args.multiple_validation_sets,
-        full_validation=args.full_validation,
-        num_dataset_builder_threads=args.num_dataset_builder_threads,
-        path_to_cache=args.data_cache_path,
-        mmap_bin_files=args.mmap_bin_files,
-        tokenizer=tokenizer,
-        reset_position_ids=args.reset_position_ids,
-        reset_attention_mask=args.reset_attention_mask,
-        eod_mask_loss=args.eod_mask_loss,
-        create_attention_mask=args.create_attention_mask_in_dataloader,
-        object_storage_cache_path=args.object_storage_cache_path,
-        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
-    )
+    data_args = {
+        "random_seed": args.seed,
+        "sequence_length": args.seq_length,
+        "blend": blend,
+        "blend_per_split": blend_per_split,
+        "split": args.split,
+        "multiple_validation_sets": args.multiple_validation_sets,
+        "full_validation": args.full_validation,
+        "num_dataset_builder_threads": args.num_dataset_builder_threads,
+        "path_to_cache": args.data_cache_path,
+        "mmap_bin_files": args.mmap_bin_files,
+        "tokenizer": tokenizer,
+        "reset_position_ids": args.reset_position_ids,
+        "reset_attention_mask": args.reset_attention_mask,
+        "eod_mask_loss": args.eod_mask_loss,
+        "create_attention_mask": args.create_attention_mask_in_dataloader,
+        "object_storage_cache_path": args.object_storage_cache_path,
+        "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
+        "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
+    }
+
+    # add FIM args to the config
+    if args.fim_data:
+        extra_tokens = {
+            "prefix": args.fim_prefix_token,
+            "middle": args.fim_middle_token,
+            "suffix": args.fim_suffix_token,
+            "pad": args.fim_pad_token,
+            "eod": args.fim_eod_token,
+        }
+        data_args.update(
+            {
+                "fim_rate": args.fim_rate,
+                "fim_spm_rate": args.fim_spm_rate,
+                "fim_extra_tokens": extra_tokens,
+                "fim_split_sample": args.fim_split_sample,
+                "fim_fragment_rate": args.fim_fragment_rate,
+                "fim_no_prefix": args.fim_no_prefix,
+            }
+        )
+        return GPTFIMDatasetConfig(**data_args)
+
+    return GPTDatasetConfig(**data_args)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
@@ -209,6 +233,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset
+        elif args.fim_data:
+            dataset_type = GPTFIMDataset
         else:
             dataset_type = GPTDataset
 
