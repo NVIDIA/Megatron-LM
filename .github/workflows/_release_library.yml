@@ -55,18 +55,18 @@ permissions:
   pull-requests: write # To create PR(s)
 
 jobs:
-  build-test-publish-wheels-dry-run:
-    uses: ./.github/workflows/_build_test_publish_wheel.yml
-    with:
-      dry-run: true
-    secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
-      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+  # build-test-publish-wheels-dry-run:
+  #   uses: ./.github/workflows/_build_test_publish_wheel.yml
+  #   with:
+  #     dry-run: true
+  #   secrets:
+  #     TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
+  #     TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
   bump-next-version:
     runs-on: ubuntu-latest
     environment: main # ${{ inputs.dry-run == true && 'public' || 'main' }}
-    needs: build-test-publish-wheels-dry-run
+    # needs: build-test-publish-wheels-dry-run
     if: |
       (
         success() || !failure()
