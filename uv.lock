@@ -2223,7 +2223,7 @@ dev = [
     { name = "tensorstore", version = "0.1.78", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "tensorstore", version = "0.1.79", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "tqdm" },
-    { name = "transformer-engine", extra = ["core-cu13", "pytorch"], marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "transformer-engine", marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "wget" },
 ]
 lts = [
@@ -2345,7 +2345,7 @@ requires-dist = [
     { name = "torch" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", specifier = ">=2.9.0a0,<2.11.0" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.10" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "wandb", marker = "extra == 'mlm'" },
     { name = "wget", marker = "extra == 'dev'" },
@@ -5683,60 +5683,17 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.9.0"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/6d/5c/21152e73aa46ac7c969d694ce86cdeb199024c7810b2d700e900ea4efb1a/transformer_engine-2.9.0-py3-none-any.whl", hash = "sha256:953147ed4c490e54c9884bb0d876a1341f05c5c5b7d304bf61f4740f6faee5af", size = 662107, upload-time = "2025-11-11T15:50:49.167Z" },
-]
-
-[package.optional-dependencies]
-core-cu13 = [
-    { name = "transformer-engine-cu13" },
-]
-pytorch = [
-    { name = "transformer-engine-torch" },
-]
-
-[[package]]
-name = "transformer-engine-cu12"
-version = "2.9.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "importlib-metadata" },
-    { name = "packaging" },
-    { name = "pydantic" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a6/af/1c449ad0c43d3d6b5c529c812a4e8338b20965ae5361a9b612c7dce21e4d/transformer_engine_cu12-2.9.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:81162874c0618f3e62eb5ffba0bb1b608b4e56d70238205b1dced7ee965d82b3", size = 303669451, upload-time = "2025-11-11T15:54:12.008Z" },
-    { url = "https://files.pythonhosted.org/packages/82/21/aa351994d8ade95681763df2b10770c768900ecc7f1cedbfa4e89fe1935a/transformer_engine_cu12-2.9.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:ad14981cbbd964f8e4446c35199d1bc5349ea30244e76bc57c1cceb5d469dd24", size = 304164366, upload-time = "2025-11-11T15:50:22.169Z" },
-]
-
-[[package]]
-name = "transformer-engine-cu13"
-version = "2.9.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "importlib-metadata" },
-    { name = "packaging" },
-    { name = "pydantic" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ab/b9/c1c788875848bf50faa22749107d91e92e9c0c78bb1878b99939209e40f9/transformer_engine_cu13-2.9.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:590aaeb3a4d552fe9ebc7019d43315f3e61153fcd1c5a07dc0c90bd8b278316e", size = 185010342, upload-time = "2025-11-13T22:35:04.742Z" },
-    { url = "https://files.pythonhosted.org/packages/95/7f/3019c21565f63eeb79d24fa7d3bae39b5b73f21c72d7d5123d21d7ce945a/transformer_engine_cu13-2.9.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:4e869f5a0fd74aaa05a5d801a96688ed21827d23efe9774bd3038d5f2802ef46", size = 185669069, upload-time = "2025-11-13T22:35:13.709Z" },
-]
-
-[[package]]
-name = "transformer-engine-torch"
-version = "2.9.0"
-source = { registry = "https://pypi.org/simple" }
+version = "2.10.0+769ed778"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.10#769ed778341a32c8c593fda391700c0a80f65f1f" }
 dependencies = [
     { name = "einops" },
+    { name = "importlib-metadata" },
     { name = "onnx" },
     { name = "onnxscript" },
+    { name = "packaging" },
+    { name = "pydantic" },
     { name = "torch", marker = "sys_platform == 'never'" },
-    { name = "transformer-engine-cu12" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a2/a3/401d741eceb8f402595e63ee0b1828d60cae988b22f2f23c9cfcc24185bd/transformer_engine_torch-2.9.0.tar.gz", hash = "sha256:abbc59f6acf635abf865085ecdf90e7d4ca9a3782bc91a9845e38adb2655a547", size = 215138, upload-time = "2025-11-11T15:49:04.258Z" }
 
 [[package]]
 name = "transformers"
