@@ -538,7 +538,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Track request metadata.
         self.request_metadata = {
-            label: torch.empty((self.max_total_requests,), dtype=dtype, device=torch.cuda.current_device())
+            label: torch.empty(
+                (self.max_total_requests,), dtype=dtype, device=torch.cuda.current_device()
+            )
             for label, dtype, _ in self.request_metadata_types
         }
 
@@ -1052,9 +1054,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_block_counts[request_slice] = block_counts
         for i, (label, dtype, _) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
-                metadata_cols[i],
-                dtype=dtype,
-                device=torch.cuda.current_device(),
+                metadata_cols[i], dtype=dtype, device=torch.cuda.current_device()
             )
 
         dummy_block_idx = self.block_allocator.dummy_block_idx
