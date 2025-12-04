@@ -512,9 +512,12 @@ class TextGenerationController:
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
-            capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
-            set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
-    
+            if context.using_cuda_graph_this_step():
+                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
+                set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
+            else:
+                set_decode_expert_padding(unwrapped_model, False)
+
         if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
             if context.is_decode_only():
                 # Turn on symmetric all reduce when in decode mode
@@ -830,18 +833,16 @@ class TextGenerationController:
 
     def dummy_forward(self):
         context = self.inference_wrapped_model.inference_context
-        if context.cuda_graph_batch_dimensions_list is None:
-            # dummy non-cuda graphed forward
-            return self.inference_wrapped_model.dummy_forward()
-        else:
-            # dummy cuda graphed forward 
-            input_ids, position_ids = self._dynamic_step_context_init(
-                # use the smallest cuda-graph config for dummy forward
-                construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list)
-            )
+        # attempt to use cuda-graph if possible 
+        input_ids, position_ids = self._dynamic_step_context_init(
+            # use the smallest cuda-graph config for dummy forward
+            construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list)
+        )
+        if context.using_cuda_graph_this_step():
             self._dynamic_step_forward_logits(input_ids, position_ids)
-            context.reset()
-
+        else:
+            self.inference_wrapped_model.dummy_forward()
+        context.reset()
 
     def _dynamic_step_context_bookkeeping(self, new_sample) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.

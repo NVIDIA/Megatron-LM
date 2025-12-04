@@ -458,6 +458,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self._using_cuda_graph_this_step = False
+        self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
 
@@ -1199,7 +1200,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
-            batch_dimensions, self.cuda_graph_batch_dimensions_list
+            batch_dimensions, 
+            self.cuda_graph_batch_dimensions_list,
+            decode_only_cuda_graphs = (not self.use_cuda_graphs_for_non_decode_steps)
         )
         self._using_cuda_graph_this_step = best_graph is not None
         
