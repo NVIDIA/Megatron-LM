@@ -402,7 +402,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if launch_inference_coordinator and self.is_dp_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
             coordinator_ready_event = spawn_context.Event()
-            # TODO(Peter) We need to pass the correct data parallel world size here
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(
