@@ -366,7 +366,7 @@ def create_hierarchical_groups(
             [g0, g1], [g2, g3], [g4, g5], [g6, g7], [g8, g9], [g10, g11], [g12, g13], [g14, g15]
         8 level-2 sub-groups:
             [g0, g2], [g1, g3], [g4, g6], [g5, g7], [g8, g10], [g9, g11], [g12, g14], [g13, g15]
-        4 level-3 sub-groups:inter_dist_opt_pg
+        4 level-3 sub-groups:
             [g0, g4, g8, g12], [g1, g5, g9, g13], [g2, g6, g10, g14], [g3, g7, g11, g15]
     """
 
