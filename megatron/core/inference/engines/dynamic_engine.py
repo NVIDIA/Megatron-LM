@@ -170,7 +170,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if pg_collection is not None:
             self.pg_collection = pg_collection
         else:
-            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups
+            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         # Initialization options.
         self.controller = controller
