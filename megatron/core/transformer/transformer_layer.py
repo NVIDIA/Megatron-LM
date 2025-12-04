@@ -710,6 +710,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
+
         nvtx_range_pop(suffix="mlp_bda")
         if self.offload_mlp_norm:
             (hidden_states,) = fine_grained_offloading_group_commit(

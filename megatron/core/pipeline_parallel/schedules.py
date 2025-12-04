@@ -9,6 +9,7 @@ from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
+from megatron.core.pipeline_parallel.data_schedule import PackingScheduler, wrap_dataloader
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_reset,
 )
@@ -500,6 +501,69 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+def wrap_iterator_helper(
+    config,
+    data_iterator: Union[Iterator, List[Iterator]],
+    num_microbatches: int,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
+    """Warp data iterator for sequence packing if needed."""
+    if config.sft_sequence_packing:
+        num_total_tokens_this_GB, sequence_square_sum_this_GB = None, None
+        if config.hybrid_context_parallel:
+            if config.hybrid_context_parallel_scheduler == 'balanced':
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
+                    data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
+                )
+            elif config.hybrid_context_parallel_scheduler == 'only_packing_no_scheduling':
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
+                    data_iterator,
+                    config,
+                    PackingScheduler.ONLY_PACKING_NO_SCHEDULING,
+                    pg_collection=None,
+                )
+            else:
+                raise ValueError(
+                    f"Invalid hybrid context parallel scheduler: \
+                    {config.hybrid_context_parallel_scheduler}"
+                )
+        else:
+            if config.balanced_sequence_packing:
+                # enable balanced sequence packing scheduler, will be implemented later
+                pass
+            else:
+                # naive sequence packing scheduler
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
+                    data_iterator,
+                    config,
+                    PackingScheduler.NAIVE_SEQUENCE_PACKING,
+                    pg_collection=None,
+                )
+        return (
+            data_iterator,
+            num_microbatches,
+            num_total_tokens_this_GB,
+            sequence_square_sum_this_GB,
+        )
+    else:
+        return data_iterator, num_microbatches, None, None
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -581,6 +645,10 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
+    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
+    )
+
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
             forward_step_func,
@@ -660,6 +728,9 @@ def forward_backward_no_pipelining(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    if config.sft_sequence_packing:
+        forward_data_store.append([num_total_tokens_this_GB, sequence_square_sum_this_GB])
 
     return forward_data_store
 
@@ -912,6 +983,10 @@ def forward_backward_pipelining_with_interleaving(
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
+
+    data_iterator, num_microbatches = wrap_iterator_helper(
+        config, data_iterator, num_microbatches, pg_collection
+    )
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2045,6 +2120,39 @@ def forward_backward_pipelining_without_interleaving(
             "Invalid combination of p2p_communicator, pg_collection "
             "provide none or provide all the process groups"
         )
+    if is_pp_first_stage(p2p_communicator.pp_group) or is_pp_last_stage(p2p_communicator.pp_group):
+        data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+            wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
+        )
+
+        if config.sft_sequence_packing:
+            info_tensor = torch.tensor(
+                [num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB],
+                dtype=torch.int,
+                device="cuda",
+            )
+            if not is_pp_last_stage(p2p_communicator.pp_group):
+                next_rank = torch.distributed.get_global_rank(
+                    p2p_communicator.pp_group, p2p_communicator.pp_group.rank() + 1
+                )
+                torch.distributed.send(info_tensor, dst=next_rank)
+
+    # TODO(tailaim): last pp rank does not need to receive num_microbatches
+    if config.sft_sequence_packing and not (is_pp_first_stage(p2p_communicator.pp_group)):
+        info_tensor = torch.empty(3, dtype=torch.int, device="cuda")
+        prev_rank = torch.distributed.get_global_rank(
+            p2p_communicator.pp_group, p2p_communicator.pp_group.rank() - 1
+        )
+        torch.distributed.recv(info_tensor, src=prev_rank)
+        num_microbatches = int(info_tensor[0].item())
+        num_total_tokens_this_GB = int(info_tensor[1].item())
+        sequence_square_sum_this_GB = int(info_tensor[2].item())
+
+        if not is_pp_last_stage(p2p_communicator.pp_group):
+            next_rank = torch.distributed.get_global_rank(
+                p2p_communicator.pp_group, p2p_communicator.pp_group.rank() + 1
+            )
+            torch.distributed.send(info_tensor, dst=next_rank)
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2314,5 +2422,8 @@ def forward_backward_pipelining_without_interleaving(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    if config.sft_sequence_packing:
+        forward_data_store.append([num_total_tokens_this_GB, sequence_square_sum_this_GB])
 
     return forward_data_store
