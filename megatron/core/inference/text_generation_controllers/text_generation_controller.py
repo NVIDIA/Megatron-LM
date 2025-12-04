@@ -19,10 +19,7 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
-from megatron.core.inference.contexts.dynamic_context import (
-    MaxSequenceLengthOverflowError,
-    WarmupEngineMode,
-)
+from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     InferenceRequest,
@@ -44,6 +41,8 @@ try:
 
 except ImportError:
     HAVE_TE = False
+
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 
 
 # pylint: disable=line-too-long
@@ -105,9 +104,6 @@ class TextGenerationController:
         self.return_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
         self.skip_prompt_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
         self.top_n_logprobs_cuda = torch.empty(max_requests, dtype=torch.int32, device=device)
-        self.return_prompt_top_n_logprobs_cuda = torch.empty(
-            max_requests, dtype=torch.bool, device=device
-        )
 
         # Used for inefficient torch sampling.
         self.torch_sampling_buckets: List[Tensor] = []
@@ -348,18 +344,18 @@ class TextGenerationController:
                 top_n_logprobs_this_step = top_n_logits_this_step.values.cpu()
                 top_n_logprobs_indices = top_n_logits_this_step.indices.cpu()
 
-                # If we return prompt top_n_log_probs then we always append to the
-                # logprobs dict. Otherwise we only append for generated tokens.
-                if sampling_params.return_prompt_top_n_logprobs:
-                    mask = torch.ones(batch_size, dtype=torch.bool)
-                else:
+                # If we skip prompt log_probs then we only append for generated tokens.
+                # Otherwise we always append to the logprobs dict.
+                if sampling_params.skip_prompt_log_probs:
                     mask = generation_started.cpu()
+                else:
+                    mask = torch.ones(batch_size, dtype=torch.bool)
 
                 self._update_top_n_logprobs_dict(
                     top_n_logprobs_this_step, top_n_logprobs_indices, mask, top_n_logprobs_dict
                 )
             else:
-                assert sampling_params.return_prompt_top_n_logprobs
+                assert not sampling_params.skip_prompt_log_probs
 
                 # Compute the prompt logprobs
                 batch_size, seq_length, _ = logits.shape
@@ -482,18 +478,13 @@ class TextGenerationController:
         return padded_batch_prompt_tokens[:original_batch_size]
 
     def _dynamic_step_context_init(
-        self,
-        num_warmup_tokens: Optional[int] = None,
-        warmup_engine_mode: Optional[WarmupEngineMode] = None,
+        self, construct_graph_dimensions: Optional[InferenceBatchDimensions] = None
     ):
         """Initializes the inference context for dynamic batching.
 
         Args:
-            num_warmup_tokens (Optional[int]): Number of tokens to use for
-                warming up cuda graphs. Must be less than or equal to
-                `max_requests`.
-            warmup_engine_mode (WarmupEngineMode): Denote whether to setup
-                for a decode or a non-decode cuda-graph warmup.
+            construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use
+                for constructing the cuda graphs.
 
         Return:
             input_ids (Tensor): The active input IDs.
@@ -507,9 +498,7 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state(
-            num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
-        )
+        context.initialize_attention_state(construct_graph_dimensions=construct_graph_dimensions)
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -520,7 +509,6 @@ class TextGenerationController:
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
-            assert warmup_engine_mode is not WarmupEngineMode.NON_DECODE
             if context.is_decode_only():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
@@ -536,7 +524,12 @@ class TextGenerationController:
                 unwrapped_model.set_symmetric_ar(None)
 
         # Get flat tokens, position ids.
-        return context.current_input_and_position_ids(num_warmup_tokens=num_warmup_tokens)
+        if construct_graph_dimensions is not None:
+            return context.current_input_and_position_ids(
+                num_warmup_tokens=construct_graph_dimensions.token_count
+            )
+        else:
+            return context.current_input_and_position_ids()
 
     def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor) -> Tensor:
         """Forward step the model to get logits for dynamic batching.
@@ -632,9 +625,6 @@ class TextGenerationController:
         self.top_n_logprobs_cuda[:active_request_count] = request_metadata[
             :, request_metadata_labels["top_n_logprobs"]
         ].to(dtype=torch.int32, copy=True, non_blocking=True)
-        self.return_prompt_top_n_logprobs_cuda[:active_request_count] = request_metadata[
-            :, request_metadata_labels["return_prompt_top_n_logprobs"]
-        ].to(dtype=torch.bool, copy=True, non_blocking=True)
 
         if backend == "torch":
             # Bucketize the core sampling parameters.
@@ -727,14 +717,14 @@ class TextGenerationController:
 
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Check if any request wants prompt top-n logprobs (top_n > 0 AND return_prompt_top_n = True)
+        # Check if any request wants prompt top-n logprobs (top_n > 0 AND skip_prompt_log_probs = False)
         # Create a copy to avoid modifying the original tensor with in-place operations
         to_check = (self.top_n_logprobs_cuda[:active_request_count] > 0).clone()
-        to_check &= self.return_prompt_top_n_logprobs_cuda[:active_request_count]
+        to_check &= ~self.skip_prompt_log_probs_cuda[:active_request_count]
 
         assert not (
             to_check.any() and materialize_only_last_token_logits
-        ), "Prompt top-n logprobs cannot be calculated if only last token logits are materialized. Set materialize_only_last_token_logits to False in DynamicInferenceContext or set return_prompt_top_n_logprobs to False in SamplingParams."
+        ), "Prompt top-n logprobs cannot be calculated if only last token logits are materialized. Set materialize_only_last_token_logits to False in DynamicInferenceContext or set skip_prompt_log_probs to True in SamplingParams."
 
         # Check if any request has top_n_logprobs > 0
         return (self.top_n_logprobs_cuda[:active_request_count] > 0).any()
@@ -814,10 +804,10 @@ class TextGenerationController:
                 request_log_probs = log_probs_per_request[
                     req_idx
                 ]  # [num_tokens_for_request, vocab_size]
-                return_prompt_top_n = bool(self.return_prompt_top_n_logprobs_cuda[req_idx].item())
+                skip_prompt = bool(self.skip_prompt_log_probs_cuda[req_idx].item())
 
-                # If return_prompt_top_n_logprobs is False, only compute for last token
-                if not return_prompt_top_n and request_log_probs.size(0) > 1:
+                # If skip_prompt_log_probs is True, only compute for last token
+                if skip_prompt and request_log_probs.size(0) > 1:
                     # Only compute top-n for the last token (first generated token)
                     top_n_logits = torch.topk(request_log_probs[-1], k=top_n)
                     top_n_results[req_idx] = [
@@ -1263,7 +1253,7 @@ class TextGenerationController:
 
                 logits_for_top_n_prompt_logprobs = (
                     logits
-                    if context_start_position == 0 and sampling_params.return_prompt_top_n_logprobs
+                    if context_start_position == 0 and not sampling_params.skip_prompt_log_probs
                     else None
                 )
                 sampled_logits = self.sample_from_logits(
@@ -1421,7 +1411,7 @@ class TextGenerationController:
                     input_prompt_length - 1 : (input_prompt_length + required_sequence_length - 1),
                 ].tolist()
             if sampling_params.top_n_logprobs > 0:
-                if sampling_params.return_prompt_top_n_logprobs:
+                if not sampling_params.skip_prompt_log_probs:
                     assert (
                         len(top_n_logprobs_dict[idx])
                         >= input_prompt_length + required_sequence_length - 1

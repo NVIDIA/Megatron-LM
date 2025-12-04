@@ -56,6 +56,7 @@ from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 
 from megatron.core.utils import configure_nvtx_profiling
+import logging
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -175,7 +176,7 @@ def get_inference_context(
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
-        materialize_only_last_token_logits=not (args.return_log_probs or args.return_prompt_top_n_logprobs),
+        materialize_only_last_token_logits=not args.return_log_probs,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
@@ -183,6 +184,8 @@ def get_inference_context(
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
+        cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
     )
 
@@ -265,7 +268,7 @@ def run_inference(
     total_output_tokens = 0
     attempted_step_count = 0
     if args.cuda_graph_impl == "local":
-        cuda_graph_request_count_map = {r:0 for r in engine.context.cuda_graph_request_counts}
+        cuda_graph_request_count_map = {}
     else:
         cuda_graph_request_count_map = None
 
@@ -341,7 +344,7 @@ def run_inference(
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
         if args.cuda_graph_impl == "local" and cuda_graph_request_count is not None:
-            cuda_graph_request_count_map[cuda_graph_request_count] += 1
+            cuda_graph_request_count_map[cuda_graph_request_count] = cuda_graph_request_count_map.get(cuda_graph_request_count, 0) + 1
 
         # Update requests.
         active_request_ids = result["active_request_ids"]
@@ -378,12 +381,14 @@ def run_inference(
                 if finished_request.sampling_params.return_log_probs:
                     if not finished_request.prompt_log_probs:
                         finished_request.prompt_log_probs = []
-                    request.log_probs = (
+                    request.prompt_log_probs = finished_request.prompt_log_probs
+                    request.generated_log_probs = finished_request.generated_log_probs
+                    request.logprobs = (
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
                 if finished_request.sampling_params.top_n_logprobs > 0:
                     request.generated_top_n_logprobs = finished_request.generated_top_n_logprobs
-                if finished_request.sampling_params.return_prompt_top_n_logprobs:
+                if not finished_request.sampling_params.skip_prompt_log_probs:
                     request.prompt_top_n_logprobs = finished_request.prompt_top_n_logprobs
                 num_requests_finished += 1
             output_times.append(get_curr_time() - output_start)
@@ -414,6 +419,10 @@ def main():
     if os.environ.get("NSIGHT_PREFIX"):
         torch.cuda.cudart().cudaProfilerStart()
     
+    level_str = os.getenv("LOG_LEVEL", "INFO").upper() 
+    level = getattr(logging, level_str, logging.INFO) 
+    logging.basicConfig(level=level, force=True)
+
     configure_nvtx_profiling(True)
 
     args = get_args()
@@ -432,8 +441,7 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         top_n_logprobs=args.top_n_logprobs,
-        return_prompt_top_n_logprobs=args.return_prompt_top_n_logprobs,
-    )
+    ) 
 
     model = get_model()
 
@@ -561,8 +569,9 @@ def main():
                         "prompt_top_n_logprobs" : getattr(req, 'prompt_top_n_logprobs', None),
                     }
                     if req.sampling_params.return_log_probs:
-                        response_logprobs = req.log_probs
-                        result_dict["logprobs"] = response_logprobs
+                        result_dict["prompt_logprobs"] = getattr(req, 'prompt_log_probs', None)
+                        result_dict["generated_logprobs"] = getattr(req, 'generated_log_probs', None)
+                        result_dict["logprobs"] = getattr(req, 'logprobs', None)
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric
