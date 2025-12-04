@@ -32,24 +32,12 @@ jobs:
       - name: Check if relevant files changed
         id: check_files
         run: |
-          # Debug: Show git remote and branch info
-          echo "=== DEBUG INFO ==="
-          echo "Event: ${{ github.event_name }}"
-          echo "Repository: ${{ github.repository }}"
-          echo "Ref: ${{ github.ref }}"
-          git remote -v
-          echo "=== END DEBUG ==="
-
           # For manual triggers, never skip
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "should_skip=false" >> $GITHUB_OUTPUT
             echo "Manual trigger - will run compatibility check"
             exit 0
           fi
-
-          # Ensure we have the latest refs from origin
-          git fetch origin main --depth=1 2>/dev/null || true
-          git fetch origin dev --depth=1 2>/dev/null || true
 
           # Determine base SHA based on event type
           if [ "${{ github.event_name }}" == "merge_group" ]; then
