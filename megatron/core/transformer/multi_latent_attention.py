@@ -15,7 +15,7 @@ except ImportError:
     HAVE_EINOPS = False
 
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -36,7 +36,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import deprecate_inference_params, is_te_min_version
+from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -173,6 +173,7 @@ class MultiLatentAttention(Attention):
             skip_bias_add=True,
             is_expert=False,
             tp_comm_buffer_name='proj',
+            tp_group=self.pg_collection.tp,
         )
 
         if (
@@ -346,6 +347,9 @@ class MLASelfAttention(MultiLatentAttention):
         cp_comm_type: Optional[str] = None,
         pg_collection: ProcessGroupCollection = None,
     ):
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
         super().__init__(
             config=config,
             submodules=submodules,
@@ -395,6 +399,11 @@ class MLASelfAttention(MultiLatentAttention):
                 is_expert=False,
                 tp_comm_buffer_name='q_down_proj',
                 skip_weight_param_allocation=False,
+                tp_group=(
+                    pg_collection.tp
+                    if q_down_proj_kwargs.get('parallel_mode') != 'duplicated'
+                    else None
+                ),
                 **q_down_proj_kwargs,
             )
 
@@ -409,6 +418,7 @@ class MLASelfAttention(MultiLatentAttention):
                 skip_bias_add=False,
                 is_expert=False,
                 tp_comm_buffer_name='q_up_proj',
+                tp_group=pg_collection.tp,
             )
 
         kv_down_proj_kwargs = {}
@@ -434,6 +444,11 @@ class MLASelfAttention(MultiLatentAttention):
             is_expert=False,
             tp_comm_buffer_name='kv_down_proj',
             skip_weight_param_allocation=False,
+            tp_group=(
+                pg_collection.tp
+                if kv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
+                else None
+            ),
             **kv_down_proj_kwargs,
         )
 
@@ -448,6 +463,7 @@ class MLASelfAttention(MultiLatentAttention):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
+            tp_group=pg_collection.tp,
         )
 
         if self.config.q_lora_rank is not None:
@@ -568,12 +584,9 @@ class MLASelfAttention(MultiLatentAttention):
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
-            if (
-                parallel_state.get_tensor_model_parallel_world_size() > 1
-                and self.config.sequence_parallel
-            ):
+            if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
-                k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb)
+                k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
         if packed_seq_params is not None:
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
