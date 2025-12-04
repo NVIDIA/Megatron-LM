@@ -23,7 +23,6 @@ def get_quant_config_or_none(
 def load_quantization_recipe(recipe_path: str) -> RecipeConfig:
     """Loads a quantization recipe from a path."""
     recipe = RecipeConfig.from_yaml_file(recipe_path)
-
     return recipe
 
 

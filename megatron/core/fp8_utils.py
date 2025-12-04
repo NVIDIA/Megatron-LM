@@ -691,9 +691,7 @@ if HAVE_TE:
         def padded_forward(input_tensor, *args, **kwargs):
             is_context_quantized = FP8GlobalStateManager.is_fp8_enabled()
             if hasattr(module, "will_execute_quantized"):
-                module_uses_quant = module.will_execute_quantized(
-                    is_context_quantized
-                )
+                module_uses_quant = module.will_execute_quantized(is_context_quantized)
             else:
                 module_uses_quant = is_context_quantized
             # Only do padding for fp8 if we are in fp8 or fp4 context

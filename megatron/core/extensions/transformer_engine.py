@@ -649,9 +649,7 @@ class TELinear(te.pytorch.Linear):
         else:
             self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
 
-    def will_execute_quantized(
-        self, is_context_quantized: bool
-    ) -> bool:
+    def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
         return _get_should_context_be_quantized_params(
             self.te_quant_params, self.training, is_context_quantized
@@ -856,9 +854,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         else:
             self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
 
-    def will_execute_quantized(
-        self, is_context_quantized: bool
-    ) -> bool:
+    def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
         return _get_should_context_be_quantized_params(
             self.te_quant_params, self.training, is_context_quantized
@@ -1529,9 +1525,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             else:
                 self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
 
-        def will_execute_quantized(
-            self, is_context_quantized: bool
-        ) -> bool:
+        def will_execute_quantized(self, is_context_quantized: bool) -> bool:
             """Returns whether the module is configured to execute quantized."""
             return _get_should_context_be_quantized_params(
                 self.te_quant_params, self.training, is_context_quantized

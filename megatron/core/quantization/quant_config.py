@@ -45,13 +45,12 @@ friendly a way as possible.
 
 import fnmatch
 import logging
-import os
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-import torch
+from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -61,19 +60,6 @@ try:
     HAVE_YAML = True
 except ImportError:
     HAVE_YAML = False
-
-
-def _safe_get_rank() -> int:
-    """Internal function that safely checks and returns the rank of the caller."""
-
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
-
-    # If torch.distributed is not initialized, try to read environment variables.
-    try:
-        return int(os.environ.get("RANK", 0))
-    except (ValueError, TypeError):
-        return 0
 
 
 @dataclass
@@ -190,6 +176,12 @@ class RecipeConfig:
         with open(recipe_yaml_path, "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
 
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Loaded quantization recipe from path '{recipe_path}'. " f"Contents: '{config}'",
+        )
+
         return RecipeConfig.from_config_dict(config)
 
     @staticmethod
@@ -210,13 +202,15 @@ class RecipeConfig:
         for matcher in self.matchers:
             config_key = matcher.match(operator_context)
             if config_key is not None:
-                if _safe_get_rank() == 0:
-                    logger.info(
-                        f'Context ({operator_context}) matched to quant config "{config_key}"'
-                    )
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f'Context ({operator_context}) matched to quant config "{config_key}"',
+                )
                 return config_key
-        if _safe_get_rank() == 0:
-            logger.info(f"No config key match found for Context ({operator_context})")
+        log_single_rank(
+            logger, logging.INFO, f"No config key match found for Context ({operator_context})"
+        )
         return None
 
     def match(self, operator_context: MatchContext) -> QuantizationConfig | None:
