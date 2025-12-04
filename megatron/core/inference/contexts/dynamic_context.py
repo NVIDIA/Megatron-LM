@@ -265,7 +265,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
         use_cuda_graphs_for_non_decode_steps: bool = True,
         use_flashinfer_fused_rope: bool = False,
-        unified_memory_level: Optional[int] = 1,
+        unified_memory_level: Optional[int] = 0,
         cuda_graph_max_tokens: Optional[int] = None,
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
