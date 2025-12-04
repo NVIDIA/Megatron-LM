@@ -1392,17 +1392,17 @@ class TestDynamicInferenceEngine:
         for request in env.requests:
             assert request.status == Status.COMPLETED, f"Request {request.request_id} not completed"
             assert len(request.generated_tokens) > 0, f"Request {request.request_id} has no tokens"
-            
+
             # Validate log probs are present
             if hasattr(request, 'generated_log_probs') and request.generated_log_probs is not None:
-                assert len(request.generated_log_probs) == len(request.generated_tokens), (
-                    f"Request {request.request_id}: log_probs length mismatch"
-                )
+                assert len(request.generated_log_probs) == len(
+                    request.generated_tokens
+                ), f"Request {request.request_id}: log_probs length mismatch"
                 # Log probs should be negative (or zero for probability 1.0)
                 for log_prob in request.generated_log_probs:
-                    assert log_prob <= 0.0, (
-                        f"Request {request.request_id}: log_prob {log_prob} is positive"
-                    )
+                    assert (
+                        log_prob <= 0.0
+                    ), f"Request {request.request_id}: log_prob {log_prob} is positive"
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1431,20 +1431,20 @@ class TestDynamicInferenceEngine:
         # Run with selective log-softmax enabled
         env_selective = self._build_test_env(test_config)
         env_selective.engine.context.use_selective_log_softmax = True
-        
+
         for request in env_selective.requests:
             env_selective.engine._add_request(request)
-        
+
         while env_selective.engine.has_unfinished_requests():
             env_selective.engine.step_modern(verbose=False)
 
         # Run with selective log-softmax disabled
         env_standard = self._build_test_env(test_config)
         env_standard.engine.context.use_selective_log_softmax = False
-        
+
         for request in env_standard.requests:
             env_standard.engine._add_request(request)
-        
+
         while env_standard.engine.has_unfinished_requests():
             env_standard.engine.step_modern(verbose=False)
 
@@ -1455,17 +1455,19 @@ class TestDynamicInferenceEngine:
                 f"Request {req_selective.request_id}: generated tokens differ between "
                 f"selective and standard implementations"
             )
-            
+
             # Log probs should be numerically close
-            if (hasattr(req_selective, 'generated_log_probs') and 
-                req_selective.generated_log_probs is not None and
-                hasattr(req_standard, 'generated_log_probs') and 
-                req_standard.generated_log_probs is not None):
-                
-                assert len(req_selective.generated_log_probs) == len(req_standard.generated_log_probs), (
-                    f"Request {req_selective.request_id}: log_probs length mismatch"
-                )
-                
+            if (
+                hasattr(req_selective, 'generated_log_probs')
+                and req_selective.generated_log_probs is not None
+                and hasattr(req_standard, 'generated_log_probs')
+                and req_standard.generated_log_probs is not None
+            ):
+
+                assert len(req_selective.generated_log_probs) == len(
+                    req_standard.generated_log_probs
+                ), f"Request {req_selective.request_id}: log_probs length mismatch"
+
                 # Compare log probs with tolerance for numerical precision
                 # Using higher tolerance for bfloat16
                 tolerance = 1e-3  # Reasonable tolerance for bfloat16
@@ -1499,38 +1501,40 @@ class TestDynamicInferenceEngine:
             materialize_only_last_token_logits=True,  # Decode-only setting
             skip_prompt_log_probs=True,  # Skip prompt log probs
         )
-        
+
         # Test with selective log-softmax enabled
         env_selective = self._build_test_env(test_config)
         env_selective.engine.context.use_selective_log_softmax = True
-        
+
         for request in env_selective.requests:
             env_selective.engine._add_request(request)
-        
+
         while env_selective.engine.has_unfinished_requests():
             env_selective.engine.step_modern(verbose=False)
-        
+
         # Test with selective log-softmax disabled
         env_standard = self._build_test_env(test_config)
         env_standard.engine.context.use_selective_log_softmax = False
-        
+
         for request in env_standard.requests:
             env_standard.engine._add_request(request)
-        
+
         while env_standard.engine.has_unfinished_requests():
             env_standard.engine.step_modern(verbose=False)
-        
+
         # Validate results match
         for req_selective, req_standard in zip(env_selective.requests, env_standard.requests):
             assert req_selective.status == req_standard.status
             assert req_selective.generated_tokens == req_standard.generated_tokens
-            
-            if (hasattr(req_selective, 'generated_log_probs') and 
-                req_selective.generated_log_probs is not None):
+
+            if (
+                hasattr(req_selective, 'generated_log_probs')
+                and req_selective.generated_log_probs is not None
+            ):
                 tolerance = 1e-3
                 for i, (lp_sel, lp_std) in enumerate(
                     zip(req_selective.generated_log_probs, req_standard.generated_log_probs)
                 ):
-                    assert abs(lp_sel - lp_std) < tolerance, (
-                        f"Decode-only log_prob mismatch at token {i}"
-                    )
+                    assert (
+                        abs(lp_sel - lp_std) < tolerance
+                    ), f"Decode-only log_prob mismatch at token {i}"

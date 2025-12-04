@@ -1927,48 +1927,30 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return newly_paused_request_ids
 
-    def selective_log_softmax(self, logits: Tensor, index: Tensor) -> Tensor:
-        """Compute log softmax probabilities for selected tokens with reduced memory footprint.
-
-        This implementation is based on the selective log-softmax optimization described in:
-        https://www.tylerromero.com/posts/2025-02-selective-log-softmax/
-
-        The optimization avoids materializing the full log_softmax output tensor by:
-        1. Computing logsumexp over the full distribution
-        2. Gathering only the logits for tokens of interest
-        3. Subtracting logsumexp to get log probabilities
-
-        For float32/float64, we use logsumexp computed in a loop to reduce peak memory.
-        For bfloat16/float16, we fall back to log_softmax in a loop for numerical stability.
+    def selective_log_softmax(self, logits):
+        """Compute log softmax probabilities for selected tokens.
 
         Args:
-            logits (Tensor): Logits tensor of shape (sequence_length, vocab_size).
-            index (Tensor): Index tensor of shape (sequence_length,), specifying the token
-                positions to gather log probabilities for.
-
+            logits (`torch.Tensor`):
+                Logits tensor of shape `(..., num_classes)`.
         Returns:
-            Tensor: Selected log probabilities with shape (sequence_length,).
+            `torch.Tensor`:
+                Gathered log probabilities with the same shape as `index`.
         """
         if logits.dtype in [torch.float32, torch.float64]:
-            # For full precision, use logsumexp approach
-            # Compute logsumexp for each position in the sequence
-            # Note: we compute this without batching to minimize peak memory usage
-            logsumexp_values = torch.logsumexp(logits, dim=-1)  # shape: (sequence_length,)
-
-            # Gather the logits for the selected tokens
-            selected_logits = logits[torch.arange(logits.size(0), device=logits.device), index]
-
-            # Compute log probabilities: log_softmax(x_i) = x_i - logsumexp(x)
-            token_logprobs = selected_logits - logsumexp_values
+            logsumexp_values = torch.stack(
+                [torch.logsumexp(lg, dim=-1) for lg in logits]
+            )  # loop to reduce peak mem consumption
+            token_logprobs = logits - logsumexp_values.unsqueeze(
+                1
+            )  # log_softmax(x_i) = x_i - logsumexp(x)
         else:
-            # For reduced precision (bfloat16/float16), logsumexp can be numerically unstable
-            # Fall back to computing log_softmax directly, but only materialize one position at a time
+            # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
             token_logprobs = []
-            for i in range(logits.size(0)):
-                logprobs_i = F.log_softmax(logits[i], dim=-1)
-                token_logprobs.append(logprobs_i[index[i]])
+            for logits_row in logits:  # loop to reduce peak mem consumption
+                logprobs_row = logits_row.log_softmax(dim=-1)
+                token_logprobs.append(logprobs_row)
             token_logprobs = torch.stack(token_logprobs)
-
         return token_logprobs
 
     def calculate_log_probs(
