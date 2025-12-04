@@ -1,5 +1,69 @@
 # Changelog
 
+## NVIDIA Megatron Core 0.15.0
+
+* Features  
+  * Performance  
+    * Fused QKV preprocessing with precomputed RoPE caches (3x preprocessing speedup, 10-14% E2E) ([MR \!3912](https://github.com/NVIDIA/Megatron-LM/commit/f0d9fa97fead9825ae3eada36ee2df568bfa415b))  
+    * Use new TE interface for user buffers ([MR \!3886](https://github.com/NVIDIA/Megatron-LM/commit/d47b83807142b6490c7a000e63d25a479b106fd9))  
+    * Add CPU activation offloading via TE ([MR \!4286](https://github.com/NVIDIA/Megatron-LM/commit/310671436c36e6bd198e92c4f30bc84469cc31d8))  
+    * Add configurable double buffering ([MR \!4026](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4026))  
+    * Add Muon optimizer and distributed optimizer support ([MR \!4106](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4106))  
+    * Add setting to support Adam or AdamW optimizer ([MR \!3866](https://github.com/NVIDIA/Megatron-LM/commit/03fd0b41b3840c6f19558161d98373a9242402e5))  
+  * MoE  
+    * Add DTensor support for EP and DSv3 modules ([MR \!3955](https://github.com/NVIDIA/Megatron-LM/commit/268fda08592528b7bc1a21aadaed259980ca8efb))  
+    * Add HybridEP backend to Flex Dispatcher ([MR \!4237](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4237))  
+    * Support FP8 recomputation for MoE components ([MR \!4030](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4030))  
+    * Implement NVFP4 Zero Padding for MoE ([MR \!4225](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4225))  
+    * Compute shared experts before router ([MR \!4068](https://github.com/NVIDIA/Megatron-LM/commit/e8024d716f3036ebcef8c5254c7830ad09aaf41b))  
+    * Enable bias in expert MLP ([MR \!3858](https://github.com/NVIDIA/Megatron-LM/commit/a329dd6da586261a45a8f7d04c1e659ffedd80ae))  
+  * Model support  
+    * Add YaRN support for GPT-OSS ([MR \!4044](https://github.com/NVIDIA/Megatron-LM/commit/2c1b77a9984bfa978e7cf1f58522e5f8e045d017))  
+    * Add support for Qwen3-Next arguments ([MR \!4070](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4070))  
+    * Add FP8 init for MTP ([MR \!3958](https://github.com/NVIDIA/Megatron-LM/commit/d6c6e54ec5eb43d4e196c7ae84e0e88f28613e6b))  
+    * Add fp8\_dpa option for FP8 scaling ([MR \!4053](https://github.com/NVIDIA/Megatron-LM/commit/61047e60e617e71ebe120ec293b62df6b0efc84f))  
+    * Add RADIO-g support to converter and tester ([MR \!4371](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4371))  
+    * Add audio semantic reasoning data for voice chat and speech instructions ([MR \!4397](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4397))  
+  * FSDP  
+    * Enable joint training of parallel modules ([MR \!3850](https://github.com/NVIDIA/Megatron-LM/commit/53008b844f98886a2144c216ecd25952cb2dda58))  
+    * Add support for multimodule communication ([MR \!4235](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4235))  
+  * Inference  
+    * Add CUDA Graph runner lookup table cache (up to 2x E2E speedup) ([MR \!4082](https://github.com/NVIDIA/Megatron-LM/commit/ab43252fdbedcc3662014ae0e110bd3278d844f4))  
+    * Add MoE dropping and padding router for CUDA Graph \+ decode ([MR \!3816](https://github.com/NVIDIA/Megatron-LM/commit/56818f9e5090ff9eb0f13f10bfe408aae4031c5c))  
+    * Dynamic audio shapes with variable sequence lengths (2.5x throughput improvement) ([MR \!4274](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4274))  
+    * Integrate unified memory for dynamic inference context ([MR \!3985](https://github.com/NVIDIA/Megatron-LM/commit/ef4ae4528a0924159069b9f3a2719616156bafa2))  
+  * Post-training  
+    * Add GPT-OSS ModelOpt support with quantization, import/export ([MR \!4169](https://github.com/NVIDIA/Megatron-LM/commit/a2d8c806b35bc708b13e6c069e19e5dfb49b8481))  
+    * Enable KD support with hybrid training loop ([MR \!4021](https://github.com/NVIDIA/Megatron-LM/commit/48d7275062a8307f82bd0fa6c1504032c7f3af96))  
+    * Add ModelOpt pruning example ([MR \!4022](https://github.com/NVIDIA/Megatron-LM/commit/5a58976ebe007064c2ff5e76e815aa5fcf1a8787))  
+  * RL  
+    * Add importance sampling and partial rollouts to Megatron RL ([MR \!4000](https://github.com/NVIDIA/Megatron-LM/commit/8399280ed3b72a183f44820896a67392c0a47e3e))  
+    * Add sequence packing for RL ([MR \!4191](https://github.com/NVIDIA/Megatron-LM/commit/ee8e9307f3ad655e6a46f98a483d8192995b02c2))  
+  * Ease of use  
+    * Handle CUDA absence during import ([MR \!4120](https://github.com/NVIDIA/Megatron-LM/commit/ae44e49271dc45b51a7400ecf6debc598ba90b54))  
+    * Add granary dataloader functionality ([MR \!4291](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4291))  
+    * Enable SWA mixing with attention ([MR \!3855](https://github.com/NVIDIA/Megatron-LM/commit/e5bc9249d7ad34355f5db4c8ff7d7a9080f94dc2))  
+* Bug fixes  
+  * Fix convergence bug in MXFP8 parameter gradient buffer reuse ([MR \!3999](https://github.com/NVIDIA/Megatron-LM/commit/c2c36f77cf7a0476daee5bb2dec604c2764de320))  
+  * Fix loss mask cloning to prevent incorrect updates ([MR \!4164](https://github.com/NVIDIA/Megatron-LM/commit/c94d58f3260aa568588265e07b3c06bb58cbde41))  
+  * Fix metadata loss in checkpoints ([MR \!4182](https://github.com/NVIDIA/Megatron-LM/commit/d8c6aa4c0b5d4c15ec1196802bce292d4580ed4a))  
+  * Fix FSDP grad accum fusion support ([MR \!4018](https://github.com/NVIDIA/Megatron-LM/commit/9f72f4775509668173c75eaab5d58a49f4473748))  
+  * Fix non-TE optimizer checkpoint issue ([MR \!3931](https://github.com/NVIDIA/Megatron-LM/commit/2ebb6ee95af8b547e3c0ac394d494cb189b890bc))  
+  * Fix BERT virtual pipeline parallelism ([MR \!3993](https://github.com/NVIDIA/Megatron-LM/commit/18420b63408101fe5a49d125fb29625f1ad6ab26))  
+  * Fix gc.freeze() slowdown by adding gc.collect() on last layer ([MR \!4003](https://github.com/NVIDIA/Megatron-LM/commit/a3f9e566c9595753553a73d403b2a481ad283fc0))  
+  * Fix full iteration CUDA graph non-tensor handling ([MR \!4019](https://github.com/NVIDIA/Megatron-LM/commit/8479eb35fbca9631acb846c3ad5d868e02214227))  
+  * Fix model\_auto\_sync mis-set and add gradient assertion ([MR \!4062](https://github.com/NVIDIA/Megatron-LM/commit/03045f2d880813695f75707e3262a2bfb4206dfe))  
+  * Fix HF import dtype and checkpoint loading issues ([MR \!4095](https://github.com/NVIDIA/Megatron-LM/commit/435e7e0620ff870d99debd73b3c9113226622dde))  
+  * Fix missing initialization in ProcessGroupCollection ([MR \!4159](https://github.com/NVIDIA/Megatron-LM/commit/5f2becf232a85df8687dc539e604e00a6a875da1))  
+  * Fix sink attention TP ([MR \!4173](https://github.com/NVIDIA/Megatron-LM/commit/3b1b9b267193d72d4f8dc710561c2368de8c114c))  
+  * Fix num\_microbatches calculation ([MR \!4199](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4199))  
+  * Fix 1f1b overlap unit tests for MTP standalone ([MR \!4210](https://github.com/NVIDIA/Megatron-LM/commit/44bc753d69cf509c158bb261434498b141fe5130))  
+  * Fix stale state dict handling ([MR \!4226](https://github.com/NVIDIA/Megatron-LM/commit/0ba847081113a92ce01084f33cd4a0c1f31b327b))  
+  * Fix dataset divergence with tokenizer PAD handling ([MR \!4231](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4231))  
+  * Fix parameter initialization ([MR \!4296](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4296))  
+  * Ensure tensor-parallel attributes set regardless of initialization flag ([MR \!4312](https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/4312))  
+* Known issues
+
 ## NVIDIA Megatron Core 0.14.0
 
 * Features  
