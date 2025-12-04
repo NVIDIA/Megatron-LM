@@ -360,7 +360,7 @@ def run_inference(
             output_start = get_curr_time()
             for finished_request_record in finished_request_records:
 
-                finished_request = finished_request_record.merge(engine.controller.tokenizer)
+                finished_request = finished_request_record.merge()
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
@@ -369,7 +369,7 @@ def run_inference(
                 request.request_id = finished_request.request_id
 
                 # Update prompt, in case engine has been suspended and resumed.
-                request.prompt_tokens = finished_request.prompt_tokens
+                request.prompt_tokens = finished_request.prompt_tokens.tolist()
                 request.prompt_text = finished_request.prompt
 
                 # Get output tokens and text.

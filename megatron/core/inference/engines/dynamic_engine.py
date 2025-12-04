@@ -565,7 +565,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.requests[request_id].record.suspend(self.controller.tokenizer)
+            self.requests[request_id].record.suspend()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -810,14 +810,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.status = Status.COMPLETED
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
-                    if finished_request.prompt is None:
-                        finished_request.prompt = self.controller.tokenizer.detokenize(
-                            finished_request.prompt_tokens.tolist()
-                        )
                     finished_request.generated_length = len(finished_request.generated_tokens)
-                    finished_request.generated_text = self.controller.tokenizer.detokenize(
-                        finished_request.generated_tokens
-                    )
                     finished_request_records.append(finished_entry.record)
                     finished_entry.future.set_result(finished_entry.record)
                 else:
@@ -1129,6 +1122,18 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
+
+        # Detokenize all finished requests (critical for InferenceClient, which
+        # doesn't necessarily have the tokenizer).
+        for record in finished_request_records:
+            for request in record.requests:
+                if request.prompt is None:
+                    request.prompt = self.controller.tokenizer.detokenize(
+                        request.prompt_tokens.tolist()
+                    )
+                request.generated_text = self.controller.tokenizer.detokenize(
+                    request.generated_tokens
+                )
 
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
