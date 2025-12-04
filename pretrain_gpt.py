@@ -2,6 +2,7 @@
 
 """Pretrain and SFT GPT."""
 
+import json
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -173,6 +174,11 @@ def core_gpt_dataset_config_from_args(args):
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
+    sequences_per_dataset = None
+    if args.path_to_sequences_per_dataset_json is not None:
+        with open(args.path_to_sequences_per_dataset_json, "r") as f:
+            sequences_per_dataset = json.load(f)
+
     data_args = {
         "random_seed": args.seed,
         "sequence_length": args.seq_length,
@@ -192,7 +198,9 @@ def core_gpt_dataset_config_from_args(args):
         "object_storage_cache_path": args.object_storage_cache_path,
         "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
         "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
-        "fast_cache": args.fast_cache,
+        "fast_cache": args.dataloader_fast_cache_load,
+        "sequences_per_dataset": sequences_per_dataset,
+        "defer_memmap": args.defer_memmap,
     }
 
     # add FIM args to the config

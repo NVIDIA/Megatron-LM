@@ -236,26 +236,39 @@ class _IndexReader(object):
         idx_path (str): The path to the index file
 
         multimodal (bool): Whether the dataset is multimodal
+
+        sequences_per_dataset (Optional[Tuple[int, int]]): The sequences per dataset.
+
+        dtype_code (int): The dtype code of the tokenized documents.
     """
 
-    def __init__(self, idx_path: str, multimodal: bool) -> None:
+    def __init__(self, idx_path: str, multimodal: bool, sequences_per_dataset: Optional[Tuple[int, int]] = None, dtype_code: int = None) -> None:
         log_single_rank(logger, logging.INFO, f"Load the {type(self).__name__} from {idx_path}")
 
-        with open(idx_path, "rb") as stream:
-            header = stream.read(9)
-            assert header == _INDEX_HEADER, f"bad header, cannot read: {idx_path}"
-
-            version = struct.unpack("<Q", stream.read(8))[0]
-            assert version == 1, f"bad version, cannot read: {idx_path}"
-
-            code = struct.unpack("<B", stream.read(1))[0]
-            self.dtype = DType.dtype_from_code(code)
+        if sequences_per_dataset:
+            # NOTE(asolergi-nv): We only enter this block when using --fast-cache
+            self.dtype = DType.dtype_from_code(dtype_code)
             self.dtype_size = DType.size(self.dtype)
+            # NOTE(asolergi-nv): For 12/1978 the number of documents is the number of sequences +1, the rest is number of documents == number of sequences"
+            self.sequence_count = sequences_per_dataset[0]
+            self.document_count = sequences_per_dataset[1]
+            offset = 34
+        else:
+            with open(idx_path, "rb") as stream:
+                header = stream.read(9)
+                assert header == _INDEX_HEADER, f"bad header, cannot read: {idx_path}"
 
-            self.sequence_count = struct.unpack("<Q", stream.read(8))[0]
-            self.document_count = struct.unpack("<Q", stream.read(8))[0]
+                version = struct.unpack("<Q", stream.read(8))[0]
+                assert version == 1, f"bad version, cannot read: {idx_path}"
 
-            offset = stream.tell()
+                code = struct.unpack("<B", stream.read(1))[0]
+                self.dtype = DType.dtype_from_code(code)
+                self.dtype_size = DType.size(self.dtype)
+
+                self.sequence_count = struct.unpack("<Q", stream.read(8))[0]
+                self.document_count = struct.unpack("<Q", stream.read(8))[0]
+
+                offset = stream.tell()
 
         self.bin_buffer_mmap = numpy.memmap(idx_path, mode="r", order="C")
         self.bin_buffer = memoryview(self.bin_buffer_mmap)
@@ -308,7 +321,6 @@ class _IndexReader(object):
 
         assert self.sequence_lengths.shape[0] == len(self)
         assert self.sequence_lengths.shape[0] == self.sequence_count
-        assert self.sequence_lengths.shape[0] == self.document_indices[-1]
 
         log_single_rank(logger, logging.INFO, f"> total number of sequences: {len(self)}")
         log_single_rank(
@@ -573,6 +585,12 @@ class IndexedDataset(torch.utils.data.Dataset):
             `object_storage_config.path_to_idx_cache` and streams data from the data (.bin) file
             in `object_storage_config.bin_chunk_nbytes` blocks. Note that `mmap` must be disabled
             for S3 data loading. Defaults to None.
+        
+        fast_cache (bool): Whether to use the fast cache mode.
+
+        sequences_per_dataset (Optional[Tuple[int, int]]): The sequences per dataset.
+
+        dtype_code (int): The dtype code of the tokenized documents.
     """
 
     def __init__(
@@ -583,6 +601,8 @@ class IndexedDataset(torch.utils.data.Dataset):
         object_storage_config: Optional[ObjectStorageConfig] = None,
         s3_config: Optional[S3Config] = None,
         fast_cache: bool = False,
+        sequences_per_dataset: Optional[Tuple[int, int]] = None,
+        dtype_code: int = None,
     ) -> None:
         super().__init__()
         self.path_prefix: str
@@ -602,7 +622,7 @@ class IndexedDataset(torch.utils.data.Dataset):
             cache_idx_path = get_index_cache_path(idx_path, object_storage_config)
             cache_index_file(idx_path, cache_idx_path)
 
-        self.initialize(path_prefix, multimodal, mmap, object_storage_config, fast_cache)
+        self.initialize(path_prefix, multimodal, mmap, object_storage_config, fast_cache, sequences_per_dataset, dtype_code)
 
     def initialize(
         self,
@@ -611,6 +631,8 @@ class IndexedDataset(torch.utils.data.Dataset):
         mmap: bool,
         object_storage_config: Optional[ObjectStorageConfig],
         fast_cache: bool,
+        sequences_per_dataset: Optional[Tuple[int, int]] = None,
+        dtype_code: int = None,
     ) -> None:
         """Initialize the dataset
 
@@ -626,6 +648,12 @@ class IndexedDataset(torch.utils.data.Dataset):
 
             object_storage_config (Optional[ObjectStorageConfig]): See IndexedDataset docstring
                 for details.
+            
+            fast_cache (bool): Whether to use the fast cache mode.
+
+            sequences_per_dataset (Optional[Tuple[int, int]]): The sequences per dataset.
+
+            dtype_code (int): The dtype code of the tokenized documents.
         """
         idx_path = get_idx_path(path_prefix)
         bin_path = get_bin_path(path_prefix)
@@ -649,7 +677,7 @@ class IndexedDataset(torch.utils.data.Dataset):
             idx_path = get_index_cache_path(get_idx_path(path_prefix), object_storage_config)
         else:
             self.bin_reader = _FileBinReader(bin_path)
-        self.index = _IndexReader(idx_path, self.multimodal)
+        self.index = _IndexReader(idx_path, self.multimodal, sequences_per_dataset, dtype_code)
 
     def __getstate__(self) -> Tuple[str, bool, bool, Optional[ObjectStorageConfig]]:
         """Get the state during pickling
