@@ -413,7 +413,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 args=(
                     coordinator_ready_event,
                     inference_coordinator_port,
-                    get_pg_size(self.process_group_collection.dp),
+                    get_pg_size(self.pg_collection.dp),
                 ),
             )
             self.inference_coordinator_process.start()
