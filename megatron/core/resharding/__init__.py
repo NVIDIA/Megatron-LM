@@ -1,3 +1,4 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from .execution import execute_reshard_plan
 from .planner import build_centralized_reshard_plan
 from .refit import reshard_model_weights, swap_model_weights
