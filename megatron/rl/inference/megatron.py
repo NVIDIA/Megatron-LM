@@ -169,7 +169,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         enable_cuda_graph=enable_cuda_graph,
         random_seed=args.seed,
         inference_logging_step_interval=inference_logging_step_interval,
-        process_group_collection=pg_collection,
+        pg_collection=pg_collection,
     )
 
 
