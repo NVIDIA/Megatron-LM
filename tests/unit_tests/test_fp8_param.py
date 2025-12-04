@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+import gc
 import os
 import sys
 
@@ -8,6 +9,7 @@ import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -29,6 +31,34 @@ from tests.unit_tests.test_utilities import Utils
 _SEED = 1234
 fp8_available, reason_for_no_fp8 = check_fp8_support()
 
+cuda_graph_supported = False
+reason_for_no_cuda_graph = ""
+try:
+    from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
+
+    cuda_graph_supported = True
+except ImportError:
+    reason_for_no_cuda_graph = "Need newer TransformerEngine"
+
+
+def enable_forward_pre_hook(model_chunks):
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.enable_forward_pre_hook()
+
+
+def disable_forward_pre_hook(model_chunks, param_sync=True):
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.disable_forward_pre_hook(param_sync=param_sync)
+
+
+def should_disable_forward_pre_hook(args):
+    """Block forward pre-hook for certain configurations."""
+    return (
+        not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
+    )
+
 
 class TestFP8Param:
 
@@ -41,6 +71,7 @@ class TestFP8Param:
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        gc.collect()
 
     def model_provider(
         self,
@@ -68,7 +99,15 @@ class TestFP8Param:
         )
 
     def create_test_args(
-        self, tp, recipe, sequence_length, micro_batch_size, inference, fp8_param_gather, **kwargs
+        self,
+        tp,
+        recipe,
+        sequence_length,
+        micro_batch_size,
+        inference,
+        fp8_param_gather,
+        use_cuda_graph,
+        **kwargs,
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -102,6 +141,10 @@ class TestFP8Param:
         if recipe == "mxfp8" and fp8_param_gather:
             args.reuse_grad_buf_for_mxfp8_param_ag = True
 
+        if use_cuda_graph:
+            args.cuda_graph_impl = "transformer_engine"
+            args.cuda_graph_warmup_steps = 0
+
         for key, value in kwargs.items():
             assert hasattr(args, key)
             setattr(args, key, value)
@@ -122,7 +165,13 @@ class TestFP8Param:
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def _run_test_helper(
-        self, tp_size, recipe, inference: bool = False, fp8_param_gather: bool = True, **kwargs
+        self,
+        tp_size,
+        recipe,
+        inference: bool = False,
+        fp8_param_gather: bool = True,
+        use_cuda_graph: bool = False,
+        **kwargs,
     ):
         """Test fp8_param with gpt_model."""
         args = self.create_test_args(
@@ -132,6 +181,7 @@ class TestFP8Param:
             self.micro_batch_size,
             inference,
             fp8_param_gather,
+            use_cuda_graph,
             **kwargs,
         )
 
@@ -143,6 +193,7 @@ class TestFP8Param:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
         )
@@ -157,6 +208,20 @@ class TestFP8Param:
                 self.model_provider, ModelType.encoder_or_decoder
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
+
+        cuda_graph_helper = None
+        # Hard coded to use cuda_graph_impl="transformer_engine"
+        cuda_graph_impl = "transformer_engine"
+        if use_cuda_graph and cuda_graph_impl == "transformer_engine":
+            from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+            cuda_graph_helper = TECudaGraphHelper(
+                model=gpt_model,
+                config=gpt_model[0].config,
+                seq_length=self.seq_length,
+                micro_batch_size=self.micro_batch_size,
+                optimizers=[optimizer],
+            )
 
         num_fp8_params = 0
         for _, param in gpt_model[0].named_parameters():
@@ -181,6 +246,17 @@ class TestFP8Param:
             if not inference:
                 gpt_model[0].zero_grad_buffer()
                 optimizer.zero_grad()
+
+            # Capture CUDA graphs after warmup if helper is provided.
+            # Hard coded cuda_graph_warmup_steps = 0.
+            cuda_graph_warmup_steps = 0
+            if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
+                if should_disable_forward_pre_hook(args):
+                    disable_forward_pre_hook(gpt_model, param_sync=False)
+                cuda_graph_helper.create_cudagraphs()
+                if should_disable_forward_pre_hook(args):
+                    enable_forward_pre_hook(gpt_model)
+                    cuda_graph_helper.cuda_graph_set_manual_hooks()
 
             # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
             # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
@@ -239,12 +315,29 @@ class TestFP8Param:
                 )
                 torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-4, rtol=1e-4)
 
+    def run_test_with_cuda_graph(self, tp_size, recipe, **kwargs):
+        loss = self._run_test_helper(
+            tp_size, recipe, fp8_param_gather=True, use_cuda_graph=True, **kwargs
+        )
+        loss_ref = self._run_test_helper(
+            tp_size, recipe, fp8_param_gather=True, use_cuda_graph=False, **kwargs
+        )
+        torch.testing.assert_close(loss, loss_ref, atol=0, rtol=0)
+
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.parametrize("tp_size", [2])
     @pytest.mark.parametrize("dp_overlap", [(True, True)])
     def test_delayed_scaling(self, tp_size, dp_overlap):
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, recipe="delayed", **kwargs)
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("dp_overlap", [(True, True)])
+    @pytest.mark.skipif(not cuda_graph_supported, reason=reason_for_no_cuda_graph)
+    def test_delayed_scaling_with_cuda_graph(self, tp_size, dp_overlap):
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test_with_cuda_graph(tp_size, "delayed", **kwargs)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
@@ -259,6 +352,15 @@ class TestFP8Param:
     @pytest.mark.parametrize("tp_size", [2])
     def test_tensorwise_scaling_inference(self, tp_size):
         self.run_test(tp_size=tp_size, recipe="tensorwise", inference=True)
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("dp_overlap", [(True, True)])
+    @pytest.mark.skipif(not cuda_graph_supported, reason=reason_for_no_cuda_graph)
+    def test_tensorwise_scaling_with_cuda_graph(self, tp_size, dp_overlap):
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test_with_cuda_graph(tp_size, "tensorwise", **kwargs)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
@@ -283,6 +385,18 @@ class TestFP8Param:
         self.run_test(tp_size=tp_size, recipe="blockwise")
 
     @pytest.mark.skipif(
+        get_device_arch_version() != 9, reason="blockwise is only supported on Hopper architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.4.0.dev0"), reason="TE 2.4.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("dp_overlap", [(True, True)])
+    @pytest.mark.skipif(not cuda_graph_supported, reason=reason_for_no_cuda_graph)
+    def test_blockwise_scaling_with_cuda_graph(self, tp_size, dp_overlap):
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test_with_cuda_graph(tp_size, "blockwise", **kwargs)
+
+    @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
@@ -295,6 +409,21 @@ class TestFP8Param:
         """
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
+
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (False, True), (True, True)])
+    @pytest.mark.skipif(not cuda_graph_supported, reason=reason_for_no_cuda_graph)
+    def test_mxfp8_with_cuda_graph(self, tp_size, dp_overlap):
+        """
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test_with_cuda_graph(tp_size=tp_size, recipe="mxfp8", **kwargs)
 
     @pytest.mark.skipif(
         get_device_arch_version() != 9, reason="blockwise is only supported on Hopper architecture"
