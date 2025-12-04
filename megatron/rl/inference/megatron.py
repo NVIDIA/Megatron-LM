@@ -4,16 +4,16 @@ import asyncio
 import logging
 from argparse import Namespace
 
-from pydantic import PrivateAttr
 import torch.distributed as dist
+from pydantic import PrivateAttr
 
 from megatron.core import parallel_state
 from megatron.core.utils import get_attr_wrapped_model
-from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.engines.mcore_engine import MCoreEngine
+from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -32,8 +32,8 @@ from megatron.core.pipeline_parallel.utils import (
     is_pp_last_stage,
 )
 from megatron.core.utils import get_mamba_inference_state_config_from_model, log_single_rank, get_pg_size
-from megatron.training.global_vars import get_args, get_tokenizer
 from megatron.training import get_wandb_writer
+from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
     ChatInferenceInterface,
