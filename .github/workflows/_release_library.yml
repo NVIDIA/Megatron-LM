@@ -49,12 +49,6 @@ on:
         required: true
       PAT:
         required: true
-      SSH_KEY:
-        required: false
-      SSH_PWD:
-        required: false
-      BOT_KEY:
-        required: true
 
 permissions:
   contents: write # To read repository content
@@ -89,20 +83,6 @@ jobs:
   #         fetch-depth: 0
   #         fetch-tags: true
   #         ref: ${{ inputs.release-ref }}
-
-  #     - name: Install GPG
-  #       run: sudo apt-get install -y gnupg2
-
-  #     - name: Import GPG key (for signing)
-  #       uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec
-  #       id: gpg-action
-  #       with:
-  #         gpg_private_key: ${{ secrets.SSH_KEY }}
-  #         passphrase: ${{ secrets.SSH_PWD }}
-  #         git_user_signingkey: true
-  #         git_commit_gpgsign: true
-  #         workdir: ${{ github.run_id }}
-
   #     - name: Bump version MCore
   #       id: bump-version-mcore
   #       env:
