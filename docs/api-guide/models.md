@@ -12,11 +12,3 @@ models.t5
 models.bert
 ```
 
-## Module contents
-
-```{automodule} core.models
-:members:
-:undoc-members:
-:show-inheritance:
-```
-
