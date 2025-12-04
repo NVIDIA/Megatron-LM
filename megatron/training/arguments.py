@@ -874,7 +874,6 @@ def validate_args(args, defaults={}):
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
     if args.moe_grouped_gemm:
-        assert args.fp16 or args.bf16, 'Currently GroupedGEMM for MoE only supports fp16 or bf16.'
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
