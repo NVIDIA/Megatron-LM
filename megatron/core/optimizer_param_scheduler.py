@@ -95,19 +95,30 @@ class OptimizerParamScheduler:
         self.step(0)
         log_single_rank(logger, logging.INFO, f"> learning rate decay style: {self.lr_decay_style}")
 
-    def get_wd(self) -> float:
-        """Weight decay incr functions"""
+    def get_wd(self, param_group: Optional[dict] = None) -> float:
+        """Weight decay incr functions
+
+        Args:
+            param_group (dict): parameter group from the optimizer."""
+
+        if param_group is not None:
+            start_wd = param_group.get('start_wd', self.start_wd)
+            end_wd = param_group.get('end_wd', self.end_wd)
+        else:
+            start_wd = self.start_wd
+            end_wd = self.end_wd
+
         if self.num_steps > self.wd_incr_steps:
-            return self.end_wd
+            return end_wd
 
         if self.wd_incr_style == 'constant':
-            assert self.start_wd == self.end_wd
-            return self.end_wd
+            assert start_wd == end_wd
+            return end_wd
 
         incr_ratio = float(self.num_steps) / float(self.wd_incr_steps)
         assert incr_ratio >= 0.0
         assert incr_ratio <= 1.0
-        delta_wd = self.end_wd - self.start_wd
+        delta_wd = end_wd - start_wd
 
         if self.wd_incr_style == 'linear':
             coeff = incr_ratio
@@ -116,7 +127,7 @@ class OptimizerParamScheduler:
         else:
             raise Exception(f'{self.wd_incr_style} weight decay increment style is not supported.')
 
-        return self.start_wd + coeff * delta_wd
+        return start_wd + coeff * delta_wd
 
     def get_lr(self, param_group: dict) -> float:
         """Learning rate decay functions from:
@@ -191,11 +202,9 @@ class OptimizerParamScheduler:
             increment (int): number of steps to increment
         """
         self.num_steps += increment
-        new_wd = self.get_wd()
         for param_group in self.optimizer.param_groups:
-            new_lr = self.get_lr(param_group)
-            param_group['lr'] = new_lr * param_group.get('lr_mult', 1.0)
-            param_group['weight_decay'] = new_wd * param_group.get('wd_mult', 1.0)
+            param_group['lr'] = self.get_lr(param_group)
+            param_group['weight_decay'] = self.get_wd(param_group) * param_group.get('wd_mult', 1.0)
 
     def state_dict(self) -> dict:
         """Return the state dict."""

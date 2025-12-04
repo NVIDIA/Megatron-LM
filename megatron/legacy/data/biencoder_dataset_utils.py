@@ -5,11 +5,14 @@ import time
 import numpy as np
 import torch
 
-from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.core import mpu, tensor_parallel
-from megatron.legacy.data.dataset_utils import create_masked_lm_predictions, \
-                                            pad_and_convert_to_numpy
-from megatron.legacy.data.data_samplers import MegatronPretrainingSampler
+from megatron.legacy.data.dataset_utils import (
+    create_masked_lm_predictions,
+    pad_and_convert_to_numpy,
+)
+from megatron.training import get_args, get_tokenizer, print_rank_0
+from megatron.training.datasets.data_samplers import MegatronPretrainingSampler
+
 
 def make_attention_mask(source_block, target_block):
     """

@@ -96,11 +96,28 @@ products:
   #     - environment: [dev]
   #       scope: [mr]
   #       platforms: [dgx_h100] # hang: #513
+  - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts_etp1_ep4]
+    products:
+      # - environment: [dev]
+      #   scope: [mr]
+      #   platforms: [dgx_h100] # hang: #513
+      - environment: [lts]
+        scope: [nightly]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4]
     products:
       - environment: [dev]

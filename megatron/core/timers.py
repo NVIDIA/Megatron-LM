@@ -2,6 +2,7 @@
 
 """Megatron timers."""
 
+import logging
 import time
 from abc import ABC, abstractmethod
 from typing import List
@@ -27,6 +28,8 @@ try:
         dist_all_gather_func = torch.distributed._all_gather_base
 except:
     dist_all_gather_func = torch.distributed._all_gather_base
+
+logger = logging.getLogger(__name__)
 
 
 class TimerBase(ABC):
@@ -433,7 +436,7 @@ class Timers:
         if rank is None:
             rank = torch.distributed.get_world_size() - 1
         if rank == torch.distributed.get_rank() and output_string is not None:
-            print(output_string, flush=True)  # pylint: disable=W0141
+            logger.info(output_string)
 
     def write(
         self,
