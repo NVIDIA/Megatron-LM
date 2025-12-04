@@ -35,6 +35,10 @@ on:
         required: true
         type: string
   push:
+    branches:
+      - dev
+      - main
+      - 'pull-request/[0-9]+'
 
 permissions:
   contents: write # To read repository content
