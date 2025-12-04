@@ -280,6 +280,9 @@ def read_metadata(tracker_filename):
                 print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
                     tracker_filename))
                 sys.exit()
+            else:
+                # Set iteration to 0 for release checkpoints
+                iteration = 0
     assert iteration > -1 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
 
@@ -862,7 +865,7 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
             )
             state_dict["model"] = model_state_dict
     if args.num_experts:
-        state_dict["model"] = handle_experts_in_state_dict(state_dict["model"])
+        state_dict["model"] = handle_experts_in_state_dict(state_dict["model"], args.num_experts)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
@@ -1323,6 +1326,9 @@ def load_args_from_checkpoint(
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
+    _set_arg('moe_router_score_function', force=True)
+    _set_arg('moe_router_enable_expert_bias', force=True)
+    _set_arg('moe_router_topk_scaling_factor', force=True)
 
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)
