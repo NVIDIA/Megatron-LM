@@ -182,8 +182,7 @@ jobs:
           PR_NUMBER=$(echo $PR_URL | grep -o '[0-9]*$')
 
           # Add comment to the newly created PR
-          gh pr comment $PR_NUMBER \
-            --body "/ok to test $(git rev-parse HEAD)"
+          echo gh pr comment $PR_NUMBER --body "/ok to test $(git rev-parse HEAD)"
 
       - name: Wait for status checks on tmp branch
         uses: actions/github-script@v7
