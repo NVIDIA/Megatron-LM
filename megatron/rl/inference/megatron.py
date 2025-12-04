@@ -27,7 +27,11 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_mamba_inference_state_config_from_model, log_single_rank
+from megatron.core.pipeline_parallel.utils import (
+    is_pp_first_stage,
+    is_pp_last_stage,
+)
+from megatron.core.utils import get_mamba_inference_state_config_from_model, log_single_rank, get_pg_size
 from megatron.training.global_vars import get_args, get_tokenizer
 from megatron.training import get_wandb_writer
 
@@ -116,7 +120,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
     tp_group = getattr(pg_collection, 'tp', None) if pg_collection is not None else None
     if tp_group is not None:
-        inference_tp_size = pg_collection.get_tensor_model_parallel_world_size()
+        inference_tp_size = get_pg_size(tp_group)
     else:
         inference_tp_size = args.tensor_model_parallel_size
 
@@ -152,7 +156,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
 
     inference_wrapped_model.model_is_pipeline_parallel = not (
-        pg_collection.is_pipeline_first_stage() and pg_collection.is_pipeline_last_stage()
+        is_pp_first_stage(pg_collection.pp) and is_pp_last_stage(pg_collection.pp)
     )
 
     text_generation_controller = SimpleTextGenerationController(
