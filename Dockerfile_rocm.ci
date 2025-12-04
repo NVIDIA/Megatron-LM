@@ -1,7 +1,13 @@
 ARG BASE_DOCKER=rocm/pytorch:rocm7.0_ubuntu24.04_py3.12_pytorch_release_2.7.1
 FROM $BASE_DOCKER
-
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
 ARG PYTORCH_ROCM_ARCH_OVERRIDE="gfx942"
+
+ENV http_proxy=$http_proxy
+ENV https_proxy=$https_proxy
+ENV no_proxy=$no_proxy
 ENV WORKSPACE_DIR=/workspace
 ENV STAGE_DIR=/workspace/installs
 RUN mkdir -p $WORKSPACE_DIR
@@ -38,6 +44,13 @@ pynvml
 RUN python -m pip install -U "nltk>=3.8.2"
 
 RUN pip3 install "huggingface_hub[cli]"
+
+ENV NLTK_DATA=/usr/share/nltk_data
+RUN python - <<'PY'
+import nltk
+ok = nltk.download('punkt_tab', download_dir='/usr/share/nltk_data', quiet=True)
+assert ok, "Failed to download punkt_tab"
+PY
 
 # Install Causal-Conv1d and its dependencies
 WORKDIR ${STAGE_DIR}
