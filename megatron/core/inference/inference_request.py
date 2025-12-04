@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.tokenizers import MegatronTokenizer
 
 
 def serialize_tensor(tensor: torch.Tensor) -> bytes:
@@ -407,9 +408,13 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
-    def suspend(self):
+    def suspend(self, tokenizer: MegatronTokenizer | None):
         """Suspend request by storing references to previous prompt, generations,
-        and sampling params."""
+        and sampling params.
+
+        Args:
+            tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
+        """
 
         old_request = self[-1]
 
@@ -445,8 +450,11 @@ class DynamicInferenceRequestRecord:
         )
         self.requests.append(new_request)
 
-    def merge(self) -> DynamicInferenceRequest:
+    def merge(self, tokenizer: MegatronTokenizer | None) -> DynamicInferenceRequest:
         """Merge requests into a single suspend-agnostic request object.
+
+        Args:
+            tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
 
         Returns:
             (DynamicInferenceRequest) Merged request.
