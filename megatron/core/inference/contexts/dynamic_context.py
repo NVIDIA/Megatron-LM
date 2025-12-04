@@ -375,6 +375,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_count_total = buffer_size_bytes // (
             self.block_size_bytes + mamba_states_memory_per_request
         )
+        block_count_total = 1024
         self.block_allocator = BlockAllocator(
             context=self,
             total_count=(
@@ -1398,7 +1399,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         request_can_be_added = (
-            self.total_request_count - self.paused_request_count < self.max_active_requests
+            self.total_request_count < self.max_active_requests
         )
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
