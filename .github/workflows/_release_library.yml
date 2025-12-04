@@ -162,6 +162,8 @@ jobs:
           cd ${{ github.run_id }}
 
           TMP_BRANCH="deploy-release/$(uuidgen)"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$TMP_BRANCH"
           git add -A .
           git commit -sS -m "beep boop 🤖: Bumping versions" || echo "No changes to commit"
