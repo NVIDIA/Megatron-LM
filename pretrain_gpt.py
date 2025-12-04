@@ -61,9 +61,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     args = get_args()
     
     # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage) and (
-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None, None
+    # if not is_first_or_last_pipeline_stage(vp_stage) and (
+    # (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+    #     return None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -197,10 +197,11 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 def is_dataset_built_on_rank(vp_stage=None):
     args = get_args()
     config = core_transformer_config_from_args(args)
-    return (
-        is_first_or_last_pipeline_stage(vp_stage)
-        or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
-    ) and parallel_state.get_tensor_model_parallel_rank() == 0
+    # return (
+    #     is_first_or_last_pipeline_stage(vp_stage)
+    #     or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+    # ) and parallel_state.get_tensor_model_parallel_rank() == 0
+    return parallel_state.get_tensor_model_parallel_rank() == 0
 
 
 def core_gpt_dataset_config_from_args(args):
@@ -296,7 +297,8 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
     # Optionally enable inprocess restart on pretrain
-    pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
+    # pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
+    store = None
 
     pretrain(
         train_valid_test_datasets_provider,

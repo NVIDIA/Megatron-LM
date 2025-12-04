@@ -6,6 +6,7 @@ import os
 import random
 import time
 import warnings
+import resource
 from datetime import timedelta
 
 import numpy as np
@@ -86,6 +87,9 @@ def initialize_megatron(
         args = validate_yaml(args, args_defaults)
     else:
         validate_args(args, args_defaults)
+
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard_limit, hard_limit))
 
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.

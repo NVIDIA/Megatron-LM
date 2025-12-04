@@ -118,6 +118,16 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
+    # launch from mpi
+    if int(os.getenv('OMPI_COMM_WORLD_SIZE', '0')) > 0:
+        args.rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
+        args.local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
+        args.world_size = int(os.environ['OMPI_COMM_WORLD_SIZE'])
+        addr, port = args.master_addr.split(':')
+        os.environ['MASTER_ADDR'] = addr
+        os.environ['MASTER_PORT'] = port
+        delattr(args, 'master_addr')
+
     # Args to disable MSC
     if not args.enable_msc:
         MultiStorageClientFeature.disable()
@@ -968,7 +978,7 @@ def validate_args(args, defaults={}):
         assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
-        assert args.context_parallel_size == 1, 'context parallel size must be 1 for hybrid context parallelism'
+        # assert args.context_parallel_size == 1, 'context parallel size must be 1 for hybrid context parallelism'
 
     if args.sft_sequence_packing:
         # Validate that packed sequence buffer is large enough for single sequences
@@ -1908,6 +1918,10 @@ def _add_logging_args(parser):
                        '  max: report the max timing across all ranks'
                        '  minmax: report min and max timings across all ranks'
                        '  all: report timings of all ranks.')
+    group.add_argument("--use-gpu-timer", action='store_true', default=False,
+                       help='Enable GPU timer.')
+    group.add_argument('--gpu-timer-interval', type=int, default=100,
+                       help='Number of iterations to run for time record for gpu timer.')
     group.add_argument('--tensorboard-log-interval', type=int, default=1,
                        help='Report to tensorboard interval.')
     group.add_argument('--tensorboard-queue-size', type=int, default=1000,
@@ -2184,7 +2198,7 @@ def _add_training_args(parser):
                        help='Use the built-in pytorch profiler. '
                        'Useful if you wish to view profiles in tensorboard.',
                        dest='use_pytorch_profiler')
-    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
+    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 24],
                        help='Global ranks to profile.')
     group.add_argument('--record-memory-history', action="store_true", default=False,
                        help='Record memory history in last rank.')
@@ -2670,6 +2684,8 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     group = parser.add_argument_group(title='distributed')
 
+    group.add_argument('--master-addr', type=str, default='127.0.0.1:8389',
+                       help='master add.')
     group.add_argument('--tensor-model-parallel-size', type=int, default=1,
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,

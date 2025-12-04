@@ -7,6 +7,7 @@ import sys
 import torch
 
 from megatron.core import Timers
+from megatron.core.gpu_timers import GPUTimer
 from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
@@ -20,6 +21,7 @@ _GLOBAL_WANDB_WRITER = None
 _GLOBAL_ONE_LOGGER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
+_GLOBAL_GPU_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
 
@@ -62,6 +64,14 @@ def get_timers():
     """Return timers."""
     _ensure_var_is_initialized(_GLOBAL_TIMERS, 'timers')
     return _GLOBAL_TIMERS
+
+
+def get_gpu_timers():
+    """Return timers."""
+    global _GLOBAL_GPU_TIMERS
+    _ensure_var_is_initialized(_GLOBAL_GPU_TIMERS, 'timers')
+    return _GLOBAL_GPU_TIMERS
+
 
 def get_energy_monitor():
     """Return energy monitor."""
@@ -137,6 +147,7 @@ def unset_global_variables():
     _GLOBAL_ONE_LOGGER = None
     _GLOBAL_ADLR_AUTORESUME = None
     _GLOBAL_TIMERS = None
+    _GLOBAL_GPU_TIMERS = None
     _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
 
@@ -258,9 +269,10 @@ def _set_adlr_autoresume(args):
 
 def _set_timers(args):
     """Initialize timers."""
-    global _GLOBAL_TIMERS
+    global _GLOBAL_TIMERS, _GLOBAL_GPU_TIMERS
     _ensure_var_is_not_initialized(_GLOBAL_TIMERS, 'timers')
     _GLOBAL_TIMERS = Timers(args.timing_log_level, args.timing_log_option)
+    _GLOBAL_GPU_TIMERS = GPUTimer(args.use_gpu_timer)
 
 def _set_energy_monitor(args):
     """Initialize energy monitor."""
@@ -299,6 +311,7 @@ def destroy_global_vars():
 
     global _GLOBAL_TIMERS
     _GLOBAL_TIMERS = None
+    _GLOBAL_GPU_TIMERS = None
 
     global _GLOBAL_ENERGY_MONITOR
     _GLOBAL_ENERGY_MONITOR = None

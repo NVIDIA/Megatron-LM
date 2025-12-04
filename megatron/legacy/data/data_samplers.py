@@ -35,13 +35,23 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'single':
         if args.sft_sequence_packing:
-            batch_sampler = MegatronSFTSampler(
-                total_samples=len(dataset),
-                consumed_samples=consumed_samples,
-                micro_batch_size=args.micro_batch_size,
-                global_batch_size=args.global_batch_size,
-                data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+            if True:    # TODO: add flag.
+                batch_sampler = MegatronSFTPrefetchDPBalancedSampler(
+                    dataset=dataset,
+                    total_samples=len(dataset),
+                    consumed_samples=consumed_samples,
+                    micro_batch_size=args.micro_batch_size,
+                    global_batch_size=args.global_batch_size,
+                    data_parallel_rank=mpu.get_data_parallel_rank(),
+                    data_parallel_size=mpu.get_data_parallel_world_size())
+            else:
+                batch_sampler = MegatronSFTSampler(
+                    total_samples=len(dataset),
+                    consumed_samples=consumed_samples,
+                    micro_batch_size=args.micro_batch_size,
+                    global_batch_size=args.global_batch_size,
+                    data_parallel_rank=mpu.get_data_parallel_rank(),
+                    data_parallel_size=mpu.get_data_parallel_world_size())
         else:
             # Megatron sampler
             batch_sampler = MegatronPretrainingSampler(
@@ -162,6 +172,9 @@ class MegatronSFTSampler(MegatronPretrainingSampler):
                 for i in range(self.num_micro_batches):
                     global_batch_idx.extend(batch[start_idx[i]:end_idx[i]])
                 yield global_batch_idx
+                # if torch.distributed.get_rank() == 0:
+                #     print(f"rank={torch.distributed.get_rank()}, {batch=}")
+                # yield batch
                 batch = []
 
         # Check the last partial batch and see drop_last is set
@@ -171,6 +184,91 @@ class MegatronSFTSampler(MegatronPretrainingSampler):
             for i in range(self.num_micro_batches):
                 global_batch_idx.extend(batch[start_idx[i]:end_idx[i]])
             yield global_batch_idx
+
+
+class MegatronSFTPrefetchDPBalancedSampler(MegatronPretrainingSampler):
+    """
+    Data sampler for hybrid context parallel (Hybrid CP) format.
+    This data sampler pulls in the entire global batch at once across all data parallel ranks.
+    This helps provide the Hybrid CP Dataloader Wrapper to schedule and load balance sub-samples
+    of the entire global batch.
+    """
+
+    def __init__(self, dataset, total_samples, consumed_samples, micro_batch_size, global_batch_size,
+                 data_parallel_rank, data_parallel_size, drop_last=True):
+        super().__init__(total_samples, consumed_samples, micro_batch_size, data_parallel_rank, data_parallel_size, drop_last)
+        self.dataset = dataset
+        self.global_batch_size = global_batch_size
+        self.data_parallel_size = data_parallel_size
+        self.num_micro_batches = self.global_batch_size // self.micro_batch_times_data_parallel_size
+        
+        from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+        from megatron.training.arguments import core_transformer_config_from_args
+        args = get_args()
+        if args.yaml_cfg is not None:
+            config = core_transformer_config_from_yaml(args, "language_model")
+        else:
+            config = core_transformer_config_from_args(args)
+        
+        self.config = config
+        from megatron.core.pipeline_parallel.data_schedule import PipelineAwareBalancedHybridCPscheduler
+        self.data_scheduler = PipelineAwareBalancedHybridCPscheduler(self.config)
+
+    def __len__(self):
+        return self.total_samples
+
+    # def get_start_end_idx_global_batch(self):
+    #     start_idx = [self.data_parallel_rank * self.micro_batch_size + i * self.micro_batch_size * self.data_parallel_size for i in range(self.num_micro_batches)]
+    #     end_idx = [start_idx[i] + self.micro_batch_size for i in range(self.num_micro_batches)]
+    #     return start_idx, end_idx
+
+    def get_shape(self, idx):
+        data = self.dataset[idx]
+        shape = data["tokens"].shape
+        return shape
+
+    def get_numel(self, idx):
+        data = self.dataset[idx]
+        numel = data["tokens"].numel()
+        return [idx, numel]
+
+    def prepare_info(self, batch, batch_numel):
+        pass
+
+    def prepare_batch(self, batch):
+        # batch_shape = [self.get_shape(idx) for idx in batch]
+        # batch_numel = [torch.prod(torch.tensor(shape)).item() for shape in batch_shape]
+        batch_numel = [self.get_numel(idx) for idx in batch]
+        # TODO: use distributed `get_numel` to reduce io pressure.
+        
+        groups, sample_id_groups = self.data_scheduler.get_groups_and_subsamples(batch_numel, self.config)
+        return groups, sample_id_groups
+
+    def __iter__(self):
+        batch = []
+        # Last batch will be dropped if drop_last is not set False
+        for idx in range(self.consumed_samples, self.total_samples):
+            batch.append(idx)
+            if len(batch) == self.global_batch_size:
+                groups, sample_id_groups = self.prepare_batch(batch)
+                
+                global_batch_idx = []
+                for microbatch_idx in range(len(sample_id_groups)):
+                    microbatch = sample_id_groups[microbatch_idx][self.data_parallel_rank]
+                    global_batch_idx.extend(microbatch)
+
+                yield global_batch_idx
+                batch = []
+
+        # Check the last partial batch and see drop_last is set
+        if len(batch) > 0 and not self.drop_last:
+            groups, sample_id_groups = self.prepare_batch(batch)
+            global_batch_idx = []
+            for microbatch_idx in range(len(sample_id_groups)):
+                microbatch = sample_id_groups[microbatch_idx][self.data_parallel_rank]
+                global_batch_idx.extend(microbatch)
+            yield global_batch_idx
+
 
 class RandomSeedDataset(Dataset):
 

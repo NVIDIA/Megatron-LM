@@ -126,6 +126,7 @@ from .global_vars import (
     get_args,
     get_signal_handler,
     get_timers,
+    get_gpu_timers,
     get_tensorboard_writer,
     get_wandb_writer,
     get_one_logger,
@@ -1358,6 +1359,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     """Single training step."""
     args = get_args()
     timers = get_timers()
+    gpu_timer = get_gpu_timers()
 
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -1445,6 +1447,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
+
+    
+    if mpu.get_pipeline_model_parallel_world_size() > 1 and not gpu_timer.inactive:
+        gpu_timer.compute(name="forward-compute")
+        gpu_timer.compute(name="backward-compute")
+        # gpu_timer.compute(name="forward-backward")
+        # fwd_bwd_tot_time = gpu_timer.elapsed("forward-backward")
+        fwd_each_time = gpu_timer.elapsed("forward-compute") # list, len = each virtual pp stage
+        bwd_each_time = gpu_timer.elapsed("backward-compute")
+        print(f"rank={torch.distributed.get_rank()}, pp_rank={mpu.get_pipeline_model_parallel_rank()}, dp_rank={mpu.get_data_parallel_rank()}, {fwd_each_time=}, {bwd_each_time=}")
+        # summary_data_parallel_imbalance(fwd_bwd_tot_time, fwd_each_time, bwd_each_time)
+        # summary_pipeline_parallel_imbalance(fwd_bwd_tot_time, fwd_each_time, bwd_each_time)
+    gpu_timer.reset()
+    gpu_timer.inactivate()
+    if args.use_gpu_timer and int(args.curr_iteration) % args.gpu_timer_interval == 0:
+        gpu_timer.activate()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
@@ -1689,7 +1707,8 @@ def training_log(
             with open(args.memory_snapshot_path, 'wb') as f:
                 dump(snapshot, f)
 
-        elapsed_time = timers('interval-time').elapsed(barrier=True)
+        # elapsed_time = timers('interval-time').elapsed(barrier=True)
+        elapsed_time = timers('forward-backward').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
         throughput = num_floating_point_operations(args,num_total_tokens_this_GB, sequence_square_sum_this_GB) / (
@@ -2944,19 +2963,21 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
 
-        valid_dataloaders = []
-        for valid_d in valid_ds:
-            if args.skip_train or args.full_validation:
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
-            else:
-                if args.multiple_validation_sets:
-                    # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                    # correct and needs to be calculated/set per validation set
-                    raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
-        if not args.multiple_validation_sets:
-            assert len(valid_dataloaders) == 1
-        test_dataloader = build_pretraining_data_loader(test_ds, 0)
+        valid_dataloaders = None
+        test_dataloader = None
+        # valid_dataloaders = []
+        # for valid_d in valid_ds:
+        #     if args.skip_train or args.full_validation:
+        #         valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+        #     else:
+        #         if args.multiple_validation_sets:
+        #             # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+        #             # correct and needs to be calculated/set per validation set
+        #             raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+        #         valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+        # if not args.multiple_validation_sets:
+        #     assert len(valid_dataloaders) == 1
+        # test_dataloader = build_pretraining_data_loader(test_ds, 0)
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0

@@ -383,6 +383,10 @@ def forward_step(
 
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
+    
+    from megatron.training.global_vars import get_gpu_timers
+    gpu_timer = get_gpu_timers()
+    gpu_timer.start(name="forward-compute")
 
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
@@ -420,6 +424,7 @@ def forward_step(
         cp_group_size,
         is_last_stage,
     )
+    gpu_timer.stop(name="forward-compute")
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
@@ -441,6 +446,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
+
+    from megatron.training.global_vars import get_gpu_timers
+    gpu_timer = get_gpu_timers()
+    gpu_timer.start(name="backward-compute")
 
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
@@ -487,6 +496,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if config.timers is not None:
         config.timers('backward-compute').stop()
 
+    gpu_timer.stop(name="backward-compute")
+
     return input_tensor_grad
 
 
@@ -514,7 +525,7 @@ def wrap_iterator_helper(
                 num_total_tokens_this_GB,
                 sequence_square_sum_this_GB,
             ) = wrap_dataloader(
-                data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
+                data_iterator, config, PackingScheduler.HYBRID_CP_WITH_PP, pg_collection=None
             )
         else:
             if config.balanced_sequence_packing:
@@ -533,6 +544,8 @@ def wrap_iterator_helper(
                     PackingScheduler.NAIVE_SEQUENCE_PACKING,
                     pg_collection=None,
                 )
+        # if torch.distributed.get_rank() == 12:
+        #     print(f"{data_iterator=}, {num_microbatches=}, {num_total_tokens_this_GB=}, {sequence_square_sum_this_GB=}")
         return (
             data_iterator,
             num_microbatches,
@@ -2099,15 +2112,15 @@ def forward_backward_pipelining_without_interleaving(
             "Invalid combination of p2p_communicator, pg_collection "
             "provide none or provide all the process groups"
         )
+    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
+    )
     if is_pp_first_stage(p2p_communicator.pp_group) or is_pp_last_stage(p2p_communicator.pp_group):
-        data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
-            wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
-        )
 
         if config.sft_sequence_packing:
             info_tensor = torch.tensor(
                 [num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB],
-                dtype=torch.int,
+                dtype=torch.float,
                 device="cuda",
             )
             if not is_pp_last_stage(p2p_communicator.pp_group):
@@ -2118,14 +2131,14 @@ def forward_backward_pipelining_without_interleaving(
 
     # TODO(tailaim): last pp rank does not need to receive num_microbatches
     if config.sft_sequence_packing and not (is_pp_first_stage(p2p_communicator.pp_group)):
-        info_tensor = torch.empty(3, dtype=torch.int, device="cuda")
+        info_tensor = torch.empty(3, dtype=torch.float, device="cuda")
         prev_rank = torch.distributed.get_global_rank(
             p2p_communicator.pp_group, p2p_communicator.pp_group.rank() - 1
         )
         torch.distributed.recv(info_tensor, src=prev_rank)
         num_microbatches = int(info_tensor[0].item())
         num_total_tokens_this_GB = int(info_tensor[1].item())
-        sequence_square_sum_this_GB = int(info_tensor[2].item())
+        sequence_square_sum_this_GB = info_tensor[2].item()
 
         if not is_pp_last_stage(p2p_communicator.pp_group):
             next_rank = torch.distributed.get_global_rank(

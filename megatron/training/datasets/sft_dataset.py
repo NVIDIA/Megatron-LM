@@ -127,7 +127,7 @@ class SFTDataset(MegatronDataset):
         else:
             padding_len = max_seq_len - num_tokens
         assert padding_len >= 0
-        filler = [tokenizer.eod] * force_eod_length + [tokenizer.pad] * (padding_len + 1)
+        filler = [1] * force_eod_length + [1] * (padding_len + 1)
 
         tokens = np.array(tokens.tolist() + filler, dtype=np.int64)
         target = np.array(target.tolist() + filler, dtype=np.int64)
@@ -140,7 +140,7 @@ class SFTDataset(MegatronDataset):
         seq_len = tokens.numel()
 
         loss_mask, position_ids, attention_mask = self._get_ltor_masks_and_position_ids(
-            seq_len, target, tokenizer.pad
+            seq_len, target, 1
         )
 
         if self.config.create_attention_mask:
@@ -217,12 +217,20 @@ class MockSFTLowLevelDataset:
         elif config["mode"] == "distribution":
             min_seq_len = config["min_seq_len"]
             max_seq_len = config["max_seq_len"]
-            mean_seq_len = config["mean_seq_len"]
             if config["type"] == "lognormal":
+                mean_seq_len = config["mean_seq_len"]
                 lognormal_sigma = config["lognormal_sigma"]
                 self.sequence_lengths = self.generate_lognormal_samples(self.size, mean_seq_len,lognormal_sigma, min_seq_len, max_seq_len)
+            elif config["type"] == "linear":
+                self.sequence_lengths = self.generate_linear_samples(self.size, min_seq_len, max_seq_len)
+                print(f"{self.sequence_lengths=}")
             else:
                 raise ValueError(f"Unsupported sequence length distribution type {config['type']}")
+
+    def generate_linear_samples(self, size, min_seq_len, max_seq_len, step=256):
+        samples = np.arange(min_seq_len, max_seq_len, step)
+        print(f"{size=}, {min_seq_len=}, {max_seq_len=}, {samples=}")
+        return samples.astype(int)   
         
     def generate_lognormal_samples(self, size, mean, sigma, min_seq_len, max_seq_len):   
         mu = np.log(mean) - sigma**2 / 2
@@ -234,7 +242,8 @@ class MockSFTLowLevelDataset:
         return self.size
 
     def __getitem__(self, idx: int) -> List[np.ndarray]:
-        length = self.sequence_lengths[idx % self.size]
+        # print(f"{idx=}, {self.size=}, {len(self.sequence_lengths)=}, {idx % self.size=}")
+        length = self.sequence_lengths[idx % len(self.sequence_lengths)]
         # the length of sample is 'length', but only length-1 elements are generated here, 
         # because an eod token will be appended at the end later in SFTDataset
         sample = np.arange(2, length + 1 , dtype=np.int64)
@@ -269,7 +278,8 @@ class MockSFTDataset(SFTDataset):
         tokens = self.dataset[int(self.indices[idx % len(self.indices)])]
         target = np.array(tokens, dtype=np.int64)
         
-        force_eod_length = int(tokenizer.force_eod)
+        # force_eod_length = int(tokenizer.force_eod)
+        force_eod_length = 1
 
         if len(tokens) > max_seq_len - force_eod_length:
             # cut the right side
@@ -285,7 +295,7 @@ class MockSFTDataset(SFTDataset):
         else:
             padding_len = max_seq_len - num_tokens
         assert padding_len >= 0
-        filler = [tokenizer.eod] * force_eod_length + [tokenizer.pad] * (padding_len + 1)
+        filler = [1] * force_eod_length + [1] * (padding_len + 1)
 
         tokens = np.array(tokens.tolist() + filler, dtype=np.int64)
         target = np.array(target.tolist() + filler, dtype=np.int64)
@@ -298,7 +308,7 @@ class MockSFTDataset(SFTDataset):
         seq_len = tokens.numel()
 
         loss_mask, position_ids, attention_mask = self._get_ltor_masks_and_position_ids(
-            seq_len, target, tokenizer.pad
+            seq_len, target, 1
         )
 
         if self.config.create_attention_mask:

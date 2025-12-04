@@ -861,6 +861,8 @@ class Attention(MegatronModule, ABC):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
 
+            # print(f"rank={torch.distributed.get_rank()}, {cu_seqlens_q=}")
+
             if split_qkv:
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify

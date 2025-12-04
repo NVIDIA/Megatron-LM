@@ -1,17 +1,10 @@
 #!/bin/bash
 
-#SBATCH -A coreai_devtech_all
-# DFW: batch
-# OCI-NRT: batch_block1
-# OCI-IAD: batch_block1,batch_block3,batch_block4,backfill_block1,backfill_block2,backfill_block3,backfill_block4
-#SBATCH -p batch
-#SBATCH -t 00:30:00
-#SBATCH --mem=0
-#SBATCH --ntasks-per-node=8
-#SBATCH --nodes=1
-#SBATCH --exclusive
-#SBATCH --gpus-per-node=8
-#SBATCH --job-name=hetero_cp_global
+# set -euo pipefail
+export DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PYTHONPATH=
 
 export NCCL_IB_SL=1
 export TOKENIZERS_PARALLELISM="false"
@@ -20,7 +13,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #export NVTE_DEBUG=1
 #export NVTE_DEBUG_LEVEL=2
 
-USER=$SLURM_JOB_USER
+USER="wuguohao"
 
 # Auto-detect batch or interactive mode.
 which srun
@@ -31,27 +24,80 @@ USE_TILING=1
 USE_CP=0
 USE_TE_CE=1
 USE_FLASH_ATTN=0
-USE_FSDP=1
+USE_FSDP=0
 PROFILE=0
+# PROFILE_RANKS=[0,1,2,3,4,5,6,7,8]
+TRAIN_ITERS=10
 USE_MOCK_DATA=1
+MASTER_PORT=6103
 TP=1
+PP=4
+PP_l=
+NUM_LAYERS=4
+
+MBZ=1
+BZ=256
+NW=8
+AD=0.0
+HD=0.0
+LI=1
+EXTRA_ARGS=""
+NONDETERMINISTIC_ATTN=1
+NUM_GPU=8
 
 # Remember to update model and job name if running in batch mode!!
-if [[ $BATCH -eq 0 ]]; then
-    DATETIME=`date +'%y-%m-%d-%H-%M-%S'`
-    MODEL_NAME="interactive_hybrid_cp"
-    WORKSPACE="/home/tailaim//work_data/megatron-lm/logs"
-    SOURCE="/home/tailaim/work_data/megatron-lm"
-    TOKENIZER="/home/tailaim/work_data/megatron-moe-scripts/Nemotron-H-4B-Instruct"
-else
-    MODEL_NAME="interactive_hybrid_cp"
-    WORKSPACE="/lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-lm/logs"
-    SOURCE="/lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-lm"
-    TOKENIZER="/lustre/fsw/portfolios/llmservice/users/kezhik/images/Nemotron-H-4B-Instruct"
+# if [[ $BATCH -eq 0 ]]; then
+#     DATETIME=`date +'%y-%m-%d-%H-%M-%S'`
+#     MODEL_NAME="interactive_hybrid_cp"
+#     WORKSPACE="/home/tailaim//work_data/megatron-lm/logs"
+#     SOURCE="/home/tailaim/work_data/megatron-lm"
+#     TOKENIZER="/home/tailaim/work_data/megatron-moe-scripts/Nemotron-H-4B-Instruct"
+# else
+#     MODEL_NAME="interactive_hybrid_cp"
+#     WORKSPACE="/lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-lm/logs"
+#     SOURCE="/lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-lm"
+#     TOKENIZER="/lustre/fsw/portfolios/llmservice/users/kezhik/images/Nemotron-H-4B-Instruct"
+# fi
+
+HOSTFILE=${HOSTFILE:-}
+if [ -f /etc/mpi/hostfile ]; then
+    if [ ! -f /etc/mpi/hostfile_seq -a -z "$HOSTFILE" ]; then
+        echo "Please use kai_launch to generate /etc/mpi/hostfile_seq"
+        exit 1
+    fi
+    HOSTFILE=${HOSTFILE:-/etc/mpi/hostfile_seq}
 fi
 
-WORKSPACE="/lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-lm/logs"
-SOURCE="/lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-lm"
+if [ -n "$HOSTFILE" ]; then
+    # 多机任务
+    if [ -z "${MY_NODE_IP:-}" ]; then echo "Variable MY_NODE_IP does not exist."; exit 1; fi
+    if ! ifconfig | grep " $MY_NODE_IP " >/dev/null; then echo "MY_NODE_IP \"$MY_NODE_IP\" is not contained in \`ifconfig\`."; exit 1; fi
+    MASTER_ADDR=$MY_NODE_IP
+    if [ ! -f "$HOSTFILE" ]; then echo "Hostfile \"$HOSTFILE\" does not exist."; exit 1; fi
+    NP=${NP:-$(cat "$HOSTFILE" | grep -v '^#' | grep -oP 'slots=\K\d+' | awk '{sum += $1} END {print sum}')}
+else
+    # 单机任务
+    MASTER_ADDR=127.0.0.1
+    NP=${NP:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}
+fi
+
+function check_str() {
+    if [ ! -v "$1" ]; then echo "Variable $1 is not set."; exit 1; fi
+    if [[ -z "${!1}" ]]; then echo "Variable $1 is not a string."; exit 1; fi
+}
+
+# PLM_RSH_ARGS
+if [ -v TARGET_IP_PORT_FILE ]; then check_str TARGET_IP_PORT_FILE; PLM_RSH_ARGS="-F $TARGET_IP_PORT_FILE";
+elif [ ! -v TARGET_IP_PORT_FILE -a -n "$HOSTFILE" ]; then PORT=$(cat /etc/ssh/ssh_config | grep 'Port' | cut -d'"' -f2); check_integer PORT; PLM_RSH_ARGS="-p $PORT";
+else PLM_RSH_ARGS=;
+fi
+
+
+MODEL_NAME="interactive_hybrid_cp"
+TOKENIZER=None
+
+WORKSPACE="/m2v_model/wuguohao03/nv_teamwork/Megatron-LM/logs"
+SOURCE="/m2v_model/wuguohao03/nv_teamwork/Megatron-LM"
 OUTPUT_BASE="${WORKSPACE}/output"
 OUTPUT="${OUTPUT_BASE}/${MODEL_NAME}"
 
@@ -64,36 +110,28 @@ export HF_DATASETS_CACHE="${OUTPUT}/hf_datasets_cache"
 
 DATA_TRAIN="/home/tailaim/data/thd_formatted_100k.jsonl"
 
-SEQ_LEN=16384 #131072 #81920 #65536
+SEQ_LEN=131072 #131072 #81920 #65536
+MAX_SEQLEN_PER_DP_CP_RANK=32768
 
-if [[ $DEBUG -eq 1 ]]; then
-    MBZ=1
-    BZ=256
-    NW=4
-    AD=0.0
-    HD=0.0
-    LI=1
+# if [[ $DEBUG -eq 1 ]]; then
+#     MBZ=1
+#     BZ=256
+#     NW=4
+#     AD=0.0
+#     HD=0.0
+#     LI=1
 
-    # EXTRA_ARGS="--deterministic-mode --use-cpu-initialization"
+#     # EXTRA_ARGS="--deterministic-mode --use-cpu-initialization"
 
-    NONDETERMINISTIC_ATTN=1
+#     NONDETERMINISTIC_ATTN=1
 
-    NUM_GPU=8
-    export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+#     NUM_GPU=8
+#     export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-    #export NCCL_ALGO=Tree
-    #export CUBLAS_WORKSPACE_CONFIG=:4096:8
-else
-    MBZ=1
-    BZ=256
-    NW=8
-    AD=0.0
-    HD=0.0
-    LI=1
-    EXTRA_ARGS=""
-    NONDETERMINISTIC_ATTN=1
-    NUM_GPU=8
-fi
+#     #export NCCL_ALGO=Tree
+#     #export CUBLAS_WORKSPACE_CONFIG=:4096:8
+# else
+# fi
 
 if [[ $USE_CP -eq 1 ]]; then
     if [[ $BATCH -eq 1 ]]; then
@@ -109,15 +147,20 @@ if [[ $USE_TE_CE -eq 1 ]]; then
 fi
 
 if [[ $PROFILE -eq 1 ]]; then
-    EXTRA_ARGS+="--profile --profile-step-start 7 --profile-step-end 8 "
+    EXTRA_ARGS+=" --profile --profile-step-start 2 --profile-step-end 4 "
 fi
 
+echo $USE_MOCK_DATA
 if [[ $USE_MOCK_DATA -eq 1 ]]; then
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"file\",\"path\":\"path/to/file\"}'"
     if [[ $BATCH -eq 0 ]]; then
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} "
+        EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":32768,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} "
+        # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"linear\",\"min_seq_len\":1024,\"max_seq_len\":32768} "
+        # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/github/github_subset_2.csv\"} "
     else
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1}' "
+        EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":32768,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1}' "
+        # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"linear\",\"min_seq_len\":1024,\"max_seq_len\":32768} "
+        # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/github/github_subset_2.csv\"} "
     fi
 else
     EXTRA_ARGS+=" --data-path ${DATA_TRAIN} "
@@ -132,13 +175,25 @@ else
 fi
 
 
+    # --profile-ranks $PROFILE_RANKS \
+
+    # --use-gpu-timer \
+    # --gpu-timer-interval 1 \
 
 OPTIONS=" \
+    --no-check-for-nan-in-loss-and-grad \
+    --recompute-activations \
+    --recompute-granularity full \
+    --timing-log-level 1 \
+    --timing-log-option minmax \
+    --use-gpu-timer \
+    --gpu-timer-interval 1 \
     --hybrid-context-parallel \
     --sft-sequence-packing \
-    --max-seqlen-per-dp-cp-rank 4096 \
+    --max-seqlen-per-dp-cp-rank $MAX_SEQLEN_PER_DP_CP_RANK \
     --sft \
-    --tokenizer-type SFTTokenizer \
+    --vocab-size 32000 \
+    --tokenizer-type NullTokenizer \
     --legacy-tokenizer \
     --use-distributed-optimizer \
     --disable-bias-linear \
@@ -155,9 +210,10 @@ OPTIONS=" \
     --rotary-base 1000000 \
     --swiglu \
     --tensor-model-parallel-size ${TP}  \
-    --pipeline-model-parallel-size 1 \
+    --pipeline-model-parallel-size ${PP} \
+    ${PP_l:+--num-layers-per-virtual-pipeline-stage $PP_l} \
     --rerun-mode disabled \
-    --num-layers 4 \
+    --num-layers $NUM_LAYERS \
     --hidden-size 2048 \
     --ffn-hidden-size 8192 \
     --add-qkv-bias \
@@ -166,15 +222,15 @@ OPTIONS=" \
     --exit-duration-in-mins 230 \
     --seq-length ${SEQ_LEN} \
     --max-position-embeddings ${SEQ_LEN} \
-    --train-samples 100000 \
-    --lr-warmup-samples 20000 \
+    --train-iters $TRAIN_ITERS \
+    --lr-warmup-samples 0 \
     --micro-batch-size ${MBZ} \
     --global-batch-size ${BZ} \
     --lr 2e-5 \
     --min-lr 0.0 \
     --lr-decay-style cosine \
     --log-interval ${LI} \
-    --eval-iters 10 \
+    --eval-iters 0 \
     --eval-interval 999999 \
     --save-interval 1000 \
     --data-cache-path ${DATACACHE_DIR} \
@@ -197,29 +253,91 @@ OPTIONS=" \
     --use-dist-ckpt \
 "
 
+# PROFILE_WRAPPER
+if [ $PROFILE == 1 ]; then PROFILE_WRAPPER="$SCRIPT_DIR/nsys_profile_rank.sh";
+else PROFILE_WRAPPER=; fi
 
 # Interactive or batch mode
-if [[ $BATCH -eq 0 ]]; then
-    if [[ $PROFILE -eq 1 ]]; then
-        nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o gpt_sft_hetero_cp_iter7_8_flash_global_64 torchrun --nproc_per_node ${NUM_GPU} pretrain_gpt.py ${OPTIONS}
-    else
-        torchrun --nproc_per_node ${NUM_GPU} /home/tailaim/work_data/megatron-lm/pretrain_gpt.py ${OPTIONS}
-    fi
-else
-    if [[ $PROFILE -eq 1 ]]; then
-        run_cmd="cd ${SOURCE}; nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi --capture-range-end stop -o without_hetero_cp_global_%q{SLURM_PROCID} python -u pretrain_gpt.py ${OPTIONS}"
-    else
-        run_cmd="cd ${SOURCE}; python -u pretrain_gpt.py ${OPTIONS}"
-    fi
+# if [[ $BATCH -eq 0 ]]; then
+#     DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+#     # if [[ $PROFILE -eq 1 ]]; then
+#     #     nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o gpt_sft_hetero_cp_iter7_8_flash_global_64 torchrun --nproc_per_node ${NUM_GPU} pretrain_gpt.py ${OPTIONS}
+#     # else
+#     #     torchrun --nproc_per_node ${NUM_GPU} /home/tailaim/work_data/megatron-lm/pretrain_gpt.py ${OPTIONS}
+#     # fi
+#     echo "MASTER_ADDR = ${MASTER_ADDR}, NP = ${NP}, NODE_RANK = ${NODE_RANK}, NUM_GPU = ${NUM_GPU} "
+#     $PROFILE_WRAPPER torchrun --master_addr ${MASTER_ADDR} --master_port=12345 --nnodes ${NP} --node_rank ${NODE_RANK} --nproc_per_node ${NUM_GPU} /m2v_model/wuguohao03/nv_teamwork/Megatron-LM/pretrain_gpt.py ${OPTIONS} | tee ${LOGS_DIR}/$DATETIME.log
+# else
+#     if [[ $PROFILE -eq 1 ]]; then
+#         run_cmd="cd ${SOURCE}; nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi --capture-range-end stop -o without_hetero_cp_global_%q{SLURM_PROCID} python -u pretrain_gpt.py ${OPTIONS}"
+#     else
+#         run_cmd="cd ${SOURCE}; python -u pretrain_gpt.py ${OPTIONS}"
+#     fi
 
-    DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
-    echo "run_cmd: ${run_cmd}"
-    srun -l --verbose \
-    --container-image /lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-moe-scripts/mcore-moe-pytorch25.06.sqsh \
-    --container-mounts "/lustre" \
-    --no-container-mount-home \
-    --output=${LOGS_DIR}/%x_%j_$DATETIME.log \
-    sh -c "${run_cmd}"
+#     DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+#     echo "run_cmd: ${run_cmd}"
+#     srun -l --verbose \
+#     --container-image /lustre/fsw/portfolios/coreai/users/tailaim/work_data/megatron-moe-scripts/mcore-moe-pytorch25.06.sqsh \
+#     --container-mounts "/lustre" \
+#     --no-container-mount-home \
+#     --output=${LOGS_DIR}/%x_%j_$DATETIME.log \
+#     sh -c "${run_cmd}"
 
-    set +x
-fi
+#     set +x
+# fi
+
+exec &> >(tee "${LOGS_DIR}/$DATETIME.log")
+echo "HOSTFILE = ${HOSTFILE} MASTER_ADDR = ${MASTER_ADDR}, NP = ${NP}, NUM_GPU = ${NUM_GPU} "
+
+cat $HOSTFILE
+
+set -x
+
+# mpirun --hostfile hostfile -np 24 cat $HOSTFILE
+
+
+mpirun --allow-run-as-root \
+        ${HOSTFILE:+--hostfile "$HOSTFILE"} \
+        --np $NP \
+        --bind-to none --map-by slot \
+        --mca plm_rsh_args "$PLM_RSH_ARGS" \
+        --mca btl self,tcp \
+        --mca pml ob1 \
+        -mca plm_rsh_num_concurrent 600 \
+        -mca routed_radix 600 \
+        -mca btl_tcp_if_include bond0,eth01 \
+        -mca oob_tcp_if_include bond0,eth01 \
+        -mca btl_openib_allow_ib false \
+        -mca opal_set_max_sys_limits 1 \
+        -x HOROVOD_MPI_THREADS_DISABLE=1 \
+        -x MPI_THREAD_SINGLE=1 \
+        -x NCCL_IB_DISABLE=0 \
+        -x NCCL_IB_GID_INDEX=3 \
+        -x NCCL_IB_HCA=mlx5 \
+        -x NCCL_IB_QPS_PER_CONNECTION=16 \
+        -x NCCL_IB_TIMEOUT=20 \
+        -x NCCL_ALGO=^NVLS,NVLSTree \
+        -x NCCL_PROTO=^LL128 \
+        -x KML_ID \
+        -x TASK_ID \
+        -x DATETIME \
+        -x CREATOR \
+        -x TASK_RECORD_URL \
+        -x HOSTNAME \
+        -x TRAIN_MODE=True \
+        -x PATH \
+        ${LD_LIBRARY_PATH:+-x LD_LIBRARY_PATH} \
+        -x PYTHONPATH="$/m2v_model/wuguohao03/nv_teamwork/Megatron-LM":$PYTHONPATH \
+        -x NCCL_DEBUG=WARN \
+        -x http_proxy=http://oversea-squid2.ko.txyun:11080 \
+        -x https_proxy=http://oversea-squid2.ko.txyun:11080 \
+        -x no_proxy=localhost,127.0.0.1,localaddress,localdomain.com,internal,corp.kuaishou.com,test.gifshow.com,staging.kuaishou.com \
+    $PROFILE_WRAPPER \
+    with_nccl_local_env \
+    python -u /m2v_model/wuguohao03/nv_teamwork/Megatron-LM/pretrain_gpt.py \
+        ${OPTIONS} \
+        --distributed-backend nccl \
+        --master-addr ${MASTER_ADDR}:${MASTER_PORT}
+
+
+exit 1
