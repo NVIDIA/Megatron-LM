@@ -29,9 +29,7 @@ from megatron.rl.rl_utils import selective_log_softmax
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    from flash_attn_3.flash_attn_interface import (
-        _flash_attn_forward,
-    )
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
     from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
