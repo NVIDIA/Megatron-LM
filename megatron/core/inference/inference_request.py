@@ -408,12 +408,12 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
-    def suspend(self, tokenizer: MegatronTokenizer):
+    def suspend(self, tokenizer: MegatronTokenizer | None = None):
         """Suspend request by storing references to previous prompt, generations,
         and sampling params.
 
         Args:
-            tokenizer (MegatronTokenizer): The tokenizer.
+            tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
         """
 
         old_request = self[-1]
@@ -430,7 +430,6 @@ class DynamicInferenceRequestRecord:
             ),
             dim=0,
         )
-        new_prompt_str = tokenizer.detokenize(new_prompt_tokens.tolist())
 
         # New sampling params.
         new_sampling_params = SamplingParams(
@@ -446,17 +445,16 @@ class DynamicInferenceRequestRecord:
         # New request.
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
-            prompt=new_prompt_str,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
         )
         self.requests.append(new_request)
 
-    def merge(self, tokenizer: MegatronTokenizer) -> DynamicInferenceRequest:
+    def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
         """Merge requests into a single suspend-agnostic request object.
 
         Args:
-            tokenizer (MegatronTokenizer): The tokenizer.
+            tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
 
         Returns:
             (DynamicInferenceRequest) Merged request.
@@ -469,16 +467,18 @@ class DynamicInferenceRequestRecord:
                 return [v for r in self.requests for v in getattr(r, key)]
 
         prompt_tokens = self.requests[0].prompt_tokens
+        prompt_text = self.requests[0].prompt
         generated_tokens = merge_lists("generated_tokens")
+        generated_text = "".join(r.generated_text for r in self.requests)
 
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
-            prompt=tokenizer.detokenize(prompt_tokens.tolist()),
+            prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
-            generated_text=tokenizer.detokenize(generated_tokens),
+            generated_text=generated_text,
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
             generated_log_probs=merge_lists("generated_log_probs"),
