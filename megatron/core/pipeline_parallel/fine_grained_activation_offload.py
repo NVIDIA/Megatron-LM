@@ -1,11 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import warnings
 from collections import deque
 from contextlib import nullcontext
 from typing import Any
 
 import torch
+
+from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
 
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
@@ -20,39 +21,6 @@ def debug_rank(message):
     assert torch.distributed.is_initialized()
     if torch.distributed.get_rank() == DEBUG_RANK:
         print(message)
-
-
-def set_ideal_affinity_for_current_gpu():
-    """Set CPU affinity for the current GPU to optimize host-device transfers."""
-    import uuid
-
-    try:
-        import cuda.bindings.driver as cuda_driver
-        import cuda.bindings.runtime as cuda_runtime
-    except ImportError:
-        try:
-            import cuda.cuda as cuda_driver
-            import cuda.cudart as cuda_runtime
-        except ImportError:
-            # print("cuda-python may not be installed, skipping GPU affinity setting")
-            warnings.warn("cuda-python may not be installed, skipping GPU affinity setting")
-            return
-    try:
-        import pynvml
-    except ImportError:
-        warnings.warn("pynvml is not installed, skipping GPU affinity setting")
-        return
-
-    # Get current CUDA device ID
-    err, device_id = cuda_runtime.cudaGetDevice()
-    assert err == cuda_runtime.cudaError_t.cudaSuccess
-    # Get device UUID
-    err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id)
-    assert err == cuda_driver.CUresult.CUDA_SUCCESS
-    # Set CPU affinity based on GPU's NUMA node
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
-    pynvml.nvmlDeviceSetCpuAffinity(handle)
 
 
 class PipelineOffloadManager:
@@ -200,6 +168,8 @@ class PipelineOffloadManager:
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = True
+        else:
+            raise RuntimeError("TE CPU offload is not available")
         self.inside_context = True
 
         torch._C._autograd._push_saved_tensors_default_hooks(
@@ -213,6 +183,8 @@ class PipelineOffloadManager:
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = False
+        else:
+            raise RuntimeError("TE CPU offload is not available")
         self.inside_context = False
         torch._C._autograd._pop_saved_tensors_default_hooks()
 
@@ -244,23 +216,17 @@ class ChunkOffloadHandler:
     def offload(src_tensor, pin_memory=True):
         """Offload."""
         debug_rank("--------offload")
-        from megatron.core.extensions.transformer_engine import Float8Tensor
-
-        fp8_offload = isinstance(src_tensor, Float8Tensor) if Float8Tensor is not None else False
 
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
 
         cpu_backup = torch.empty(
             src_tensor.size(),
-            dtype=torch.uint8 if fp8_offload else src_tensor.dtype,
+            dtype=src_tensor.dtype,
             layout=src_tensor.layout,
             device="cpu",
             pin_memory=pin_memory,
         )
-
-        if fp8_offload:
-            cpu_backup = Float8Tensor.make_like(src_tensor, data=cpu_backup)
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
         state = (src_tensor.device, cpu_backup)
