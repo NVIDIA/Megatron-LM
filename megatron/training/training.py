@@ -50,6 +50,7 @@ except ImportError:
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    get_attr_wrapped_model,
     get_model_config,
     StragglerDetector,
 )
@@ -1491,6 +1492,7 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1680,6 +1682,7 @@ def training_log(
             num_layers=args.num_layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
+            pg_collection=pg_collection,
         )
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
@@ -2178,6 +2181,8 @@ def train(
     for model_module in model:
         model_module.train()
 
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+
     # Tracking loss.
     total_loss_dict = {}
 
@@ -2549,6 +2554,7 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            pg_collection=model_pg_collection,
         )
 
         # Evaluation.
