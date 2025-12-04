@@ -31,6 +31,7 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
+from megatron.core.utils import internal_api
 
 from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -186,6 +187,7 @@ def get_mem_size_str(n_bytes: int) -> str:
     raise Exception(f"something went wrong, n_bytes={n_bytes}.")
 
 
+@internal_api
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
     """Inference context that is passed to the main model in order
@@ -384,7 +386,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Set max_total_requests, max_active_requests, max_tokens.
         self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
-        self.max_active_requests = self.block_allocator.active_count
+        max_active_requests = self.block_allocator.active_count // tp_size * tp_size
+        self.max_active_requests = (
+            max_active_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
+        )
         self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
 
         assert self.max_tokens >= self.max_active_requests, (
