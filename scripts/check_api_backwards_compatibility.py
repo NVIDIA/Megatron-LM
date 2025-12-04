@@ -46,6 +46,13 @@ if sys.platform == 'win32':
 # Decorators that exempt objects from compatibility checks
 EXEMPT_DECORATORS = ['internal_api', 'deprecated']
 
+# Breakage kinds to ignore (not actual API signature changes)
+# AttributeChangedValueBreakage: Changing constant values (e.g., VERSION = "1.0" -> "2.0")
+#   is not a breaking API change - the constant still exists with the same name
+IGNORED_BREAKAGE_KINDS = [
+    'AttributeChangedValueBreakage',
+]
+
 
 def has_exempt_decorator(obj: Object) -> bool:
     """Check if a Griffe object has any exempt decorator.
@@ -206,9 +213,10 @@ def get_object_path(change) -> str:
 
 
 def should_skip_change(change, filtered_paths: set) -> bool:
-    """Determine if a breaking change should be skipped based on exempt decorators.
+    """Determine if a breaking change should be skipped.
     
     A change is skipped if:
+    - The change kind is in IGNORED_BREAKAGE_KINDS (not a signature change)
     - The changed object itself is in filtered_paths (exact match)
     - The changed object is a child of an exempt object (prefix match)
     
@@ -219,6 +227,11 @@ def should_skip_change(change, filtered_paths: set) -> bool:
     Returns:
         bool: True if the change should be skipped (filtered out)
     """
+    # Check if this breakage kind should be ignored (not a signature change)
+    change_kind = type(change).__name__
+    if change_kind in IGNORED_BREAKAGE_KINDS:
+        return True
+    
     path = get_object_path(change)
     if not path:
         return False
