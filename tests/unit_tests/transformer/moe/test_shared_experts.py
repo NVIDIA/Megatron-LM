@@ -106,7 +106,7 @@ class TestSharedExperts:
         assert moe_layer_no_overlap.token_dispatcher.shared_experts is None
 
         # Create a dummy input tensor.
-        hidden_states = torch.ones(
+        hidden_states = torch.randn(
             (32, 2, self.config.hidden_size),
             requires_grad=True,
             device="cuda",
