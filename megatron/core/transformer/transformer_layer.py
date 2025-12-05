@@ -288,6 +288,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
+            maybe_fuse_quantize=self.config.fp8 or self.config.fp4,
         )
 
         attention_optional_kwargs = {}
