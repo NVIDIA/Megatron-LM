@@ -95,9 +95,9 @@ class MambaLayer(GraphableMegatronModule):
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
-        packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
         Perform a forward pass through the Mamba layer.

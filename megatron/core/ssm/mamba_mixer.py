@@ -400,9 +400,9 @@ class MambaMixer(MegatronModule):
         self,
         hidden_states,
         inference_context=None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
         hidden_states: (nL, B, D) / (L B D)

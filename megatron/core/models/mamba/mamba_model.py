@@ -182,7 +182,6 @@ class MambaModel(LanguageModule):
         labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
         runtime_gather_output: Optional[bool] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
