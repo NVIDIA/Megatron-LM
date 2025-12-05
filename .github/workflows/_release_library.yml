@@ -73,6 +73,8 @@ jobs:
         success() || !failure()
       )
       && !cancelled()
+    outputs:
+      version: ${{ needs.bump-version-mcore.outputs.release-version }}
     env:
       IS_DRY_RUN: ${{ inputs.dry-run }}
     steps:
@@ -98,6 +100,8 @@ jobs:
           MINOR=$(cat $PACKAGE_INFO_FILE | awk '/^MINOR = /' | awk -F"= " '{print $2}')
           PATCH=$(cat $PACKAGE_INFO_FILE | awk '/^PATCH = /' | awk -F"= " '{print $2}')
           PRERELEASE=$(cat $PACKAGE_INFO_FILE | awk '/^PRE_RELEASE = /' | awk -F"= " '{print $2}' | tr -d '"' | tr -d "'")
+
+          echo "release-version=$MAJOR.$MINOR.$NEXT_PATCH$NEXT_PRERELEASE" | tee -a "$GITHUB_OUTPUT"
 
           if [[ "$PRERELEASE" != "" ]]; then
             if [[ "$PRERELEASE" == *rc* ]]; then
@@ -307,12 +311,13 @@ jobs:
     with:
       dry-run: false
       ref: ${{ inputs.release-ref }}
+      no-publish: false
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
   create-gh-release:
-    needs: [build-test-publish-wheels]
+    needs: [build-test-publish-wheels, bump-next-version]
     runs-on: ubuntu-latest
     environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
     if: |
@@ -326,7 +331,7 @@ jobs:
     env:
       REPOSITORY: ${{ github.repository }}
       PROJECT_NAME: Megatron Core
-      VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
+      VERSION: ${{ needs.bump-next-version.outputs.release-version }}
       TAG_PREFIX: ${{ inputs.gh-release-tag-prefix || '' }}
     steps:
       - name: Checkout repository
