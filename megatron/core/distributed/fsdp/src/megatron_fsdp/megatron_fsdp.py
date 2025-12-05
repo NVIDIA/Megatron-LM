@@ -841,6 +841,16 @@ class MegatronFSDP(torch.nn.Module):
                     )
                 )
 
+            # Register the post-backward hook to deallocate model parameters and
+            # reduce-scatter gradients immediately after the module backward pass
+            # has completed to conserve memory for the subsequent backward pass.
+            self.forward_pre_hooks[f"module {name} register post-backward hook"] = (
+                module.register_forward_pre_hook(
+                    functools.partial(_register_post_backward_hook, _post_backward),
+                    with_kwargs=True,
+                )
+            )
+
             # Skip if the module is already registered in fsdp_modules.
             if any(is_submodule(module, fsdp_module) for fsdp_module in fsdp_modules):
                 continue
@@ -870,16 +880,6 @@ class MegatronFSDP(torch.nn.Module):
             # hook to the output tensor(s) of a module during a post-forward hook.
             self.backward_pre_hooks[f"all-gather module {name} parameters"] = (
                 create_custom_backward_hook(module, _pre_backward)
-            )
-
-            # Register the post-backward hook to deallocate model parameters and
-            # reduce-scatter gradients immediately after the module backward pass
-            # has completed to conserve memory for the subsequent backward pass.
-            self.forward_pre_hooks[f"module {name} register post-backward hook"] = (
-                module.register_forward_pre_hook(
-                    functools.partial(_register_post_backward_hook, _post_backward),
-                    with_kwargs=True,
-                )
             )
 
         # Register root module pre- and post-backward hooks in cases where the
