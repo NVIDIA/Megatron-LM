@@ -748,6 +748,48 @@ def save_to_aux_losses_tracker(
     tracker[name]["avg_group"] = avg_group
 
 
+def compute_and_save_load_balance_discrepancy(
+    tokens_per_expert: torch.Tensor,
+    num_experts: int,
+    layer_number: int,
+    num_layers: int,
+    reduce_group: torch.distributed.ProcessGroup = None,
+):
+    """Compute load balance discrepancy and save to tracker.
+
+    Computes the L1 distance between actual token distribution and uniform distribution
+    across experts. This metric is logged per layer and aggregated across layers.
+
+    Args:
+        tokens_per_expert (torch.Tensor): Number of tokens per expert, shape [num_experts].
+        num_experts (int): Number of experts.
+        layer_number (int): Layer index.
+        num_layers (int): Total number of layers.
+        reduce_group (torch.distributed.ProcessGroup): The group for reducing.
+    """
+    if layer_number is None:
+        return
+
+    total_num_tokens = tokens_per_expert.sum()
+    if total_num_tokens == 0:
+        return
+
+    # Compute L1 distance to uniform distribution
+    # token_ratio: actual fraction of tokens per expert
+    # uniform_ratio: expected fraction if perfectly balanced (1/num_experts)
+    token_ratio = tokens_per_expert.float() / total_num_tokens
+    uniform_ratio = 1.0 / num_experts
+    load_balance_discrepancy = (token_ratio - uniform_ratio).abs().sum()
+
+    save_to_aux_losses_tracker(
+        "load_balance_discrepancy",
+        load_balance_discrepancy,
+        layer_number,
+        num_layers,
+        reduce_group=reduce_group,
+    )
+
+
 def clear_aux_losses_tracker():
     """Clear the auxiliary losses."""
     tracker = get_moe_layer_wise_logging_tracker()
@@ -792,6 +834,86 @@ def reduce_aux_losses_tracker_across_ranks(
             torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
 
+def _log_load_balance_discrepancy_metrics(
+    discrepancy_list: torch.Tensor,
+    num_moe_layers: int,
+    iteration: int,
+    writer,
+    wandb_writer,
+    per_layer_logging: bool,
+):
+    """Log load balance discrepancy metrics with percentiles across layers (Type 1).
+
+    Args:
+        discrepancy_list: Per-layer L1 discrepancy values, shape [num_layers].
+        num_moe_layers: Number of MoE layers.
+        iteration: Current training iteration.
+        writer: TensorBoard writer.
+        wandb_writer: W&B writer.
+        per_layer_logging: Whether to log per-layer values.
+
+    Returns:
+        str: Formatted log string for console output.
+    """
+    # Filter to only MoE layers (non-zero values indicate MoE layers)
+    # Note: discrepancy_list may have zeros for non-MoE layers
+    moe_layer_discrepancies = discrepancy_list[discrepancy_list > 0]
+    if len(moe_layer_discrepancies) == 0:
+        return ""
+
+    # Compute statistics across layers
+    mean_val = moe_layer_discrepancies.mean()
+    percentiles = [0.50, 0.95]
+
+    # Use quantile to compute percentiles
+    percentile_tensor = torch.quantile(
+        moe_layer_discrepancies.float(),
+        torch.tensor(percentiles, device=moe_layer_discrepancies.device),
+    )
+    p50_val = percentile_tensor[0].item()
+    p95_val = percentile_tensor[1].item()
+
+    # Format log string for console output
+    log_string = (
+        f" load_balance_discrepancy(mean/p50/p95): "
+        f"{mean_val.item():.4f}/{p50_val:.4f}/{p95_val:.4f} |"
+    )
+
+    # For TensorBoard/WandB, log all percentiles separately
+    all_percentiles = [0.05, 0.50, 0.75, 0.90, 0.95]
+    all_percentile_names = ["p5", "p50", "p75", "p90", "p95"]
+    all_percentile_values = torch.quantile(
+        moe_layer_discrepancies.float(),
+        torch.tensor(all_percentiles, device=moe_layer_discrepancies.device),
+    ).tolist()
+
+    metrics = {"moe/load_balance_discrepancy_mean": mean_val.item()}
+    for name, val in zip(all_percentile_names, all_percentile_values):
+        metrics[f"moe/load_balance_discrepancy_{name}"] = val
+
+    if writer is not None:
+        for metric_name, metric_val in metrics.items():
+            writer.add_scalar(metric_name, metric_val, iteration)
+        if per_layer_logging:
+            for i, val in enumerate(discrepancy_list.tolist()):
+                if val > 0:  # Only log MoE layers
+                    writer.add_scalar(f"moe/load_balance_discrepancy_layer_{i}", val, iteration)
+
+    if wandb_writer is not None:
+        wandb_writer.log(metrics, iteration)
+        if per_layer_logging:
+            wandb_writer.log(
+                {
+                    f"moe/load_balance_discrepancy_layer_{i}": val
+                    for i, val in enumerate(discrepancy_list.tolist())
+                    if val > 0
+                },
+                iteration,
+            )
+
+    return log_string
+
+
 def track_moe_metrics(
     loss_scale: float,
     iteration: int,
@@ -806,7 +928,12 @@ def track_moe_metrics(
     mtp_num_layers: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ):
-    """Track the MoE metrics for logging."""
+    """Track the MoE metrics for logging.
+
+    Returns:
+        str: Formatted log string for load_balance_discrepancy metrics.
+    """
+    moe_log_string = ""
     # Aux loss logging
     tracker = get_moe_layer_wise_logging_tracker()
     # Initialize the tracker if force_initialize is True
@@ -831,12 +958,18 @@ def track_moe_metrics(
         num_moe_layers = sum(moe_layer_freq)
     else:
         raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
-
     if mtp_num_layers is not None:
         num_moe_layers += mtp_num_layers
 
     aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
     for name, loss_list in aux_losses.items():
+        # Special handling for load_balance_discrepancy: compute percentiles across layers
+        if name == "load_balance_discrepancy":
+            moe_log_string += _log_load_balance_discrepancy_metrics(
+                loss_list, num_moe_layers, iteration, writer, wandb_writer, per_layer_logging
+            )
+            continue
+
         if total_loss_dict is not None:
             if name not in total_loss_dict:
                 total_loss_dict[name] = loss_list.sum() / num_moe_layers
@@ -866,6 +999,8 @@ def track_moe_metrics(
                     )
 
     clear_aux_losses_tracker()
+
+    return moe_log_string
 
 
 def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_rate):
