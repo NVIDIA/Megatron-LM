@@ -219,23 +219,43 @@ def extract_param_metadata(
 def select_src_metadata_balanced(
     src_meta_list: list[ParameterMetadata], dst_metadata: ParameterMetadata, dst_rank: int
 ) -> ParameterMetadata:
-    """Choose representative source metadata using DP round-robin across source DP groups."""
+    """Choose a representative source `ParameterMetadata` for a destination rank.
+
+    Multiple source data-parallel (DP) groups may hold the same logical parameter.
+    To avoid always reading from the same group, we:
+      - bucket `src_meta_list` by their DP group (tuple of ranks)
+      - if there is only one bucket, just return the first entry
+      - otherwise, map the destination rank's DP index to one of the source
+        DP groups in a round-robin fashion, and pick the first metadata in it.
+    """
     if not src_meta_list:
         raise ValueError("src_meta_list must be non-empty")
-    groups: dict[tuple[int, ...], list[ParameterMetadata]] = {}
-    for m in src_meta_list:
-        key = tuple(m.data_parallel_group_ranks or [])
-        groups.setdefault(key, []).append(m)
-    if len(groups) == 1:
+
+    # Group source metadata by their DP group layout so we can balance across groups.
+    #   (dp_rank0, dp_rank1, ...) -> [ParameterMetadata for that DP group]
+    grouped_by_dp: dict[tuple[int, ...], list[ParameterMetadata]] = {}
+    for meta in src_meta_list:
+        dp_group = tuple(meta.data_parallel_group_ranks or [])
+        grouped_by_dp.setdefault(dp_group, []).append(meta)
+
+    # Fast path: only one DP layout present; no balancing necessary.
+    if len(grouped_by_dp) == 1:
         return src_meta_list[0]
-    dst_dp = dst_metadata.data_parallel_group_ranks or []
-    if dst_rank in dst_dp and len(dst_dp) > 0:
-        my_dst_dp_idx = dst_dp.index(dst_rank)
+
+    # Determine this destination rank's index within its DP group (if any).
+    dst_dp_ranks = dst_metadata.data_parallel_group_ranks or []
+    if dst_dp_ranks and dst_rank in dst_dp_ranks:
+        dst_dp_index = dst_dp_ranks.index(dst_rank)
     else:
-        my_dst_dp_idx = 0
-    keys_sorted = sorted(groups.keys())
-    chosen_key = keys_sorted[my_dst_dp_idx % len(keys_sorted)]
-    return groups[chosen_key][0]
+        # Fallback: treat as the first DP index.
+        dst_dp_index = 0
+
+    # Use a stable ordering of DP groups so that round-robin is deterministic.
+    sorted_dp_groups = sorted(grouped_by_dp.keys())
+    chosen_group = sorted_dp_groups[dst_dp_index % len(sorted_dp_groups)]
+
+    # Within the chosen group, any representative metadata works; use the first.
+    return grouped_by_dp[chosen_group][0]
 
 
 logger = logging.getLogger(__name__)
