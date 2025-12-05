@@ -40,7 +40,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter, await_process_event
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import get_asyncio_loop, internal_api, trace_async_exceptions
 
 try:
