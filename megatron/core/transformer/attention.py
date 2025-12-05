@@ -23,10 +23,8 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.tensor_parallel.mappings import (
-    all_gather_last_dim_from_tensor_parallel_region,
-)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
@@ -184,8 +182,9 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         if self.config.num_query_groups < world_size:
             self.num_query_groups_per_partition = 1
-            self.num_attention_heads_per_partition = divide(self.config.num_attention_heads,
-                                                            self.config.num_query_groups)
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, self.config.num_query_groups
+            )
         else:
             self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
         self.world_size = world_size
@@ -1127,9 +1126,11 @@ class SelfAttention(Attention):
 
         if self.config.num_query_groups < self.world_size:
             mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
-            idx = get_tensor_model_parallel_rank() // (self.world_size // self.config.num_query_groups)
+            idx = get_tensor_model_parallel_rank() // (
+                self.world_size // self.config.num_query_groups
+            )
             size = mixed_qkv.size()[-1] // self.config.num_query_groups
-            mixed_qkv = mixed_qkv[:, :, idx * size:(idx + 1) * size]
+            mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
@@ -1170,9 +1171,13 @@ class SelfAttention(Attention):
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.config.num_query_groups < self.world_size:
-            idx = get_tensor_model_parallel_rank() % (self.world_size // self.config.num_query_groups)
-            size = self.num_attention_heads_per_partition // (self.world_size // self.config.num_query_groups)
-            query = query[:, :, idx * size:(idx + 1) * size, :]
+            idx = get_tensor_model_parallel_rank() % (
+                self.world_size // self.config.num_query_groups
+            )
+            size = self.num_attention_heads_per_partition // (
+                self.world_size // self.config.num_query_groups
+            )
+            query = query[:, :, idx * size : (idx + 1) * size, :]
 
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)
