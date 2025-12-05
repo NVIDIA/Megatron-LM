@@ -62,7 +62,7 @@ RUN bash -ex <<"EOF"
 
     git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
-        git checkout 1dddd194c26911c35b4f53a148617dd73de0ffc9
+        git checkout 83e0d156807f31abed4ea55c2fa6eb4b62a11b82
         patch -p1 < /workspace/deepep.patch
     popd
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.
