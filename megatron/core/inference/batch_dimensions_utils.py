@@ -60,8 +60,6 @@ class InferenceBatchDimensions:
                 self.token_count >= real_batch_dim.token_count
                 and self.prefill_req_count >= real_batch_dim.prefill_req_count
                 and self.decode_req_count >= real_batch_dim.decode_req_count
-                and self.token_count - self.decode_req_count
-                >= real_batch_dim.token_count - real_batch_dim.decode_req_count
             )
         else:
             return (

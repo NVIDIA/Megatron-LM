@@ -482,7 +482,7 @@ class MambaMixer(MegatronModule):
                 context.mamba_metadata.batch_indices_decode,
             ).transpose(0, 1)
             y_prefill = self.ssm_prefill(
-                zxBCdt_prefill[: token_count - decode_req_count],
+                zxBCdt_prefill,
                 conv_state=conv_state,
                 ssm_state=ssm_state,
                 seq_idx=context.mamba_metadata.seq_idx,

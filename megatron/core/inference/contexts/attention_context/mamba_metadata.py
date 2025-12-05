@@ -144,7 +144,7 @@ class MambaMetadata:
             )
             if padded_seq_len > seq_len:
                 self._seq_idx_buffer[:, seq_len:padded_seq_len].fill_(-1)
-            self.seq_idx = self._seq_idx_buffer[:, :padded_seq_len]
+            self.seq_idx = self._seq_idx_buffer[:, :padded_token_count]
 
             # Update cu_seqlens
             self._cu_seqlens_buffer[0] = 0
