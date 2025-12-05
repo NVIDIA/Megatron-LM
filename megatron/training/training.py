@@ -52,9 +52,18 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_model_config,
+    get_pg_size,
+    get_pg_rank,
     StragglerDetector,
 )
 from megatron.core.fp8_utils import correct_amax_history_if_needed
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.pipeline_parallel.utils import (
+    is_pp_first_stage,
+    is_pp_last_stage,
+    is_vp_first_stage,
+    is_vp_last_stage,
+)
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -833,6 +842,9 @@ def pretrain(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
 
+    if getattr(args, 'perform_rl_step', False):
+        rl_utils.rl_inference_interface_shutdown()
+
     ft_integration.shutdown()
     one_logger_utils.finish()
 
@@ -870,10 +882,12 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
+def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     args = get_args()
     args.model_type = model_type
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import has_modelopt_state
@@ -890,23 +904,38 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Build model.
     def build_model():
         if (
-            mpu.get_pipeline_model_parallel_world_size() > 1
+            get_pg_size(pg_collection.pp) > 1
             and args.virtual_pipeline_model_parallel_size is not None
         ):
             model = []
-            for i in range(args.virtual_pipeline_model_parallel_size):
+            vp_size = args.virtual_pipeline_model_parallel_size
+            for i in range(vp_size):
                 # Set pre_process and post_process only after virtual rank is set.
-                pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
-                post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
+                pre_process = is_pp_first_stage(pg_collection.pp) and is_vp_first_stage(
+                    vp_stage=i, vp_size=vp_size
+                )
+                post_process = is_pp_last_stage(pg_collection.pp) and is_vp_last_stage(
+                    vp_stage=i, vp_size=vp_size
+                )
                 this_model = model_provider_func(
-                    pre_process=pre_process, post_process=post_process, vp_stage=i)
+                    pre_process=pre_process,
+                    post_process=post_process,
+                    vp_stage=i,
+                    config=config,
+                    pg_collection=pg_collection,
+                )
                 this_model.model_type = model_type
                 this_model.vp_stage = i
                 model.append(this_model)
         else:
-            pre_process = mpu.is_pipeline_first_stage()
-            post_process = mpu.is_pipeline_last_stage()
-            model = model_provider_func(pre_process=pre_process, post_process=post_process)
+            pre_process = is_pp_first_stage(pg_collection.pp)
+            post_process = is_pp_last_stage(pg_collection.pp)
+            model = model_provider_func(
+                pre_process=pre_process,
+                post_process=post_process,
+                config=config,
+                pg_collection=pg_collection,
+            )
             model.model_type = model_type
         return model
 
@@ -931,12 +960,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     num_parameters = sum(
         [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
     )
-    if mpu.get_data_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0:
+    if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
             ' > number of parameters on (tensor, pipeline) '
             'model parallel rank ({}, {}): {}'.format(
-                mpu.get_tensor_model_parallel_rank(),
-                mpu.get_pipeline_model_parallel_rank(),
+                get_pg_rank(pg_collection.tp),
+                get_pg_rank(pg_collection.pp),
                 num_parameters,
             ),
             flush=True,
@@ -1467,32 +1496,37 @@ def training_log(
     total_loss_dict[nan_iters_key] = total_loss_dict.get(nan_iters_key, 0) + int(got_nan)
 
     # Logging.
-    timers_to_log = [
-        'forward-backward',
-        'forward-compute',
-        'backward-compute',
-        'batch-generator',
-        'forward-recv',
-        'forward-send',
-        'backward-recv',
-        'backward-send',
-        'forward-send-forward-recv',
-        'forward-send-backward-recv',
-        'backward-send-forward-recv',
-        'backward-send-backward-recv',
-        'forward-backward-send-forward-backward-recv',
-        'layernorm-grads-all-reduce',
-        'embedding-grads-all-reduce',
-        'all-grads-sync',
-        'params-all-gather',
-        'optimizer-copy-to-main-grad',
-        'optimizer-unscale-and-check-inf',
-        'optimizer-clip-main-grad',
-        'optimizer-count-zeros',
-        'optimizer-inner-step',
-        'optimizer-copy-main-to-model-params',
-        'optimizer',
-    ]
+    timers_to_log = []
+    if args.timing_log_level >= 1:
+        timers_to_log.extend([
+            'forward-backward',
+            'layernorm-grads-all-reduce',
+            'embedding-grads-all-reduce',
+            'all-grads-sync',
+            'params-all-gather',
+            'optimizer-copy-to-main-grad',
+            'optimizer-unscale-and-check-inf',
+            'optimizer-clip-main-grad',
+            'optimizer-count-zeros',
+            'optimizer-inner-step',
+            'optimizer-copy-main-to-model-params',
+            'optimizer',
+        ])
+    if args.timing_log_level >= 2:
+        timers_to_log.extend([
+            'batch-generator',
+            'forward-compute',
+            'backward-compute',
+            'forward-recv',
+            'forward-send',
+            'backward-recv',
+            'backward-send',
+            'forward-send-forward-recv',
+            'forward-send-backward-recv',
+            'backward-send-forward-recv',
+            'backward-send-backward-recv',
+            'forward-backward-send-forward-backward-recv',
+        ])
     # Add timers from RL loop if needed.
     if getattr(args, 'perform_rl_step', False):
         timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
@@ -1622,7 +1656,7 @@ def training_log(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
     if iteration % args.log_interval == 0:
-        if args.record_memory_history and is_last_rank():
+        if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
 
@@ -1703,7 +1737,9 @@ def training_log(
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
-            report_memory_flag = False
+            if iteration > 1:
+                # Make sure the memory after the second iteration is reported to include optimizer state memory.
+                report_memory_flag = False
         # Write timers to wandb, don't reset the counts
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
@@ -2336,6 +2372,8 @@ def train(
                 train_data_iterator = rl_utils.setup_grpo_data_iterator(
                     model, optimizer, iteration, ref_state_dict, buffered_rollouts
                 )
+                # Buffered rollouts are used as a state container for setups when
+                # we use previously-generated data for an update.
                 buffered_rollouts = train_data_iterator
 
         ft_integration.on_training_step_start()
@@ -2541,6 +2579,8 @@ def train(
             wandb_writer.finish()
         ft_integration.shutdown()
         one_logger_utils.finish()
+        if getattr(args, 'perform_rl_step', False):
+            rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
 
     return iteration, num_floating_point_operations_so_far
@@ -2859,33 +2899,36 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     # Construct the data pipeline
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
-        # Build datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None
-        )
-        valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-        
-        # Build dataloders.
-        train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+        # Build datasets and dataloders.
+        if getattr(args, 'perform_rl_step', True):
+            # we don't need to build any dataloaders for RL training
+            train_dataloader = None
+            valid_dataloaders = None
+            test_dataloader = None
+            do_train = args.train_iters > 0
+            do_valid = (args.full_validation or args.eval_iters > 0)
+            do_test = (args.full_validation or args.eval_iters > 0)
+        else:
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+            train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+            valid_dataloaders = []
+            for valid_d in valid_ds:
+                if args.skip_train or args.full_validation:
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                else:
+                    if args.multiple_validation_sets:
+                        # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                        # correct and needs to be calculated/set per validation set
+                        raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+            if not args.multiple_validation_sets:
+                assert len(valid_dataloaders) == 1
+            test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            do_train = train_dataloader is not None and args.train_iters > 0
+            do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
+            do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 
-        valid_dataloaders = []
-        for valid_d in valid_ds:
-            if args.skip_train or args.full_validation:
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
-            else:
-                if args.multiple_validation_sets:
-                    # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                    # correct and needs to be calculated/set per validation set
-                    raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
-        if not args.multiple_validation_sets:
-            assert len(valid_dataloaders) == 1
-        test_dataloader = build_pretraining_data_loader(test_ds, 0)
-
-        # Flags to know if we need to do training/validation/testing.
-        do_train = train_dataloader is not None and args.train_iters > 0
-        do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
-        do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
         )
