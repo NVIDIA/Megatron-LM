@@ -11,11 +11,11 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.moe.moe_utils import (
+from megatron.core.transformer.moe.moe_logging import (
     clear_aux_losses_tracker,
-    get_default_pg_collection,
     get_moe_layer_wise_logging_tracker,
 )
+from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed

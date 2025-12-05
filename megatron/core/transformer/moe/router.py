@@ -8,15 +8,17 @@ import torch
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_logging import (
+    save_load_balance_discrepancy,
+    save_to_aux_losses_tracker,
+)
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
     apply_random_logits,
     apply_router_token_dropping,
-    compute_and_save_load_balance_discrepancy,
     compute_routing_scores_for_aux_loss,
     router_gating_linear,
-    save_to_aux_losses_tracker,
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
@@ -432,7 +434,7 @@ class TopKRouter(Router):
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
 
-        compute_and_save_load_balance_discrepancy(
+        save_load_balance_discrepancy(
             tokens_per_expert,
             self.config.num_moe_experts,
             self.layer_number,

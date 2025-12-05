@@ -96,7 +96,7 @@ from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -1678,15 +1678,14 @@ def training_log(
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
         track_names.append("load_balance_discrepancy")
-        moe_log_string = track_moe_metrics(
+        moe_log_string = MoEMetricsTracker.get_instance().track(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,
-            total_loss_dict=total_loss_dict,
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
-            track_names=track_names,
+            names=track_names,
             num_layers=args.num_layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,

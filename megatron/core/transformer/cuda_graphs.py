@@ -1827,7 +1827,7 @@ class TECudaGraphHelper:
         _set_capture_end()
 
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
-        from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
+        from megatron.core.transformer.moe.moe_logging import clear_aux_losses_tracker
 
         torch.distributed.barrier()
         for model_chunk in self.model:
