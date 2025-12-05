@@ -601,8 +601,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.config.mtp_num_layers is not None:
             if self.mtp_hybrid_override_pattern is not None:
                 pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
                 # We do not need pre and post process stage for MTP layer, given they are handled in the 
                 # MultiTokenPredictionLayer itself.
+                assert self.config.mtp_num_layers_per_layer is not None, \
+                    "mtp_num_layers_per_layer must be set when using mtp_hybrid_override_pattern"
                 self.mtp_model_layer = build_module(
                     self.submodules.mtp_model_layer,
                     self.config,
@@ -612,7 +615,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     dtype=self.config.params_dtype,
                     pg_collection=pg_collection,
                     vp_stage=self.vp_stage,
-                    num_layers=self.config.mtp_num_layers
+                    num_layers=self.config.mtp_num_layers_per_layer
                 )
             else:
                 # Uses the transformer block spec for MTP layer. This option is only implemented for the 

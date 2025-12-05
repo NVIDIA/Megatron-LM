@@ -54,6 +54,9 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    mtp_num_layers_per_layer: Optional[int] = None
+    """Number of layers inside each MTP layer (e.g., for hybrid models)."""
+
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage.
     None implies equal layer division across PP ranks."""
