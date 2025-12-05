@@ -16,6 +16,32 @@ from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 Shape = Union[List[int], torch.Size]
 
 
+def _ensure_3d_tensor(tensor):
+    """Ensure tensor is 3D for P2P/bridge communication.
+
+    P2P and bridge communicators expect 3D tensors.
+    Handles both single tensors and lists of tensors (for VPP).
+    """
+    if isinstance(tensor, list):
+        return [_ensure_3d_tensor(t) for t in tensor]
+    if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
+        return tensor.unsqueeze(-1)
+    return tensor
+
+
+def _restore_tensor_shape(tensor):
+    """Restore original tensor shape after P2P/bridge communication.
+
+    Remove the extra dimension added by _ensure_3d_tensor if it was singleton.
+    Handles both single tensors and lists of tensors (for VPP).
+    """
+    if isinstance(tensor, list):
+        return [_restore_tensor_shape(t) for t in tensor]
+    if isinstance(tensor, torch.Tensor) and tensor.ndim == 3 and tensor.shape[-1] == 1:
+        return tensor.squeeze(-1)
+    return tensor
+
+
 @dataclass
 class RankModuleInfo:
     """Information about a rank in a module."""
@@ -281,12 +307,12 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has outgoing modules, send forward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    bridge_comm.send_forward(output_dict[module_name])
+                    tensor_to_send = _ensure_3d_tensor(output_dict[module_name])
+                    bridge_comm.send_forward(tensor_to_send)
             else:
                 # If not last stage, send forward activation by using P2P communicator.
-                rank_module_info.p2p_communicator.send_forward(
-                    output_dict[module_name], is_last_stage=False
-                )
+                tensor_to_send = _ensure_3d_tensor(output_dict[module_name])
+                rank_module_info.p2p_communicator.send_forward(tensor_to_send, is_last_stage=False)
 
     def send_forward_recv_backward(
         self,
@@ -303,28 +329,23 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
-        logging.debug(
-            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-            f"[send_forward_recv_backward] output_dict keys: {output_dict.keys()}, "
-            f"tensor_shape: {tensor_shape}, is_last_stage: {is_last_stage}"
-        )
         grad_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
             if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                 # If last stage, and has outgoing modules, send forward activation and
                 # receive backward gradient by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    grad_dict[bridge_comm.src_module_name] = bridge_comm.send_forward_recv_backward(
-                        output_dict[module_name]
-                    )
+                    tensor_to_send = _ensure_3d_tensor(output_dict[module_name])
+                    grad_tensor = bridge_comm.send_forward_recv_backward(tensor_to_send)
+                    grad_dict[bridge_comm.src_module_name] = _restore_tensor_shape(grad_tensor)
             else:
                 # If not last stage, send forward activation and receive backward gradient
                 # by using P2P communicator.
-                grad_dict[module_name] = (
-                    rank_module_info.p2p_communicator.send_forward_recv_backward(
-                        output_dict[module_name], tensor_shapes=tensor_shape, is_last_stage=False
-                    )
+                tensor_to_send = _ensure_3d_tensor(output_dict[module_name])
+                grad_tensor = rank_module_info.p2p_communicator.send_forward_recv_backward(
+                    tensor_to_send, tensor_shapes=tensor_shape, is_last_stage=False
                 )
+                grad_dict[module_name] = _restore_tensor_shape(grad_tensor)
         return grad_dict
 
     def send_backward_recv_forward(
@@ -353,19 +374,19 @@ class MultiModulePipelineCommunicator:
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     # If first stage, and has incoming modules, send backward gradient and
                     # receive forward activation by using bridge communicator.
-                    input_dict[bridge_comm.src_module_name] = (
-                        bridge_comm.send_backward_recv_forward(
-                            grad_dict[bridge_comm.src_module_name]
-                        )
+                    grad_to_send = _ensure_3d_tensor(grad_dict[bridge_comm.src_module_name])
+                    activation_tensor = bridge_comm.send_backward_recv_forward(grad_to_send)
+                    input_dict[bridge_comm.src_module_name] = _restore_tensor_shape(
+                        activation_tensor
                     )
             else:
                 # If not first stage, send backward gradient and receive forward activation
                 # by using P2P communicator.
-                input_dict[module_name] = (
-                    rank_module_info.p2p_communicator.send_backward_recv_forward(
-                        grad_dict[module_name], tensor_shapes=tensor_shape, is_first_stage=False
-                    )
+                grad_to_send = _ensure_3d_tensor(grad_dict[module_name])
+                activation_tensor = rank_module_info.p2p_communicator.send_backward_recv_forward(
+                    grad_to_send, tensor_shapes=tensor_shape, is_first_stage=False
                 )
+                input_dict[module_name] = _restore_tensor_shape(activation_tensor)
         return input_dict
 
     def recv_backward(
@@ -389,12 +410,14 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has incoming modules, receive backward gradient
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    grad_dict[bridge_comm.src_module_name] = bridge_comm.recv_backward()
+                    recv_grad_tensor = bridge_comm.recv_backward()
+                    grad_dict[bridge_comm.src_module_name] = _restore_tensor_shape(recv_grad_tensor)
             else:
                 # If not last stage, receive backward gradient by using P2P communicator.
-                grad_dict[module_name] = rank_module_info.p2p_communicator.recv_backward(
+                recv_grad_tensor = rank_module_info.p2p_communicator.recv_backward(
                     tensor_shapes=tensor_shape, is_last_stage=False
                 )
+                grad_dict[module_name] = _restore_tensor_shape(recv_grad_tensor)
         return grad_dict
 
     def send_backward(self, grad_dict: Dict[str, torch.Tensor], is_first_stage: bool = False):
@@ -412,12 +435,12 @@ class MultiModulePipelineCommunicator:
                 # If first stage, and has incoming modules, send backward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
-                    bridge_comm.send_backward(grad_dict[bridge_comm.src_module_name])
+                    grad_to_send = _ensure_3d_tensor(grad_dict[bridge_comm.src_module_name])
+                    bridge_comm.send_backward(grad_to_send)
             else:
                 # If not first stage, send backward activation by using P2P communicator.
-                rank_module_info.p2p_communicator.send_backward(
-                    grad_dict[module_name], is_first_stage=False
-                )
+                grad_to_send = _ensure_3d_tensor(grad_dict[module_name])
+                rank_module_info.p2p_communicator.send_backward(grad_to_send, is_first_stage=False)
 
     @staticmethod
     def compute_total_pipeline_stages(
