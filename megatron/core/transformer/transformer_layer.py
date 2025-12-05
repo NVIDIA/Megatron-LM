@@ -455,7 +455,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     def create_mcore_cudagraph_manager(self, config):
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
         # If no cudagraph scope specified, just cudagraph the entire layer
-        if not self.config.cuda_graph_scope:
+        if "full" in self.config.cuda_graph_scope:
             self.cudagraph_manager = CudaGraphManager(config)
         elif "attn" in self.config.cuda_graph_scope:
             if not isinstance(self.self_attention, IdentityOp):
@@ -643,6 +643,34 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
         return pre_mlp_layernorm_output
 
+    def _forward_post_mlp(self, mlp_output_with_bias, residual, using_fused_tp_inference_kernel):
+        # TODO: could we move `bias_dropout_add_exec_handler` itself
+        # inside the module provided in the `bias_dropout_add_spec` module?
+        nvtx_range_push(suffix="mlp_bda")
+        if using_fused_tp_inference_kernel:
+            # In inference optimized transformer layer, there is no bias and dropout
+            # The remaining residual add is already handled inside the
+            # MLP module.
+            hidden_states = mlp_output_with_bias[0]
+        else:
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                    mlp_output_with_bias, residual, self.hidden_dropout
+                )
+        nvtx_range_pop(suffix="mlp_bda")
+
+        # Jit compiled function creates 'view' tensor. This tensor
+        # potentially gets saved in the MPU checkpoint function context,
+        # which rejects view tensors. While making a viewless tensor here
+        # won't result in memory savings (like the data loader, or
+        # p2p_communication), it serves to document the origin of this
+        # 'view' tensor.
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+        return output
+
     def _forward_mlp(self, hidden_states, inference_context=None):
         """
         Perform a forward pass through the feed-forward layer.
@@ -717,6 +745,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias[0]
             )
         nvtx_range_pop(suffix="mlp")
+<<<<<<< HEAD
 
         if (
             self.is_moe_layer
@@ -777,6 +806,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         return output
+=======
+        
+        return self._forward_post_mlp(mlp_output_with_bias, residual, using_fused_tp_inference_kernel)
+>>>>>>> 425e34c54a (fix rebase)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
@@ -1134,7 +1167,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     
         return super().__call__(*args, **kwargs)
 
-<<<<<<< HEAD
     def get_layer_norm_weights(self):
         """
         Get the weights of all layernorms (attention and MLP) in the transformer layer.
@@ -1142,7 +1174,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             List[Tensor]: A list of layernorm weight tensors.
         """
         return
-=======
+
+
 class MoETransformerLayer(TransformerLayer):
     def __init__(self, *args, **kwargs):
         self.is_moe_layer = True
@@ -1152,7 +1185,7 @@ class MoETransformerLayer(TransformerLayer):
 
     def create_mcore_cudagraph_manager(self, config):
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
-        if not self.config.cuda_graph_scope or "moe_router" in self.config.cuda_graph_scope:
+        if self.config.cuda_graph_scope in ["full", "moe_router"]:
             self.use_partial_cudagraphs = True        
             self.cudagraph_manager_router = CudaGraphManager(
                 self.config, self,
@@ -1189,4 +1222,3 @@ class MoETransformerLayer(TransformerLayer):
             return self._forward_mlp_postprocess(residual, expert_output, shared_expert_output, mlp_bias)
         else:
             return super()._forward_mlp(hidden_states)
->>>>>>> 3323abddcc (add mcore cg updates)
