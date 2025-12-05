@@ -58,6 +58,7 @@ from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFa
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
 from megatron.training.utils import unwrap_model
 from megatron.core.utils import get_pg_size, get_attr_wrapped_model
+from megatron.core.process_groups_config import ProcessGroupCollection
 logger = logging.getLogger(__name__)
 
 # Global variable to store packing context for forward_step
