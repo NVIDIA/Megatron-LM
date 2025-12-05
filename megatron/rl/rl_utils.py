@@ -658,7 +658,7 @@ def get_environment_rollouts(
 
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
-        swap_train_to_inference_model(model, inference_model, args.refit_method)
+        swap_model_weights(model, inference_model, args.refit_method)
     else:
         inference_model = model
 
@@ -2407,6 +2407,7 @@ def megatron_rl_inference_mode(
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
+    print(f"[{dist.get_rank()}:DP] Entering inference mode")
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
@@ -2458,6 +2459,8 @@ def megatron_rl_inference_mode(
                 inference_interface._inference_engine.create_cuda_graphs(reset_context=True)
 
         loop.run_until_complete(inference_interface.resume())
+
+        print(f"[{dist.get_rank()}:DP] Exited inference mode")
         yield inference_interface
 
         with nvtx_range("suspend-engine"):
@@ -2533,12 +2536,3 @@ def get_sequence_packing_tensorboard_metrics(args):
         metrics['bin-batch-size'] = bin_batch_size
         metrics['consumed-bins'] = args.consumed_train_bins
     return metrics
-
-def swap_train_to_inference_model(train_model: LanguageModule, inference_model: list[LanguageModule], refit_method: str):
-    """Swap the train model to the inference model.
-
-    Args:
-        train_model: The train model to swap to the inference model.
-        inference_model: The inference model (list) to swap to the train model.
-    """
-    swap_model_weights(train_model, inference_model, refit_method)

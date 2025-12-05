@@ -7,7 +7,7 @@ High-level refit/reshard orchestration:
 - reshard_model_weights: transport-agnostic core; builds/caches plan and executes.
 """
 
-from typing import Any, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -18,13 +18,20 @@ from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
 
+# Supported refit backend names
+RefitBackendName = Literal["nccl", "gloo"]
+
 
 def swap_model_weights(
-    src_model: LanguageModule, target_model: LanguageModule, refit_method: Union[str, CopyService]
+    src_model: LanguageModule,
+    target_model: LanguageModule,
+    refit_method: Union[RefitBackendName, CopyService],
 ):
     """
     Orchestrate weight swap/refit.
-    - refit_method can be a string backend name ('nccl') or a CopyService instance.
+    - refit_method can be:
+        * a string backend name (one of the supported refit backends), or
+        * a CopyService instance.
     """
     if isinstance(refit_method, CopyService):
         service = refit_method
