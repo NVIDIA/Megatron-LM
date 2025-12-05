@@ -541,6 +541,23 @@ def get_pg_rank(group=None):
     return group.rank()
 
 
+def get_pg_src_rank(group=None):
+    """Calculate the global rank corresponding to the first local rank
+    in the given process group.
+
+    Args:
+        group: Process group to query. If None or distributed is not initialized,
+            returns 0.
+
+    Returns:
+        int: The first (source) global rank in the group.
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 0
+    ranks = torch.distributed.get_process_group_ranks(group)
+    return ranks[0]
+
+
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
     """Get an attribute from a wrapped model.
     If return_model_obj is true, return the object that has the 'attr' attribute;
@@ -2299,4 +2316,37 @@ def internal_api(func: Callable) -> Callable:
             pass
     """
     func._internal_api = True
+    return func
+
+
+def experimental_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as experimental API.
+
+    Use this decorator for:
+    - Experimental features that may change without notice
+    - New APIs under active development
+    - Features that are not yet stable
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks, allowing rapid iteration during development.
+
+    Args:
+        func: The function or class to mark as experimental
+
+    Returns:
+        The original function/class with an experimental API marker
+
+    Example:
+        @experimental_api
+        def new_experimental_feature():
+            '''This API is experimental and may change'''
+            pass
+
+        @experimental_api
+        class ExperimentalModel:
+            '''This model is under active development'''
+            pass
+    """
+    func._experimental_api = True
     return func

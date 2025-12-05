@@ -454,7 +454,7 @@ class TestDynamicInferenceEngine:
 
         # Append output tokens.
         for finished_request_record in finished_request_records:
-            finished_request = finished_request_record.merge(env.engine.controller.tokenizer)
+            finished_request = finished_request_record.merge()
             request = env.requests[finished_request.request_id]
             request.output = finished_request.generated_tokens
             request.status = finished_request.status
@@ -731,9 +731,7 @@ class TestDynamicInferenceEngine:
         # It's safe to use request 0's sampling params here because all sampling
         # params are identical as long as use_fixed_output_lengths == False.
         finished_request_records = env.engine.generate(prompts, env.requests[0].sampling_params)
-        finished_requests = [
-            r.merge(env.engine.controller.tokenizer) for r in finished_request_records
-        ]
+        finished_requests = [r.merge() for r in finished_request_records]
 
         # Verify results
         assert len(finished_requests) == len(
@@ -784,7 +782,7 @@ class TestDynamicInferenceEngine:
                     request_id
                 ].sampling_params.num_tokens_to_generate
                 request_record = fut.result()
-                request = request_record.merge(env.engine.controller.tokenizer)
+                request = request_record.merge()
                 assert request.generated_length == num_tokens_to_generate, (
                     f"Request {request_id} expected to generate {num_tokens_to_generate} "
                     f"tokens but generated {request.generated_length}"
