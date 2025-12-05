@@ -23,6 +23,7 @@ from typing import ClassVar, Dict, List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import internal_api
 
 
@@ -112,6 +113,7 @@ class MoEMetricsTracker:
         num_layers: Optional[int] = None,
         moe_layer_freq: Optional[Union[int, List[int]]] = None,
         mtp_num_layers: Optional[int] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> str:
         """Track MoE metrics: reduce, write to backends, and return log string.
 
@@ -143,7 +145,7 @@ class MoEMetricsTracker:
                 self.initialize_metric(name, num_layers, device=torch.cuda.current_device())
 
         # Reduce metrics across ranks
-        self.reduce_across_ranks(names_list)
+        self.reduce_across_ranks(names_list, pg_collection=pg_collection)
 
         # Compute number of MoE layers
         num_moe_layers = self._compute_num_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
@@ -166,7 +168,11 @@ class MoEMetricsTracker:
 
         return log_string
 
-    def reduce_across_ranks(self, names: Optional[Union[str, List[str]]] = None) -> None:
+    def reduce_across_ranks(
+        self,
+        names: Optional[Union[str, List[str]]] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ) -> None:
         """Reduce metrics across distributed ranks.
 
         Performs multi-stage reduction:
@@ -179,6 +185,15 @@ class MoEMetricsTracker:
             names: Metric name(s) to reduce. If None, reduces all metrics.
         """
         names_list = self._resolve_names(names)
+        if pg_collection is None:
+            # Use parallel_state groups
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            dp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=False, partial_data_parallel=False
+            )
+        else:
+            pp_group = pg_collection.pp
+            dp_group = pg_collection.dp
 
         for name in names_list:
             if name not in self._metrics:
@@ -191,17 +206,14 @@ class MoEMetricsTracker:
             torch.distributed.all_reduce(
                 values, group=parallel_state.get_pipeline_model_parallel_group()
             )
-
             # Reduce aux losses across custom reduce_group
             if entry.reduce_group is not None:
                 torch.distributed.all_reduce(values, group=entry.reduce_group)
-
             # Average aux losses across custom avg_group
             if entry.avg_group is not None:
                 torch.distributed.all_reduce(
                     values, group=entry.avg_group, op=torch.distributed.ReduceOp.AVG
                 )
-
             # Average across data parallel ranks
             # global_load_balancing_loss already uses tp_dp_cp_group in reduce_group
             if name != "global_load_balancing_loss":
@@ -220,7 +232,7 @@ class MoEMetricsTracker:
         Returns:
             Formatted log string for console output.
         """
-        log_parts = [f" {name}: {value:.4f} |" for name, value in aggregated.items()]
+        log_parts = [f" {name}: {value:.2f} |" for name, value in aggregated.items()]
         return "".join(log_parts)
 
     def write(
@@ -240,8 +252,7 @@ class MoEMetricsTracker:
     def clear(self) -> None:
         """Clear metric values (zero out tensors)."""
         for name in self._metrics.keys():
-            if name in self._metrics:
-                self._metrics[name].values.zero_()
+            self._metrics[name].values.zero_()
 
     def get_metrics(self) -> Dict[str, _MetricEntry]:
         """Get all recorded metrics."""
@@ -263,7 +274,7 @@ class MoEMetricsTracker:
         self,
         name: str,
         num_layers: int,
-        device: str = "cuda",
+        device: Union[str, torch.device, int] = torch.cuda.current_device(),
         percentiles: Optional[List[float]] = None,
     ) -> None:
         """Force initialize a metric entry."""
@@ -314,11 +325,6 @@ class MoEMetricsTracker:
 
         For all metrics: computes average across layers.
         If percentiles is set: also computes specified percentiles as additional scalars.
-
-        Args:
-            loss_scale: Scale factor to apply to losses.
-            num_moe_layers: Number of MoE layers for averaging.
-            names: List of metric names to aggregate.
 
         Returns:
             Dictionary of aggregated metric name -> scalar value.
@@ -481,6 +487,7 @@ def track_moe_metrics(
     num_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> str:
     """Track the MoE metrics for logging.
 
@@ -497,4 +504,5 @@ def track_moe_metrics(
         num_layers=num_layers,
         moe_layer_freq=moe_layer_freq,
         mtp_num_layers=mtp_num_layers,
+        pg_collection=pg_collection,
     )
