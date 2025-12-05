@@ -1,13 +1,9 @@
 ARG BASE_DOCKER=rocm/pytorch:rocm7.0_ubuntu24.04_py3.12_pytorch_release_2.7.1
 FROM $BASE_DOCKER
-ARG http_proxy
-ARG https_proxy
-ARG no_proxy
+
 ARG PYTORCH_ROCM_ARCH_OVERRIDE="gfx942"
 
-ENV http_proxy=$http_proxy
-ENV https_proxy=$https_proxy
-ENV no_proxy=$no_proxy
+ENV NO_PROXY=localhost,127.0.0.1,pypi.org,files.pythonhosted.org
 ENV WORKSPACE_DIR=/workspace
 ENV STAGE_DIR=/workspace/installs
 ENV PIP_DEFAULT_TIMEOUT=120
