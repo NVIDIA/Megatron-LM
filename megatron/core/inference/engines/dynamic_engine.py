@@ -19,7 +19,6 @@ import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
-from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
@@ -42,7 +41,14 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import Counter, await_process_event
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.utils import get_asyncio_loop, internal_api, trace_async_exceptions
+from megatron.core.utils import (
+    get_asyncio_loop,
+    get_pg_rank,
+    get_pg_size,
+    get_pg_src_rank,
+    internal_api,
+    trace_async_exceptions,
+)
 
 try:
     from tqdm import tqdm
@@ -137,7 +143,7 @@ class DynamicInferenceEngine(AbstractEngine):
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
         inference_logging_step_interval: int = 0,
-        process_group_collection: Optional[ProcessGroupCollection] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
 
         assert isinstance(
@@ -148,10 +154,10 @@ class DynamicInferenceEngine(AbstractEngine):
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
         assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        if process_group_collection is not None:
-            self.process_group_collection = process_group_collection
+        if pg_collection is not None:
+            self.pg_collection = pg_collection
         else:
-            self.process_group_collection = parallel_state
+            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         # Deprecate `enable_cuda_graph`.
         if enable_cuda_graph is not None:
@@ -165,6 +171,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self.enable_cuda_graph = (
                 controller.inference_wrapped_model.model.config.enable_cuda_graph
             )
+
+        if pg_collection is not None:
+            self.pg_collection = pg_collection
+        else:
+            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         # Initialization options.
         self.controller = controller
@@ -385,15 +396,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
         # Get world info.
-        dp_group = self.process_group_collection.get_data_parallel_group()
-        dp_src = self.process_group_collection.get_data_parallel_src_rank()
-        dp_size = self.process_group_collection.get_data_parallel_world_size()
-        dp_rank = self.process_group_collection.get_data_parallel_rank()
+        dp_group = self.pg_collection.dp
+        dp_src = get_pg_src_rank(dp_group)
+        dp_size = get_pg_size(self.pg_collection.dp)
+        dp_rank = get_pg_rank(self.pg_collection.dp)
 
-        mp_group = self.process_group_collection.get_model_parallel_group()
-        mp_src = self.process_group_collection.get_model_parallel_src_rank()
-        tp_rank = self.process_group_collection.get_tensor_model_parallel_rank()
-        pp_rank = self.process_group_collection.get_pipeline_model_parallel_rank()
+        mp_group = self.pg_collection.mp
+        mp_src = get_pg_src_rank(mp_group)
+        tp_rank = get_pg_rank(self.pg_collection.tp)
+        pp_rank = get_pg_rank(self.pg_collection.pp)
 
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
@@ -407,7 +418,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 args=(
                     coordinator_ready_event,
                     inference_coordinator_port,
-                    self.process_group_collection.get_data_parallel_world_size(),
+                    get_pg_size(self.pg_collection.dp),
                 ),
             )
             self.inference_coordinator_process.start()
@@ -572,7 +583,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.requests[request_id].record.suspend(self.controller.tokenizer)
+            self.requests[request_id].record.suspend()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -817,14 +828,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.status = Status.COMPLETED
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
-                    if finished_request.prompt is None:
-                        finished_request.prompt = self.controller.tokenizer.detokenize(
-                            finished_request.prompt_tokens.tolist()
-                        )
                     finished_request.generated_length = len(finished_request.generated_tokens)
-                    finished_request.generated_text = self.controller.tokenizer.detokenize(
-                        finished_request.generated_tokens
-                    )
                     finished_request_records.append(finished_entry.record)
                     finished_entry.future.set_result(finished_entry.record)
                 else:
@@ -1136,6 +1140,18 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
+
+        # Detokenize all finished requests (critical for InferenceClient, which
+        # doesn't necessarily have the tokenizer).
+        for record in finished_request_records:
+            for request in record.requests:
+                if request.prompt is None:
+                    request.prompt = self.controller.tokenizer.detokenize(
+                        request.prompt_tokens.tolist()
+                    )
+                request.generated_text = self.controller.tokenizer.detokenize(
+                    request.generated_tokens
+                )
 
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:

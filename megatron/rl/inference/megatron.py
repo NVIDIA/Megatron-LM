@@ -4,16 +4,16 @@ import asyncio
 import logging
 from argparse import Namespace
 
-from pydantic import PrivateAttr
 import torch.distributed as dist
+from pydantic import PrivateAttr
 
 from megatron.core import parallel_state
 from megatron.core.utils import get_attr_wrapped_model
-from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.engines.mcore_engine import MCoreEngine
+from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -27,9 +27,13 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_mamba_inference_state_config_from_model, log_single_rank
-from megatron.training.global_vars import get_args, get_tokenizer
+from megatron.core.pipeline_parallel.utils import (
+    is_pp_first_stage,
+    is_pp_last_stage,
+)
+from megatron.core.utils import get_mamba_inference_state_config_from_model, log_single_rank, get_pg_size
 from megatron.training import get_wandb_writer
+from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
     ChatInferenceInterface,
@@ -117,12 +121,9 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
     tp_group = getattr(pg_collection, 'tp', None) if pg_collection is not None else None
     if tp_group is not None:
-        inference_tp_size = dist.get_world_size(group=tp_group)
-    elif getattr(args, 'rl_inference_tensor_model_parallel_size', None) is not None:
-        inference_tp_size = args.rl_inference_tensor_model_parallel_size
+        inference_tp_size = get_pg_size(tp_group)
     else:
         inference_tp_size = args.tensor_model_parallel_size
-
 
     # Inference context.
     inference_context = DynamicInferenceContext(
@@ -150,13 +151,15 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         use_flashinfer_fused_rope=None,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
+        cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
 
     inference_wrapped_model.model_is_pipeline_parallel = not (
-        pg_collection.is_pipeline_first_stage() and pg_collection.is_pipeline_last_stage()
+        is_pp_first_stage(pg_collection.pp) and is_pp_last_stage(pg_collection.pp)
     )
 
     text_generation_controller = SimpleTextGenerationController(
@@ -169,7 +172,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         enable_cuda_graph=enable_cuda_graph,
         random_seed=args.seed,
         inference_logging_step_interval=inference_logging_step_interval,
-        process_group_collection=pg_collection,
+        pg_collection=pg_collection,
     )
 
 
