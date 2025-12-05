@@ -136,11 +136,13 @@ class RecipeConfig:
         self.matchers = matchers
 
     @staticmethod
-    def _build_matchers(matchers_dict: Dict) -> List[Matcher]:
+    def _build_matchers(matchers_dict: Dict | None) -> List[Matcher]:
         # NOTE(slayton): We rely on order for matchers because it allows us to specify an
         # override ordering from the yaml structure. Process matchers in order of
         # definition, so we can have fallthrus.
         matchers: List[Matcher] = []
+        if matchers_dict is None:
+            return matchers
 
         for name, matcher in matchers_dict.items():
             enabled = matcher.get("enabled", False)
@@ -174,12 +176,12 @@ class RecipeConfig:
             raise ImportError("yaml is not installed. Please install it with `pip install pyyaml`.")
 
         with open(recipe_yaml_path, "r") as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
+            config = yaml.load(f, Loader=yaml.SafeLoader)
 
         log_single_rank(
             logger,
             logging.INFO,
-            f"Loaded quantization recipe from path '{recipe_path}'. " f"Contents: '{config}'",
+            f"Loaded quantization recipe from path '{recipe_yaml_path}'. " f"Contents: '{config}'",
         )
 
         return RecipeConfig.from_config_dict(config)
@@ -190,7 +192,7 @@ class RecipeConfig:
 
         matchers_config = config.get("matchers", None)
         matchers = RecipeConfig._build_matchers(matchers_config)
-        config_dict = config.get("configs", None)
+        config_dict = config.get("configs", {})
 
         return RecipeConfig(matchers, config_dict)
 

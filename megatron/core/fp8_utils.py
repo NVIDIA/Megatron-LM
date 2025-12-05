@@ -571,6 +571,7 @@ if HAVE_TE:
                     fp8_format=fp8_format
                 )
             elif config.fp8_recipe == Fp8Recipe.custom:
+                assert config.fp8_quantizer_factory is not None
                 fp8_recipe = _get_custom_recipe(config.fp8_quantizer_factory)
             else:
                 raise ValueError(

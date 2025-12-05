@@ -62,7 +62,7 @@ from megatron.core.utils import (
 
 try:
     import transformer_engine as te
-    from transformer_engine.pytorch.fp8 import fp8_autocast
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
     HAVE_TE = True
 except ImportError:
@@ -220,6 +220,7 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         ):
             from megatron.core.fp8_utils import _get_custom_recipe
 
+            assert qrecipe.custom_recipe_factory is not None
             quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
         elif qrecipe.fp8_quantization_recipe is not None:
             if qrecipe.fp8_format == "e4m3":
@@ -259,12 +260,12 @@ def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, tra
 def _get_should_context_be_quantized_recipe(
     qrecipe: TEQuantizationRecipe, is_original_context_quantized: bool
 ):
-    if is_context_quantized:
+    if is_original_context_quantized:
         if not qrecipe.override_quantized_autocast:
-            return is_context_quantized
+            return is_original_context_quantized
     else:
         if not qrecipe.override_nonquantized_autocast:
-            return is_context_quantized
+            return is_original_context_quantized
     if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
         # Force BF16 for this layer and override autocast
         return False
