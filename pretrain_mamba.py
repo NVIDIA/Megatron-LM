@@ -111,7 +111,9 @@ def get_batch(data_iterator, vp_stage=None):
             for key, data in batch.items():
                 if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
                     continue
-                if data is not None:  # on PP rank 0, labels and loss_mask will be None
+                if data is not None:
+                    # On first PP rank, labels and loss_mask can be None.
+                    # On last PP rank, tokens and position_ids can be None.
                     batch[key] = data.index_select(1, index)
 
     return batch.values()
