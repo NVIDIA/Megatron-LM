@@ -232,9 +232,9 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
             output, _ = layer(input_tensor)
             fwd_end.record()
 
-            loss = output.sum()
+            backward_grad = torch.randn_like(output)
             bwd_start.record()
-            loss.backward()
+            output.backward(backward_grad)
             bwd_end.record()
 
         torch.cuda.nvtx.range_pop()
@@ -319,7 +319,7 @@ def _check_dependencies(case: MoEPerformanceCase):
                 pytest.skip("HybridEP is not available")
 
 
-@pytest.mark.flaky(reruns=4)
+@pytest.mark.flaky(reruns=10)
 @pytest.mark.internal
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for MoE performance benchmarking"
@@ -405,10 +405,10 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
 #         --capture-range=cudaProfilerApi \
 #         --capture-range-end=stop \
 #         -o output \
-#         uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 tests/unit_tests/performance/test_moe_layer.py
+#         uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m tests.functional_tests.test_cases.common.moe_perf
 # Commands to run with pytest:
 # export MEGATRON_UPDATE_PERF_BASELINES=0 # set to 1 to update baseline perf numbers
-# uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m pytest tests/unit_tests/performance/test_moe_layer.py
+# uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m tests.functional_tests.test_cases.common.moe_perf
 if __name__ == "__main__":
     pytest.main(["-x", "-v", "-s", __file__])  # -xvs
     # torch.cuda.cudart().cudaProfilerStart()
