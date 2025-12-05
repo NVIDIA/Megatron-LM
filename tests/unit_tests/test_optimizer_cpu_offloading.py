@@ -64,7 +64,7 @@ def setup_seed(seed):
 def test_multi_device_hybrid_optimizer(
     with_param_groups, optimizer, offload_fraction, overlap_cpu_optimizer_d2h_h2d, n_steps
 ):
-    setup_seed(42)
+    setup_seed(1)
     net1 = Net().cuda()
     net2 = Net().cuda()
     net2.load_state_dict(net1.state_dict())
