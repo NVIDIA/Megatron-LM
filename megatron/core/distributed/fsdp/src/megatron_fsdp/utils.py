@@ -176,6 +176,7 @@ def get_mesh_names(device_mesh: Optional[DeviceMesh] = None) -> list[str]:
         # Fallback to the DeviceMesh global state to retrieve flattened
         # meshes associated with the DeviceMesh.
         from torch.distributed.device_mesh import _mesh_resources
+
         flatten_mesh_names = [
             child_mesh_dim_name
             for child_mesh, root_mesh in _mesh_resources.child_to_root_mapping.items()
