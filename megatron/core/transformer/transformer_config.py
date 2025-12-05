@@ -749,6 +749,12 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    enable_kda: bool = False
+    """Enable KDA (Key Delta Attention) module. Default is False."""
+
+    kda_hyperparameters: Optional[dict] = None
+    """Hyperparameters for KDA module. Should include keys like 'delta_threshold', 'sparsity_factor', etc."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
