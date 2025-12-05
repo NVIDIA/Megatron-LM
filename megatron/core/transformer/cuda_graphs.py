@@ -477,7 +477,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 cudagraph_input.copy_(user_input)
 
         ctx.runner = runner
-        if runner.fp8_enabled:
+        if runner.fp8_enabled or runner.fp4_enabled:
             if isinstance(FP8GlobalStateManager.get_fp8_recipe(), te.common.recipe.DelayedScaling):
                 for m in runner.base_module.modules():
                     if isinstance(m, TransformerEngineBaseModule):
@@ -500,7 +500,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
         runner.fwd_graph.replay()
 
         out = tuple(
-            o.detach() if not hasattr(o, "is_cudagraph_input") else o
+            o.clone() if not hasattr(o, "is_cudagraph_input") else o
             for o in runner.fwd_graph_output_surface
         )
         return out
@@ -672,10 +672,6 @@ class _CudaGraphRunner(torch.nn.Module):
         self.outputs = outputs
         self.params_to_backprop = ()
 
-        # Freeze GC, to speed up capture time ~15-20x.
-        if FREEZE_GC:
-            gc.freeze()
-
         # save grads and other variables that may be affected by graph warmup
         if self.training and torch.is_grad_enabled():
             grad_backup = []
@@ -787,10 +783,26 @@ class _CudaGraphRunner(torch.nn.Module):
                             _ensure_generator_state_is_cudagraph_safe(default_gen)
                         )
 
+                # Freeze GC, to speed up capture time ~15-20x.
+                if FREEZE_GC:
+                    gc.freeze()
+
                 with torch.cuda.graph(
                     self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
                 ):
                     outputs = self.base_module.forward(*args, **kwargs)
+
+                # Unfreeze GC.
+                if FREEZE_GC:
+                    gc.unfreeze()
+
+                    # gc.collect() drops references to unreachable tensors created during capture,
+                    # returning their storage to the allocator to avoid a slowdown during replay. However,
+                    # it forces expensive global garbage collection, so must be done only on the last layer
+                    # per-device to avoid slowing down graph creation.
+                    if self.is_last_layer:
+                        gc.collect()
+
 
         # save cudagraph output buffer
         if isinstance(fwd_graph_outputs, torch.Tensor):
@@ -827,13 +839,12 @@ class _CudaGraphRunner(torch.nn.Module):
             for name in tracker:
                 tracker[name]["values"].copy_(cached_aux_losses[name])
 
+
+
     def create_bwd_graph(self, global_tensor_pool):
         """Create a bwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
         global bwd_buffer_reuse_ref_count, strong_reference_cache, strong_reference_cache_dataptrs
-        # Freeze GC, to speed up capture time ~15-20x.
-        if FREEZE_GC:
-            gc.freeze()
 
         assert self.grad_enabled
         self.bwd_graph = torch.cuda.CUDAGraph()
@@ -873,7 +884,9 @@ class _CudaGraphRunner(torch.nn.Module):
         input_tensors = self.get_tensors(self.fwd_graph_input_args, self.fwd_graph_input_kwargs)
         fwd_input_surface = input_tensors + tuple(self.params_to_backprop)
 
-        torch.cuda.synchronize()
+        # Freeze GC, to speed up capture time ~15-20x.
+        if FREEZE_GC:
+            gc.freeze()
 
         with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
             grad_inputs = torch.autograd.grad(
@@ -884,6 +897,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 only_inputs=True,
                 allow_unused=True,
             )
+
+        # Unfreeze GC.
+        if FREEZE_GC:
+            gc.unfreeze()
+
+            if self.is_first_layer:
+                gc.collect()
+
         grad_inputs = list(grad_inputs)
 
         self.static_grad_outputs = static_grad_outputs
@@ -961,13 +982,6 @@ class _CudaGraphRunner(torch.nn.Module):
         delattr(self, "kwargs")
         delattr(self, "outputs")
 
-        # Unfreeze GC.
-        if FREEZE_GC:
-            gc.unfreeze()
-
-            if self.is_first_layer:
-                gc.collect()
-
     def record_graph_capture(self, args, kwargs):
         """Records the data needed to create this runner's forward cudagraph.
         The first pass records a graph and appends the runner to _CudagraphGlobalRecord.
@@ -1012,10 +1026,14 @@ class _CudaGraphRunner(torch.nn.Module):
                         recipe = FP8GlobalStateManager.get_fp8_recipe()
                         if isinstance(recipe, NVFP4BlockScaling):
                             self.fp4_enabled = True
+                            self.fp4_recipe = get_fp4_recipe(self.base_module.config)
                         else:
                             self.fp8_enabled = True
+                            self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
                     else:        
-                            self.fp8_enabled = True
+                        self.fp8_enabled = True
+                        self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+
 
             logger.debug(f"Recording forward graph creation...")
             m_args, m_kwargs = self.replace_tensors_with_weak_refs(args, kwargs, cache_refs=True)
@@ -1259,13 +1277,14 @@ class CudaGraphManager(torch.nn.Module):
         ), "RNG tracker does not support cudagraphs!"
 
         assert config.cuda_graph_impl == "local", "Option cuda_graph_impl=local not enabled."
-        assert (
-            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
-            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
-        ), (
-            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
-            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
-        )
+        if torch.cuda.get_device_capability()[0] < 10:
+            assert (
+                "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+                or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+            ), (
+                "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+                "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
+            )
 
         self.cudagraph_runners = []
         self.inference_cudagraphs_lookup_table = defaultdict(lambda: None)

@@ -268,6 +268,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
+        self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
 
         if pg_collection is None:
@@ -275,7 +276,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
-        self.submodules_config = submodules
         self.layer_number = layer_number + get_transformer_layer_offset(
             self.config, vp_stage, get_pg_rank(pg_collection.pp)
         )
@@ -464,23 +464,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
     def create_mcore_cudagraph_manager(self, config):
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
-        # If no cudagraph scope specified, just cudagraph the entire layer
+        # If full scope, just cudagraph the entire layer
         if "full" in self.config.cuda_graph_scope:
             self.cudagraph_manager = CudaGraphManager(config)
-        elif "attn" in self.config.cuda_graph_scope:
-            if not isinstance(self.self_attention, IdentityOp):
-                self.cudagraph_manager_router = CudaGraphManager(
-                    self.config, self,
-                    function_name="_forward_attention", 
-                )
-        elif "mlp" in self.config.cuda_graph_scope:
-            # Cudagraphing MoE layers are supposed to be through MoeTransforerLayer below
+        elif "attn" in self.config.cuda_graph_scope and self.submodules_config.self_attention != IdentityOp:
+            self.cudagraph_manager = CudaGraphManager(config)
+        elif "mlp" in self.config.cuda_graph_scope and self.submodules_config.mlp != IdentityOp:
+            # Cudagraphing MoE layers are supposed handled by MoeTransforerLayer
             assert not self.is_moe_layer
-            if not isinstance(self.mlp, IdentityOp):
-                self.cudagraph_manager_router = CudaGraphManager(
-                    self.config, self,
-                    function_name="_forward_mlp", 
-                )
+            self.cudagraph_manager = CudaGraphManager(config)
+
 
     @staticmethod
     def _get_layer_offset(config: TransformerConfig):
@@ -1243,7 +1236,7 @@ class MoETransformerLayer(TransformerLayer):
 
     def create_mcore_cudagraph_manager(self, config):
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
-        if self.config.cuda_graph_scope in ["full", "moe_router"]:
+        if "full" in self.config.cuda_graph_scope or "moe_router" in self.config.cuda_graph_scope:
             self.use_partial_cudagraphs = True        
             self.cudagraph_manager_router = CudaGraphManager(
                 self.config, self,
