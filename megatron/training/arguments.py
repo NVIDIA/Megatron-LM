@@ -1201,6 +1201,7 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
 
+    # Experimental attention variant check
     if args.linear_attention_type is not None:
         print_rank_0(
             '--linear-attention-type is deprecated, use --experimental-attention-variant instead.',
@@ -1209,7 +1210,7 @@ def validate_args(args, defaults={}):
         args.experimental_attention_variant = args.linear_attention_type
         del args.linear_attention_type
 
-    # Muon optimizercheck
+    # Muon optimizer check
     if 'muon' in args.optimizer:
         assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."

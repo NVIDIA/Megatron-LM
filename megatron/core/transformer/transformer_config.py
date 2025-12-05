@@ -241,6 +241,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant: gated_delta_net
     ####################
+    linear_attention_type: Optional[str] = None
+    """Type of linear attention to use.
+    Deprecated. Use experimental_attention_variant instead."""
+
     linear_attention_freq: Optional[Union[int, List[int]]] = None
     """Frequency between LA (linear attention) layers 
     and SDPA (scaled dot-product attention) layers.
@@ -876,6 +880,14 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        if self.linear_attention_type is not None:
+            warnings.warn(
+                "linear_attention_type is deprecated, "
+                "use experimental_attention_variant instead."
+            )
+            self.experimental_attention_variant = self.linear_attention_type
+            self.linear_attention_type = None
 
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
