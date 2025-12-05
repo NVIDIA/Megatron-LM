@@ -409,7 +409,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     def create_mcore_cudagraph_manager(self, config):
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
         # If no cudagraph scope specified, just cudagraph the entire layer
-        if not self.config.cuda_graph_scope:
+        if "full" in self.config.cuda_graph_scope:
             self.cudagraph_manager = CudaGraphManager(config)
         elif "attn" in self.config.cuda_graph_scope:
             if not isinstance(self.self_attention, IdentityOp):
@@ -582,6 +582,28 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
         return pre_mlp_layernorm_output
 
+    def _forward_post_mlp(self, mlp_output_with_bias, residual):
+        # TODO: could we move `bias_dropout_add_exec_handler` itself
+        # inside the module provided in the `bias_dropout_add_spec` module?
+        nvtx_range_push(suffix="mlp_bda")
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                mlp_output_with_bias, residual, self.hidden_dropout
+            )
+        nvtx_range_pop(suffix="mlp_bda")
+
+        # Jit compiled function creates 'view' tensor. This tensor
+        # potentially gets saved in the MPU checkpoint function context,
+        # which rejects view tensors. While making a viewless tensor here
+        # won't result in memory savings (like the data loader, or
+        # p2p_communication), it serves to document the origin of this
+        # 'view' tensor.
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+        return output
+
     def _forward_mlp(self, hidden_states, inference_context=None):
         """
         Perform a forward pass through the feed-forward layer.
@@ -648,27 +670,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias[0]
             )
         nvtx_range_pop(suffix="mlp")
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        nvtx_range_push(suffix="mlp_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.hidden_dropout
-            )
-        nvtx_range_pop(suffix="mlp_bda")
-
-        # Jit compiled function creates 'view' tensor. This tensor
-        # potentially gets saved in the MPU checkpoint function context,
-        # which rejects view tensors. While making a viewless tensor here
-        # won't result in memory savings (like the data loader, or
-        # p2p_communication), it serves to document the origin of this
-        # 'view' tensor.
-        output = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-        )
-
-        return output
+        
+        return self._forward_post_mlp(mlp_output_with_bias, residual)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
@@ -887,7 +890,7 @@ class MoETransformerLayer(TransformerLayer):
 
     def create_mcore_cudagraph_manager(self, config):
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
-        if not self.config.cuda_graph_scope or "moe_router" in self.config.cuda_graph_scope:
+        if self.config.cuda_graph_scope in ["full", "moe_router"]:
             self.use_partial_cudagraphs = True        
             self.cudagraph_manager_router = CudaGraphManager(
                 self.config, self,

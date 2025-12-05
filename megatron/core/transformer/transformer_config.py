@@ -666,7 +666,7 @@ class TransformerConfig(ModelParallelConfig):
 
     cuda_graph_scope: str = "full"
     """Determines the CUDA graphs capturing scope.
-    When cuda_graph_impl is set to "transformer_engine", valid values are "full" and "attn".
+    When cuda_graph_impl is set to "transformer_engine", valid values are: "full" "attn" "moe" "moe_router" "mlp".
     "Full" scope captures a whole Transformer layer. "Attn" scope only captures operations in
     TransformerLayer._forward_attention().
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope

@@ -320,7 +320,7 @@ class MoELayer(BaseMoELayer):
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors)
 
-        return output, mlp_bias
+        return outputs
 
     def backward_dw(self):
         """Compute weight gradients for experts and shared experts."""
