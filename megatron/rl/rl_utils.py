@@ -57,7 +57,7 @@ from megatron.training.global_vars import (
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
 from megatron.training.utils import unwrap_model
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import get_pg_size, get_attr_wrapped_model
 logger = logging.getLogger(__name__)
 
 # Global variable to store packing context for forward_step
@@ -662,9 +662,9 @@ def get_environment_rollouts(
     else:
         inference_model = model
 
-    #TODO(peter): We need to get the models process group collection and use that for these checks
+    inference_pg_collection = get_attr_wrapped_model(inference_model[0], "pg_collection")
     assert (
-        n_prompts % mpu.get_expert_data_parallel_world_size() == 0
+        n_prompts % get_pg_size(inference_pg_collection.ep) == 0
     ), "n_prompts must be divisible by data_parallel_world_size"
 
     with nvtx_range("rollout-collection"):
@@ -710,8 +710,7 @@ def get_environment_rollouts(
             torch.distributed.broadcast_object_list(rollouts, src=0)
         print(f"Got rollouts on rank {rank}")
 
-    #TODO(Peter): We need to use the proper models MPU here.
-    if lang_rl_log_dir and rank == get_tensor_model_parallel_src_rank():
+    if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
             lang_rl_log_dir
             + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
@@ -2117,9 +2116,9 @@ def setup_grpo_data_iterator(
     args = get_args()
 
     if inference_model is not None:
-        inference_mpu = unwrap_model(inference_model[0]).pg_collection
+        inference_pg_collection = unwrap_model(inference_model[0]).pg_collection
     else:
-        inference_mpu = mpu
+        inference_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
     if (
@@ -2159,7 +2158,7 @@ def setup_grpo_data_iterator(
                 if bin_idx.item() < len(my_bin_seq_indices)
             )
             # Estimate global sequences for this step
-            est_global_sequences = step_sequences * get_pg_size(inference_mpu.dp)
+            est_global_sequences = step_sequences * get_pg_size(inference_pg_collection.dp)
             print_rank_0(
                 f"[Sequence Packing] Optimizer step {plan['current_step']}/{plan['total_steps']}: "
                 f"processing {len(step_bin_indices)} bins (~{est_global_sequences} sequences globally)"
@@ -2527,8 +2526,7 @@ def get_sequence_packing_tensorboard_metrics(args):
     """Get tensorboard metrics for sequence packing mode."""
     metrics = {}
     if args.consumed_train_bins > 0:
-        # TODO(Peter) We need to use the proper models MPU for refitting. If you forget you probably need to change this all over this 
-        # file
+        # TODO(Peter) We need to use the proper models MPU for refitting.
         bin_batch_size = (
             mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
         )
