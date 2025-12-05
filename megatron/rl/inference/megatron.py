@@ -114,7 +114,6 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
 
     mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
-
     # DynamicInferenceContext must use the inference model's TP size, not the
     # training TP size from global args. The inference model may have a custom
     # ProcessGroupCollection with a different TP size.
@@ -231,7 +230,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     async def launch(cls, model: GPTModel, **kwargs):
         args = get_args()
         tokenizer = get_tokenizer()
-        rank = dist.get_rank()
 
         if tokenizer.bos is None:
             log_single_rank(
@@ -251,6 +249,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             if metrics_writer is None:
                 log_single_rank(logger, logging.WARNING, "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
                            "wandb module is available. Inference logging will be disabled.")
+
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model, inference_logging_step_interval, metrics_writer)
         await inference_engine.start_listening_to_data_parallel_coordinator(inference_coordinator_port=41521, launch_inference_coordinator=True)
         if dist.get_rank() == 0:

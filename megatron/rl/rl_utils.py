@@ -57,6 +57,7 @@ from megatron.training.global_vars import (
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
 from megatron.training.utils import unwrap_model
+from megatron.core.utils import get_pg_size
 logger = logging.getLogger(__name__)
 
 # Global variable to store packing context for forward_step
@@ -2158,7 +2159,7 @@ def setup_grpo_data_iterator(
                 if bin_idx.item() < len(my_bin_seq_indices)
             )
             # Estimate global sequences for this step
-            est_global_sequences = step_sequences * inference_mpu.get_data_parallel_world_size()
+            est_global_sequences = step_sequences * get_pg_size(inference_mpu.dp)
             print_rank_0(
                 f"[Sequence Packing] Optimizer step {plan['current_step']}/{plan['total_steps']}: "
                 f"processing {len(step_bin_indices)} bins (~{est_global_sequences} sequences globally)"

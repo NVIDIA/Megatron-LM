@@ -154,11 +154,6 @@ class DynamicInferenceEngine(AbstractEngine):
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
         assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        if pg_collection is not None:
-            self.pg_collection = pg_collection
-        else:
-            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-
         # Deprecate `enable_cuda_graph`.
         if enable_cuda_graph is not None:
             warnings.warn(
