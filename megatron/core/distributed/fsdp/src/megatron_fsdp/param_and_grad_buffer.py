@@ -2735,8 +2735,8 @@ class ParamAndGradBuffer:
         reduce_scatter_ops = []
         for g in self.parameter_groups:
             gbuf = g.main_grad_buffer
-            if gbuf is not None:
-                continue  # TODO(mxfp8): This is an error?
+            if gbuf is None:
+                continue
             scaling_factor = gbuf.gradient_scaling_factor
             reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
             reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
