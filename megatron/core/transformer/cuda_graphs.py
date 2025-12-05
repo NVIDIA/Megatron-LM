@@ -1697,7 +1697,10 @@ class TECudaGraphHelper:
         )
 
         # If PP is not enabled, we only need to capture one microbatch.
-        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
+        if (
+            parallel_state.get_pipeline_model_parallel_world_size() == 1
+            and not self.config.overlap_moe_expert_parallel_comm
+        ):
             assert (
                 self.num_model_chunks == 1
             ), "If PP is not enabled, there should be only one model chunk."
@@ -1727,8 +1730,8 @@ class TECudaGraphHelper:
             msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
         if self.config.overlap_moe_expert_parallel_comm:
-            wgrad_in_graph_scope = "attn" in self.config.cuda_graph_scope or (
-                "moe_router" in self.config.cuda_graph_scope
+            wgrad_in_graph_scope = CudaGraphScope.attn in self.config.cuda_graph_scope or (
+                CudaGraphScope.moe_router in self.config.cuda_graph_scope
                 and self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
             )
