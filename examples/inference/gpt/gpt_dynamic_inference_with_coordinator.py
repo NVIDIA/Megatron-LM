@@ -51,6 +51,7 @@ async def main(
             "Sampling parameters are specified per request.",
             DeprecationWarning,
         )
+        
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine.
@@ -60,14 +61,6 @@ async def main(
         launch_inference_coordinator=True,
         verbose=True,
     )
-
-    # if you want to use your own inference coordinator -
-    # 1. set launch_inference_coordinator to False
-    # 2. setup a router socket at tcp://MASTER_ADDR:PORT
-    # 3. wait for data parallel groups to establish connection (BasicInferenceCoordinator.__init__)
-    # 4. look at InferenceCoordinator.start() to see how we can route requests from users <-> data parallel groups
-    #   based on headers.
-    # 5. look at InferenceClient to see how we create requests with headers.
 
     args = get_args()
 
@@ -185,6 +178,8 @@ async def main(
                 ))
 
         # kill the engines and suspend the client
+        # Right now, we can only call stop when all requests are done. 
+        # Todo: Make this explicit in the Client class....
         client.stop_engines()
         client.stop()
 
@@ -200,10 +195,6 @@ if __name__ == "__main__":
             extra_args_provider=add_dynamic_inference_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
-
-        # Start Nsight profiler.
-        if os.environ.get("NSIGHT_PREFIX"):
-            torch.cuda.cudart().cudaProfilerStart()
 
         args = get_args()
         tokenizer = get_tokenizer()
@@ -251,6 +242,10 @@ if __name__ == "__main__":
             print(setup_prefix)
             print("~~~")
 
+        # Start Nsight profiler.
+        if os.environ.get("NSIGHT_PREFIX"):
+            torch.cuda.cudart().cudaProfilerStart()
+
         asyncio.run(
             main(
                 engine,
@@ -258,3 +253,7 @@ if __name__ == "__main__":
                 args.inference_coordinator_port,
             )
         )
+
+        # Stop Nsight profiler.
+        if os.environ.get("NSIGHT_PREFIX"):
+            torch.cuda.cudart().cudaProfilerStop()

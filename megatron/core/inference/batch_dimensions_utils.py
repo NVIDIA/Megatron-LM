@@ -11,7 +11,8 @@ and matching CUDA graph batch dimensions.
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-
+from megatron.core import parallel_state
+import torch
 
 @dataclass(order=True, frozen=True)
 class InferenceBatchDimensions:
@@ -123,6 +124,44 @@ class InferenceBatchDimensions:
         """
         return self.prefill_req_count + self.decode_req_count
 
+    @staticmethod
+    def adjust_batch_dims_for_expert_parallelism(local_batch_dims, decode_only_cuda_graphs: bool) -> "InferenceBatchDimensions":
+        """Adjusted batch dimensions for expert parallelism. 
+            We take the max token count across expert model parallel group.
+        Return:
+            (InferenceBatchDimensions) A new InferenceBatchDimensions object with adjusted dimensions.
+        """
+        
+        ep_size = parallel_state.get_expert_model_parallel_world_size()
+        if ep_size <= 1:
+            return local_batch_dims
+
+        expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+        # all reduce local work across expert model parallel group
+
+        is_non_decode = local_batch_dims.prefill_req_count > 0
+
+        sync_tensor = torch.tensor(
+            [local_batch_dims.token_count, int(is_non_decode)], 
+            dtype=torch.int32,
+            device=torch.cuda.current_device()
+        )
+        torch.distributed.all_reduce(
+            sync_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=expert_model_parallel_group,
+        )  
+        sync_tensor = sync_tensor.cpu()
+        is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
+        if decode_only_cuda_graphs and is_any_ep_rank_in_non_decode: 
+            return None  # indicate no match, run in eager mode
+
+        adjusted_batch_dim = InferenceBatchDimensions(
+            token_count=int(sync_tensor[0].item()),
+            prefill_req_count=local_batch_dims.prefill_req_count,
+            decode_req_count=local_batch_dims.decode_req_count
+        )
+        return adjusted_batch_dim
 
 class CUDAGraphBatchDimensionBuilder:
     """Builder for creating and managing CUDA graph batch dimensions.
@@ -355,6 +394,7 @@ class CUDAGraphBatchDimensionBuilder:
         real_batch_dim: InferenceBatchDimensions,
         cuda_graph_batch_dimensions_list: List[InferenceBatchDimensions],
         strict: bool = False,
+        decode_only_cuda_graphs: bool = False
     ) -> Optional[InferenceBatchDimensions]:
         """
         Matches the best CUDA graph batch dimension for the given real batch dimension.
@@ -364,16 +404,28 @@ class CUDAGraphBatchDimensionBuilder:
             cuda_graph_batch_dimensions_list: List of available CUDA graph batch dimensions
             strict: If False, prefill slots can be used for prefill or decode requests.
                    If True, prefill slots can only be used for prefill requests.
-
+            decode_only_cuda_graphs: Used by expert parallel matching. If this is true, 
+            and one of the EP ranks is running a non-decode step, we elect to run in 
+            eager mode instead of matching a decode-only cuda graph.
         Returns:
             The best matching CUDA graph batch dimension, or None if no applicable match is found
         """
         # first filter out batch dimensions with smaller token count, prefill req count,
         # or decode req count, as they are not applicable
+
+        adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
+            real_batch_dim, decode_only_cuda_graphs)
+
+        if adjusted_batch_dim is None:
+            # we hit this scenario if decode_only_cuda_graphs is true,
+            # and one of the EP ranks is running a non-decode step
+            # in that case, all ranks have to run in eager mode
+            return None
+
         graph_batch_dims_applicable = [
             graph_batch_dim
             for graph_batch_dim in cuda_graph_batch_dimensions_list
-            if graph_batch_dim.is_applicable_for_batch_dim(real_batch_dim, strict=strict)
+            if graph_batch_dim.is_applicable_for_batch_dim(adjusted_batch_dim, strict=strict)
         ]
         if len(graph_batch_dims_applicable) == 0:
             return None
