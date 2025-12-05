@@ -27,7 +27,7 @@ from model_provider import model_provider
 stimer = StragglerDetector()
 
 
-def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
+def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
     # for inference with cuda graphs. Without out this the post checks in the transformer config will assert error.
     if config is None:
@@ -59,7 +59,14 @@ def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
             )
 
     with build_model_context(**build_model_context_args):
-        return gpt_builder(args, pre_process, post_process, vp_stage=vp_stage, config=config)
+        return gpt_builder(
+            args,
+            pre_process,
+            post_process,
+            vp_stage=vp_stage,
+            config=config,
+            pg_collection=pg_collection,
+        )
 
 
 # define spiky loss as a variation of 20% or more
@@ -385,11 +392,25 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    def _model_builder(args, pre_process, post_process, vp_stage=None):
+    def _model_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
         if getattr(args, "is_hybrid_model", False):
-            return mamba_builder(args, pre_process, post_process, vp_stage)
+            return mamba_builder(
+                args,
+                pre_process,
+                post_process,
+                vp_stage,
+                config=config,
+                pg_collection=pg_collection,
+            )
         else:
-            return _gpt_builder(args, pre_process, post_process, vp_stage)
+            return _gpt_builder(
+                args,
+                pre_process,
+                post_process,
+                vp_stage,
+                config=config,
+                pg_collection=pg_collection,
+            )
 
     pretrain(
         None,  # we don't need to build any datasets for RL training
