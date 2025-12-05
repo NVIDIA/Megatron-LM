@@ -3762,7 +3762,7 @@ def make_fsdp_dtensor(
                 device_mesh=tp_mesh,
                 placements=placements,
                 run_check=run_check,
-                shape=global_shape,
+                shape=tuple(global_shape),
                 stride=torch.empty(global_shape).stride(),
             )
 
