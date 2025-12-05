@@ -24,7 +24,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossAutoScaler,
     MTPLossLoggingHelper,
@@ -344,16 +344,16 @@ class GPTModel(LanguageModule):
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb = self.rotary_pos_emb(
-                    rotary_seq_len,
-                    packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
+                    rotary_seq_len, packed_seq_params=packed_seq_params
                 )
         elif self.position_embedding_type == 'yarn':
             if self.training or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
-                rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len)
+                rotary_pos_emb, _ = self.rotary_pos_emb(
+                    rotary_seq_len, packed_seq_params=packed_seq_params
+                )
             else:
                 raise NotImplementedError(
                     "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
@@ -361,7 +361,9 @@ class GPTModel(LanguageModule):
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
-                rotary_pos_emb = self.rotary_pos_emb(position_ids, self.mrope_section)
+                rotary_pos_emb = self.rotary_pos_emb(
+                    position_ids, self.mrope_section, packed_seq_params=packed_seq_params
+                )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
                 raise NotImplementedError(
@@ -374,7 +376,7 @@ class GPTModel(LanguageModule):
             and (
                 (
                     self.config.cuda_graph_impl == "local"
-                    and "full_iteration" not in self.config.cuda_graph_scope
+                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
                 )
                 or self.config.flash_decode
             )

@@ -23,7 +23,7 @@ from megatron.core.models.retro.utils import (
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
@@ -772,7 +772,7 @@ def validate_args(args, defaults={}):
             if args.rank == 0:
                 print('accumulate and all-reduce gradients in fp32 for '
                       'bfloat16 data type.', flush=True)
-    if args.cuda_graph_impl == "local" and "full_iteration" in args.cuda_graph_scope:
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         if not args.inference_dynamic_batching:
             assert not args.check_for_nan_in_loss_and_grad, \
             "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
@@ -955,6 +955,13 @@ def validate_args(args, defaults={}):
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
+
+    if args.hybrid_context_parallel:
+        assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
+        assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
+        assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
+        assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
+        assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -1273,6 +1280,15 @@ def validate_args(args, defaults={}):
         assert (
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
+    if args.cuda_graph_scope == "full" or (
+        isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
+    ):
+        if isinstance(args.cuda_graph_scope, list):
+            assert args.cuda_graph_scope == ["full"], "full scope cannot be used with other scopes."
+        args.cuda_graph_scope = []
+        warn_rank_0(
+            'full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.'
+        )
     
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
@@ -1494,7 +1510,7 @@ def _add_inference_args(parser):
                        '"none": no CUDA graph. '
                        '"local": capture the CUDA graph using MCore local implementation. --cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. '
                        '"transformer_engine": capture the CUDA graph using TE make_graphed_callables().')
-    group.add_argument('--cuda-graph-scope', nargs='+', type=str, default=[],
+    group.add_argument('--cuda-graph-scope', nargs='+', type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope, default=[],
                        help='Determines the CUDA graphs capturing scope. '
                        'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
                        '"attn": captures operations in TransformerLayer._forward_attention(). '
@@ -1506,7 +1522,8 @@ def _add_inference_args(parser):
                        '"mamba": captures the mamba layer. '
                        '"full_iteration": captures a whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
-                       'If not specified, the default scope is to capture the whole Transformer layer.')
+                       'If not specified, the default scope is to capture the whole Transformer layer. '
+                       'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')
@@ -2866,6 +2883,13 @@ def _add_distributed_args(parser):
                        '--hierarchical-context-parallel-sizes 2 4 indicates every two adjacent gpus '
                        'forms the first level of cp groups and the cp ranks with the same odevity '
                        'forms the second level of cp groups.')
+    group.add_argument('--max-seqlen-per-cp-rank', type=int, default=None,
+                       help='Maximum sequence length per CP rank. This is used to calculate the '
+                       'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
+    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
+                       help='Enables hybrid context parallel. This is used to balance the workload '
+                       'of each CP rank when we use packed samples with variable sequence lengths. '
+                       'Requires --max-seqlen-per-cp-rank to be set.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '
