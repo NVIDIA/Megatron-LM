@@ -316,7 +316,7 @@ class _CudagraphGlobalRecord:
             runner, graph_type = g[0:2]
             if graph_type == 'fwd':
                 args, kwargs, out = g[2:]
-                runner.create_fwd_graph(global_tensor_pool, args, kwargs, out)
+                runner.create_fwd_graph(args, kwargs, out, clone_inputs=True, global_tensor_pool=global_tensor_pool)
             else:
                 runner.create_bwd_graph(global_tensor_pool)
 
@@ -567,9 +567,7 @@ class _CudaGraphRunner(torch.nn.Module):
     ):
         """Creates a _CudaGraphRunner, which holds a single pair of fwd and bwd cudagraphs, which
         are not created until this runner records its graph creation into
-        '_CudagraphGlobalRecord', and 'create_cudagraphs()' is called. share_cudagraph_io_buffers
-        is a boolean flag to indicate whether to reuse the cudagraph input and output buffers for
-        transformer layer specific optimizations that reduce memory usage and tensor copies."""
+        '_CudagraphGlobalRecord', and 'create_cudagraphs()' is called."""
 
         super().__init__()
 
@@ -635,7 +633,7 @@ class _CudaGraphRunner(torch.nn.Module):
         else:
             return nullcontext()
 
-    def create_fwd_graph(self, global_tensor_pool, args, kwargs, outputs):
+    def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True, global_tensor_pool=[]):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
 
@@ -721,9 +719,13 @@ class _CudaGraphRunner(torch.nn.Module):
                 )
 
         # Finalize the cudagraph input buffers
-        self.fwd_graph_input_args, self.fwd_graph_input_kwargs = self._apply_to_all_tensors(
-            get_fwd_input_buffer, args, kwargs
-        ) 
+        if clone_inputs:
+            self.fwd_graph_input_args, self.fwd_graph_input_kwargs = self._apply_to_all_tensors(
+                get_fwd_input_buffer, args, kwargs
+            )
+        else:
+            self.fwd_graph_input_args, self.fwd_graph_input_kwargs = args, kwargs
+
         input_tensors = self.get_tensors(
             self.fwd_graph_input_args, 
             self.fwd_graph_input_kwargs
@@ -797,7 +799,6 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph_output_surface = list(self.get_tensors(fwd_graph_outputs))
 
         for idx, o in enumerate(self.get_tensors(self.outputs)):
-            assert o.is_cudagraph_output
             if hasattr(o, "is_cudagraph_input"):
                 self.fwd_graph_output_surface[idx].is_cudagraph_input = True
                 if not hasattr(o, "fwd_cudagraph_buffer"):
@@ -1337,12 +1338,12 @@ class CudaGraphManager(torch.nn.Module):
                     )
                 else:
                     runner = _CudaGraphRunner(
-                        megatron_module,
-                        fwd_mempool,
-                        bwd_mempool,
+                        megatron_module, 
+                        CudaGraphManager.global_mempool, 
                         args,
                         kwargs,
-                        self.share_cudagraph_io_buffers,
+                        self.func, 
+                        self.need_backward,
                     )
                     self.cudagraph_runners.append(runner)
                     if is_inference_mode:
@@ -1401,7 +1402,7 @@ class CudaGraphManager(torch.nn.Module):
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference
                     local_args, local_kwargs = args, kwargs
-                    if runner.reuse_input_output_buffer and not runner.is_first_layer:
+                    if not runner.is_first_layer:
                         # Find previous layer's runner in the global record
                         try:
                             previous_runner = next(
@@ -1422,10 +1423,8 @@ class CudaGraphManager(torch.nn.Module):
                             # No match found for previous layer, continue with no buffer reuse
                             pass
 
-                    clone_inputs = not (
-                        runner.reuse_input_output_buffer and not runner.is_first_layer
-                    )
-                    runner.create_fwd_graph(local_args, local_kwargs, clone_inputs=clone_inputs)
+                    runner.create_fwd_graph(
+                        local_args, local_kwargs, outputs=None, clone_inputs=runner.is_first_layer)
                     runner.fwd_graph_recorded = True
                     runner.cudagraph_created = True
 
