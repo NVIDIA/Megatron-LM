@@ -1693,6 +1693,10 @@ def _add_network_size_args(parser):
                        'We compute the average of the MTP losses across all depths, '
                        'and multiply it the scaling factor to obtain the overall MTP loss, '
                        'which serves as an additional training objective.')
+    group.add_argument('--mtp-use-repeated-layer', action='store_true',
+                       help='Use a single MTP layer repeatedly instead of multiple separate layers. '
+                       'This is more parameter-efficient. When enabled, only 1 MTP layer is created '
+                       'and applied --mtp-num-layers times.')
     return parser
 
 
