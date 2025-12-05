@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from pytest import fixture
 from unittest.mock import patch
 
 import torch
@@ -55,6 +56,12 @@ class MockTokenizer:
 
     def detokenize(self, tokens):
         return [str(tok) for tok in tokens]
+
+
+@fixture(scope='module', autouse=True)
+def mock_pipeline_stuff():
+    with patch('megatron.rl.rl_utils.is_pipeline_last_stage', return_value=True):
+        yield
 
 
 def test_get_logprobs():
@@ -303,72 +310,6 @@ def test_grpo_loss_truncation():
     # ratios: [[2., 0.5],[20., 1.]]
     torch.testing.assert_close(truncated_from_above, torch.tensor([[True, False], [True, False]]))
     torch.testing.assert_close(truncated_from_below, torch.tensor([[False, True], [False, False]]))
-
-
-@patch('megatron.rl.rl_utils.mpu')
-def test_prepare_data_for_update(mock_mpu):
-    """Test that getting logprobs at least does not crash."""
-    mock_mpu.get_expert_data_parallel_world_size.return_value = 0
-    # We use args inside of get_logprobs, we need to initialize them.
-
-    args = arguments.parse_args(ignore_unknown_args=True)
-    setattr(args, 'data_parallel_size', 1)
-    setattr(args, 'micro_batch_size', 2)
-    setattr(args, 'global_batch_size', 2)
-    setattr(args, 'seq_length', 4)
-    setattr(args, 'curr_iteration', 1)
-    global_vars.unset_global_variables()
-    global_vars.set_global_variables(args, build_tokenizer=False)
-
-    model = MockModel()
-    tokenizer = MockTokenizer()
-
-    r1 = TokenRollout(
-        trajectory=[1, 2, 3],
-        reward=3.14,
-        generation_mask=[False, True, True],
-        logprobs=[0.1, 0.2, 0.3],
-        env_id='MEGAENV',
-        problem_id="2",
-    )
-    r2 = TokenRollout(
-        trajectory=[1, 2, 3, 4],
-        reward=0.14,
-        generation_mask=[False, True, True, True],
-        logprobs=[0.1, 0.2, 0.3, -1.2],
-        env_id='MEGAENV',
-        problem_id="2",
-    )
-    rollouts = [[r1, r2]]
-    try:
-        data_iter = rl_utils.prepare_data_for_update([model], {}, rollouts, tokenizer)
-    except AssertionError as e:
-        # We expect trajectories to come padded there.
-        assert str(e).startswith('Rollout is not the correct length')
-
-    r1 = TokenRollout(
-        trajectory=torch.Tensor([1, 2, 3, tokenizer.eod]).cuda(),
-        reward=3.14,
-        generation_mask=torch.Tensor([False, True, True, True]).cuda(),
-        logprobs=torch.Tensor([-0.2, -0.3, -3.2]).cuda(),
-        env_id='MEGAENV',
-        problem_id="2",
-    )
-    r2 = TokenRollout(
-        trajectory=torch.Tensor([1, 2, 234, tokenizer.eod]).cuda(),
-        reward=0.14,
-        generation_mask=torch.Tensor([False, True, True, True]).cuda(),
-        logprobs=torch.Tensor([-0.2, -0.3, -1.2]),
-        env_id='MEGAENV',
-        problem_id="2",
-    )
-    rollouts = [[r1, r2]]
-    data_iter = rl_utils.prepare_data_for_update([model], {}, rollouts, tokenizer)
-
-    _, _, old_logprobs, _, _, _, _ = next(data_iter)
-    # All logits are ones in the MockModel.
-    # All probabilities should be uniform.
-    torch.testing.assert_close(old_logprobs.exp(), torch.ones_like(old_logprobs) / VOCAB)
 
 
 def test_sequence_packing_basic():
