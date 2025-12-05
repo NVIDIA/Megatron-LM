@@ -541,6 +541,23 @@ def get_pg_rank(group=None):
     return group.rank()
 
 
+def get_pg_src_rank(group=None):
+    """Calculate the global rank corresponding to the first local rank
+    in the given process group.
+
+    Args:
+        group: Process group to query. If None or distributed is not initialized,
+            returns 0.
+
+    Returns:
+        int: The first (source) global rank in the group.
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 0
+    ranks = torch.distributed.get_process_group_ranks(group)
+    return ranks[0]
+
+
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
     """Get an attribute from a wrapped model.
     If return_model_obj is true, return the object that has the 'attr' attribute;

@@ -8,7 +8,7 @@ from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 
 
-def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None):
+def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building MAMBA model ...')
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
@@ -35,6 +35,7 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None):
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
+        pg_collection=pg_collection,
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):
