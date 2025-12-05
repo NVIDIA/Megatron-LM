@@ -1803,6 +1803,8 @@ def _add_network_size_args(parser):
                        help='Use a single MTP layer repeatedly instead of multiple separate layers. '
                        'This is more parameter-efficient. When enabled, only 1 MTP layer is created '
                        'and applied --mtp-num-layers times.')
+    group.add_argument('--mtp-num-layers-per-layer', type=int, default=None,
+                       help='Number of layers inside each MTP layer (e.g., for hybrid models).')
     return parser
 
 
