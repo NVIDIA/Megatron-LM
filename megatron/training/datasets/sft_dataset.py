@@ -61,17 +61,6 @@ class SFTDataset(MegatronDataset):
         config: GPTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
-        self.packed_sequence_get_count = 0
-        self.packed_sequence_truncated_count = 0
-        self.packed_sequence_padded_count = 0
-        self.conversation_truncated_count = 0
-        self.conversation_length_hist = Counter()
-        self.truncated_tokens_hist = Counter()
-        self.padded_tokens_hist = Counter()
-        # TODO(duncan): Add character to token ratio?
-        # WARNING: The following code relies on DP=1 and num-workers=0. This will be removed
-        # if index_split == Split.train:
-        #     atexit.register(self._dump_stats)
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
@@ -119,8 +108,6 @@ class SFTDataset(MegatronDataset):
         eod = tokenizer.eod
         pad = tokenizer.pad
         # TODO(duncan): Track number of convs dropped and/or truncated and amount of end-padding
-        conversation_truncated_count = 0
-        truncated_tokens_count = 0
         for conversation in split_conversations:
 
             tokens, targets = tokenizer.tokenize_conversation(
@@ -134,8 +121,6 @@ class SFTDataset(MegatronDataset):
             if tokens_list[-1] != eod:
                 tokens_list.append(eod)
                 targets_list.append(eod)
-
-            self.conversation_length_hist[len(tokens_list)] += 1
 
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
@@ -157,8 +142,6 @@ class SFTDataset(MegatronDataset):
 
             # Handle any necessary truncation
             if len(pack_tokens) >= pack_length + 1:  # +1 here to account for later alignment
-                truncated_tokens_count += len(pack_tokens) - pack_length
-                conversation_truncated_count += 1
                 truncate_left_not_right = True  # TODO(duncan): plumb this switch in
                 if truncate_left_not_right:  # Retain existing eod
                     max_body = pack_length
@@ -177,20 +160,12 @@ class SFTDataset(MegatronDataset):
                 cu_seqlens[-1] = len(pack_tokens) - 1
                 break
 
-        if conversation_truncated_count > 0:
-            self.conversation_truncated_count += conversation_truncated_count
-            self.packed_sequence_truncated_count += 1
-
-        self.truncated_tokens_hist[truncated_tokens_count] += 1
-
         # Handle any necessary padding
         if len(pack_tokens) < pack_length + 1:  # +1 here to account for later alignment
             pad_len = pack_length + 1 - len(pack_tokens)
             extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
             # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
             cu_seqlens[-1] = len(pack_tokens) - 1
-            self.packed_sequence_padded_count += 1
-            self.padded_tokens_hist[pad_len - 1] += 1
 
         assert len(pack_tokens) == pack_length + 1
         assert len(pack_targets) == pack_length + 1
@@ -217,8 +192,6 @@ class SFTDataset(MegatronDataset):
         adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = adjacent_diffs.max()  # max_seqlen is a 0-D tensor
 
-        self.packed_sequence_get_count += 1
-
         return {
             'tokens': input_ids,
             'labels': labels,
@@ -228,22 +201,3 @@ class SFTDataset(MegatronDataset):
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,
         }
-
-    # TODO(duncan): remove this
-    def get_stats(self):
-        return {
-            "packed_sequence_get_count": self.packed_sequence_get_count,
-            "packed_sequence_truncated_count": self.packed_sequence_truncated_count,
-            "packed_sequence_padded_count": self.packed_sequence_padded_count,
-            "conversation_truncated_count": self.conversation_truncated_count,
-            "conversation_length_hist": dict(self.conversation_length_hist),
-            "truncated_tokens_hist": dict(self.truncated_tokens_hist),
-            "padded_tokens_hist": dict(self.padded_tokens_hist),
-        }
-
-    # TODO(duncan): remove this
-    def _dump_stats(self):
-        stats_path = "/lustre/fsw/portfolios/llmservice/users/duncan/mamba/packed-sequence/megatron-hybrid-fix/stats/stats.json"
-        with open(stats_path, "w") as f:
-            json.dump(self.get_stats(), f, indent=2, sort_keys=True)
-        print(f"\n[SFTDataset] wrote stats -> {stats_path}")
