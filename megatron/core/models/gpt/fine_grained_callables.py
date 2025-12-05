@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
@@ -67,7 +68,7 @@ def should_free_input(name, is_moe, config):
         # scope, tokens and probs are fixed size tensors, so they cannot be freed.
         # For deepep mode, they are both needed in backward pass, so they cannot be freed.
         "moe_dispatch": config.moe_token_dispatcher_type == "alltoall"
-        and ("moe_preprocess" not in config.cuda_graph_scope),
+        and (CudaGraphScope.moe_preprocess not in config.cuda_graph_scope),
     }
 
     return free_input_nodes.get(name, False)
@@ -349,10 +350,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             """Execute weight gradients, skipping CUDA graphed components during replay."""
             is_replay = hasattr(layer, 'cuda_graphs') and layer.cuda_graphs
             if self.shared_expert_dw_callable is not None and (
-                not is_replay or "moe_router" not in self.cuda_graph_scope
+                not is_replay or CudaGraphScope.moe_router not in self.cuda_graph_scope
             ):
                 self.shared_expert_dw_callable()
-            if not is_replay or "attn" not in self.cuda_graph_scope:
+            if not is_replay or CudaGraphScope.attn not in self.cuda_graph_scope:
                 self.attn_dw_callable()
             if is_replay and self.graphed_backward_dw_callable is not None:
                 self.graphed_backward_dw_callable()
@@ -368,8 +369,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             assert (
-                "mlp" not in layer.config.cuda_graph_scope
-                and "moe" not in layer.config.cuda_graph_scope
+                CudaGraphScope.mlp not in layer.config.cuda_graph_scope
+                and CudaGraphScope.moe not in layer.config.cuda_graph_scope
             ), (
                 "Supported CUDA graph scope with EP overlap: "
                 "attn, moe_router, moe_preprocess, mlp, got {}".format(
