@@ -695,14 +695,20 @@ def apply_router_token_dropping(
     )
 
     # Create capacity mask based on drop policy
-    if drop_policy == "probs":
-        _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
-        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
-    elif drop_policy == "position":
-        _, capacity_indices = torch.topk(routing_map.int(), k=expert_capacity, dim=0, sorted=False)
-        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+    if expert_capacity > num_tokens:
+        # No need to drop tokens if capacity exceeds the number of tokens
+        capacity_mask = torch.ones_like(routing_probs).bool()
     else:
-        raise ValueError(f"Invalid drop_policy: {drop_policy}")
+        if drop_policy == "probs":
+            _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
+            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+        elif drop_policy == "position":
+            _, capacity_indices = torch.topk(
+                routing_map.int(), k=expert_capacity, dim=0, sorted=False
+            )
+            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+        else:
+            raise ValueError(f"Invalid drop_policy: {drop_policy}")
 
     # Apply capacity constraints
     if pad_to_capacity:
