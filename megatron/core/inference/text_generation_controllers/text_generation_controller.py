@@ -662,7 +662,15 @@ class TextGenerationController:
         return return_log_probs.any(), top_n_log_probs.any()
 
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
-        """Calculate log probs from logits."""
+        """Calculate log probs from logits.
+
+        Args:
+            logits (Tensor): The logits tensor from the forward pass.
+
+        Returns:
+            Tuple of (log_probs_list, log_probs_tensor) where log_probs_tensor may be None
+            if using selective log softmax optimization.
+        """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
@@ -853,6 +861,13 @@ class TextGenerationController:
         log_probs = None
         top_n_logprobs = None
         if return_log_probs or return_top_n_logprobs:
+            # Check for incompatible configuration: selective log softmax cannot be used
+            # with top-n logprobs as the latter requires the full log_probs tensor.
+            assert not (context.use_selective_log_softmax and return_top_n_logprobs), (
+                "use_selective_log_softmax cannot be used with top_n_logprobs. "
+                "Either set use_selective_log_softmax=False in DynamicInferenceContext "
+                "or set top_n_logprobs=0 in SamplingParams."
+            )
             log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
             if return_top_n_logprobs:
                 top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
