@@ -15,7 +15,12 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
-from megatron.rl.rl_utils import calculate_grpo_loss, get_logprobs, get_rl_runtime_state
+from megatron.rl.rl_utils import (
+    calculate_grpo_loss,
+    load_packed_data_by_index,
+    get_logprobs,
+    get_rl_runtime_state,
+)
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
@@ -191,53 +196,26 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         batch_data = next(data_iterator)
     timers('batch-generator').stop()
 
-    seq_starts = None
-    seq_lengths = None
     attention_mask = None
 
     if args.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
-        bin_idx = bin_tensor.item()
-
-        # Get packing context (should always be available in packed mode)
-        runtime_state = get_rl_runtime_state()
-        packing_context = runtime_state.packing_context
-
-        idx = slice(bin_idx, bin_idx + 1)
-        # Extract packed data for this bin (already on GPU)
-        tokens = packing_context['packed_trajs'][idx]
-        position_ids = packing_context['packed_position_ids'][idx]
-        attention_mask = (
-            packing_context['packed_attention_mask'][idx]
-            if packing_context['packed_attention_mask'] is not None
-            else None
-        )
-        old_logprobs = packing_context['old_logprobs'][idx]
-        ref_logprobs = packing_context['ref_logprobs'][idx]
-        loss_mask = packing_context['packed_loss_mask'][idx, 1:]
-
-        # Get sequence-level data for this bin
-        packing_info = packing_context['packing_info']
-        seq_starts = packing_info['seq_starts'][bin_idx]
-        seq_indices = packing_info['bin_seq_indices'][bin_idx]
-
-        # Handle empty bins (used for padding to ensure all ranks have same iterations)
-        if not seq_indices:
-            seq_lengths = []
-            advantages = torch.tensor([], device='cuda')
-        else:
-            seq_lengths = [packing_info['seq_lengths'][idx] for idx in seq_indices]
-            advantages = packing_context['bin_advantages'][bin_idx]
-
-        # Extract packed inference_logprobs if available
-        if (
-            'packed_inference_logprobs' in packing_context
-            and args.rl_inference_logprobs_is_correction
-        ):
-            inference_logprobs = packing_context['packed_inference_logprobs'][idx]
-        else:
-            inference_logprobs = None
+        
+        (   
+            tokens, 
+            advantages, 
+            old_logprobs, 
+            loss_mask, 
+            position_ids, 
+            ref_logprobs, 
+            inference_logprobs, 
+            seq_starts, 
+            seq_lengths, 
+            seq_indices,
+            packed_seq_params, 
+            packed_seq_len 
+        ) = load_packed_data_by_index(bin_tensor.item())
 
         runtime_state = get_rl_runtime_state()
         runtime_state.increment_sequences(len(seq_indices))
@@ -252,6 +230,11 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             ref_logprobs,
             inference_logprobs,
         ) = batch_data
+
+        seq_starts = None
+        seq_lengths = None
+        packed_seq_params = None
+        packed_seq_len = 0
 
         # Move to CUDA
         tokens = tokens.cuda()
@@ -283,7 +266,9 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
         logprobs_or_hidden_states = get_logprobs(
-            model_to_use, tokens, position_ids, attention_mask, no_grad=False
+            model_to_use, tokens, position_ids, attention_mask, no_grad=False,
+            packed_seq_params=packed_seq_params,
+            packed_seq_len=packed_seq_len
         )
 
         if not is_pipeline_last_stage():

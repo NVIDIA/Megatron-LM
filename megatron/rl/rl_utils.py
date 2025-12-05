@@ -12,7 +12,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -25,15 +25,16 @@ from wandb import wandb_run
 from megatron.core import mpu
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
-from megatron.core.utils import get_asyncio_loop
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.optimizer import MegatronOptimizer
-from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, is_pipeline_last_stage, get_pipeline_model_parallel_last_rank, get_pipeline_model_parallel_group
+from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, is_pipeline_last_stage, get_pipeline_model_parallel_last_rank, get_pipeline_model_parallel_group, get_tensor_model_parallel_world_size
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.utils import get_asyncio_loop
 from megatron.rl.agent.api import (
     EvaluationRequest,
     EvaluationResponse,
@@ -448,6 +449,7 @@ class SequencePacker:
         )
         loss_mask = torch.zeros((num_bins, self.bin_size), dtype=torch.float, device=device)
 
+        # TODO(jalbericiola): packing_info as a dataclass and not just a dict
         # Track packing information for unpacking later
         packing_info = {
             'bin_seq_indices': bin_seq_indices,  # Which original sequences are in each bin
@@ -513,6 +515,111 @@ class SequencePacker:
 
         return packed_sequences, position_ids, attention_mask, loss_mask, packing_info
 
+
+def create_packed_seq_params_for_bin(
+    packing_info: Dict[str, Any],
+    bin_idx: int,
+    bin_size: int,
+    device: torch.device,
+) -> Optional[PackedSeqParams]:
+    """Create PackedSeqParams for a single bin to enable proper attention masking in TE.
+
+    When using Transformer Engine with sequence packing, we need to provide cu_seqlens
+    (cumulative sequence lengths) so that TE knows the boundaries between sequences
+    within a packed bin. This prevents attention leakage between unrelated sequences.
+
+    Args:
+        packing_info: Dictionary containing packing metadata from SequencePacker
+        bin_idx: Index of the bin to create params for
+        bin_size: Size of the bin (padded sequence length)
+        device: Device to create tensors on
+
+    Returns:
+        PackedSeqParams with cu_seqlens set for proper attention masking (or None if empty)
+    """
+    seq_indices = packing_info['bin_seq_indices'][bin_idx]
+
+    # Handle empty bins (padding bins with no sequences)
+    if not seq_indices:
+        return None
+
+    # Get actual sequence lengths for sequences in this bin
+    seq_lengths_in_bin = [packing_info['seq_lengths'][idx] for idx in seq_indices]
+
+    # Build cumulative sequence lengths for actual sequences
+    # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
+    cu_seqlens_list = np.cumsum([0] + seq_lengths_in_bin)
+
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
+
+    max_seqlen = max(seq_lengths_in_bin) if seq_lengths_in_bin else bin_size
+
+    return PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=None,
+        cu_seqlens_kv_padded=None,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+    )
+
+
+def load_packed_data_by_index(bin_idx: int):
+    """Load packed data by index.
+
+    Args:
+        bin_idx: Index of the bin to load.
+    """
+    runtime_state = get_rl_runtime_state()
+    args = get_args()
+    packing_context = runtime_state.packing_context
+    # Get packing context (should always be available in packed mode)
+    idx = slice(bin_idx, bin_idx + 1)
+    # Extract packed data for this bin (already on GPU)
+    tokens = packing_context['packed_trajs'][idx]
+    position_ids = packing_context['packed_position_ids'][idx]
+
+    if 'old_logprobs' in packing_context:
+        old_logprobs = packing_context['old_logprobs'][idx]
+    else:
+        old_logprobs = None
+    if 'ref_logprobs' in packing_context:
+        ref_logprobs = packing_context['ref_logprobs'][idx]
+    else:
+        ref_logprobs = None
+    loss_mask = packing_context['packed_loss_mask'][idx, 1:]
+
+    # Get sequence-level data for this bin
+    packing_info = packing_context['packing_info']
+    seq_starts = packing_info['seq_starts'][bin_idx]
+    seq_indices = packing_info['bin_seq_indices'][bin_idx]
+
+    # Handle empty bins (used for padding to ensure all ranks have same iterations)
+    if not seq_indices:
+        seq_lengths = []
+        advantages = torch.tensor([], device='cuda')
+    else:
+        seq_lengths = [packing_info['seq_lengths'][idx] for idx in seq_indices]
+        if 'bin_advantages' in packing_context:
+            advantages = packing_context['bin_advantages'][bin_idx]
+        else:
+            advantages = None
+
+    # Extract packed inference_logprobs if available
+    if (
+        'packed_inference_logprobs' in packing_context
+        and args.rl_inference_logprobs_is_correction
+    ):
+        inference_logprobs = packing_context['packed_inference_logprobs'][idx]
+    else:
+        inference_logprobs = None
+
+    # Get cached PackedSeqParams for proper attention masking in Transformer Engine
+    # These were pre-computed in prepare_data_for_update to avoid repeated tensor allocations
+    packed_seq_params, packed_seq_len = packing_context['cached_packed_seq_params'][bin_idx]
+
+    return tokens, advantages, old_logprobs, loss_mask, position_ids, ref_logprobs, inference_logprobs, seq_starts, seq_lengths, seq_indices, packed_seq_params, packed_seq_len
 
 def get_agent(args):
     """Get an agent based on environment configuration.
@@ -703,7 +810,7 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
+def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, packed_seq_params=None, packed_seq_len=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -711,6 +818,12 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
         tokens: inputs for which we want to get logprobs.
         position_ids: position ids that come with tokens.
         attention_mask: attention mask that comes with tokens.
+        no_grad: whether to run in no_grad mode.
+        packed_seq_params: Optional PackedSeqParams for sequence packing with TE.
+            When provided with qkv_format='thd', the input tokens are sliced to
+            remove padding before the forward pass, and outputs are padded back.
+        packed_seq_len: Optional length of the packed sequence (excluding padding).
+            Required when packed_seq_params is provided to avoid CPU-GPU synchronization.
 
     Returns:
         Logprobs of input sequences.
@@ -723,6 +836,51 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
         with nvtx_range("forward-pass", time=False):
             # TODO(vitalyk): use fp16/bf16 as a function argument. Do not use args.
             args = get_args()
+            
+            # Handle THD format: slice off padding before forward, pad back after
+            original_seq_len = tokens.shape[1]
+            attention_mask_for_forward = attention_mask
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                # Get the actual token count (excluding padding)
+                if packed_seq_len is not None:
+                    actual_len = packed_seq_len
+                else:
+                    actual_len = packed_seq_params.cu_seqlens_q[-1].item()
+                
+                if actual_len == 0:
+                    # No real tokens, skip packed path
+                    packed_seq_params = None
+                else:
+                    # When sequence parallelism is enabled, the sequence length must be 
+                    # divisible by the tensor parallel world size for reduce-scatter ops
+                    if model.config.sequence_parallel:
+                        tp_world_size = get_tensor_model_parallel_world_size()
+                        if actual_len % tp_world_size != 0:
+                            actual_len = ((actual_len + tp_world_size - 1) // tp_world_size) * tp_world_size
+                            # Update cu_seqlens to match the padded length.
+                            # The last entry of cu_seqlens must equal the tensor's sequence dimension.
+                            # Without this, TE attention/rotary ops see mismatched dimensions.
+                            if packed_seq_params.cu_seqlens_q[-1].item() != actual_len:
+                                # Clone to avoid modifying cached params
+                                new_cu_seqlens = packed_seq_params.cu_seqlens_q.clone()
+                                new_cu_seqlens[-1] = actual_len
+                                packed_seq_params = PackedSeqParams(
+                                    qkv_format=packed_seq_params.qkv_format,
+                                    cu_seqlens_q=new_cu_seqlens,
+                                    cu_seqlens_kv=new_cu_seqlens,
+                                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                                    cu_seqlens_kv_padded=packed_seq_params.cu_seqlens_kv_padded,
+                                    max_seqlen_q=packed_seq_params.max_seqlen_q,
+                                    max_seqlen_kv=packed_seq_params.max_seqlen_kv,
+                                )
+
+                    # Slice inputs to remove padding (or pad if needed for SP alignment)
+                    # dimension 0 is batch, with seq packing BS=1
+                    tokens = tokens[:, :actual_len]
+                    position_ids = position_ids[:, :actual_len]
+                    # attention_mask is not used with THD format (cu_seqlens handles it)
+                    attention_mask_for_forward = None
+            
             # This is a hack to fix megatron's behaviour when flash-decode affects the training code flow.
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
@@ -731,18 +889,34 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
                 logits_or_hidden_states = model(
                     tokens,
                     position_ids,
-                    attention_mask,
+                    attention_mask_for_forward,
+                    packed_seq_params=packed_seq_params,
                     runtime_gather_output=True,
                     fp32_output=fp32_output,
                 )
             model.config.flash_decode = flash_decode
-            # We do not need logprobs for the n+1 token.
-        
+            
+
         if not is_pipeline_last_stage():
             return logits_or_hidden_states
         else:
+            logits = logits_or_hidden_states
             with nvtx_range("log-softmax", time=False):
-                logprobs = selective_log_softmax(logits_or_hidden_states[:, :-1, :], tokens[:, 1:])
+                # Pad logits back to original sequence length if we sliced
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                    if logits.shape[1] < original_seq_len:
+                        pad_len = original_seq_len - logits.shape[1]
+                        # Pad with zeros (these positions will be masked out anyway)
+                        logits = torch.nn.functional.pad(logits, (0, 0, 0, pad_len), value=0)
+                    # Also need to restore tokens for the log_softmax below
+                    tokens_for_softmax = torch.nn.functional.pad(
+                        tokens, (0, original_seq_len - tokens.shape[1]), value=0
+                    )
+                else:
+                    tokens_for_softmax = tokens
+                
+                # We do not need logprobs for the n+1 token.
+                logprobs = selective_log_softmax(logits[:, :-1, :], tokens_for_softmax[:, 1:])
             return logprobs
 
 
@@ -1234,7 +1408,9 @@ def prepare_data_for_update(
         original_trajs = trajs
 
         # Sequence packing or standard processing
+        runtime_state = get_rl_runtime_state()
         packing_context = {}  # Store all packing-related data
+        runtime_state.packing_context = packing_context
 
         if args.rl_use_sequence_packing:
             with nvtx_range("sequence_packing"):
@@ -1478,6 +1654,22 @@ def prepare_data_for_update(
                 # Store my_bin_seq_indices for later use
                 packing_context['my_bin_seq_indices'] = my_bin_seq_indices
 
+                # Pre-compute all PackedSeqParams for all bins ONCE to avoid repeated
+                # tensor allocations that cause CUDA memory fragmentation and periodic spikes
+                cached_packed_seq_params = []
+                device = packing_context['packed_trajs'].device
+                for bin_idx in range(len(packing_context['packed_trajs'])):
+                    params = create_packed_seq_params_for_bin(
+                        packing_info=packing_info,
+                        bin_idx=bin_idx,
+                        bin_size=args.rl_sequence_packing_bin_size,
+                        device=device,
+                    )
+                    # Compute seq_len here (one-time .item() call during caching is fine)
+                    seq_len = params.cu_seqlens_q[-1].item() if params is not None else 0
+                    cached_packed_seq_params.append((params, seq_len))
+                packing_context['cached_packed_seq_params'] = cached_packed_seq_params
+
                 # Log packing efficiency (for this rank's bins)
                 total_tokens = sum(packing_info['seq_lengths'])  # All sequences
                 my_sequences = sum(len(indices) for indices in my_bin_seq_indices)
@@ -1625,27 +1817,39 @@ def prepare_data_for_update(
             forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
         def logprobs_forward_step(data_iterator, model):
-            batch_data = next(data_iterator)
-            if len(batch_data) == 2:
-                b_trajs, b_posids = batch_data
-                b_attn_mask = original_attention_mask
+            if args.rl_use_sequence_packing:
+                bin_tensor = next(data_iterator)[0]
+                ( b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params, b_packed_seq_len ) = load_packed_data_by_index(bin_tensor.item())
             else:
-                b_trajs, b_posids, b_attn_mask = batch_data
-            return get_logprobs(model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask.cuda() if b_attn_mask is not None else None, no_grad=True), None
+                batch_data = next(data_iterator)
+                if len(batch_data) == 2:
+                    b_trajs, b_posids = batch_data
+                else:
+                    b_trajs, b_posids, _ = batch_data
+                b_packed_seq_params = None
+                b_packed_seq_len = 0
+                b_trajs = b_trajs.cuda()
+                b_posids = b_posids.cuda()
+
+            b_trajs = b_trajs.cuda()
+            b_posids = b_posids.cuda()
+
+            return get_logprobs(model, b_trajs, b_posids, None, no_grad=True, packed_seq_params=b_packed_seq_params, packed_seq_len=b_packed_seq_len), None
 
 
         with nvtx_range("create-logprobs-dataloader"):
-            data_iter = DataLoader(
-                TensorDataset(compute_trajs, compute_position_ids), batch_size=args.micro_batch_size
-            )
-            if compute_attention_mask is not None:
+            # Use batch_size=1 for packed computation to enable proper attention masking
+            # via PackedSeqParams (TE needs cu_seqlens per bin)
+            logprobs_batch_size = 1 if use_packed_computation else args.micro_batch_size
+            if args.rl_use_sequence_packing:
                 data_iter = DataLoader(
-                    TensorDataset(compute_trajs, compute_position_ids, compute_attention_mask), batch_size=args.micro_batch_size
+                    TensorDataset(torch.arange(len(compute_trajs))), batch_size=logprobs_batch_size
                 )
             else:
                 data_iter = DataLoader(
-                    TensorDataset(compute_trajs, compute_position_ids), batch_size=args.micro_batch_size
+                    TensorDataset(compute_trajs, compute_position_ids), batch_size=logprobs_batch_size
                 )
+
             old_logprobs = []
 
             # Compute logprobs
@@ -1794,9 +1998,6 @@ def prepare_data_for_update(
         with nvtx_range("create_dataloader"):
             if args.rl_use_sequence_packing:
                 # Store packing context in runtime state for forward_step
-                runtime_state = get_rl_runtime_state()
-                runtime_state.packing_context = packing_context
-
                 packing_info = packing_context['packing_info']
                 packing_context['bin_advantages'] = []
                 for bin_idx, seq_indices in enumerate(packing_info['bin_seq_indices']):

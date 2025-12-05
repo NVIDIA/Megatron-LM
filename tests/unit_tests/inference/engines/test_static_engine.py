@@ -201,7 +201,7 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
             assert len(results) == batch_size
             for result in results:
                 if isinstance(result, DynamicInferenceRequestRecord):
-                    result = result.merge(self.static_engine.controller.tokenizer)
+                    result = result.merge()
                 assert isinstance(result, InferenceRequest), (
                     "expected <InferenceRequest>; found <%s>." % type(result).__name__
                 )

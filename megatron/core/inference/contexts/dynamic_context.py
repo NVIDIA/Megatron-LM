@@ -31,6 +31,7 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
+from megatron.core.utils import internal_api
 
 from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -186,6 +187,7 @@ def get_mem_size_str(n_bytes: int) -> str:
     raise Exception(f"something went wrong, n_bytes={n_bytes}.")
 
 
+@internal_api
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
     """Inference context that is passed to the main model in order
@@ -386,14 +388,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Set max_total_requests, max_active_requests, max_tokens.
 
         # The maximum number of requests is limited by the number of max sequence length requests that can fit in the buffer.
-        blocks_per_max_seq = math.ceil(max_sequence_length / block_size_tokens)
+        blocks_per_max_seq = -(-max_sequence_length // block_size_tokens)
         self.max_total_requests = ( self.block_allocator.total_count - 1 ) // blocks_per_max_seq # -1 for dummy block
 
         # The maximum number of active requests is limited by the number of active blocks and the number of total requests.
         self.max_active_requests = min(self.max_total_requests, self.block_allocator.active_count)
 
         # The maximum number of active requests must be divisible by the tensor model parallel size.
-        self.max_active_requests = math.floor(self.max_active_requests / tp_size) * tp_size
+        self.max_active_requests =self.max_active_requests // tp_size * tp_size
+        self.max_active_requests = (
+            self.max_active_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
+        )
         self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
 
         assert self.max_tokens >= self.max_active_requests, (
@@ -1932,13 +1937,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
 
         # Calculate log_probs (sequence_length x vocab_size)
-        log_probs = F.log_softmax(logits.squeeze(0).float(), dim=-1)
+        logits_squeezed = logits.squeeze(0).float()
 
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
+            log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
             selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.flatten().tolist()], log_probs
+            return [[lp] for lp in selected_log_probs.tolist()], log_probs
 
+        log_probs = F.log_softmax(logits_squeezed, dim=-1)
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
         # prefill requests and then set the token ids explicitly for the newly generated tokens.
