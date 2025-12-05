@@ -6,6 +6,7 @@ import logging
 import os
 import warnings
 from datetime import timedelta
+from math import log2
 from typing import Callable, List, Optional
 
 import numpy as np
@@ -110,6 +111,8 @@ _CONTEXT_PARALLEL_GROUP = None
 _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 # Hierarchical context parallel groups
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
+# Hybrid context parallel groups
+_HYBRID_DP_CP_GROUPS = {}
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
@@ -410,6 +413,31 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
+def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
+    """
+    Creates groups required for hybrid DPxCP.
+    Creates a new group for every power of 2 up to the number of DPxCP ranks.
+    Returns a dictionary indexed by group size.
+    """
+    hybrid_dp_cp_groups = {}
+    # Generate group for every power of 2 up to the number of CP ranks
+    # We limit the allowed group sizes in order to avoid excessive overhead.
+    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
+    for group_size in group_sizes:
+        for i in range(0, len(ranks), group_size):
+            group = create_group(
+                ranks[i : i + group_size],
+                pg_options=pg_options,
+                group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
+            )
+            if rank in ranks[i : i + group_size]:
+                assert (
+                    group_size not in hybrid_dp_cp_groups
+                ), f"Rank {rank} appears in multiple Hybrid DP CP groups of size {group_size}"
+                hybrid_dp_cp_groups[group_size] = group
+    return hybrid_dp_cp_groups
+
+
 class RankGenerator(object):
     """A class for generating rank groups for different modes of parallelism."""
 
@@ -530,6 +558,7 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
+    hybrid_context_parallel: bool = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -880,6 +909,19 @@ def initialize_model_parallel(
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to the dp group.
         if "NCCL_COLLNET_ENABLE" in os.environ:
             del os.environ["NCCL_COLLNET_ENABLE"]
+
+    if hybrid_context_parallel:
+        global _HYBRID_DP_CP_GROUPS
+        for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
+            assert (
+                len(ranks_with_cp) % 2 == 0
+            ), "Hybrid context parallel requires an even number of ranks"
+            _HYBRID_DP_CP_GROUPS.update(
+                create_hybrid_dp_cp_groups(
+                    rank, ranks_with_cp, get_nccl_options("dp_cp", nccl_comm_cfgs)
+                )
+            )
+        # TODO: Are gloo groups needed for hybrid cp?
 
     for ranks in decoder_rank_generator.get_ranks('dp'):
         group = create_group(
@@ -1393,6 +1435,18 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
     if check_initialized:
         assert _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS is not None
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+
+
+def get_hybrid_data_context_parallel_groups(check_initialized=True, group_size=None):
+    """Get the hybrid context parallel groups the caller rank belongs to."""
+    # If the group size is the same as the entire DPxCP group, return the original group
+    if get_data_parallel_world_size(with_context_parallel=True) == group_size:
+        if check_initialized:
+            assert _DATA_PARALLEL_GROUP_WITH_CP is not None
+        return _DATA_PARALLEL_GROUP_WITH_CP
+    if check_initialized:
+        assert _HYBRID_DP_CP_GROUPS is not None
+    return _HYBRID_DP_CP_GROUPS[group_size]
 
 
 def get_embedding_group(check_initialized=True):

@@ -546,10 +546,14 @@ class DSAIndexer(MegatronModule):
             None, None, x, self.config, packed_seq_params
         )
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len, packed_seq_params=packed_seq_params
+            )
             mscale = 1.0
         else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+            rotary_pos_emb, mscale = self.rotary_pos_emb(
+                rotary_seq_len, packed_seq_params=packed_seq_params
+            )
 
         # =========================================
         # Gather inputs if sp is enabled

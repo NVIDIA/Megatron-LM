@@ -1,0 +1,183 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Trigger MBridge Tests
+# Remote testing of MBridge from MCore
+# Triggers MBridge CI tests with current MCore commit to verify backward compatibility
+
+on:
+  # Manual trigger only
+  workflow_dispatch:
+    inputs:
+      mbridge_ref:
+        description: 'MBridge branch/ref to trigger'
+        required: false
+        type: string
+        default: 'main'
+      run_cicd_main:
+        description: 'Run cicd-main.yml (full CI/CD)'
+        required: false
+        type: boolean
+        default: true
+      run_install_test:
+        description: 'Run install-test.yml (quick install check)'
+        required: false
+        type: boolean
+        default: true
+      test_suite:
+        description: 'Test suite to run (for cicd-main)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'unit-only'
+          - 'functional-only'
+        default: 'all'
+
+jobs:
+  # First job: Get MCore commit info (shared by all matrix jobs)
+  get-mcore-info:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.mcore_info.outputs.sha }}
+      short_sha: ${{ steps.mcore_info.outputs.short_sha }}
+      branch: ${{ steps.mcore_info.outputs.branch }}
+      repo_url: ${{ steps.mcore_info.outputs.repo_url }}
+    steps:
+      - name: Checkout MCore
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Get MCore commit info
+        id: mcore_info
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "branch=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
+          
+          # Get repo URL from origin remote, fallback to constructing from github context
+          REPO_URL=$(git remote get-url origin 2>/dev/null || echo "${{ github.server_url }}/${{ github.repository }}.git")
+          echo "repo_url=${REPO_URL}" >> $GITHUB_OUTPUT
+
+          echo "📦 MCore commit: $(git rev-parse --short HEAD)"
+          echo "🌿 Branch: ${GITHUB_REF#refs/heads/}"
+          echo "📍 Repo: ${REPO_URL}"
+
+  # Matrix job: Trigger and monitor MBridge workflows in parallel
+  trigger-and-monitor:
+    needs: [get-mcore-info]
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Don't fail workflow if monitoring times out
+    strategy:
+      fail-fast: false  # Continue other matrix jobs even if one fails
+      matrix:
+        include:
+          - workflow: install-test.yml
+            name: Install Test
+          - workflow: cicd-main.yml
+            name: CI/CD Main
+    
+    name: ${{ matrix.name }}
+    
+    steps:
+      - name: Check if workflow should run
+        id: should_run
+        run: |
+          if [[ "${{ matrix.workflow }}" == "install-test.yml" && "${{ inputs.run_install_test }}" == "true" ]]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ matrix.workflow }}" == "cicd-main.yml" && "${{ inputs.run_cicd_main }}" == "true" ]]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Skipping ${{ matrix.workflow }} (not enabled)"
+          fi
+      
+      - name: Trigger ${{ matrix.workflow }}
+        if: steps.should_run.outputs.run == 'true'
+        id: trigger
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          echo "🚀 Triggering ${{ matrix.workflow }} | MCore: ${{ needs.get-mcore-info.outputs.short_sha }} | MBridge: ${{ inputs.mbridge_ref }}"
+          
+          gh workflow run ${{ matrix.workflow }} \
+            --repo NVIDIA-NeMo/Megatron-Bridge --ref ${{ inputs.mbridge_ref }} \
+            --field mcore_commit=${{ needs.get-mcore-info.outputs.sha }} \
+            --field mcore_branch=${{ needs.get-mcore-info.outputs.branch }} \
+            --field mcore_repo=${{ needs.get-mcore-info.outputs.repo_url }} \
+            --field test_suite=${{ inputs.test_suite }} \
+            --field triggered_by=mcore-ci
+      
+      - name: Get run ID
+        if: steps.should_run.outputs.run == 'true'
+        id: get_run_id
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          sleep 10  # Wait for run to appear
+          RUN_ID=$(gh run list \
+            --repo NVIDIA-NeMo/Megatron-Bridge \
+            --workflow=${{ matrix.workflow }} \
+            --limit 5 \
+            --json databaseId,createdAt \
+            --jq "sort_by(.createdAt) | reverse | .[0] | .databaseId")
+          
+          echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
+          echo "📋 Run ID: ${RUN_ID}"
+          
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🔄 ${{ matrix.name }} Triggered
+          
+          **MCore:** \`${{ needs.get-mcore-info.outputs.short_sha }}\` | **MBridge:** \`${{ inputs.mbridge_ref }}\` | **Suite:** \`${{ inputs.test_suite }}\`
+          
+          - 🔄 [${{ matrix.workflow }}](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID}) - Running...
+          - ⏳ Monitoring every 5 minutes until completion
+          
+          > **Note:** Tests run without approval when triggered from MCore
+          EOF
+      
+      - name: Monitor workflow
+        if: steps.should_run.outputs.run == 'true'
+        id: monitor
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          RUN_ID="${{ steps.get_run_id.outputs.run_id }}"
+          echo "📊 Monitoring ${{ matrix.workflow }} (Run ID: ${RUN_ID})"
+          
+          gh run watch ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --exit-status
+          
+          CONCLUSION=$(gh run view ${RUN_ID} --repo NVIDIA-NeMo/Megatron-Bridge --json conclusion --jq -r .conclusion)
+          echo "workflow_status=${CONCLUSION}" >> $GITHUB_ENV
+          echo "✅ Completed: ${CONCLUSION}"
+      
+      - name: Report results
+        if: always() && steps.should_run.outputs.run == 'true'
+        run: |
+          CONCLUSION="${{ env.workflow_status || 'unknown' }}"
+          RUN_ID="${{ steps.get_run_id.outputs.run_id }}"
+          
+          case "$CONCLUSION" in
+            "success") ICON="✅"; MSG="passed" ;;
+            "failure") ICON="❌"; MSG="failed"; EXIT_CODE=1 ;;
+            "cancelled") ICON="🚫"; MSG="cancelled"; EXIT_CODE=0 ;;
+            *) ICON="⏳"; MSG="still running or timed out"; EXIT_CODE=0 ;;
+          esac
+          
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 📊 ${{ matrix.name }} Results
+          
+          ### ${ICON} ${{ matrix.workflow }}
+          **Status:** \`${CONCLUSION}\`
+          
+          [View full results →](https://github.com/NVIDIA-NeMo/Megatron-Bridge/actions/runs/${RUN_ID})
+          
+          ---
+          *Triggered from MCore \`${{ needs.get-mcore-info.outputs.short_sha }}\`*
+          EOF
+          
+          echo "${ICON} ${{ matrix.name }} ${MSG}"
+          exit ${EXIT_CODE:-0}
+

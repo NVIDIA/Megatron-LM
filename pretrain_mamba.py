@@ -44,6 +44,13 @@ def get_batch(data_iterator, vp_stage=None):
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(data_iterator)
+    
+    # Support for Packed Sequence (Unused in this script)
+    cu_seqlens = batch.pop('cu_seqlens', None)
+    cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
+    max_seqlen = batch.pop('max_seqlen', None)
+    # Support for Hybrid Context Parallel (Unused in this script)
+    local_cp_size = batch.pop('local_cp_size', None)
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)

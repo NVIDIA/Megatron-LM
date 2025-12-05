@@ -26,7 +26,7 @@ The compatibility checker:
 ### ⏭️ What Gets Skipped
 
 - **Test functions** - Functions starting with `test_`
-- **Exempt decorators** - Functions marked with `@internal_api` or `@deprecated`
+- **Exempt decorators** - Functions marked with `@internal_api`, `@experimental_api`, or `@deprecated`
 - **Excluded paths** - Code in `tests/`, `experimental/`, `legacy/`
 
 ### ✅ Allowed Changes
@@ -57,6 +57,8 @@ python scripts/check_api_backwards_compatibility.py --baseline core_r0.8.0 --cur
 
 If you need to make breaking changes to internal or experimental APIs:
 
+#### Internal API (for internal implementation details)
+
 ```python
 from megatron.core.utils import internal_api
 
@@ -69,10 +71,28 @@ def experimental_feature(x, y):
     pass
 ```
 
-**When to use:**
+**When to use `@internal_api`:**
 - Internal APIs not documented for external use
 - Experimental features explicitly marked as unstable
 - Functions in development that haven't been released yet
+
+#### Experimental API (for experimental features)
+
+```python
+from megatron.core.utils import experimental_api
+
+@experimental_api
+def new_experimental_feature(x, y):
+    """
+    This API is experimental and may change without notice.
+    """
+    pass
+```
+
+**When to use `@experimental_api`:**
+- Experimental features explicitly marked as unstable
+- New APIs under active development
+- Features that haven't been stabilized yet
 
 ### Deprecating APIs
 
@@ -196,7 +216,7 @@ Script loads code via griffe:
   • Current: PR branch
     ↓
 Apply filtering:
-  • Skip @internal_api and @deprecated
+  • Skip @internal_api, @experimental_api, and @deprecated
   • Skip private functions (_prefix)
   • Skip test/experimental paths
     ↓
@@ -223,6 +243,7 @@ Edit `scripts/check_api_backwards_compatibility.py`:
 # Add more exempt decorators
 EXEMPT_DECORATORS = [
     "internal_api",
+    "experimental_api",
     "deprecated",
 ]
 
@@ -255,11 +276,11 @@ The workflow auto-detects the latest `core_r*` tag. To manually specify:
 
 ### Q: Can I disable the check for my PR?
 
-**A:** No, but you can mark specific functions as exempt using `@internal_api`.
+**A:** No, but you can mark specific functions as exempt using `@internal_api` or `@experimental_api`.
 
 ### Q: What if I need to make a breaking change?
 
-**A:** Use the `@deprecated` decorator for a gradual transition, or mark the function as exempt if it's internal/experimental.
+**A:** Use the `@deprecated` decorator for a gradual transition, or mark the function as exempt using `@internal_api` (for internal code) or `@experimental_api` (for experimental features).
 
 ### Q: Does this check all of Megatron-LM?
 
