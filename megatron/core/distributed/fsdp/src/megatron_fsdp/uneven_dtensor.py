@@ -279,7 +279,11 @@ def gather_uneven_dtensor_to_full_tensor(
         if full_flattened_mesh_dim_name in get_mesh_names(device_mesh):
             # Retrieve the existing flattened DeviceMesh ProcessGroup.
             try:
-                process_group = device_mesh._get_root_mesh()._flatten_mapping[full_flattened_mesh_dim_name].get_group()
+                process_group = (
+                    device_mesh._get_root_mesh()
+                    ._flatten_mapping[full_flattened_mesh_dim_name]
+                    .get_group()
+                )
             except AttributeError:
                 process_group = device_mesh[full_flattened_mesh_dim_name].get_group()
         else:
