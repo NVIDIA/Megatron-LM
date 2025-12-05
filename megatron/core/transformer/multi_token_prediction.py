@@ -982,6 +982,9 @@ class MultiTokenPredictionBlock(MegatronModule):
     the linear projection. The combined serves as the input of the Transformer block at
     the k-th depth to produce the output representation.
 
+    When `mtp_use_repeated_layer=True` in config, instead of creating N separate MTP layers,
+    only 1 layer is created and applied mtp_num_layers times. 
+
     for more information, please refer to DeepSeek-V3 Technical Report
     https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
     """
@@ -999,6 +1002,8 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
+        
+        self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
 
         # Initialize Context Parallelism (CP) support for MTP
         # This enables MTP to work with CP > 1 by providing the CP process group
@@ -1030,12 +1035,21 @@ class MultiTokenPredictionBlock(MegatronModule):
                 )
             return module
 
-        self.layers = torch.nn.ModuleList(
-            [
-                build_layer(layer_spec, i + 1)
-                for i, layer_spec in enumerate(self.submodules.layer_specs)
-            ]
-        )
+        if self.mtp_use_repeated_layer:
+            assert len(self.submodules.layer_specs) == 1, (
+                f"Repeated MTP mode requires exactly 1 layer spec, got {len(self.submodules.layer_specs)}. "
+                f"The layer will be applied {self.config.mtp_num_layers} times."
+            )
+            self.layers = torch.nn.ModuleList([
+                build_layer(self.submodules.layer_specs[0], layer_number=1)
+            ])
+        else:
+            self.layers = torch.nn.ModuleList(
+                [
+                    build_layer(layer_spec, i + 1)
+                    for i, layer_spec in enumerate(self.submodules.layer_specs)
+                ]
+            )
 
     def forward(
         self,
@@ -1071,8 +1085,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         offset = get_mtp_layer_offset(self.config)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hidden_states = hidden_states_list[offset]
-        for layer_number in range(len(self.layers)):
-            (hidden_states, input_ids, position_ids) = self.layers[layer_number](
+        for iteration in range(self.config.mtp_num_layers):
+            layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+            (hidden_states, input_ids, position_ids) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
