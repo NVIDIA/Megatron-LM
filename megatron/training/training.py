@@ -2990,7 +2990,8 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
 
         # Build dataloders.
-        train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+        if not args.skip_train:
+            train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
 
         valid_dataloaders = []
         for valid_d in valid_ds:
