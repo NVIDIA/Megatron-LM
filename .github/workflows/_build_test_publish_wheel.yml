@@ -140,7 +140,7 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}
+          name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
           path: dist/
 
   publish-wheels:
@@ -160,6 +160,7 @@ jobs:
       - name: Download wheels
         uses: actions/download-artifact@v4
         with:
+          name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
           path: dist/
           merge-multiple: true
 
