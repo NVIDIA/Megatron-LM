@@ -19,6 +19,12 @@ from megatron.core.transformer.multi_latent_attention import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
+def is_linear_attention_variant(experimental_attention_variant: str) -> bool:
+    """Check if the experimental attention variant is a linear attention variant."""
+    linear_attention_variants = ["gated_delta_net"]
+    return experimental_attention_variant in linear_attention_variants
+
+
 def get_gated_delta_net_module_spec_for_backend(
     backend: BackendSpecProvider, normalization: Optional[str] = None
 ) -> ModuleSpec:
