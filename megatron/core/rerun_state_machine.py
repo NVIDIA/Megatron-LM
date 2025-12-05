@@ -584,7 +584,7 @@ class RerunStateMachine:
             if not self.first_iteration_complete:
                 return
 
-            result_rejected: bool = self.error_injector.maybe_inject() or rejection_func(result)
+            result_rejected = self.error_injector.maybe_inject() or rejection_func(result)
             if result_rejected:
                 self.failed_validation_call = validation_call
                 self.initial_result = result
@@ -648,8 +648,8 @@ class RerunStateMachine:
             # This is the second re-run.
             elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
                 # Ensure we're not on the same GPU as the first rerun.
-                node: str = os.uname()[1]
-                device: int = torch.cuda.current_device()
+                node = os.uname()[1]
+                device = torch.cuda.current_device()
                 if node == self.suspicious_node and device == self.suspicious_device:
                     logger.error(
                         f"Got rescheduled on the same GPU. Need to resume again from the same "
@@ -913,8 +913,11 @@ class RerunStateMachine:
     def _get_validation_call_info(self, message: str) -> Call:
         """Internal method to get the context about the caller to validate_result()."""
 
-        frame: inspect.frame = inspect.currentframe()
+        frame = inspect.currentframe()
+        assert frame is not None
+        assert frame.f_back is not None
         frame = frame.f_back.f_back
+        assert frame is not None
         filename: str = inspect.getframeinfo(frame).filename
         lineno: int = frame.f_lineno
         rank: int = _safe_get_rank()
@@ -992,12 +995,11 @@ class RerunStateMachine:
                 node: str = os.uname()[1]
                 device: int = torch.cuda.current_device()
                 with open(self.result_rejected_tracker_filename, "a") as f:
-                    print(
+                    f.write(
                         f"ts={datetime.datetime.now()} node={node} device={device} "
                         f"jobID={os.getenv('SLURM_JOBID', 'N/A')} rank={rank} "
                         f"iteration={self.current_iteration} status={status} result={result} "
-                        f"message='{message}'",
-                        file=f,
+                        f"message='{message}'\n"
                     )
             except Exception as e:
                 logger.error(f"Could not log validation error! ({e})")
@@ -1098,7 +1100,7 @@ class RerunDataIterator:
             n = self.saved_microbatches[self.replay_pos]
             self.replay_pos += 1
             return n
-        n: Any = next(self.iterable)
+        n = next(self.iterable)
         if get_rerun_state_machine().get_mode() != RerunMode.DISABLED:
             self.saved_microbatches.append(n)
         return n
@@ -1155,7 +1157,7 @@ class QuickStats:
             if self.pos < self.max_size:
                 self.samples.append(data)
             else:
-                self.samples[self.pos % self.self.max_size] = data
+                self.samples[self.pos % self.max_size] = data
             self.pos += 1
             if data > self.max:
                 self.max = data
@@ -1338,6 +1340,7 @@ def get_rerun_state_machine() -> RerunStateMachine:
     if _GLOBAL_RERUN_STATE_MACHINE is None:
         logger.warning("Implicit initialization of Rerun State Machine!")
         initialize_rerun_state_machine()
+        assert _GLOBAL_RERUN_STATE_MACHINE is not None
     return _GLOBAL_RERUN_STATE_MACHINE
 
 
