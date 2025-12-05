@@ -79,6 +79,7 @@ class GroupedMLP(MegatronModule):
         self.config: TransformerConfig = config
         self.num_local_experts = num_local_experts
         gg.assert_grouped_gemm_is_available()
+        assert self.config.bf16, "The legacy GroupedMLP for MoE only supports bf16."
         assert (
             config.add_bias_linear == False
         ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
@@ -235,7 +236,6 @@ class GroupedMLP(MegatronModule):
         permuted_probs: torch.Tensor,
     ):
         """Forward step of the GroupedMLP."""
-        assert self.config.bf16, "Currently GroupedGEMM for MoE only supports bf16."
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
 
