@@ -20,7 +20,7 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_last_stage,
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
-from megatron.core.inference.inference_request import DynamicInferenceRequest, InferenceRequest, Status
+from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
@@ -88,11 +88,6 @@ class TextGenerationController:
         vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
 
         self._sampling_backend = "torch"
-
-        # Initialize bookkeeping tensors.
-        self._sampling_logits_cuda = torch.empty(
-            max_requests, vocab_size, dtype=logits_dtype, device=device
-        )
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
 
         # Keep track of request metadata.
@@ -578,16 +573,6 @@ class TextGenerationController:
                 pp_group=self.pp_group,
             )
 
-        # Last token logits.
-        if context.materialize_only_last_token_logits:
-            # When materialize_only_last_token_logits is true, last_token_logits is
-            # already called in the forward pass of GPT.
-            last_token_logits = logits.squeeze(0)
-        else:
-            last_token_logits = context.last_token_logits(logits)
-        # Copy last_token_logits to contiguous buffer.
-        self._sampling_logits_cuda[:active_request_count].copy_(last_token_logits, non_blocking=True)
-
         return logits
 
     def _dynamic_step_sample_bookkeeping(self):
@@ -615,14 +600,27 @@ class TextGenerationController:
 
             # Store the buckets and their equivalence class representatives.
             self._torch_sampling_buckets = (
-                (indices, temp[rep], top_k[rep], top_p[rep])
-                for indices, rep in bucket_map.values()
+                (indices, temp[rep], top_k[rep], top_p[rep]) for indices, rep in bucket_map.values()
             )
 
-    def _dynamic_step_sample_logits(self):
-        """Sample tokens from logits for dynamic batching."""
+    def _dynamic_step_sample_logits(self, logits: Tensor):
+        """Sample tokens from logits for dynamic batching.
+
+        Args:
+            logits (Tensor): The logits from the forward pass.
+        """
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
         # and then broadcast the sampled tokens rather than broadcasting the raw logits.
+
+        # Last token logits.
+        context = self.inference_wrapped_model.inference_context
+        if context.materialize_only_last_token_logits:
+            # When materialize_only_last_token_logits is true, last_token_logits is
+            # already called in the forward pass of GPT.
+            last_token_logits = logits.squeeze(0)
+        else:
+            last_token_logits = context.last_token_logits(logits)
+
         if self._sampling_backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
             token_list = []
@@ -630,9 +628,7 @@ class TextGenerationController:
 
             for indices, temp, top_k, top_p in self._torch_sampling_buckets:
                 token_list.append(
-                    self._torch_sampling_func(
-                        self._sampling_logits_cuda[indices, :], temp, top_k, top_p
-                    )
+                    self._torch_sampling_func(last_token_logits[indices, :], temp, top_k, top_p)
                 )
                 indices_list.append(torch.tensor(indices))
 
@@ -845,10 +841,9 @@ class TextGenerationController:
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
-        self._dynamic_step_sample_bookkeeping()
-        self._dynamic_step_sample_logits()
-
         return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+        self._dynamic_step_sample_bookkeeping()
+        self._dynamic_step_sample_logits(logits)
 
         log_probs = None
         top_n_logprobs = None
