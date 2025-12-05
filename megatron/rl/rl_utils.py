@@ -31,7 +31,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, get_tensor_model_parallel_world_size
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
-from megatron.core.transformer.utils import toggle_cuda_graphs, set_model_to_sequence_parallel
+from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import get_asyncio_loop
 from megatron.rl.agent.api import (
     EvaluationRequest,
