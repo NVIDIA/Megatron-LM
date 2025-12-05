@@ -28,6 +28,22 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
+
+        # Handle GPT-OSS mode with YaRN RoPE configuration
+        if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:
+            print_rank_0("GPT-OSS mode enabled: Configuring YaRN RoPE parameters")
+
+            # Set GPT-OSS YaRN values directly on the config
+            # These defaults are based on Huggingface GPT-OSS configurations
+            config.position_embedding_type = "yarn"
+            config.yarn_rotary_scaling_factor = 32.0
+            config.yarn_original_max_position_embeddings = 131072
+            config.yarn_beta_fast = 32.0
+            config.yarn_beta_slow = 1.0
+            config.yarn_mscale = 1.0
+            config.yarn_mscale_all_dim = 0.0
+            config.yarn_correction_range_round_to_int = False
+
     if args.use_legacy_models:
         model = megatron.legacy.model.GPTModel(
             config,
