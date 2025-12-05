@@ -28,8 +28,14 @@ from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.optimizer import MegatronOptimizer
-from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, is_pipeline_last_stage, get_pipeline_model_parallel_last_rank, get_pipeline_model_parallel_group, get_tensor_model_parallel_world_size
+from megatron.core.parallel_state import (
+    get_tensor_model_parallel_src_rank, 
+    get_pipeline_model_parallel_last_rank, 
+    get_pipeline_model_parallel_group, 
+    get_tensor_model_parallel_world_size
+)
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
@@ -897,7 +903,7 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, pac
             model.config.flash_decode = flash_decode
             
 
-        if not is_pipeline_last_stage():
+        if not is_pp_last_stage():
             return logits_or_hidden_states
         else:
             logits = logits_or_hidden_states
@@ -1868,12 +1874,12 @@ def prepare_data_for_update(
                     forward_only=True,
                     adjust_tensor_shapes_fn=None,
                 )
-                if is_pipeline_last_stage():
+                if is_pp_last_stage():
                     old_logprobs.append(
                         output_tensor[0].detach()
                     )
 
-            if is_pipeline_last_stage():
+            if is_pp_last_stage():
                 old_logprobs = torch.concat(old_logprobs, dim=0)
                 assert old_logprobs.dtype == dtype
             else:
@@ -1956,12 +1962,12 @@ def prepare_data_for_update(
                     forward_only=True,
                     adjust_tensor_shapes_fn=None,
                 )
-                if is_pipeline_last_stage():
+                if is_pp_last_stage():
                     ref_logprobs.append(
                         output_tensor[0].detach()
                     )
 
-            if is_pipeline_last_stage():
+            if is_pp_last_stage():
                 ref_logprobs = torch.concat(ref_logprobs, dim=0)
                 assert ref_logprobs.dtype == dtype
             else:
