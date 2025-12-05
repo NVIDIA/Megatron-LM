@@ -721,7 +721,11 @@ class MegatronFSDP(torch.nn.Module):
             # and unsharding operations when performing activation recomputation
             # / gradient checkpointing.
             module._training_state = TrainingState.PRE_BACKWARD
-            param_list = list(module.parameters(recurse=False))
+
+            if isinstance(module, tuple(fsdp_unit_modules)):
+                param_list = list(module.parameters())
+            else:
+                param_list = list(module.parameters(recurse=False))
 
             # All-gather / unshard the module parameters before the backward pass.
             self.all_gather_and_wait_parameters_ready(
@@ -837,12 +841,9 @@ class MegatronFSDP(torch.nn.Module):
                     )
                 )
 
-            # Register the backward pre-hook to unshard FSDP unit module parameters
-            # immediately before the backward pass via attaching a gradient-triggered
-            # hook to the output tensor(s) of a module during a post-forward hook.
-            self.backward_pre_hooks[f"all-gather module {name} parameters"] = (
-                create_custom_backward_hook(module, _pre_backward)
-            )
+            # Skip if the module is already registered in fsdp_modules.
+            if any(is_submodule(module, fsdp_module) for fsdp_module in fsdp_modules):
+                continue
 
             if isinstance(module, tuple(fsdp_unit_modules)):
                 fsdp_modules.append(module)
@@ -863,6 +864,13 @@ class MegatronFSDP(torch.nn.Module):
                 self.forward_hooks[f"remove module {name} fp8 transpose cache"] = (
                     module.register_forward_hook(_release_module_fp8_transpose_cache, prepend=False)
                 )
+
+            # Register the backward pre-hook to unshard FSDP unit module parameters
+            # immediately before the backward pass via attaching a gradient-triggered
+            # hook to the output tensor(s) of a module during a post-forward hook.
+            self.backward_pre_hooks[f"all-gather module {name} parameters"] = (
+                create_custom_backward_hook(module, _pre_backward)
+            )
 
             # Register the post-backward hook to deallocate model parameters and
             # reduce-scatter gradients immediately after the module backward pass
