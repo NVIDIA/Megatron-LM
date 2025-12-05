@@ -67,6 +67,7 @@ jobs:
       - name: Build Docker image
         run: |
           set -euxo pipefail
+          env | grep -i proxy
           docker build --no-cache \
             -f Dockerfile_rocm.ci \
             --build-arg http_proxy=$HTTP_PROXY \
