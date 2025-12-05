@@ -703,14 +703,12 @@ class MockGPTLowLevelDataset:
     size: int = 100000
     """The hard-coded number of samples to generate"""
 
-    max_sequence_length: int = 4096
-    """The hard-coded max sequence length to generate"""
-
-    def __init__(self, tokenizer: MegatronTokenizerBase) -> None:
+    def __init__(self, tokenizer: MegatronTokenizerBase, vocab_size: int) -> None:
         self.tokenizer = tokenizer
+        self.vocab_size = vocab_size
         rng = numpy.random.default_rng(seed=self.seed)
         self.sequence_lengths = rng.integers(
-            low=1, high=self.max_sequence_length, size=self.size, dtype=numpy.int32
+            low=1, high=self.vocab_size, size=self.size, dtype=numpy.int32
         )
 
     def __len__(self) -> int:
