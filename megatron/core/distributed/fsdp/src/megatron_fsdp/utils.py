@@ -149,10 +149,12 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
     return HAVE_TE_FP8_TENSOR_CLASS and isinstance(tensor, FP8_TENSOR_CLASS)
 
 
-def get_mesh_names(device_mesh: Optional[DeviceMesh] = None) -> list[str]:
+def get_mesh_names(
+    device_mesh: Optional[DeviceMesh] = None, only_submesh_dims: bool = False
+) -> list[str]:
     """
-    Get all the sub-mesh ("dp", "cp", etc.) and flattened-mesh ("dp_cp", etc.)
-    names in the DeviceMesh.
+    Get all the sub-mesh ("dp", "cp", etc.) and flattened-mesh ("dp_cp", etc.) names
+    in the DeviceMesh. When only_submesh_dims=True, only checks for sub-mesh dimensions.
     """
     if device_mesh is None:
         # Device mesh does not exist.
@@ -187,7 +189,10 @@ def get_mesh_names(device_mesh: Optional[DeviceMesh] = None) -> list[str]:
     # Order of the returned list of mesh dimension names must match the index
     # of the root mesh dimension names followed by flattened sub-meshes:
     # [<root mesh dimension names>, <flattened mesh dimension names>]
-    return submesh_dim_names + flatten_mesh_names
+    if only_submesh_dims:
+        return submesh_dim_names
+    else:
+        return submesh_dim_names + flatten_mesh_names
 
 
 def contains_submesh(
@@ -752,6 +757,12 @@ class FSDPDistributedIndex:
         """
         Megatron-FSDP is responsible for storing all required DeviceMesh
         as per best practices recommended by the DeviceMesh API.
+
+        NOTE(@cspades): In PyTorch 2.11, retrieving flattened mesh dimensions
+        will be impossible via the device_mesh[...] API. We will require all
+        users to correctly _unflatten() their DeviceMesh such that all
+        dimensions used by Megatron-FSDP are sub-meshes of the DeviceMesh.
+        contains_submesh(...) -> get_mesh_names(only_submesh_dims=True).
         """
         self.mesh_library = {}
 
