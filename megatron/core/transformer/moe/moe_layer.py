@@ -125,7 +125,7 @@ class MoELayer(BaseMoELayer):
 
         # Initialize latent projections
         if self.config.moe_latent_size:
-            assert HAVE_TE
+            assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
             self.fc1_latent_proj = TELinear(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -144,7 +144,7 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 init_method=self.config.output_layer_init_method,
                 bias=self.config.add_bias_linear,
-                skip_bias_add=True,
+                skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
             )
@@ -202,6 +202,12 @@ class MoELayer(BaseMoELayer):
         """
         residual = hidden_states
         probs, routing_map = self.router(hidden_states)
+        # Project the hidden_states from hidden dimension down to latent dimenion.
+        if self.config.moe_latent_size:
+            assert (
+                not self.shared_expert_overlap
+            ), "Shared expert overlap not supported when MoE latent projections are used."
+            hidden_states, _ = self.fc1_latent_proj(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
@@ -302,20 +308,9 @@ class MoELayer(BaseMoELayer):
         def custom_forward(hidden_states):
             shared_expert_output = self.shared_experts_compute(hidden_states)
             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
-
-            # Project the hidden_states from hidden dimension down to latent dimenion.
-            if self.config.moe_latent_size:
-                assert (
-                    not self.shared_expert_overlap
-                ), "Shared expert overlap not supported when MoE latent projections are used."
-                hidden_states, _ = self.fc1_latent_proj(hidden_states)
-
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
-
-            if self.config.moe_latent_size and mlp_bias is not None:
-                output = output + mlp_bias
-                mlp_bias = None
+            assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
             output = self.combine(output, shared_expert_output)
 
             return output, mlp_bias
