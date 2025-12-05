@@ -69,6 +69,9 @@ jobs:
           set -euxo pipefail
           docker build --no-cache \
             -f Dockerfile_rocm.ci \
+            --build-arg http_proxy=$HTTP_PROXY \
+            --build-arg https_proxy=$HTTPS_PROXY \
+            --build-arg no_proxy=$NO_PROXY \
             --build-arg PYTORCH_ROCM_ARCH_OVERRIDE=${{ steps.gpu-arch.outputs.arch }} \
             -t megatron-lm-ci:${{ github.sha }} \
             .
