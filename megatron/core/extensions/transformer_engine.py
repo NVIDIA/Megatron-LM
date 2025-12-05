@@ -356,12 +356,28 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group = None
 
-        if is_te_min_version("2.2.0.dev0"):
-            assert class_has_init_param(te.pytorch.Linear, "keep_fp8_weight_transpose_cache"), "Transformer Engine v2.2.0 or later is required to use keep_fp8_weight_transpose_cache"
-            extra_kwargs["keep_fp8_weight_transpose_cache"] = self.config.keep_fp8_weight_transpose_cache
-        if is_te_min_version("2.4.0.dev0"):
-            assert class_has_init_param(te.pytorch.Linear, "use_fsdp2"), "Transformer Engine v2.4.0 or later is required to use use_fsdp2"
-            extra_kwargs["use_fsdp2"] = self.config.use_fsdp2
+        if is_te_min_version("2.2.0"):
+            if class_has_init_param(te.pytorch.Linear, "keep_fp8_weight_transpose_cache"):
+                extra_kwargs["keep_fp8_weight_transpose_cache"] = (
+                    self.config.keep_fp8_weight_transpose_cache
+                )
+            else:
+                warnings.warn(
+                    "Transformer Engine is missing `keep_fp8_weight_transpose_cache`; "
+                    "latest FP8 weight transpose cache optimizations will not be applied. "
+                    "Consider upgrading to a newer version of Transformer Engine.",
+                    UserWarning,
+                )
+        if is_te_min_version("2.4.0"):
+            if class_has_init_param(te.pytorch.Linear, "use_fsdp2"):
+                extra_kwargs["use_fsdp2"] = self.config.use_fsdp2
+            else:
+                warnings.warn(
+                    "Transformer Engine is missing `use_fsdp2`; latest FSDP2 features will "
+                    "not be applied. Consider upgrading to a newer version of Transformer "
+                    "Engine.",
+                    UserWarning,
+                )
 
         super().__init__(
             in_features=input_size,
@@ -526,13 +542,31 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                     ), "Buffer name should be set to configure communication overlap settings"
                     extra_kwargs["ub_name"] = tp_comm_buffer_name
 
-        if is_te_min_version("2.2.0.dev0"):
-            assert class_has_init_param(te.pytorch.LayerNormLinear, "keep_fp8_weight_transpose_cache"), "Transformer Engine v2.2.0 or later is required to use keep_fp8_weight_transpose_cache"
-            extra_kwargs["keep_fp8_weight_transpose_cache"] = self.config.keep_fp8_weight_transpose_cache
+        if is_te_min_version("2.2.0"):
+            if class_has_init_param(
+                te.pytorch.LayerNormLinear, "keep_fp8_weight_transpose_cache"
+            ):
+                extra_kwargs["keep_fp8_weight_transpose_cache"] = (
+                    self.config.keep_fp8_weight_transpose_cache
+                )
+            else:
+                warnings.warn(
+                    "Transformer Engine is missing `keep_fp8_weight_transpose_cache`; "
+                    "latest FP8 weight transpose cache optimizations will not be applied. "
+                    "Consider upgrading to a newer version of Transformer Engine.",
+                    UserWarning,
+                )
 
-        if is_te_min_version("2.4.0.dev0"):
-            assert class_has_init_param(te.pytorch.LayerNormLinear, "use_fsdp2"), "Transformer Engine v2.4.0 or later is required to use use_fsdp2"
-            extra_kwargs["use_fsdp2"] = self.config.use_fsdp2
+        if is_te_min_version("2.4.0"):
+            if class_has_init_param(te.pytorch.LayerNormLinear, "use_fsdp2"):
+                extra_kwargs["use_fsdp2"] = self.config.use_fsdp2
+            else:
+                warnings.warn(
+                    "Transformer Engine is missing `use_fsdp2`; latest FSDP2 features will "
+                    "not be applied. Consider upgrading to a newer version of Transformer "
+                    "Engine.",
+                    UserWarning,
+                )
         if self.config.symmetric_ar_type is not None:
             assert is_torch_min_version("2.7.0a0"), "Must have at least torch version 2.7 or higher"
             assert is_te_min_version("2.3.0") or get_te_version() == PkgVersion(
