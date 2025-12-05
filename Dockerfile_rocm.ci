@@ -65,7 +65,7 @@ RUN git clone https://github.com/sudhu2k/mamba mamba &&\
     cd mamba &&\
     git checkout hipcub_warp_threads_deprecation &&\
     git show --oneline -s &&\
-    pip install --no-build-isolation .
+    pip install --no-build-isolation --no-deps .
 
 # Build flash-attention
 ARG BUILD_FA="1"
@@ -82,7 +82,7 @@ fi
 # Clone TE repo and submodules
 WORKDIR ${STAGE_DIR}
 
-ARG TE_COMMIT=c91bac54e9ff4992cdf2dbee9218d039986ebcd7
+ARG TE_COMMIT=release_v2.2_rocm
 ENV NVTE_FRAMEWORK=pytorch
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH_OVERRIDE}
 ENV NVTE_USE_HIPBLASLT=1

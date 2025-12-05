@@ -64,14 +64,24 @@ jobs:
           echo "Using GPU arch: $ARCH"
           echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
 
-      - name: Build Docker image
-        run: |
-          set -euxo pipefail
-          docker build --no-cache \
-            -f Dockerfile_rocm.ci \
-            --build-arg PYTORCH_ROCM_ARCH_OVERRIDE=${{ steps.gpu-arch.outputs.arch }} \
-            -t megatron-lm-ci:${{ github.sha }} \
-            .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image with registry cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile_rocm.ci
+          push: true
+          load: true
+          tags: |
+            rocm/megatron-lm-private:${{ github.sha }}
+          build-args: |
+            PYTORCH_ROCM_ARCH_OVERRIDE=${{ steps.gpu-arch.outputs.arch }}
+          cache-from: |
+            type=registry,ref=rocm/megatron-lm-private:cache
+          cache-to: |
+            type=registry,ref=rocm/megatron-lm-private:cache,mode=max
 
       - name: Run unit tests in container
         run: |
@@ -87,11 +97,11 @@ jobs:
             --security-opt seccomp=unconfined \
             --security-opt apparmor=unconfined \
             --shm-size=128G \
-            -v "${{ github.workspace }}:/workspace/Megatron-LM/output" \
+            -v "${{ github.workspace }}:/workspace/Megatron-LM" \
             --workdir /workspace/Megatron-LM \
             --name megatron-lm-container \
             --entrypoint /workspace/Megatron-LM/run_unit_tests.sh \
-            megatron-lm-ci:${{ github.sha }}
+            rocm/megatron-lm-private:${{ github.sha }}
 
       - name: List test reports
         if: always()
@@ -117,6 +127,6 @@ jobs:
       - name: Cleanup Docker image
         if: always()
         run: |
-          docker image rm megatron-lm-ci:${{ github.sha }} || true
+          docker image rm rocm/megatron-lm-private:${{ github.sha }} || true
 
 
