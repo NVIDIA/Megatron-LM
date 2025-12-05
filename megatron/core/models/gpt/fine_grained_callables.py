@@ -285,7 +285,7 @@ class TransformerLayerNode(ScheduleNode):
         # kept until all modules' backward_dw has been invoked.
         if self.delay_wgrad_compute:
             self.output_grads = grads
-            self.delay_grads_release = True
+            self.delay_grads_release = len(self.bwd_dw_callables) > 0
 
         # return grads for record stream
         return grads
