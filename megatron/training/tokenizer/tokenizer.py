@@ -167,15 +167,33 @@ class _HuggingFaceTokenizer(MegatronLegacyTokenizer):
         return self._tokenizer.decode(token_ids, **kwargs)
 
     def offsets(self, ids: list[int], text: str) -> list[int]:
-        retok_ids: "transformers.BatchEncoding" = self._tokenizer(text)
-        offsets, next_start_idx = [], 0
-        for i in range(len(ids)):
-            span = retok_ids.token_to_chars(i)
-            if span is not None:
-                offsets.append(span.start)
-                next_start_idx = span.end
-            else:
-                offsets.append(next_start_idx)
+        offsets = []
+        if getattr(self._tokenizer, "is_fast", False):
+            # Fast tokenizer: use token_to_chars
+            retok_ids: "transformers.BatchEncoding" = self._tokenizer(text)
+            next_start_idx = 0
+            for i in range(len(ids)):
+                span = retok_ids.token_to_chars(i)
+                if span is not None:
+                    offsets.append(span.start)
+                    next_start_idx = span.end
+                else:
+                    offsets.append(next_start_idx)
+
+        else:
+            # Slow tokenizer
+
+            current_pos = 0
+            for token_id in ids:
+                token_str = self._tokenizer.convert_ids_to_tokens(token_id)
+                idx = text.find(token_str, current_pos)
+
+                if idx == -1:
+                    offsets.append(current_pos)
+                else:
+                    offsets.append(idx)
+                    current_pos = idx + len(token_str)
+
         return offsets
 
     @property
