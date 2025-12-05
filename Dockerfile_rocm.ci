@@ -43,8 +43,11 @@ RUN python -m pip install -U "nltk>=3.8.2"
 
 RUN pip3 install "huggingface_hub[cli]"
 
-ENV NLTK_DATA=/usr/share/nltk_data
-RUN python3 -m nltk.downloader punkt_tab
+RUN python - <<'PY'
+import nltk
+ok = nltk.download('punkt_tab', download_dir='/usr/share/nltk_data', quiet=True)
+assert ok, "Failed to download punkt_tab"
+PY
 
 # Install Causal-Conv1d and its dependencies
 WORKDIR ${STAGE_DIR}
