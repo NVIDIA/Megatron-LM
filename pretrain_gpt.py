@@ -48,6 +48,10 @@ def get_batch(data_iterator, vp_stage=None):
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(data_iterator)
 
+    assert "cu_seqlens" not in batch and "max_seqlen" not in batch, (
+        "Packed sequence training is not yet supported for GPTModel."
+    )
+
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
