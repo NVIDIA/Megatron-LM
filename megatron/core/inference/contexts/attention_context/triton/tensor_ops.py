@@ -1,3 +1,4 @@
+import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
@@ -75,6 +76,154 @@ def _tensor_merge_kernel(
 
             tensor_b_data = tl.load(tensor_b_ptr, mask=row_mask, other=0.0)
             tl.store(output_ptr, tensor_b_data, mask=row_mask)
+
+
+@triton.jit
+def _tensor_masked_update_kernel_2d(
+    STATES_PTR,
+    IDX_PTR,
+    NEW_STATES_PTR,
+    stride_state_b,
+    stride_state_d0,
+    stride_new_b,
+    stride_new_d0,
+    ROW_SIZE,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Kernel to update values in a 2D states tensor using a mask."""
+    pid_batch = tl.program_id(0)
+    pid_row_chunk = tl.program_id(1)
+
+    target_idx = tl.load(IDX_PTR + pid_batch)
+    if target_idx == -1:
+        return
+
+    row_start_offset = pid_row_chunk * BLOCK_SIZE
+    row_offsets = row_start_offset + tl.arange(0, BLOCK_SIZE)
+    mask = row_offsets < ROW_SIZE
+
+    # 2D Calculation: base + batch * stride0 + col * stride1
+    dst_ptr = STATES_PTR + (target_idx * stride_state_b) + (row_offsets * stride_state_d0)
+    src_ptr = NEW_STATES_PTR + (pid_batch * stride_new_b) + (row_offsets * stride_new_d0)
+
+    val = tl.load(src_ptr, mask=mask)
+    tl.store(dst_ptr, val, mask=mask)
+
+
+@triton.jit
+def _tensor_masked_update_kernel_3d(
+    STATES_PTR,
+    IDX_PTR,
+    NEW_STATES_PTR,
+    stride_state_b,
+    stride_state_d0,
+    stride_state_d1,
+    stride_new_b,
+    stride_new_d0,
+    stride_new_d1,
+    SIZE_D0,
+    SIZE_D1,  # Dimensions of the non-batch axes
+    ROW_SIZE,  # Total elements per batch item (D0 * D1)
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Kernel to update values in a 3D states tensor using a mask."""
+    pid_batch = tl.program_id(0)
+    pid_row_chunk = tl.program_id(1)
+
+    target_idx = tl.load(IDX_PTR + pid_batch)
+    if target_idx == -1:
+        return
+
+    # Linear index within the "row" (flattened 3D volume)
+    row_start_offset = pid_row_chunk * BLOCK_SIZE
+    flat_offsets = row_start_offset + tl.arange(0, BLOCK_SIZE)
+    mask = flat_offsets < ROW_SIZE
+
+    # Reconstruct 3D coordinates from linear index
+    # Given shape (batch, D0, D1)
+    # idx_d1 = flat_idx % D1
+    # idx_d0 = flat_idx // D1
+    idx_d1 = flat_offsets % SIZE_D1
+    idx_d0 = flat_offsets // SIZE_D1
+
+    # Calculate pointers using specific strides
+    dst_offset = (
+        (target_idx * stride_state_b) + (idx_d0 * stride_state_d0) + (idx_d1 * stride_state_d1)
+    )
+
+    src_offset = (pid_batch * stride_new_b) + (idx_d0 * stride_new_d0) + (idx_d1 * stride_new_d1)
+
+    dst_ptr = STATES_PTR + dst_offset
+    src_ptr = NEW_STATES_PTR + src_offset
+
+    val = tl.load(src_ptr, mask=mask)
+    tl.store(dst_ptr, val, mask=mask)
+
+
+@triton.jit
+def _tensor_masked_update_kernel_4d(
+    STATES_PTR,
+    IDX_PTR,
+    NEW_STATES_PTR,
+    stride_state_b,
+    stride_state_d0,
+    stride_state_d1,
+    stride_state_d2,
+    stride_new_b,
+    stride_new_d0,
+    stride_new_d1,
+    stride_new_d2,
+    SIZE_D0,
+    SIZE_D1,
+    SIZE_D2,  # Dimensions (C, H, W)
+    ROW_SIZE,  # Total elements (C * H * W)
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Kernel to update values in a 4D states tensor using a mask."""
+    pid_batch = tl.program_id(0)
+    pid_row_chunk = tl.program_id(1)
+
+    target_idx = tl.load(IDX_PTR + pid_batch)
+    if target_idx == -1:
+        return
+
+    # Linear index
+    row_start_offset = pid_row_chunk * BLOCK_SIZE
+    flat_offsets = row_start_offset + tl.arange(0, BLOCK_SIZE)
+    mask = flat_offsets < ROW_SIZE
+
+    # Reconstruct 4D coordinates from linear index
+    # Given shape (batch, D0, D1, D2)
+    # idx_d2 = flat % D2
+    # temp   = flat // D2
+    # idx_d1 = temp % D1
+    # idx_d0 = temp // D1
+
+    idx_d2 = flat_offsets % SIZE_D2
+    temp = flat_offsets // SIZE_D2
+    idx_d1 = temp % SIZE_D1
+    idx_d0 = temp // SIZE_D1
+
+    # Calculate pointers using specific strides
+    dst_offset = (
+        (target_idx * stride_state_b)
+        + (idx_d0 * stride_state_d0)
+        + (idx_d1 * stride_state_d1)
+        + (idx_d2 * stride_state_d2)
+    )
+
+    src_offset = (
+        (pid_batch * stride_new_b)
+        + (idx_d0 * stride_new_d0)
+        + (idx_d1 * stride_new_d1)
+        + (idx_d2 * stride_new_d2)
+    )
+
+    dst_ptr = STATES_PTR + dst_offset
+    src_ptr = NEW_STATES_PTR + src_offset
+
+    val = tl.load(src_ptr, mask=mask)
+    tl.store(dst_ptr, val, mask=mask)
 
 
 def _compute_row_size(tensor):
@@ -199,3 +348,86 @@ def tensor_merge(tensor_a, tensor_b, output_tensor, pos_on_device, check_bounds:
         BLOCK_SIZE=block_size,
         OUTPUT_BATCH_SIZE=output_batch_size,
     )
+
+
+def tensor_masked_update(states: torch.Tensor, idx: torch.Tensor, new_states: torch.Tensor):
+    """
+    Update `states` to `new_states` at `idx`, but ignore any -1 values in `idx`.
+    Works for 2D, 3D, or 4D tensors.
+
+    Args:
+        states: (N, ...) - Destination tensor (2D, 3D, or 4D)
+        idx: (B,) - Indices to update. -1 means skip.
+        new_states: (B, ...) - Source tensor. Must match states shape[1:]
+    """
+    assert states.is_cuda and idx.is_cuda and new_states.is_cuda
+    assert idx.ndim == 1
+    assert states.shape[1:] == new_states.shape[1:], "State dimensions must match"
+
+    ndim = states.ndim
+    assert ndim in [2, 3, 4], "Only 2D, 3D, and 4D tensors are supported"
+
+    n_updates = idx.shape[0]
+
+    row_size = 1
+    for dim in states.shape[1:]:
+        row_size *= dim
+
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (n_updates, triton.cdiv(row_size, meta['BLOCK_SIZE']))
+
+    if ndim == 2:
+        _tensor_masked_update_kernel_2d[grid](
+            STATES_PTR=states,
+            IDX_PTR=idx,
+            NEW_STATES_PTR=new_states,
+            stride_state_b=states.stride(0),
+            stride_state_d0=states.stride(1),
+            stride_new_b=new_states.stride(0),
+            stride_new_d0=new_states.stride(1),
+            ROW_SIZE=row_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+    elif ndim == 3:
+        # Shapes: (N, D0, D1)
+        _tensor_masked_update_kernel_3d[grid](
+            STATES_PTR=states,
+            IDX_PTR=idx,
+            NEW_STATES_PTR=new_states,
+            # Strides
+            stride_state_b=states.stride(0),
+            stride_state_d0=states.stride(1),
+            stride_state_d1=states.stride(2),
+            stride_new_b=new_states.stride(0),
+            stride_new_d0=new_states.stride(1),
+            stride_new_d1=new_states.stride(2),
+            # Dims
+            SIZE_D0=states.shape[1],
+            SIZE_D1=states.shape[2],
+            ROW_SIZE=row_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+    elif ndim == 4:
+        # Shapes: (N, D0, D1, D2)
+        _tensor_masked_update_kernel_4d[grid](
+            STATES_PTR=states,
+            IDX_PTR=idx,
+            NEW_STATES_PTR=new_states,
+            # Strides
+            stride_state_b=states.stride(0),
+            stride_state_d0=states.stride(1),
+            stride_state_d1=states.stride(2),
+            stride_state_d2=states.stride(3),
+            stride_new_b=new_states.stride(0),
+            stride_new_d0=new_states.stride(1),
+            stride_new_d1=new_states.stride(2),
+            stride_new_d2=new_states.stride(3),
+            # Dims
+            SIZE_D0=states.shape[1],
+            SIZE_D1=states.shape[2],
+            SIZE_D2=states.shape[3],
+            ROW_SIZE=row_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )

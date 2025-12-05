@@ -3,6 +3,7 @@ import torch
 
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_get_slice_after,
+    tensor_masked_update,
     tensor_merge,
 )
 
@@ -224,3 +225,59 @@ def test_tensor_merge_small(device):
 
     assert torch.equal(output_tensor[:2], tensor_a[:2])
     assert torch.equal(output_tensor[2:7], tensor_b)
+
+
+@pytest.mark.parametrize("ndim", [2, 3, 4])
+def test_tensor_masked_update(device, ndim):
+    """
+    Tests tensor_masked_update for 2D, 3D, and 4D tensors.
+    Covering 3 scenarios:
+    1. idx has only valid values (arbitrary order).
+    2. idx has mixed valid values and -1s (all -1s at the end).
+    3. idx has all -1s.
+    """
+
+    num_states = 32
+    batch_size = 8
+
+    # Define shapes based on dimensionality
+    if ndim == 2:
+        shape_states = (num_states, 64)
+        shape_new = (batch_size, 64)
+    elif ndim == 3:
+        shape_states = (num_states, 8, 8)
+        shape_new = (batch_size, 8, 8)
+    elif ndim == 4:
+        shape_states = (num_states, 4, 4, 4)
+        shape_new = (batch_size, 4, 4, 4)
+
+    def allocate_tensors():
+        states = torch.randn(shape_states, device=device)
+        new_states = torch.randn(shape_new, device=device)
+        return states, new_states
+
+    # Scenario 1: no -1s
+    states, new_states = allocate_tensors()
+    idx = torch.randperm(num_states, device=device)[:batch_size]
+    expected_states = states.clone()
+    expected_states[idx] = new_states
+    tensor_masked_update(states, idx, new_states)
+    assert torch.equal(states, expected_states), f"Failed {ndim}D: all valid idx values"
+
+    # Scenario 2: mix of regular values and -1s
+    states, new_states = allocate_tensors()
+    num_valid = batch_size // 2
+    valid_indices = torch.randperm(num_states, device=device)[:num_valid]
+    idx = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+    idx[:num_valid] = valid_indices
+    expected_states = states.clone()
+    expected_states[valid_indices] = new_states[:num_valid]
+    tensor_masked_update(states, idx, new_states)
+    assert torch.equal(states, expected_states), f"Failed {ndim}D: mix of valid and mask values"
+
+    # Scenario 3: all -1s
+    states, new_states = allocate_tensors()
+    idx = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+    expected_states = states.clone()
+    tensor_masked_update(states, idx, new_states)
+    assert torch.equal(states, expected_states), f"Failed {ndim}D: all mask values"

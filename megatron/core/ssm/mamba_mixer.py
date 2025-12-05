@@ -20,6 +20,7 @@ from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFac
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_get_slice_after,
+    tensor_masked_update,
     tensor_merge,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -35,7 +36,6 @@ from megatron.core.utils import (
     check_mamba_sequence_packing_support,
     deprecate_inference_params,
     log_single_rank,
-    maybe_cat,
 )
 
 from .mamba_context_parallel import MambaContextParallel
@@ -633,9 +633,10 @@ class MambaMixer(MegatronModule):
         if conv_state is not None and is_dynamic_batching:
             # xBC should have shape (b l d) for causal_conv1d_varlen_states
             assert batch_indices is not None
-            conv_state[batch_indices] = causal_conv1d_varlen_states(
+            conv_varlen_states = causal_conv1d_varlen_states(
                 xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
             )
+            tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
             # Maintain channels-last memory layout to use seq_idx for causal_conv1d_fn
             # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
@@ -736,12 +737,12 @@ class MambaMixer(MegatronModule):
             if return_varlen_states:
                 assert batch_indices is not None
 
-                y, _, varlen_states = y
+                y, _, ssm_varlen_states = y
 
                 # This has to be varlen_states, NOT last_state
                 # See reference implementation:
                 # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
-                ssm_state[batch_indices] = varlen_states
+                tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
             else:
                 y, last_state = y
                 ssm_state.copy_(last_state)

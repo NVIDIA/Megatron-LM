@@ -51,7 +51,7 @@ class MambaMetadata:
             (self.max_requests,), -1, dtype=torch.int32, device=self.device
         )
         self._seq_idx_buffer = torch.full(
-            (self.max_tokens,), -1, dtype=torch.int32, device=self.device
+            (1, self.max_tokens), -1, dtype=torch.int32, device=self.device
         )
         self._cu_seqlens_buffer = torch.zeros(
             (self.max_requests + 1,), dtype=torch.int32, device=self.device
@@ -139,13 +139,12 @@ class MambaMetadata:
             # Update seq_idx
             seq_len = real_token_count - real_decode_count
             padded_seq_len = padded_token_count - padded_decode_count
-
-            self._seq_idx_buffer[:seq_len].copy_(
+            self._seq_idx_buffer[:, :seq_len].copy_(
                 token_to_request_idx[real_decode_count:real_token_count] - real_decode_count
             )
             if padded_seq_len > seq_len:
-                self._seq_idx_buffer[seq_len:padded_seq_len].fill_(-1)
-            self.seq_idx = self._seq_idx_buffer[:padded_seq_len].unsqueeze(0)
+                self._seq_idx_buffer[:, seq_len:padded_seq_len].fill_(-1)
+            self.seq_idx = self._seq_idx_buffer[:, :padded_seq_len]
 
             # Update cu_seqlens
             self._cu_seqlens_buffer[0] = 0
@@ -161,8 +160,8 @@ class MambaMetadata:
             self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
-            self._device_decode_prefill_buffer[0] = padded_decode_count
-            self._device_decode_prefill_buffer[1] = padded_prefill_count
+            self._device_decode_prefill_buffer[0] = real_decode_count
+            self._device_decode_prefill_buffer[1] = real_prefill_count
             self.device_decode_prefill = self._device_decode_prefill_buffer
 
     def allocate_slot(self) -> Optional[int]:
