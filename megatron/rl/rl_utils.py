@@ -1850,6 +1850,8 @@ def prepare_data_for_update(
                     TensorDataset(compute_trajs, compute_position_ids), batch_size=logprobs_batch_size
                 )
 
+            dtype = torch.bfloat16 if args.bf16 else ( torch.float16 if args.fp16 else torch.float32 )
+
             old_logprobs = []
 
             # Compute logprobs
@@ -1873,8 +1875,9 @@ def prepare_data_for_update(
 
             if is_pipeline_last_stage():
                 old_logprobs = torch.concat(old_logprobs, dim=0)
+                assert old_logprobs.dtype == dtype
             else:
-                old_logprobs = torch.empty(len(compute_trajs), args.seq_length-1, dtype=torch.bfloat16, device=torch.cuda.current_device())
+                old_logprobs = torch.empty(len(compute_trajs), args.seq_length-1, dtype=dtype, device=torch.cuda.current_device())
 
             dist.broadcast(old_logprobs, src=get_pipeline_model_parallel_last_rank(), group=get_pipeline_model_parallel_group())
             old_logprobs = old_logprobs.cpu()
@@ -1960,8 +1963,9 @@ def prepare_data_for_update(
 
             if is_pipeline_last_stage():
                 ref_logprobs = torch.concat(ref_logprobs, dim=0)
+                assert ref_logprobs.dtype == dtype
             else:
-                ref_logprobs = torch.empty(len(compute_trajs), args.seq_length-1, dtype=torch.bfloat16, device=torch.cuda.current_device())
+                ref_logprobs = torch.empty(len(compute_trajs), args.seq_length-1, dtype=dtype, device=torch.cuda.current_device())
             dist.broadcast(ref_logprobs, src=get_pipeline_model_parallel_last_rank(), group=get_pipeline_model_parallel_group())
             ref_logprobs = ref_logprobs.cpu()
 
