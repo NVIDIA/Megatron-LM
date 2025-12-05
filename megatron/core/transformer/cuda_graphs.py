@@ -600,11 +600,39 @@ class _CudaGraphRunner(torch.nn.Module):
             _determine_if_first_last_layer_of_this_vp_chunk(base_module)
         )
 
+        # We use this attribute to record the value of 'is_first_microbatch' each fwd cudagraph replay
+        # so that way we only update the value of this flag in FP8GlobalStateManager when it changes,
+        # which incurs an expensive HtoD sync
+        if self.is_first_layer:
+            self.fp8_param_cache_updated = None
+
         if hasattr(self.base_module, "config") and isinstance(self.base_module.config, TransformerConfig):
             self.fuse_wgrad_accumulation = self.base_module.config.gradient_accumulation_fusion
             self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
             self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
             self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
+            self.fp8_enabled = self.base_module.config.fp8 is not None
+            self.fp4_enabled = self.base_module.config.fp4 is not None
+            self.fp8_runtime_enabled = None
+            self.fp4_runtime_enabled = None
+
+            if self.fp8_enabled:
+                self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+
+            if self.fp4_enabled:
+                from megatron.core.fp4_utils import get_fp4_recipe  # to avoid circular import
+
+                self.fp4_recipe = get_fp4_recipe(self.base_module.config)
+                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+
+
+
+    def __str__(self):
+        return "%s; hid %s" % (
+            self.base_module.__class__.__name__,
+            tuple(self.fwd_graph_input_kwarg_metas["hidden_states"].shape),
+        )
 
     def get_fp8_context(self):
         """Return a new fp8 context in cudagraph mode."""
@@ -626,9 +654,9 @@ class _CudaGraphRunner(torch.nn.Module):
         if not self.is_transformer_decoder_layer:
             return nullcontext()
 
-        if self.fp8_enabled:
+        if self.fp8_runtime_enabled:
             return self.get_fp8_context()
-        elif self.fp4_enabled:
+        elif self.fp4_runtime_enabled:
             return self.get_fp4_context()
         else:
             return nullcontext()
@@ -839,8 +867,6 @@ class _CudaGraphRunner(torch.nn.Module):
             for name in tracker:
                 tracker[name]["values"].copy_(cached_aux_losses[name])
 
-
-
     def create_bwd_graph(self, global_tensor_pool):
         """Create a bwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
@@ -1025,14 +1051,11 @@ class _CudaGraphRunner(torch.nn.Module):
                         from transformer_engine.common.recipe import NVFP4BlockScaling
                         recipe = FP8GlobalStateManager.get_fp8_recipe()
                         if isinstance(recipe, NVFP4BlockScaling):
-                            self.fp4_enabled = True
-                            self.fp4_recipe = get_fp4_recipe(self.base_module.config)
+                            self.fp4_runtime_enabled = True
                         else:
-                            self.fp8_enabled = True
-                            self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                            self.fp8_runtime_enabled = True
                     else:        
-                        self.fp8_enabled = True
-                        self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                        self.fp8_runtime_enabled = True
 
 
             logger.debug(f"Recording forward graph creation...")
@@ -1464,6 +1487,7 @@ class CudaGraphManager(torch.nn.Module):
                     runner.eval()
                 out = runner.record_graph_capture(args, kwargs)
 
+        self.is_first_microbatch = False
         # If forward only, next replay should be a forward pass as well
         if self.training and torch.is_grad_enabled():
             runner.status = _GraphStatus.BWD_READY
