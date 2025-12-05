@@ -2088,20 +2088,22 @@ def maybe_cat(a, b, dim=0, *, required=False):
     return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
 
 
+_ASYNC_IO_LOOP: asyncio.AbstractEventLoop | None = None
+
+
 def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
     """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
+    global _ASYNC_IO_LOOP
     if loop is None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError as e:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            if _ASYNC_IO_LOOP is not None:
+                return _ASYNC_IO_LOOP
+            else:
+                _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
     return loop
-
-
-def is_using_quantization_scales(config):
-    """Returns whether the model is using quantization scales based on the config."""
-    return getattr(config, "fp8", False) or getattr(config, "fp4", False)
 
 
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
@@ -2297,4 +2299,37 @@ def internal_api(func: Callable) -> Callable:
             pass
     """
     func._internal_api = True
+    return func
+
+
+def experimental_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as experimental API.
+
+    Use this decorator for:
+    - Experimental features that may change without notice
+    - New APIs under active development
+    - Features that are not yet stable
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks, allowing rapid iteration during development.
+
+    Args:
+        func: The function or class to mark as experimental
+
+    Returns:
+        The original function/class with an experimental API marker
+
+    Example:
+        @experimental_api
+        def new_experimental_feature():
+            '''This API is experimental and may change'''
+            pass
+
+        @experimental_api
+        class ExperimentalModel:
+            '''This model is under active development'''
+            pass
+    """
+    func._experimental_api = True
     return func

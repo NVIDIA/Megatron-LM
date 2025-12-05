@@ -97,6 +97,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Model provider",
     )
     group.add_argument(
+        "--skip-prompt-log-probs",
+        action='store_true',
+        default=False,
+        help='Skip prompt log probs.',
+    )
+    group.add_argument(
         "--output-path",
         type=str,
         default=None,
@@ -300,7 +306,8 @@ def get_requests_from_file(
     # Load prompts.
     n_prompts = sum(1 for _ in open(args.prompt_file))
     prompts = []
-    sampling_params = get_default_sampling_params(tokenizer.eod)
+    if sampling_params is None:
+        sampling_params = get_default_sampling_params(tokenizer.eod)
     sampling_params_list = []
     with open(args.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
@@ -379,12 +386,7 @@ def build_dynamic_engine_setup_prefix(
     """
     # CUDA graph config
     if args.cuda_graph_impl == "local":
-        cg_str = (
-            "graphs "
-            f"[{len(context.cuda_graph_token_counts)}] "
-            f"{context.cuda_graph_token_counts[0]}:"
-            f"{context.cuda_graph_token_counts[-1]}"
-        )
+        cg_str = f"graphs {len(context.cuda_graph_batch_dimensions_list)}"
     else:
         cg_str = "--"
 
