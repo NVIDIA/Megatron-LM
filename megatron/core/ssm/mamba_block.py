@@ -27,6 +27,9 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
+
+from megatron.core.ssm.mlp_layer import MLPLayer
+
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
@@ -284,6 +287,15 @@ class MambaStack(MegatronModule):
                 with inner_fp8_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                        )
+                    elif isinstance(layer, MLPLayer):
+                        # MLPLayer (standalone MLP without attention)
+                        hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             inference_context=inference_context,

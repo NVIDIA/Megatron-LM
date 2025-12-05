@@ -1799,6 +1799,10 @@ def _add_network_size_args(parser):
                        'which serves as an additional training objective.')
     group.add_argument('--moe-latent-size', type=int, default=None,
                        help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
+    group.add_argument('--mtp-use-repeated-layer', action='store_true',
+                       help='Use a single MTP layer repeatedly instead of multiple separate layers. '
+                       'This is more parameter-efficient. When enabled, only 1 MTP layer is created '
+                       'and applied --mtp-num-layers times.')
     return parser
 
 
