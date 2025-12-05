@@ -59,6 +59,7 @@ jobs:
     uses: ./.github/workflows/_build_test_publish_wheel.yml
     with:
       dry-run: true
+      ref: ${{ inputs.release-ref }}
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
@@ -305,6 +306,7 @@ jobs:
     uses: ./.github/workflows/_build_test_publish_wheel.yml
     with:
       dry-run: false
+      ref: ${{ inputs.release-ref }}
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
