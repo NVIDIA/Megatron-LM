@@ -51,6 +51,7 @@ except ImportError:
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    get_attr_wrapped_model,
     get_model_config,
     StragglerDetector,
 )
@@ -1183,7 +1184,7 @@ def setup_model_and_optimizer(
         # set dense model related args in to global args before getting dense model
         args.num_experts = None
         args.expert_model_parallel_size = 1
-        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity 
+        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
         dense_model_for_upcycling = get_model(model_provider_func, model_type)
@@ -1434,6 +1435,7 @@ def training_log(
     grad_norm,
     params_norm,
     num_zeros_in_grad,
+    pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1623,6 +1625,7 @@ def training_log(
             num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
+            pg_collection=pg_collection,
         )
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
@@ -2093,6 +2096,8 @@ def train(
     for model_module in model:
         model_module.train()
 
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+
     # Tracking loss.
     total_loss_dict = {}
 
@@ -2456,6 +2461,7 @@ def train(
             grad_norm,
             params_norm,
             num_zeros_in_grad,
+            pg_collection=model_pg_collection,
         )
 
         # Evaluation.
@@ -2744,7 +2750,7 @@ def evaluate_and_print_results(
         eval_iters = [args.eval_iters]
     else:
         eval_iters = args.eval_iters
-        
+
     if args.full_validation:
         assert len(eval_iters) == len(data_iterators)
 
@@ -2760,7 +2766,7 @@ def evaluate_and_print_results(
         eval_iters = [args.eval_iters]
     else:
         eval_iters = args.eval_iters
-    
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
@@ -2956,7 +2962,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
     if valid_dataloaders is not None:
         # when using full validation, we need to override eval iters with the correct
-        # number of iterations on tp rank 0 so that it can be distributed to the other 
+        # number of iterations on tp rank 0 so that it can be distributed to the other
         # ranks later
         if args.full_validation:
             if args.multiple_validation_sets:
