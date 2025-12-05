@@ -11,19 +11,12 @@ from typing import Any, Optional, Union
 
 from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.utils import unwrap_model
 
 from . import build_centralized_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
-
-
-def _unwrap_module(module: LanguageModule) -> Any:
-    return (
-        module.module.module
-        if hasattr(module, 'module') and hasattr(module.module, 'module')
-        else module.module if hasattr(module, 'module') else module
-    )
 
 
 def swap_model_weights(
@@ -61,8 +54,8 @@ def reshard_model_weights(
     num_experts = src_lm.config.num_moe_experts
 
     # Unwrap to get owning modules (with parameters and pg_collection)
-    src_core = _unwrap_module(src_lm)
-    tgt_core = _unwrap_module(tgt_lm)
+    src_core = unwrap_model(src_lm)
+    tgt_core = unwrap_model(tgt_lm)
 
     # Ensure pg_collection exists
     if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
