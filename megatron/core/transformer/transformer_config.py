@@ -11,6 +11,7 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.utils import experimental_api
 
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
@@ -31,6 +32,7 @@ except ImportError:
 
 
 @dataclass
+@experimental_api
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
 
@@ -1924,6 +1926,7 @@ class TransformerConfig(ModelParallelConfig):
 
 
 @dataclass
+@experimental_api
 class MLATransformerConfig(TransformerConfig):
     """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.
 
