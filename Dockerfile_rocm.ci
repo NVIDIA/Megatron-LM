@@ -3,7 +3,7 @@ FROM $BASE_DOCKER
 
 ARG PYTORCH_ROCM_ARCH_OVERRIDE="gfx942"
 
-ENV NO_PROXY=localhost,127.0.0.1,pypi.org,files.pythonhosted.org
+ENV NO_PROXY=localhost,127.0.0.1,pypi.org,files.pythonhosted.org,raw.githubusercontent.com,nltk.github.io
 ENV WORKSPACE_DIR=/workspace
 ENV STAGE_DIR=/workspace/installs
 ENV PIP_DEFAULT_TIMEOUT=120
