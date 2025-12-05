@@ -1780,8 +1780,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for src_tensors, (model_param, param_range_map) in zip(
                         bucket_state, gbuf_range_map["param_map"].items()
                     ):
+                        # Strip metadata fields like 'padding' before loading the state tensors.
+                        param_state_tensors = {
+                            k: v for k, v in src_tensors.items() if k != "padding"
+                        }
                         # Main param & optimizer states.
-                        self._set_main_param_and_optimizer_states(model_param, src_tensors)
+                        self._set_main_param_and_optimizer_states(model_param, param_state_tensors)
 
     @torch.no_grad()
     def load_parameter_state_from_fs_model_space(self, state_dict):
