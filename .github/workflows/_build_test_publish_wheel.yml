@@ -1,6 +1,11 @@
 on:
   workflow_call:
     inputs:
+      ref:
+        required: false
+        description: Ref (SHA or branch) to release
+        type: string
+        default: ${{ github.sha }}
       dry-run:
         required: false
         description: Upload to PyPy Test instance
@@ -41,6 +46,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Build wheel
         id: build-wheel
