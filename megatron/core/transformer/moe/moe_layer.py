@@ -166,35 +166,15 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
-    def router_and_preprocess(self, hidden_states: torch.Tensor):
-        """Compute and preprocess token routing for dispatch.
+        self.fwd_execution_map = None
+
+    def route(self, hidden_states: torch.Tensor):
+        """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
-        producing routing probabilities and a mapping. It then preprocesses the
-        hidden states and probabilities for the token dispatcher. The original
-        hidden states are returned as a residual connection.
+        producing routing probabilities and a mapping.
         """
-        residual = hidden_states
-        probs, routing_map = self.router(hidden_states)
-        hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs
-        )
-        return hidden_states, probs, residual
 
-    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
-        """Dispatches tokens to assigned expert ranks via communication.
-        This method performs the actual communication (e.g., All-to-All) to distribute
-        tokens and their associated probabilities to the devices hosting their assigned
-        experts.
-        """
-        return self.token_dispatcher.token_dispatch(hidden_states, probs)
-
-    def shared_experts_compute(self, hidden_states: torch.Tensor):
-        """Computes the output of the shared experts.
-
-        If a shared expert is configured and not overlapped with communication,
-        it is computed here.
-        """
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
@@ -214,7 +194,31 @@ class MoELayer(BaseMoELayer):
             else:
                 shared_expert_output = self.shared_experts(hidden_states)
 
-        return shared_expert_output
+        probs, routing_map = self.router(hidden_states)
+        return probs, routing_map, shared_expert_output
+
+    def preprocess(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+    ):
+        """Preprocess token routing for dispatch.
+
+        This method preprocesses the hidden states and routing probabilities for the token
+        dispatcher. The original hidden states are returned as a residual connection.
+        """
+        residual = hidden_states
+        probs, routing_map = self.router(hidden_states)
+        hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+            hidden_states, routing_map, probs
+        )
+        return hidden_states, probs, residual
+
+    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+        """Dispatches tokens to assigned expert ranks via communication.
+        This method performs the actual communication (e.g., All-to-All) to distribute
+        tokens and their associated probabilities to the devices hosting their assigned
+        experts.
+        """
+        return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     def routed_experts_compute(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, residual: torch.Tensor
@@ -234,20 +238,29 @@ class MoELayer(BaseMoELayer):
 
         return output, mlp_bias
 
-    def combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
+    def combine(self, output: torch.Tensor):
         """Combines expert outputs via communication and adds shared expert output.
 
         This method uses the token dispatcher to combine the outputs from different
-        experts (e.g., via an All-to-All communication). It then adds the output
-        from the shared expert if it exists.
+        experts (e.g., via an All-to-All communication)
         """
         output = self.token_dispatcher.token_combine(output)
         output = self.token_dispatcher.combine_postprocess(output)
+        return output
+
+    def dispatch_expert_compute_combine(self, hidden_states, probs, routing_map):
+        hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
+        dispatched_input, probs = self.dispatch(hidden_states, probs)
+        output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
+        output = self.combine(output)
+        return output, mlp_bias
+
+    def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         if shared_expert_output is not None:
             output = output + shared_expert_output
         return output
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, intermediate_tensors=None):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -269,12 +282,27 @@ class MoELayer(BaseMoELayer):
             )
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states):
-            shared_expert_output = self.shared_experts_compute(hidden_states)
-            hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
-            dispatched_input, probs = self.dispatch(hidden_states, probs)
-            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
-            output = self.combine(output, shared_expert_output)
+        def custom_forward(hidden_states, intermediate_tensors=None):
+            if self.fwd_execution_map is not None:
+                if "route" in self.fwd_execution_map:
+                    return self.route(hidden_states)
+            else:
+                probs, routing_map, shared_expert_output = self.route(hidden_states)
+
+            if self.fwd_execution_map is not None:
+                if "dispatch_expert_compute_combine" in self.fwd_execution_map:
+                    hidden_states, probs, routing_map = intermediate_tensors
+                    return self.dispatch_expert_compute_combine(hidden_states, probs, routing_map)
+            else:
+                output, mlp_bias = self.dispatch_expert_compute_combine(hidden_states, probs, routing_map)
+
+            if self.fwd_execution_map is not None:
+                if "postprocess" in self.fwd_execution_map:
+                    output, shared_expert_output, mlp_bias = intermediate_tensors
+                    return self.postprocess(output, shared_expert_output)
+            else:
+                output = self.postprocess(output, shared_expert_output) 
+
             return output, mlp_bias
 
         if self.moe_layer_recompute:
@@ -285,11 +313,12 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
+                    intermediate_tensors,
                 )
             else:
-                output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states, intermediate_tensors)
         else:
-            output, mlp_bias = custom_forward(hidden_states)
+            outputs = custom_forward(hidden_states, intermediate_tensors)
 
         return output, mlp_bias
 
