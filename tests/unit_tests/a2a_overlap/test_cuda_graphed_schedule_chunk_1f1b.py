@@ -15,6 +15,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -350,9 +351,9 @@ class TestPartialCudaGraphedA2AOverlap:
 
         loss_list_ref = self._run_test_helper(4, "none", None, 3, **extra_kwargs)
         for cuda_graph_scope in [
-            ["attn"],
-            ["attn", "moe_router"],
-            ["attn", "moe_router", "moe_preprocess"],
+            [CudaGraphScope.attn],
+            [CudaGraphScope.attn, CudaGraphScope.moe_router],
+            [CudaGraphScope.attn, CudaGraphScope.moe_router, CudaGraphScope.moe_preprocess],
         ]:
             cuda_graph_warmup_steps = 3
             loss_list = self._run_test_helper(
