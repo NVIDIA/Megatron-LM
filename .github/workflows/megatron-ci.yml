@@ -64,14 +64,21 @@ jobs:
           echo "Using GPU arch: $ARCH"
           echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build Docker image
-        run: |
-          set -euxo pipefail
-          docker build --no-cache \
-            -f Dockerfile_rocm.ci \
-            --build-arg PYTORCH_ROCM_ARCH_OVERRIDE=${{ steps.gpu-arch.outputs.arch }} \
-            -t megatron-lm-ci:${{ github.sha }} \
-            .
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile_rocm.ci
+          push: false
+          load: true
+          tags: megatron-lm-ci:${{ github.sha }}
+          build-args: |
+            PYTORCH_ROCM_ARCH_OVERRIDE=${{ steps.gpu-arch.outputs.arch }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Run unit tests in container
         run: |
