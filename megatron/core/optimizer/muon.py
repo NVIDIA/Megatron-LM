@@ -234,9 +234,10 @@ def get_megatron_muon_optimizer(
             # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
-            # TODO(deyuf): might not be sufficient for future algorithm. revisit this conditioning
-            if not getattr(param, 'is_embedding_or_output_parameter', False) and not (
-                len(param.shape) == 1
+            # TODO(deyuf): currently only allow 2D non-embedding weight to avoid breaking
+            if (
+                not getattr(param, 'is_embedding_or_output_parameter', False)
+                and len(param.shape) == 2
             ):
                 linear_params.append(param)
             else:
@@ -339,6 +340,7 @@ def get_megatron_muon_optimizer(
         param.requires_grad = True
 
     # chain everything together
+    init_fns = [muon_init_state_fn] + len(chained_adam.chained_optimizers) * [adam_init_state_fn]
     optimizers += chained_adam.chained_optimizers
 
     if layer_wise_distributed_optimizer:
@@ -346,9 +348,6 @@ def get_megatron_muon_optimizer(
         if reset_config_bf16:
             config.bf16 = True
         return LayerWiseDistributedOptimizer(
-            optimizers,
-            config,
-            pg_collection,
-            init_state_fn_list=[muon_init_state_fn, adam_init_state_fn],
+            optimizers, config, pg_collection, init_state_fn_list=init_fns
         )
     return ChainedOptimizer(optimizers)
