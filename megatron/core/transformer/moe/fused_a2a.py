@@ -3,6 +3,7 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+from megatron.core.utils import internal_api
 
 try:
     from deep_ep import Buffer
@@ -320,6 +321,7 @@ def init_hybrid_ep_buffer(
     )
 
 
+@internal_api
 class HybridEPDispatch(torch.autograd.Function):
     '''
     Fused dispatch operation for permute + dispatch a2a + permute using the HybridEP backend
@@ -396,6 +398,7 @@ class HybridEPDispatch(torch.autograd.Function):
         return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
 
 
+@internal_api
 class HybridEPCombine(torch.autograd.Function):
     '''
     Fused combine operation for permute + combine a2a + permute using the HybridEP backend
@@ -432,6 +435,7 @@ class HybridEPCombine(torch.autograd.Function):
 
 if HAVE_HYBRIDEP:
 
+    @internal_api
     def hybrid_ep_dispatch(
         x,
         routing_map,
@@ -482,6 +486,7 @@ if HAVE_HYBRIDEP:
             pad_multiple,
         )
 
+    @internal_api
     def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple):
         '''
         Perform fused combine operation for unpermute + combine a2a + unpermute
