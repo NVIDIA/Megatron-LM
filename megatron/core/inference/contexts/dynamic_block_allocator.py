@@ -77,7 +77,7 @@ class BlockAllocator:
         Return:
             (bool) Is memory available?
         """
-        return self.get_active_avail() >= num_blocks and self.total_avail >= num_blocks
+        return self.get_active_avail() >= num_blocks
 
     def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
         """Allocate memory blocks if available, else return None.
@@ -90,7 +90,6 @@ class BlockAllocator:
         """
         if self.is_memory_available(num_blocks):
             self.total_avail -= num_blocks
-            assert self.total_avail >= 0, f"Total available blocks cannot be negative {self.total_avail}"
             block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
             assert num_blocks == block_ids.numel()
             return block_ids

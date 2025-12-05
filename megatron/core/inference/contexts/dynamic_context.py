@@ -377,7 +377,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_count_total = buffer_size_bytes // (
             self.block_size_bytes + mamba_states_memory_per_request
         )
-        block_count_total = 1024 # Should be min reduce of all PP ranks, need to override this to something smaller than the smallest calculated value until that is implemented.
         self.block_allocator = BlockAllocator(
             context=self,
             total_count=(
@@ -386,18 +385,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Set max_total_requests, max_active_requests, max_tokens.
-
-        # The maximum number of requests is limited by the number of max sequence length requests that can fit in the buffer.
-        blocks_per_max_seq = -(-max_sequence_length // block_size_tokens)
-        self.max_total_requests = ( self.block_allocator.total_count - 1 ) // blocks_per_max_seq # -1 for dummy block
-
-        # The maximum number of active requests is limited by the number of active blocks and the number of total requests.
-        self.max_active_requests = min(self.max_total_requests, self.block_allocator.active_count)
-
-        # The maximum number of active requests must be divisible by the tensor model parallel size.
-        self.max_active_requests =self.max_active_requests // tp_size * tp_size
+        self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
+        max_active_requests = self.block_allocator.active_count // tp_size * tp_size
         self.max_active_requests = (
-            self.max_active_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
+            max_active_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
         )
         self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
 
@@ -1413,7 +1404,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         request_can_be_added = (
             self.total_request_count - self.paused_request_count < self.max_active_requests
-        ) and ( self.total_request_count < self.max_total_requests )
+        )
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
         )
@@ -1484,7 +1475,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             current_id = self.total_request_count
 
-        if current_id >= self.max_total_requests:
+        if current_id >= self.max_active_requests:
             raise RequestOverflowError(req.request_id)
 
         if self.active_token_count + chunk_length > self.max_tokens:
