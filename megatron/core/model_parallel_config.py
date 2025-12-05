@@ -247,10 +247,17 @@ class ModelParallelConfig:
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
     ep_overlap_early_attn_memory_release: bool = False
-    """Release the memory of the attention module early in EP overlap. The original attn_bwd 
-    happens after combine_forward, this flag will call attn_bwd before mlp_forward and attn's 
-    activation will be released earlier. Note this flag has performance impacts, the
-    moe_combine_fwd and moe_dispatch_bwd will be exposed."""
+    """Enable early memory release of attention activations during EP overlap.
+    EP overlap can increase peak memory usage when the overlapped forward module allocates 
+    more memory than what is freed by the backward module. This flag addresses this by 
+    reordering the attention backward pass to occur earlier in the schedule.
+    Specifically:
+    - Without this flag: attn_bwd executes after moe_combine_fwd
+    - With this flag: attn_bwd executes before mlp_fwd
+    The earlier execution releases attention activations sooner, reducing peak memory.
+    Note: This may impact performance as moe_combine_fwd and moe_dispatch_bwd become 
+    exposed (not overlapped with other computation).
+    """
 
     ###################
     # Pipeline Parallel
