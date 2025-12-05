@@ -3,6 +3,7 @@
 from typing import Optional
 
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+from megatron.core.metrics import collector
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
@@ -35,6 +36,7 @@ def get_moe_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_activation_func: bool = False,
+    metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE"""
     assert num_experts is not None
@@ -61,6 +63,8 @@ def get_moe_module_spec_for_backend(
 
     # MoE module spec
     moe_module_spec = ModuleSpec(
-        module=MoELayer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
+        module=MoELayer,
+        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
+        params={"metric_collector": metric_collector},
     )
     return moe_module_spec

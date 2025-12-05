@@ -4,6 +4,7 @@ import warnings
 from typing import Optional, Union
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.metrics import collector
 from megatron.core.models.backends import (
     BackendSpecProvider,
     InferenceSpecProvider,
@@ -77,12 +78,15 @@ def get_gpt_layer_with_inference_spec(
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
+    metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
 ) -> ModuleSpec:
     """Use this spec to use inference optimized linear layers.
     Args:
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        metric_collector (MetricCollector): Metrics collector to use for per-layer forward pass
+            metrics.
     """
     assert HAVE_TE, "--transformer-impl inference_optimized requires transformer engine"
     backend = InferenceSpecProvider()
@@ -140,7 +144,10 @@ def get_gpt_layer_with_inference_spec(
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
                     module=SelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
+                    params={
+                        "attn_mask_type": AttnMaskType.causal,
+                        "metric_collector": metric_collector,
+                    },
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=backend.column_parallel_layer_norm_linear(),
                         core_attention=backend.core_attention(),
@@ -180,6 +187,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
+    metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -222,6 +230,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
+        metric_collector=metric_collector,
     )
 
     if multi_latent_attention:
@@ -268,7 +277,10 @@ def get_gpt_layer_with_transformer_engine_spec(
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
                     module=SelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
+                    params={
+                        "attn_mask_type": AttnMaskType.causal,
+                        "metric_collector": metric_collector,
+                    },
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=backend.column_parallel_layer_norm_linear(),
                         core_attention=backend.core_attention(),
@@ -307,6 +319,7 @@ def get_gpt_layer_local_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
+    metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -319,6 +332,9 @@ def get_gpt_layer_local_spec(
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        use_kitchen (bool, optional): To use KitchenSpecProvider. Defaults to False.
+        metric_collector (MetricCollector): Metrics collector to use for per-layer forward pass
+          metrics.
 
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
@@ -348,6 +364,7 @@ def get_gpt_layer_local_spec(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        metric_collector=metric_collector,
     )
 
     if multi_latent_attention:
@@ -384,7 +401,10 @@ def get_gpt_layer_local_spec(
                 input_layernorm=layer_norm,
                 self_attention=ModuleSpec(
                     module=SelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
+                    params={
+                        "attn_mask_type": AttnMaskType.causal,
+                        "metric_collector": metric_collector,
+                    },
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=backend.column_parallel_linear(),
                         core_attention=backend.core_attention(),
@@ -415,6 +435,7 @@ def _get_mlp_module_spec(
     moe_grouped_gemm: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
 ):
     warnings.warn(
         """This private function is on a deprecation track. Please switch to `get_mlp_module_spec`
@@ -427,6 +448,7 @@ def _get_mlp_module_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         fp8=fp8,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        metric_collector=metric_collector,
     )
 
 
@@ -437,6 +459,7 @@ def get_mlp_module_spec(
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
+    metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
     if fp8 is not None:
@@ -460,6 +483,7 @@ def get_mlp_module_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
+        metric_collector=metric_collector,
     )
 
 
@@ -470,6 +494,7 @@ def get_mlp_module_spec_for_backend(
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
+    metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
 
@@ -498,6 +523,7 @@ def get_mlp_module_spec_for_backend(
             moe_grouped_gemm=moe_grouped_gemm,
             moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
             use_te_activation_func=use_te_activation_func,
+            metric_collector=metric_collector,
         )
 
 
@@ -508,6 +534,7 @@ def get_gpt_decoder_block_spec(
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
+    metric_collector: collector.MetricCollector = collector.NoopMetricCollector(),
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -521,6 +548,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            metric_collector=metric_collector,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -531,6 +559,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            metric_collector=metric_collector,
         )
     else:
         layer_norm_impl = LNImpl
@@ -543,6 +572,7 @@ def get_gpt_decoder_block_spec(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            metric_collector=metric_collector,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -553,6 +583,7 @@ def get_gpt_decoder_block_spec(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            metric_collector=metric_collector,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
