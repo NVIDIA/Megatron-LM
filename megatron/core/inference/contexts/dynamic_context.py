@@ -385,7 +385,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # If using pipeline parallelism synchronize the total block count in case the
-        # pipeline stages have different layer allocations.
+        # pipeline stages have different layer allocations. Non-uniform block counts
+        # can lead to some ranks pausing requests earlier than other ranks
+        # (i.e., divergence in the scheduling behavior).
         if pp_size > 1:
             block_count_total_tensor = torch.tensor(
                 block_count_total, dtype=torch.int32, device=torch.cuda.current_device()
