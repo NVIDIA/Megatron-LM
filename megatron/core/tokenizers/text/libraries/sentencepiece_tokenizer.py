@@ -139,11 +139,11 @@ class SentencePieceTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerCha
         return tokens
 
     def text_to_ids(self, text, sample_alpha=None) -> List[int]:
-        """Converts text to tokens ids."""
-        if isinstance(text, str):
-            return self._text_to_ids(text, sample_alpha)
-        else:
-            raise ValueError(f"Expected str input, but got {type(text)}")
+        """Converts text to token IDs."""
+        token_ids = self.tokenizer.encode_as_ids(text)
+        # Ensure token IDs are within [0, vocab_size)
+        token_ids = [token_id if token_id < self.vocab_size else self.tokenizer.unk_id for token_id in token_ids]
+        return token_ids
 
     def _text_to_ids(self, text, sample_alpha=None) -> List[int]:
         """Converts text to tokens ids."""

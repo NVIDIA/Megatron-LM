@@ -108,6 +108,8 @@ class LanguageModelEmbedding(MegatronModule):
         Returns:
             Tensor: The output embeddings
         """
+        # Ensure input_ids are within range [0, vocab_size)
+        input_ids = torch.clamp(input_ids, min=0, max=self.vocab_size - 1)
         word_embeddings = self.word_embeddings(input_ids)
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
