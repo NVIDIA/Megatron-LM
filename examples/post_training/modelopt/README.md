@@ -1,9 +1,9 @@
 <div align="center">
 
-# TensorRT Model Optimizer Integrated Examples
+# Model Optimizer Integrated Examples
 
 
-[TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) |
+[Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) |
 [Local Examples](#getting-started-in-a-local-environment) |
 [Configuration](./ADVANCED.md#advanced-configuration) |
 [Slurm Examples](./ADVANCED.md#slurm-examples) |
@@ -12,7 +12,7 @@
 
 </div>
 
-[TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) (**ModelOpt**, `nvidia-modelopt`)
+[Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) (**ModelOpt**, `nvidia-modelopt`)
 provides end-to-end model optimization for NVIDIA hardware including quantization (real or simulated),
 knowledge distillation, pruning, speculative decoding, and more.
 
@@ -42,7 +42,7 @@ Install `nvidia-modelopt` from [PyPI](https://pypi.org/project/nvidia-modelopt/)
 ```sh
 pip install -U nvidia-modelopt
 ```
-Alternatively, you can install from [source](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+Alternatively, you can install from [source](https://github.com/NVIDIA/Model-Optimizer)
 to try our latest features.
 
 > **❗ IMPORTANT:** The first positional argument (e.g. `meta-llama/Llama-3.2-1B-Instruct`) of each script
@@ -104,7 +104,7 @@ See [Adanvanced Topics](./ADVANCED.md) for a `moonshotai/Kimi-K2-Instruct` EAGLE
 
 ### ⭐ Pruning
 
-Checkout pruning getting started section and guidelines for configuring pruning parameters in the [ModelOpt pruning README](https://github.com/NVIDIA/TensorRT-Model-Optimizer/tree/main/examples/pruning).
+Checkout pruning getting started section and guidelines for configuring pruning parameters in the [ModelOpt pruning README](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning).
 
 Pruning is supported for GPT and Mamba models in Pipeline Parallel mode. Available pruning dimensions are:
 
