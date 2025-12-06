@@ -825,6 +825,9 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
+    def dummy_forward(self):
+        return self.inference_wrapped_model.dummy_forward()
+
     def _dynamic_step_context_bookkeeping(self, new_sample) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
