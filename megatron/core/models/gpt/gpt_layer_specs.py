@@ -11,6 +11,7 @@ from megatron.core.models.backends import (
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.attention_kda import KDASelfAttention
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -671,3 +672,49 @@ def get_gpt_mtp_block_spec_for_backend(
         mtp_block_spec = None
 
     return mtp_block_spec
+
+
+def get_kda_layer_spec(
+    delta_threshold: Optional[float] = 0.1,
+    sparsity_factor: Optional[float] = 0.5,
+) -> ModuleSpec:
+    """
+    Use this spec to configure KDA (Key Delta Attention) layers.
+
+    Args:
+        delta_threshold (float, optional): Threshold for delta-based sparsity. Defaults to 0.1.
+        sparsity_factor (float, optional): Factor to scale sparse attention. Defaults to 0.5.
+
+    Returns:
+        ModuleSpec: Specification for KDA layers.
+    """
+    backend = InferenceSpecProvider()
+
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=backend.layer_norm(),
+            self_attention=ModuleSpec(
+                module=KDASelfAttention,
+                params={
+                    "delta_threshold": delta_threshold,
+                    "sparsity_factor": sparsity_factor,
+                },
+                submodules=SelfAttentionSubmodules(
+                    linear_q_proj=backend.column_parallel_linear(),
+                    linear_kv_proj=backend.column_parallel_linear(),
+                    linear_out_proj=backend.row_parallel_linear(),
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=backend.layer_norm(),
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=backend.column_parallel_linear(),
+                    linear_fc2=backend.row_parallel_linear(),
+                ),
+            ),
+            mlp_bda=get_bias_dropout_add,
+        ),
+    )
