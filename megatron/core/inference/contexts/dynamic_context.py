@@ -215,6 +215,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             utilized, resulting in a total buffer size of `2 * buffer_size_gb`.
             Regardless of total buffer size, the KV cache is conceptually divided
             into 50% active requests and 50% paused requests.
+        max_requests (int): Max number of active requests to use for
+            decode-only forward passes. This value is primarily limited by the
+            combination of `buffer_size_gb` and `max_sequence_length`.
         max_tokens (int): Max number of tokens to use for forward passes. This is
             primarily limited by prefill activation memory usage. (Defaults to
             16384).
@@ -256,6 +259,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_attention_heads: int,
         max_sequence_length: int,
         buffer_size_gb: float,
+        max_requests: int = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         block_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
@@ -391,6 +395,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_active_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
         )
         self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
+
+        # User-specified max_requests.
+        if max_requests is not None:
+            assert max_requests <= self.max_active_requests, (
+                f"User-specified `max_requests` {max_requests} > "
+                f"`max_active_requests` {self.max_active_requests}"
+            )
+            self.max_active_requests = max_requests
 
         assert self.max_tokens >= self.max_active_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
