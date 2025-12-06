@@ -535,7 +535,7 @@ class TELinear(te.pytorch.Linear):
             )
 
         if is_te_min_version("0.8.0"):
-            if self.config.tp_comm_overlap:
+            if self.config.tp_comm_overlap and parallel_mode != "duplicated":
                 if is_te_min_version("1.5.0"):
                     # Use old overlap flags if they were supplied instead
                     extra_kwargs["ub_overlap_ag"] = (
