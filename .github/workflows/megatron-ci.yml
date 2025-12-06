@@ -109,6 +109,15 @@ jobs:
             --entrypoint /workspace/Megatron-LM/run_unit_tests.sh \
             rocm/megatron-lm-private:${{ github.sha }}
 
+      - name: Publish test report (dorny/test-reporter)
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Megatron-LM unit tests
+          path: output/junit_report_*.xml
+          reporter: java-junit
+          fail-on-error: false
+
       - name: List test reports
         if: always()
         run: |
