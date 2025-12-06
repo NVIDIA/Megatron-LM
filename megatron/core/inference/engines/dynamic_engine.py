@@ -40,7 +40,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter, await_process_event
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import get_asyncio_loop, internal_api, trace_async_exceptions
 
 try:
@@ -550,12 +549,6 @@ class DynamicInferenceEngine(AbstractEngine):
             "suspended", unified_memory_level=self.unified_memory_level
         ):
             self.context.deallocate_all_tensors()
-
-        # Delete cuda graphs when not using unified memory at all (level 0). For
-        # levels 1 and 2, the context's tensors maintain static memory addresses,
-        # so the cuda graphs are re-used.
-        if self.unified_memory_level == 0:
-            delete_cuda_graphs()
 
         # Maintain references to requests before reset.
         waiting_request_ids = list(self.waiting_request_ids)

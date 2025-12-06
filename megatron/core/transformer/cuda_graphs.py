@@ -99,6 +99,7 @@ class ArgMetadata:
             self.shape = arg.shape
             self.dtype = arg.dtype
             self.device = arg.device
+            self.value = arg.data_ptr()
         else:
             self.value = arg
 
@@ -1319,7 +1320,7 @@ class CudaGraphManager(torch.nn.Module):
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
 
-            elif self.training:
+            elif self.training and torch.is_grad_enabled():
                 # Training mode
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
                 # check if a layer is frozen during training.
