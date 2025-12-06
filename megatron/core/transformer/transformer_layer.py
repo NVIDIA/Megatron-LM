@@ -263,6 +263,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         config: TransformerConfig,
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
+        add_layer_offset: bool = True,
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
@@ -274,8 +275,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.pg_collection = pg_collection
 
         self.submodules_config = submodules
-        self.layer_number = layer_number + get_transformer_layer_offset(
-            self.config, vp_stage, get_pg_rank(pg_collection.pp)
+        self.layer_number = layer_number + (
+            get_transformer_layer_offset(self.config, vp_stage, get_pg_rank(pg_collection.pp))
+            if add_layer_offset
+            else 0
         )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
