@@ -216,9 +216,6 @@ class TransformerConfig(ModelParallelConfig):
     """Number of SMs to use for HybridEP. In pure NVL scenarios, 
     16 SMs can generally achieve good bandwidth."""
 
-    moe_latent_size: Optional[int] = None
-    """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
-
     ####################
     # initialization
     ####################
@@ -751,6 +748,11 @@ class TransformerConfig(ModelParallelConfig):
     transformer_impl: str = "transformer_engine"
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
+
+    # TODO: Move this next to other MoE arguments when backwards compatibility
+    # check is fixed.
+    moe_latent_size: Optional[int] = None
+    """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
