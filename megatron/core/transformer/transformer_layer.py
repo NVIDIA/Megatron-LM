@@ -217,6 +217,8 @@ class TransformerLayerSubmodules:
             after the MLP.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
             in the `sharded_state_dict` method.
+        post_mlp_layernorm (Union[ModuleSpec, type]): Specification for the layer normalization
+            after the MLP.
     """
 
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
@@ -229,6 +231,7 @@ class TransformerLayerSubmodules:
 
     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
     mlp: Union[ModuleSpec, type] = IdentityOp
+    post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
@@ -371,8 +374,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
 
+        # [Module 10: Post MLP] Optional Layernorm after MLP
+        self.post_mlp_layernorm = build_module(
+            submodules.post_mlp_layernorm,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
+        self.recompute_post_mlp_layernorm = False
         self.recompute_mlp = False
         if self.config.recompute_granularity == 'selective':
             if "layernorm" in self.config.recompute_modules:
@@ -394,6 +405,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                             )
 
                             set_save_original_input(self.mlp.linear_fc1)
+                if not isinstance(self.post_mlp_layernorm, IdentityOp):
+                    self.recompute_post_mlp_layernorm = True
+                    if self.config.fp8 or self.config.fp4:
+                        if isinstance(self.mlp, MoELayer):
+                            self.mlp.set_for_recompute_post_mlp_layernorm()
+                        else:
+                            from megatron.core.extensions.transformer_engine import (
+                                set_save_original_input,
+                            )
+
+                            set_save_original_input(self.mlp.linear_fc2)
             if "mlp" in self.config.recompute_modules:
                 if not isinstance(self.mlp, MoELayer):
                     self.recompute_mlp = True
@@ -624,6 +646,28 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias[0]
             )
         nvtx_range_pop(suffix="mlp")
+
+        if isinstance(mlp_output_with_bias, tuple):
+            mlp_output, bias_output = mlp_output_with_bias
+            del mlp_output_with_bias
+            if self.recompute_post_mlp_layernorm:
+                self.post_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                mlp_output = self.post_mlp_norm_checkpoint.checkpoint(
+                    self.post_mlp_layernorm, mlp_output
+                )
+                self.post_mlp_norm_checkpoint.discard_output_and_register_recompute(mlp_output)
+            else:
+                mlp_output = self.post_mlp_layernorm(mlp_output)
+            mlp_output_with_bias = (mlp_output, bias_output)
+        else:
+            if self.recompute_post_mlp_layernorm:
+                self.post_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                mlp_output = self.post_mlp_norm_checkpoint.checkpoint(
+                    self.post_mlp_layernorm, mlp_output_with_bias
+                )
+                self.post_mlp_norm_checkpoint.discard_output_and_register_recompute(mlp_output)
+            else:
+                mlp_output_with_bias = self.post_mlp_layernorm(mlp_output_with_bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?

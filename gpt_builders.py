@@ -35,6 +35,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
             parallel_output=True,
             pre_process=pre_process,
             post_process=post_process,
+            post_mlp_layernorm=args.post_mlp_layernorm,
         )
     else:  # using core models
         if args.spec is not None:
@@ -119,6 +120,7 @@ def _get_transformer_layer_spec(use_te, config):
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             qk_l2_norm=args.qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            post_mlp_layernorm=args.post_mlp_layernorm,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
@@ -135,4 +137,5 @@ def _get_transformer_layer_spec(use_te, config):
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             normalization=args.normalization,
             use_kitchen=config.use_kitchen,
+            post_mlp_layernorm=args.post_mlp_layernorm,
         )
