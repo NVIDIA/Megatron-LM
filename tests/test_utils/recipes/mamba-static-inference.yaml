@@ -57,7 +57,7 @@ products:
   - test_case: [hybrid_static_inference_tp1_pp1_2B_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [hybrid_static_inference_tp1_pp1_2B_cudagraphs]
     products:
