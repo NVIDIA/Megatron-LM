@@ -104,7 +104,8 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        # Use moe_latent_size only for routed experts. 'is_expert' is false for shared_experts
+        # Use moe_latent_size only for routed experts. 'is_expert' is false for
+        # shared_experts.
         use_latent_size = (self.config.moe_latent_size is not None) and is_expert
 
         self.linear_fc1 = build_module(

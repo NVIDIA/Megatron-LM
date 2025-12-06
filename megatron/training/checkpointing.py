@@ -1341,7 +1341,7 @@ def load_args_from_checkpoint(
     _set_arg('heterogeneous_layers_config_path', force=True)
     _set_arg('heterogeneous_layers_config_encoded_json', force=True)
 
-    # MoE latent projection
+    # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
 
     # Tokenizer args.

@@ -120,10 +120,10 @@ class MoELayer(BaseMoELayer):
             and "shared_experts" in config.recompute_modules
         )
 
-        # Initialize router
+        # Initialize router.
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
 
-        # Initialize latent projections
+        # Initialize latent projections.
         if self.config.moe_latent_size:
             assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
             self.fc1_latent_proj = TELinear(
