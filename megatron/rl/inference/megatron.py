@@ -127,6 +127,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         materialize_only_last_token_logits=True,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
