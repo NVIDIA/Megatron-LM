@@ -25,6 +25,7 @@ class ModuleSpec:
     module: Union[Tuple, type]
     params: dict = field(default_factory=lambda: {})
     submodules: type = None
+    metainfo: dict = field(default_factory=lambda: {})
 
 
 def import_module(module_path: Tuple[str]):
