@@ -1,5 +1,10 @@
-User Guide 
-============
+User Guide
+==========
 
-.. mdinclude:: ../../../megatron/core/QuickStart.md
-.. mdinclude:: ../../../megatron/core/MSC_Integration.md
+Comprehensive guides for using Megatron Core and Megatron-LM.
+
+.. toctree::
+   :maxdepth: 2
+
+   basic-usage/index
+   features/index

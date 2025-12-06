@@ -1,23 +1,62 @@
-.. Lumache documentation master file, created by
-   sphinx-quickstart on Tue Aug 15 13:44:10 2023.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
-
 Megatron Core User Guide
-===================================
+========================
 
-**Megatron Core** is a Python library that has the core components required to build your language models. 
-A reference implementation of Megatron Core can be found in  `NeMo <https://github.com/NVIDIA/NeMo/tree/main>`_ It offers a *simple* and
-*intuitive* API.
+**Megatron Core** is a GPU-optimized library for training large language models at scale. It provides modular, composable building blocks for creating custom training frameworks with state-of-the-art parallelism strategies and performance optimizations.
+
+Megatron Core offers a flexible, reusable foundation for building large-scale transformer training systems. **Megatron-LM** serves as a reference implementation demonstrating how to use Megatron Core components to train models with billions to trillions of parameters across distributed GPU clusters.
+
+Key Features
+------------
+
+* Composable transformer building blocks (attention, MLP, etc.)
+* Advanced parallelism strategies (TP, PP, DP, EP, CP)
+* Pipeline schedules and distributed optimizers
+* Mixed precision support (FP16, BF16, FP8)
+* GPU-optimized kernels and memory management
+* High-performance dataloaders and dataset utilities
+* Model architectures (LLaMA, Qwen, DeepSeek, GPT, Mamba, etc.)
 
 .. toctree::
    :maxdepth: 2
-   :caption: User Guide
+   :caption: Get Started
 
-   user-guide/index
+   get-started/quickstart
 
 .. toctree::
-   :maxdepth: 3
-   :caption: API Guide
-   
+   :maxdepth: 2
+   :caption: Basic Usage
+
+   user-guide/data-preparation
+   user-guide/training-examples
+   user-guide/parallelism-guide
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Supported Models
+
+   models/index
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Advanced Features
+
+   user-guide/features/context_parallel
+   user-guide/features/custom_fsdp
+   user-guide/features/dist_optimizer
+   user-guide/features/pipeline_parallel_layout
+   user-guide/features/megatron_energon
+   user-guide/features/megatron_rl
+   user-guide/features/tokenizers
+   user-guide/features/multi_token_prediction
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Discussions
+
+   advanced/index
+
+.. toctree::
+   :maxdepth: 2
+   :caption: API Reference
+
    api-guide/index
