@@ -9,6 +9,9 @@ from megatron.core.models.backends import (
     InferenceSpecProvider,
     LocalSpecProvider,
 )
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_module_spec_for_backend,
+)
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
@@ -174,6 +177,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
+    experimental_attention_variant: Optional[str] = None,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
@@ -188,6 +192,9 @@ def get_gpt_layer_with_transformer_engine_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        experimental_attention_variant (str, optional): The type of experimental attention variant.
+                                                        Defaults to None.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
@@ -223,6 +230,17 @@ def get_gpt_layer_with_transformer_engine_spec(
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
     )
+
+    if experimental_attention_variant is not None:
+        return get_experimental_attention_variant_module_spec_for_backend(
+            backend=backend,
+            experimental_attention_variant=experimental_attention_variant,
+            qk_layernorm=qk_layernorm,
+            qk_l2_norm=qk_l2_norm,
+            multi_latent_attention=multi_latent_attention,
+            num_experts=num_experts,
+            mlp=mlp,
+        )
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -302,6 +320,7 @@ def get_gpt_layer_local_spec(
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
+    experimental_attention_variant: Optional[str] = None,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
@@ -315,6 +334,9 @@ def get_gpt_layer_local_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        experimental_attention_variant (str, optional): The type of experimental attention variant.
+                                                        Defaults to None.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
@@ -323,6 +345,11 @@ def get_gpt_layer_local_spec(
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
     """
+
+    if experimental_attention_variant is not None:
+        raise NotImplementedError(
+            "Experimental attention variant is not supported with local spec yet."
+        )
 
     if use_kitchen:
         assert HAVE_KITCHEN
