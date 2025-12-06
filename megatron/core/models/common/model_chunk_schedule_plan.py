@@ -35,23 +35,20 @@ class TransformerLayerSchedulePlan:
     mtp post process nodes.
 
     layer (TransformerLayerSchedulePlan)
-    ├── attn (TransformerLayerNode): attention module
-    ├── post_attn (TransformerLayerNode): layernorm -> router -> dispatch preprocess
+    ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
     └── mtp_post_process (PostProcessNode): mtp post process
 
     Note that MTP layer has the same operation and execution order with TransformerLayer regarding
-    post_attn, moe_dispatch, mlp, moe_combine, but contains extra operations in attn and
-    mtp_post_process:
+    moe_dispatch, mlp, moe_combine, but contains extra operations in attn and mtp_post_process:
     * mtp.attn wraps around transformer_layer.attn with extra norm, proj and embedding operations.
     * mtp.mtp_post_process contains output_layer, mtp loss operations, whereas
       transformer_layer.mtp_post_process is empty.
     """
 
     attn = None
-    post_attn = None
     moe_dispatch = None
     mlp = None
     moe_combine = None
@@ -88,7 +85,7 @@ class TransformerLayerSchedulePlan:
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
-            attn, post_attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
+            attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
         """
         from megatron.core.models.gpt.fine_grained_callables import (
             TransformerLayerNode,
@@ -108,11 +105,7 @@ class TransformerLayerSchedulePlan:
             else isinstance(self.layer.mlp, MoELayer)
         )
 
-        enable_deepep = (
-            self.layer.config.moe_token_dispatcher_type == "flex"
-            and self.layer.config.moe_flex_dispatcher_backend == "deepep"
-        )
-        extra_args["enable_deepep"] = enable_deepep
+        extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
         extra_args["is_mtp"] = is_mtp
@@ -133,7 +126,6 @@ class TransformerLayerSchedulePlan:
 
         (
             attn_module,
-            post_attn_module,
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
@@ -145,11 +137,9 @@ class TransformerLayerSchedulePlan:
         self.attn = create_node(comp_stream, attn_module, "attn")
         self.mlp = create_node(comp_stream, mlp_module, "mlp")
         if is_moe:
-            self.post_attn = create_node(comp_stream, post_attn_module, "post_attn")
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
             self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
         else:
-            self.post_attn = NoopScheduleNode()
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
 
@@ -182,8 +172,8 @@ class TransformerLayerSchedulePlan:
         to maximize parallelism and efficiency.
 
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
-        comm_stream: combine_bwd            | dispatch_fwd->dispatch_bwd  | combine_fwd
-        comp_stream: attn_fwd->post_attn_fwd| mlp_bwd->mlp_bwd_dw->mlp_fwd| post_attn_bwd->attn_bwd
+        comm_stream: combine_bwd | dispatch_fwd->dispatch_bwd  | combine_fwd
+        comp_stream: attn_fwd    | mlp_bwd->mlp_bwd_dw->mlp_fwd| attn_bwd
         For MTP, mtp_post_process_fwd is executed after the combine_fwd in the comp_stream,
         and mtp_post_process_bwd is executed before the combine_bwd in the comp_stream.
 
@@ -206,7 +196,6 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.attn.forward(f_input)
-                f_input = f_layer.post_attn.forward(f_input)
 
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
@@ -229,7 +218,6 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.mtp_post_process.forward(f_input)
 
         if b_layer is not None:
-            b_grad = b_layer.post_attn.backward(b_grad)
             b_grad = b_layer.attn.backward(b_grad)
 
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
