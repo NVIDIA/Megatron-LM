@@ -41,11 +41,16 @@ def destroy_device_mesh(device_mesh):
 
     # Teardown device mesh.
     del device_mesh
-    _mesh_resources.mesh_stack.clear()
-    _mesh_resources.child_to_root_mapping.clear()
-    _mesh_resources.root_to_flatten_mapping.clear()
-    _mesh_resources.flatten_name_to_root_dims.clear()
-    _mesh_resources.mesh_dim_group_options.clear()
+    try:
+        _mesh_resources.child_to_root_mapping.clear()
+        _mesh_resources.root_to_flatten_mapping.clear()
+        _mesh_resources.mesh_stack.clear()
+        _mesh_resources.mesh_dim_group_options.clear()
+        _mesh_resources.flatten_name_to_root_dims.clear()
+    except:
+        # Global _MeshEnv is on a convoluted deprecation path.
+        # Attempt to clean the global state, otherwise skip.
+        pass
 
 
 class ToyCNN(torch.nn.Module):
