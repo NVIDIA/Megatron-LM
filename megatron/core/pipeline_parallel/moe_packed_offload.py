@@ -299,10 +299,10 @@ class PagedStashBuffer:
         
         # Head and tail pointers for free_list circular buffer
         self.free_list_head = torch.zeros(1, dtype=torch.int64, device=device)  # Read pointer (allocation)
-        self.free_list_tail = torch.tensor([self.num_pages], dtype=torch.int64, device=device)  # Write pointer (deallocation)
+        self.free_list_tail = self.num_pages*torch.ones(1, dtype=torch.int64, device=device)  # Write pointer (deallocation)
         
         # Capacity of free list
-        self.free_list_capacity = torch.tensor([self.num_pages], dtype=torch.int64, device=device)
+        self.free_list_capacity = self.num_pages*torch.ones(1, dtype=torch.int64, device=device)
     
     def reset(self):
         """Reset the paged buffer - reinitialize free list."""
@@ -1171,8 +1171,8 @@ class PackedOffloadManager:
         Returns a tag to identify the tensor later.
         """
 
-
-        if self.max_num_tokens is None or tensor.size(0) != self.max_num_tokens:
+        # Handle 0-dim tensors (torch.Size([])) - they have no size(0)
+        if self.max_num_tokens is None or tensor.dim() == 0 or tensor.size(0) != self.max_num_tokens:
             return tensor.detach()
         if isinstance(tensor, MXFP8Tensor):
             #debug_print(f'on_save_for_backward MXFP8Tensor ({self._current_layer_name}) ndim {tensor.ndim} shape {tensor.shape} {tensor.dtype} rowwise {tensor._rowwise_data is not None} columnwise {(tensor._columnwise_data.shape, tensor._columnwise_data.dtype) if tensor._columnwise_data is not None else None}-scale_inv {tensor._columnwise_scale_inv.shape} {tensor._columnwise_scale_inv.dtype}')
