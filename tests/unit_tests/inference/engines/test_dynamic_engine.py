@@ -1129,9 +1129,7 @@ class TestDynamicInferenceEngine:
     def test_max_requests(self, max_requests: int | None):
         """Test max requests."""
         env = self._run_test(
-            context_max_requests=max_requests,
-            num_tokens_to_generate=16,
-            num_gap_steps=1,
+            context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
         )
         step_count = env.engine.step_count
         context = env.engine.context
