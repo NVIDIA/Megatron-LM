@@ -397,8 +397,7 @@ def delete_cuda_graphs():
         runner.bwd_graph_recorded = False
         runner.fwd_graph = None
         runner.bwd_graph = None
-        runner.fwd_mempool = None
-        runner.bwd_mempool = None
+        runner.mempool = None
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -410,8 +409,6 @@ def delete_cuda_graphs():
     torch.cuda.empty_cache()
 
     CudaGraphManager.global_mempool = None
-    CudaGraphManager.fwd_mempools = None
-    CudaGraphManager.bwd_mempool = None
 
 
 class _GraphStatus(Enum):
@@ -626,8 +623,6 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.fp4_recipe = get_fp4_recipe(self.base_module.config)
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
 
-
-
     def __str__(self):
         return "%s; hid %s" % (
             self.base_module.__class__.__name__,
@@ -648,12 +643,6 @@ class _CudaGraphRunner(torch.nn.Module):
 
     def get_quantization_context(self):
         """Return appropriate quantization context (FP8 or FP4) in cudagraph mode."""
-
-        # TODO jiemingz: this is a temporary hack to disable grabbing the fp8 context outside of the 
-        # transformer layer
-        if not self.is_transformer_decoder_layer:
-            return nullcontext()
-
         if self.fp8_runtime_enabled:
             return self.get_fp8_context()
         elif self.fp4_runtime_enabled:
@@ -768,7 +757,6 @@ class _CudaGraphRunner(torch.nn.Module):
         with ctx:
             # warmup again as case graph capture mode may execute a different codepath
             for _ in range(1):
-                assert self.num_warmup_steps >= 1
                 with self.get_quantization_context():
                     def clone_ten(ten):
                         clone = torch.zeros_like(ten)
@@ -830,6 +818,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     # per-device to avoid slowing down graph creation.
                     if self.is_last_layer:
                         gc.collect()
+                _set_capture_end()
 
 
         # save cudagraph output buffer
@@ -928,9 +917,6 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.unfreeze()
 
-            if self.is_first_layer:
-                gc.collect()
-
         grad_inputs = list(grad_inputs)
 
         self.static_grad_outputs = static_grad_outputs
@@ -970,17 +956,9 @@ class _CudaGraphRunner(torch.nn.Module):
                     self.groundtruth_grad_added_to_main_grad[param] = param.grad_added_to_main_grad
 
         # The rest of the function is solely for memory management
-        all_tensors = (
-            list(self.fwd_graph_input_surface)
-            + list(self.fwd_graph_output_surface)
-            + list(self.static_grad_outputs)
-            + list(self.static_grad_inputs)
-        )
         # tensors outside the cudagraph mempool are added to the global_tensor_pool for reuse
-        for ten in all_tensors:
-            if not torch.is_tensor(ten):
-                continue
-            if ten.data_ptr() not in strong_reference_cache_dataptrs:
+        for ten in self.fwd_graph_input_surface + self.static_grad_outputs:
+            if not torch.is_tensor(ten) or ten.data_ptr() not in strong_reference_cache_dataptrs:
                 continue
             if hasattr(ten, "buffer_reuse_count") and ten.buffer_reuse_count != 0:
                 continue
@@ -1067,7 +1045,6 @@ class _CudaGraphRunner(torch.nn.Module):
         if len(out) == 1:
             return out[0]
         return out
-
 
     def replay_graph_capture(self, is_first_microbatch, args, kwargs):
         """Replay the fwd cuda graph with autograd."""
@@ -1236,13 +1213,15 @@ class _CudaGraphRunner(torch.nn.Module):
                 _check_supported_type(ArgMetadata(arg))
             if torch.is_tensor(arg):
                 return [arg]
-            elif is_dataclass(arg):
+
+            if is_dataclass(arg):
                 return [
-                    attr for field in fields(arg)
+                    attr
+                    for field in fields(arg)
                     if torch.is_tensor(attr := getattr(arg, field.name))
                 ]
-            else:
-                return []
+
+            return []
 
         if torch.is_tensor(args):
             return args
