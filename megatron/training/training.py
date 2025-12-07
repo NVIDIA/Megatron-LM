@@ -1855,6 +1855,7 @@ def post_training_step_callbacks(
 
     # Straggler detector.
     if iteration % args.log_interval == 0 and args.log_straggler:
+        # Use FLOPs accumulated since last log event and then reset the counter
         stimer.report(num_floating_point_operations_since_last_log_event, args.log_interval)
         num_floating_point_operations_since_last_log_event = 0.0
 
@@ -1895,6 +1896,9 @@ def post_training_step_callbacks(
     if args.manual_gc:
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
             gc.collect()
+
+    # Return updated FLOPs accumulator so caller can persist the reset
+    return num_floating_point_operations_since_last_log_event
 
 
 def checkpoint_and_decide_exit(
@@ -2503,8 +2507,9 @@ def train(
                 energy_monitor.resume()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
-        # Some of these only happen at specific iterations.
-        post_training_step_callbacks(
+        # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
+        # (it is reset inside the callback after logging).
+        num_floating_point_operations_since_last_log_event = post_training_step_callbacks(
             model,
             optimizer,
             opt_param_scheduler,
