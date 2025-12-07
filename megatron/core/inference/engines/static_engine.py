@@ -98,7 +98,6 @@ class StaticInferenceEngine(AbstractEngine):
         )
 
         # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # pax("inference_wrapper_config")
         dynamic_context = DynamicInferenceContext.from_config(
             inference_config=inference_wrapper_config,
             model=text_generation_controller.inference_wrapped_model.model,
@@ -119,7 +118,7 @@ class StaticInferenceEngine(AbstractEngine):
             context=dynamic_context,
             enable_cuda_graph=True,
         )
-        # raise Exception("hi.")
+        raise Exception("hi.")
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         try:
             if not legacy:

@@ -182,9 +182,6 @@ def compile_allocator():
 
 
 def create_unified_mempool() -> "MemPool":
-    # >>>
-    # raise Exception("hi.")
-    # <<<
     """Create a unified memory mempool using CUDA managed memory.
 
     Returns:

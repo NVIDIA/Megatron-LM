@@ -286,19 +286,6 @@ class DynamicInferenceEngine(AbstractEngine):
             input_ids, position_ids = self.controller._dynamic_step_context_init(
                 construct_graph_dimensions=cuda_graph_batch_dimension
             )
-            # >>>
-            # if torch.max(position_ids).item() >= 64:
-            #     pax({
-            #         "pos emb" : self.controller.inference_wrapped_model.model.embedding.position_embeddings.weight.shape,
-            #         "max_sequence_length" : self.context.max_sequence_length,
-            #         "pos max" : torch.max(position_ids).item(),
-            #     })
-
-            # try:
-            #     print("~~~~~~~~~~~~ input_ids, %s." % str(input_ids))
-            # except Exception as e:
-            #     raise Exception("hi.")
-            # <<<
             # Progress.
             tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}"
             if HAVE_TQDM:

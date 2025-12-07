@@ -449,56 +449,34 @@ def main():
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # context = get_inference_context(
-    #     requests,
-    #     sampling_params,
-    #     mamba_inference_state_config=mamba_inference_state_config,
-    # )
-    # controller = get_inference_controller(model, context)
-
-    # # Validate all context_length's <= max_tokens.
-    # if args.disable_chunked_prefill:
-    #     invalid_prompt_length_map = {}
-    #     for request_idx, request in enumerate(requests):
-    #         if len(request.prompt_tokens) > context.max_tokens:
-    #             invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
-    #     assert not invalid_prompt_length_map, (
-    #         "request idxs with prompts longer than context.max_tokens: "
-    #         ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
-    #     )
-
-    # # Inference engine.
-    # engine = DynamicInferenceEngine(
-    #     controller,
-    #     context,
-    #     enable_cuda_graph=args.cuda_graph_impl == "local",
-    #     random_seed=args.seed,
-    #     track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
-    #     enable_chunked_prefill=not args.disable_chunked_prefill,
-    #     inference_logging_step_interval=args.inference_wandb_logging_step_interval,
-    # )
-    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    dynamic_context = DynamicInferenceContext.from_config(
-        inference_config=inference_wrapper_config,
-        model=text_generation_controller.inference_wrapped_model.model,
-        max_batch_size=max_batch_size,
-        buffer_size_gb=buffer_size_gb,
-        num_cuda_graphs=1,
+    context = get_inference_context(
+        requests,
+        sampling_params,
         mamba_inference_state_config=mamba_inference_state_config,
     )
-    # >>>
-    self.controller.inference_wrapped_model.inference_context = dynamic_context
-    self.controller.inference_wrapped_model.prep_model_for_inference()
-    self.controller._init_dynamic_sampling_tensors()
-    # <<<
-    self.dynamic_engine = DynamicInferenceEngine(
-        controller=self.controller,
-        random_seed=self.random_seed,
-        context=dynamic_context,
-        enable_cuda_graph=True,
+    controller = get_inference_controller(model, context)
+
+    # Validate all context_length's <= max_tokens.
+    if args.disable_chunked_prefill:
+        invalid_prompt_length_map = {}
+        for request_idx, request in enumerate(requests):
+            if len(request.prompt_tokens) > context.max_tokens:
+                invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
+        assert not invalid_prompt_length_map, (
+            "request idxs with prompts longer than context.max_tokens: "
+            ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
+        )
+
+    # Inference engine.
+    engine = DynamicInferenceEngine(
+        controller,
+        context,
+        enable_cuda_graph=args.cuda_graph_impl == "local",
+        random_seed=args.seed,
+        track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+        enable_chunked_prefill=not args.disable_chunked_prefill,
+        inference_logging_step_interval=args.inference_wandb_logging_step_interval,
     )
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
