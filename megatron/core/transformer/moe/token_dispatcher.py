@@ -1035,7 +1035,7 @@ class _HybridEPManager(_DispatchManager):
 
         if self.packed_offloading_capacity_factor is not None:
             pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
-            budget = int(routing_map.shape[0] * self.config.moe_router_topk  * (self.packed_offloading_capacity_factor+1))
+            budget = int(routing_map.shape[0] * self.config.moe_router_topk  * self.packed_offloading_capacity_factor)
             budget += -budget % pad_multiple
             routing_map_maybe_dropped, over_budget = self.budget_check(routing_map, budget)
             self.over_budget |= over_budget
