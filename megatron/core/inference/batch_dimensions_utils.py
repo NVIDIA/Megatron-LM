@@ -31,11 +31,25 @@ class InferenceBatchDimensions:
     prefill_req_count: int = 0
     decode_req_count: int = 0
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # def __str__(self):
+    #     """
+    #     Returns a string representation of the batch dimensions.
+    #     """
+    #     return f"[{self.token_count}]: {self.prefill_req_count} P + {self.decode_req_count} D"
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    def get_per_prefill_tokens(self):
+        if self.prefill_req_count == 0:
+            return -1
+        else:
+            return (self.token_count - self.decode_req_count) // self.prefill_req_count
+
     def __str__(self):
         """
         Returns a string representation of the batch dimensions.
         """
-        return f"[{self.token_count}]: {self.prefill_req_count} P + {self.decode_req_count} D"
+        return f"[{self.token_count}]: {self.prefill_req_count} P + {self.decode_req_count} D .... PER_PREFILL_TOKENS {self.get_per_prefill_tokens()}"
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def is_applicable_for_batch_dim(
         self, real_batch_dim: "InferenceBatchDimensions", strict: bool = False

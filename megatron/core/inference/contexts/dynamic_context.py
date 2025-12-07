@@ -463,6 +463,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             )
         )
+        # >>>
+        # pax({
+        #     "cuda_graph_batch_dimensions_list" : self.cuda_graph_batch_dimensions_list,
+        #     "cuda_graph_token_counts" : self.cuda_graph_token_counts,
+        #     "max_sequence_length" : self.max_sequence_length,
+        # })
+        # <<<
 
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
@@ -678,7 +685,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         buffer_size_gb: float = 40,
         num_cuda_graphs: int = None,
         mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
-        unified_memory_level: int = 0,
+        # >>>
+        unified_memory_level: int = 1,
+        # unified_memory_level: int = 0,
+        # <<<
     ):
         """
         Instantiate a `DynamicInferenceContext` from a `TransformerConfig` and an `InferenceWrapperConfig`.
@@ -686,16 +696,34 @@ class DynamicInferenceContext(BaseInferenceContext):
         # TODO: Add other necessary configs from inference_config
 
         model_config = model.config
-        max_sequence_length = (
-            inference_config.inference_max_seq_length or model_config.max_sequence_length
-        )
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # max_sequence_length = (
+        #     inference_config.inference_max_seq_length or model_config.max_sequence_length
+        # )
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        model_max_seq_len = model.get_max_sequence_length()
+        inf_max_seq_len = inference_config.inference_max_seq_length
+        if inf_max_seq_len:
+            max_sequence_length = min(model_max_seq_len, inf_max_seq_len)
+        else:
+            max_sequence_length = model_max_seq_len
+        assert max_batch_size <= model_max_seq_len
+
+        # >>>
+        # pax("model_max_seq_len, inf_max_seq_len, max_sequence_length, max_batch_size")
+        # <<<
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         max_sequence_length = max(max_sequence_length, max_batch_size)
         return cls(
             params_dtype=inference_config.params_dtype,
             num_layers=model_config.num_layers // model_config.pipeline_model_parallel_size,
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
-            max_sequence_length=inference_config.inference_max_seq_length,
+            # >>>
+            # max_sequence_length=inference_config.inference_max_seq_length,
+            # max_sequence_length=2560,
+            max_sequence_length=max_sequence_length,
+            # <<<
             buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,
             num_cuda_graphs=num_cuda_graphs,
@@ -1006,6 +1034,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         prompt_tokens: List[Tensor] = []
         metadata_rows: List[List[float]] = []
 
+        # >>>
+        # from collections import defaultdict
+        # request_map = defaultdict(list)
+        # for r in requests:
+        #     request_map[r.prompt_tokens.shape[0]].append(r)
+        # pax("request_map")
+        # uprint("request_map: %s." % str(list(request_map.keys())))
+        # <<<
         for req in requests:
             assert isinstance(
                 req, DynamicInferenceRequest
@@ -1016,6 +1052,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert req.remaining_prompt_tokens is not None, "request missing prompt tokens"
             assert req.sampling_params is not None, "request missing sampling params"
             chunk_length = req.remaining_prompt_length
+            # >>>
+            # if chunk_length > 64:
+            #     pax("req, chunk_length")
+            # <<<
             assert chunk_length > 0, "request without prompt tokens is not supported"
             lengths.append(chunk_length)
             num_tokens_to_generate.append(req.sampling_params.num_tokens_to_generate)
@@ -1101,6 +1141,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         expanded_positions = position_template.unsqueeze(0).expand(num_new_requests, -1)
         mask = position_template.unsqueeze(0) < lengths_long.unsqueeze(1)
         positions = expanded_positions[mask]
+        # >>>
+        # max_pos_id = positions.max().item()
+        # if max_pos_id >= 64:
+        #     print_seq("max_length %d, max_pos_id %d." % (max_length, max_pos_id))
+        # <<<
         assert positions.numel() == total_new_tokens
         self.token_to_position_in_request[token_slice] = positions
         self.token_to_pos_ids[token_slice] = positions
@@ -1153,6 +1198,18 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         per_prefill_tokens = prefill_tokens // graph_dimensions.prefill_req_count
         rem_prefill_tokens = prefill_tokens % graph_dimensions.prefill_req_count
+        # >>>
+        uprint("graph dims: %s ... prefill_tokens %d, prefill_req_count %d ... per %d, rem %d." % (
+            graph_dimensions,
+            prefill_tokens,
+            graph_dimensions.prefill_req_count,
+            per_prefill_tokens,
+            rem_prefill_tokens,
+        ))
+        if per_prefill_tokens > 64:
+            # print_seq("stop.")
+            pax()
+        # <<<
 
         # If there are remaining prefill tokens, we evenly distribute them to the prefill requests
         # starting from the first prefill request until we run out of remaining prefill tokens
