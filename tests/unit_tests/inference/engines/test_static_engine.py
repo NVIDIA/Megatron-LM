@@ -83,6 +83,9 @@ class StaticInferenceEngineTestHarness:
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
         ).cuda()
+        # >>>
+        # pax({"pos emb": gpt_model.embedding.position_embeddings.weight.shape})
+        # <<<
         gpt_model.to(inference_config_params_dtype)
 
         inference_wrapper_config = InferenceWrapperConfig(
@@ -369,3 +372,17 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
             ), f"Status should be completed but its {result.status}"
             assert result.generated_length > 0, f"Generated length should be greater than zero"
             assert result.generated_text is not None, f'Generated text should not be None'
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+if __name__ == "__main__":
+    import os
+    del os.environ["NCCL_DEBUG"]
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+    from lutil import pax as _pax
+    import builtins
+    builtins.pax = _pax
+
+    test = TestStaticInferenceEngine()
+    test.test_generate_dynamic(4, 1, False)
+    print("~~~\nsuccess.")
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<

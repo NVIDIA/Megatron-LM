@@ -97,6 +97,30 @@ class StaticInferenceEngine(AbstractEngine):
             text_generation_controller.inference_wrapped_model.model
         )
 
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # pax("inference_wrapper_config")
+        dynamic_context = DynamicInferenceContext.from_config(
+            inference_config=inference_wrapper_config,
+            model=text_generation_controller.inference_wrapped_model.model,
+            max_batch_size=max_batch_size,
+            buffer_size_gb=buffer_size_gb,
+            num_cuda_graphs=1,
+            mamba_inference_state_config=mamba_inference_state_config,
+            # >>>
+            unified_memory_level=1,
+            # <<<
+        )
+        self.controller.inference_wrapped_model.inference_context = dynamic_context
+        self.controller.inference_wrapped_model.prep_model_for_inference()
+        self.controller._init_dynamic_sampling_tensors()
+        self.dynamic_engine = DynamicInferenceEngine(
+            controller=self.controller,
+            random_seed=self.random_seed,
+            context=dynamic_context,
+            enable_cuda_graph=True,
+        )
+        # raise Exception("hi.")
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         try:
             if not legacy:
                 dynamic_context = DynamicInferenceContext.from_config(

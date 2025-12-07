@@ -265,7 +265,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
         use_cuda_graphs_for_non_decode_steps: bool = True,
         use_flashinfer_fused_rope: bool = False,
-        unified_memory_level: Optional[int] = 0,
+        # >>>
+        unified_memory_level: Optional[int] = 1,
+        # unified_memory_level: Optional[int] = 0,
+        # <<<
         cuda_graph_max_tokens: Optional[int] = None,
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
@@ -670,6 +673,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         buffer_size_gb: float = 40,
         num_cuda_graphs: int = None,
         mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
+        unified_memory_level: int = 0,
     ):
         """
         Instantiate a `DynamicInferenceContext` from a `TransformerConfig` and an `InferenceWrapperConfig`.
@@ -692,6 +696,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_cuda_graphs=num_cuda_graphs,
             use_flashinfer_fused_rope=None,
             mamba_inference_state_config=mamba_inference_state_config,
+            unified_memory_level=unified_memory_level,
         )
 
     @classmethod
@@ -1016,6 +1021,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
             )
             metadata_rows.append(req.tracked_metadata)
+        # >>>
+        # if max(lengths) >= 64:
+        #     pax("requests", {"lengths / max": max(lengths)})
+        # <<<
 
         total_new_tokens = sum(lengths)
         if self.active_token_count + total_new_tokens > self.max_tokens:
@@ -1025,6 +1034,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         lengths_tensor = torch.tensor(
             lengths, dtype=self.request_query_lengths.dtype, device=device
         )
+        # >>>
+        # lengths_tensor_max = lengths_tensor.max().item()
+        # if lengths_tensor_max >= 64:
+        #     pax("lengths_tensor, lengths_tensor_max")
+        # <<<
         tokens_to_generate_tensor = torch.tensor(
             num_tokens_to_generate, dtype=self.request_query_lengths.dtype, device=device
         )
@@ -1091,6 +1105,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         expanded_positions = position_template.unsqueeze(0).expand(num_new_requests, -1)
         mask = position_template.unsqueeze(0) < lengths_long.unsqueeze(1)
         positions = expanded_positions[mask]
+        # >>>
+        # if torch.max(positions).item() >= 64:
+        #     pax("max_length, position_template, mask, positions")
+        # <<<
         assert positions.numel() == total_new_tokens
         self.token_to_position_in_request[token_slice] = positions
         self.token_to_pos_ids[token_slice] = positions
@@ -1128,14 +1146,44 @@ class DynamicInferenceContext(BaseInferenceContext):
         shared_sampling_params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
         shared_decode_tokens = torch.zeros(1, dtype=torch.long, device=torch.cuda.current_device())
 
-        decode_requests = [
-            DynamicInferenceRequest(
-                request_id=i,
-                prompt_tokens=shared_decode_tokens,
-                sampling_params=shared_sampling_params,
-            )
-            for i in range(graph_dimensions.decode_req_count)
-        ]
+        # >>>
+        # decode_requests = [
+        #     DynamicInferenceRequest(
+        #         request_id=i,
+        #         prompt_tokens=shared_decode_tokens,
+        #         sampling_params=shared_sampling_params,
+        #     )
+        #     for i in range(graph_dimensions.decode_req_count)
+        # ]
+        # +++
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        print("~~~~~~~~ count %d." % graph_dimensions.decode_req_count)
+        print("~~~~~~~~ %s ... %s." % (
+            shared_decode_tokens.shape,
+            shared_decode_tokens,
+        ))
+        decode_requests = []
+        for i in range(graph_dimensions.decode_req_count):
+            # print("  +++ %d, %s ... %s." % (
+            #     i,
+            #     shared_decode_tokens.shape,
+            #     shared_decode_tokens,
+            # ))
+            try:
+                r = DynamicInferenceRequest(
+                    request_id=i,
+                    prompt_tokens=shared_decode_tokens,
+                    sampling_params=shared_sampling_params,
+                )
+            except Exception as e:
+                # pax("e, i, shared_decode_tokens") # , shared_sampling_params")
+                pax({
+                    "shape" : shared_decode_tokens.shape,
+                    "str" : str(shared_decode_tokens),
+                })
+                # pax("shared_decode_tokens")
+            decode_requests.append(r)
+        # <<<
         self.add_dummy_requests_parallel(decode_requests, count_as_prefill=False)
         if graph_dimensions.prefill_req_count == 0:
             self.num_prefill_requests = 0
@@ -1143,6 +1191,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         per_prefill_tokens = prefill_tokens // graph_dimensions.prefill_req_count
         rem_prefill_tokens = prefill_tokens % graph_dimensions.prefill_req_count
+        # >>>
+        # if per_prefill_tokens > 64:
+        #     pax("prefill_tokens, per_prefill_tokens, rem_prefill_tokens")
+        # <<<
 
         # If there are remaining prefill tokens, we evenly distribute them to the prefill requests
         # starting from the first prefill request until we run out of remaining prefill tokens
@@ -1151,6 +1203,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             per_prefill_tokens + (1 if i < rem_prefill_tokens else 0)
             for i in range(graph_dimensions.prefill_req_count)
         ]
+        # >>>
+        # if max(prefill_token_counts) > 64:
+        #     pax("graph_dimensions", {"prefill_token_counts / max": max(prefill_token_counts)})
+        # <<<
 
         assert per_prefill_tokens > 0
         # Create a single large tensor and slice from it for each prefill request
