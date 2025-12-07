@@ -974,7 +974,9 @@ class PackedOffloadManager:
         # allocate streams and events for synchronization
         self.enabled = False
         self._pack_stream = torch.cuda.Stream()
-        self._unpack_stream = torch.cuda.Stream()
+        # Currently paged/packed stashing is not stream-safe, so use the same stream for packing 
+        # and unpacking
+        self._unpack_stream = self._pack_stream 
         self._pack_stream_status = 'idle' # idle, offloading
         self._unpack_stream_status = 'idle' # idle, reloading
         self.packed_tensors_to_offload = []
