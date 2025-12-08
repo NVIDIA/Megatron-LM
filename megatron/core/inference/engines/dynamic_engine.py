@@ -1430,24 +1430,24 @@ class DynamicInferenceEngine(AbstractEngine):
             pass
 
     def _ep_group_has_work(self):
-        """Determines if there are some pending requests in the expert parallel group this 
+        """Determines if there are some pending requests in the expert parallel group this
         rank is a part of
         """
         range_push("_ep_group_has_work")
-        
-        is_stopped = self.stopped.is_set() or self.received_stop 
+
+        is_stopped = self.stopped.is_set() or self.received_stop
         is_paused = self.paused.is_set() or self.received_pause
         is_suspended = self.suspend_signal or self.is_suspended
         if is_stopped or is_paused or is_suspended:
-            # Signals can be received asynchronously on EP ranks. 
-            # We do not want a rank to pause/stop/suspend prematurely if one of it's peers 
+            # Signals can be received asynchronously on EP ranks.
+            # We do not want a rank to pause/stop/suspend prematurely if one of it's peers
             # is yet to receive the signal.
-            # So this is an *attempt* to process the signal. This rank has received the signal 
+            # So this is an *attempt* to process the signal. This rank has received the signal
             # and passes 0 to the all-reduce. If any other rank in the EP group has not received the signal yet,
-            # it will pass a non-zero value to the all-reduce, and hence the global work will be non-zero, 
-            # and we will defer processing the signal. 
+            # it will pass a non-zero value to the all-reduce, and hence the global work will be non-zero,
+            # and we will defer processing the signal.
             # When all ranks receive the signal, global work will be zero, and we can process the signal safely.
-            local_work = 0  
+            local_work = 0
         else:
             local_work = self.context.get_active_request_count() + len(self.waiting_request_ids)
 
@@ -1455,9 +1455,7 @@ class DynamicInferenceEngine(AbstractEngine):
             expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
             # all reduce local work across expert model parallel group
 
-            local_work_tensor = torch.tensor(
-                [local_work], device=torch.cuda.current_device()
-            )
+            local_work_tensor = torch.tensor([local_work], device=torch.cuda.current_device())
             torch.distributed.all_reduce(
                 local_work_tensor,
                 op=torch.distributed.ReduceOp.SUM,
@@ -1466,7 +1464,7 @@ class DynamicInferenceEngine(AbstractEngine):
             global_work = local_work_tensor.item()
         else:
             global_work = local_work
-        
+
         range_pop()
         return global_work > 0
 
@@ -1493,18 +1491,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 # needed to send one message on an IPC socket. However
                 # just to be safe, we use 20ms here.
 
-                pending_requests = self.context.get_active_request_count() + len(self.waiting_request_ids)
-                ep_group_has_work = self._ep_group_has_work() 
+                pending_requests = self.context.get_active_request_count() + len(
+                    self.waiting_request_ids
+                )
+                ep_group_has_work = self._ep_group_has_work()
 
                 if ep_group_has_work and pending_requests == 0:
-                    # run dummy forward pass
-                    self.controller.dummy_forward() 
+                    # run dummy forward pass if EP group as a whole has work,
+                    # but this rank does not have any work.
+                    self.controller.dummy_forward()
                     continue
 
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
-                
-                if (not ep_group_has_work) and (self.paused.is_set() or self.received_pause or self.received_stop):
+                if (not ep_group_has_work) and (
+                    self.paused.is_set() or self.received_pause or self.received_stop
+                ):
                     await asyncio.sleep(0.02)
                     continue
 
@@ -1517,9 +1519,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.resume()
 
                 # No requests.
-                if (
-                    not pending_requests
-                ):
+                if not pending_requests:
                     await asyncio.sleep(0.02)
                     continue
 
