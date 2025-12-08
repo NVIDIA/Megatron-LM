@@ -238,6 +238,7 @@ class GroupedMLP(MegatronModule):
         permuted_probs: torch.Tensor,
     ):
         """Forward step of the GroupedMLP."""
+        assert self.config.bf16, "Currently GroupedGEMM for MoE only supports bf16."
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
 
