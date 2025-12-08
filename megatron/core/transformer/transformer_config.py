@@ -746,7 +746,7 @@ class TransformerConfig(ModelParallelConfig):
     # Quantization
     ####################
     quant_recipe: Optional[RecipeConfig] = None
-    """Configuration of any quantization to be applied to the model"""
+    """Configuration of any per-module quantization settings to be applied to the model"""
 
     transformer_impl: str = "transformer_engine"
     """Transformer implementation to use.
@@ -782,9 +782,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
 
-        if self.num_query_groups % self.tensor_model_parallel_size != 0:
+        if (
+            self.num_query_groups % self.tensor_model_parallel_size != 0
+            and self.tensor_model_parallel_size % self.num_query_groups != 0
+        ):
             raise ValueError(
-                f"num_query_groups ({self.num_query_groups}) must be a multiple of "
+                f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
@@ -866,6 +869,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
+            if self.moe_flex_dispatcher_backend == "hybridep":
+                raise ValueError("Only one backend is supported for flex token dispatcher.")
             self.moe_flex_dispatcher_backend = "deepep"
             warnings.warn(
                 "moe_enable_deepep is deprecated."
@@ -880,8 +885,6 @@ class TransformerConfig(ModelParallelConfig):
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
                 )
-            if self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "hybrid_ep":
-                raise ValueError("Only one type of backend is supported for flex token dispatcher.")
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

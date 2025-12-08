@@ -24,10 +24,24 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
+
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+
+    HAVE_TORCH_SYMM_MEM = True
+except ImportError:
+    HAVE_TORCH_SYMM_MEM = False
+
+try:
+    import triton  # pylint: disable=unused-import
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
 
 from megatron.core import config
 from megatron.core.package_info import __version__ as mcore_version
@@ -614,6 +628,65 @@ class GlobalMemoryBuffer:
                 )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+
+class GlobalSymmetricMemoryBuffer:
+    """
+    Global symmetric memory buffer used in inference.
+    This buffer is used by mcore-inference's low-latency
+    NVLS all-gather and reduce-scatter collectives.
+    """
+
+    def __init__(self, size_in_mb, process_group):
+        if not HAVE_TORCH_SYMM_MEM or not HAVE_TRITON:
+            # This should be hit if the user is running an older
+            # version of torch, or if they do not have triton
+            # installed.
+            self.symm_buffer = None
+            self.symm_mem_hdl = None
+        else:
+            numel = int(size_in_mb * 1024 * 1024)  # size in bytes
+            try:
+                symm_mem.enable_symm_mem_for_group(process_group.group_name)
+                self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
+                self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
+            except RuntimeError as e:
+                # If symmetric memory initialization fails, set buffer and handle to None
+                # This should happen if the process group is not contained within NVlink
+                self.symm_buffer = None
+                self.symm_mem_hdl = None
+
+    def _can_allocate(self, numel, dtype) -> bool:
+        """
+        Returns whether enough symmetric memory is available
+        for the given tensor shape and dtype.
+        """
+        if self.symm_mem_hdl is None:
+            return False
+        size_of_dtype = torch.tensor([], dtype=dtype).element_size()
+        required_len = numel * size_of_dtype
+        return required_len <= self.symm_buffer.numel()
+
+    def _allocate(self, numel, dtype) -> torch.Tensor:
+        """
+        Allocates a sub-tensor from the self.symm_buffer for the given numel and dtype"""
+        required_bytes = numel * torch.tensor([], dtype=dtype).element_size()
+        return self.symm_buffer[0:required_bytes].view(dtype).view(numel)
+
+    def maybe_get_tensor(self, tensor_shape, dtype):
+        """
+        Returns (potentially) a sub-tensor from the self.symm_buffer for the given shape.
+        If enough symmetric memory is not available, returns None.
+        """
+        if self.symm_mem_hdl is None:
+            return {"tensor": None, "handle": None}
+        numel = reduce(operator.mul, tensor_shape, 1)
+        if not self._can_allocate(numel, dtype):
+            return {"tensor": None, "handle": None}
+        return {
+            "tensor": self._allocate(numel, dtype).view(*tensor_shape),
+            "handle": self.symm_mem_hdl,
+        }
 
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
@@ -2088,23 +2161,28 @@ def maybe_cat(a, b, dim=0, *, required=False):
     return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
 
 
+_ASYNC_IO_LOOP: asyncio.AbstractEventLoop | None = None
+
+
 def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
     """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
+    global _ASYNC_IO_LOOP
     if loop is None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError as e:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            if _ASYNC_IO_LOOP is not None:
+                return _ASYNC_IO_LOOP
+            else:
+                _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
     return loop
 
 
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
 
 
-def trace_async_exceptions(
-    func: Optional[Callable[..., Coroutine]], *, verbose: bool = False
-) -> Callable[..., Coroutine]:
+def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = False):
     """Decorator to be applied to every coroutine that runs in a separate task.
 
     This is needed because asyncio tasks do not propagate exceptions.
@@ -2119,36 +2197,57 @@ def trace_async_exceptions(
     ```
     """
 
-    def _decorate(fn):
-        if not asyncio.iscoroutinefunction(fn):
-            raise TypeError("trace_async_exceptions can only be used with async functions")
+    def _log_verbose(name: str, start: float) -> None:
+        elapsed = (time.perf_counter() - start) * 1000.0
+        cnt, tot = _ASYNC_TASK_STATS[name]
+        _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
+        avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
 
-        @functools.wraps(fn)
-        async def wrapper(*args, **kwargs):
-            if verbose:
-                start = time.perf_counter()
-            try:
-                return await fn(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"Exception in async function {fn.__name__}: {e}")
-                traceback.print_exc()
-                sys.exit(1)
-            finally:
+        log10 = numpy.log10(max(cnt, 1))
+        if numpy.isclose(log10, round(log10)):
+            logger.info(
+                f"{name} completed in {elapsed:.3f} ms, "
+                f"lifetime avg: {avg:.3f} ms, "
+                f"lifetime cnt: {cnt + 1}"
+            )
+
+    def _decorate(fn: Callable):
+        if asyncio.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
                 if verbose:
-                    elapsed = (time.perf_counter() - start) * 1000.0
-                    name = fn.__qualname__
-                    cnt, tot = _ASYNC_TASK_STATS[name]
-                    _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
-                    avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
+                    start = time.perf_counter()
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"Exception in async function {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
 
-                    log10 = numpy.log10(max(cnt, 1))
-                    if numpy.isclose(log10, round(log10)):
-                        logger.info(
-                            f"{name} completed in {elapsed:.3f} ms, "
-                            f"lifetime avg: {avg:.3f} ms, "
-                            f"lifetime cnt: {cnt + 1}"
-                        )
+        elif inspect.isasyncgenfunction(fn):
 
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                if verbose:
+                    start = time.perf_counter()
+                agen = fn(*args, **kwargs)
+                try:
+                    async for item in agen:
+                        yield item
+                except Exception as e:
+                    logger.error(f"Exception in async generator {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
+
+        else:
+            raise TypeError("trace_async_exceptions must be used on async functions or generators")
         return wrapper
 
     return _decorate if func is None else _decorate(func)
@@ -2273,4 +2372,37 @@ def internal_api(func: Callable) -> Callable:
             pass
     """
     func._internal_api = True
+    return func
+
+
+def experimental_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as experimental API.
+
+    Use this decorator for:
+    - Experimental features that may change without notice
+    - New APIs under active development
+    - Features that are not yet stable
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks, allowing rapid iteration during development.
+
+    Args:
+        func: The function or class to mark as experimental
+
+    Returns:
+        The original function/class with an experimental API marker
+
+    Example:
+        @experimental_api
+        def new_experimental_feature():
+            '''This API is experimental and may change'''
+            pass
+
+        @experimental_api
+        class ExperimentalModel:
+            '''This model is under active development'''
+            pass
+    """
+    func._experimental_api = True
     return func
