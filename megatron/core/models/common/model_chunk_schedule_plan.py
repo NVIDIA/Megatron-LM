@@ -86,7 +86,7 @@ class TransformerLayerSchedulePlan:
         # get callable nodes for transformer/mtp layer
         self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
 
-    def __del__(self):
+    def release_state(self):
         if hasattr(self, 'attn') and self.attn is not None:
             del self.attn
             self.attn = None
@@ -415,7 +415,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         """Gets the model chunk state."""
         return self._model_chunk_state
 
-    def __del__(self):
+    def release_state(self):
         """Release reference, this helps avoid memory leak."""
         self._model_chunk_state.model = None
         self.pre_process.model_chunk_state = None
@@ -497,6 +497,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 b_grad=b_grad,
                 is_last_layer_in_bwd=(i == b_num_layers - 1),
             )
+            b_layer.release_state()
             torch.cuda.nvtx.range_pop()
 
         # backward pass for the remaining layers
@@ -506,6 +507,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             _, b_grad = TransformerLayerSchedulePlan.run(
                 None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
             )
+            b_layer.release_state()
             torch.cuda.nvtx.range_pop()
 
         # forward pass for the remaining layers
@@ -533,6 +535,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         if b_num_layers > 0:
             assert b_layer is not None
             b_layer.attn.backward_dw()
+            b_layer.release_state()
 
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
@@ -545,5 +548,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_schedule_plan.wait_current_stream()
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
+            # Release reference as early as possible, this helps avoid memory leak.
+            b_schedule_plan.release_state()
 
         return f_input
