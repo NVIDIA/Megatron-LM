@@ -711,49 +711,56 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
-                    # Get appropriate inner quantization context
-                    if use_inner_quantization_context:
-                        if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
+                    # debugmtl
+                    try:
+                        # Get appropriate inner quantization context
+                        if use_inner_quantization_context:
+                            if self.config.fp8:
+                                inner_quantization_context = get_fp8_context(
+                                    self.config, layer.layer_number - 1
+                                )
+                            elif self.config.fp4:
+                                inner_quantization_context = get_fp4_context(
+                                    self.config, layer.layer_number - 1
+                                )
+                            else:
+                                inner_quantization_context = nullcontext()
                         else:
                             inner_quantization_context = nullcontext()
-                    else:
-                        inner_quantization_context = nullcontext()
 
-                    if self.config.fine_grained_activation_offloading:
-                        fine_grained_offloading_set_last_layer(
-                            l_no == self.num_layers_per_pipeline_rank - 1
-                        )
+                        if self.config.fine_grained_activation_offloading:
+                            fine_grained_offloading_set_last_layer(
+                                l_no == self.num_layers_per_pipeline_rank - 1
+                            )
 
-                    with self.offload_context, inner_quantization_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            rotary_pos_cos=rotary_pos_cos,
-                            rotary_pos_sin=rotary_pos_sin,
-                            rotary_pos_cos_sin=rotary_pos_cos_sin,
-                            attention_bias=attention_bias,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                            sequence_len_offset=sequence_len_offset,
-                        )
+                        with self.offload_context, inner_quantization_context:
+                            hidden_states, context = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
+                                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                                attention_bias=attention_bias,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                                sequence_len_offset=sequence_len_offset,
+                            )
 
-                    if (
-                        torch.is_grad_enabled()
-                        and self.config.cpu_offloading
-                        and self.group_prefetch_offload_commit_async is not None
-                    ):
-                        hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
-
+                        if (
+                            torch.is_grad_enabled()
+                            and self.config.cpu_offloading
+                            and self.group_prefetch_offload_commit_async is not None
+                        ):
+                            hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+                    except Exception as e:
+                        # print(
+                        #     f"rank:{torch.distributed.get_rank()}, error: {e}, \
+                        # error layer number: {layer.layer_number}"
+                        # )
+                        raise e
         # Final layer norm.
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)

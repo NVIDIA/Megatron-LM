@@ -457,7 +457,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
+        # debugmtl sync here hang
+        # torch.cuda.synchronize()
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        # debugmtl barrier here works, sync here works
+        # torch.distributed.barrier()
+        # torch.cuda.synchronize()
         return output, context
 
     def _forward_attention(
@@ -677,6 +682,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
+        # debugmtl barrier here works, sync here hang
+        # torch.distributed.barrier()
+        # torch.cuda.synchronize()
+
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of mlp_output_with_bias[0]
@@ -711,6 +720,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
 
+        # debugmtl barrier here works
+        # torch.distributed.barrier()
+
         nvtx_range_pop(suffix="mlp_bda")
         if self.offload_mlp_norm:
             (hidden_states,) = fine_grained_offloading_group_commit(
@@ -726,6 +738,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+
+        # debugmtl barrier here works!
+        # torch.distributed.barrier()
 
         return output
 

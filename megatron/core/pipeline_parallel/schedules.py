@@ -984,8 +984,8 @@ def forward_backward_pipelining_with_interleaving(
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
-    data_iterator, num_microbatches = wrap_iterator_helper(
-        config, data_iterator, num_microbatches, pg_collection
+    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
     )
 
     # Needed only when gradients are finalized in M-Core
@@ -2004,6 +2004,9 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
+    if config.sft_sequence_packing:
+        forward_data_store.append([num_total_tokens_this_GB, sequence_square_sum_this_GB])
+
     return forward_data_store
 
 
@@ -2120,39 +2123,10 @@ def forward_backward_pipelining_without_interleaving(
             "Invalid combination of p2p_communicator, pg_collection "
             "provide none or provide all the process groups"
         )
-    if is_pp_first_stage(p2p_communicator.pp_group) or is_pp_last_stage(p2p_communicator.pp_group):
-        data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
-            wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
-        )
 
-        if config.sft_sequence_packing:
-            info_tensor = torch.tensor(
-                [num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB],
-                dtype=torch.int,
-                device="cuda",
-            )
-            if not is_pp_last_stage(p2p_communicator.pp_group):
-                next_rank = torch.distributed.get_global_rank(
-                    p2p_communicator.pp_group, p2p_communicator.pp_group.rank() + 1
-                )
-                torch.distributed.send(info_tensor, dst=next_rank)
-
-    # TODO(tailaim): last pp rank does not need to receive num_microbatches
-    if config.sft_sequence_packing and not (is_pp_first_stage(p2p_communicator.pp_group)):
-        info_tensor = torch.empty(3, dtype=torch.int, device="cuda")
-        prev_rank = torch.distributed.get_global_rank(
-            p2p_communicator.pp_group, p2p_communicator.pp_group.rank() - 1
-        )
-        torch.distributed.recv(info_tensor, src=prev_rank)
-        num_microbatches = int(info_tensor[0].item())
-        num_total_tokens_this_GB = int(info_tensor[1].item())
-        sequence_square_sum_this_GB = int(info_tensor[2].item())
-
-        if not is_pp_last_stage(p2p_communicator.pp_group):
-            next_rank = torch.distributed.get_global_rank(
-                p2p_communicator.pp_group, p2p_communicator.pp_group.rank() + 1
-            )
-            torch.distributed.send(info_tensor, dst=next_rank)
+    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
+    )
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:

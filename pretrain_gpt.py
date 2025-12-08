@@ -29,7 +29,6 @@ from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
-    get_packed_seq_params_on_this_pp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
@@ -62,49 +61,48 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     args = get_args()
     config = core_transformer_config_from_args(args)
     
-    # TODO: this is pretty hacky, find a better way
-    if (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)):
-        return None, None, None, None, None, None
-    # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(
-        data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
-        )
-    
-    if not is_first_or_last_pipeline_stage(vp_stage):
-        if args.args.hybrid_context_parallel:
-            local_cp_size=batch['local_cp_size'].item()
-            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=local_cp_size)
-        else:
-            local_cp_size, cp_group = None, None
-                     
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=batch['cu_seqlens_padded'],
-            cu_seqlens_kv=batch['cu_seqlens_padded'],
-            cu_seqlens_q_padded=batch['cu_seqlens_padded'],
-            cu_seqlens_kv_padded=batch['cu_seqlens_padded'],
-            max_seqlen_q=batch['cu_seqlens_padded'],
-            max_seqlen_kv=batch['cu_seqlens_padded'],
-            local_cp_size=local_cp_size,
-            cp_group=cp_group,
-        )
-        return None, None, None, None, None, packed_seq_params
-    
     if args.sft_sequence_packing:
+        
+        #TODO(tailaim): sequence packing doesn't consider the MTP rank,
+        # we need to handle this.
+        
+        # get batches based on the TP rank you are on
+        batch = get_batch_on_this_tp_rank(
+            data_iterator,
+            mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+            vp_stage=vp_stage,
+        )
+        
+        
+        
         cu_seqlens = batch.pop('cu_seqlens')
         cu_seqlens_padded = batch.pop('cu_seqlens_padded')
-
         max_seqlen = int(batch.pop('max_seqlen').item())
         # local_cp_size is None if we disable hybrid-cp
         local_cp_size = int(batch.pop('local_cp_size').item()) if ('local_cp_size' in batch) else None
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, 
-                cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size)
+
         
+        if is_first_or_last_pipeline_stage(vp_stage):
+            batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, 
+                    cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size, vp_stage=vp_stage)
+            return (*batch.values(), packed_seq_params)
+        
+        else:
+            _, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, 
+                    cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size, only_packed_seq_params=True)
+            return None, None, None, None, None, packed_seq_params
     else:
+        # TODO: this is pretty hacky, find a better way
+        if not is_first_or_last_pipeline_stage(vp_stage) and (
+        (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+            return None, None, None, None, None, None
+        batch = get_batch_on_this_tp_rank(
+        data_iterator,
+        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        )
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
-    return (*batch.values(), packed_seq_params)
+        return (*batch.values(), packed_seq_params)
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -197,6 +195,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
             if return_schedule_plan:
+                
                 assert args.overlap_moe_expert_parallel_comm, \
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
                 schedule_plan = model.build_schedule_plan(
