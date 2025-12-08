@@ -92,25 +92,9 @@ class BlockAllocator:
             self.total_avail -= num_blocks
             block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
             assert num_blocks == block_ids.numel()
-            # >>>
-            if set(block_ids.tolist()) & set(self.block_bag[:self.total_avail].tolist()):
-                pax("self", {
-                    "block_bag" : str(self.block_bag[-16:].tolist()),
-                    "block_ids" : str(block_ids.tolist()),
-                    "unique" : self.get_num_unique_ids(),
-                })
-            # <<<
             return block_ids
         else:
             return None
-
-    # >>>
-    def get_num_unique_total(self):
-        return len(set(self.block_bag.view(-1).tolist()))
-
-    def get_num_unique_avail(self):
-        return len(set(self.block_bag.view(-1)[:self.total_avail].tolist()))
-    # <<<
 
     def release_memory_blocks(self, blocks: Tensor) -> None:
         """Release memory blocks.
@@ -124,17 +108,6 @@ class BlockAllocator:
         num_blocks = blocks.size(dim=0)
         self.block_bag[self.total_avail : (self.total_avail + num_blocks)] = blocks
         self.total_avail += num_blocks
-        # >>>
-        # if (self.total_avail == self.total_count - 1 and
-        #     self.get_num_unique_ids() != self.total_count):
-        if self.get_num_unique_avail() != self.total_avail:
-        # if repeat_idx == 0 and step_count == 16:
-            pax("self", {
-                "block_bag" : str(self.block_bag[-16:].tolist()),
-                "blocks" : str(blocks.tolist()),
-                "unique" : self.get_num_unique_ids(),
-            })
-        # <<<
 
     def reset(self) -> None:
         """Reset the allocator to initial state.

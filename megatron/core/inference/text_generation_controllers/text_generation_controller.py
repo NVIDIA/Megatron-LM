@@ -551,10 +551,6 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         with torch.inference_mode():
-            # >>>
-            # if repeat_idx == 1:
-            #     pax("input_ids, position_ids, repeat_idx, context")
-            # <<<
             logits = self.inference_wrapped_model.run_one_forward_step(
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
@@ -909,35 +905,7 @@ class TextGenerationController:
             context.padded_active_request_count if context.is_decode_only() else None
         )
 
-        # >>>
-        # if repeat_idx == 1:
-        #     print_seq("block_bag ....... uniq %d ... [%s] %s ... %s" % (
-        #         context.block_allocator.get_num_unique_ids(),
-        #         get_array_hash(context.block_allocator.block_bag),
-        #         context.block_allocator.block_bag.view(-1)[:16].tolist(),
-        #         context.block_allocator.block_bag.view(-1)[-16:].tolist(),
-        #     ))
-        #     pax({
-        #         "paused_request_count" : context.paused_request_count,
-        #         "total_request_count" : context.total_request_count,
-        #         "active_token_count" : context.active_token_count,
-        #         "input_ids" : input_ids,
-        #         "position_ids" : position_ids,
-        #         "block_allocator" : context.block_allocator,
-        #     })
-        # <<<
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)
-        # >>>
-        if False: # repeat_idx == 1 and context.total_request_count == 5:
-            pax("context", {
-                "repeat_idx" : repeat_idx,
-                "total_request_count" : context.total_request_count,
-                "active_token_count" : context.active_token_count,
-                "input_ids" : input_ids[:, :context.active_token_count],
-                "position_ids" : position_ids[:, :context.active_token_count],
-                "logits" : logits[:, :context.active_token_count],
-            })
-        # <<<
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
