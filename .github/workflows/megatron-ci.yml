@@ -64,6 +64,19 @@ jobs:
           echo "Using GPU arch: $ARCH"
           echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve TransformerEngine commit for branch
+        id: te-ref
+        run: |
+          set -e
+          BRANCH=release_v2.2
+          SHA=$(git ls-remote https://github.com/ROCm/TransformerEngine.git "refs/heads/$BRANCH" | cut -f1)
+          if [ -z "$SHA" ]; then
+            echo "::error::Failed to resolve TransformerEngine commit for branch $BRANCH"
+            exit 1
+          fi
+          echo "Using TransformerEngine commit: $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
       - name: Login to Docker Hub (same registry as Jenkins)
         uses: docker/login-action@v3
         with:
@@ -84,6 +97,7 @@ jobs:
             rocm/megatron-lm-private:${{ github.sha }}
           build-args: |
             PYTORCH_ROCM_ARCH_OVERRIDE=${{ steps.gpu-arch.outputs.arch }}
+            TE_COMMIT=${{ steps.te-ref.outputs.sha }}
           cache-from: |
             type=registry,ref=rocm/megatron-lm-private:cache
           cache-to: |
@@ -116,7 +130,7 @@ jobs:
           name: Megatron-LM unit tests
           path: output/junit_report_*.xml
           reporter: java-junit
-          fail-on-error: false
+          fail-on-error: true
 
       - name: List test reports
         if: always()
