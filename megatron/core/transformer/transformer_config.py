@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from dataclasses import dataclass
@@ -7,7 +7,7 @@ from typing import Callable, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from megatron.core.enums import Fp8Recipe
+from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
@@ -222,9 +222,6 @@ class TransformerConfig(ModelParallelConfig):
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
 
-    moe_deepep_num_sms: int = 20
-    """Number of SMs to use for DeepEP."""
-
     ####################
     # initialization
     ####################
@@ -360,10 +357,10 @@ class TransformerConfig(ModelParallelConfig):
     activation and weight tensors and e5m2 for all FP8 output activation gradient tensors."""
 
     fp8_recipe: Optional[str] = "delayed"
-    """If set, enables the use of FP8 precision through Transformer Engine. There are 3 predefined
+    """If set, enables the use of FP8 precision through Transformer Engine. There are 5 predefined
     choices (1) 'tensorwise' uses per tensor current scaling recipe, (2) 'delayed'
     uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only,
-    4) 'blockwise' for blockwise scaling recipe."""
+    4) 'blockwise' for blockwise scaling recipe, 5) 'custom' for custom quantization recipe."""
 
     fp8_param: bool = False
     """If set, keep the parameters in fp8 precision to save memory. This option must be used
@@ -371,6 +368,10 @@ class TransformerConfig(ModelParallelConfig):
     will be converted to fp8; for example, biases will remain unchanged. The parameters affected are
     primarily the weights of GEMMs. The specific parameters that will be converted to fp8 are
     determined by TE."""
+
+    fp8_quantizer_factory: Optional[str] = None
+    """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
+    Required when fp8_recipe is custom."""
 
     fp8_margin: int = 0
     """Margin for the scaling factor computation."""
@@ -433,6 +434,10 @@ class TransformerConfig(ModelParallelConfig):
     together with fp4 mode (i.e., TransformerConfig.fp4 is not None). Note that not all parameters
     will be converted to fp4; for example, biases will remain unchanged."""
 
+    fp4_quantizer_factory: Optional[str] = None
+    """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
+    Required when fp4_recipe is custom."""
+
     ####################
     # MoE related
     ####################
@@ -482,10 +487,14 @@ class TransformerConfig(ModelParallelConfig):
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
     """
 
+    moe_router_padding_for_quantization: Optional[bool] = False
+    """Whether to pad the routing_map to make sure the number of tokens each expert receives
+    is a multiple of 16/32 for quantized precision (e.g., FP8, FP4). This can remove the explicit
+    padding in the GroupedMLP layer."""
+
     moe_router_padding_for_fp8: Optional[bool] = False
-    """Whether to pad the routing_map to make sure the number of tokens each expert received
-    is a multiple of 16/32 for FP8 precision. This can remove the explicit padding in the
-    GroupedMLP layer."""
+    """[Compatibility alias for moe_router_padding_for_quantization]
+    Enabling this will also enable moe_router_padding_for_quantization."""
 
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
@@ -571,6 +580,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
+    moe_flex_dispatcher_backend: str = "deepep"
+    """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
+    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
+    the MNNVL case."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -600,6 +614,16 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
+
+    moe_latent_size: Optional[int] = None
+    """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
+
+    moe_deepep_num_sms: int = 20
+    """Number of SMs to use for DeepEP."""
+
+    moe_hybridep_num_sms: int = 16
+    """Number of SMs to use for HybridEP. In pure NVL scenarios,
+    16 SMs can generally achieve good bandwidth."""
 
     ##################
     # Context Parallel
@@ -695,6 +719,9 @@ class TransformerConfig(ModelParallelConfig):
     symmetric_ar_type: Optional[str] = None
     """Type of symmetric all reduce to use"""
 
+    use_inference_optimized_layers: bool = False
+    """If True, use inference optimized transformer layers during inference."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -732,7 +759,7 @@ class TransformerConfig(ModelParallelConfig):
     # Quantization
     ####################
     quant_recipe: Optional[RecipeConfig] = None
-    """Configuration of any quantization to be applied to the model"""
+    """Configuration of any per-module quantization settings to be applied to the model"""
 
     transformer_impl: str = "transformer_engine"
     """Transformer implementation to use.
@@ -768,9 +795,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
 
-        if self.num_query_groups % self.tensor_model_parallel_size != 0:
+        if (
+            self.num_query_groups % self.tensor_model_parallel_size != 0
+            and self.tensor_model_parallel_size % self.num_query_groups != 0
+        ):
             raise ValueError(
-                f"num_query_groups ({self.num_query_groups}) must be a multiple of "
+                f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
@@ -805,6 +835,14 @@ class TransformerConfig(ModelParallelConfig):
                         f"({max_bf16_layers_per_pipeline_stage})."
                     )
 
+            if self.fp8_recipe == Fp8Recipe.custom:
+                if not self.fp8_quantizer_factory:
+                    raise ValueError(
+                        "fp8_quantizer_factory must be provided when fp8_recipe is 'custom'. "
+                        "Specify a Python import path (e.g., package.module.quantizer_factory) "
+                        "via --fp8-quantizer-factory."
+                    )
+
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
@@ -814,6 +852,14 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp4 and self.fp8:
             raise ValueError("fp4 and fp8 cannot be used simultaneously. Please choose one.")
+
+        if self.fp4 and self.fp4_recipe == Fp4Recipe.custom:
+            if not self.fp4_quantizer_factory:
+                raise ValueError(
+                    "fp4_quantizer_factory must be provided when fp4_recipe is 'custom'. "
+                    "Specify a Python import path (e.g., package.module.quantizer_factory) "
+                    "via --fp4-quantizer-factory."
+                )
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
@@ -836,11 +882,21 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
+            if self.moe_flex_dispatcher_backend == "hybridep":
+                raise ValueError("Only one backend is supported for flex token dispatcher.")
+            self.moe_flex_dispatcher_backend = "deepep"
+            warnings.warn(
+                "moe_enable_deepep is deprecated."
+                "Please use --moe-flex-dispatcher-backend=deepep instead."
+            )
 
         if self.moe_token_dispatcher_type == "flex":
-            if self.moe_pad_expert_input_to_capacity:
+            if self.moe_pad_expert_input_to_capacity and (
+                self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "deepep"
+            ):
                 raise ValueError(
-                    "Flex token dispatcher does not support moe_pad_expert_input_to_capacity"
+                    "Flex token dispatcher with deepep backend does not support "
+                    "moe_pad_expert_input_to_capacity"
                 )
 
         if self.moe_shared_expert_intermediate_size is not None:
@@ -1337,13 +1393,23 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_router_padding_for_fp8:
-            if self.fp8 is None:
-                raise ValueError("fp8 must be specified when moe_router_padding_for_fp8 is True.")
+            # enable moe_router_padding_for_quantization
+            warnings.warn(
+                "--moe-router-padding-for-fp8 is going to be deprecated. "
+                "Use --moe-router-padding-for-quantization instead."
+            )
+            self.moe_router_padding_for_quantization = True
+
+        if self.moe_router_padding_for_quantization:
+            if self.fp8 is None and self.fp4 is None:
+                raise ValueError(
+                    "fp8/fp4 must be specified when moe_router_padding_for_quantization is True."
+                )
 
             if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:
                 raise ValueError(
                     "allgather and alltoall_seq dispatcher does not support "
-                    "moe_router_padding_for_fp8."
+                    "moe_router_padding_for_quantization."
                 )
 
         if (
@@ -1552,6 +1618,13 @@ class TransformerConfig(ModelParallelConfig):
                     f"Length of no_rope list ({len(self.no_rope_freq)}) must match "
                     f"the number of layers ({self.num_layers})"
                 )
+
+        if self.transformer_impl == "inference_optimized":
+            assert self.normalization == "RMSNorm"
+            assert not self.layernorm_zero_centered_gamma
+            assert not self.add_bias_linear
+            assert not self.add_qkv_bias
+            assert not self.use_kitchen
 
 
 @dataclass

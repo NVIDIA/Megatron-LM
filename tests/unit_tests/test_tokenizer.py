@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import base64
 import json
 from argparse import Namespace
@@ -41,7 +43,7 @@ def local_test_specs():
             tokenizer_model=f"{TOKENIZER_DIR}/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json",
             tiktoken_pattern="v2",
             tiktoken_num_special_tokens=1000,
-            tiktoken_special_tokens=["<unk>", "<s>", "</s>"],
+            tokenizer_special_tokens=["<unk>", "<s>", "</s>"],
         ),
         Namespace(
             rank=0,
@@ -52,7 +54,7 @@ def local_test_specs():
             tokenizer_model=f"{TOKENIZER_DIR}/multiMixV5_fix_default_500000_128k.vocab.json",
             tiktoken_pattern="v1",
             tiktoken_num_special_tokens=1000,
-            tiktoken_special_tokens=["<unk>", "<s>", "</s>"],
+            tokenizer_special_tokens=["<unk>", "<s>", "</s>"],
         ),
         Namespace(
             rank=0,
@@ -117,7 +119,7 @@ def gpt2_tiktok_vocab(tmp_path_factory):
         tokenizer_model=str(file_name),
         tiktoken_pattern="v1",
         tiktoken_num_special_tokens=1000,
-        tiktoken_special_tokens=["<unk>", "<s>", "</s>"],
+        tokenizer_special_tokens=["<unk>", "<s>", "</s>"],
     )
 
 
