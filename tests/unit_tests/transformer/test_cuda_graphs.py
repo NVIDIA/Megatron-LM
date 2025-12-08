@@ -26,6 +26,7 @@ from megatron.core.transformer.cuda_graphs import (
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.training.global_vars import destroy_global_vars
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -505,18 +506,15 @@ class TestParallelMambaBlockCudagraphs:
             del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
 
 
-# Global storage for comparing unique buffer counts across different num_microbatches
-_unique_buffer_counts = None
+# Global storage for comparing unique buffer counts across different num_microbatches,
+# keyed by (pp_size, vpp_size)
+_unique_buffer_counts = {}
 
 
 class TestTECudaGraphHelper:
     def setup_method(self, method):
         # Initialize parallel state
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-        )
-        model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -525,14 +523,25 @@ class TestTECudaGraphHelper:
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
 
-    @pytest.mark.parametrize("num_microbatches", [4, 16, 64, 256])
-    def test_get_cuda_graph_input_data(self, num_microbatches):
+    @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
+    @pytest.mark.parametrize("pp_size", [1, 2, 4])
+    @pytest.mark.parametrize("vpp_size", [None, 2])
+    def test_get_cuda_graph_input_data(self, num_microbatches, pp_size, vpp_size):
         """Test _get_cuda_graph_input_data function in TECudaGraphHelper."""
+
+        if vpp_size and pp_size == 1:
+            pytest.skip("vpp_size must be None when pp_size is 1")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vpp_size,
+        )
 
         # Set up test configuration
         seq_length = 128
         micro_batch_size = 2
-        num_layers = 4
+        num_layers = 8
         vocab_size = 1024
         hidden_size = 64
         num_attention_heads = 4
@@ -557,7 +566,9 @@ class TestTECudaGraphHelper:
             use_te_rng_tracker=True,
             bf16=True,
             tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vpp_size,
+            pipeline_dtype=torch.bfloat16,
             context_parallel_size=1,
         )
 
@@ -565,21 +576,22 @@ class TestTECudaGraphHelper:
         torch.manual_seed(123)
         model_parallel_cuda_manual_seed(123)
 
-        gpt_model = GPTModel(
-            config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-            vocab_size=vocab_size,
-            max_sequence_length=seq_length,
-            parallel_output=True,
-            position_embedding_type="rope",
-        )
-
-        # Move model to CUDA
-        gpt_model.cuda()
+        model = []
+        for i in range(vpp_size or 1):
+            this_model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=vocab_size,
+                max_sequence_length=seq_length,
+                parallel_output=True,
+                position_embedding_type="rope",
+                vp_stage=i if vpp_size else None,
+            ).cuda()
+            model.append(this_model)
 
         # Initialize TECudaGraphHelper
         cuda_graph_helper = TECudaGraphHelper(
-            model=[gpt_model],
+            model=model,
             config=transformer_config,
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
@@ -694,17 +706,19 @@ class TestTECudaGraphHelper:
             f"should be <= total_entries ({total_entries})"
         )
         global _unique_buffer_counts
-        if _unique_buffer_counts is None:
-            _unique_buffer_counts = unique_buffer_count
+        # Use (pp_size, vpp_size) as key to track unique buffer counts per configuration
+        config_key = (pp_size, vpp_size)
+        if config_key not in _unique_buffer_counts:
+            _unique_buffer_counts[config_key] = unique_buffer_count
         else:
-            assert unique_buffer_count == _unique_buffer_counts, (
-                f"Unique buffer count mismatch: expected {_unique_buffer_counts}, "
+            assert unique_buffer_count == _unique_buffer_counts[config_key], (
+                f"Unique buffer count mismatch: expected {_unique_buffer_counts[config_key]}, "
                 f"got {unique_buffer_count}"
             )
 
         # Verify that buffers with the same signature can potentially be reused
         # (the actual reuse depends on the schedule, but the mechanism should work)
-        if num_microbatches > 1 and num_graphable_layers > 0:
+        if expected_length > 1:
             # Check that we have multiple entries with the same signature
             has_duplicate_signatures = any(
                 len(indices) > 1 for indices in sample_keys_to_indices.values()
@@ -714,14 +728,8 @@ class TestTECudaGraphHelper:
                 "but all signatures are unique"
             )
 
-            # If we have duplicate signatures and the schedule allows it,
-            # some buffers should be reused (max_reuse > 1)
-            # Note: The exact amount of reuse depends on the schedule order
-            # With 1F1B interleaved schedule, we should see some reuse
-            if max_reuse > 1:
-                # Verify that reused buffers have the same signature
-                reused_tensors = [ptr for ptr, count in tensor_reuse_count.items() if count > 1]
-                assert len(reused_tensors) > 0, "Expected some reused tensors"
+            # We tested with a large number of microbatches, so we should see some buffer reuse.
+            assert max_reuse > 1, "Expected some buffer reuse"
 
         # Verify that make_graphed_callables_kwargs contains expected keys
         assert (
