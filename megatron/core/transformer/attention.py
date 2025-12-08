@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
@@ -23,6 +23,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -60,7 +61,7 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flash_attn_3.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -178,16 +179,38 @@ class Attention(MegatronModule, ABC):
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
-        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        if self.config.num_query_groups < world_size:
+            # When num_kv_heads < tp_size, each TP rank (post AG) initially produces
+            # activations for 1 kv_head and (num_q_heads / num_kv_heads) q_heads.
+            # We then pull out the appropriate (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = 1
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, self.config.num_query_groups
+            )
+        else:
+            # When num_kv_heads >= tp_size, each TP rank produces activations for
+            # (num_kv_heads / tp_size) kv_heads and (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, world_size
+            )
+        self.world_size = world_size
 
         # To support both CUDA Graphs and key value with different hidden size
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
+        if self.config.num_query_groups < world_size:
+            # TE throws an assertion error if num_kv_heads / num_query_groups
+            # is not divisible by TP size.
+            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = world_size
+        else:
+            tmp_config = self.config
         self.core_attention = build_module(
             submodules.core_attention,
-            config=self.config,
+            config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
@@ -1111,6 +1134,26 @@ class SelfAttention(Attention):
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
 
+        if self.config.num_query_groups < self.world_size:
+            # Note that weights are interleaved in the following manner:
+            # q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ...
+            # When tp_size > num_kv_heads, we split "q1 q2 k1 v1" over multiple
+            # ranks, so a rank does not have a clean partitioning of just the q_heads
+            # it needs. Instead, we perform the following steps:
+            # 1. Assemble the full "q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ..."
+            #    through an AG.
+            # 2. Pull out the right slice (e.g., "q1 q2 k1 v1" or "q3 q4 k2 v2").
+            # 3. Split q_heads (e.g., q1, q2), k_heads (e.g., k1), v_heads (e.g., v1).
+            # 4. Further index into query to get only the q_heads that this rank is
+            #    responsible for (e.g., q1).
+            # The block of code below performs steps 1 and 2.
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
+            idx = get_tensor_model_parallel_rank() // (
+                self.world_size // self.config.num_query_groups
+            )
+            size = mixed_qkv.size()[-1] // self.config.num_query_groups
+            mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
+
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
@@ -1148,6 +1191,18 @@ class SelfAttention(Attention):
 
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+
+        if self.config.num_query_groups < self.world_size:
+            # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
+            # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
+            # This is step 4 in the list of steps above.
+            idx = get_tensor_model_parallel_rank() % (
+                self.world_size // self.config.num_query_groups
+            )
+            size = self.num_attention_heads_per_partition // (
+                self.world_size // self.config.num_query_groups
+            )
+            query = query[:, :, idx * size : (idx + 1) * size, :]
 
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)

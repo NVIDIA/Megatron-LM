@@ -37,6 +37,7 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, get_tensor_model_parallel_world_size
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
@@ -879,7 +880,6 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, pac
                                     max_seqlen_q=packed_seq_params.max_seqlen_q,
                                     max_seqlen_kv=packed_seq_params.max_seqlen_kv,
                                 )
-
                     # Slice inputs to remove padding (or pad if needed for SP alignment)
                     # dimension 0 is batch, with seq packing BS=1
                     tokens = tokens[:, :actual_len]
