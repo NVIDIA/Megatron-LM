@@ -260,6 +260,11 @@ def build_centralized_reshard_plan(
     # Build the plan on global rank 0 and broadcast to all ranks
     if my_global_rank == 0:
         plans_for_all_ranks = {r: ReshardPlan([], [], []) for r in range(world_size)}
+        # Global monotonically increasing ID for non-local transfers.
+        # This is shared between the corresponding send/recv ops so that
+        # advanced backends (e.g., NVSHMEM) can build richer schedules.
+        next_task_id = 0
+
         for dst_rank in range(world_size):
             dst_rank_params = dst_param_metadata_by_rank.get(dst_rank, {})
             for resolved_name, dst_metadata in dst_rank_params.items():
@@ -270,7 +275,9 @@ def build_centralized_reshard_plan(
                         "not found in source model."
                     )
                 # Choose a representative source metadata with DP round-robin balancing
-                src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
+                src_metadata = select_src_metadata_balanced(
+                    src_meta_list, dst_metadata, dst_rank
+                )
                 sources = _determine_source_ranks_for_dst_param(
                     resolved_name, src_metadata, dst_metadata, dst_rank
                 )
@@ -280,6 +287,9 @@ def build_centralized_reshard_plan(
                             (dst_metadata.name, None, None, src_slice, dst_slice)
                         )
                     else:
+                        task_id = next_task_id
+                        next_task_id += 1
+
                         plans_for_all_ranks[dst_rank].recv_ops.append(
                             TransferOp(
                                 param_name=dst_metadata.name,
@@ -287,6 +297,7 @@ def build_centralized_reshard_plan(
                                 is_send=False,
                                 my_slice=dst_slice,
                                 peer_slice=src_slice,
+                                task_id=task_id,
                             )
                         )
                         plans_for_all_ranks[src_rank].send_ops.append(
@@ -296,6 +307,7 @@ def build_centralized_reshard_plan(
                                 is_send=True,
                                 my_slice=src_slice,
                                 peer_slice=dst_slice,
+                                task_id=task_id,
                             )
                         )
         plans_list = [plans_for_all_ranks[r] for r in range(world_size)]

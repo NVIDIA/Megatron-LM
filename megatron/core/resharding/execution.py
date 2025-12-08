@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 from .copy_services.base import CopyService
+from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from .utils import ReshardPlan
 
 logger = logging.getLogger(__name__)
@@ -41,12 +42,17 @@ def execute_reshard_plan(
                 dst_view = dst_param.data[dst_slice]
                 dst_view.copy_(src_view)
 
+    is_nvshmem = isinstance(service, NVSHMEMCopyService)
+
     # Submit sends
     for op in plan.send_ops:
         src_param = src_params.get(op.param_name)
         if src_param is not None:
             src_view = src_param.data[op.my_slice].contiguous()
-            service.submit_send(src_view, op.peer_rank)
+            if is_nvshmem and op.task_id is not None:
+                service.submit_send_with_id(op.task_id, src_view, op.peer_rank)
+            else:
+                service.submit_send(src_view, op.peer_rank)
 
     # Submit recvs
     recv_writebacks: List[Tuple[torch.Tensor, torch.nn.Parameter, tuple[slice, ...]]] = []
@@ -55,7 +61,10 @@ def execute_reshard_plan(
         if dst_param is not None:
             dst_slice_view = dst_param.data[op.my_slice]
             recv_buffer = torch.empty_like(dst_slice_view.contiguous())
-            service.submit_recv(recv_buffer, op.peer_rank)
+            if is_nvshmem and op.task_id is not None:
+                service.submit_recv_with_id(op.task_id, recv_buffer, op.peer_rank)
+            else:
+                service.submit_recv(recv_buffer, op.peer_rank)
             recv_writebacks.append((recv_buffer, dst_param, op.my_slice))
 
     # Execute

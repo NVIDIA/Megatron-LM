@@ -25,6 +25,11 @@ class TransferOp:
     my_slice: tuple[slice, ...]  # My tensor slice
     peer_slice: tuple[slice, ...]  # Peer's tensor slice (for reference)
 
+    # Optional global task identifier for advanced backends (e.g., NVSHMEM)
+    # When present, this ID is shared between the matching send/recv ops
+    # across ranks and can be used to build richer communication schedules.
+    task_id: int | None = None
+
 
 @dataclass
 class ParameterMetadata:

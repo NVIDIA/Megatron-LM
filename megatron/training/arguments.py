@@ -2001,9 +2001,11 @@ def _add_rl_args(parser):
     group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
                        help='Degree of tensor model parallelism for inference for RL.')     
     group.add_argument('--refit-method', type=str, default='nccl',
-                       choices=['nccl', 'gloo'],
+                       choices=['nccl', 'gloo', 'nvshmem'],
                        help=('Method to refit the model weights between training and inference models during RL. '
-                             'nccl: use NCCLCopyService to refit the model weights between training and inference models during RL.'))
+                             'nccl: use NCCLCopyService to refit the model weights between training and inference models during RL; '
+                             'gloo: use GlooCopyService over CPU; '
+                             'nvshmem: use NVSHMEMCopyService to refit using the in-tree NVSHMEM copy service.'))
     return parser
 
 def _add_training_args(parser):
