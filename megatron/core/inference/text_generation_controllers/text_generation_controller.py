@@ -832,6 +832,9 @@ class TextGenerationController:
         return top_n_results if top_n_results else None
 
     def dummy_forward(self):
+        """Run a dummy forward pass through the model, with a single token.
+        Use-case: Used in EP on ranks which do not have any work, but are needed
+        for the all-to-all communication."""
         return self.inference_wrapped_model.dummy_forward()
 
     def _dynamic_step_context_bookkeeping(self, new_sample) -> Dict[str, Tensor]:

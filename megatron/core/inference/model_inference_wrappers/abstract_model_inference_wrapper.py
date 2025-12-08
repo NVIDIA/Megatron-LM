@@ -167,7 +167,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
         )
 
     def dummy_forward(self):
-        """Runs a dummy forward pass with 1 token of the model."""
+        """Run a dummy forward pass through the model, with a single token.
+        Use-case: Used in EP on ranks which do not have any work, but are needed
+        for the all-to-all communication."""
         tokens = torch.zeros((1, 1), dtype=torch.long, device=torch.cuda.current_device())
         position_ids = torch.zeros((1, 1), dtype=torch.long, device=torch.cuda.current_device())
         attention_mask = None
