@@ -62,6 +62,14 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
+# >>>
+from lutil import pax as _pax, print_seq as _print_seq, get_array_hash as _get_array_hash
+import builtins
+builtins.pax = _pax
+builtins.print_seq = _print_seq
+builtins.get_array_hash = _get_array_hash
+# <<<
+
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -325,6 +333,10 @@ def run_inference(
             # Suspend.
             if attempted_step_count % args.suspend_resume_interval == 0:
                 print("**** step %d/%d ... suspend." % (engine.step_count, attempted_step_count))
+                # >>>
+                # pax({"context": engine.context})
+                # raise Exception("hi.")
+                # <<<
                 engine.suspend()
 
             # Resume, 0+ attempted steps later.
@@ -336,6 +348,10 @@ def run_inference(
             ):
                 print("**** step %d/%d ... resume." % (engine.step_count, attempted_step_count))
                 engine.resume()
+                # >>>
+                # pax({"context": engine.context})
+                # raise Exception("hi.")
+                # <<<
 
         # If engine suspended, continue to next iter.
         if isinstance(result, EngineSuspendedError):
@@ -395,6 +411,13 @@ def run_inference(
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
 
+    # >>>
+    # Resume engine (NOOP if not suspended).
+    if engine.is_suspended:
+        engine.resume()
+    # pax({"engine / is_suspended": engine.is_suspended})
+    # <<<
+
     return {
         "step_times" : step_times,
         "add_times" : add_times,
@@ -448,6 +471,9 @@ def main():
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
+    # >>>
+    # pax("requests")
+    # <<<
     context = get_inference_context(
         requests,
         sampling_params,
@@ -484,9 +510,57 @@ def main():
 
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
-    for _ in range(args.inference_repeat_n):
+    # >>>
+    # for _ in range(args.inference_repeat_n):
+    # +++
+    for repeat_idx in range(args.inference_repeat_n):
+        # os.environ["REPEAT_IDX"] = str(repeat_idx)
+        builtins.repeat_idx = repeat_idx
+    # <<<
+        # >>>
+        if os.environ["LAWRENCE_X"] == "0":
+            args.suspend_resume_interval = None
+        else:
+            args.suspend_resume_interval = 8 if repeat_idx == 0 else None
+        # args.suspend_resume_interval = None if repeat_idx == 0 else 8
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        engine.reset()
+        context.print_snapshot(f"repeat_idx {repeat_idx}")
+        # <<<
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # del context.memory_buffer
+        # del context
+        # context = get_inference_context(
+        #     requests,
+        #     sampling_params,
+        #     mamba_inference_state_config=mamba_inference_state_config,
+        # )
+        # controller = get_inference_controller(model, context)
+        # engine = DynamicInferenceEngine(
+        #     controller,
+        #     context,
+        #     enable_cuda_graph=args.cuda_graph_impl == "local",
+        #     random_seed=args.seed,
+        #     track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+        #     enable_chunked_prefill=not args.disable_chunked_prefill,
+        #     inference_logging_step_interval=args.inference_wandb_logging_step_interval,
+        # )
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        # >>>
+        # context.reset()
+        # engine.reset()
+        # context.padded_active_request_count = 0
+        # context.padded_active_token_count = 0
+        # <<<
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # pax("context")
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         t = get_curr_time()
         result = run_inference(requests, engine)
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # if repeat_idx == 1:
+        #     pax("context")
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         step_times = result["step_times"]
         add_times = result["add_times"]
         output_times = result["output_times"]
@@ -548,6 +622,14 @@ def main():
                     escaped_output_text = "--"
                 print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
                 text_hashes.append(o_hash)
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        print(f"~~~ s {args.suspend_resume_interval}, n {args.inference_repeat_n} ~~~~~~~~~~~~~~~~~~~~~~~~")
+        for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
+            prompt_len = len(requests[request_idxs[0]].prompt_tokens)
+            escaped_prompt_text = escape_str(prompt_text)
+            print(f"{escaped_prompt_text:<33} .... [{text_hashes[unique_idx]}] {escape_str(requests[request_idxs[0]].output_text)}")
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:

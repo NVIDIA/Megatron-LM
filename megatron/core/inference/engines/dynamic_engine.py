@@ -541,9 +541,16 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Skip if already suspended, which can happen when using the inference
         # coordinator.
+        # >>>
+        # pax({"is_suspended": self.is_suspended})
+        # <<<
         if self.is_suspended:
             return
         self.is_suspended = True
+
+        # >>>
+        # self.context.print_snapshot(0)
+        # <<<
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
@@ -622,6 +629,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Notify event loop.
         self._loop.call_soon_threadsafe(asyncio.create_task, self._notify_cond_for_new_request())
+
+        # >>>
+        # self.context.print_snapshot(1)
+        # if repeat_idx == 1:
+        #     pax({"block_allocator": self.context.block_allocator})
+        # raise Exception("hi.")
+        # <<<
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
@@ -967,6 +981,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 if token_fully_can_be_added:
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
+                    # >>>
+                    # if repeat_idx == 0:
+                    #     pax({"input_and_position_ids"})
+                    # <<<
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -1024,6 +1042,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        # >>>
+        print("........ request_ids: %s." % str(self.context.request_ids[self.context.paused_request_count:self.context.total_request_count].tolist()))
+        # <<<
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
@@ -1228,6 +1249,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
+        # >>>
+        # if self.is_suspended:
+        #     return {
+        #         "active_request_ids" : [],
+        #         "finished_request_records" : [],
+        #         "step_time" : -1.,
+        #         "cuda_graph_request_count" : -1,
+        #     }
+        # <<<
         last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data, verbose=verbose)
         # Keep for compatibility with current test suite.

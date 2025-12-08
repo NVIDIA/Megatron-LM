@@ -640,6 +640,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             if isinstance(value, torch.Tensor):
                 delattr(self, key)
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    def print_snapshot(self, title):
+        print("+++ %s ++++++++++++++++++++++++++++++++" % title)
+        def print_tensor(k, t):
+            print("    .... %s ... %s ... %s." % (
+                k,
+                str(t.view(-1)[:16].tolist()).strip("]"),
+                str(t.view(-1)[-16:].tolist()).strip("["),
+            ))
+        for key, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                print_tensor(key, value)
+        print_tensor("block_bag", self.block_allocator.block_bag)
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
         """Round up to nearest multiple of `TOKEN_ROUNDER` (above) that is also divisible by tensor model parallel size."""
