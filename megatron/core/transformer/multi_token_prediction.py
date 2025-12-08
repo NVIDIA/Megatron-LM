@@ -13,9 +13,6 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_set_last_layer,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
@@ -949,7 +946,6 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
-        self.layers[-1].transformer_layer.is_last_layer = True
         self.cp_group = pg_collection.cp
 
     def _build_layers(self, pg_collection):

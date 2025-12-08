@@ -277,7 +277,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
-        self.is_last_layer = False
 
         self.submodules_config = submodules
         self.layer_number = layer_number + get_transformer_layer_offset(
@@ -501,9 +500,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             fine_grained_offloading_group_start,
             get_fine_grained_offloading_context,
         )
-        if self.config.fine_grained_activation_offloading:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import fine_grained_offloading_set_last_layer
-            fine_grained_offloading_set_last_layer(self.is_last_layer)
 
         if self.offload_module_in_cuda_graph:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import fine_grained_offloading_backward_record
@@ -856,9 +852,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         However, CUDA graph accepts only Tensor inputs.
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         """
-        if self.config.fine_grained_activation_offloading:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import fine_grained_offloading_set_last_layer
-            fine_grained_offloading_set_last_layer(self.is_last_layer)
         context = None
         if self.config.cuda_graph_scope and 'attn' not in self.config.cuda_graph_scope:
             hidden_states, context = self._forward_attention(*args, **kwargs)
