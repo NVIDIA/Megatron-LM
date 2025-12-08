@@ -129,9 +129,7 @@ class TensorReusePool:
     def get(self, tensor):
         for idx, buf in enumerate(self.pool):
             if self._tensors_match(buf, tensor):
-                out = self.pool.pop(idx).detach()
-                out.requires_grad = tensor.requires_grad
-                return out
+                return self.pool.pop(idx)
 
         out = torch.zeros_like(tensor)
         self.tensor_strong_refs.append(out)
@@ -161,27 +159,6 @@ def _check_supported_type(meta):
     assert meta.type in _SUPPORTED_TYPES or is_dataclass(
         meta.value
     ), f"Cudagraphs recieved an arg of type {meta.type} which is not supported."
-
-
-def _determine_if_transformer_decoder_layer(base_module):
-    """Determine if the given module is a transformer decoder layer."""
-    # import modules here to avoid a circular import
-    from megatron.core.ssm.mamba_layer import MambaLayer
-    from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
-
-    is_potential_decoder_layer = isinstance(
-        base_module, (TransformerLayer, BaseTransformerLayer, MambaLayer)
-    )
-    if not is_potential_decoder_layer:
-        return False
-    if isinstance(base_module, TransformerLayer) and not isinstance(
-        base_module.cross_attention, IdentityOp
-    ):
-        # If the layer has a cross attention, it is not a decoder layer
-        return False
-    else:
-        # Otherwise it is a decoder layer
-        return True
 
 
 def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
@@ -326,7 +303,6 @@ class _CudagraphGlobalRecord:
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
         progress_bar = enumerate(cls.cudagraph_record)
-        global_tensor_pool = []
 
         if HAVE_TQDM:
             progress_bar = tqdm(progress_bar, "create cuda graphs", total=len(cls.cudagraph_record))
@@ -344,14 +320,13 @@ class _CudagraphGlobalRecord:
             runner, graph_type = g[0:2]
             if graph_type == 'fwd':
                 args, kwargs, out = g[2:]
-                runner.create_fwd_graph(args, kwargs, out, clone_inputs=True, global_tensor_pool=global_tensor_pool)
+                runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
             else:
-                runner.create_bwd_graph(global_tensor_pool)
+                runner.create_bwd_graph()
 
         global bwd_buffer_reuse_ref_count, fwd_buffer_reuse_ref_count
-        # assert bwd_buffer_reuse_ref_count == 0
-        # assert fwd_buffer_reuse_ref_count == 0
-
+        assert bwd_buffer_reuse_ref_count == 0
+        assert fwd_buffer_reuse_ref_count == 0
 
         # Memory usage.
         time_end = time.time()
@@ -620,7 +595,6 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fp4_enabled = False
         self.deallocate_pipeline_outputs = False
 
-        self.is_transformer_decoder_layer = _determine_if_transformer_decoder_layer(base_module)
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
         self.is_first_layer, self.is_last_layer = (
@@ -659,24 +633,14 @@ class _CudaGraphRunner(torch.nn.Module):
             tuple(self.fwd_graph_input_kwarg_metas["hidden_states"].shape),
         )
 
-    def get_fp8_context(self):
-        """Return a new fp8 context in cudagraph mode."""
-        from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
-
-        return get_fp8_context(self.base_module.config, self.base_module.layer_number - 1)
-
-    def get_fp4_context(self):
-        """Return a new fp4 context in cudagraph mode."""
-        from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
-
-        return get_fp4_context(self.base_module.config, self.base_module.layer_number - 1)
-
     def get_quantization_context(self):
         """Return appropriate quantization context (FP8 or FP4) in cudagraph mode."""
         if self.fp8_runtime_enabled:
-            return self.get_fp8_context()
+            from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
+            return get_fp8_context(self.base_module.config, self.base_module.layer_number - 1)
         elif self.fp4_runtime_enabled:
-            return self.get_fp4_context()
+            from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
+            return get_fp4_context(self.base_module.config, self.base_module.layer_number - 1)
         else:
             return nullcontext()
 
@@ -694,34 +658,31 @@ class _CudaGraphRunner(torch.nn.Module):
                 stack.extend(f for f, _ in fn.next_functions if f)
 
         # Return module params that were found in the graph, preserving original order
-        return [p for p in self.base_module.parameters() if id(p) in p_ids]
+        return tuple(p for p in self.base_module.parameters() if id(p) in p_ids)
         
-    def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True, global_tensor_pool=[]):
+    def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
 
         def get_fwd_input_buffer(ten):
             assert ten.is_cudagraph_input
             if hasattr(ten, "is_static"):
-                return ten
+                buf = ten
             elif hasattr(ten, "is_cudagraph_output"):
-                out = ten.fwd_cudagraph_buffer
-                out.buffer_reuse_count -= 1
-                if out.buffer_reuse_count == 0:
+                buf = ten.fwd_cudagraph_buffer
+                buf.buffer_reuse_count -= 1
+                if buf.buffer_reuse_count == 0:
                     delattr(ten, 'fwd_cudagraph_buffer')
                     global fwd_buffer_reuse_ref_count
                     fwd_buffer_reuse_ref_count -= 1
             else:
-                out = _CudagraphGlobalRecord.tensor_reuse_pool.get(ten)
-          
-            out = out.detach()
-            out.requires_grad = ten.requires_grad
-            return out
+                buf = _CudagraphGlobalRecord.tensor_reuse_pool.get(ten)
+
+            return buf.detach().requires_grad_(ten.requires_grad)
 
         self.args = args
         self.kwargs = kwargs
         self.outputs = outputs
-        self.params_to_backprop = ()
 
         # save grads and other variables that may be affected by graph warmup
         if self.training and torch.is_grad_enabled():
@@ -745,7 +706,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
         # cache the moe aux loss if needed, this is needed because the moe aux loss is accumulated inside
         # the transformer layer forward pass:
-        is_moe = self.is_transformer_decoder_layer and hasattr(self.base_module, "is_moe_layer") and self.base_module.is_moe_layer
+        from megatron.core.transformer.transformer_layer import MoETransformerLayer
+        is_moe = isinstance(self.base_module, MoETransformerLayer)
         if is_moe:
             from megatron.core.transformer.moe.moe_utils import get_moe_layer_wise_logging_tracker
             tracker = get_moe_layer_wise_logging_tracker()
@@ -753,7 +715,6 @@ class _CudaGraphRunner(torch.nn.Module):
             for name in tracker:
                 if "values" in tracker[name]:
                     cached_aux_losses[name] = torch.clone(tracker[name]["values"])
-
 
         self.fwd_graph = torch.cuda.CUDAGraph()
 
@@ -773,37 +734,28 @@ class _CudaGraphRunner(torch.nn.Module):
         else:
             self.fwd_graph_input_args, self.fwd_graph_input_kwargs = args, kwargs
 
-        input_tensors = self.get_tensors(
+        self.fwd_graph_input_surface = self.get_tensors(
             self.fwd_graph_input_args, 
             self.fwd_graph_input_kwargs
         )
-        self.fwd_graph_input_surface = list(input_tensors)
 
         for ten in self.fwd_graph_input_surface:
             ten.is_cudagraph_input = True
         # input buffer now finalized
 
-        if not self.grad_enabled:
-            ctx = torch.no_grad()
-        else:
-            ctx = nullcontext()
-
+        ctx = torch.no_grad() if not self.grad_enabled else nullcontext()
         with ctx:
             # warmup again as case graph capture mode may execute a different codepath
             for _ in range(self.num_warmup_steps):
                 with self.get_quantization_context():
                     def clone_ten(ten):
-                        clone = torch.zeros_like(ten)
-                        clone.requires_grad = ten.requires_grad
-                        return clone
-
+                        return torch.zeros_like(ten).requires_grad_(ten.requires_grad)
                     warmup_args, warmup_kwargs = self._apply_to_all_tensors(clone_ten, args, kwargs)
                     warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
 
                 if self.grad_enabled:
                     warmup_outputs = self.get_tensors(warmup_outputs)
                     warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
-
                     input_tensors = self.get_tensors(args, kwargs)
                     torch.autograd.grad(
                         outputs=warmup_outputs,
@@ -843,7 +795,6 @@ class _CudaGraphRunner(torch.nn.Module):
                     # per-device to avoid slowing down graph creation.
                     if self.is_last_layer:
                         gc.collect()
-                _set_capture_end()
 
 
         # save cudagraph output buffer
@@ -872,7 +823,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
             self.params_to_backprop = self.get_connected_params(fwd_graph_outputs)
             self.num_wgrads = len(self.params_to_backprop)
-            self.num_dgrads = len(input_tensors)
+            self.num_dgrads = len(self.fwd_graph_input_surface)
+            self.fwd_graph_input_surface = self.fwd_graph_input_surface + self.params_to_backprop
 
             if self.fp8_enabled:
                 restore_fp8_tensors([self.base_module], saved_fp8_tensors)
@@ -885,7 +837,7 @@ class _CudaGraphRunner(torch.nn.Module):
             for name in tracker:
                 tracker[name]["values"].copy_(cached_aux_losses[name])
 
-    def create_bwd_graph(self, global_tensor_pool):
+    def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
         global bwd_buffer_reuse_ref_count, strong_reference_cache, strong_reference_cache_dataptrs
@@ -897,8 +849,7 @@ class _CudaGraphRunner(torch.nn.Module):
         for _, state in get_all_rng_states().items():
             self.bwd_graph.register_generator_state(state)
 
-        static_grad_outputs = []
-
+        self.static_grad_outputs = []
         for idx, o in enumerate(self.get_tensors(self.outputs)):
             out_grad = None
             if o.requires_grad:
@@ -914,10 +865,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 else:
                     out_grad = _CudagraphGlobalRecord.tensor_reuse_pool.get(o)
                 out_grad.requires_grad = True
-            static_grad_outputs.append(out_grad)
-
-        input_tensors = self.get_tensors(self.fwd_graph_input_args, self.fwd_graph_input_kwargs)
-        fwd_input_surface = input_tensors + tuple(self.params_to_backprop)
+            self.static_grad_outputs.append(out_grad)
 
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
@@ -926,8 +874,8 @@ class _CudaGraphRunner(torch.nn.Module):
         with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
-                inputs=tuple(i for i in fwd_input_surface if i.requires_grad),
-                grad_outputs=tuple(o for o in static_grad_outputs if o is not None),
+                inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
+                grad_outputs=tuple(o for o in self.static_grad_outputs if o is not None),
                 retain_graph=self.backward_retain_grad,
                 only_inputs=True,
                 allow_unused=True,
@@ -937,14 +885,10 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.unfreeze()
 
-        grad_inputs = list(grad_inputs)
-
-        self.static_grad_outputs = static_grad_outputs
-        self.static_grad_inputs = []
-
         # Constructs a tuple suitable for returning from Graphed.backward:
         # Pads out the actually-needed grads with Nones in gradient slots for inputs
         # that don't require grad
+        grad_inputs = list(grad_inputs)
         self.static_grad_inputs = []
         for idx, input_tensor in enumerate(self.get_tensors(self.args, self.kwargs)):
             if input_tensor.requires_grad:
@@ -962,12 +906,9 @@ class _CudaGraphRunner(torch.nn.Module):
 
         # at this point static_grad_inputs hold the input dgrads, add the wgrads next
         assert self.num_wgrads == len(grad_inputs)
-        assert self.num_dgrads == len(input_tensors)
-
-        self.fwd_graph_input_surface.extend(self.params_to_backprop)
         self.static_grad_inputs.extend(grad_inputs)
         self.static_grad_inputs = tuple(self.static_grad_inputs)
-        self.params_to_backprop = tuple(self.params_to_backprop)
+        self.static_grad_outputs = tuple(self.static_grad_outputs)
 
         self.groundtruth_grad_added_to_main_grad = {}
         if self.fuse_wgrad_accumulation:
@@ -976,7 +917,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     self.groundtruth_grad_added_to_main_grad[param] = param.grad_added_to_main_grad
 
         # The rest of the function is solely for memory management
-        # tensors outside the cudagraph mempool are added to the global_tensor_pool for reuse
+        # tensors outside the cudagraph mempool are returned to the pool for reuse
         for ten in self.fwd_graph_input_surface + self.static_grad_outputs:
             if torch.is_tensor(ten):
                 reuse_count = ten.buffer_reuse_count if hasattr(ten, "buffer_reuse_count") else 0
@@ -1210,16 +1151,6 @@ class _CudaGraphRunner(torch.nn.Module):
             return ref
 
         return self._apply_to_all_tensors(replace_with_weak_ref, args, kwargs)
-
-    def clone_tensors(self, args, kwargs=None):
-        """Replace all tensors inside arg, kwargs with zeroed copies."""
-
-        def clone_arg(arg):
-            ten = torch.zeros_like(arg)
-            ten.requires_grad = arg.requires_grad
-            return ten
-
-        return self._apply_to_all_tensors(clone_arg, args, kwargs)
 
     def get_tensors(self, args, kwargs=None, check_types=True):
         """
