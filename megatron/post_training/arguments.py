@@ -2,7 +2,7 @@
 
 
 def add_modelopt_args(parser):
-    """Add additional arguments for using TensorRT Model Optimizer (modelopt) features."""
+    """Add additional arguments for using Model Optimizer (modelopt) features."""
     group = parser.add_argument_group(title="modelopt-generic")
 
     # Model and Checkpoint Compatibility
@@ -122,7 +122,7 @@ def add_modelopt_args(parser):
         action="store_true",
         help='Will be set automatically when loading a ModelOpt checkpoint.',
     )
-    
+
     # GPT-OSS YaRN RoPE support
     group.add_argument(
         '--enable-gpt-oss',

@@ -4,19 +4,21 @@
 import functools
 import os
 import sys
+
 import torch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 
+from examples.post_training.modelopt.finetune import SFTDataset
 from megatron.core import mpu
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_provider import model_provider
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
+from model_provider import model_provider
 
-from examples.post_training.modelopt.finetune import SFTDataset
 
 def add_extract_args(parser):
     """Add additional arguments for feature extraction."""
@@ -51,7 +53,7 @@ if __name__ == "__main__":
 
     args = get_args()
     tokenizer = get_tokenizer()
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
 
     load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
     print_rank_0("Done loading checkpoint")
@@ -68,7 +70,7 @@ if __name__ == "__main__":
         "shard_index": mpu.get_expert_data_parallel_rank(),
     }
     sft_dataset = SFTDataset(args.num_samples, None, **kwargs)
-    
+
     extract_feature(sft_dataset, unwrapped_model, os.path.join(args.output_dir, "train"), 0, int(args.num_samples * 0.98))
     extract_feature(sft_dataset, unwrapped_model, os.path.join(args.output_dir, "valid"), int(args.num_samples * 0.98), int(args.num_samples * 0.99))
     extract_feature(sft_dataset, unwrapped_model, os.path.join(args.output_dir, "test"), int(args.num_samples * 0.99), args.num_samples)
