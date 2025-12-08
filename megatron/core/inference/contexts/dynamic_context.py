@@ -270,6 +270,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
         num_request_metadata: Optional[int] = None,
+        persist_cuda_graphs: Optional[bool] = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -360,6 +361,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Unified memory.
         self.unified_memory_level = unified_memory_level
+        self.persist_cuda_graphs = persist_cuda_graphs
         if unified_memory_level > 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()

@@ -136,6 +136,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         use_flashinfer_fused_rope=None,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
         metrics_writer=metrics_writer,
+        persist_cuda_graphs=args.rl_persist_cuda_graphs
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
