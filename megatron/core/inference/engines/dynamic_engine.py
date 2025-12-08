@@ -1440,7 +1440,7 @@ class DynamicInferenceEngine(AbstractEngine):
         is_suspended = self.suspend_signal or self.is_suspended
         if is_stopped or is_paused or is_suspended:
             # Signals can be received asynchronously on EP ranks. 
-            # We do not want a rank to pause/stop/suspend prematurely if one it's peers 
+            # We do not want a rank to pause/stop/suspend prematurely if one of it's peers 
             # is yet to receive the signal.
             # So this is an *attempt* to process the signal. This rank has received the signal 
             # and passes 0 to the all-reduce. If any other rank in the EP group has not received the signal yet,
