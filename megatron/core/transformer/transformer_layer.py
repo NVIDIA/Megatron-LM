@@ -259,8 +259,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     Transformer layer takes input with size [s, b, h] and returns an
     output of the same size.
     """
+
     cuda_graph_stream = None
     cuda_graph_event = None
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -276,7 +278,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
-
 
         self.submodules_config = submodules
         self.layer_number = layer_number + get_transformer_layer_offset(
@@ -502,8 +503,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         if self.offload_module_in_cuda_graph:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import fine_grained_offloading_backward_record
-            hidden_states = fine_grained_offloading_backward_record(hidden_states, TransformerLayer.cuda_graph_event)
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                fine_grained_offloading_backward_record,
+            )
+
+            hidden_states = fine_grained_offloading_backward_record(
+                hidden_states, TransformerLayer.cuda_graph_event
+            )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -598,9 +604,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
 
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_group_commit,
             fine_grained_offloading_group_start,
             get_fine_grained_offloading_context,
-            fine_grained_offloading_group_commit,
         )
 
         # Residual connection.
@@ -671,7 +677,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
             if self.offload_modules["dense_mlp"]:
-                pre_mlp_layernorm_output = fine_grained_offloading_group_start(pre_mlp_layernorm_output, name="dense_mlp")
+                pre_mlp_layernorm_output = fine_grained_offloading_group_start(
+                    pre_mlp_layernorm_output, name="dense_mlp"
+                )
                 with get_fine_grained_offloading_context(self.offload_modules["dense_mlp"]):
                     mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
                 if self.offload_modules["dense_mlp"]:
@@ -841,7 +849,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if context is not None:
             cuda_graph_outputs.append(context)
         if self.offload_module_in_cuda_graph:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import fine_grained_offloading_forward_record
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                fine_grained_offloading_forward_record,
+            )
+
             fine_grained_offloading_forward_record(TransformerLayer.cuda_graph_event)
         return tuple(cuda_graph_outputs)
 
@@ -1025,7 +1036,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     'inference_context'
                 ].is_decode_only()
         return super().__call__(*args, **kwargs)
-    
+
     def _set_offload_modules(self):
         """Set the offload modules for the transformer layer."""
         self.offload_modules = {
@@ -1039,7 +1050,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             "dense_mlp": False,
         }
         if self.config.fine_grained_activation_offloading:
-            if "attn_norm" in self.config.offload_modules and not isinstance(self.input_layernorm, IdentityOp):
+            if "attn_norm" in self.config.offload_modules and not isinstance(
+                self.input_layernorm, IdentityOp
+            ):
                 self.offload_modules["attn_norm"] = True
             if "qkv_linear" in self.config.offload_modules:
                 self.offload_modules["qkv_linear"] = True
@@ -1047,7 +1060,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self.offload_modules["core_attn"] = True
             if "attn_proj" in self.config.offload_modules:
                 self.offload_modules["attn_proj"] = True
-            if "mlp_norm" in self.config.offload_modules and not isinstance(self.pre_mlp_layernorm, IdentityOp):
+            if "mlp_norm" in self.config.offload_modules and not isinstance(
+                self.pre_mlp_layernorm, IdentityOp
+            ):
                 self.offload_modules["mlp_norm"] = True
             if "expert_fc1" in self.config.offload_modules:
                 self.offload_modules["expert_fc1"] = True
@@ -1058,14 +1073,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
         if "attn" in self.config.cuda_graph_scope:
-            if self.offload_modules["core_attn"] or self.offload_modules["attn_proj"] or self.offload_modules["qkv_linear"]:
+            if (
+                self.offload_modules["core_attn"]
+                or self.offload_modules["attn_proj"]
+                or self.offload_modules["qkv_linear"]
+            ):
                 self.offload_module_in_cuda_graph = True
-        if (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope):
+        if not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope:
             if self.offload_modules["mlp_norm"] or self.offload_modules["dense_mlp"]:
                 self.offload_module_in_cuda_graph = True
         if self.offload_module_in_cuda_graph:
-            assert is_torch_min_version("2.9.0a0"), "Fine-grained activation offloading needs torch>=2.9.0 to support cuda graph."
-            assert self.config.cuda_graph_warmup_steps > 0, "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
+            assert is_torch_min_version(
+                "2.9.0a0"
+            ), "Fine-grained activation offloading needs torch>=2.9.0 to support cuda graph."
+            assert (
+                self.config.cuda_graph_warmup_steps > 0
+            ), "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
         # Set the cuda graph stream and event for the transformer layer.
         if TransformerLayer.cuda_graph_stream is None:
             if self.offload_module_in_cuda_graph:

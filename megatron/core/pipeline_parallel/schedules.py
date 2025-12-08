@@ -425,7 +425,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
-def backward_step(model, input_tensor, output_tensor, output_tensor_grad, model_type, config):
+def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -565,9 +565,6 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
-    if not forward_only and config.fine_grained_activation_offloading:
-        fine_grained_offloading_reset()
-
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
@@ -614,7 +611,7 @@ def forward_backward_no_pipelining(
                 total_num_tokens += num_tokens
                 if not forward_only:
                     backward_step(
-                        model, input_tensor, output_tensor, output_tensor_grad, model_type, config
+                        input_tensor, output_tensor, output_tensor_grad, model_type, config
                     )
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
@@ -637,7 +634,7 @@ def forward_backward_no_pipelining(
         total_num_tokens += num_tokens
 
         if not forward_only:
-            backward_step(model, input_tensor, output_tensor, output_tensor_grad, model_type, config)
+            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -647,6 +644,9 @@ def forward_backward_no_pipelining(
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
         )
+
+    if not forward_only and config.fine_grained_activation_offloading:
+        fine_grained_offloading_reset()
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
@@ -903,9 +903,6 @@ def forward_backward_pipelining_with_interleaving(
     assert (
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
-
-    if not forward_only and config.fine_grained_activation_offloading:
-        fine_grained_offloading_reset()
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -1289,7 +1286,7 @@ def forward_backward_pipelining_with_interleaving(
         )
 
         input_tensor_grad = backward_step(
-            None, input_tensor, output_tensor, output_tensor_grad, model_type, config
+            input_tensor, output_tensor, output_tensor_grad, model_type, config
         )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
@@ -1911,6 +1908,8 @@ def forward_backward_pipelining_with_interleaving(
             pg_collection=pg_collection,
         )
 
+    if not forward_only and config.fine_grained_activation_offloading:
+        fine_grained_offloading_reset()
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
         config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
@@ -2051,9 +2050,6 @@ def forward_backward_pipelining_without_interleaving(
 
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
-
-    if not forward_only and config.fine_grained_activation_offloading:
-        fine_grained_offloading_reset()
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
@@ -2236,7 +2232,7 @@ def forward_backward_pipelining_without_interleaving(
                     enable_grad_sync()
 
             input_tensor_grad = backward_step(
-                None, input_tensor, output_tensor, output_tensor_grad, model_type, config
+                input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
             if last_iteration:
@@ -2272,7 +2268,7 @@ def forward_backward_pipelining_without_interleaving(
             )
 
             input_tensor_grad = backward_step(
-                None, input_tensor, output_tensor, output_tensor_grad, model_type, config
+                input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
             p2p_communicator.send_backward(
@@ -2301,6 +2297,9 @@ def forward_backward_pipelining_without_interleaving(
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
         )
+
+    if not forward_only and config.fine_grained_activation_offloading:
+        fine_grained_offloading_reset()
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
