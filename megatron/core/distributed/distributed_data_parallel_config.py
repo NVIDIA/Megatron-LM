@@ -62,6 +62,10 @@ class DistributedDataParallelConfig:
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
 
+    fp4_param_gather: bool = False
+    """If true, keep the compute param in nvfp4 (do not use any other intermediate dtype) and
+       perform the param all-gather in nvfp4."""
+
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""

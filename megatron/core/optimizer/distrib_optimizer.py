@@ -2472,19 +2472,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # do the work of copying data from main params to model params.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return
-
-        quantize_param_shard(
-            *self._get_fp8_params_and_shard_fp32_from_fp8(), self.data_parallel_group
-        )
-        # Quantize FP32 master shards back to NVFP4 model params (row/col + tiles)
-        if HAVE_TE_NVFP4_CAST:
-            nvfp4_params, shard_fp32, shard_offsets = self._get_nvfp4_params_and_shard_fp32_from_nvfp4()
-            # If any shard is partial, TE function will raise; we allow full casts only for now
-            try:
-                _te_cast_nvfp4(nvfp4_params, shard_fp32, shard_offsets, self.data_parallel_group)
-            except NotImplementedError:
-                pass
-
+        if self.ddp_config.fp8_param_gather:
+            quantize_param_shard(
+                *self._get_fp8_params_and_shard_fp32_from_fp8(), self.data_parallel_group
+            )
+        elif self.ddp_config.fp4_param_gather:
+            # Quantize FP32 master shards back to NVFP4 model params (row/col + tiles)
+            if HAVE_TE_NVFP4_CAST:
+                nvfp4_params, shard_fp32, shard_offsets = self._get_nvfp4_params_and_shard_fp32_from_nvfp4()
+                # If any shard is partial, TE function will raise; we allow full casts only for now
+                try:
+                    _te_cast_nvfp4(nvfp4_params, shard_fp32, shard_offsets, self.data_parallel_group)
+                except NotImplementedError:
+                    pass
+        else:
+            pass
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
