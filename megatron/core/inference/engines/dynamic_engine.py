@@ -1439,12 +1439,14 @@ class DynamicInferenceEngine(AbstractEngine):
         is_paused = self.paused.is_set() or self.received_pause
         is_suspended = self.suspend_signal or self.is_suspended
         if is_stopped or is_paused or is_suspended:
-            # attempt to pause/stop/suspend 
-            # contribute 0 work to the all-reduce 
-            # Signals are received asynchronously so some EP ranks might not have 
-            # received them yet. So in that case they might nominate +ve work 
-            # and in that case we do not want to pause/stop/suspend prematurely.
-            # Ultimately when all of them receive the signal, they will all contribute 0 work
+            # Signals can be received asynchronously on EP ranks. 
+            # We do not want a rank to pause/stop/suspend prematurely if one it's peers 
+            # is yet to receive the signal.
+            # So this is an *attempt* to process the signal. This rank has received the signal 
+            # and passes 0 to the all-reduce. If any other rank in the EP group has not received the signal yet,
+            # it will pass a non-zero value to the all-reduce, and hence the global work will be non-zero, 
+            # and we will defer processing the signal. 
+            # When all ranks receive the signal, global work will be zero, and we can process the signal safely.
             local_work = 0  
         else:
             local_work = self.context.get_active_request_count() + len(self.waiting_request_ids)

@@ -69,6 +69,8 @@ if not HAVE_FA3:
     except ImportError as e:
         pass
 
+HAVE_FA3 = False # Temporarily disable FA3 support
+
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
