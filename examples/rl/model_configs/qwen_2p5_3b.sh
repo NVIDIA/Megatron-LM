@@ -56,7 +56,6 @@ ENV_DEPENDENT="\
   --grpo-entropy-term-weight $ENTROPY_WEIGHT \
   --langrl-env-config $ENV_CONFIG "
 
- # --ckpt-convert-format torch_dist \
 # Original Qwen model uses a wrong padding_id token. unsloth tokenizer fixes it.
 MODEL_OPTIONS="\
   --calculate-per-token-loss \
