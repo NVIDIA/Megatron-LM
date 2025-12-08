@@ -1248,9 +1248,10 @@ class TransformerConfig(ModelParallelConfig):
                     self.cuda_graph_scope is not None
                 ), "cuda_graph_scope must be set when enabling offloading."
                 assert (
-                    ("attn" in self.cuda_graph_scope and "moe_router" in self.cuda_graph_scope)
-                    or (CudaGraphScope.attn in self.cuda_graph_scope
-                    and CudaGraphScope.moe_router in self.cuda_graph_scope)
+                    "attn" in self.cuda_graph_scope and "moe_router" in self.cuda_graph_scope
+                ) or (
+                    CudaGraphScope.attn in self.cuda_graph_scope
+                    and CudaGraphScope.moe_router in self.cuda_graph_scope
                 ), "attn and moe_router must be in cuda_graph_scope when enabling offloading."
                 assert (
                     "attn_norm" not in self.offload_modules

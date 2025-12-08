@@ -268,7 +268,7 @@ class MultiLatentAttention(Attention):
                 raise ValueError(
                     f"Unsupported experimental attention variant: "
                     f"{self.config.experimental_attention_variant}"
-            )
+                )
         if self.offload_qkv_linear:
             (query, key, value) = fine_grained_offloading_group_commit(
                 query, key, value, name="qkv_linear", forced_released_tensors=[hidden_states]
