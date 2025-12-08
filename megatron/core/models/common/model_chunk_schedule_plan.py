@@ -515,7 +515,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             _, b_grad = TransformerLayerSchedulePlan.run(
                 None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
             )
-            b_layer.release_state()
+            if i < b_num_layers - 1:
+                b_layer.release_state()
             torch.cuda.nvtx.range_pop()
 
         # forward pass for the remaining layers
