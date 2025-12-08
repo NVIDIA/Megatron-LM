@@ -111,6 +111,33 @@ class ArgMetadata:
         else:
             self.value = arg
 
+class TensorReusePool:
+
+    tensor_strong_refs = []
+    tensor_strong_refs_dataptrs = set()
+    pool = []
+
+    def _tensors_match(self, a, b):
+        return a.shape == b.shape and a.dtype == b.dtype and a.device == b.device
+
+    def insert(self, tensor):
+        self.pool.append(tensor)
+
+    def owns(self, tensor):
+        return tensor.data_ptr() in self.tensor_strong_refs_dataptrs
+
+    def get(self, tensor):
+        for idx, buf in enumerate(self.pool):
+            if self._tensors_match(buf, tensor):
+                out = self.pool.pop(idx).detach()
+                out.requires_grad = tensor.requires_grad
+                return out
+
+        out = torch.zeros_like(tensor)
+        self.tensor_strong_refs.append(out)
+        self.tensor_strong_refs_dataptrs.add(out.data_ptr())
+        return out
+
 
 def _check_supported_type(meta):
     """Check if arg meta is a supported type for cudagraph input/outputs."""
@@ -242,6 +269,8 @@ class _CudagraphGlobalRecord:
     'record_bwd_graph."""
     cudagraph_record = []
     cudagraph_inference_record = []
+
+    tensor_reuse_pool = TensorReusePool()
 
     @classmethod
     def record_fwd_graph(cls, runner, args, kwargs, out):
@@ -650,6 +679,44 @@ class _CudaGraphRunner(torch.nn.Module):
         else:
             return nullcontext()
 
+    def get_connected_params(self, outputs, all_params):
+        """
+        Identifies parameters connected to the outputs by traversing the autograd graph.
+        This replaces the need for a warmup backward pass.
+        """
+        # Reuse existing method to flatten outputs into a list of tensors
+        # Wrap in tuple if single tensor to satisfy get_tensors signature
+        args_to_check = (outputs,) if torch.is_tensor(outputs) else outputs
+        # Disable type checks as we are processing raw output tensors, not ArgMetadata
+        flat_outputs = self.get_tensors(args_to_check, check_types=False)
+        
+        # Filter for tensors that actually require gradients
+        roots = [t for t in flat_outputs if t.requires_grad]
+
+        visited = set()
+        stack = [t.grad_fn for t in roots if t.grad_fn is not None]
+        connected_param_ids = set()
+
+        while stack:
+            fn = stack.pop()
+            if fn in visited or fn is None:
+                continue
+            visited.add(fn)
+
+            # In PyTorch, AccumulateGrad nodes correspond to leaf parameters
+            # and possess a 'variable' attribute pointing to the actual Parameter tensor.
+            if hasattr(fn, 'variable'):
+                connected_param_ids.add(id(fn.variable))
+            
+            # Add parents to stack
+            for next_fn, _ in fn.next_functions:
+                if next_fn:
+                    stack.append(next_fn)
+
+        # Filter the module's parameters to return only those found in the graph.
+        # This maintains the original order and ensures we only track owned parameters.
+        return [p for p in all_params if id(p) in connected_param_ids]
+
     def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True, global_tensor_pool=[]):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
@@ -665,22 +732,10 @@ class _CudaGraphRunner(torch.nn.Module):
                     delattr(ten, 'fwd_cudagraph_buffer')
                     global fwd_buffer_reuse_ref_count
                     fwd_buffer_reuse_ref_count -= 1
-
-                out = out.detach()
-                out.requires_grad = ten.requires_grad
-                return out
             else:
-                for idx, buf in enumerate(global_tensor_pool):
-                    if tensors_match(buf, ten):
-                        out = global_tensor_pool.pop(idx).detach()
-                        out.requires_grad = ten.requires_grad
-                        return out
-
-            out = torch.zeros_like(ten).detach()
-            global strong_reference_cache, strong_reference_cache_dataptrs
-            strong_reference_cache.append(out)
-            strong_reference_cache_dataptrs.add(out.data_ptr())
-
+                out = _CudagraphGlobalRecord.tensor_reuse_pool.get(ten)
+          
+            out = out.detach()
             out.requires_grad = ten.requires_grad
             return out
 
@@ -744,6 +799,7 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fwd_graph_input_kwargs
         )
         self.fwd_graph_input_surface = list(input_tensors)
+        self.num_dgrads = len(input_tensors)
 
         for ten in self.fwd_graph_input_surface:
             ten.is_cudagraph_input = True
@@ -756,7 +812,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         with ctx:
             # warmup again as case graph capture mode may execute a different codepath
-            for _ in range(1):
+            for _ in range(0):
                 with self.get_quantization_context():
                     def clone_ten(ten):
                         clone = torch.zeros_like(ten)
@@ -771,7 +827,6 @@ class _CudaGraphRunner(torch.nn.Module):
                     warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
 
                     input_tensors = self.get_tensors(args, kwargs)
-                    self.num_dgrads = len(input_tensors)
                     input_tensors += tuple(self.base_module.parameters())
 
                     grads = torch.autograd.grad(
@@ -845,6 +900,10 @@ class _CudaGraphRunner(torch.nn.Module):
                 however the graphed module must output at least one tensor, 
                 so that a corresponding backward node may be registered in the autograd graph."""
 
+
+            self.params_to_backprop = self.get_connected_params(fwd_graph_outputs, self.base_module.parameters())
+            self.num_wgrads = len(self.params_to_backprop)
+
             if self.fp8_enabled:
                 restore_fp8_tensors([self.base_module], saved_fp8_tensors)
             # restore cached grads
@@ -885,14 +944,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     bwd_buffer_reuse_ref_count -= 1
 
                 else:
-                    for idx, buf in enumerate(global_tensor_pool):
-                        if tensors_match(buf, o):
-                            out_grad = global_tensor_pool.pop(idx).detach()
-                            break  # Found a buffer, exit loop
-                    else:
-                        out_grad = torch.zeros_like(o)
-                        strong_reference_cache.append(out_grad)
-                        strong_reference_cache_dataptrs.add(out_grad.data_ptr())
+                    out_grad = _CudagraphGlobalRecord.tensor_reuse_pool.get(o)
                 out_grad.requires_grad = True
             static_grad_outputs.append(out_grad)
 
@@ -958,11 +1010,10 @@ class _CudaGraphRunner(torch.nn.Module):
         # The rest of the function is solely for memory management
         # tensors outside the cudagraph mempool are added to the global_tensor_pool for reuse
         for ten in self.fwd_graph_input_surface + self.static_grad_outputs:
-            if not torch.is_tensor(ten) or ten.data_ptr() not in strong_reference_cache_dataptrs:
-                continue
-            if hasattr(ten, "buffer_reuse_count") and ten.buffer_reuse_count != 0:
-                continue
-            global_tensor_pool.append(ten)
+            if torch.is_tensor(ten):
+                reuse_count = ten.buffer_reuse_count if hasattr(ten, "buffer_reuse_count") else 0
+                if _CudagraphGlobalRecord.tensor_reuse_pool.owns(ten) and reuse_count == 0:
+                    _CudagraphGlobalRecord.tensor_reuse_pool.insert(ten)
 
         # now weakref everything
         self.fwd_graph_input_surface = self.replace_tensors_with_weak_refs(
