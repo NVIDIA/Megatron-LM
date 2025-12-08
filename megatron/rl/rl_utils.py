@@ -1841,8 +1841,6 @@ def prepare_data_for_update(
                 packing_context['packed_inference_logprobs'] = packed_inference_logprobs.cuda()
                 packing_context['has_inference_logprobs'] = True
 
-        # TODO(vitalyk): add a test for prepare_data_for_update.
-
         with torch.no_grad(), nvtx_range("compute_ref_logprobs"):
             # We need to load the ref model state dict and compute the logprobs for the ref model
             cur_st_dict = {
