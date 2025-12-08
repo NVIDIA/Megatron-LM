@@ -2233,6 +2233,9 @@ class ParamAndGradBuffer:
                 # before forward activations and gradients are allocated in training.
                 wbuf.free_bucket_storage()
 
+            if tbuf and tbuf.is_data_distributed:
+                tbuf.free_bucket_storage()
+
         # Allocate the main_weight buffer and main_grad buffer data in one buffer.
         if self.buffer_all_in_one:
             with self.mem_alloc_context():
