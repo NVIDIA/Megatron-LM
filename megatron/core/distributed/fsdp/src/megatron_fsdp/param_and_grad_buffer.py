@@ -2474,8 +2474,9 @@ class ParamAndGradBuffer:
                 item_id, only_shard=sharded_optimizer_state
             )
             if group.main_weight_buffer is not None:
-                # Convert the gradient to the main weight buffer dtype.
-                optimizer_grad = optimizer_grad.to(param.dtype)
+                if not getattr(self, "use_precision_aware_optimizer", False):
+                    # Convert the gradient to the main weight buffer dtype.
+                    optimizer_grad = optimizer_grad.to(param.dtype)
 
             if name not in self.dist_main_grad:
                 # Register the gradient as a distributed tensor.
@@ -2782,6 +2783,9 @@ class GradReducePipeline:
             outer_fsdp_group_grad_reduce (bool, optional): Whether to reduce gradients
                 across outer-DP groups. Defaults to False.
         """
+        # Sort parameters by their bucket IDs to ensure a deterministic processing order.
+        # Performing reduce-scatter operations out of order can lead to hangs.
+        params = sorted(list(params), key=lambda x: self.buffer.param_to_param_group[x])
         for param in params:
             bucket_id = self.buffer.param_to_param_group[param]
             param_group = self.buffer.parameter_groups[bucket_id]

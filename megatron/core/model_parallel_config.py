@@ -6,8 +6,11 @@ from typing import Callable, ContextManager, Optional
 
 import torch
 
+from megatron.core.utils import experimental_api
+
 
 @dataclass
+@experimental_api
 class ModelParallelConfig:
     """Base configuration for Megatron Core
 
@@ -51,6 +54,22 @@ class ModelParallelConfig:
        groups of two levels, so the first value of the list indicates the group size of the a2a
        communication type, and the second value indicates the group size of the p2p communication
        type.
+    """
+
+    max_seqlen_per_dp_cp_rank: Optional[int] = None
+    """
+    Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
+    can handle without overflowing the memory. Typically, a good starting point is to set this
+    to maximum sequence length / context parallel size.
+    This is used to calculate the number and length of sub-samples assigned to 
+    each rank when using hybrid_context_parallel.
+    """
+
+    hybrid_context_parallel: bool = False
+    """
+    If true, enables hybrid context parallel. This is used to balance the workload of 
+    each CP rank when we use packed samples with variable sequence lengths.
+    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
     """
 
     expert_model_parallel_size: int = 1

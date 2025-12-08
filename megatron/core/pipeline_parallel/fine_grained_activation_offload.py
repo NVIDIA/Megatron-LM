@@ -6,6 +6,8 @@ from typing import Any, Dict, Tuple
 
 import torch
 
+from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
+
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
 DEBUG_RANK = 0
@@ -563,6 +565,8 @@ class PipelineOffloadManager:
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = True
+        else:
+            raise RuntimeError("TE CPU offload is not available")
         self.inside_context = True
 
         torch._C._autograd._push_saved_tensors_default_hooks(
@@ -578,6 +582,8 @@ class PipelineOffloadManager:
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = False
+        else:
+            raise RuntimeError("TE CPU offload is not available")
         self.inside_context = False
         torch._C._autograd._pop_saved_tensors_default_hooks()
 

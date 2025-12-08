@@ -7,8 +7,12 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.fp4_utils import get_fp4_align_size
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -751,18 +755,29 @@ def clear_aux_losses_tracker():
         tracker[name]["values"].zero_()
 
 
-def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = None):
+def reduce_aux_losses_tracker_across_ranks(
+    track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
+):
     """Collect and reduce the auxiliary losses across ranks."""
     tracker = get_moe_layer_wise_logging_tracker()
     if track_names is None:
         track_names = tracker.keys()
+
+    if pg_collection is None:
+        # Use parallel_state groups
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        dp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=False, partial_data_parallel=False
+        )
+    else:
+        pp_group = pg_collection.pp
+        dp_group = pg_collection.dp
+
     for name in track_names:
         values = tracker[name]["values"]
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Collect aux losses across PP.
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pp_group)
         # Reduce aux losses across ranks.
         if tracker[name].get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
@@ -774,11 +789,7 @@ def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = No
         # The `global_load_balancing_loss` already uses `tp_dp_cp_group` in `reduce_group`,
         # so we don't need to reduce it again. Others use `tp_cp_group` in `reduce_group`.
         if name != "global_load_balancing_loss":
-            torch.distributed.all_reduce(
-                values,
-                group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-                op=torch.distributed.ReduceOp.AVG,
-            )
+            torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
 
 def track_moe_metrics(
@@ -793,6 +804,7 @@ def track_moe_metrics(
     num_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Track the MoE metrics for logging."""
     # Aux loss logging
@@ -806,7 +818,7 @@ def track_moe_metrics(
                     tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
-    reduce_aux_losses_tracker_across_ranks(track_names)
+    reduce_aux_losses_tracker_across_ranks(track_names, pg_collection=pg_collection)
 
     # Get number of MoE layers
     if moe_layer_freq is None:
@@ -1017,6 +1029,15 @@ def router_gating_linear(
     return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
 
 
+def get_align_size_for_quantization(config: TransformerConfig):
+    """Get the alignment size for quantization."""
+    if config.fp8:
+        return get_fp8_align_size(config.fp8_recipe)
+    elif config.fp4:
+        return get_fp4_align_size(config.fp4_recipe)
+    return 16
+
+
 # TODO(Hepteract): delete the usage of the global parallel_state.
 # Initialize process groups with the global parallel_state.
 def get_default_pg_collection():
@@ -1193,13 +1214,13 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         ):
             if (
                 step_condition == "route"
-                and 'moe_router' in moe_layer.config.cuda_graph_scope
-                and 'moe_preprocess' not in moe_layer.config.cuda_graph_scope
+                and CudaGraphScope.moe_router in moe_layer.config.cuda_graph_scope
+                and CudaGraphScope.moe_preprocess not in moe_layer.config.cuda_graph_scope
             ):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "route", **kwargs)
             elif (
                 step_condition == "preprocess"
-                and 'moe_preprocess' in moe_layer.config.cuda_graph_scope
+                and CudaGraphScope.moe_preprocess in moe_layer.config.cuda_graph_scope
             ):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "preprocess", **kwargs)
 

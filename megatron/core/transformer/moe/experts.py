@@ -21,8 +21,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.fp4_utils import get_fp4_align_size
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -41,7 +39,10 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
-from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
+from megatron.core.transformer.moe.moe_utils import (
+    ProcessGroupCollection,
+    get_align_size_for_quantization,
+)
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -49,6 +50,7 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import internal_api
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -68,6 +70,8 @@ class GroupedMLP(MegatronModule):
     Executes multiple experts in parallel to maximize computational efficiency.
     """
 
+    # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
+    @internal_api
     def __init__(
         self,
         num_local_experts: int,
@@ -731,6 +735,8 @@ class TEGroupedMLP(MegatronModule):
     Executes multiple experts in parallel to maximize computational efficiency.
     """
 
+    # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
+    @internal_api
     def __init__(
         self,
         num_local_experts,
@@ -753,7 +759,6 @@ class TEGroupedMLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.num_local_experts,
@@ -765,7 +770,7 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=False,
             is_expert=True,
             tp_comm_buffer_name='fc1',
-            tp_group=pg_collection.expt_tp,
+            pg_collection=pg_collection,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -773,7 +778,6 @@ class TEGroupedMLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.num_local_experts,
@@ -785,7 +789,7 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=True,
             is_expert=True,
             tp_comm_buffer_name='fc2',
-            tp_group=pg_collection.expt_tp,
+            pg_collection=pg_collection,
         )
 
         self.offload_expert_fc1 = (
@@ -1039,6 +1043,8 @@ class SequentialMLP(MegatronModule):
     This class executes each expert sequentially.
     """
 
+    # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
+    @internal_api
     def __init__(
         self,
         num_local_experts,
@@ -1074,18 +1080,10 @@ class SequentialMLP(MegatronModule):
             )
             self.local_experts.append(expert)
 
-    def _get_align_size_for_quantization(self):
-        """Get the alignment size for quantization."""
-        if self.config.fp8:
-            return get_fp8_align_size(self.config.fp8_recipe)
-        elif self.config.fp4:
-            return get_fp4_align_size(self.config.fp4_recipe)
-        return 16
-
     def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
         actual_num_tokens = hidden.shape[0]
-        divisor = self._get_align_size_for_quantization()
+        divisor = get_align_size_for_quantization(self.config)
         padded_num_tokens = ceil(actual_num_tokens / divisor) * divisor - actual_num_tokens
         if padded_num_tokens > 0:
             pad_tensor = torch.zeros(
