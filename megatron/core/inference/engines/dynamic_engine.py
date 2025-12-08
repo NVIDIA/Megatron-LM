@@ -573,6 +573,16 @@ class DynamicInferenceEngine(AbstractEngine):
         # Suspend requests objects.
         for request_id in active_request_ids:
             self.requests[request_id].record.suspend(self.controller.tokenizer)
+        # >>>
+        if self.context.block_allocator.get_num_unique_total() != self.context.block_allocator.total_count:
+            pax({
+                "block_allocator" : self.context.block_allocator,
+                # "active_used" : self.context.block_allocator.get_active_used(),
+                # "paused_used" : self.context.block_allocator.get_paused_used(),
+                "block_bag" : str(self.context.block_allocator.block_bag[-16:].tolist()),
+                "unique" : self.context.block_allocator.get_num_unique_total(),
+            })
+        # <<<
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -597,6 +607,19 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Reset context and request data.
             self.context.reset()
+
+            # >>>
+            # pax({
+            #     "block_allocator" : self.context.block_allocator,
+            #     # "active_used" : self.context.block_allocator.get_active_used(),
+            #     # "paused_used" : self.context.block_allocator.get_paused_used(),
+            #     "unique" : self.context.block_allocator.get_num_unique_ids(),
+            # })
+            # <<<
+            # >>>
+            if self.context.block_allocator.get_num_unique_total() != self.context.block_allocator.total_count:
+                raise Exception("wha?")
+            # <<<
 
             # Create cuda graphs (before adding requests, to be in decode mode).
             # Only create cuda graphs when not using unified memory at all (level
@@ -635,6 +658,14 @@ class DynamicInferenceEngine(AbstractEngine):
         # if repeat_idx == 1:
         #     pax({"block_allocator": self.context.block_allocator})
         # raise Exception("hi.")
+        # <<<
+        # >>>
+        # pax({
+        #     "block_allocator" : self.context.block_allocator,
+        #     "active_used" : self.context.block_allocator.get_active_used(),
+        #     "paused_used" : self.context.block_allocator.get_paused_used(),
+        #     "unique" : self.context.block_allocator.get_num_unique_ids(),
+        # })
         # <<<
 
     @trace_async_exceptions
@@ -1041,22 +1072,23 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        import os
-        output_path = os.path.join(os.getcwd(), "block_bag_%s.txt" % os.environ["LAWRENCE_X"])
-        with open(output_path, "a") as f:
-            f.write(".......... %d/%d .... block_bag, uniq %d ... [%s] %s.\n" % (
-                repeat_idx,
-                self.step_count,
-                self.context.block_allocator.get_num_unique_ids(),
-                get_array_hash(self.context.block_allocator.block_bag),
-                self.context.block_allocator.block_bag.view(-1)[-32:].tolist(),
-            ))
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
         # >>>
-        # print("........ request_ids: %s." % str(self.context.request_ids[self.context.paused_request_count:self.context.total_request_count].tolist()))
+        import builtins
+        builtins.step_count = self.step_count
         # <<<
+        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # import os
+        # output_path = os.path.join(os.getcwd(), "block_bag_%s.txt" % os.environ["LAWRENCE_X"])
+        # with open(output_path, "a") as f:
+        #     f.write(".......... %d/%d .... block_bag, uniq %d ... [%s] %s.\n" % (
+        #         repeat_idx,
+        #         self.step_count,
+        #         self.context.block_allocator.get_num_unique_ids(),
+        #         get_array_hash(self.context.block_allocator.block_bag),
+        #         self.context.block_allocator.block_bag.view(-1)[-32:].tolist(),
+        #     ))
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
