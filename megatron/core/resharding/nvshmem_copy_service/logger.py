@@ -1,8 +1,19 @@
 """
+
 Per-PE Logger with colored console and file output.
 
-Copied in-tree from the standalone nvshmem_copy_service implementation.
+
+
+Similar to the C++ Logger implementation, provides:
+
+- Per-PE colored console output
+
+- Per-PE file logging
+
+- Support for TRACE, DEBUG, INFO, SUMMARY, WARN, ERROR levels
+
 """
+#TODO(Peter): We need to remove this logger and use the regular Megatron logger.
 
 import logging
 import os

@@ -1,8 +1,9 @@
 """
 Validation utilities for GPU-to-GPU communication.
 
-Copied in-tree from the standalone nvshmem_copy_service implementation.
-"""
+Provides deterministic data generation and validation for verifying
+
+correctness of communication operations."""
 
 from dataclasses import dataclass
 from typing import List

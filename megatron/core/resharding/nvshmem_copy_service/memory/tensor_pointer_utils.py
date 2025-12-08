@@ -22,12 +22,24 @@ class TensorPointerExtractor:
 
         Returns:
             int: Memory address of the tensor data
+        
+        Examples:
+
+            >>> import torch
+
+            >>> t = torch.zeros(100, device='cuda')
+
+            >>> ptr = TensorPointerExtractor.get_pointer(t)
+
+            >>> isinstance(ptr, int)
+
+            True
         """
         if isinstance(tensor, torch.Tensor):
             return tensor.data_ptr()
         elif hasattr(tensor, "data"):  # CuPy array
             return tensor.data.ptr
         else:  # Assume raw integer pointer
-            return int(tensor)
+            return tensor
 
 

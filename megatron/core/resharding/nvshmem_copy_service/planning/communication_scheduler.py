@@ -186,7 +186,7 @@ class CommunicationScheduler:
         )
 
         # Gather all summaries from all PEs using torch.distributed
-        all_summaries_list: List[Dict[Tuple[int, int, int], Dict[str, object]] | None] = [  # noqa: E501
+        all_summaries_list: List[Dict[Tuple[int, int, int], Dict[str, object]] | None] = [
             None
         ] * n_pes
         dist.all_gather_object(all_summaries_list, local_summaries)
@@ -199,8 +199,8 @@ class CommunicationScheduler:
             for key, data in pe_summaries.items():
                 summary = WorkloadSummary(
                     total_size=int(data["total_size"]),
-                    task_ids=list(data["task_ids"]),  # type: ignore[arg-type]
-                    task_sizes=list(data["task_sizes"]),  # type: ignore[arg-type]
+                    task_ids=list(data["task_ids"]),
+                    task_sizes=list(data["task_sizes"]),
                 )
                 global_map[key] = summary
 

@@ -1,9 +1,9 @@
 """
 Remote Copy Service - Main orchestrator for NVSHMEM-based GPU-to-GPU transfers.
 
-This is an in-tree copy of the standalone Python implementation from
-`kan/mcore-reshard/nvshmem_copy_service/python/service.py`, with imports
-updated to use the Megatron package layout.
+This service coordinates task segmentation, workload packing, scheduling,
+
+GPU resource management, and pipelined execution.
 """
 
 from typing import List, Dict, Tuple, Optional
@@ -332,7 +332,7 @@ class RemoteCopyService:
             PELogger.debug("Barrier: Synchronizing all PEs before finalize")
             nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
             self.gpu_resources.send_stream.sync()
-        except Exception as e:  # pragma: no cover - defensive logging
+        except Exception as e:
             PELogger.error(f"Error in final barrier: {e}")
 
         # Free buffers

@@ -83,15 +83,15 @@ class KernelLauncher:
         cp_src, cp_dst, cp_sizes, num_chunks = gpu_plan
 
         # Grid/Block configuration
-        threads_per_block = 1024
-        num_blocks = 75
+        THREADS_PER_BLOCK = 1024
+        NUM_BLOCKS = 75
 
         # Launch kernel using cached CuPy stream
         assert self.chunked_copy_kernel is not None
         assert self.cp_pack_stream is not None
         self.chunked_copy_kernel(
-            (num_blocks,),
-            (threads_per_block,),
+            (NUM_BLOCKS,),
+            (THREADS_PER_BLOCK,),
             (cp_src, cp_dst, cp_sizes, num_chunks),
             stream=self.cp_pack_stream,
         )
@@ -126,15 +126,15 @@ class KernelLauncher:
         cp_src, cp_dst, cp_sizes, num_chunks = gpu_plan
 
         # Grid/Block configuration
-        threads_per_block = 1024
-        num_blocks = 75
+        THREADS_PER_BLOCK = 1024
+        NUM_BLOCKS = 75
 
         # Launch kernel using cached CuPy stream
         assert self.chunked_copy_kernel is not None
         assert self.cp_unpack_stream is not None
         self.chunked_copy_kernel(
-            (num_blocks,),
-            (threads_per_block,),
+            (NUM_BLOCKS,),
+            (THREADS_PER_BLOCK,),
             (cp_src, cp_dst, cp_sizes, num_chunks),
             stream=self.cp_unpack_stream,
         )

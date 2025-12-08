@@ -10,7 +10,7 @@ from typing import Optional, Dict
 import nvshmem.core
 import torch
 import torch.distributed as dist
-from cuda.core.experimental import Device, system  # type: ignore[attr-defined]
+from cuda.core.experimental import Device, system
 
 
 class GPUResourceManager:
