@@ -1156,12 +1156,6 @@ def validate_args(args, defaults={}):
                     'Disabling --async-save.'
                 )
             args.async_save = False
-        elif args.dist_ckpt_workers > 1 and args.rank == 0:
-            print(
-                'Warning: async ckpt forks processes for parallel writing which may introduce '
-                'instability on checkpoints. Consider using --dist-ckpt-workers=1 in case of '
-                'issues.'
-            )
 
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
