@@ -49,7 +49,6 @@ class ToyModel(torch.nn.Module):
                 )
                 for i, layer in enumerate(self.net):
                     # Group by module; with this linear-only model, each group corresponds to a layer.
-                    off.fine_grained_offloading_set_last_layer(i == len(self.net) - 1)
                     x = off.fine_grained_offloading_group_start(x, name=f"layer_{i}")
                     x = layer(x)
                     # Commit the group; returns a tuple of tensors

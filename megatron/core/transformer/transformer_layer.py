@@ -519,17 +519,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        if self.offload_modules["attn_norm"]:
+        if self.offload_attn_norm:
             hidden_states = fine_grained_offloading_group_start(hidden_states, name="attn_norm")
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with get_fine_grained_offloading_context(self.offload_modules["attn_norm"]):
+            with get_fine_grained_offloading_context(self.offload_attn_norm):
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     self.input_layernorm, hidden_states
                 )
         else:
-            with get_fine_grained_offloading_context(self.offload_modules["attn_norm"]):
+            with get_fine_grained_offloading_context(self.offload_attn_norm):
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
@@ -564,7 +564,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="self_attn_bda")
 
-        if self.offload_modules["attn_norm"]:
+        if self.offload_attn_norm:
             (hidden_states,) = fine_grained_offloading_group_commit(
                 hidden_states, name="attn_norm", forced_released_tensors=[residual]
             )
@@ -615,17 +615,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        if self.offload_modules["mlp_norm"]:
+        if self.offload_mlp_norm:
             hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with get_fine_grained_offloading_context(self.offload_modules["mlp_norm"]):
+            with get_fine_grained_offloading_context(self.offload_mlp_norm):
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                     self.pre_mlp_layernorm, hidden_states
                 )
         else:
-            with get_fine_grained_offloading_context(self.offload_modules["mlp_norm"]):
+            with get_fine_grained_offloading_context(self.offload_mlp_norm):
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
@@ -680,13 +680,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
-            if self.offload_modules["dense_mlp"]:
+            if self.offload_dense_mlp:
                 pre_mlp_layernorm_output = fine_grained_offloading_group_start(
                     pre_mlp_layernorm_output, name="dense_mlp"
                 )
-                with get_fine_grained_offloading_context(self.offload_modules["dense_mlp"]):
+                with get_fine_grained_offloading_context(self.offload_dense_mlp):
                     mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
-                if self.offload_modules["dense_mlp"]:
+                if self.offload_dense_mlp:
                     (mlp_output,) = fine_grained_offloading_group_commit(
                         mlp_output_with_bias[0], name="dense_mlp", forced_released_tensors=[]
                     )
@@ -728,7 +728,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="mlp_bda")
-        if self.offload_modules["mlp_norm"]:
+        if self.offload_mlp_norm:
             (hidden_states,) = fine_grained_offloading_group_commit(
                 hidden_states, name="mlp_norm", forced_released_tensors=[residual]
             )
@@ -1044,48 +1044,34 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
     def _set_offload_modules(self):
         """Set the offload modules for the transformer layer."""
-        self.offload_modules = {
-            "attn_norm": False,
-            "qkv_linear": False,
-            "core_attn": False,
-            "attn_proj": False,
-            "mlp_norm": False,
-            "expert_fc1": False,
-            "moe_act": False,
-            "dense_mlp": False,
-        }
         if self.config.fine_grained_activation_offloading:
-            if "attn_norm" in self.config.offload_modules and not isinstance(
-                self.input_layernorm, IdentityOp
-            ):
-                self.offload_modules["attn_norm"] = True
-            if "qkv_linear" in self.config.offload_modules:
-                self.offload_modules["qkv_linear"] = True
-            if "core_attn" in self.config.offload_modules:
-                self.offload_modules["core_attn"] = True
-            if "attn_proj" in self.config.offload_modules:
-                self.offload_modules["attn_proj"] = True
-            if "mlp_norm" in self.config.offload_modules and not isinstance(
-                self.pre_mlp_layernorm, IdentityOp
-            ):
-                self.offload_modules["mlp_norm"] = True
-            if "expert_fc1" in self.config.offload_modules:
-                self.offload_modules["expert_fc1"] = True
-            if "moe_act" in self.config.offload_modules:
-                self.offload_modules["moe_act"] = True
-            if "dense_mlp" in self.config.offload_modules and not self.is_moe_layer:
-                self.offload_modules["dense_mlp"] = True
+            self.offload_attn_norm = (
+                "attn_norm" in self.config.offload_modules
+                and not isinstance(self.input_layernorm, IdentityOp)
+            )
+            self.offload_qkv_linear = "qkv_linear" in self.config.offload_modules
+            self.offload_core_attn = "core_attn" in self.config.offload_modules
+            self.offload_attn_proj = "attn_proj" in self.config.offload_modules
+            self.offload_mlp_norm = (
+                "mlp_norm" in self.config.offload_modules
+                and not isinstance(self.pre_mlp_layernorm, IdentityOp)
+            )
+            self.offload_expert_fc1 = "expert_fc1" in self.config.offload_modules
+            self.offload_moe_act = "moe_act" in self.config.offload_modules
+            self.offload_dense_mlp = (
+                "dense_mlp" in self.config.offload_modules and not self.is_moe_layer
+            )
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
         if CudaGraphScope.attn in self.config.cuda_graph_scope:
             if (
-                self.offload_modules["core_attn"]
-                or self.offload_modules["attn_proj"]
-                or self.offload_modules["qkv_linear"]
+                self.offload_core_attn
+                or self.offload_attn_proj
+                or self.offload_qkv_linear
             ):
                 self.offload_module_in_cuda_graph = True
         if not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope:
-            if self.offload_modules["mlp_norm"] or self.offload_modules["dense_mlp"]:
+            if self.offload_mlp_norm or self.offload_dense_mlp:
                 self.offload_module_in_cuda_graph = True
         if self.offload_module_in_cuda_graph:
             assert is_torch_min_version(
