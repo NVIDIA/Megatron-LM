@@ -203,7 +203,9 @@ class TestMoELayerFP16:
     @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
     @pytest.mark.parametrize("num_moe_experts", [2, 4])
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 1), (2, 2), (4, 2)])
-    def test_moe_layer_fp16_forward_backward(self, num_moe_experts, moe_token_dispatcher_type, tp_size, ep_size):
+    def test_moe_layer_fp16_forward_backward(
+        self, num_moe_experts, moe_token_dispatcher_type, tp_size, ep_size
+    ):
         """Test MoE layer forward and backward pass with fp16 params and inputs."""
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
@@ -262,7 +264,9 @@ class TestMoELayerFP16:
         loss.backward()
 
         assert hidden_states.grad is not None, "Input gradients should exist"
-        assert hidden_states.grad.dtype == torch.float16, f"Expected fp16 gradients, got {hidden_states.grad.dtype}"
+        assert (
+            hidden_states.grad.dtype == torch.float16
+        ), f"Expected fp16 gradients, got {hidden_states.grad.dtype}"
 
         for name, param in moe_layer.named_parameters():
             if param.requires_grad:
