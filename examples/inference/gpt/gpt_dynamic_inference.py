@@ -176,7 +176,7 @@ def get_inference_context(
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
-        materialize_only_last_token_logits=not (args.return_log_probs or args.return_prompt_top_n_logprobs),
+        materialize_only_last_token_logits=not args.return_log_probs,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
@@ -360,7 +360,7 @@ def run_inference(
             output_start = get_curr_time()
             for finished_request_record in finished_request_records:
 
-                finished_request = finished_request_record.merge(engine.controller.tokenizer)
+                finished_request = finished_request_record.merge()
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
@@ -369,7 +369,7 @@ def run_inference(
                 request.request_id = finished_request.request_id
 
                 # Update prompt, in case engine has been suspended and resumed.
-                request.prompt_tokens = finished_request.prompt_tokens
+                request.prompt_tokens = finished_request.prompt_tokens.tolist()
                 request.prompt_text = finished_request.prompt
 
                 # Get output tokens and text.
@@ -381,12 +381,14 @@ def run_inference(
                 if finished_request.sampling_params.return_log_probs:
                     if not finished_request.prompt_log_probs:
                         finished_request.prompt_log_probs = []
-                    request.log_probs = (
+                    request.prompt_log_probs = finished_request.prompt_log_probs
+                    request.generated_log_probs = finished_request.generated_log_probs
+                    request.logprobs = (
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
                 if finished_request.sampling_params.top_n_logprobs > 0:
                     request.generated_top_n_logprobs = finished_request.generated_top_n_logprobs
-                if finished_request.sampling_params.return_prompt_top_n_logprobs:
+                if not finished_request.sampling_params.skip_prompt_log_probs:
                     request.prompt_top_n_logprobs = finished_request.prompt_top_n_logprobs
                 num_requests_finished += 1
             output_times.append(get_curr_time() - output_start)
@@ -443,8 +445,7 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         top_n_logprobs=args.top_n_logprobs,
-        return_prompt_top_n_logprobs=args.return_prompt_top_n_logprobs,
-    )
+    ) 
 
     model = get_model()
 
@@ -577,8 +578,9 @@ def main():
                         "prompt_top_n_logprobs" : getattr(req, 'prompt_top_n_logprobs', None),
                     }
                     if req.sampling_params.return_log_probs:
-                        response_logprobs = req.log_probs
-                        result_dict["logprobs"] = response_logprobs
+                        result_dict["prompt_logprobs"] = getattr(req, 'prompt_log_probs', None)
+                        result_dict["generated_logprobs"] = getattr(req, 'generated_log_probs', None)
+                        result_dict["logprobs"] = getattr(req, 'logprobs', None)
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric

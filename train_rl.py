@@ -14,7 +14,12 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
-from megatron.rl.rl_utils import calculate_grpo_loss, get_logprobs, get_rl_runtime_state
+from megatron.rl.rl_utils import (
+    calculate_grpo_loss,
+    create_packed_seq_params_for_bin,
+    get_logprobs,
+    get_rl_runtime_state,
+)
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
@@ -190,6 +195,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     seq_starts = None
     seq_lengths = None
     attention_mask = None
+    packed_seq_params = None
+    packed_seq_len = 0
 
     if args.rl_use_sequence_packing:
         # Get bin index from data iterator
@@ -235,6 +242,19 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         else:
             inference_logprobs = None
 
+        # Get cached PackedSeqParams for proper attention masking in Transformer Engine
+        # These were pre-computed in prepare_data_for_update to avoid repeated tensor allocations
+        if 'cached_packed_seq_params' in packing_context:
+            packed_seq_params, packed_seq_len = packing_context['cached_packed_seq_params'][bin_idx]
+        else:
+            packed_seq_params = create_packed_seq_params_for_bin(
+                packing_info=packing_info,
+                bin_idx=bin_idx,
+                bin_size=args.rl_sequence_packing_bin_size,
+                device=tokens.device,
+            )
+            packed_seq_len = packed_seq_params.cu_seqlens_q[-1].item() if packed_seq_params is not None else 0
+
         runtime_state = get_rl_runtime_state()
         runtime_state.increment_sequences(len(seq_indices))
     else:
@@ -279,7 +299,9 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
         current_logprobs = get_logprobs(
-            model_to_use, tokens, position_ids, attention_mask, no_grad=False
+            model_to_use, tokens, position_ids, attention_mask, no_grad=False,
+            packed_seq_params=packed_seq_params,
+            packed_seq_len=packed_seq_len
         )
 
         # Calculate loss using unified function
