@@ -903,7 +903,7 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, pac
             model.config.flash_decode = flash_decode
             
 
-        if not is_pp_last_stage():
+        if not is_pp_last_stage(get_pipeline_model_parallel_group()):
             return logits_or_hidden_states
         else:
             logits = logits_or_hidden_states
@@ -1874,12 +1874,12 @@ def prepare_data_for_update(
                     forward_only=True,
                     adjust_tensor_shapes_fn=None,
                 )
-                if is_pp_last_stage():
+                if is_pp_last_stage(get_pipeline_model_parallel_group()):
                     old_logprobs.append(
                         output_tensor[0].detach()
                     )
 
-            if is_pp_last_stage():
+            if is_pp_last_stage(get_pipeline_model_parallel_group()):
                 old_logprobs = torch.concat(old_logprobs, dim=0)
                 assert old_logprobs.dtype == dtype
             else:
@@ -1962,12 +1962,12 @@ def prepare_data_for_update(
                     forward_only=True,
                     adjust_tensor_shapes_fn=None,
                 )
-                if is_pp_last_stage():
+                if is_pp_last_stage(get_pipeline_model_parallel_group()):
                     ref_logprobs.append(
                         output_tensor[0].detach()
                     )
 
-            if is_pp_last_stage():
+            if is_pp_last_stage(get_pipeline_model_parallel_group()):
                 ref_logprobs = torch.concat(ref_logprobs, dim=0)
                 assert ref_logprobs.dtype == dtype
             else:
