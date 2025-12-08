@@ -1041,9 +1041,21 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        import os
+        output_path = os.path.join(os.getcwd(), "block_bag_%s.txt" % os.environ["LAWRENCE_X"])
+        with open(output_path, "a") as f:
+            f.write(".......... %d/%d .... block_bag, uniq %d ... [%s] %s.\n" % (
+                repeat_idx,
+                self.step_count,
+                self.context.block_allocator.get_num_unique_ids(),
+                get_array_hash(self.context.block_allocator.block_bag),
+                self.context.block_allocator.block_bag.view(-1)[-32:].tolist(),
+            ))
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         # >>>
-        print("........ request_ids: %s." % str(self.context.request_ids[self.context.paused_request_count:self.context.total_request_count].tolist()))
+        # print("........ request_ids: %s." % str(self.context.request_ids[self.context.paused_request_count:self.context.total_request_count].tolist()))
         # <<<
         self.step_end_event.record()
         self.step_end_event.synchronize()

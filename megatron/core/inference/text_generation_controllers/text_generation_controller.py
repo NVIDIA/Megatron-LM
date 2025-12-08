@@ -910,21 +910,21 @@ class TextGenerationController:
         )
 
         # >>>
-        if repeat_idx == 1:
-            print_seq("block_bag ....... uniq %d ... [%s] %s ... %s" % (
-                len(set(context.block_allocator.block_bag.view(-1).tolist())),
-                get_array_hash(context.block_allocator.block_bag),
-                context.block_allocator.block_bag.view(-1)[:16].tolist(),
-                context.block_allocator.block_bag.view(-1)[-16:].tolist(),
-            ))
-            pax({
-                "paused_request_count" : context.paused_request_count,
-                "total_request_count" : context.total_request_count,
-                "active_token_count" : context.active_token_count,
-                "input_ids" : input_ids,
-                "position_ids" : position_ids,
-                "block_allocator" : context.block_allocator,
-            })
+        # if repeat_idx == 1:
+        #     print_seq("block_bag ....... uniq %d ... [%s] %s ... %s" % (
+        #         context.block_allocator.get_num_unique_ids(),
+        #         get_array_hash(context.block_allocator.block_bag),
+        #         context.block_allocator.block_bag.view(-1)[:16].tolist(),
+        #         context.block_allocator.block_bag.view(-1)[-16:].tolist(),
+        #     ))
+        #     pax({
+        #         "paused_request_count" : context.paused_request_count,
+        #         "total_request_count" : context.total_request_count,
+        #         "active_token_count" : context.active_token_count,
+        #         "input_ids" : input_ids,
+        #         "position_ids" : position_ids,
+        #         "block_allocator" : context.block_allocator,
+        #     })
         # <<<
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)
         # >>>

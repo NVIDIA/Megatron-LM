@@ -96,6 +96,11 @@ class BlockAllocator:
         else:
             return None
 
+    # >>>
+    def get_num_unique_ids(self):
+        return len(set(self.block_bag.view(-1).tolist()))
+    # <<<
+
     def release_memory_blocks(self, blocks: Tensor) -> None:
         """Release memory blocks.
 
@@ -108,6 +113,10 @@ class BlockAllocator:
         num_blocks = blocks.size(dim=0)
         self.block_bag[self.total_avail : (self.total_avail + num_blocks)] = blocks
         self.total_avail += num_blocks
+        # >>>
+        # if self.get_num_unique_ids() != self.total_count:
+        #     pax("self, blocks", {"unique": self.get_num_unique_ids()})
+        # <<<
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
