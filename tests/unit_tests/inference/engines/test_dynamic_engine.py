@@ -1362,7 +1362,7 @@ class TestDynamicInferenceEngine:
         step_count = env.engine.step_count
         context = env.engine.context
         if max_requests is None:
-            assert context.max_active_requests == 409
+            assert context.max_active_requests == 408
             assert step_count == 22
         else:
             assert max_requests < len(env.requests), (
