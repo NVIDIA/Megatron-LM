@@ -1045,16 +1045,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     def _set_offload_modules(self):
         """Set the offload modules for the transformer layer."""
         if self.config.fine_grained_activation_offloading:
-            self.offload_attn_norm = (
-                "attn_norm" in self.config.offload_modules
-                and not isinstance(self.input_layernorm, IdentityOp)
+            self.offload_attn_norm = "attn_norm" in self.config.offload_modules and not isinstance(
+                self.input_layernorm, IdentityOp
             )
             self.offload_qkv_linear = "qkv_linear" in self.config.offload_modules
             self.offload_core_attn = "core_attn" in self.config.offload_modules
             self.offload_attn_proj = "attn_proj" in self.config.offload_modules
-            self.offload_mlp_norm = (
-                "mlp_norm" in self.config.offload_modules
-                and not isinstance(self.pre_mlp_layernorm, IdentityOp)
+            self.offload_mlp_norm = "mlp_norm" in self.config.offload_modules and not isinstance(
+                self.pre_mlp_layernorm, IdentityOp
             )
             self.offload_expert_fc1 = "expert_fc1" in self.config.offload_modules
             self.offload_moe_act = "moe_act" in self.config.offload_modules
@@ -1064,11 +1062,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
         if CudaGraphScope.attn in self.config.cuda_graph_scope:
-            if (
-                self.offload_core_attn
-                or self.offload_attn_proj
-                or self.offload_qkv_linear
-            ):
+            if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
                 self.offload_module_in_cuda_graph = True
         if not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope:
             if self.offload_mlp_norm or self.offload_dense_mlp:
