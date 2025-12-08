@@ -48,6 +48,9 @@ except ImportError:
 
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_linear_attention_variant,
+)
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_attr_wrapped_model,
@@ -379,8 +382,7 @@ def num_floating_point_operations(args, batch_size):
                 )
             )
 
-        linear_attention_variants = ["gated_delta_net"]
-        if args.experimental_attention_variant in linear_attention_variants:
+        if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
@@ -433,7 +435,10 @@ def num_floating_point_operations(args, batch_size):
                     )
                 )
             else:
-                raise ValueError(f"Invalid linear_attention_type: {args.linear_attention_type}")
+                raise ValueError(
+                    "Invalid experimental_attention_variant: "
+                    f"{args.experimental_attention_variant}"
+                )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -2985,7 +2990,8 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
 
         # Build dataloders.
-        train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+        if not args.skip_train:
+            train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
 
         valid_dataloaders = []
         for valid_d in valid_ds:
