@@ -1635,6 +1635,7 @@ class TECudaGraphHelper:
                 fine_grained_offloading_disable_offload,
                 fine_grained_offloading_enable_offload,
                 fine_grained_offloading_init_chunk_handler,
+                fine_grained_offloading_reset,
             )
             from functools import partial
             # if self.config.offload_module_in_cuda_graph:
@@ -1646,6 +1647,7 @@ class TECudaGraphHelper:
                     vp_size=self.config.virtual_pipeline_model_parallel_size,
                     min_offloaded_tensor_size=self.config.min_offloaded_tensor_size
                 )
+                kwargs['reset_hook'] = fine_grained_offloading_reset
             return kwargs
 
         kwargs = get_make_graphed_callables_kwargs()
