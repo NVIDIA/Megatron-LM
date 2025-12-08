@@ -65,7 +65,7 @@ async def main(
     args = get_args()
 
     # Test suspend/resume intervals.
-    if args.suspend_resume_interval is not None:
+    if dist.get_rank() == 0 and args.suspend_resume_interval is not None:
         # Since the client doesn't directly call engine.async_step here, we test
         # the suspend-resume system ~4 times.
         suspend_resume_interval = max(1, len(requests) // 4)

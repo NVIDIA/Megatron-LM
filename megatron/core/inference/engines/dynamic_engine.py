@@ -1439,9 +1439,14 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    def _ep_group_has_work(self):
+    def _ep_group_has_work(self, local_work: int) -> bool:
         """Determines if there are some pending requests in the expert parallel group this
-        rank is a part of
+        rank is a part of.
+        Args:
+            local_work (int): The local work count for this rank. This is a sum of active 
+            and waiting requests.
+        Returns:
+            bool: True if there is some work in the EP group, False otherwise.
         """
         range_push("_ep_group_has_work")
 
@@ -1458,8 +1463,6 @@ class DynamicInferenceEngine(AbstractEngine):
             # and we will defer processing the signal.
             # When all ranks receive the signal, global work will be zero, and we can process the signal safely.
             local_work = 0
-        else:
-            local_work = self.context.get_active_request_count() + len(self.waiting_request_ids)
 
         if parallel_state.get_expert_model_parallel_world_size() > 1:
             expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
@@ -1468,15 +1471,15 @@ class DynamicInferenceEngine(AbstractEngine):
             local_work_tensor = torch.tensor([local_work], device=torch.cuda.current_device())
             torch.distributed.all_reduce(
                 local_work_tensor,
-                op=torch.distributed.ReduceOp.SUM,
+                op=torch.distributed.ReduceOp.MAX,
                 group=expert_model_parallel_group,
             )
-            global_work = local_work_tensor.item()
+            max_global_work = local_work_tensor.item()
         else:
-            global_work = local_work
+            max_global_work = local_work
 
         range_pop()
-        return global_work > 0
+        return max_global_work > 0
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
@@ -1504,7 +1507,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 pending_requests = self.context.get_active_request_count() + len(
                     self.waiting_request_ids
                 )
-                ep_group_has_work = self._ep_group_has_work()
+                ep_group_has_work = self._ep_group_has_work(pending_requests)
 
                 if ep_group_has_work and pending_requests == 0:
                     # run dummy forward pass if EP group as a whole has work,
