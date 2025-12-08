@@ -268,7 +268,8 @@ class OffloadTensorGroup:
         self._offload_event = torch.cuda.Event()
         self._reload_event = torch.cuda.Event()
         self.offload = True
-
+        self.total_offload_bytes = 0
+        self.total_tensor_count = 0
         if name == "expert_fc1" or name == "moe_act":
             self.use_cpu_pool = False
         else:
@@ -297,6 +298,11 @@ class OffloadTensorGroup:
     def wait_reload_event(self, stream):
         """Wait for the reload event."""
         stream.wait_event(self._reload_event)
+
+    def update_offload_info(self, tensor):
+        """Update the offload information."""
+        self.total_offload_bytes += tensor.numel() * tensor.element_size()
+        self.total_tensor_count += 1
 
 
 class PipelineOffloadManager:
@@ -402,6 +408,7 @@ class PipelineOffloadManager:
 
     def post_warmup_callback(self):
         """Callback after warmup."""
+        # pylint: disable=bad-builtin
         debug_rank("post_warmup_callback")
         self._is_warmup = False
         assert len(self._cached_chunks_forward) == len(
@@ -431,6 +438,24 @@ class PipelineOffloadManager:
                 break
         debug_rank(f"offload margin {self._offload_margin}")
         assert self._offload_margin == 0, "Offload margin is not 0"
+        # Dump the offload information
+        total_tensor_count = {}
+        total_offload_bytes = {}
+        for chunk in self._cached_chunks_backward:
+            for group in chunk.offload_groups:
+                if group.offload:
+                    if group._name not in total_tensor_count:
+                        total_tensor_count[group._name] = 0
+                    total_tensor_count[group._name] += group.total_tensor_count
+                    if group._name not in total_offload_bytes:
+                        total_offload_bytes[group._name] = 0
+                    total_offload_bytes[group._name] += group.total_offload_bytes
+        assert torch.distributed.is_initialized()
+        rank = torch.distributed.get_rank()
+        for name, tensor_count in total_tensor_count.items():
+            print(f"rank {rank} total offloaded tensor count for group {name} {tensor_count}")
+        for name, offload_bytes in total_offload_bytes.items():
+            print(f"rank {rank} total offloaded bytes for group {name} {offload_bytes}")
 
     def push(self, handler):
         """Add a chunk handler to the backward queue."""
@@ -632,8 +657,6 @@ class ChunkOffloadHandler:
         self.torch_tensor_count = 0
         self.d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
         self.h2d_stream = PipelineOffloadManager.get_instance().h2d_stream
-        # self._offload_events = {}
-        # self._reload_events = {}
         self.min_offloaded_tensor_size = min_offloaded_tensor_size
         self.cpu_tensor_pool = cpu_tensor_pool
         self.offload_groups = []
@@ -645,13 +668,10 @@ class ChunkOffloadHandler:
         self._groups_to_offload = []
         self._groups_to_reload = []
         self._tensor_count_current_group = 0
-        # self._offload_events = {}
-        # self._reload_events = {}
 
     def is_empty_chunk(self, name=None):
         """Check if this chunk has no tensors to manage."""
         debug_rank(f"------is_empty_chunk {self._max_group_size}")
-        # return len(self._tensor_tag_to_state) == 0
         if name is not None:
             for group in self.offload_groups:
                 debug_rank(f"group name {group._name} need name {name}")
@@ -743,6 +763,8 @@ class ChunkOffloadHandler:
                     state = self.offload(
                         tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
                     )
+                    if self.is_warmup:
+                        group_to_offload.update_offload_info(tensor_on_device)
                     tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
