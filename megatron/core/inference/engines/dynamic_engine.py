@@ -1514,6 +1514,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
+                # (not ep_group has_work) - only process pause/stop when
+                # all ranks in EP group have received the signal.
                 if (not ep_group_has_work) and (
                     self.paused.is_set() or self.received_pause or self.received_stop
                 ):
