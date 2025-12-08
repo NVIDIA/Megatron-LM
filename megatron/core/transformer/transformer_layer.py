@@ -1077,14 +1077,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self.offload_modules["dense_mlp"] = True
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
-        if "attn" in self.config.cuda_graph_scope:
+        if CudaGraphScope.attn in self.config.cuda_graph_scope:
             if (
                 self.offload_modules["core_attn"]
                 or self.offload_modules["attn_proj"]
                 or self.offload_modules["qkv_linear"]
             ):
                 self.offload_module_in_cuda_graph = True
-        if not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope:
+        if not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope:
             if self.offload_modules["mlp_norm"] or self.offload_modules["dense_mlp"]:
                 self.offload_module_in_cuda_graph = True
         if self.offload_module_in_cuda_graph:
