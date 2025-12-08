@@ -1439,6 +1439,45 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
+    def _ep_group_has_work(self):
+        """Determines if there are some pending requests in the expert parallel group this 
+        rank is a part of
+        """
+        range_push("_ep_group_has_work")
+        
+        is_stopped = self.stopped.is_set() or self.received_stop 
+        is_paused = self.paused.is_set() or self.received_pause
+        is_suspended = self.suspend_signal or self.is_suspended
+        if is_stopped or is_paused or is_suspended:
+            # attempt to pause/stop/suspend 
+            # contribute 0 work to the all-reduce 
+            # Signals are received asynchronously so some EP ranks might not have 
+            # received them yet. So in that case they might nominate +ve work 
+            # and in that case we do not want to pause/stop/suspend prematurely.
+            # Ultimately when all of them receive the signal, they will all contribute 0 work
+            local_work = 0  
+        else:
+            local_work = self.context.get_active_request_count() + len(self.waiting_request_ids)
+
+        if parallel_state.get_expert_model_parallel_world_size() > 1:
+            expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+            # all reduce local work across expert model parallel group
+
+            local_work_tensor = torch.tensor(
+                [local_work], device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(
+                local_work_tensor,
+                op=torch.distributed.ReduceOp.SUM,
+                group=expert_model_parallel_group,
+            )
+            global_work = local_work_tensor.item()
+        else:
+            global_work = local_work
+        
+        range_pop()
+        return global_work > 0
+
     @trace_async_exceptions
     async def run_engine_with_coordinator(
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
@@ -1462,25 +1501,32 @@ class DynamicInferenceEngine(AbstractEngine):
                 # needed to send one message on an IPC socket. However
                 # just to be safe, we use 20ms here.
 
+                pending_requests = self.context.get_active_request_count() + len(self.waiting_request_ids)
+                ep_group_has_work = self._ep_group_has_work() 
+
+                if ep_group_has_work and pending_requests == 0:
+                    # run dummy forward pass
+                    self.controller.dummy_forward() 
+                    continue
+
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
-                if self.paused.is_set() or self.received_pause or self.received_stop:
+                
+                if (not ep_group_has_work) and (self.paused.is_set() or self.received_pause or self.received_stop):
                     await asyncio.sleep(0.02)
                     continue
 
                 # Suspend, resume.
-                if self.suspend_signal:
+                if (not ep_group_has_work) and self.suspend_signal:
                     self.suspend()
                     await asyncio.sleep(0.02)
                     continue
-
                 else:
                     self.resume()
 
                 # No requests.
                 if (
-                    self.context.get_active_request_count() == 0
-                    and len(self.waiting_request_ids) == 0
+                    not pending_requests
                 ):
                     await asyncio.sleep(0.02)
                     continue
