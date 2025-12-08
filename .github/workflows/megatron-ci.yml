@@ -68,7 +68,7 @@ jobs:
         id: te-ref
         run: |
           set -e
-          BRANCH=release_v2.2
+          BRANCH=release_v2.2_rocm
           SHA=$(git ls-remote https://github.com/ROCm/TransformerEngine.git "refs/heads/$BRANCH" | cut -f1)
           if [ -z "$SHA" ]; then
             echo "::error::Failed to resolve TransformerEngine commit for branch $BRANCH"
