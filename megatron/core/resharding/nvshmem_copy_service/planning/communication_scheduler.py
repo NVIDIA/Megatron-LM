@@ -20,7 +20,6 @@ class CommunicationScheduler:
         workloads: Dict[int, List[WorkloadGroup]],
         my_pe: int,
         n_pes: int,
-        group=None,
     ) -> Tuple[Dict[int, List[ScheduledBatch]], Dict[Tuple[int, int, int], WorkloadSummary]]:
         """
         Main scheduling method.
@@ -37,7 +36,7 @@ class CommunicationScheduler:
 
         # Step 1: Collect all batches across all PE pairs
         PELogger.debug("Collecting batches from all PEs...")
-        all_batches = self._collect_all_batches(workloads, my_pe, n_pes, group)
+        all_batches = self._collect_all_batches(workloads, my_pe, n_pes)
         PELogger.debug(f"Collected {len(all_batches)} total batches globally")
 
         # Step 2: Assign batches to iterations using conflict-free algorithm
@@ -52,7 +51,6 @@ class CommunicationScheduler:
             workloads,
             my_pe,
             n_pes,
-            group,
         )
         PELogger.debug(f"Exchanged {len(global_summaries)} workload summaries")
 
@@ -73,7 +71,6 @@ class CommunicationScheduler:
         workloads: Dict[int, List[WorkloadGroup]],
         my_pe: int,
         n_pes: int,
-        group=None,
     ) -> List[ScheduledBatch]:
         """
         Exchanges batch counts and details with all PEs to build a global view.
@@ -94,7 +91,7 @@ class CommunicationScheduler:
 
         # Gather all batches from all PEs using torch.distributed
         all_batches_list: List[List[Tuple[int, int, int]] | None] = [None] * n_pes
-        dist.all_gather_object(all_batches_list, local_batches, group=group)
+        dist.all_gather_object(all_batches_list, local_batches)
 
         # Flatten into global batch list
         global_batches: List[ScheduledBatch] = []
@@ -158,7 +155,6 @@ class CommunicationScheduler:
         workloads: Dict[int, List[WorkloadGroup]],
         my_pe: int,
         n_pes: int,
-        group=None,
     ) -> Dict[Tuple[int, int, int], WorkloadSummary]:
         """
         Exchange detailed workload content using torch.distributed.
@@ -193,7 +189,7 @@ class CommunicationScheduler:
         all_summaries_list: List[Dict[Tuple[int, int, int], Dict[str, object]] | None] = [  # noqa: E501
             None
         ] * n_pes
-        dist.all_gather_object(all_summaries_list, local_summaries, group=group)
+        dist.all_gather_object(all_summaries_list, local_summaries)
 
         # Merge into global map
         global_map: Dict[Tuple[int, int, int], WorkloadSummary] = {}

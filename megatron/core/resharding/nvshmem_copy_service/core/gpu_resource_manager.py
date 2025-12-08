@@ -22,11 +22,6 @@ class GPUResourceManager:
         self.n_pes: int = -1
         self.initialized: bool = False
 
-        # Dedicated torch.distributed process group for NVSHMEM collectives.
-        # This isolates NVSHMEM's use of collectives from the default WORLD
-        # group that Megatron and the test harness use for their own ops.
-        self.pg: Optional[dist.ProcessGroup] = None
-
         # CUDA streams (cuda.core.experimental)
         self.pack_stream = None
         self.unpack_stream = None
@@ -65,15 +60,9 @@ class GPUResourceManager:
         self.device = Device(local_rank)
         self.device.set_current()
 
-        # Extract rank, nranks from process group
+        # Extract rank, nranks from the default process group
         num_ranks = dist.get_world_size()
         rank_id = dist.get_rank()
-
-         # Create a dedicated process group for NVSHMEM collectives.
-         # Using a private group avoids interfering with Megatron's own
-         # WORLD-group collectives (e.g., during test setup/teardown),
-         # which can otherwise trigger "collective mismatch" runtime errors.
-        self.pg = dist.new_group(ranks=list(range(num_ranks)))
 
         # Create/Broadcast UniqueID using broadcast_object_list
         uniqueid = nvshmem.core.get_unique_id(empty=True)
@@ -83,11 +72,11 @@ class GPUResourceManager:
         else:
             broadcast_objects = [None]
 
-        # Broadcast ID to all ranks
-        dist.broadcast_object_list(broadcast_objects, src=0, group=self.pg)
+        # Broadcast ID to all ranks using the default group
+        dist.broadcast_object_list(broadcast_objects, src=0)
 
         # Barrier to ensure everyone has the ID before NVSHMEM init
-        dist.barrier(group=self.pg)
+        dist.barrier()
 
         # Initialize NVSHMEM with the broadcasted UID
         nvshmem.core.init(

@@ -230,7 +230,6 @@ class RemoteCopyService:
             workloads,
             self.my_pe,
             self.n_pes,
-            group=self.gpu_resources.pg,
         )
 
         self.num_iterations = self.comm_scheduler.num_iterations

@@ -40,17 +40,12 @@ class WorkloadPacker:
             if workloads[dest_pe]:
                 total_size = sum(b.total_size for b in workloads[dest_pe])
                 PELogger.debug(
-                    "  Dest PE %d: %d tasks → %d batches, %d bytes total",
-                    dest_pe,
-                    len(tasks),
-                    len(workloads[dest_pe]),
-                    total_size,
+                    f"  Dest PE {dest_pe}: {len(tasks)} tasks → "
+                    f"{len(workloads[dest_pe])} batches, {total_size} bytes total"
                 )
             else:
                 PELogger.debug(
-                    "  Dest PE %d: %d tasks → 0 batches (empty after packing)",
-                    dest_pe,
-                    len(tasks),
+                    f"  Dest PE {dest_pe}: {len(tasks)} tasks → 0 batches (empty after packing)"
                 )
 
         return workloads
@@ -81,11 +76,8 @@ class WorkloadPacker:
                     [str(t.task_id) for t in current_batch.tasks[:10]]
                 )
                 PELogger.debug(
-                    "  Packed batch to PE %d idx %d: %s... (total %d tasks)",
-                    dest_pe,
-                    len(batches) - 1,
-                    task_first_10_string,
-                    len(current_batch.tasks),
+                    f"  Packed batch to PE {dest_pe} idx {len(batches) - 1}: "
+                    f"{task_first_10_string}... (total {len(current_batch.tasks)} tasks)"
                 )
                 # Start new batch
                 current_batch = WorkloadGroup(

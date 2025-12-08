@@ -46,7 +46,7 @@ class GPUExecutionPlanner:
             recv_slots: List of receive buffer slots
             receive_requests: List of all receive requests for matching
         """
-        PELogger.debug("Creating GPU plans for %d iterations", len(iter_schedules))
+        PELogger.debug(f"Creating GPU plans for {len(iter_schedules)} iterations")
         for i, sched in enumerate(iter_schedules):
             send_batch = sched["send"]
             if send_batch:
@@ -72,16 +72,13 @@ class GPUExecutionPlanner:
                 )
                 task_ids = [t.task_id for t in send_batch.tasks]
                 PELogger.debug(
-                    "  Iter %d send plan: %d tasks → PE %d, %d bytes",
-                    i,
-                    len(send_batch.tasks),
-                    send_batch.dest_pe,
-                    send_batch.total_size,
+                    f"  Iter {i} send plan: {len(send_batch.tasks)} tasks → "
+                    f"PE {send_batch.dest_pe}, {send_batch.total_size} bytes"
                 )
-                PELogger.debug(
-                    "    Send task IDs: %s",
-                    task_ids[:10] if len(task_ids) <= 10 else task_ids[:10] + ["..."],
+                displayed_ids = (
+                    task_ids[:10] if len(task_ids) <= 10 else task_ids[:10] + ["..."]
                 )
+                PELogger.debug(f"    Send task IDs: {displayed_ids}")
 
             recv_batch = sched["recv"]
             if recv_batch:
@@ -91,19 +88,15 @@ class GPUExecutionPlanner:
                 # Skip if no summary available (shouldn't happen in normal operation)
                 if summary is None:
                     PELogger.error(
-                        "Iter %d: recv batch from PE %d has no tasks_summary - "
-                        "UNPACK WILL BE SKIPPED!",
-                        i,
-                        recv_batch.src_pe,
+                        f"Iter {i}: recv batch from PE {recv_batch.src_pe} has no "
+                        "tasks_summary - UNPACK WILL BE SKIPPED!"
                     )
                     recv_batch.gpu_plan = None
                     continue
 
                 PELogger.debug(
-                    "  Iter %d recv from PE %d: %d tasks in summary",
-                    i,
-                    recv_batch.src_pe,
-                    len(summary.task_ids),
+                    f"  Iter {i} recv from PE {recv_batch.src_pe}: "
+                    f"{len(summary.task_ids)} tasks in summary"
                 )
 
                 ptrs = []
@@ -131,20 +124,14 @@ class GPUExecutionPlanner:
                     else:
                         unmatched_task_ids.append(t_id)
                         PELogger.error(
-                            "Iter %d: Unexpected task %d from PE %d - "
-                            "no matching recv request!",
-                            i,
-                            t_id,
-                            recv_batch.src_pe,
+                            f"Iter {i}: Unexpected task {t_id} from PE "
+                            f"{recv_batch.src_pe} - no matching recv request!"
                         )
 
                 if unmatched_task_ids:
                     PELogger.error(
-                        "  Iter %d: %d unmatched tasks from PE %d: %s",
-                        i,
-                        len(unmatched_task_ids),
-                        recv_batch.src_pe,
-                        unmatched_task_ids[:10],
+                        f"  Iter {i}: {len(unmatched_task_ids)} unmatched tasks "
+                        f"from PE {recv_batch.src_pe}: {unmatched_task_ids[:10]}"
                     )
 
                 # Plan kernel args for unpacking
@@ -158,26 +145,20 @@ class GPUExecutionPlanner:
 
                 if recv_batch.gpu_plan is None:
                     PELogger.error(
-                        "  Iter %d recv plan: FAILED - no gpu_plan created for %d "
-                        "tasks from PE %d",
-                        i,
-                        len(sizes),
-                        recv_batch.src_pe,
+                        f"  Iter {i} recv plan: FAILED - no gpu_plan created for "
+                        f"{len(sizes)} tasks from PE {recv_batch.src_pe}"
                     )
                 else:
                     PELogger.debug(
-                        "  Iter %d recv plan: %d tasks ← PE %d, %d bytes",
-                        i,
-                        len(sizes),
-                        recv_batch.src_pe,
-                        recv_batch.total_size,
+                        f"  Iter {i} recv plan: {len(sizes)} tasks ← "
+                        f"PE {recv_batch.src_pe}, {recv_batch.total_size} bytes"
                     )
-                    PELogger.debug(
-                        "    Recv task IDs: %s",
+                    displayed_recv_ids = (
                         matched_task_ids[:10]
                         if len(matched_task_ids) <= 10
-                        else matched_task_ids[:10] + ["..."],
+                        else matched_task_ids[:10] + ["..."]
                     )
+                    PELogger.debug(f"    Recv task IDs: {displayed_recv_ids}")
 
     def _plan_kernel_args(
         self,
