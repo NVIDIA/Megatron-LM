@@ -3,7 +3,12 @@ name: API Compatibility Check
 on:
   push:
     branches:
-      - "pull-request/[0-9]+"
+      - dev
+      - main
+      - 'pull-request/[0-9]+'
+      - 'deploy-release/*'
+  merge_group:
+    types: [checks_requested]
 
   # Allow manual trigger
   workflow_dispatch:
@@ -33,17 +38,37 @@ jobs:
             echo "Manual trigger - will run compatibility check"
             exit 0
           fi
-          
-          # Check if any relevant files changed
-          # Use merge-base to find common ancestor with main
-          # This ensures we only detect changes actually made in this PR branch,
-          # not changes that happened in main after the branch was created
-          BASE_SHA=$(git merge-base origin/main HEAD)
-          echo "Comparing against merge-base: $BASE_SHA"
-          
+
+          # Determine base SHA based on event type
+          if [ "${{ github.event_name }}" == "merge_group" ]; then
+            BASE_SHA="${{ github.event.merge_group.base_sha }}"
+            echo "Merge group event - comparing against base: $BASE_SHA"
+          else
+            # For push events, use merge-base to find common ancestor
+            # This ensures we only detect changes actually made in this PR branch,
+            # not changes that happened in main after the branch was created
+            BASE_SHA=$(git merge-base origin/main HEAD 2>/dev/null || echo "")
+            if [ -z "$BASE_SHA" ]; then
+              # Fallback for pull-request/* branches targeting dev
+              BASE_SHA=$(git merge-base origin/dev HEAD 2>/dev/null || echo "")
+            fi
+            echo "Push event - comparing against merge-base: $BASE_SHA"
+          fi
+
+          if [ -z "$BASE_SHA" ]; then
+            echo "Could not determine base SHA - will run compatibility check"
+            echo "should_skip=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           # Check for changes in megatron/core Python files (excluding tests and legacy)
-          CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD -- 'megatron/core/**/*.py' ':!megatron/core/tests/**' ':!megatron/legacy/**' || echo "")
-          
+          # Note: Using both *.py and **/*.py to match files at root and in subdirectories
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD -- \
+            'megatron/core/*.py' \
+            'megatron/core/**/*.py' \
+            ':!megatron/core/tests/**' \
+            ':!megatron/legacy/**' 2>/dev/null || echo "")
+
           if [ -z "$CHANGED_FILES" ]; then
             echo "should_skip=true" >> $GITHUB_OUTPUT
             echo "No relevant megatron/core files changed - will skip compatibility check"
@@ -66,7 +91,7 @@ jobs:
       # Default baseline for automatic PR checks
       # Can be: branch name (e.g., 'main'), commit hash, or tag
       # Will be resolved to commit hash during execution
-      DEFAULT_BASELINE: 'd61029f765dd37e00909ae20bb588ecc1b37b1e6'
+      DEFAULT_BASELINE: 'b51db3e07a97fed6af5464fae8fa43be1d0564b9'
       # Tag pattern for auto-detection (e.g., 'core_r*', 'core_v*')
       TAG_PATTERN: 'core_v*'
       # Tag regex filter (e.g., '^core_v[0-9]+\.[0-9]+\.[0-9]+$' for stable versions only)
@@ -174,7 +199,17 @@ jobs:
           echo "      def internal_helper_function():"
           echo "          pass"
           echo ""
-          echo "3️⃣  USE DEPRECATION (For gradual API changes)"
+          echo "3️⃣  MARK AS EXPERIMENTAL API (If this is experimental code)"
+          echo "   → Add @experimental_api decorator from megatron.core.utils"
+          echo ""
+          echo "   Example:"
+          echo "      from megatron.core.utils import experimental_api"
+          echo ""
+          echo "      @experimental_api"
+          echo "      class ExperimentalFeature:"
+          echo "          pass"
+          echo ""
+          echo "4️⃣  USE DEPRECATION (For gradual API changes)"
           echo "   → Add @deprecated decorator for transition period"
           echo "   → Example:"
           echo "      from megatron.core.utils import deprecated"

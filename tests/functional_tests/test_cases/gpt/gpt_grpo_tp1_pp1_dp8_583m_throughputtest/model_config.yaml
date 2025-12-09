@@ -62,7 +62,7 @@ MODEL_ARGS:
   --grpo-clamp-eps-upper: 0.2
   --grpo-kl-beta: 0.0
   --grpo-entropy-term-weight: 0.0
-  --langrl-env-config: examples/rl/environment_configs/countdown.yaml
+  --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_tp1_pp1_dp8_583m_throughputtest/env_config.yaml
   --rl-partial-rollouts: true
   --lr: 0.000001
   --lr-warmup-samples: 0
