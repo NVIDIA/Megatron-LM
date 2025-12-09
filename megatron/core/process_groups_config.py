@@ -140,6 +140,23 @@ class ProcessGroupCollection:
             else:
                 raise ValueError(f"Unknown attribute: {key}")
 
+    def __repr__(self):
+        """Return a concise representation showing which process groups exist and their sizes."""
+        active_pgs = []
+        for field_info in fields(self):
+            if hasattr(self, field_info.name):
+                pg = getattr(self, field_info.name)
+                if pg is not None:
+                    active_pgs.append(f"{field_info.name}({pg.size()})")
+                else:
+                    # Field exists but is None
+                    active_pgs.append(f"{field_info.name}(None)")
+        return (
+            f"ProcessGroupCollection({', '.join(active_pgs)})"
+            if active_pgs
+            else "ProcessGroupCollection(empty)"
+        )
+
     @classmethod
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
         """
