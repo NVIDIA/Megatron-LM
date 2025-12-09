@@ -1518,10 +1518,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.controller.dummy_forward()
                     continue
 
-                # todo [Siddharth]: Can this hardcoded sleep be avoided
-                # with asyncio zmq sockets?
-
-                # 3. NO WORK IN EP GROUP - Processing Control Signals
+                
+                # 3. No work in EP group - Processing Control Signals
                 if not ep_group_has_work:
                     # Priority A: STOP
                     # If we have received a stop signal AND the group agrees (ep_group_has_work is False),
@@ -1538,9 +1536,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         self.resume()
                   
-
+                    # Priority C: PAUSE or no work - nothing needs to be done
+                    # todo [Siddharth]: Can this hardcoded sleep be avoided
+                    # with asyncio zmq sockets?
                     await asyncio.sleep(0.02)  # Yield to event loop
                     continue
+
                 # 4. Actual Step
                 await self.async_step(verbose=verbose)
 
