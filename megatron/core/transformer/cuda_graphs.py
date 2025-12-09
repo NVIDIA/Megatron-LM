@@ -1610,21 +1610,17 @@ class TECudaGraphHelper:
             model_chunk_idx = abs(chunk_id) - 1
 
             if chunk_id > 0:
+                if model_chunk_idx not in fwd_sample_queues:
+                    fwd_sample_queues[model_chunk_idx] = []
+
                 sample_start_idx = (prefix_num_layers[model_chunk_idx] * get_num_microbatches()) + (
                     fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
                 )
-                fwd_sample_idx = [
-                    sample_start_idx + i for i in range(self.num_layers_per_chunk[model_chunk_idx])
-                ]
-                if model_chunk_idx not in fwd_sample_queues:
-                    fwd_sample_queues[model_chunk_idx] = []
-                for per_callable_fwd_idx in fwd_sample_idx:
+                for layer_idx, layer in enumerate(self.callables_per_chunk[model_chunk_idx]):
+                    per_callable_fwd_idx = sample_start_idx + layer_idx
+
                     # Get sample_args and sample_kwargs for index per_callable_fwd_idx.
                     assert sample_args[per_callable_fwd_idx] is None
-                    layer = self.callables_per_chunk[model_chunk_idx][
-                        per_callable_fwd_idx - sample_start_idx
-                    ]
-                    layer_static_inputs_generated = False
                     if id(layer) not in layer_sample_keys_cache:
                         # Have not generated the static inputs for this layer yet. So we don't
                         # know the input signature of this layer. Generate the static inputs, and
@@ -1634,7 +1630,6 @@ class TECudaGraphHelper:
                                 layer, self.chunks_with_decoder[model_chunk_idx]
                             )
                         )
-                        layer_static_inputs_generated = True
                         sample_args_keys = tuple(
                             (t.shape, t.dtype, t.layout) for t in sample_args[per_callable_fwd_idx]
                         )
@@ -1662,9 +1657,11 @@ class TECudaGraphHelper:
                         ), "sample_args and sample_kwargs must not be None when reusing."
                         sample_args[per_callable_fwd_idx] = sample_args[reuse_fwd_idx]
                         sample_kwargs[per_callable_fwd_idx] = sample_kwargs[reuse_fwd_idx]
-                    elif not layer_static_inputs_generated:
-                        # Unfortunately, no previous static inputs are available for reuse. So we
-                        # need to generate the new static inputs for this forward pass.
+
+                    if sample_args[per_callable_fwd_idx] is None:
+                        # Unfortunately, no previous static inputs are available for reuse,
+                        # sample_args is still None. Last attempt: generate the new static inputs
+                        # for this forward pass.
                         sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
                             _get_layer_static_inputs(
                                 layer, self.chunks_with_decoder[model_chunk_idx]
