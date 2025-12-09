@@ -33,6 +33,7 @@ Checkpointing Distributed Optimizer
 -----------------------------------
 
 **Checkpoint Compatibility and Optimizer State Formats**
+
 Beginning with mcore v0.14, the flattened_range attribute was removed from dist_checkpointing. As a result:
 - Optimizer states saved with mcore versions < 0.14 are no longer loadable.
 Loading these legacy optimizer states is not supported because the required sharded metadata is no longer available.
@@ -41,6 +42,7 @@ No additional work is required—model weights from checkpoints produced by earl
 
 **Distributed Optimizer Checkpoint Formats**
 The refactor of the Distributed Optimizer introduces **two checkpoint formats**:
+
 - dp_reshardable (Default)
    - Fast save/load performance.
    - Not reshardable — not possible to change model parallelism when using this format.
@@ -52,6 +54,7 @@ The refactor of the Distributed Optimizer introduces **two checkpoint formats**:
 
 **Workflow for Changing Model Parallelism**
 You can combine formats to optimize both flexibility and performance:
+
    1. Train using dp_reshardable (default) for faster checkpointing.
    2. When you need to change model parallelism:
       - Stop training.
