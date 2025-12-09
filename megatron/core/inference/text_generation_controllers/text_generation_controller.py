@@ -641,11 +641,12 @@ class TextGenerationController:
             sampled_indices = torch.cat(indices_list, dim=0)
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
 
-    def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
-        """Perform bookkeeping necessary to compute log probs for dynamic batching.
+    def _dynamic_step_log_probs_check(self) -> Tuple[bool, bool]:
+        """Perform checks on the requests' logprobs arguments.
 
         Returns:
             return_log_probs (bool): Whether to return the sampled log_probs.
+            use_top_n_log_probs (bool): Whether we are filtering top-n log_probs.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -653,6 +654,16 @@ class TextGenerationController:
         return (
             (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
             (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
+        )
+
+    def _dynamic_step_log_probs_bookkeeping(self):
+        """Perform bookkeeping necessary to compute log probs for dynamic batching.
+        """
+        context = self.inference_wrapped_model.inference_context
+
+        self.context.select_log_prob_indices(
+            self._request_metadata["return_log_probs"],
+            context.request_query_lengths,
         )
 
     def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
@@ -848,11 +859,13 @@ class TextGenerationController:
         if context.active_token_count == 0:
             return None
 
+        # Enqueue simple GPU kernels.
+        return_log_probs, use_top_n_log_probs = self._dynamic_step_log_probs_check()
+
         input_ids, position_ids = self._dynamic_step_context_init()
 
-        cuda_graph_request_count = (
-            context.padded_active_request_count if context.is_decode_only() else None
-        )
+        if return_log_probs.item():
+            self._dynamic_step_log_probs_bookkeeping()
 
         self._dynamic_step_forward_logits(input_ids, position_ids)
 
@@ -865,7 +878,6 @@ class TextGenerationController:
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
-        return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
         self._dynamic_step_sample_bookkeeping()
         self._dynamic_step_sample_logits()
 
@@ -876,6 +888,9 @@ class TextGenerationController:
             if return_top_n_logprobs:
                 top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(log_probs_tensor)
 
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
         if skip_bookkeeping:
             request_bookkeeping = {}
         else:
