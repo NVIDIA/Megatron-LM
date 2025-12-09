@@ -2,9 +2,14 @@ dist\_checkpointing package
 ===========================
 
 A library for saving and loading the distributed checkpoints.
-A "distributed checkpoint" can have various underlying formats (current default format is based on Zarr)
-but has a distinctive property - the checkpoint saved in one parallel configuration (tensor/pipeline/data parallelism)
-can be loaded in a different parallel configuration.
+A *distributed checkpoint* in Megatron Core uses the ``torch_dist`` format,
+a custom checkpointing mechanism built on top of PyTorch's native
+checkpointing capabilities.
+
+A key property of distributed checkpoints is that a checkpoint saved under one
+parallel configuration (tensor, pipeline, or data parallelism) can be loaded
+under a different parallel configuration. This enables flexible scaling and
+resharding of models across heterogeneous training setups.
 
 Using the library requires defining sharded state_dict dictionaries with functions from  *mapping* and *optimizer* modules.
 Those state dicts can be saved or loaded with a *serialization* module using strategies from *strategies* module.
