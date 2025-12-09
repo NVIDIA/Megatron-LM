@@ -98,7 +98,7 @@ pip install --no-build-isolation .[mlm,dev]
 
 ```
 Megatron-LM/
-├── megatron/                    
+├── megatron/
 │   ├── core/                    # Megatron Core (kernels, parallelism, building blocks)
 │   │   ├── models/              # Transformer models
 │   │   ├── transformer/         # Transformer building blocks
@@ -127,7 +127,7 @@ Megatron-LM/
 
 - **Training state-of-the-art foundation models** at scale with cutting-edge performance on latest NVIDIA hardware
 - **Research teams** exploring new architectures and training techniques
-- **Learning distributed training** concepts and best practices  
+- **Learning distributed training** concepts and best practices
 - **Quick experimentation** with proven model configurations
 
 **What you get:**
@@ -136,7 +136,7 @@ Megatron-LM/
 - End-to-end examples from data prep to evaluation
 - Research-focused tools and utilities
 
-### Megatron Core: Composable Library  
+### Megatron Core: Composable Library
 
 **Composable library** with GPU-optimized building blocks for custom training frameworks.
 
@@ -169,7 +169,7 @@ Megatron-LM/
 - **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Training library with bidirectional Hugging Face ↔ Megatron checkpoint conversion, flexible training loops, and production-ready recipes
 - **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)** - Scalable toolkit for efficient reinforcement learning with RLHF, DPO, and other post-training methods
 - **[NeMo Framework](https://docs.nvidia.com/nemo-framework/user-guide/latest/overview.html)** - Enterprise framework with cloud-native support and end-to-end examples
-- **[TensorRT Model Optimizer (ModelOpt)](https://github.com/NVIDIA/TensorRT-Model-Optimizer)** - Model optimization toolkit for quantization, pruning, and distillation
+- **[Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer)** - Model optimization toolkit for quantization, pruning, distillation, speculative decoding, and more. Checkout end-to-end examples in [examples/post_training/modelopt](./examples/post_training/modelopt/).
 
 **Compatible with:** [Hugging Face Accelerate](https://github.com/huggingface/accelerate), [Colossal-AI](https://github.com/hpcaitech/ColossalAI), [DeepSpeed](https://github.com/microsoft/DeepSpeed)
 
@@ -256,7 +256,7 @@ Our codebase efficiently trains models from 2B to 462B parameters across thousan
 **Benchmark Configuration:**
 
 - **Vocabulary size**: 131,072 tokens
-- **Sequence length**: 4096 tokens  
+- **Sequence length**: 4096 tokens
 - **Model scaling**: Varied hidden size, attention heads, and layers to achieve target parameter counts
 - **Communication optimizations**: Fine-grained overlapping with DP (`--overlap-grad-reduce`, `--overlap-param-gather`), TP (`--tp-comm-overlap`), and PP (enabled by default)
 

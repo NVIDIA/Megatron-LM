@@ -7,6 +7,7 @@ from contextlib import nullcontext
 import torch
 
 from megatron.core.enums import Fp4Recipe
+from megatron.core.fp8_utils import _get_custom_recipe
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -47,6 +48,28 @@ def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
     return HAVE_TE_FP4_TENSOR_CLASS and isinstance(tensor, FP4_TENSOR_CLASS)
 
 
+def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
+    """
+    Get the alignment size required for FP4 GEMM.
+    FP4 GEMM requires Blackwell and later architectures.
+
+    The value 32 is a hardware requirement: TMA (Tensor Memory Accelerator) requires
+    a 16-byte aligned address for efficient memory access. Since FP4 uses 4 bits per value,
+    16 bytes (128 bits) corresponds to 32 FP4 values. Therefore, the alignment size for FP4
+    is 32. With this alignment, NVFP4 GEMM can be performed efficiently.
+
+    Note that since we are also random hadamard transform for NVFP4 training, we want
+    fused group nvfp4 quantize plus hadamard transform. Hadamard transform will leverage
+    tensor core instructions for better performance, while group quantize kernels also
+    prefer a more aligned size in token dimension M. Therefore, we apply align size 64
+    here for better performance in MOE.
+
+    Paper link: https://arxiv.org/pdf/2509.25149
+    """
+    # pylint: disable=unused-argument
+    return 64
+
+
 def dequantize_fp4_tensor(fp4_tensor: torch.Tensor) -> torch.Tensor:
     """Dequantize a fp4 tensor to a higher precision tensor."""
     if is_te_min_version("2.7.0.dev0"):
@@ -70,9 +93,11 @@ if HAVE_TE:
                         Transformer Engine. Please make sure you are using TE version 
                         >= 2.7.0.dev0."""
                     )
+            elif config.fp4_recipe == Fp4Recipe.custom:
+                fp4_recipe = _get_custom_recipe(config.fp4_quantizer_factory)
             else:
                 raise ValueError(
-                    "NVFP4BlockScaling is the only supported FP4 recipe. "
+                    "NVFP4BlockScaling and custom are the only supported FP4 recipes. "
                     "Please make sure you are using a compatible TE version >= 2.7.0.dev0."
                 )
         else:

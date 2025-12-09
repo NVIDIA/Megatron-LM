@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}_{platforms}"
+  name: '{test_case}_{environment}_{platforms}'
   model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
@@ -48,7 +48,7 @@ spec:
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts/"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_$CLUSTER.json"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
@@ -104,7 +104,7 @@ products:
         scope: [nightly]
         platforms: [dgx_h100]
   #######################################################################
-  # MR tests: Mostly DEV on MR, and LTS on nightly cadence, except for  #
+  # mr, mr-github tests: Mostly DEV on mr, mr-github, and LTS on nightly cadence, except for  #
   #             some very important tests.                              #
   #######################################################################
   - test_case: [gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files]
@@ -114,10 +114,15 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer]
+  - test_case: [gpt3_mcore_te_tp1_pp1_dist_optimizer_fim_dataset]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github-broken]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
@@ -179,7 +184,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
@@ -235,21 +240,21 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_tunable_overlap]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_uneven_pipeline]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp2_account_for_embedding_loss_in_pipeline_split]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
@@ -270,55 +275,55 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_dp_last]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_dp_last]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_nondeterministic]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_nondeterministic_dp_last]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss_nondeterministic]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_nondeterministic_dp_last]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mcore_te_tp2_pp2_cross_entropy_loss_fusion]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
@@ -340,7 +345,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_mla]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective]
     products:
@@ -394,21 +399,21 @@ products:
   - test_case: [gpt3_mcore_tp2_pp2_uninstall_te]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_7b_tp1_pp4_memory_speed]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly] # OOM: #434
   - test_case: [gpt3_7b_tp4_pp1_memory_speed]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly] # OOM: #434
@@ -433,12 +438,12 @@ products:
   # - environment: [lts]
   #   scope: [nightly] # Requires PyT 2.4: #481
   #######################################################################
-  # Super important MR tests that run for both DEV and LTS per MR       #
+  # Super important mr, mr-github tests that run for both DEV and LTS per mr, mr-github       #
   #######################################################################
   - test_case: [gpt3_mcore_reruns_persistent_1]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr, mr-github-broken]
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly]
@@ -454,15 +459,12 @@ products:
       - environment: [lts]
         scope: [mr]
       - environment: [dev]
-        scope: [mr, mr-github]
-        platforms: [dgx_h100]
-      - environment: [dev]
-        scope: [mr-slim]
+        scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [mr]
@@ -471,10 +473,7 @@ products:
       - environment: [lts]
         scope: [mr]
       - environment: [dev]
-        scope: [mr, mr-github]
-        platforms: [dgx_h100]
-      - environment: [dev]
-        scope: [mr-slim]
+        scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone]
     products:

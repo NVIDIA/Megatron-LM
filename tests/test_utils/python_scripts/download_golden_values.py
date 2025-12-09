@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 import os
 import pathlib
@@ -91,8 +93,6 @@ def main(pipeline_id: int, only_failing: bool):
                 continue
 
             golden_values_source_name = golden_values_source.name
-            golden_values_source_name = golden_values_source_name.replace("_dgx_h100", "")
-            golden_values_source_name = golden_values_source_name.replace("_dgx_a100", "")
             golden_values_source_name = golden_values_source_name.replace(
                 "generations", "golden_values"
             )
