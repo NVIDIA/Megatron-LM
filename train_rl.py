@@ -193,8 +193,6 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         batch_data = next(data_iterator)
     timers('batch-generator').stop()
 
-    attention_mask = None
-
     if args.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
@@ -210,8 +208,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             seq_starts, 
             seq_lengths, 
             seq_indices,
-            packed_seq_params, 
-            packed_seq_len 
+            packed_seq_params
         ) = load_packed_data_by_index(bin_tensor.item())
 
         runtime_state = get_rl_runtime_state()
@@ -231,7 +228,6 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         seq_starts = None
         seq_lengths = None
         packed_seq_params = None
-        packed_seq_len = 0
 
         # Move to CUDA
         tokens = tokens.cuda()
@@ -263,9 +259,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
         logprobs_or_hidden_states = get_logprobs(
-            model_to_use, tokens, position_ids, attention_mask, no_grad=False,
-            packed_seq_params=packed_seq_params,
-            packed_seq_len=packed_seq_len
+            model_to_use, tokens, position_ids, no_grad=False,
+            packed_seq_params=packed_seq_params
         )
 
         if not is_pipeline_last_stage():
@@ -351,6 +346,17 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
+
+    ## VSCODE DEBUGGER INIT
+    if os.environ.get("VSCODE_DEBUG", "0") == "1" and int(os.environ["RANK"]) == 7:
+        import socket
+
+        import debugpy
+
+        debugpy.listen(("0.0.0.0", 5678))
+        print(">>>> RANK 7 IS WAITING FOR DEBUGGER...")
+        print(f"{socket.gethostbyname(socket.gethostname())}:5678")
+        debugpy.wait_for_client()
 
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
