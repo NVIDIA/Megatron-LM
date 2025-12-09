@@ -59,11 +59,13 @@ from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.qk_clip import clip_qk
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -90,6 +92,7 @@ from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -379,7 +382,8 @@ def num_floating_point_operations(args, num_total_tokens_this_GB, sequence_squar
                 )
             )
 
-        if args.linear_attention_type is not None:
+        linear_attention_variants = ["gated_delta_net"]
+        if args.experimental_attention_variant in linear_attention_variants:
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
@@ -404,7 +408,7 @@ def num_floating_point_operations(args, num_total_tokens_this_GB, sequence_squar
             num_linear_attention_layers = sum(linear_attention_pattern)
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if args.linear_attention_type == "gated_delta_net":
+            if args.experimental_attention_variant == "gated_delta_net":
                 # Calculate the FLOPs for the gated delta net attention.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
@@ -476,7 +480,7 @@ def num_floating_point_operations(args, num_total_tokens_this_GB, sequence_squar
             )
             +                
             # Self Attention
-            standard_self_attn_term
+            self_attn_term
             
         )
         return total_floating_point_operations
@@ -599,15 +603,15 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def get_no_wd_decay_cond(no_wd_decay_cond_type, default_skip_embedding_weight_decay):
+def get_no_weight_decay_cond(no_weight_decay_cond_type, default_skip_embedding_weight_decay):
     """Get the no weight decay condition function."""
 
-    # Default case: no_wd_decay_cond_type is None
-    no_wd_decay_cond_fn = None
+    # Default case: no_weight_decay_cond_type is None
+    no_weight_decay_cond_fn = None
 
-    if no_wd_decay_cond_type == 'qwen3_next':
+    if no_weight_decay_cond_type == 'apply_wd_to_qk_layernorm':
         # Qwen3-Next applies weight decay to qk layernorm as a special case
-        def qwen3_next_no_wd_decay_cond(name, param):
+        def apply_wd_to_qk_layernorm_fn(name, param):
             if "q_layernorm" in name or "k_layernorm" in name:
                 no_wd = False
             else:
@@ -617,11 +621,11 @@ def get_no_wd_decay_cond(no_wd_decay_cond_type, default_skip_embedding_weight_de
                     or (default_skip_embedding_weight_decay and "embedding" in name)
                 )
             return no_wd
-        no_wd_decay_cond_fn = qwen3_next_no_wd_decay_cond
-    elif no_wd_decay_cond_type is not None:
-        raise ValueError(f"Invalid no_wd_decay_cond_type: {no_wd_decay_cond_type}")
+        no_weight_decay_cond_fn = apply_wd_to_qk_layernorm_fn
+    elif no_weight_decay_cond_type is not None:
+        raise ValueError(f"Invalid no_weight_decay_cond_type: {no_weight_decay_cond_type}")
 
-    return no_wd_decay_cond_fn
+    return no_weight_decay_cond_fn
 
 def pretrain(
     train_valid_test_dataset_provider,
@@ -759,7 +763,7 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    no_wd_decay_cond = get_no_wd_decay_cond(
+    no_weight_decay_cond = get_no_weight_decay_cond(
         args.no_weight_decay_cond_type,
         default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
     )
@@ -767,7 +771,7 @@ def pretrain(
         model_provider,
         model_type,
         checkpointing_context=checkpointing_context,
-        no_wd_decay_cond=no_wd_decay_cond,
+        no_weight_decay_cond=no_weight_decay_cond,
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -958,6 +962,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args = get_args()
     args.model_type = model_type
 
+    if has_nvidia_modelopt:
+        from megatron.post_training.checkpointing import has_modelopt_state
+        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
+        # set a flag to use our model provider if so.
+        if args.load is not None and has_modelopt_state(args.load):
+            print_rank_0(f'ModelOpt checkpoint detected')
+            args.modelopt_enabled = True
+        elif getattr(args, "export_kd_teacher_load", None):
+            # For distillation ckpts without ModelOpt state
+            args.modelopt_enabled = True
+
+
     # Build model.
     def build_model():
         if (
@@ -1074,6 +1090,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             else:
                 kwargs['bucket_size'] = args.ddp_bucket_size
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
+            kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['average_in_collective'] = args.ddp_average_in_collective
             if args.use_megatron_fsdp and args.use_precision_aware_optimizer:
                 kwargs["preserve_fp32_weights"] = False
@@ -1173,7 +1190,7 @@ def get_optimizer_param_scheduler(optimizer):
 def setup_model_and_optimizer(
     model_provider_func,
     model_type,
-    no_wd_decay_cond=None,
+    no_weight_decay_cond=None,
     scale_lr_cond=None,
     lr_mult=1.0,
     checkpointing_context=None,
@@ -1182,17 +1199,6 @@ def setup_model_and_optimizer(
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
-
-    if has_nvidia_modelopt:
-        from megatron.post_training.checkpointing import has_modelopt_state
-        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
-        # set a flag to use our model provider if so.
-        if args.load is not None and has_modelopt_state(args.load):
-            print_rank_0(f'ModelOpt checkpoint detected')
-            args.modelopt_enabled = True
-        elif getattr(args, "export_kd_teacher_load", None):
-            # For distillation ckpts without ModelOpt state
-            args.modelopt_enabled = True
 
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
@@ -1209,7 +1215,7 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_optimizer(
             config,
             model,
-            no_wd_decay_cond,
+            no_weight_decay_cond,
             scale_lr_cond,
             lr_mult,
             use_gloo_process_groups=args.enable_gloo_process_groups,
@@ -1222,7 +1228,7 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_muon_optimizer(
             config,
             model,
-            no_wd_decay_cond,
+            no_weight_decay_cond,
             scale_lr_cond,
             lr_mult,
             use_gloo_process_groups=args.enable_gloo_process_groups,
@@ -1403,7 +1409,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, num_total_tokens_this_GB, sequence_square_sum_this_GB
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, num_total_tokens_this_GB, sequence_square_sum_this_GB, 0
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -1418,6 +1424,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    # get max attention logit for logging and run clip_qk()
+    # Part of MuonClip Optimizer step
+    log_max_attention_logit = 0
+    if args.qk_clip or args.log_max_attention_logit:
+        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+            
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -1475,10 +1488,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             exit_code,
             grad_norm,
             num_zeros_in_grad,
+            log_max_attention_logit,
             num_total_tokens_this_GB,
             sequence_square_sum_this_GB,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, num_total_tokens_this_GB, sequence_square_sum_this_GB
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit, num_total_tokens_this_GB, sequence_square_sum_this_GB
 
 
 def training_log(
@@ -1493,6 +1507,7 @@ def training_log(
     grad_norm,
     params_norm,
     num_zeros_in_grad,
+    max_attention_logit,
     num_total_tokens_this_GB,
     sequence_square_sum_this_GB,
 ):
@@ -1531,32 +1546,37 @@ def training_log(
     total_loss_dict[nan_iters_key] = total_loss_dict.get(nan_iters_key, 0) + int(got_nan)
 
     # Logging.
-    timers_to_log = [
-        'forward-backward',
-        'forward-compute',
-        'backward-compute',
-        'batch-generator',
-        'forward-recv',
-        'forward-send',
-        'backward-recv',
-        'backward-send',
-        'forward-send-forward-recv',
-        'forward-send-backward-recv',
-        'backward-send-forward-recv',
-        'backward-send-backward-recv',
-        'forward-backward-send-forward-backward-recv',
-        'layernorm-grads-all-reduce',
-        'embedding-grads-all-reduce',
-        'all-grads-sync',
-        'params-all-gather',
-        'optimizer-copy-to-main-grad',
-        'optimizer-unscale-and-check-inf',
-        'optimizer-clip-main-grad',
-        'optimizer-count-zeros',
-        'optimizer-inner-step',
-        'optimizer-copy-main-to-model-params',
-        'optimizer',
-    ]
+    timers_to_log = []
+    if args.timing_log_level >= 1:
+        timers_to_log.extend([
+            'forward-backward',
+            'layernorm-grads-all-reduce',
+            'embedding-grads-all-reduce',
+            'all-grads-sync',
+            'params-all-gather',
+            'optimizer-copy-to-main-grad',
+            'optimizer-unscale-and-check-inf',
+            'optimizer-clip-main-grad',
+            'optimizer-count-zeros',
+            'optimizer-inner-step',
+            'optimizer-copy-main-to-model-params',
+            'optimizer',
+        ])
+    if args.timing_log_level >= 2:
+        timers_to_log.extend([
+            'batch-generator',
+            'forward-compute',
+            'backward-compute',
+            'forward-recv',
+            'forward-send',
+            'backward-recv',
+            'backward-send',
+            'forward-send-forward-recv',
+            'forward-send-backward-recv',
+            'backward-send-forward-recv',
+            'backward-send-backward-recv',
+            'forward-backward-send-forward-backward-recv',
+        ])
     # Add timers from RL loop if needed.
     if getattr(args, 'perform_rl_step', False):
         timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
@@ -1652,6 +1672,10 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+        if args.log_max_attention_logit:
+            writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
+            if wandb_writer:
+                wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -1681,8 +1705,18 @@ def training_log(
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
+    # Track sparse attention indexer loss
+    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+        indexer_loss_scale = 1 / get_num_microbatches()
+        DSAIndexerLossLoggingHelper.track_indexer_metrics(
+            loss_scale=indexer_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
+        )
     if iteration % args.log_interval == 0:
-        if args.record_memory_history and is_last_rank():
+        if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
 
@@ -1771,7 +1805,9 @@ def training_log(
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
-            report_memory_flag = False
+            if iteration > 1:
+                # Make sure the memory after the second iteration is reported to include optimizer state memory.
+                report_memory_flag = False
         # Write timers to wandb, don't reset the counts
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
@@ -1899,6 +1935,7 @@ def post_training_step_callbacks(
     iteration,
     prof,
     num_floating_point_operations_since_last_log_event,
+    nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
@@ -1909,6 +1946,7 @@ def post_training_step_callbacks(
 
     # Straggler detector.
     if iteration % args.log_interval == 0 and args.log_straggler:
+        # Use FLOPs accumulated since last log event and then reset the counter
         stimer.report(num_floating_point_operations_since_last_log_event, args.log_interval)
         num_floating_point_operations_since_last_log_event = 0.0
 
@@ -1941,12 +1979,17 @@ def post_training_step_callbacks(
             assert prof is not None
             prof.stop()
         else:
-            torch.cuda.cudart().cudaProfilerStop()
+            torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
+            if nsys_nvtx_context is not None:
+                nsys_nvtx_context.__exit__(None, None, None)
 
     # Manual garbage collection.
     if args.manual_gc:
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
             gc.collect()
+
+    # Return updated FLOPs accumulator so caller can persist the reset
+    return num_floating_point_operations_since_last_log_event
 
 
 def checkpoint_and_decide_exit(
@@ -2070,7 +2113,8 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
-
+    
+        
     if getattr(args, 'perform_rl_step', False):
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
 
@@ -2239,7 +2283,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "local" and "full_iteration" in args.cuda_graph_scope:
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     def get_e2e_base_metrics():
@@ -2265,6 +2309,7 @@ def train(
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     prof = None
+    nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
         args.profile
         and torch.distributed.get_rank() in args.profile_ranks
@@ -2319,8 +2364,9 @@ def train(
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
-                torch.cuda.cudart().cudaProfilerStart()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
+                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
+                nsys_nvtx_context.__enter__()
 
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
@@ -2414,6 +2460,7 @@ def train(
             exit_code,
             grad_norm,
             num_zeros_in_grad,
+            max_attention_logit,
             num_total_tokens_this_GB, 
             sequence_square_sum_this_GB,
         ) = train_step(
@@ -2520,6 +2567,7 @@ def train(
             grad_norm,
             params_norm,
             num_zeros_in_grad,
+            max_attention_logit,
             num_total_tokens_this_GB, 
             sequence_square_sum_this_GB
         )
@@ -2563,14 +2611,16 @@ def train(
                 energy_monitor.resume()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
-        # Some of these only happen at specific iterations.
-        post_training_step_callbacks(
+        # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
+        # (it is reset inside the callback after logging).
+        num_floating_point_operations_since_last_log_event = post_training_step_callbacks(
             model,
             optimizer,
             opt_param_scheduler,
             iteration,
             prof,
             num_floating_point_operations_since_last_log_event,
+            nsys_nvtx_context,
         )
 
         # Checkpoint and decide whether to exit.
@@ -2585,6 +2635,10 @@ def train(
         )
         if should_exit:
             break
+
+    # Destroy CUDA Graphs.
+    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+        cuda_graph_helper.delete_cuda_graphs()
 
     one_logger_utils.track_e2e_metrics()
 
@@ -2659,7 +2713,7 @@ def evaluate(
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "local" and "full_iteration" in args.cuda_graph_scope:
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     if eval_iters is None:

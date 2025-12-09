@@ -115,12 +115,12 @@ fi
 if [[ $USE_MOCK_DATA -eq 1 ]]; then
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"file\",\"path\":\"path/to/file\"}'"
     if [[ $BATCH -eq 0 ]]; then
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} "
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} --tokenizer-type NullTokenizer --vocab-size 131072 "
     else
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1}' "
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1}' --tokenizer-type NullTokenizer --vocab-size 131072 "
     fi
 else
-    EXTRA_ARGS+=" --data-path ${DATA_TRAIN} "
+    EXTRA_ARGS+=" --data-path ${DATA_TRAIN} --tokenizer-model ${TOKENIZER} "
 fi
 
 if [[ $USE_FSDP -eq 1 ]]; then
@@ -143,7 +143,6 @@ OPTIONS=" \
     --use-distributed-optimizer \
     --disable-bias-linear \
     --sft-tokenizer-prompt-format nemotron-h-aligned \
-    --tokenizer-model ${TOKENIZER} \
     --transformer-impl transformer_engine \
     --normalization RMSNorm \
     --norm-epsilon 1e-06 \

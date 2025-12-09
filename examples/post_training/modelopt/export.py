@@ -13,10 +13,11 @@ import torch
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_provider import model_provider
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.training import get_args, get_model
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import unwrap_model
+from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
 
@@ -64,11 +65,11 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
 
-    # Materialize the model from meta device to cpu before loading the checkpoint. 
+    # Materialize the model from meta device to cpu before loading the checkpoint.
     unwrapped_model = unwrap_model(model)[0]
-    unwrapped_model.to_empty(device="cpu") 
+    unwrapped_model.to_empty(device="cpu")
 
     if args.load is not None:
         _ = load_modelopt_checkpoint(model)

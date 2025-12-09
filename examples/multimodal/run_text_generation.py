@@ -202,7 +202,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
         inference_engine = StaticInferenceEngine(
-            controller, max_batch_size=1, random_seed=args.seed
+            controller, max_batch_size=1, random_seed=args.seed, legacy=True
         )
         sampling_params = SamplingParams(
             temperature=config.temperature,

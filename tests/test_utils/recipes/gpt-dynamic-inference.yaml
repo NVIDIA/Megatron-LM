@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}_{platforms}"
+  name: '{test_case}_{environment}_{platforms}'
   model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
@@ -57,20 +57,20 @@ products:
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr-broken, mr-github] # Broken since: [Was PR1912][Dev] feat(moe): Fine-grained activation offloading (#1969)
+        scope: [mr-broken, mr-github-broken] # this test takes too long for github CI
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp8_pp1_583m_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_fp8_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_logitsmatch_decode_graphs_only]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]

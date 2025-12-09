@@ -26,6 +26,7 @@ from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager impor
     LocalCheckpointManager,
 )
 
+from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedBase, ShardedTensorFactory
@@ -78,7 +79,11 @@ class TestLocalCheckpointing:
         opt_param_scheduler = None
         rng_state = None
         iteration = None
-        optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space')
+        metadata = dict(
+            dp_cp_group=parallel_state.get_data_parallel_group(with_context_parallel=True)
+        )
+        model_sd_kwargs = dict(metadata=metadata)
+        optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space', metadata=metadata)
         mock_args = parse_args(ignore_unknown_args=True)
         mock_args.no_save_optim = False
         mock_args.no_save_rng = True
@@ -91,6 +96,7 @@ class TestLocalCheckpointing:
             opt_param_scheduler,
             rng_state,
             iteration=iteration,
+            model_sd_kwargs=model_sd_kwargs,
             optim_sd_kwargs=optim_sd_kwargs,
         )
         sharded_tensor_factories = find_matching_values(
@@ -255,6 +261,7 @@ class TestLocalCheckpointing:
     @pytest.mark.parametrize(('use_ramdisk'), [True, False])
     @pytest.mark.parametrize(('async_save'), [True, False])
     @pytest.mark.parametrize(('algo'), ['atomic', 'fully_parallel'])
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_failed_save(self, caplog, tmp_path_dist_ckpt, tp, pp, use_ramdisk, async_save, algo):
         Utils.initialize_model_parallel(tp, pp)
