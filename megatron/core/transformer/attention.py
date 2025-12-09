@@ -45,7 +45,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType
+from .enums import AttnMaskType, CudaGraphScope
 from .transformer_config import TransformerConfig
 
 try:
@@ -65,7 +65,7 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flash_attn_3.flash_attn_interface import _flash_attn_forward
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -190,6 +190,7 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
+        # TODO: This is built twice when using MLA, should be refactored.
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -238,12 +239,17 @@ class Attention(MegatronModule, ABC):
 
         if (
             HAVE_TE
-            and self.config.fp8
-            and self.config.fp8_recipe != 'delayed'
-            and is_te_min_version("2.6.0dev0")
             and isinstance(self.linear_proj, TELinear)
+            and (
+                (
+                    self.config.fp8
+                    and self.config.fp8_recipe != 'delayed'
+                    and is_te_min_version("2.6.0dev0")
+                )
+                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
+            )
         ):
-            # For fp8 training, the output of the fused core_attn is saved by itself, and
+            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
             # linear_proj also saves the quantized tensor of this output. Here we set the
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
@@ -823,7 +829,7 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and "full_iteration" not in self.config.cuda_graph_scope
+            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
@@ -1003,6 +1009,13 @@ class Attention(MegatronModule, ABC):
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
         raise NotImplementedError("set_for_recompute_input_layernorm is not implemented.")
+
+    def clip_qk(self):
+        """
+        QK Clipping is a technique to clip the query and key attention logits to prevent the
+        attention logits from exploding.
+        """
+        raise NotImplementedError("clip_qk is not implemented.")
 
 
 class SelfAttention(Attention):
@@ -1234,10 +1247,107 @@ class SelfAttention(Attention):
         self.linear_proj.backward_dw()
 
     def set_for_recompute_input_layernorm(self):
-        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
         set_save_original_input(self.linear_qkv)
+
+    def clip_qk(self):
+        """
+        QK Clipping is a technique to clip the query and key attention logits to prevent the
+        attention logits from exploding. This function is experimental on GQA.
+        """
+        if not self.config.qk_clip:
+            raise ValueError("qk_clip option needs to be enabled")
+
+        if self.core_attention.current_max_attn_logits is None:
+            raise ValueError("current_max_attn_logits is None")
+
+        assert self.core_attention.current_max_attn_logits.shape == (
+            self.num_attention_heads_per_partition,
+        ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
+                    but {self.core_attention.current_max_attn_logits.shape}"
+
+        grouped_max_attn_logits = torch.max(
+            self.core_attention.current_max_attn_logits.view(
+                self.num_query_groups_per_partition, -1
+            ),
+            dim=1,
+        ).values
+
+        # only update the weight if any head has
+        # current_max_attn_logits > qk_clip_threshold
+        if torch.any(grouped_max_attn_logits > self.config.qk_clip_threshold):
+            # Use num_query_groups_per_partition for tensor parallel scenarios
+
+            # qk_clip_balancing_eta (g, 1, 1)
+            assert grouped_max_attn_logits.shape == (
+                self.num_query_groups_per_partition,
+            ), f"current_max_attn_logits shape is not ({self.num_query_groups_per_partition},) \
+                but {grouped_max_attn_logits.shape}"
+            self.qk_clip_balancing_eta = torch.clamp(
+                self.config.qk_clip_threshold / grouped_max_attn_logits, max=1.0
+            ).view(self.num_query_groups_per_partition, 1, 1)
+            assert torch.all(self.qk_clip_balancing_eta <= 1.0)
+
+            # Handle different weight access patterns (main_param vs direct access)
+            if hasattr(self.linear_qkv.weight, 'main_param'):
+                self.linear_qkv.weight.main_param.data.copy_(
+                    self._clip_linear_qkv(self.linear_qkv.weight.main_param.data)
+                )
+
+            self.linear_qkv.weight.data.copy_(self._clip_linear_qkv(self.linear_qkv.weight.data))
+
+        # reset current_max_attn_logits
+        self.core_attention.current_max_attn_logits = None
+
+    def _clip_linear_qkv(self, weight):
+        """Apply qkclip to linear_qkv layer"""
+        # Reshape to (g, query_projection_size + 2 * kv_projection_size, -1)
+        weight_reshaped = weight.view(
+            self.num_query_groups_per_partition,
+            (self.query_projection_size + 2 * self.kv_projection_size)
+            // self.num_query_groups_per_partition,
+            -1,
+        )
+
+        # Split into query_projection_size and 2 * kv_projection_size parts:
+        # (n, a, -1) and (n, b, -1)
+        weight_q = weight_reshaped[
+            :, : self.query_projection_size // self.num_query_groups_per_partition, :
+        ]
+        weight_k = weight_reshaped[
+            :,
+            self.query_projection_size
+            // self.num_query_groups_per_partition : (
+                self.query_projection_size + self.kv_projection_size
+            )
+            // self.num_query_groups_per_partition,
+            :,
+        ]
+        weight_v = weight_reshaped[
+            :,
+            (self.query_projection_size + self.kv_projection_size)
+            // self.num_query_groups_per_partition :,
+            :,
+        ]
+
+        # extend the qk_clip_balancing_eta to the same shape as weight_q and weight_k
+        self.qk_clip_balancing_eta_extended = self.qk_clip_balancing_eta.repeat(
+            1, weight_q.size(1), 1
+        )
+
+        # Clipping
+        weight_q.mul_(torch.pow(self.qk_clip_balancing_eta_extended, self.config.qk_clip_alpha))
+        weight_k.mul_(torch.pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha))
+
+        # Concatenate back and reshape to original shape
+        weight_updated = torch.cat([weight_q, weight_k, weight_v], dim=1)
+        weight_updated = weight_updated.view(
+            self.query_projection_size + 2 * self.kv_projection_size, -1
+        )
+
+        return weight_updated
 
 
 class CrossAttention(Attention):

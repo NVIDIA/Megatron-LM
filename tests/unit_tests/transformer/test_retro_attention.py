@@ -196,6 +196,7 @@ class TestRetroAttention:
             config.hidden_size,
         )
 
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_gpu_forward(self):
         for recompute_granularity in (None, 'selective'):

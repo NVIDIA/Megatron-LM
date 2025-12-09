@@ -24,7 +24,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossAutoScaler,
     MTPLossLoggingHelper,
@@ -374,7 +374,7 @@ class GPTModel(LanguageModule):
             and (
                 (
                     self.config.cuda_graph_impl == "local"
-                    and "full_iteration" not in self.config.cuda_graph_scope
+                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
                 )
                 or self.config.flash_decode
             )
@@ -575,9 +575,19 @@ class GPTModel(LanguageModule):
                     runtime_gather_output=runtime_gather_output,
                 )
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
-                mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group)
+                mtp_labels, _ = roll_tensor(
+                    mtp_labels,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
                 loss_mask, num_tokens = roll_tensor(
-                    loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
+                    loss_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
                 )
                 mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
                 mtp_loss = loss_mask * mtp_loss
@@ -611,8 +621,6 @@ class GPTModel(LanguageModule):
                     # Perform the sequence parallel gather here instead of after the output layer
                     # because we need to slice the last token logits from the full view of the
                     # packed logits across all requests.
-                    # TODO(ksanthanam): Make the equivalent change in the `MambaModel` code after
-                    # merging in !3722.
                     hidden_states = gather_from_sequence_parallel_region(
                         hidden_states, group=self.pg_collection.tp
                     )
@@ -620,7 +628,7 @@ class GPTModel(LanguageModule):
                     sequence_parallel_override = True
 
                 # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
-                # state ([B, H]) → unsqueeze back to [1, B, H]
+                # state ([B, H]) → unsqueeze back to [B, 1, H]
                 # (so that the output layer, which expects S×B×H, receives only the final token)
                 hidden_states = inference_context.last_token_logits(
                     hidden_states.squeeze(1).unsqueeze(0)

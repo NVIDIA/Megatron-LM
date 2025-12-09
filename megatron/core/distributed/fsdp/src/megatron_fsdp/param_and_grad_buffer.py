@@ -1801,14 +1801,16 @@ class ParamAndGradBuffer:
             self.weight_alloc = FixedPoolAllocator(
                 name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
             )
-            # TODO(mxfp8): Do we need separate alloc for transpose buffer?
+            self.transpose_weight_alloc = FixedPoolAllocator(
+                name="fsdp_fp8_transpose_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+            )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
             )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
             self.weight_alloc = StorageResizeBasedBucketAllocator()
-            # TODO(mxfp8): Do we need separate alloc for transpose buffer?
+            self.transpose_weight_alloc = StorageResizeBasedBucketAllocator()
             self.main_grad_alloc = None
             self.double_buf_units = []
 
@@ -1902,8 +1904,7 @@ class ParamAndGradBuffer:
                         device=self.device,
                         data_parallel_group=main_buf_dp_group,
                         is_transpose_buffer=True,
-                        # TODO(mxfp8): Do we need separate alloc for transpose buffer?
-                        temporary_bucket_allocator=self.weight_alloc,
+                        temporary_bucket_allocator=self.transpose_weight_alloc,
                         bucket_id=group_id,
                         chunk_size_factor=group.chunk_size_factor,
                         mem_alloc_context=self.mem_alloc_context,
@@ -2232,6 +2233,9 @@ class ParamAndGradBuffer:
                 # before forward activations and gradients are allocated in training.
                 wbuf.free_bucket_storage()
 
+            if tbuf and tbuf.is_data_distributed:
+                tbuf.free_bucket_storage()
+
         # Allocate the main_weight buffer and main_grad buffer data in one buffer.
         if self.buffer_all_in_one:
             with self.mem_alloc_context():
@@ -2552,8 +2556,9 @@ class ParamAndGradBuffer:
                 item_id, only_shard=sharded_optimizer_state
             )
             if group.main_weight_buffer is not None:
-                # Convert the gradient to the main weight buffer dtype.
-                optimizer_grad = optimizer_grad.to(param.dtype)
+                if not getattr(self, "use_precision_aware_optimizer", False):
+                    # Convert the gradient to the main weight buffer dtype.
+                    optimizer_grad = optimizer_grad.to(param.dtype)
 
             if name not in self.dist_main_grad:
                 # Register the gradient as a distributed tensor.
@@ -2733,8 +2738,8 @@ class ParamAndGradBuffer:
         reduce_scatter_ops = []
         for g in self.parameter_groups:
             gbuf = g.main_grad_buffer
-            if gbuf is not None:
-                continue  # TODO(mxfp8): This is an error?
+            if gbuf is None:
+                continue
             scaling_factor = gbuf.gradient_scaling_factor
             reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
             reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
@@ -2873,6 +2878,9 @@ class GradReducePipeline:
             outer_fsdp_group_grad_reduce (bool, optional): Whether to reduce gradients
                 across outer-DP groups. Defaults to False.
         """
+        # Sort parameters by their bucket IDs to ensure a deterministic processing order.
+        # Performing reduce-scatter operations out of order can lead to hangs.
+        params = sorted(list(params), key=lambda x: self.buffer.param_to_param_group[x])
         for param in params:
             bucket_id = self.buffer.param_to_param_group[param]
             param_group = self.buffer.parameter_groups[bucket_id]
@@ -3473,16 +3481,17 @@ class AllGatherPipeline:
             buf = self.buffer.parameter_groups[bucket_id].transpose_weight_buffer
         else:
             buf = self.buffer.parameter_groups[bucket_id].model_weight_buffer
-        buf.free_bucket_storage()
 
+        buf.free_bucket_storage()
         self.bucket_status[bucket_key] = BucketStatus.EMPTY
 
     def recycle_unused_buckets(self):
         """Recycle the unused buckets."""
-        for (bucket_id, bwd), can_be_released in self.bucket_can_be_released.items():
+        for bucket_key, can_be_released in self.bucket_can_be_released.items():
             if can_be_released:
-                self.release_bucket(bucket_id, bwd)
-                self.bucket_can_be_released[(bucket_id, bwd)] = False
+                bucket_id, is_transpose_weight = bucket_key[0], bucket_key[1]
+                self.release_bucket(bucket_id, is_transpose_weight)
+                self.bucket_can_be_released[bucket_key] = False
 
     def get_fsdp_buffer(self, bucket_id: int, bwd=False) -> DataParallelBuffer:
         """Get the FSDP buffer with the given bucket ID."""
