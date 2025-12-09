@@ -158,10 +158,17 @@ def st_128(ptr, x, y, z, w, mask, multicast_op):
             pack=1,
         )
 
+
 @triton.jit
 def add_v8_bf16_from_u32(
-    a0, a1, a2, a3,  # First vector of 8 bf16s, packed in 4 uint32s
-    b0, b1, b2, b3,  # Second vector of 8 bf16s, packed in 4 uint32s
+    a0,
+    a1,
+    a2,
+    a3,  # First vector of 8 bf16s, packed in 4 uint32s
+    b0,
+    b1,
+    b2,
+    b3,  # Second vector of 8 bf16s, packed in 4 uint32s
 ):
     """
     Adds two vectors of 8 bfloat16 numbers.
@@ -185,7 +192,8 @@ def add_v8_bf16_from_u32(
         pack=1,
     )
 
-@triton.jit 
+
+@triton.jit
 def asm_rsqrt(x, eps):
     """
     Computes the reciprocal square root of a float32 number using inline assembly.

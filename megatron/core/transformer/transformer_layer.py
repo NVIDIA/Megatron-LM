@@ -507,7 +507,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            residual=residual 
+            residual=residual,
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -521,10 +521,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        using_fused_tp_communication_kernel = (not self.training) and (self.config.inference_fuse_tp_communication)
+        using_fused_tp_communication_kernel = (not self.training) and (
+            self.config.inference_fuse_tp_communication
+        )
         if using_fused_tp_communication_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout 
-            # The remaining residual add is already handled inside the 
+            # In inference optimized transformer layer, there is no bias and dropout
+            # The remaining residual add is already handled inside the
             # self attention module.
             hidden_states = attention_output_with_bias[0]
         else:
@@ -589,7 +591,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.config.mlp_chunks_for_prefill > 1
             and inference_context is not None
             and not inference_context.is_decode_only()
-            and not isinstance(self.mlp, IdentityOp) 
+            and not isinstance(self.mlp, IdentityOp)
             and not self.config.transformer_impl == "inference_optimized"
         )
 
@@ -637,10 +639,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        using_fused_tp_communication_kernel = (not self.training) and (self.config.inference_fuse_tp_communication)
+        using_fused_tp_communication_kernel = (not self.training) and (
+            self.config.inference_fuse_tp_communication
+        )
         if using_fused_tp_communication_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout 
-            # The remaining residual add is already handled inside the 
+            # In inference optimized transformer layer, there is no bias and dropout
+            # The remaining residual add is already handled inside the
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
         else:

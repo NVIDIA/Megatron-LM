@@ -986,7 +986,9 @@ class Attention(MegatronModule, ABC):
         # =================
 
         nvtx_range_push(suffix="linear_proj")
-        using_inference_optimized_layer = (not self.training) and (self.config.transformer_impl == "inference_optimized")
+        using_inference_optimized_layer = (not self.training) and (
+            self.config.transformer_impl == "inference_optimized"
+        )
         if using_inference_optimized_layer:
             output, bias = self.linear_proj(core_attn_out, residual)
         else:

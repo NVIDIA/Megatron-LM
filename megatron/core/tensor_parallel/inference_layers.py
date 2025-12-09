@@ -11,9 +11,9 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.inference.communication.torch_symm_triton import (
+    fused_multimem_rs_add_norm_ag,
     multimem_all_gather,
     multimem_reduce_scatter,
-    fused_multimem_rs_add_norm_ag,
 )
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer
@@ -91,8 +91,8 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
                 config.sequence_parallel
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
-        # Boolean to be toggled externally for skipping norm and all-gather. 
-        # This is used when enabling fused reduce-scatter + add + rms-norm + all-gather 
+        # Boolean to be toggled externally for skipping norm and all-gather.
+        # This is used when enabling fused reduce-scatter + add + rms-norm + all-gather
         # in tensor parallelism. In this case, the preceeding RowParallelLinear layer
         # has already applied the rms-norm and all-gather.
         self.skip_norm_and_all_gather = False
@@ -134,7 +134,6 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
             return x
 
-
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -142,22 +141,22 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         """
         # Necessary conditions to ensure we are executing the fused rs-add-rmsnorm-ag
         # in the preceeding RowParallelLinear layer.
-        # 1. skip_norm_and_all_gather is True 
-        # 2. tp_size > 1 
-        # 3. enough symmetric memory is available - if available it already has the output 
+        # 1. skip_norm_and_all_gather is True
+        # 2. tp_size > 1
+        # 3. enough symmetric memory is available - if available it already has the output
         symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
         is_in_fused_mode = (
-            self.skip_norm_and_all_gather and self.tp_size > 1 and
-            symm_mem_buffer["handle"] is not None
+            self.skip_norm_and_all_gather
+            and self.tp_size > 1
+            and symm_mem_buffer["handle"] is not None
         )
         if is_in_fused_mode:
             x = symm_mem_buffer["tensor"]
         else:
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = self._all_gather(x, symm_mem_buffer)
-        
+
         x = torch.matmul(x, self.weight.t())
-     
 
         return x, None
 
@@ -204,8 +203,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             assert (
                 config.sequence_parallel
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
-        
-        # Placeholder for next layer norm weights for fused 
+
+        # Placeholder for next layer norm weights for fused
         # reduce-scatter + add + rms-norm + all-gather
         self.next_layer_norm_weights = None
         self.config = config
@@ -242,21 +241,22 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
                 multimem_reduce_scatter(output, x, symm_mem_buffer["handle"])
                 return output
-            else: 
+            else:
                 assert residual is not None
                 fused_multimem_rs_add_norm_ag(
-                                            residual,
-                                            symm_mem_buffer["tensor"],
-                                            symm_mem_buffer["handle"],
-                                            residual,
-                                            self.next_layer_norm_weights,
-                                            self.config.layernorm_epsilon)
-                # 1. Residual has the output of the reduce-scatter + residual add 
-                #    Care must be taken in the model definition, so as to not apply the 
-                #    residual again. 
-                # 2. The output of the full reduce-scatter + add + rms-norm + all-gather is 
+                    residual,
+                    symm_mem_buffer["tensor"],
+                    symm_mem_buffer["handle"],
+                    residual,
+                    self.next_layer_norm_weights,
+                    self.config.layernorm_epsilon,
+                )
+                # 1. Residual has the output of the reduce-scatter + residual add
+                #    Care must be taken in the model definition, so as to not apply the
+                #    residual again.
+                # 2. The output of the full reduce-scatter + add + rms-norm + all-gather is
                 #    written into symm_mem_buffer["tensor"] and will be accessible there.
-                return residual 
+                return residual
         else:
             # revert to torch dist (NCCL) reduce-scatter
             x = torch.matmul(x, self.weight.t())
@@ -264,7 +264,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         return x
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor]=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass.
         """
