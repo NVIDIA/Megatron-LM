@@ -50,7 +50,7 @@ class SamplingParams:
             assert (
                 self.skip_prompt_log_probs
             ), "return_prompt_top_n_logprobs requires skip_prompt_log_probs to be False"
-        if self.top_n_logprobs > 0:
+        if self.return_log_probs:
             self.return_prompt_top_n_logprobs = not self.skip_prompt_log_probs
         else:
             self.return_prompt_top_n_logprobs = False
