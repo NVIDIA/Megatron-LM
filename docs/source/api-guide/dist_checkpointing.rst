@@ -59,7 +59,7 @@ Workflow for Changing Model Parallelism
 
 You can combine formats to optimize both flexibility and performance:
 
-   1. Train using dp_reshardable (default) for faster checkpointing.
+   1. Train using ``dp_reshardable`` (default) for faster checkpointing.
    2. When you need to change model parallelism:
 
       - Stop training.
