@@ -43,6 +43,8 @@ from megatron.core.inference.utils import Counter, await_process_event
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import get_asyncio_loop, internal_api, trace_async_exceptions
 
+from .async_zmq_barrier import AsyncZMQBarrier
+
 try:
     from tqdm import tqdm
 
@@ -464,6 +466,16 @@ class DynamicInferenceEngine(AbstractEngine):
         ]
 
         torch.distributed.barrier(mp_group)
+
+        # initialize ep barrier 
+        self.ep_rank = parallel_state.get_expert_model_parallel_rank() 
+        self.ep_world_size = parallel_state.get_expert_model_parallel_world_size()
+        # todo: modify to use actual IP of ep-rank 0....
+        # todo: modify to find an empty port automatically... 
+        if self.ep_world_size > 1:
+            self.expert_parallel_async_barrier = AsyncZMQBarrier(self.zmq_context,
+                                                                 rank=self.ep_rank,
+                                                                 world_size=self.ep_world_size)
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
@@ -1385,7 +1397,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.received_pause = False
             elif header == Headers.STOP_ACK:
                 self.stopped.set()
-                self.stop()
+                self.received_stop = False
             elif header == Headers.UNPAUSE:
                 self.paused.clear()
                 self.running.set()
@@ -1439,7 +1451,7 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    def _ep_group_has_work(self, local_work: int) -> bool:
+    async def _ep_group_has_work(self, local_work: int) -> bool:
         """Determines if there are some pending requests in the expert parallel group this
         rank is a part of.
         Args:
@@ -1465,16 +1477,7 @@ class DynamicInferenceEngine(AbstractEngine):
             local_work = 0
 
         if parallel_state.get_expert_model_parallel_world_size() > 1:
-            expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
-            # all reduce local work across expert model parallel group
-
-            local_work_tensor = torch.tensor([local_work], device=torch.cuda.current_device())
-            torch.distributed.all_reduce(
-                local_work_tensor,
-                op=torch.distributed.ReduceOp.MAX,
-                group=expert_model_parallel_group,
-            )
-            max_global_work = local_work_tensor.item()
+            max_global_work = await self.expert_parallel_async_barrier.all_reduce_max(local_work)
         else:
             max_global_work = local_work
 
@@ -1491,8 +1494,6 @@ class DynamicInferenceEngine(AbstractEngine):
         try:
             while True:
                 self.schedule_requests()
-                if self.stopped.is_set():
-                    break
 
                 # for the cases below (no active requests, or undergoing a state-change)
                 # do not use asyncio.sleep(0)
@@ -1507,8 +1508,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 pending_requests = self.context.get_active_request_count() + len(
                     self.waiting_request_ids
                 )
-                ep_group_has_work = self._ep_group_has_work(pending_requests)
+                # 1. Check for work availability (Consensus Step)
+                ep_group_has_work = await self._ep_group_has_work(pending_requests)
 
+                # 2. Dummy Work Logic (Keep group alive if peers have work)
                 if ep_group_has_work and pending_requests == 0:
                     # run dummy forward pass if EP group as a whole has work,
                     # but this rank does not have any work.
@@ -1517,27 +1520,28 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
-                # (not ep_group has_work) - only process pause/stop when
-                # all ranks in EP group have received the signal.
-                if (not ep_group_has_work) and (
-                    self.paused.is_set() or self.received_pause or self.received_stop
-                ):
-                    await asyncio.sleep(0.02)
-                    continue
 
-                # Suspend, resume.
-                if (not ep_group_has_work) and self.suspend_signal:
-                    self.suspend()
-                    await asyncio.sleep(0.02)
-                    continue
-                else:
-                    self.resume()
+                # 3. NO WORK IN EP GROUP - Processing Control Signals
+                if not ep_group_has_work:
+                    # Priority A: STOP
+                    # If we have received a stop signal AND the group agrees (ep_group_has_work is False),
+                    # we must break the loop to exit.
+                    if self.stopped.is_set():
+                        # Optional: Log graceful shutdown
+                        if verbose and self.rank == 0:
+                            logging.info("Stopping engine.")
+                        break
 
-                # No requests.
-                if not pending_requests:
-                    await asyncio.sleep(0.02)
-                    continue
+                    # Priority B: SUSPEND
+                    if self.suspend_signal:
+                        self.suspend()
+                    else:
+                        self.resume()
+                  
 
+                    await asyncio.sleep(0.02)  # Yield to event loop
+                    continue
+                # 4. Actual Step
                 await self.async_step(verbose=verbose)
 
         except asyncio.CancelledError:
