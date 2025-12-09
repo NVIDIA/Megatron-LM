@@ -29,6 +29,36 @@ you can fix it by explicitly allow-listing the missing class in your script:
 
    torch.serialization.add_safe_globals([argparse.Namespace])
 
+Checkpointing Distributed Optimizer
+-----------------------------------
+
+**Checkpoint Compatibility and Optimizer State Formats**
+Beginning with mcore v0.14, the flattened_range attribute was removed from dist_checkpointing. As a result:
+- Optimizer states saved with mcore versions < 0.14 are no longer loadable.
+Loading these legacy optimizer states is not supported because the required sharded metadata is no longer available.
+- Model weights from older checkpoints remain fully compatible.
+No additional work is required—model weights from checkpoints produced by earlier versions are loaded automatically.
+
+**Distributed Optimizer Checkpoint Formats**
+The refactor of the Distributed Optimizer introduces **two checkpoint formats**:
+- dp_reshardable (Default)
+   - Fast save/load performance.
+   - Not reshardable — not possible to change model parallelism when using this format.
+   - Recommended for general training when model parallelism changes are not needed.
+- fully_reshardable
+   - Fully reshardable — supports arbitrary changes in model parallelism.
+   - Slower than dp_reshardable.
+   - Enabled via the `--dist-ckpt-optim-fully-reshardable` flag.
+
+**Workflow for Changing Model Parallelism**
+You can combine formats to optimize both flexibility and performance:
+   1. Train using dp_reshardable (default) for faster checkpointing.
+   2. When you need to change model parallelism:
+      - Stop training.
+      - Change model parallelism for train config.
+      - Resume training with `--dist-ckpt-optim-fully-reshardable`.
+   3. Save at least one checkpoint under the new model parallel configuration.
+   4. (Optional) To continue the training with updated model parallelism and better checkpointing performance, stop training and switch back to `dp_reshardable` format by removing `--dist-ckpt-optim-fully-reshardable`.
 
 Subpackages
 -----------
