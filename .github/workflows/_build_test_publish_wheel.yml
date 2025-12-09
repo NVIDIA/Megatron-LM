@@ -1,5 +1,21 @@
 on:
   workflow_call:
+    inputs:
+      ref:
+        required: false
+        description: Ref (SHA or branch) to release
+        type: string
+        default: ${{ github.sha }}
+      dry-run:
+        required: false
+        description: Upload to PyPy Test instance
+        type: boolean
+        default: true
+      no-publish:
+        required: false
+        description: Do not publish the wheel
+        type: boolean
+        default: true
     secrets:
       TWINE_USERNAME:
         required: true
@@ -26,16 +42,17 @@ jobs:
       PACKAGE: ${{ matrix.PACKAGE }}
       IMAGE: ${{ matrix.IMAGE }}
       PLATFORM: ${{ matrix.PLATFORM }}
+      PUBLISH_DRYRUN: ${{ inputs.dry-run }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Build wheel
         id: build-wheel
         run: |
           set -x
-
-          PUBLISH_DRYRUN=yes
 
           if [ "$PACKAGE" = "megatron-core" ]; then
             ROOTDIR="megatron/core"
@@ -48,7 +65,7 @@ jobs:
             exit 1
           fi
 
-          if [ "$PUBLISH_DRYRUN" = "yes" ]; then
+          if [ "$PUBLISH_DRYRUN" = "true" ]; then
             PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" $ROOTDIR/package_info.py)
             sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" $ROOTDIR/package_info.py
           fi
@@ -123,26 +140,31 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}
+          name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
           path: dist/
 
   publish-wheels:
     needs: [build-and-test-wheels]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: inputs.no-publish == false
     environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'main' || 'public' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - PACKAGE: megatron_core
-          - PACKAGE: megatron_fsdp
+          - PACKAGE: megatron-core
+            PLATFORM: arm64
+          - PACKAGE: megatron-core
+            PLATFORM: amd64
+          - PACKAGE: megatron-fsdp
+            IMAGE: quay.io/pypa/manylinux_2_28_x86_64
     env:
       PACKAGE: ${{ matrix.PACKAGE }}
     steps:
       - name: Download wheels
         uses: actions/download-artifact@v4
         with:
+          name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
           path: dist/
           merge-multiple: true
 

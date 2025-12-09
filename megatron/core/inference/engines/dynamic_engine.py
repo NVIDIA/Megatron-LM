@@ -24,7 +24,6 @@ from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
-    WarmupEngineMode,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
@@ -259,68 +258,47 @@ class DynamicInferenceEngine(AbstractEngine):
         config = controller.inference_wrapped_model.inference_wrapper_config
         moe_pad_experts = config.moe_pad_experts_for_cuda_graph_inference
 
-        if moe_pad_experts and context.non_decode_cuda_graphs:
-            context.non_decode_cuda_graphs = False
-            if self.rank == 0:
+        if moe_pad_experts:
+            filtered_cuda_graph_batch_dimensions_list = []
+            for config in context.cuda_graph_batch_dimensions_list:
+                if config.prefill_req_count == 0:
+                    filtered_cuda_graph_batch_dimensions_list.append(config)
+            if len(filtered_cuda_graph_batch_dimensions_list) != len(
+                context.cuda_graph_batch_dimensions_list
+            ):
                 warnings.warn(
                     "MoE models do not support non-decode cuda graphs. "
                     "Forcing non_decode_cuda_graphs to False."
                 )
+            context.cuda_graph_batch_dimensions_list = filtered_cuda_graph_batch_dimensions_list
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
-        logging.info(
-            "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s.",
-            len(context.cuda_graph_token_counts),
-            context.cuda_graph_token_counts,
-        )
-        for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
-            # Check whether to skip non-decode graphs.
-            if (
-                warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                and not context.non_decode_cuda_graphs
-            ):
-                continue
+        logging.info("> dynamic_engine.py: building cuda graphs for ")
+        for graph in context.cuda_graph_batch_dimensions_list:
+            logging.info(graph)
 
-            tbar = enumerate(context.cuda_graph_token_counts)
+        tbar = enumerate(context.cuda_graph_batch_dimensions_list)
+        if HAVE_TQDM:
+            tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
+        for tbar_idx, cuda_graph_batch_dimension in tbar:
+            input_ids, position_ids = self.controller._dynamic_step_context_init(
+                construct_graph_dimensions=cuda_graph_batch_dimension
+            )
+            # Progress.
+            tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}"
             if HAVE_TQDM:
-                tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
-
-            # Iterate cuda graph dims.
-            for tbar_idx, cuda_graph_token_count in tbar:
-                if (
-                    cuda_graph_token_count == 1
-                    and warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                ):
-                    # This case is not supported`` as we require atleast two
-                    # tokens for a non-decode engine step.
-                    continue
-
-                # Initialize context.
-                input_ids, position_ids = self.controller._dynamic_step_context_init(
-                    num_warmup_tokens=cuda_graph_token_count, warmup_engine_mode=warmup_engine_mode
+                tbar.set_description(tbar_str)
+            else:
+                logging.info(
+                    f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
                 )
 
-                # Initialize attention state.
-                assert (
-                    cuda_graph_token_count == context.padded_active_token_count
-                ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
+            # Forward pass -> logits.
+            controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-                # Progress.
-                mode_str = warmup_engine_mode.name.lower()
-                tbar_str = f"cuda graph warmup - {mode_str}, d {cuda_graph_token_count}"
-                if HAVE_TQDM:
-                    tbar.set_description(tbar_str)
-                else:
-                    logging.info(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
-
-                # Forward pass -> logits.
-                controller._dynamic_step_forward_logits(input_ids, position_ids)
-
-                if reset_context:
-                    with torch.inference_mode():
-                        context.reset()  # todo: @lmcafee, remove if unnecessary.
+            context.reset()
 
         # Memory usage.
         time_end = time.time()
@@ -587,7 +565,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.requests[request_id].record.suspend(self.controller.tokenizer)
+            self.requests[request_id].record.suspend()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -687,6 +665,14 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate is None
             or request.sampling_params.num_tokens_total is None
         )
+        if request.sampling_params.return_prompt_top_n_logprobs:
+            assert (
+                request.sampling_params.return_log_probs
+            ), "return_prompt_top_n_logprobs requires sampling_params.return_log_probs to be True"
+        if request.sampling_params.top_n_logprobs > 0:
+            assert (
+                request.sampling_params.return_log_probs
+            ), "top_n_logprobs requires sampling_params.return_log_probs to be True"
         if request.sampling_params.num_tokens_total is not None:
             request.sampling_params.num_tokens_to_generate = (
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)
@@ -785,6 +771,7 @@ class DynamicInferenceEngine(AbstractEngine):
         step_time: float,
         sample: torch.Tensor,
         log_probs: torch.Tensor,
+        top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -795,6 +782,8 @@ class DynamicInferenceEngine(AbstractEngine):
             step_time (float): The latency of the last step
             sample: (torch.Tensor): The newly generated tokens for each request
             log_probs: (List): Log probs for each request
+            top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
+                list of (top_n_logprobs, top_n_indices) tuples.
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -806,8 +795,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
-        for request_id, token, request_log_probs in zip(
-            request_ids.tolist(), sample.tolist(), log_probs_iter
+        for req_idx, (request_id, token, request_log_probs) in enumerate(
+            zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
         ):
             request: DynamicInferenceRequest = self.get_request(request_id)
             if request_id != self.context.chunked_prefill_request_id:
@@ -816,43 +805,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.tpot = []
                 request.tpot.append(step_time)
 
-                if request_log_probs is not None:
-                    if not request.prompt_log_probs:
-                        request.prompt_log_probs = []
-                    if not request.generated_log_probs:
-                        request.generated_log_probs = []
-                    # If the request log probs span > 1 token we are in prefill
-                    if len(request_log_probs) > 1:
-                        request.prompt_log_probs.extend(request_log_probs)
-                    else:
-                        if (
-                            # If it is a chunked prefill request
-                            len(request.prompt_log_probs) > 0
-                            # And we are missing the last token for prefill
-                            and len(request.prompt_log_probs) < len(request.prompt_tokens)
-                            # And we need to track full prefill
-                            and not self.context.materialize_only_last_token_logits
-                        ):
-                            assert (
-                                len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
-                            ), "Prompt log probs length is not equal to prompt tokens length - 1"
-                            request.prompt_log_probs.extend(request_log_probs)
-                        else:
-                            request.generated_log_probs.extend(request_log_probs)
-
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
-                    if finished_request.prompt is None:
-                        finished_request.prompt = self.controller.tokenizer.detokenize(
-                            finished_request.prompt_tokens.tolist()
-                        )
                     finished_request.generated_length = len(finished_request.generated_tokens)
-                    finished_request.generated_text = self.controller.tokenizer.detokenize(
-                        finished_request.generated_tokens
-                    )
                     finished_request_records.append(finished_entry.record)
                     finished_entry.future.set_result(finished_entry.record)
                 else:
@@ -861,20 +819,85 @@ class DynamicInferenceEngine(AbstractEngine):
                 # The chunked prefill produces useless tokens
                 # so we are not appending them to the generated tokens.
                 # Additionally, chunked prefill request do not finish.
-                # However, the log probs are still needed.
-                if request_log_probs is not None:
-                    if self.context.materialize_only_last_token_logits:
-                        # Here we discard intermediate log probs
-                        # as we only materialize the last token log probs
-                        request.prompt_log_probs = []
-                        request.generated_log_probs = []
+                active_request_ids.append(request_id)
+
+            # Process log_probs if available (unified for both regular and chunked prefill)
+            if request_log_probs is not None:
+                # Initialize lists if they don't exist
+                if not request.prompt_log_probs:
+                    request.prompt_log_probs = []
+                if not request.generated_log_probs:
+                    request.generated_log_probs = []
+
+                # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
+                if (
+                    request_id == self.context.chunked_prefill_request_id
+                    and self.context.materialize_only_last_token_logits
+                ):
+                    request.prompt_log_probs = []
+                    request.generated_log_probs = []
+                else:
+                    prompt_length = len(request.prompt_tokens)
+                    total_accumulated = len(request.prompt_log_probs) + len(
+                        request.generated_log_probs
+                    )
+
+                    # Handle skip_prompt_log_probs during prefill
+                    # If skip_prompt_log_probs is True and we have multiple log probs (prefill),
+                    # only process the last one (first generated token)
+                    if request.sampling_params.skip_prompt_log_probs and len(request_log_probs) > 1:
+                        # Only append the last log prob (first generated token) to generated_log_probs
+                        request.generated_log_probs.append(request_log_probs[-1])
                     else:
-                        # Otherwise, we gather log probs for all tokens
-                        if not request.prompt_log_probs:
-                            request.prompt_log_probs = []
-                        request.prompt_log_probs.extend(request_log_probs)
-                        request.generated_log_probs = []
-                    active_request_ids.append(request_id)
+                        # Vectorized approach: calculate split point and use list slicing
+                        if not request.sampling_params.skip_prompt_log_probs:
+                            # Calculate how many log probs go to prompt vs generated
+                            remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                            split_idx = min(remaining_prompt_slots, len(request_log_probs))
+
+                            # Batch extend instead of individual appends
+                            if split_idx > 0:
+                                request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                            if split_idx < len(request_log_probs):
+                                request.generated_log_probs.extend(request_log_probs[split_idx:])
+                        else:
+                            # All log probs go to generated
+                            request.generated_log_probs.extend(request_log_probs)
+
+            # Process top_n_logprobs if available (unified for both regular and chunked prefill)
+            if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                # Initialize lists if they don't exist
+                if request.prompt_top_n_logprobs is None:
+                    request.prompt_top_n_logprobs = []
+                if request.generated_top_n_logprobs is None:
+                    request.generated_top_n_logprobs = []
+
+                top_n_data_list = top_n_logprobs[req_idx]
+                prompt_length = len(request.prompt_tokens)
+
+                # Process each token's top-n logprobs
+                for top_n_values, top_n_indices in top_n_data_list:
+                    logit_dict = {}
+                    for logprob, logprob_index in zip(
+                        top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()
+                    ):
+                        key = self.controller.tokenizer.detokenize([logprob_index])
+                        logit_dict[key] = logprob
+
+                    # Simple decision: check total count accumulated so far
+                    total_accumulated = len(request.prompt_top_n_logprobs) + len(
+                        request.generated_top_n_logprobs
+                    )
+
+                    # If skip_prompt_log_probs is False and we haven't reached prompt end,
+                    # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
+                    if (
+                        not request.sampling_params.skip_prompt_log_probs
+                        and total_accumulated < prompt_length - 1
+                    ):
+                        request.prompt_top_n_logprobs.append(logit_dict)
+                    else:
+                        request.generated_top_n_logprobs.append(logit_dict)
 
         return active_request_ids, finished_request_records
 
@@ -1059,12 +1082,14 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         # Increment finished_request_count.
         cuda_graph_request_count = None
+
         if step_result is not None:
             active_request_ids = step_result["active_request_ids"]
             newly_paused_request_ids = step_result["newly_paused_request_ids"]
             finished_request_ids = step_result["finished_request_ids"]
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
+            top_n_logprobs = step_result.get("top_n_logprobs", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -1074,10 +1099,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Mark requests finished.
             [self.get_request(i).add_event_finish() for i in finished_request_ids.tolist()]
-
             # Add finished events.
-            active_request_ids, finished_request_records = self.post_process_requests(
-                active_request_ids, finished_request_ids, step_time, sample, log_probs
+            (active_request_ids, finished_request_records) = self.post_process_requests(
+                active_request_ids,
+                finished_request_ids,
+                step_time,
+                sample,
+                log_probs,
+                top_n_logprobs,
             )
 
         else:
@@ -1093,6 +1122,18 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
+
+        # Detokenize all finished requests (critical for InferenceClient, which
+        # doesn't necessarily have the tokenizer).
+        for record in finished_request_records:
+            for request in record.requests:
+                if request.prompt is None:
+                    request.prompt = self.controller.tokenizer.detokenize(
+                        request.prompt_tokens.tolist()
+                    )
+                request.generated_text = self.controller.tokenizer.detokenize(
+                    request.generated_tokens
+                )
 
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
@@ -1143,17 +1184,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     datetime.now().strftime("%H:%M:%S"),
                     step_time,
                     (
-                        " [%s + cuda graph %s]"
+                        " [%s + real config %s + cuda graph %s]"
                         % (
                             step_type,
+                            self.context.batch_dimensions,
                             (
-                                "DIM %d:%d"
-                                % (
-                                    context_state["padded_active_token_count"],
-                                    context_state["active_token_count"],
-                                )
-                                if context_state["using_cuda_graph_this_step"]
-                                else "OFF"
+                                "OFF"
+                                if not self.context.using_cuda_graph_this_step()
+                                else self.context.padded_batch_dimensions
                             ),
                         )
                     ),

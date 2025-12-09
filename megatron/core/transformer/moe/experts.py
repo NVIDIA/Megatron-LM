@@ -118,6 +118,9 @@ class GroupedMLP(MegatronModule):
         assert (
             config.add_bias_linear == False
         ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
+        assert (
+            config.moe_latent_size is None
+        ), "MoE latent projection not supported in GroupedMLP yet."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
@@ -778,7 +781,7 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.num_local_experts,
-            self.input_size,
+            self.input_size if self.config.moe_latent_size is None else self.config.moe_latent_size,
             ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,
@@ -799,7 +802,11 @@ class TEGroupedMLP(MegatronModule):
             submodules.linear_fc2,
             self.num_local_experts,
             self.config.moe_ffn_hidden_size,
-            self.config.hidden_size,
+            (
+                self.config.hidden_size
+                if self.config.moe_latent_size is None
+                else self.config.moe_latent_size
+            ),
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,

@@ -152,7 +152,7 @@ async def main(
             throughputs = []
 
             for record in results:
-                req = record.merge(engine.controller.tokenizer)
+                req = record.merge()
                 result_dict = {
                     "input_prompt": req.prompt,
                     "generated_text": req.generated_text.replace("\n", "\\n"),
@@ -173,7 +173,7 @@ async def main(
             print("Results:")
             unique_prompt_map = defaultdict(list)
             for record in results:
-                req = record.merge(engine.controller.tokenizer)
+                req = record.merge()
                 unique_prompt_map[req.prompt].append(req)
             for idx, (prompt_text, reqs) in enumerate(unique_prompt_map.items()):
                 print(f"%d/%d. prompt '%s' ... [%d] output '%s'." % (
@@ -200,10 +200,6 @@ if __name__ == "__main__":
             extra_args_provider=add_dynamic_inference_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
-
-        # Start Nsight profiler.
-        if os.environ.get("NSIGHT_PREFIX"):
-            torch.cuda.cudart().cudaProfilerStart()
 
         args = get_args()
         tokenizer = get_tokenizer()
@@ -251,6 +247,10 @@ if __name__ == "__main__":
             print(setup_prefix)
             print("~~~")
 
+        # Start Nsight profiler.
+        if os.environ.get("NSIGHT_PREFIX"):
+            torch.cuda.cudart().cudaProfilerStart()
+
         asyncio.run(
             main(
                 engine,
@@ -258,3 +258,7 @@ if __name__ == "__main__":
                 args.inference_coordinator_port,
             )
         )
+
+        # Stop Nsight profiler.
+        if os.environ.get("NSIGHT_PREFIX"):
+            torch.cuda.cudart().cudaProfilerStop()
