@@ -871,6 +871,14 @@ class _NullTokenizer(MegatronLegacyTokenizer):
     def additional_special_tokens_ids(self):
         return None
 
+    @property
+    def force_eod(self):
+        """To force an EOD at the end of every data sample in SFT."""
+        return True
+    
+    @property
+    def pad(self):
+        return self._eod_id - 1
 
 class _NullMultimodalTokenizer(MegatronLegacyTokenizer):
     def __init__(self, vocab_size, image_token=None, image_token_id=None):

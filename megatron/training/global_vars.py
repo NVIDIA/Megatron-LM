@@ -10,6 +10,7 @@ from megatron.core import Timers
 from megatron.core.gpu_timers import GPUTimer
 from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
+from megatron.core.jit import disable_jit_fuser
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
 from megatron.training import dist_signal_handler
 from megatron.training.tokenizer import build_tokenizer
@@ -120,6 +121,9 @@ def set_global_variables(args, build_tokenizer=True):
 
     if args.exit_signal_handler:
         _set_signal_handler()
+
+    if args.disable_jit_fuser:
+        disable_jit_fuser()
 
 
 def unset_global_variables():

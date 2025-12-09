@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 
 import pytest
@@ -401,3 +402,39 @@ class TestLayerWiseOptimizer:
         This will be insufficient when world size > 2.
         """
         self._run_parameter_update_test(model_class=TinyModel)
+
+    def test_broadcast_vs_allgather(self):
+        """Test LayerWiseDistributedOptimizer allgather code agains broadcast code."""
+        model, optimizer, pg_collection = self.create_model_and_optimizer(model_class=SimpleModel)
+
+        # Create reference model and optimizer using the same function
+        reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
+            model_class=SimpleModel, copy_from=model
+        )
+
+        # Set same gradients on both models
+        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
+            assert torch.equal(param.data, ref_param.data)
+            torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
+            grad_value = torch.randn_like(param)
+            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+            param.main_grad = grad_value.clone().detach()
+            ref_param.main_grad = grad_value.clone().detach()
+
+        optimizer.step()
+
+        # Verify at least some parameters were updated
+        params_updated = 0
+        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
+            if not torch.equal(param.data, ref_param.data):
+                params_updated += 1
+
+        assert params_updated > 0, "At least some parameters should be updated"
+
+        # step() internal call allgather_params. replace reference object with bcast
+        reference_optimizer.allgather_params = reference_optimizer.broadcast_params
+        reference_optimizer.step()
+
+        # Verify updated values match reference optimizer
+        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
+            torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)

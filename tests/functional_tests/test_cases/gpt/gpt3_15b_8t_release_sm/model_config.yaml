@@ -23,7 +23,7 @@ MODEL_ARGS:
   --micro-batch-size: 4
   --rampup-batch-size: "[384 384 97656250]"
   --global-batch-size: 1152
-  --train-samples: 4882812
+  --train-samples: 19531250
   --manual-gc: true
   # Transformer Engine args
   --transformer-impl: transformer_engine
@@ -68,9 +68,10 @@ MODEL_ARGS:
   --eval-iters: 32
   --eval-interval: 2000
   # Add checkpointing args
-  --load: ${CHECKPOINT_LOAD_PATH}
   --save: ${CHECKPOINT_SAVE_PATH}
-  --save-interval: 1000
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 5000
+  --save-retain-interval: 10000
   # Add initialization args
   --init-method-std: 0.0134
   # Add logging args
@@ -86,7 +87,8 @@ MODEL_ARGS:
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   # Add mixed precision args
   --bf16: true
-  --exit-interval: 13000
+  --exit-interval: 10200
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
 METRICS:
   - "iteration-time"
   - "lm loss"

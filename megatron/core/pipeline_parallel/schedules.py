@@ -22,6 +22,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -272,7 +273,9 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+            # See https://github.com/NVIDIA/Megatron-LM/pull/2217 for detailed explanation
+            # of scaling by cp_group_size
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_group_size / num_microbatches)
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
@@ -519,14 +522,32 @@ def wrap_iterator_helper(
     if config.sft_sequence_packing:
         num_total_tokens_this_GB, sequence_square_sum_this_GB = None, None
         if config.hybrid_context_parallel:
-            (
-                data_iterator,
-                num_microbatches,
-                num_total_tokens_this_GB,
-                sequence_square_sum_this_GB,
-            ) = wrap_dataloader(
-                data_iterator, config, PackingScheduler.HYBRID_CP_WITH_PP, pg_collection=None
-            )
+            if config.hybrid_context_parallel_scheduler == 'balanced':
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
+                    data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
+                )
+            elif config.hybrid_context_parallel_scheduler == 'only_packing_no_scheduling':
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
+                    data_iterator,
+                    config,
+                    PackingScheduler.ONLY_PACKING_NO_SCHEDULING,
+                    pg_collection=None,
+                )
+            else:
+                raise ValueError(
+                    f"Invalid hybrid context parallel scheduler: \
+                    {config.hybrid_context_parallel_scheduler}"
+                )
         else:
             if config.balanced_sequence_packing:
                 # enable balanced sequence packing scheduler, will be implemented later
@@ -717,7 +738,7 @@ def forward_backward_no_pipelining(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and "full_iteration" not in config.cuda_graph_scope
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
 
@@ -976,8 +997,8 @@ def forward_backward_pipelining_with_interleaving(
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
-    data_iterator, num_microbatches = wrap_iterator_helper(
-        config, data_iterator, num_microbatches, pg_collection
+    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
     )
 
     # Needed only when gradients are finalized in M-Core
@@ -1991,10 +2012,13 @@ def forward_backward_pipelining_with_interleaving(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and "full_iteration" not in config.cuda_graph_scope
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
+
+    if config.sft_sequence_packing:
+        forward_data_store.append([num_total_tokens_this_GB, sequence_square_sum_this_GB])
 
     return forward_data_store
 
@@ -2145,6 +2169,10 @@ def forward_backward_pipelining_without_interleaving(
                 p2p_communicator.pp_group, p2p_communicator.pp_group.rank() + 1
             )
             torch.distributed.send(info_tensor, dst=next_rank)
+
+    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
+    )
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2411,7 +2439,7 @@ def forward_backward_pipelining_without_interleaving(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and "full_iteration" not in config.cuda_graph_scope
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
 

@@ -559,6 +559,7 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
+    min_hybrid_context_parallel_size: int = 1,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -969,6 +970,22 @@ def initialize_model_parallel(
             )
             if rank in ranks:
                 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
+
+    if hybrid_context_parallel:
+        # PyTorch is performing lazy initialization of the communicator group.
+        # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
+        group_sizes = [
+            2**i
+            for i in range(
+                int(log2(min_hybrid_context_parallel_size)), int(log2(data_parallel_size))
+            )
+        ]
+        if group_sizes[-1] * 2 == data_parallel_size:
+            group_sizes.append(data_parallel_size)
+        for group_size in group_sizes:
+            group = get_hybrid_data_context_parallel_groups(group_size=group_size)
+            torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+            torch.cuda.synchronize()
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
