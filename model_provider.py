@@ -22,7 +22,7 @@ import megatron.legacy.model  # isort: skip
 
 
 def model_provider(
-    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None
+    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]:
     """Builds the model.
 
@@ -64,7 +64,7 @@ def model_provider(
         # [ModelOpt]: Use custom builder + spec when modelopt is enabled
         model_builder = modelopt_gpt_mamba_builder
 
-    return model_builder(args, pre_process, post_process, vp_stage)
+    return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
 
 
 def count_parameters_in_layer(model, layer_name):
