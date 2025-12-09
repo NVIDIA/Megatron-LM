@@ -119,7 +119,7 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
-        
+
         self.tp_group = pg_collection.tp
 
         # Initialize router.
