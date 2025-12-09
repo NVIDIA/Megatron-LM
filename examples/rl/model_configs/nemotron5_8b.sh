@@ -29,13 +29,13 @@ else
   # Some default values if config is unsupported.
   echo "Undected environment config, using default values"
   GRPO_CLAMP_EPS_LOWER=${GRPO_CLAMP_EPS_LOWER:-0.2}
-  GRPO_CLAMP_EPS_UPPER=${GRPO_CLAMP_EPS_UPPER:-0.2}
+  GRPO_CLAMP_EPS_UPPER=${GRPO_CLAMP_EPS_UPPER:-0.4}
   MAX_INFERENCE_BS=${MAX_INFERENCE_BS:-64}
   GRPO_GROUP_SIZE=${GRPO_GROUP_SIZE:-16}
-  GRPO_PROMPTS_PER_STEP=${GRPO_PROMPTS_PER_STEP:-32}
+  GRPO_PROMPTS_PER_STEP=${GRPO_PROMPTS_PER_STEP:-16}
   GRPO_ITERATIONS=${GRPO_ITERATIONS:-1}
   GRPO_KL_BETA=${GRPO_KL_BETA:-"0.0"}
-  TRAINING_BATCH_SIZE=${TRAINING_BATCH_SIZE:-512}
+  TRAINING_BATCH_SIZE=${TRAINING_BATCH_SIZE:-256}
   MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
   MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-12000}
   EXIT_INTERVAL=${EXIT_INTERVAL:-16}
@@ -61,49 +61,49 @@ MODEL_OPTIONS="\
   --inference-max-batch-size $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --hybrid-override-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
-    --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
-    --tiktoken-pattern v2 \
-    --distributed-timeout-minutes 60 \
-    --use-mcore-models \
-    --no-mmap-bin-files \
-    --untie-embeddings-and-output-weights \
-    --disable-bias-linear \
+  --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+  --tiktoken-pattern v2 \
+  --distributed-timeout-minutes 60 \
+  --use-mcore-models \
+  --no-mmap-bin-files \
+  --untie-embeddings-and-output-weights \
+  --disable-bias-linear \
   --normalization RMSNorm \
   --norm-epsilon 1e-5 \
-   --init-method-std 0.014 \
-    --position-embedding-type none \
-    --squared-relu \
-    --num-layers 52 \
-    --hidden-size 4096 \
-    --num-attention-heads 32 \
-    --group-query-attention \
-    --num-query-groups 8 \
-    --ffn-hidden-size 21504 \
-    --kv-channels 128 \
-    --normalization RMSNorm \
-    --attention-dropout 0.0 \
-    --hidden-dropout 0.0 \
-    --exit-duration-in-mins 5750 \
-    --seq-length 8191 \
-    --max-position-embeddings 8192 \
+  --init-method-std 0.014 \
+  --position-embedding-type none \
+  --squared-relu \
+  --num-layers 52 \
+  --hidden-size 4096 \
+  --num-attention-heads 32 \
+  --group-query-attention \
+  --num-query-groups 8 \
+  --ffn-hidden-size 21504 \
+  --kv-channels 128 \
+  --normalization RMSNorm \
+  --attention-dropout 0.0 \
+  --hidden-dropout 0.0 \
+  --exit-duration-in-mins 5750 \
+  --seq-length 8191 \
+  --max-position-embeddings 8192 \
   --tensor-model-parallel-size $TP  \
   --pipeline-model-parallel-size $PP  \
   --no-masked-softmax-fusion \
   --attention-softmax-in-fp32 \
-   --weight-decay 0.1 \
-    --clip-grad 1.0 \
-    --tokenizer-type TikTokenizer \
-    --tokenizer-model ${TOKENIZER_MODEL} \
-    --no-use-tokenizer-model-from-checkpoint-args \
-     --position-embedding-type none \
-     --dist-ckpt-strictness log_unexpected \
-      --ckpt-format torch_dist \
---ckpt-fully-parallel-save \
-    --ckpt-fully-parallel-load \
---use-distributed-optimizer \
-    --overlap-grad-reduce \
-    --overlap-param-gather \
-    --no-create-attention-mask-in-dataloader \
-  --lr 1e-6 \
+  --weight-decay 0.01 \
+  --clip-grad 0.1 \
+  --tokenizer-type TikTokenizer \
+  --tokenizer-model ${TOKENIZER_MODEL} \
+  --no-use-tokenizer-model-from-checkpoint-args \
+  --position-embedding-type none \
+  --dist-ckpt-strictness log_unexpected \
+  --ckpt-format torch_dist \
+  --ckpt-fully-parallel-save \
+  --ckpt-fully-parallel-load \
+  --use-distributed-optimizer \
+  --overlap-grad-reduce \
+  --overlap-param-gather \
+  --no-create-attention-mask-in-dataloader \
+  --lr 1e-7 \
   --lr-warmup-samples 0 \
   "
