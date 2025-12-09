@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -e
+set -u -o pipefail
 set -x
 
 # Install mock for unit tests
@@ -22,6 +22,8 @@ fi
 # Find all test files recursively
 TEST_FILES=$(find tests/unit_tests -type f -name "test_*.py")
 
+ANY_FAIL=0
+
 for file in $TEST_FILES; do
     echo "Running test file: $file"
     torchrun --standalone --nproc_per_node=$NUM_GPUS -m pytest \
@@ -29,14 +31,19 @@ for file in $TEST_FILES; do
         --csv "$OUT_DIR/test_report_$(basename "$file" .py).csv" \
         --junitxml "$OUT_DIR/junit_report_$(basename "$file" .py).xml" \
         $file
+    rc=$?
 
-    if [[ $? -ne 0 ]]; then
-        echo "Test failed in $file. Stopping execution."
-        exit 1
+    if [[ $rc -ne 0 ]]; then
+        echo "Test failed in $file."
+        ANY_FAIL=1
     fi
 done
 
-echo "All test files passed successfully."
+if [[ $ANY_FAIL -ne 0 ]]; then
+    echo "One or more test files failed."
+else
+    echo "All test files passed successfully."
+fi
 
 # Merge all individual CSVs into one unified report
 python - <<EOF
@@ -60,3 +67,5 @@ if dfs:
 else:
     print("No test report CSV files found to merge.")
 EOF
+
+exit $ANY_FAIL
