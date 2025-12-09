@@ -28,11 +28,6 @@ def add_modelopt_args(parser):
         action="store_true",
         help="Forcing local DotProductAttention; otherwise TEDotProductAttention is used.",
     )
-    group.add_argument(
-        "--disable-export-te-mcore-model",
-        action="store_true",
-        help="Disable (override) the export-te-mcore-model argument if it is set. This is useful to run a model with native TE layers.",
-    )
     # Quantization
     group.add_argument(
         "--export-kv-cache-quant",
