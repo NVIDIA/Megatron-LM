@@ -507,6 +507,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            residual=residual 
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -520,10 +521,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
+        using_fused_tp_communication_kernel = (not self.training) and (self.config.inference_fuse_tp_communication)
+        if using_fused_tp_communication_kernel:
+            # In inference optimized transformer layer, there is no bias and dropout 
+            # The remaining residual add is already handled inside the 
+            # self attention module.
+            hidden_states = attention_output_with_bias[0]
+        else:
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                    attention_output_with_bias, residual, self.hidden_dropout
+                )
         nvtx_range_pop(suffix="self_attn_bda")
 
         # Residual connection.
@@ -581,7 +589,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.config.mlp_chunks_for_prefill > 1
             and inference_context is not None
             and not inference_context.is_decode_only()
-            and not isinstance(self.mlp, IdentityOp)
+            and not isinstance(self.mlp, IdentityOp) 
+            and not self.config.transformer_impl == "inference_optimized"
         )
 
         if self.recompute_mlp:
@@ -615,7 +624,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = (mlp_output, bias_output)
 
         else:
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, residual=residual)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -628,10 +637,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.hidden_dropout
-            )
+        using_fused_tp_communication_kernel = (not self.training) and (self.config.inference_fuse_tp_communication)
+        if using_fused_tp_communication_kernel:
+            # In inference optimized transformer layer, there is no bias and dropout 
+            # The remaining residual add is already handled inside the 
+            # MLP module.
+            hidden_states = mlp_output_with_bias[0]
+        else:
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                    mlp_output_with_bias, residual, self.hidden_dropout
+                )
         nvtx_range_pop(suffix="mlp_bda")
 
         # Jit compiled function creates 'view' tensor. This tensor
