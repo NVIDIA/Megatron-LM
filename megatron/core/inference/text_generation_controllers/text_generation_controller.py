@@ -98,7 +98,7 @@ class TextGenerationController:
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
-        if context.materialize_only_last_token_logits:
+        if context.config.materialize_only_last_token_logits:
             max_logits = max_requests
         else:
             max_logits = context.max_tokens
@@ -117,9 +117,17 @@ class TextGenerationController:
             self._all_logits_cuda = torch.empty(
                 (1, max_logits, vocab_size), dtype=logits_dtype, device=device
             )
+            self._log_probs_output = torch.zeros(
+                (max_logits, vocab_size), dtype=torch.float32, device=device
+            )
         else:
             self._all_logits_cuda = None
+            self._log_probs_output = None
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+
+        # Raw GPU tensor results from early-launched .sum() kernels.
+        # Read with .item() later after GPU overlap.
+        self._active_params_count: Dict[str, Tensor] = {}
 
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
@@ -570,7 +578,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         logits_seq_len = (
             active_request_count
-            if context.materialize_only_last_token_logits
+            if context.config.materialize_only_last_token_logits
             else context.padded_active_token_count
         )
 
@@ -580,7 +588,7 @@ class TextGenerationController:
             )
         assert logits_seq_len == (
             active_request_count
-            if context.materialize_only_last_token_logits
+            if context.config.materialize_only_last_token_logits
             else input_ids.shape[1]
         )
 
@@ -668,35 +676,93 @@ class TextGenerationController:
             sampled_indices = torch.cat(indices_list, dim=0)
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
 
-    def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
-        """Perform bookkeeping necessary to compute log probs for dynamic batching.
+    def _dynamic_step_active_params_count(self, batch_size: int):
+        """Launch GPU reduction kernels to count how many requests want optional features.
 
-        Returns:
-            return_log_probs (bool): Whether to return the sampled log_probs.
+        This is Domain A work: it operates on tensors sized by padded_active_request_count
+        and fires .sum() kernels whose results will be read (via .item()) later, after the
+        forward pass has had time to overlap with these reductions.
+
+        The active_log_prob_mask is the union of return_log_probs and top_n_logprobs,
+        since both require log_softmax computation.
+
+        Args:
+            batch_size (int): Number of active requests.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
 
+        # Build the combined log-prob mask: any request wanting return_log_probs OR
+        # top_n_logprobs needs the log_softmax computed.
+        return_log_probs = context.active_request_metadata["return_log_probs"][:batch_size]
+        top_n_logprobs = context.active_request_metadata["top_n_logprobs"][:batch_size] > 0
+
+        # Domain A: copy the combined mask into a static-address GPU buffer and
+        # fire a .sum() reduction kernel.  The mask is reused by Domain B/C
+        # after CPU Sync 1.
+        request_mask = return_log_probs | top_n_logprobs
+        padded_count = context.padded_active_request_count
+        context.active_log_prob_mask[:batch_size].copy_(request_mask[:batch_size], non_blocking=True)
+        context.active_log_prob_mask[batch_size:padded_count] = False
+        self._active_params_count["log_probs"] = context.active_log_prob_mask[:padded_count].sum()
+        # Also track top_n separately so the caller knows whether to run top_n extraction.
+        self._active_params_count["top_n_logprobs"] = top_n_logprobs.sum()
+
+    def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
+        """Sync on the early-launched .sum() results and return whether log probs are needed.
+
+        This should be called after the forward pass so that the .item() calls
+        are effectively free (the reduction kernels have already completed).
+
+        Returns:
+            need_log_probs (bool): Whether any request wants log probs or top-n log probs.
+            need_top_n (bool): Whether any request wants top-n log probs specifically.
+        """
         return (
-            (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
-            (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
+            self._active_params_count["log_probs"].item() > 0,
+            self._active_params_count["top_n_logprobs"].item() > 0,
         )
 
     def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
-        """Calculate log probs from logits."""
-        context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
-        logits_seq_len = (
-            active_request_count
-            if context.materialize_only_last_token_logits
-            else context.padded_active_token_count
-        )
+        """Calculate log probs from logits.
 
-        return context.calculate_log_probs(
-            self._all_logits_cuda[:, :logits_seq_len, :],
-            self._sampled_tokens_cuda[:active_request_count],
-            only_last_token_logits=context.config.materialize_only_last_token_logits,
-        )
+        Uses the three-domain decomposition: the Domain A mask was already built
+        in _dynamic_step_active_params_count, and the count was synced in
+        _dynamic_step_log_probs_bookkeeping. This method invokes Domain B
+        (decode) or Domain B+C (prefill) via context.calculate_log_probs.
+
+        When CUDA graphing is active, all tensors are passed at their padded
+        (graph-stable) sizes so the log-prob kernels can be captured/replayed.
+        """
+        context = self.inference_wrapped_model.inference_context
+        log_prob_request_count = self._active_params_count["log_probs"].item()
+
+        if self._enable_cuda_graph:
+            # Padded dimensions for graph-stable shapes.
+            logits_seq_len = (
+                context.padded_active_request_count
+                if context.config.materialize_only_last_token_logits
+                else context.padded_active_token_count
+            )
+            return context.calculate_log_probs(
+                self._all_logits_cuda[:, :logits_seq_len, :],
+                self._sampled_tokens_cuda[:context.padded_active_request_count],
+                only_last_token_logits=context.config.materialize_only_last_token_logits,
+                log_prob_request_count=log_prob_request_count,
+                log_probs=self._log_probs_output[:logits_seq_len],
+            )
+        else:
+            active_request_count = context.total_request_count - context.paused_request_count
+            logits_seq_len = (
+                active_request_count
+                if context.config.materialize_only_last_token_logits
+                else context.padded_active_token_count
+            )
+            return context.calculate_log_probs(
+                self._all_logits_cuda[:, :logits_seq_len, :],
+                self._sampled_tokens_cuda[:active_request_count],
+                only_last_token_logits=context.config.materialize_only_last_token_logits,
+                log_prob_request_count=log_prob_request_count,
+            )
 
     def _dynamic_step_calculate_top_n_logprobs(
         self, log_probs_tensor: Optional[Tensor] = None
@@ -892,22 +958,19 @@ class TextGenerationController:
 
         input_ids, position_ids = self._dynamic_step_context_init()
 
-        cuda_graph_request_count = (
-            context.padded_active_request_count if context.is_decode_only() else None
-        )
+        # Fire .sum() reduction kernels early — these will complete during the forward pass.
+        self._dynamic_step_active_params_count(active_request_count)
 
         self._dynamic_step_forward_logits(input_ids, position_ids)
 
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
+        # Yield to event loop. The forward pass GPU kernels are running asynchronously.
+        # By the time we resume, the .sum() reductions have certainly completed.
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
+        # Sync on the .sum() results — effectively free since they completed during FW pass.
         return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+
         self._dynamic_step_sample_bookkeeping()
         self._dynamic_step_sample_logits()
 
@@ -918,6 +981,9 @@ class TextGenerationController:
             if return_top_n_logprobs:
                 top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(log_probs_tensor)
 
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
         if skip_bookkeeping:
             request_bookkeeping = {}
         else:
