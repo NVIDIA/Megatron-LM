@@ -1008,6 +1008,13 @@ class MultiTokenPredictionBlock(MegatronModule):
         
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
 
+        vp_size = config.virtual_pipeline_model_parallel_size
+        assert is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size), (
+            f"MTP layers must be placed on the last virtual pipeline stage. "
+            f"Got vp_stage={vp_stage} with vp_size={vp_size}. "
+            f"Placing MTP layers on different VPP stages is not currently supported."
+        )
+
         # Initialize Context Parallelism (CP) support for MTP
         # This enables MTP to work with CP > 1 by providing the CP process group
         # to the roll_tensor function for proper boundary communication
