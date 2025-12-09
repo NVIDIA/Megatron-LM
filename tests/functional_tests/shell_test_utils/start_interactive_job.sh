@@ -70,12 +70,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Check if yq is installed
-if ! command -v yq &>/dev/null; then
-    echo "Error: yq is not installed. Please install it first."
-    exit 1
-fi
-
 # Validate required arguments
 if [ -z "$PARTITION" ] || [ -z "$SLURM_ACCOUNT" ] || [ -z "$IMAGE" ] || [ -z "$DATASET_DIR" ]; then
     echo "Error: Missing required arguments"
