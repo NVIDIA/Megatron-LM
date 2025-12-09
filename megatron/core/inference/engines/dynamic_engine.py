@@ -553,7 +553,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.deallocate_all_tensors()
 
         # Delete cuda graphs when not using unified memory at all (level 0) and
-        # `--rl-persist-cuda-graphs` is not passed. For UVM levels 1 and 2, the context's tensors
+        # `--rl-training-cuda-graphs` is not passed. For UVM levels 1 and 2, the context's tensors
         # maintain static memory addresses, so the cuda graphs are re-used.
         if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
             delete_cuda_graphs()
