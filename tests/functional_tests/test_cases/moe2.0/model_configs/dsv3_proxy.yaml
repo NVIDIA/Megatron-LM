@@ -19,6 +19,7 @@ MODEL_ARGS:
   --multi-latent-attention: true
   --num-attention-heads: 32
   --kv-channels: 128
+  --qk-layernorm: true
   --position-embedding-type: rope
   --rotary-base: 10000
   --q-lora-rank: 1536
@@ -57,7 +58,6 @@ MODEL_ARGS:
   --hidden-dropout: 0.0
   --clip-grad: 1.0
   --weight-decay: 0.1
-  --qk-layernorm: true
   # Add learning rate args
   --lr-warmup-fraction: .01
   --lr: 0.00015
@@ -82,4 +82,4 @@ METRICS:
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
   - "mtp_1 loss"
-  - "load-balancing loss"
+  - "seq_load_balancing_loss"
