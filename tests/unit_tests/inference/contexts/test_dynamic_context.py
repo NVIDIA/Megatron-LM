@@ -509,7 +509,6 @@ class TestDynamicContext:
             torch.tensor([2, 1], device='cuda', dtype=torch.int32),
         )
 
-        termination_idx = DynamicInferenceRequest.get_metadata_labels()["termination_id"]
         assert torch.equal(
             dynamic_context.request_metadata["termination_id"][:2],
             torch.tensor([7.0, 8.0], device='cuda'),
