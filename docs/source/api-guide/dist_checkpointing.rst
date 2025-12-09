@@ -41,6 +41,7 @@ Loading these legacy optimizer states is not supported because the required shar
 No additional work is required—model weights from checkpoints produced by earlier versions are loaded automatically.
 
 **Distributed Optimizer Checkpoint Formats**
+
 The refactor of the Distributed Optimizer introduces **two checkpoint formats**:
 
 - dp_reshardable (Default)
@@ -53,6 +54,7 @@ The refactor of the Distributed Optimizer introduces **two checkpoint formats**:
    - Enabled via the `--dist-ckpt-optim-fully-reshardable` flag.
 
 **Workflow for Changing Model Parallelism**
+
 You can combine formats to optimize both flexibility and performance:
 
    1. Train using dp_reshardable (default) for faster checkpointing.
