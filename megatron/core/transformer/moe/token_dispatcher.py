@@ -1012,7 +1012,7 @@ class _HybridEPManager(_DispatchManager):
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
 
         if self.packed_offloading_capacity_factor is not None:
-            pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+            pad_multiple = get_align_size_for_quantization(self.config)
             budget = int(routing_map.shape[0] * self.config.moe_router_topk  * self.packed_offloading_capacity_factor)
             budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
