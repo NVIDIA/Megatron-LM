@@ -31,14 +31,6 @@ Strategies are passed to `dist_checkpointing.load` and `dist_checkpointing.save`
 :show-inheritance:
 ```
 
-### dist_checkpointing.strategies.zarr module
-
-```{automodule} core.dist_checkpointing.strategies.zarr
-:members:
-:undoc-members:
-:show-inheritance:
-```
-
 ## Module contents
 
 ```{automodule} core.dist_checkpointing.strategies
