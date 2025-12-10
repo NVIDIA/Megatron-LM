@@ -1638,7 +1638,16 @@ class TECudaGraphHelper:
                     per_callable_fwd_idx = sample_start_idx + layer_idx
 
                     # Get sample_args and sample_kwargs for index per_callable_fwd_idx.
-                    assert sample_args[per_callable_fwd_idx] is None
+                    assert (
+                        sample_args[per_callable_fwd_idx] is None
+                        and sample_kwargs[per_callable_fwd_idx] is None
+                    ), (
+                        f"sample_args and sample_kwargs must be None before assigning static data, "
+                        f"but got sample_args[{per_callable_fwd_idx}] = "
+                        f"{sample_args[per_callable_fwd_idx]} and "
+                        f"sample_kwargs[{per_callable_fwd_idx}] = "
+                        f"{sample_kwargs[per_callable_fwd_idx]}."
+                    )
                     if id(layer) not in layer_sample_keys_cache:
                         # Have not generated the static inputs for this layer yet. So we don't
                         # know the input signature of this layer. Generate the static inputs, and
@@ -1672,7 +1681,11 @@ class TECudaGraphHelper:
                         assert (
                             sample_args[reuse_fwd_idx] is not None
                             and sample_kwargs[reuse_fwd_idx] is not None
-                        ), "sample_args and sample_kwargs must not be None when reusing."
+                        ), (
+                            f"sample_args and sample_kwargs must not be None when reusing, but got "
+                            f"sample_args[{reuse_fwd_idx}] = {sample_args[reuse_fwd_idx]} and "
+                            f"sample_kwargs[{reuse_fwd_idx}] = {sample_kwargs[reuse_fwd_idx]}.",
+                        )
                         sample_args[per_callable_fwd_idx] = sample_args[reuse_fwd_idx]
                         sample_kwargs[per_callable_fwd_idx] = sample_kwargs[reuse_fwd_idx]
 
