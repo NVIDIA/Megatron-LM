@@ -665,14 +665,20 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate is None
             or request.sampling_params.num_tokens_total is None
         )
-        if request.sampling_params.return_prompt_top_n_logprobs:
-            assert (
-                request.sampling_params.return_log_probs
-            ), "return_prompt_top_n_logprobs requires sampling_params.return_log_probs to be True"
         if request.sampling_params.top_n_logprobs > 0:
             assert (
                 request.sampling_params.return_log_probs
             ), "top_n_logprobs requires sampling_params.return_log_probs to be True"
+        if (
+            request.sampling_params.return_log_probs
+            and not request.sampling_params.skip_prompt_log_probs
+        ):
+            assert not self.context.materialize_only_last_token_logits, (
+                "Prompt log probs cannot be calculated if only last token logits are materialized. "
+                "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
+                "or skip_prompt_log_probs to True in SamplingParams."
+            )
+
         if request.sampling_params.num_tokens_total is not None:
             request.sampling_params.num_tokens_to_generate = (
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)
