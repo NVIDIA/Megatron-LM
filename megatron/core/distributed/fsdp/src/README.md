@@ -62,18 +62,34 @@ Transform your PyTorch model to use Fully Sharded Data Parallelism with just a f
 
 ```python
 import torch
-from megatron_fsdp import fully_shard
+from megatron_fsdp import (
+    fully_shard,
+    fully_shard_model,
+    fully_shard_optimizer,
+)
 
-# Your existing model and optimizer
-model = YourModel()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-# Enable FSDP with Megatron-FSDP.
-# Alternatively, you can use fully_shard_model() followed by fully_shard_optimizer()!
+"""
+Enable FSDP with Megatron-FSDP via fully_shard().
+"""
+model: torch.nn.Module = YourModel()
+optimizer: torch.optim.Optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 model, optimizer = fully_shard(
     model,
     optimizer,
-    fsdp_unit_modules=[YourTransformerBlock], # Modules to shard.
+    fsdp_unit_modules=[YourModelLayerClass], # Sub-modules to shard.
+    ...
+)
+
+"""
+Alternatively, you can use fully_shard_model() followed by fully_shard_optimizer()!
+"""
+mfsdp_model = fully_shard_model(
+    model,
+    fsdp_unit_modules=[YourModelLayerClass],
+    ...
+)
+optimizer = fully_shard_optimizer(
+    torch.optim.Adam(mfsdp_model.parameters(), lr=1e-3)
 )
 
 # Your model is now ready for distributed training!
@@ -107,6 +123,8 @@ fully_shard(model)
 
 ## `fully_shard` / `MegatronFSDP` API - Advanced Features
 
+Megatron-FSDP's API has a comprehensive set of arguments for fine-tuning your model's performance and memory usage:
+
 ```python
 import torch
 from megatron_fsdp import fully_shard
@@ -138,6 +156,8 @@ model, optimizer = fully_shard(
     model,
     # PyTorch Optimizer
     optimizer,
+    # Sharded Modules
+    fsdp_unit_modules=[...],
     # Device Mesh
     device_mesh=device_mesh
     # Always required for FSDP or HSDP.
@@ -154,8 +174,6 @@ model, optimizer = fully_shard(
     # FSDP Sharding Strategy: no_shard (0) / optim (1) / optim_grads (2) / optim_grads_params (3)
     zero_dp_strategy=3,
     outer_dp_sharding_strategy=1,
-    # Sharded Modules
-    fsdp_unit_modules=[...],
     # Initialize the model on devices in shards to avoid OOM. Requires device("meta")-init for model.
     init_model_with_meta_device=True,
     # Reduce gradients in FP32.
@@ -183,21 +201,21 @@ model.load_state_dict(ckpt_state_dict["model"], strict=False)
 optimizer.load_state_dict(ckpt_state_dict["optimizer"])
 ```
 
+- `fsdp_unit_modules` is a list of sub-module classes or `str` import-paths associated with modules that you want `MegatronFSDP` to fully-shard.
+  - Required if `1`, `2`, or `3` are specified as the sharding strategy. Defaults to `None`, in which case Megatron-FSDP will replicate the parameters similar to DDP.
 - `zero_dp_strategy` (and `outer_dp_sharding_strategy`) configure different degrees of zero-redundancy data parallelism as described in [ZeRO (Zero Redundancy Optimizer)](https://arxiv.org/abs/1910.02054). It reduces CUDA memory utilization during model training by distributing model parameters, gradients, and optimizer states across multiple devices in the DP `ProcessGroup`, and collectively communicating subsets of parameters and gradients to specific devices when needed for computation or differentiation. More aggressive sharding strategies will entail more communication overhead, with `no_shard` being the least memory efficient but most communication efficient, and `optim_grads_params` being the most memory efficient but least communication efficient. `outer_dp_sharding_strategy` has the same options, except for the (required) "outer" DP group (`dp_outer_dim` / `hybrid_fsdp_group`) when using [Hybrid-Sharded Data Parallelism (HSDP)](https://arxiv.org/pdf/2304.11277), and only `no_shard` (DP Replication) and `optim` (Optimizer State Hybrid Sharding, requires `zero_dp_strategy='optim_grads_params`) are supported.
   - Default: `optim_grads_params` or `3` for `zero_dp_strategy` and `no_shard` or `0` for `outer_dp_sharding_strategy`
   - `0` or `no_shard` implies that your model is not sharded. Similar memory usage to `DDP`.
   - `1` or `optim` implies that your optimizer state is sharded for distributed optimization. Similar to optimizer state sharding in `ZeRO-DP`.
   - `2` or `optim_grads` implies that your optimizer state and gradients are sharded. Similar to `ZeRO-2`.
   - `3` or `optim_grads_params` implies that your optimizer state, gradients, and training parameters are sharded. Similar to `ZeRO-3`.
-- `fsdp_unit_modules` is a list of sub-module classes or `str` import-paths associated with modules that you want `MegatronFSDP` to fully-shard.
-  - Required if `1`, `2`, or `3` are specified as the sharding strategy. Defaults to `None`.
-- `device_mesh` is a [`torch.distributed.DeviceMesh`](https://docs.pytorch.org/docs/stable/distributed.html#devicemesh) that informs `MegatronFSDP` of your distributed environment for sharding in conjunction with hardware configuration and other parallelisms.
+- `device_mesh` is a [`torch.distributed.DeviceMesh`](https://docs.pytorch.org/docs/stable/distributed.html#devicemesh) that informs `MegatronFSDP` of your distributed environment for sharding in conjunction with hardware configuration and other parallelisms. If not provided, `megatron_fsdp.fully_shard(_model)` will build an FSDP DeviceMesh for you automatically.
   - `dp_shard_dim` is the name of the sub-mesh required for FSDP sharding, and is commonly the flattened combination of the data parallel (DP) and context parallel (CP) sub-meshes.
     - When model parameters are replicated across DP-CP during the backward pass, resultant gradients across DP and CP ranks are reduced simultaneously, normalized by the DP-CP world size. For more information about how ring attention shards the sequence dimension through the attention and non-attention layers of the Transformer, refer to: [Ring Attention with Blockwise Transformers for Near-Infinite Context](https://arxiv.org/abs/2310.01889).
   - `dp_outer_dim` is the name of the sub-mesh corresponding to the "outer" DP group, which is required for replication or sharding in HSDP. `fully_shard` will perform HSDP if `dp_outer_dim` is specified.
   - `tp_dim` is the name of the sub-mesh used for tensor parallelism (TP), which is required for `(FSDP, TP)`-strided sharding when using Megatron-LM or Torch-native `DTensor` TP.
     - For more information about tensor parallelism, refer to: [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053).
-  - `hybrid_fsdp_group` is the `ProcessGroup` which contains all ranks in the flattened `dp_shard_dim` and `dp_outer_dim` sub-meshes utilized to specify the `(DP-Outer, DP-Shard)` sharded coordinate system for the weight and gradient buffers. Required for HSDP.
+  - `hybrid_fsdp_group` is the `ProcessGroup` which contains all ranks in the flattened `dp_shard_dim` and `dp_outer_dim` sub-meshes utilized to specify the `(DP-Outer, DP-Shard)` sharded mesh coordinates for the weight and gradient buffers. Required for HSDP.
 - `expt_device_mesh` is another [`torch.distributed.DeviceMesh`](https://docs.pytorch.org/docs/stable/distributed.html#devicemesh) tailored for the expert parallel (EP) modules in `MegatronFSDP`.
   - `dp_shard_dim` is the name of the sub-mesh required for FSDP sharding of the EP modules, enabling expert data parallelism (EDP).
   - `tp_dim` is the name of the sub-mesh used for expert tensor parallelism (ETP), which is required for `(FSDP, ETP)`-strided sharding when using Megatron-LM or Torch-native `DTensor` ETP.

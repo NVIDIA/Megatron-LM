@@ -15,7 +15,7 @@
 import logging
 import types
 from enum import IntEnum
-from typing import Optional, Sequence, Type
+from typing import Callable, Optional, Sequence, Type
 
 import torch
 from torch.distributed import DeviceMesh
@@ -58,6 +58,40 @@ class ShardingStrategy(IntEnum):
     OPTIM_GRADS_PARAMS = 3
 
 
+def experimental_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as experimental API.
+
+    Use this decorator for:
+    - Experimental features that may change without notice
+    - New APIs under active development
+    - Features that are not yet stable
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks, allowing rapid iteration during development.
+
+    Args:
+        func: The function or class to mark as experimental
+
+    Returns:
+        The original function/class with an experimental API marker
+
+    Example:
+        @experimental_api
+        def new_experimental_feature():
+            '''This API is experimental and may change'''
+            pass
+
+        @experimental_api
+        class ExperimentalModel:
+            '''This model is under active development'''
+            pass
+    """
+    func._experimental_api = True
+    return func
+
+
+@experimental_api
 def fully_shard_model(
     module: torch.nn.Module,
     device_mesh: Optional[DeviceMesh] = None,
@@ -85,9 +119,13 @@ def fully_shard_model(
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
     disable_symmetric_registration: bool = False,
-):
+) -> torch.nn.Module:
     """
-    Fully-shard the model for Megatron-FSDP.
+    Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
+    class that schedules the sharding lifecycle of the model parameters and gradients
+    during training and inference.
+
+    The original `torch.nn.Module` can be accessed at `MegatronFSDP.module`.
 
     Args:
         Subset of the arguments for fully_shard(). Refer to the docstring for fully_shard().
@@ -243,19 +281,26 @@ def fully_shard_model(
     return model
 
 
+@experimental_api
 def fully_shard_optimizer(
-    model: MegatronFSDP,
-    optimizer: torch.optim.Optimizer,
-    preproc_state_dict_for_dcp_ckpt: bool = True,
-):
+    optimizer: torch.optim.Optimizer, preproc_state_dict_for_dcp_ckpt: bool = True
+) -> torch.optim.Optimizer:
     """
     Fully shard the optimizer for Megatron-FSDP. This is an in-place operation on the optimizer
     instance, which modifies the optimizer to call methods exposed by the MegatronFSDP model API.
 
-    Args:
-        model (MegatronFSDP):
-            The Megatron-FSDP model to be fully sharded.
+    The optimizer should be registered on the MegatronFSDP distributed model parameters:
+    ```
+        # Fully-shard the model.
+        mfsdp_model = fully_shard_model(model, ...)
 
+        # Register the fully-sharded parameters with the optimizer.
+        # Use MegatronFSDP._replace_param_with_distributed_if_needed()
+        # to swap to the distributed optimizer state parameters.
+        optimizer = fully_shard_optimizer(Adam(params=mfsdp_model.parameters()))
+    ```
+
+    Args:
         optimizer (torch.optim.Optimizer):
             The optimizer to be fully sharded.
 
@@ -265,26 +310,30 @@ def fully_shard_optimizer(
     Returns:
         optimizer (torch.optim.Optimizer): The in-place modified optimizer for Megatron-FSDP.
     """
-    # Swap to the model distributed parameters for the optimizer state.
-    # MegatronFSDP.__init__() will call this method upon completion, but
-    # this is to ensure intended operation even if fully_shard_optimizer()
-    # is invoked post-initialization, in which case it is possible the user
-    # has swapped to the MegatronFSDP unsharded compute parameters.
-    model._replace_param_with_distributed_if_needed()
-
-    # Replace the optimizer module parameter references with
-    # Megatron-FSDP-managed parameters.
-    optimizer.param_groups.clear()
-    optimizer.state.clear()
-    optimizer.add_param_group({"params": model.module.parameters()})
+    # Extract a reference to MegatronFSDP from the first registered Parameter.
+    if not optimizer.param_groups:
+        raise ValueError(
+            f"[MegatronFSDP fully_shard_optimizer()] Provided optimizer doesn't "
+            f"have any registered parameters: {optimizer}"
+        )
+    first_mfsdp_param = optimizer.param_groups[0][next(iter(optimizer.param_groups[0]))][0]
+    if not getattr(first_mfsdp_param, "_megatron_fsdp_model", None):
+        raise ValueError(
+            f"[MegatronFSDP fully_shard_optimizer()] Could not retrieve a reference to "
+            f"MegatronFSDP from the first registered Parameter: {first_mfsdp_param} \n"
+            "Make sure the optimizer is registered to the MegatronFSDP distributed "
+            "parameters via MegatronFSDP._replace_param_with_distributed_if_needed() "
+            "before initializing the optimizer on the MegatronFSDP model. "
+        )
+    mfsdp_api = first_mfsdp_param._megatron_fsdp_model
 
     # Save a reference to the optimizer.step() and optimizer.zero_grad() methods.
     optimizer_step_base_func = type(optimizer).step
     optimizer_zero_grad_base_func = type(optimizer).zero_grad
 
     # Define a new optimizer.step() method that distributes optimizer state and gradients,
-    # waits for asynchronous gradient reduce-scatter work to be completed, and
-    # updates model weights.
+    # waits for asynchronous gradient reduce-scatter work to be completed, and updates
+    # model weights. These options can be turned off via arguments in optimizer.step().
     def megatron_fsdp_optimizer_step(optimizer, *args, **kwargs):
         # Extract extended kwargs.
         sync_grad_before_optimizer_step = kwargs.pop("sync_grad_before_optimizer_step", True)
@@ -297,18 +346,19 @@ def fully_shard_optimizer(
         # NOTE: Only necessary if MegatronFSDP.model_auto_sync = False, in which case
         # gradient synchronization is not automatically handled by MegatronFSDP during
         # the post-backward hook and we need to synchronize manually.
-        if sync_grad_before_optimizer_step and not model.model_auto_sync:
-            model.finish_grad_sync()
+        if sync_grad_before_optimizer_step and not mfsdp_api.model_auto_sync:
+            mfsdp_api.finish_grad_sync()
 
         # Execute the base optimizer.step() on the model optimizer named parameters.
         optimizer_step_base_func(optimizer, *args, **kwargs)
 
         # Update the raw module training parameters with optimized values.
         if install_optimized_model_weights:
-            model.install_optimized_model_weights()
+            mfsdp_api.install_optimized_model_weights()
 
     # Define a new optimizer.zero_grad() method that zeros the gradient in both
-    # the optimizer as well as the Megatron-FSDP gradient buffer.
+    # the optimizer as well as the Megatron-FSDP gradient buffer. These options
+    # can be turned off via arguments in optimizer.zero_grad().
     def megatron_fsdp_optimizer_zero_grad(optimizer, *args, **kwargs):
         # Extract extended kwargs.
         zero_grad_buffer = kwargs.pop("zero_grad_buffer", True)
@@ -318,7 +368,7 @@ def fully_shard_optimizer(
 
         # Zero out the gradient in the Megatron-FSDP gradient buffer.
         if zero_grad_buffer:
-            model.zero_grad_buffer()
+            mfsdp_api.zero_grad_buffer()
 
     # Override the optimizer.step() and optimizer.zero_grad() methods to support
     # Megatron-FSDP operations.
@@ -349,7 +399,7 @@ def fully_shard_optimizer(
 
 def fully_shard(
     module: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None,
+    optimizer: torch.optim.Optimizer,
     device_mesh: Optional[DeviceMesh] = None,
     dp_shard_dim: Optional[str] = None,
     dp_outer_dim: Optional[str] = None,
@@ -393,7 +443,8 @@ def fully_shard(
             manually configure the model for optimization. Defaults to None.
 
         device_mesh (Optional[DeviceMesh]):
-            Device mesh object defining the topology for distributed training.
+            Device mesh object defining the topology for distributed training. If not provided,
+            Megatron-FSDP will build a default FSDP DeviceMesh.
 
         dp_shard_dim (Optional[str]):
             Name of the data parallel sharding sub-mesh in the device_mesh. Supports
@@ -555,8 +606,13 @@ def fully_shard(
     )
 
     # Extend optimizer methods to support Megatron-FSDP operations.
-    if optimizer is not None:
-        fully_shard_optimizer(model, optimizer, preproc_state_dict_for_dcp_ckpt)
+    # Replace the optimizer module parameter references with
+    # Megatron-FSDP-managed distributed parameters.
+    model._replace_param_with_distributed_if_needed()
+    optimizer.param_groups.clear()
+    optimizer.state.clear()
+    optimizer.add_param_group({"params": model.parameters()})
+    fully_shard_optimizer(optimizer, preproc_state_dict_for_dcp_ckpt)
 
     # Return model and optimizer.
     return model, optimizer
