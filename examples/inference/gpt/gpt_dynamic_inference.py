@@ -360,7 +360,7 @@ def run_inference(
             output_start = get_curr_time()
             for finished_request_record in finished_request_records:
 
-                finished_request = finished_request_record.merge(engine.controller.tokenizer)
+                finished_request = finished_request_record.merge()
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
@@ -369,7 +369,7 @@ def run_inference(
                 request.request_id = finished_request.request_id
 
                 # Update prompt, in case engine has been suspended and resumed.
-                request.prompt_tokens = finished_request.prompt_tokens
+                request.prompt_tokens = finished_request.prompt_tokens.tolist()
                 request.prompt_text = finished_request.prompt
 
                 # Get output tokens and text.
@@ -383,6 +383,9 @@ def run_inference(
                         finished_request.prompt_log_probs = []
                     request.prompt_log_probs = finished_request.prompt_log_probs
                     request.generated_log_probs = finished_request.generated_log_probs
+                    request.logprobs = (
+                        finished_request.prompt_log_probs + finished_request.generated_log_probs
+                    )
                 if finished_request.sampling_params.top_n_logprobs > 0:
                     request.generated_top_n_logprobs = finished_request.generated_top_n_logprobs
                 if not finished_request.sampling_params.skip_prompt_log_probs:
@@ -568,6 +571,7 @@ def main():
                     if req.sampling_params.return_log_probs:
                         result_dict["prompt_logprobs"] = getattr(req, 'prompt_log_probs', None)
                         result_dict["generated_logprobs"] = getattr(req, 'generated_log_probs', None)
+                        result_dict["logprobs"] = getattr(req, 'logprobs', None)
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric

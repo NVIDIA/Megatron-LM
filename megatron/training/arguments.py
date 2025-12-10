@@ -977,6 +977,19 @@ def validate_args(args, defaults={}):
     if args.add_bias_linear:
         args.add_qkv_bias = True
 
+    if args.qk_clip:
+        assert is_te_min_version("2.9.0"), \
+            '--qk-clip is only supported with TE >= 2.9.0.'
+        assert 0.0 < args.qk_clip_alpha < 1.0, \
+            '--qk-clip-alpha must be between 0.0 and 1.0 when using --qk-clip.'
+        assert args.qk_clip_threshold > 0, \
+            '--qk-clip-threshold must be greater than 0 when using --qk-clip.'
+
+    # decoupled log max attention logit check
+    if args.log_max_attention_logit:
+        assert is_te_min_version("2.9.0"), \
+            '--log-max-attention-logit is only supported with TE >= 2.9.0.'
+
     # Retro checks.
     if args.retro_add_retriever:
 
@@ -1025,7 +1038,8 @@ def validate_args(args, defaults={}):
         args.num_experts = None
     if args.num_experts is not None and args.moe_ffn_hidden_size is None:
         args.moe_ffn_hidden_size = args.ffn_hidden_size
-        print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
+        if args.rank == 0:
+            print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
     # Context parallel
     if args.context_parallel_size > 1:
@@ -1147,6 +1161,15 @@ def validate_args(args, defaults={}):
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
 
+    if args.use_dist_ckpt and args.async_save:
+        if not args.use_persistent_ckpt_worker:
+            if args.rank == 0:
+                print(
+                    'Warning: --async-save is not supported without --use-persistent-ckpt-worker. '
+                    'Disabling --async-save.'
+                )
+            args.async_save = False
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
@@ -1164,10 +1187,18 @@ def validate_args(args, defaults={}):
         assert args.save is not None, "When using upcycling, the --save option must be specified."
         if not args.no_load_optim:
             args.no_load_optim = True
-            print('Warning: disabling --no-load-optim for upcycling.')
+            if args.rank == 0:
+                print('Warning: enabling --no-load-optim for upcycling.')
         if not args.no_load_rng:
             args.no_load_rng = True
-            print('Warning: disabling --no-load-rng for upcycling.')
+            if args.rank == 0:
+                print('Warning: enabling --no-load-rng for upcycling.')
+
+    # --skip-train checks.
+    if args.skip_train and not args.no_load_optim:
+        args.no_load_optim = True
+        if args.rank == 0:
+            print('Warning: enabling --no-load-optim when skipping training.')
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -1224,6 +1255,23 @@ def validate_args(args, defaults={}):
         assert (
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
+    
+    if args.multi_latent_attention:
+        assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
+
+    # MoE latent projections
+    if args.moe_latent_size is not None:
+        assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
+        assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
+        assert not args.use_legacy_models, "MoE latent projections are only supported for mcore models."
+        assert not args.moe_use_legacy_grouped_gemm, "MoE latent projection is not supported yet with legacy grouped GEMM."
+
+    if args.tiktoken_special_tokens and not args.tokenizer_special_tokens:
+        warn_rank_0(
+            "--tiktoken-special-tokens argument is deprecated and will be removed soon. "
+            "Use --tokenizer-special-tokens instead."
+        )
+        args.tokenizer_special_tokens = args.tiktoken_special_tokens
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1324,6 +1372,12 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['use_kitchen'] = True
         kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
 
+    kw_args['moe_latent_size'] = args.moe_latent_size
+
+    if args.te_precision_config_file:
+        assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
+        # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
+        kw_args['quant_recipe'] = load_quantization_recipe(args.te_precision_config_file)
 
     # Return config.
     return config_class(**kw_args)
@@ -1374,7 +1428,7 @@ def _add_transformer_engine_args(parser):
                        help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
     group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
                        help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
-    
+
     # FP4 related arguments
     group.add_argument('--fp4-format', default=None,
                        choices=['e2m1'],
@@ -1397,6 +1451,9 @@ def _add_transformer_engine_args(parser):
                             'Required for CUDA graphs support.')
     group.add_argument('--inference-rng-tracker', action='store_true', default=False,
                        help='Use a random number generator configured for inference.')
+    group.add_argument('--te-precision-config-file', default=None,
+                       help='Configuration file to select per-module precision overrides. '
+                       'See TransformerEngineMixedPrecision.md')
     return parser
 
 def _add_inference_args(parser):
@@ -1514,7 +1571,7 @@ def _add_inference_args(parser):
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
                        help='Disable chunked prefill (chunked prefill is enabled by default).')  
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
-                       type=int, default=1024,
+                       type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
@@ -1705,6 +1762,8 @@ def _add_network_size_args(parser):
                        'We compute the average of the MTP losses across all depths, '
                        'and multiply it the scaling factor to obtain the overall MTP loss, '
                        'which serves as an additional training objective.')
+    group.add_argument('--moe-latent-size', type=int, default=None,
+                       help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
     return parser
 
 
@@ -1886,13 +1945,15 @@ def _add_logging_args(parser):
     group.add_argument('--log-world-size-to-tensorboard',
                        action='store_true',
                        help='Enable world size logging to tensorboard.')
+    group.add_argument('--log-max-attention-logit', action='store_true',
+                       help='Enable max attention logit logging to tensorboard.')
     group.add_argument('--wandb-project', type=str, default='',
                        help='The wandb project name. Ignore wandb by default.')
     group.add_argument('--wandb-entity', type=str, default='',
                        help='The wandb entity name. It is useful when '
                        'there are multiple sub-projects in a project. '
                        'https://community.wandb.ai/t/how-do-i-decide-which-account-private-or-team-to-upload-the-run-to/5704 '
-                       'Ignore wandb by default.')    
+                       'Ignore wandb by default.')
     group.add_argument('--wandb-exp-name', type=str, default='',
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
@@ -2231,6 +2292,12 @@ def _add_training_args(parser):
     group.add_argument('--add-qkv-bias', action='store_true',
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
+    group.add_argument('--qk-clip', action='store_true',
+                       help='Whether to use qk-clip for training stabilization, strongly recommended for Muon.')
+    group.add_argument('--qk-clip-alpha', type=float, default=0.5,
+                       help='The balancing alpha for qk-clip.')
+    group.add_argument('--qk-clip-threshold', type=float, default=100,
+                       help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
@@ -2845,6 +2912,11 @@ def _add_tokenizer_args(parser):
                        help='Sentencepiece tokenizer model.')
     group.add_argument('--tokenizer-metadata', type=str, default=None,
                        help='Path to tokenizer metadata in json format.')
+    group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
+                       help='List of special tokens. For TikTokenizer needs to have '
+                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
+    group.add_argument('--legacy-tokenizer', action='store_true', default=False,
+                       help='To use Megatron-LM legacy tokenizer system.')
     group.add_argument('--tiktoken-pattern', type=str, default=None,
                        help='Which tiktoken pattern to use. Options: [v1, v2]')
     group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
@@ -2852,9 +2924,13 @@ def _add_tokenizer_args(parser):
     group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
                        help='List of tiktoken special tokens, needs to have '
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
-    group.add_argument('--legacy-tokenizer', action='store_true', default=False,
-                       help='To use legacy tokenizer system.')
-    group.add_argument("--trust-remote-code", action="store_true",
+    group.add_argument('--tokenizer-sentencepiece-legacy', action='store_true', default=False,
+                       help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.')
+    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=False,
+                       help='Whether to use fast HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=False,
+                       help='Converting text to ids will include special for HuggingFace tokenizer.')
+    group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
     return parser
 
