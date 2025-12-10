@@ -150,8 +150,6 @@ class RotaryEmbedding(nn.Module):
     @lru_cache(maxsize=32)
     def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of RoPE embedding before CP sharding.
-    def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
-        """Forward pass of RoPE embedding before CP sharding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
