@@ -1006,28 +1006,6 @@ class _HybridEPManager(_DispatchManager):
         self.packed_offloading_capacity_factor = self.config.moe_expert_capacity_factor_for_packed_offloading
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
 
-    def budget_check(self, routing_map, budget):
-        # TODO: the check should be done in hybridep to avoid the AG below
-        # routing_map: [num_local_tokens, world_size, num_local_experts]
-        num_local_tokens_per_expert = routing_map.sum(dim=0).flatten()
-        num_tokens_per_expert = torch.empty(
-            self.group.size(),
-            self.num_experts,
-            device=num_local_tokens_per_expert.device,
-            dtype=num_local_tokens_per_expert.dtype,
-        )
-        torch.distributed.all_gather_into_tensor(
-            num_tokens_per_expert, num_local_tokens_per_expert, self.group
-        )
-        
-        num_global_tokens_per_expert =num_tokens_per_expert.sum(dim=0)
-        if self.config.fp8:
-            pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
-            num_global_tokens_per_expert += -num_global_tokens_per_expert % pad_multiple
-        num_tokens_per_ep_rank = num_global_tokens_per_expert.view(routing_map.shape[1], routing_map.shape[2]).sum(dim=-1)
-        routing_map_maybe_dropped, over_budget = drop_routing_map_triton(routing_map, budget, num_tokens_per_ep_rank)
-        return routing_map_maybe_dropped, over_budget
-
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
         self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
@@ -1037,11 +1015,7 @@ class _HybridEPManager(_DispatchManager):
             pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
             budget = int(routing_map.shape[0] * self.config.moe_router_topk  * self.packed_offloading_capacity_factor)
             budget += -budget % pad_multiple
-            routing_map_maybe_dropped, over_budget = self.budget_check(routing_map, budget)
-            self.over_budget |= over_budget
-            self.num_dispatched_tokens = budget
             self.num_permuted_tokens = budget
-            self.routing_map = routing_map_maybe_dropped.reshape(num_tokens, self.num_experts)
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
             num_out_tokens = num_tokens * self.config.moe_router_topk
@@ -1086,6 +1060,9 @@ class _HybridEPManager(_DispatchManager):
                 pad_multiple=self.pad_multiple,
             )
         )
+        if self.packed_offloading_capacity_factor is not None:
+            over_budget = self.handle[8] != 0 # this is overflow_flag
+            self.over_budget |= over_budget
 
         if self.num_permuted_tokens is None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
