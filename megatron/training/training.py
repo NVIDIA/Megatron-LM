@@ -54,6 +54,9 @@ from megatron.core.utils import (
     get_model_config,
     StragglerDetector,
 )
+from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.process_groups_config import ProcessGroupCollection
+
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
@@ -705,6 +708,75 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
 
+    # Build a separate inference model for RL if requested.
+    inference_model = None
+    if args.perform_rl_step:
+        pg_collection = None
+        if args.rl_inference_tensor_model_parallel_size is not None:
+            print_rank_0(f"Setting tensor model parallel size to {args.rl_inference_tensor_model_parallel_size} for inference model")
+            # Build custom process groups for inference with a different TP size, keeping CP and PP the same as training
+            tp_size = args.rl_inference_tensor_model_parallel_size
+            #TODO(peter): Get these from args when we want to support other parallelism changes
+            cp_size = mpu.get_context_parallel_world_size()
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            ep_size = mpu.get_expert_model_parallel_world_size()
+            dp_size = args.world_size // (tp_size * cp_size * pp_size)
+            assert dp_size >= 1 and (tp_size * cp_size * pp_size * dp_size) == args.world_size, \
+                "World size must be divisible by tp*cp*pp for inference PG layout"
+
+            grid = HyperCommGrid([tp_size, cp_size, ep_size, pp_size, dp_size], ["tp", "cp", "ep", "pp", "dp"])
+            tp_group = grid.create_pg("tp")
+            cp_group = grid.create_pg("cp")
+            pp_group = grid.create_pg("pp")
+            ep_group = grid.create_pg("ep")
+            dp_group = grid.create_pg("dp")
+            # Composite groups required by MoE/router and some utilities
+            tp_cp_group = grid.create_pg(["tp", "cp"])
+            mp_group = grid.create_pg(["tp", "cp", "ep", "pp"])
+            tp_ep_group = grid.create_pg(["tp", "ep"])
+            tp_ep_pp_group = grid.create_pg(["tp", "ep", "pp"])
+            dp_cp_group = grid.create_pg(["cp", "dp"])
+            tp_dp_cp_group = grid.create_pg(["tp", "cp", "dp"])
+            embd_group_ranks = mpu.default_embedding_ranks(
+                torch.distributed.get_process_group_ranks(pp_group)
+            )
+            embd_group = torch.distributed.new_group(ranks=embd_group_ranks)
+            pos_embd_group_ranks = mpu.default_position_embedding_ranks(
+                torch.distributed.get_process_group_ranks(pp_group)
+            )
+            pos_embd_group = torch.distributed.new_group(ranks=pos_embd_group_ranks)
+            inference_pg_collection = ProcessGroupCollection(
+                tp=tp_group,
+                cp=cp_group,
+                pp=pp_group,
+                ep=ep_group,
+                embd=embd_group,
+                pos_embd=pos_embd_group,
+                dp=dp_group,
+                tp_cp=tp_cp_group,
+                mp=mp_group,
+                expt_tp=tp_group,
+                expt_dp=dp_group,
+                tp_ep=tp_ep_group,
+                tp_ep_pp=tp_ep_pp_group,
+                dp_cp=dp_cp_group,
+                tp_dp_cp=tp_dp_cp_group,
+            )
+
+            # Build an isolated inference config so training config remains unchanged
+            inference_config = copy.deepcopy(config)
+            inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
+    
+            inference_model = get_model(
+                model_provider,
+                model_type,
+                wrap_with_ddp=False,
+                pg_collection=inference_pg_collection,
+                config=inference_config,
+            )
+            inference_model[0].eval()
+
+
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
@@ -779,6 +851,7 @@ def pretrain(
                 config,
                 checkpointing_context,
                 non_loss_data_func,
+                inference_model,
             )
 
         print_datetime('after training is done')
@@ -942,6 +1015,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # are set for all params so the optimizer can use them.
     for model_module in model:
         for param in model_module.parameters():
+            #TODO(Peter) We need to use the proper models MPU here.
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     # Print number of parameters.
@@ -2043,6 +2117,7 @@ def train(
     config,
     checkpointing_context,
     non_loss_data_func,
+    inference_model=None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
@@ -2379,7 +2454,7 @@ def train(
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
                 train_data_iterator = rl_utils.setup_grpo_data_iterator(
-                    model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                    model, inference_model, optimizer, iteration, ref_state_dict, buffered_rollouts
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
