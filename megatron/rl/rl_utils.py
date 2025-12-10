@@ -2160,7 +2160,7 @@ def prepare_data_for_update(
                     log_single_rank(
                         logger,
                         logging.INFO,
-                        f"  - Step {step + 1}: {step_bins} bins, ~{est_global_seqs} sequences globally",
+                        f"[Sequence Packing]  - Step {step + 1}: {step_bins} bins, ~{est_global_seqs} sequences globally",
                     )
 
                 if total_steps > 3:

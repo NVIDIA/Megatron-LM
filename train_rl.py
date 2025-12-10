@@ -363,17 +363,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
-    ## VSCODE DEBUGGER INIT
-    if os.environ.get("VSCODE_DEBUG", "0") == "1" and int(os.environ["RANK"]) == 7:
-        import socket
-
-        import debugpy
-
-        debugpy.listen(("0.0.0.0", 5678))
-        print(">>>> RANK 7 IS WAITING FOR DEBUGGER...")
-        print(f"{socket.gethostbyname(socket.gethostname())}:5678")
-        debugpy.wait_for_client()
-
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
