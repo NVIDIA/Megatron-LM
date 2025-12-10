@@ -209,13 +209,6 @@ class TransformerConfig(ModelParallelConfig):
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
 
-    moe_deepep_num_sms: int = 20
-    """Number of SMs to use for DeepEP."""
-
-    moe_hybridep_num_sms: int = 16
-    """Number of SMs to use for HybridEP. In pure NVL scenarios, 
-    16 SMs can generally achieve good bandwidth."""
-
     ####################
     # initialization
     ####################
@@ -608,6 +601,16 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
+
+    moe_latent_size: Optional[int] = None
+    """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
+
+    moe_deepep_num_sms: int = 20
+    """Number of SMs to use for DeepEP."""
+
+    moe_hybridep_num_sms: int = 16
+    """Number of SMs to use for HybridEP. In pure NVL scenarios,
+    16 SMs can generally achieve good bandwidth."""
 
     ##################
     # Context Parallel
