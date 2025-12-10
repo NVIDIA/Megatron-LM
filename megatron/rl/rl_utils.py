@@ -505,6 +505,7 @@ class SequencePacker:
                     ]  # Truncate to actual seq length
                     loss_mask[bin_idx, start:end] *= gen_mask.float()
 
+            seq_starts.append(current_pos)
             packing_info['seq_starts'].append(seq_starts)
 
         # Add bin_start_positions - a dict mapping bin_idx to list of start positions for each sequence in that bin
@@ -554,11 +555,11 @@ def create_packed_seq_params_for_bin(
 
     # Build cumulative sequence lengths for actual sequences
     # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
-    cu_seqlens_list = np.cumsum([0] + seq_lengths_in_bin)
+    cu_seqlens_list = np.append(np.cumsum([0] + seq_lengths_in_bin), bin_size)
 
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
 
-    max_seqlen = max(seq_lengths_in_bin) if seq_lengths_in_bin else bin_size
+    max_seqlen = bin_size
 
     return PackedSeqParams(
         qkv_format='thd',
@@ -600,7 +601,6 @@ def load_packed_data_by_index(bin_idx: int):
     else:
         ref_logprobs = None
     loss_mask = packing_context['packed_loss_mask'][idx, 1:]
-    print(f"loss_mask: {loss_mask.shape}")
 
     # Get sequence-level data for this bin
     packing_info = packing_context['packing_info']
