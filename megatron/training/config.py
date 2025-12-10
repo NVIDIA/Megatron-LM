@@ -1,22 +1,22 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass, field
 import signal
-from typing import Optional, Literal
+from typing import Literal
 
 @dataclass(kw_only=True)
 class TrainingConfig:
     """Configuration settings related to the training loop."""
 
-    micro_batch_size: Optional[int] = None
+    micro_batch_size: int | None = None
     """Batch size per model instance (local batch size). Global batch size is local batch size times
     data parallel size times number of micro batches."""
 
-    global_batch_size: Optional[int] = None
+    global_batch_size: int | None = None
     """Training batch size. If set, it should be a multiple of micro-batch-size times
     data-parallel-size. If this value is None, then use micro-batch-size * data-parallel-size
     as the global batch size. This choice will result in 1 for number of micro-batches."""
 
-    rampup_batch_size: Optional[list[int]] = field(default=None, metadata={"argparse_meta": {"nargs": 3}})
+    rampup_batch_size: list[int] | None = field(default=None, metadata={"argparse_meta": {"nargs": 3}})
     """Batch size ramp up with the following values: <start batch size>, <batch size increment>,
     <ramp-up samples>
     For example:
@@ -37,31 +37,31 @@ class TrainingConfig:
     0=off, 1=moderate, 2=aggressive.
     """
 
-    check_weight_hash_across_dp_replicas_interval: Optional[int] = None
+    check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 
-    train_sync_interval: Optional[int] = None
+    train_sync_interval: int | None = None
     """Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU."""
 
-    train_iters: Optional[int] = None
+    train_iters: int | None = None
     """Total number of iterations to train over all training runs.
     Note that either train_iters or train_samples should be provided.
     """
 
-    train_samples: Optional[int] = None
+    train_samples: int | None = None
     """Total number of samples to train over all training runs.
     Note that either train_iters or train_samples should be provided."""
 
-    exit_interval: Optional[int] = None
+    exit_interval: int | None = None
     """Exit the program after the iteration is divisible by this value."""
 
-    exit_duration_in_mins: Optional[int] = None
+    exit_duration_in_mins: int | None = None
     """Exit the program after this many minutes."""
 
     exit_signal_handler: bool = False
     """Dynamically save the checkpoint and shutdown the training if SIGTERM is received"""
 
-    exit_signal: int = int(signal.SIGTERM)
+    exit_signal: signal.Signals = signal.SIGTERM
     """Signal for the signal handler to detect."""
 
     exit_signal_handler_for_dataloader: bool = False
@@ -91,11 +91,11 @@ class TrainingConfig:
 class ValidationConfig:
     """Configuration settings related to validation during or after model training."""
 
-    eval_iters: Optional[int] = 100
+    eval_iters: int | None = 100
     """Number of iterations to run for evaluation. Used for both validation and test. If not set,
     evaluation will not run."""
 
-    eval_interval: Optional[int] = None
+    eval_interval: int | None = None
     """Interval between running evaluation on validation set. If not set, evaluation will not run
     during training.
     """
@@ -114,83 +114,3 @@ class ValidationConfig:
        separate loss for each dataset in the list. This argument requires that no weights are 
        included in the list.
     """
-
-@dataclass(kw_only=True)
-class DistributedInitConfig:
-    """Configuration settings for distributed training initialization."""
-
-    # ---------------- Distributed config. ----------------
-
-    distributed_backend: Literal["nccl", "gloo"] = "nccl"
-    """Which backend to use for distributed training."""
-
-    distributed_timeout_minutes: int = 10
-    """Timeout minutes for torch.distributed."""
-
-    align_grad_reduce: bool = True
-    """If not set, all PP stages will launch gradient reduces simultaneously.
-    Otherwise, each PP stage will independently launch as needed.
-    """
-
-    local_rank: int = field(default_factory=lambda: int(os.getenv("LOCAL_RANK", "0")))
-    """local rank passed from distributed launcher."""
-
-    lazy_init: bool = False
-    """If set to True, initialize_megatron() skips DDP initialization and returns function to complete it instead.
-    Also turns on --use-cpu-initialization flag. This is for external DDP manager."""
-
-    use_megatron_fsdp: bool = False
-    """Use Megatron's Fully Sharded Data Parallel. Cannot be used together with use_torch_fsdp2."""
-
-    use_torch_fsdp2: bool = False
-    """Use the torch FSDP2 implementation. FSDP2 is not currently working with Pipeline Parallel.
-    It is still not in a stable release stage, and may therefore contain bugs or other
-    potential issues."""
-
-    nccl_communicator_config_path: Optional[str] = None
-    """Path to the yaml file with NCCL communicator configurations. The number of min/max thread
-    groups and thread group cluster size of each communicator can be configured by setting
-    `min_ctas`, `max_ctas`, and `cga_cluster_size`."""
-
-    use_tp_pp_dp_mapping: bool = False
-    """If set, distributed ranks initialize order is changed from tp-dp-pp to tp-pp-dp.
-    Make sure EP and CP aren't used with this option enabled.
-    """
-
-    use_gloo_process_groups: bool = True
-    """If set, create Gloo process groups for communications."""
-
-    use_sharp: bool = False
-    """Set the use of SHARP for the collective communications of data-parallel process groups.
-    When `True`, run barrier within each data-parallel process group,
-    which specifies the SHARP application target groups.
-    """
-
-    sharp_enabled_group: Optional[Literal["dp", "dp_replica"]] = None
-    """IB SHARP can be enabled from only one communication group.
-    By default, it is enabled from dp group if not specified and use_sharp=True.
-    Available options: [dp, dp_replica]
-    """
-
-    high_priority_stream_groups: Optional[list[str]] = None
-    """Specify which communicator groups should use high priority streams during creation.
-    Assigning high priority to communication streams ensures that communication kernels
-    are scheduled with higher priority, minimizing the exposed communication when it is
-    overlapped with other computation kernels.
-    """
-
-    external_gpu_device_mapping: bool = False
-    """If True, indicates that GPU device mapping has been externally managed
-    (e.g., via CUDA_VISIBLE_DEVICES environment variable). When True, uses device 0
-    instead of local rank for CUDA device selection. This is useful when launching
-    with external process managers that handle GPU visibility.
-    """
-
-    enable_megatron_core_experimental: bool = False
-    """Enable experimental features for Megatron Core."""
-
-    distributed_timeout_seconds_after_init: int | None = None
-    """Timeout in seconds for process groups after initialization. This timeout is applied to all process groups after initialization and the first iteration completes."""
-
-    disable_jit_fuser: bool = False
-    """Disable the JIT fuser."""

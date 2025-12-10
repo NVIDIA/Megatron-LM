@@ -2,12 +2,14 @@
 
 import dataclasses
 import typing
+import types
 from typing import Any, Optional
 from argparse import ArgumentParser, _ArgumentGroup
 import inspect
 import itertools
 import builtins
 import ast
+import enum
 from dataclasses import Field, fields
 
 # TODO: support arg renames
@@ -19,7 +21,35 @@ class TypeInferenceError(Exception):
 class ArgumentGroupFactory:
     """Utility that adds an argument group to an ArgumentParser based on the attributes of a dataclass.
 
-    This class can be overriden as needed to support dataclasses
+    This utility uses dataclass metadata including type annotations and docstrings to automatically
+        infer the type, default, and other argparse keyword arguments.
+
+    You can override or supplement the automatically inferred argparse kwargs for any 
+        dataclass field by providing an "argparse_meta" key in the field's metadata dict.
+        The value should be a dict of kwargs that will be passed to ArgumentParser.add_argument().
+        These metadata kwargs take precedence over the automatically inferred values.
+
+        Example:
+            @dataclass
+            class YourConfig:
+                your_attribute: int | str | None = field(
+                    default=None,
+                    metadata={
+                        "argparse_meta": {
+                            "arg_names": ["--your-arg-name1", "--your-arg-name2"],
+                            "type": str,
+                            "nargs": "+",
+                            "default": "foo",
+                        }
+                    },
+                )
+
+        In this example, inferring the type automatically would fail, as Unions are
+        not supported. However the metadata is present, so that takes precedence.
+        Any keyword arguments to `ArgumentParser.add_argument()` can be included in
+        the "argparse_meta" dict, as well as "arg_names" for the argument flag name.
+
+    This class can also be used as a base class and extended as needed to support dataclasses
         that require some customized or additional handling.
 
     Args:
@@ -52,6 +82,17 @@ class ArgumentGroupFactory:
         arg_name = "--" + arg_name.replace("_", "-")
         return arg_name
 
+    def _get_enum_kwargs(self, config_type: enum.EnumMeta) -> dict[str, Any]:
+        """Build kwargs for Enums.
+
+        With these settings, the user must provide a valid enum value, e.g.
+            'flash', for `AttnBackend.flash`.
+        """
+        def enum_type_handler(cli_arg):
+            return config_type[cli_arg]
+
+        return {"type": enum_type_handler, "choices": list(config_type)}
+
     def _extract_type(self, config_type: type) -> dict[str, Any]:
         """Determine the type, nargs, and choices settings for this argument.
 
@@ -61,11 +102,14 @@ class ArgumentGroupFactory:
         origin = typing.get_origin(config_type)
         type_tuple = typing.get_args(config_type)
 
+        if isinstance(config_type, type) and issubclass(config_type, enum.Enum):
+            return self._get_enum_kwargs(config_type)
+
         # Primitive type
         if origin is None:
             return {"type": config_type}
 
-        if origin is typing.Union:
+        if origin in [types.UnionType, typing.Union]:
             # Handle Optional and Union
             if type_tuple[1] == type(None): # Optional type. First element is value inside Optional[]
                 return self._extract_type(type_tuple[0])
@@ -98,7 +142,7 @@ class ArgumentGroupFactory:
         argparse_kwargs = {}
         argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)]
         argparse_kwargs["dest"] = attribute.name
-        argparse_kwargs["help"] = self.field_docstrings[attribute.name]
+        argparse_kwargs["help"] = self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else ""
 
         # dataclasses specifies that both should not be set
         if isinstance(attribute.default, type(dataclasses.MISSING)):
@@ -152,7 +196,7 @@ class ArgumentGroupFactory:
         """
         arg_group = parser.add_argument_group(title=title, description=self.src_cfg_class.__doc__)
         for attr in fields(self.src_cfg_class):
-            if attr.name in self.exclude:
+            if attr.name in self.exclude or attr.init is False:
                 continue
 
             add_arg_kwargs = self._build_argparse_kwargs_from_field(attr)

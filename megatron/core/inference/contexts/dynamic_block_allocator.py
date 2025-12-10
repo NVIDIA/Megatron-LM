@@ -115,4 +115,5 @@ class BlockAllocator:
         This resets the available block count to the entire memory pool
         (except for the dummy block).
         """
+
         self.total_avail = self.total_count - 1
