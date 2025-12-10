@@ -40,7 +40,7 @@ from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, get
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
-from megatron.core.utils import get_asyncio_loop
+from megatron.core.utils import get_asyncio_loop, log_single_rank
 from megatron.rl.agent.api import (
     EvaluationRequest,
     EvaluationResponse,
@@ -62,7 +62,7 @@ from megatron.training.global_vars import (
     get_wandb_writer,
 )
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
-from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
+from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range
 
 logger = logging.getLogger(__name__)
 
@@ -435,12 +435,12 @@ class SequencePacker:
             avg_seqs_per_bin = sum(sequences_per_bin) / len(sequences_per_bin)
             min_seqs = min(sequences_per_bin)
             max_seqs = max(sequences_per_bin)
-            print_rank_0(
+            log_single_rank(logger, logging.INFO, (
                 f"[SequencePacker] Packing distribution: {num_bins} bins, "
                 f"avg {avg_seqs_per_bin:.1f} seqs/bin, "
                 f"min {min_seqs}, max {max_seqs} seqs/bin "
                 f"(limit: {self.max_sequences_per_bin})"
-            )
+            ))
             # Store for later use
             self.last_avg_seqs_per_bin = avg_seqs_per_bin
 
@@ -694,7 +694,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             inference_interface=inference_interface,
             generation_args={
                 'temperature': args.grpo_default_temperature,
-                'max_tokens': args.seq_length,
+                'max_tokens': args.inference_max_seq_length,
                 'top_p': args.grpo_default_top_p,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
@@ -745,7 +745,7 @@ def get_environment_rollouts(
             rank = torch.distributed.get_rank()
             with nvtx_range("collect-rollouts"):
                 if rank == 0:
-                    print(f"Collecting rollouts on rank {rank}, Iteration {args.curr_iteration}...")
+                    log_single_rank(logger, logging.INFO, f"Collecting rollouts, Iteration {args.curr_iteration}...")
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
                     ]
@@ -764,7 +764,7 @@ def get_environment_rollouts(
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
-        print(f"Got rollouts on rank {rank}")
+        logger.debug(f"Got rollouts on rank {rank}")
 
     if lang_rl_log_dir and rank == get_tensor_model_parallel_src_rank():
         with open(
@@ -1076,7 +1076,7 @@ def prepare_trajectories(
         if not tokenizer.pad:
             for pad_token in DEFAULT_PAD_TOKENS:
                 if pad_token in tokenizer.vocab:
-                    print_rank_0(f"Updating tokenizer pad token to {pad_token}")
+                    log_single_rank(logger, logging.INFO, f"Updating tokenizer pad token to {pad_token}")
                     tokenizer._tokenizer.pad_token_id = tokenizer.vocab[pad_token]
                     break
             else:
@@ -1085,11 +1085,9 @@ def prepare_trajectories(
         assert "<SPECIAL_233>" in tokenizer.vocab, "Pad token is NOT in the tokenizer"
         tokenizer._pad_id = tokenizer.vocab["<SPECIAL_233>"]
 
-    print_rank_0(
-        f"Tokenizer vocab size: {tokenizer.vocab_size}\n"
-        f"Tokenizer PAD: '{tokenizer.detokenize([tokenizer.pad])} ({tokenizer.pad})'\n"
-        f"Tokenizer EOD: '{tokenizer.detokenize([tokenizer.eod])} ({tokenizer.eod})'"
-    )
+    log_single_rank(logger, logging.INFO, f"Tokenizer vocab size: {tokenizer.vocab_size}")
+    log_single_rank(logger, logging.INFO, f"Tokenizer PAD: '{tokenizer.detokenize([tokenizer.pad])} ({tokenizer.pad})'")
+    log_single_rank(logger, logging.INFO, f"Tokenizer EOD: '{tokenizer.detokenize([tokenizer.eod])} ({tokenizer.eod})'")
 
     trajs = []
     generation_masks = []
@@ -1129,10 +1127,9 @@ def prepare_trajectories(
             env_id = rollout.env_id
             env_id_counts[env_id] += 1
 
-    print(
-        "Rollout counts:"
-        + "".join([f"\n\t{env_id}: {count}" for env_id, count in env_id_counts.items()])
-    )
+    logger.info(f"[{dist.get_rank()}] Rollout counts:")
+    for env_id, count in env_id_counts.items():
+        logger.info(f"[{dist.get_rank()}] \t{env_id}: {count}")
 
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')
     trajs = torch.tensor(trajs, device='cpu')
@@ -1362,16 +1359,13 @@ def prepare_data_for_update(
                 ) = packer.pack_sequences(traj_list, generation_masks)
 
                 rank = mpu.get_expert_data_parallel_rank()
-                # Debug: Check packing output
-                if rank == 0:
-                    seq_per_bin = [len(indices) for indices in packing_info['bin_seq_indices']]
-                    print(f"\nDEBUG: Initial packing output (before distribution):")
-                    print(f"  - Total bins created: {len(packing_info['bin_seq_indices'])}")
-                    print(f"  - Total sequences packed: {sum(seq_per_bin)}")
-                    print(
-                        f"  - Sequences per bin: min={min(seq_per_bin)}, max={max(seq_per_bin)}, avg={sum(seq_per_bin)/len(seq_per_bin):.1f}"
-                    )
-                    print(f"  - First 20 bins: {seq_per_bin[:20]}")
+
+                seq_per_bin = [len(indices) for indices in packing_info['bin_seq_indices']]
+                log_single_rank(logger, logging.DEBUG, (f"Initial packing output (before distribution):"))
+                log_single_rank(logger, logging.DEBUG, f"  - Total bins created: {len(packing_info['bin_seq_indices'])}")
+                log_single_rank(logger, logging.DEBUG, f"  - Total sequences packed: {sum(seq_per_bin)}")
+                log_single_rank(logger, logging.DEBUG, f"  - Sequences per bin: min={min(seq_per_bin)}, max={max(seq_per_bin)}, avg={sum(seq_per_bin)/len(seq_per_bin):.1f}")
+                log_single_rank(logger, logging.DEBUG, f"  - First 20 bins: {seq_per_bin[:20]}")
 
                 # Store packing info for later unpacking
                 # Also store the actual padded length in packing_info for the unpacker
@@ -1484,18 +1478,13 @@ def prepare_data_for_update(
                     packing_context['packed_inference_logprobs'] = packed_inference_logprobs
 
                 # Debug: Check what we're extracting
-                if rank == 0:
-                    print(f"\nDEBUG: Rank 0 {packing_algo} bin assignment:")
-                    print(f"  - Total bins before distribution: {num_bins}")
-                    print(
-                        f"  - Bins assigned to rank 0: {my_bin_indices[:10]}... (showing first 10)"
-                    )
-                    print(f"  - Number of bins for this rank: {len(my_bin_indices)}")
-                    print(f"  - Length of my_bin_seq_indices: {len(my_bin_seq_indices)}")
-                    if len(my_bin_seq_indices) > 0:
-                        print(
-                            f"  - Sequences in first 5 bins: {[len(indices) for indices in my_bin_seq_indices[:5]]}"
-                        )
+                log_single_rank(logger, logging.DEBUG, (f"Rank 0 {packing_algo} bin assignment:"))
+                log_single_rank(logger, logging.DEBUG, f"  - Total bins before distribution: {num_bins}")
+                log_single_rank(logger, logging.DEBUG, f"  - Bins assigned to rank 0: {my_bin_indices[:10]}... (showing first 10)")
+                log_single_rank(logger, logging.DEBUG, f"  - Number of bins for this rank: {len(my_bin_indices)}")
+                log_single_rank(logger, logging.DEBUG, f"  - Length of my_bin_seq_indices: {len(my_bin_seq_indices)}")
+                if len(my_bin_seq_indices) > 0:
+                    log_single_rank(logger, logging.DEBUG, f"  - Sequences in first 5 bins: {[len(indices) for indices in my_bin_seq_indices[:5]]}")
 
                 # Create updated packing info for this rank
                 packing_info = {
@@ -1610,18 +1599,14 @@ def prepare_data_for_update(
                     global_avg_seqs_per_bin = 1  # Default to 1 if no bins
                 packing_context['global_avg_seqs_per_bin'] = global_avg_seqs_per_bin
 
-                print_rank_0(f"\n[Sequence Packing] Statistics:")
-                print_rank_0(f"  - Total sequences: {len(packing_info['seq_lengths'])}")
-                print_rank_0(f"  - Total bins: {num_bins}")
-                print_rank_0(f"  - Bin size: {packed_trajs.shape[1]} tokens")
-                print_rank_0(f"  - Average sequence length: {avg_seq_length:.1f} tokens")
-                print_rank_0(f"  - Average sequences per bin: {global_avg_seqs_per_bin:.1f}")
-                print_rank_0(
-                    f"  - This rank: {my_sequences} sequences in {packed_trajs.shape[0]} bins"
-                )
-                print_rank_0(
-                    f"  - Packing efficiency: {packing_efficiency:.1%} ({my_tokens:,} / {total_capacity:,} tokens)"
-                )
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing] Statistics:")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Total sequences: {len(packing_info['seq_lengths'])}")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Total bins: {num_bins}")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Bin size: {packed_trajs.shape[1]} tokens")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Average sequence length: {avg_seq_length:.1f} tokens")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Average sequences per bin: {global_avg_seqs_per_bin:.1f}")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - This rank: {my_sequences} sequences in {packed_trajs.shape[0]} bins")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Packing efficiency: {packing_efficiency:.1%} ({my_tokens:,} / {total_capacity:,} tokens)")
 
                 # Add detailed per-rank sequence distribution analysis
                 if torch.distributed.is_initialized():
@@ -1658,15 +1643,9 @@ def prepare_data_for_update(
 
                     # Print detailed statistics for each rank
                     if rank == 0:
-                        print(
-                            f"\n[Sequence Packing] Per-rank distribution ({packing_algo} algorithm):"
-                        )
-                        print(
-                            "  Rank | Total Bins | Non-empty | Sequences | Min/Bin | Max/Bin | Avg/Bin"
-                        )
-                        print(
-                            "  -----|------------|-----------|-----------|---------|---------|--------"
-                        )
+                        log_single_rank(logger, logging.INFO,f"[Sequence Packing] Per-rank distribution ({packing_algo} algorithm):")
+                        log_single_rank(logger, logging.INFO, "[Sequence Packing]  Rank | Total Bins | Non-empty | Sequences | Min/Bin | Max/Bin | Avg/Bin")
+                        log_single_rank(logger, logging.INFO, "[Sequence Packing]  -----|------------|-----------|-----------|---------|---------|--------")
                         for stats in all_rank_stats:
                             r = int(stats[0].item())
                             total_bins = int(stats[1].item())
@@ -1675,12 +1654,10 @@ def prepare_data_for_update(
                             min_seq = int(stats[4].item())
                             max_seq = int(stats[5].item())
                             avg_seq = stats[6].item()
-                            print(
-                                f"   {r:3d} | {total_bins:10d} | {non_empty:9d} | {sequences:9d} | {min_seq:7d} | {max_seq:7d} | {avg_seq:6.1f}"
-                            )
+                            log_single_rank(logger, logging.INFO, f"[Sequence Packing]   {r:3d} | {total_bins:10d} | {non_empty:9d} | {sequences:9d} | {min_seq:7d} | {max_seq:7d} | {avg_seq:6.1f}")
 
                         # Also show first few bins for rank 0 as example
-                        print(f"\n  Example (Rank 0 first 10 bins): {seq_counts_per_bin[:10]}")
+                        log_single_rank(logger, logging.INFO, f"[Sequence Packing]  Example (Rank 0 first 10 bins): {seq_counts_per_bin[:10]}")
 
                         # Show the improvement from round-robin
                         total_seqs_all_ranks = sum(int(stats[3].item()) for stats in all_rank_stats)
@@ -1689,11 +1666,9 @@ def prepare_data_for_update(
                             abs(int(stats[3].item()) - avg_seqs_per_rank)
                             for stats in all_rank_stats
                         )
-                        print(f"\n  Round-robin distribution quality:")
-                        print(f"  - Average sequences per rank: {avg_seqs_per_rank:.1f}")
-                        print(
-                            f"  - Max deviation from average: {max_deviation:.0f} sequences ({max_deviation/avg_seqs_per_rank*100:.1f}%)"
-                        )
+                        log_single_rank(logger, logging.INFO, f"[Sequence Packing]  Round-robin distribution quality:")
+                        log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Average sequences per rank: {avg_seqs_per_rank:.1f}")
+                        log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Max deviation from average: {max_deviation:.0f} sequences ({max_deviation/avg_seqs_per_rank*100:.1f}%)")
 
                 compute_trajs = packing_context['packed_trajs']
                 compute_position_ids = packing_context['packed_position_ids']             
@@ -1974,9 +1949,7 @@ def prepare_data_for_update(
                 }
 
                 if args.micro_batch_size != 1:
-                    print_rank_0(
-                        f"WARNING: micro_batch_size={args.micro_batch_size} but sequence packing expects 1. Using 1."
-                    )
+                    log_single_rank(logger, logging.WARNING, f"WARNING: micro_batch_size={args.micro_batch_size} but sequence packing expects 1. Using 1." )
                 micro_batch_size = 1
 
                 from megatron.core.num_microbatches_calculator import (
@@ -1997,16 +1970,12 @@ def prepare_data_for_update(
 
                 new_num_microbatches = get_num_microbatches()
 
-                print_rank_0(f"\n[Sequence Packing] Multi-step training plan:")
-                print_rank_0(f"  - Target sequences per step: {target_sequences_per_step}")
-                print_rank_0(f"  - Bins per rank per step: {bins_per_rank_per_step}")
-                print_rank_0(
-                    f"  - Estimated sequences per step: ~{int(effective_global_batch_size * global_avg_seqs_per_bin)}"
-                )
-                print_rank_0(f"  - Total optimizer steps: {total_steps}")
-                print_rank_0(
-                    f"  - Microbatches per step: {new_num_microbatches} (was {old_num_microbatches})"
-                )
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing] Multi-step training plan:")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Target sequences per step: {target_sequences_per_step}")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Bins per rank per step: {bins_per_rank_per_step}")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Estimated sequences per step: ~{int(effective_global_batch_size * global_avg_seqs_per_bin)}")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Total optimizer steps: {total_steps}")
+                log_single_rank(logger, logging.INFO, f"[Sequence Packing]  - Microbatches per step: {new_num_microbatches} (was {old_num_microbatches})")
 
                 for step in range(min(3, total_steps)):
                     start_idx = step * bins_per_rank_per_step
@@ -2019,12 +1988,10 @@ def prepare_data_for_update(
                         if bin_idx < len(my_bin_seq_indices)
                     )
                     est_global_seqs = actual_seqs * dp_world_size
-                    print_rank_0(
-                        f"  - Step {step + 1}: {step_bins} bins, ~{est_global_seqs} sequences globally"
-                    )
+                    log_single_rank(logger, logging.INFO, f"  - Step {step + 1}: {step_bins} bins, ~{est_global_seqs} sequences globally")
 
                 if total_steps > 3:
-                    print_rank_0(f"  - ... ({total_steps - 3} more steps)")
+                    log_single_rank(logger, logging.INFO, f"  - ... ({total_steps - 3} more steps)")
 
                 start_idx = 0
                 end_idx = min(bins_per_rank_per_step, num_bins_this_rank)
@@ -2142,15 +2109,12 @@ def setup_grpo_data_iterator(
             )
             # Estimate global sequences for this step
             est_global_sequences = step_sequences * mpu.get_data_parallel_world_size()
-            print_rank_0(
-                f"[Sequence Packing] Optimizer step {plan['current_step']}/{plan['total_steps']}: "
-                f"processing {len(step_bin_indices)} bins (~{est_global_sequences} sequences globally)"
-            )
+            log_single_rank(logger, logging.INFO, f"[Sequence Packing] Optimizer step {plan['current_step']}/{plan['total_steps']}: processing {len(step_bin_indices)} bins (~{est_global_sequences} sequences globally)")
 
             runtime_state.reset_iteration_counters()
 
         else:
-            print_rank_0(f"[Sequence Packing] All bins processed, waiting for new rollouts")
+            log_single_rank(logger, logging.INFO, f"[Sequence Packing] All bins processed, waiting for new rollouts")
             train_data_iterator = buffered_rollouts
     else:
         train_data_iterator = buffered_rollouts
@@ -2195,7 +2159,7 @@ def evaluate_and_print_results_rl(
 
             rank = torch.distributed.get_rank()
             if rank == 0:
-                print(f"Collecting evaluation results on rank {rank}...")
+                logger.info(f"Collecting evaluation results...")
                 agent = get_agent(args)
                 request = EvaluationRequest(
                     inference_interface=inference_interface,
@@ -2242,7 +2206,7 @@ def evaluate_and_print_results_rl(
                             except Exception as e:
                                 lang_rl_log(f"Error: {e}")
                                 lang_rl_log(f"Result: {result}")
-            print(
+            logger.info(
                 "Collected metrics:"
                 + "".join([f"\n\t{k} count: {len(v)}" for k, v in eval_metrics.items()])
             )
@@ -2255,7 +2219,7 @@ def evaluate_and_print_results_rl(
             wandb_writer = get_wandb_writer()
             if wandb_writer:
                 wandb_writer.log(eval_metrics, step=iteration)
-            print(
+            logger.info(
                 "Evaluation results:"
                 + "".join([f"\n\t{k}: {v:0.4f}" for k, v in eval_metrics.items()])
             )
@@ -2310,9 +2274,7 @@ def calculate_grpo_loss(
     """
     # Ensure shapes match before computation
     if current_logprobs.shape != old_logprobs.shape:
-        print_rank_0(
-            f"WARNING: Shape mismatch - current_logprobs: {current_logprobs.shape}, old_logprobs: {old_logprobs.shape}"
-        )
+        log_single_rank(logger, logging.WARNING, f"WARNING: Shape mismatch - current_logprobs: {current_logprobs.shape}, old_logprobs: {old_logprobs.shape}")
 
     ratios = (current_logprobs - old_logprobs).exp()
     clamped_ratios = ratios.clamp(1 - clamp_eps_lower, 1 + clamp_eps_upper)
@@ -2390,7 +2352,7 @@ def megatron_rl_inference_mode(
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
-    print(f"[{dist.get_rank()}:DP] Entering inference mode")
+    logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
@@ -2421,8 +2383,8 @@ def megatron_rl_inference_mode(
                 assert (
                     reset_cuda_graphs
                 ), "reset_cuda_graphs must be True when offloading kv cache during training"
-                print(
-                    f"[{dist.get_rank()}:DP] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
+                logger.debug(
+                    f"[{dist.get_rank()}] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
                 kv_cache = inference_interface._inference_engine.context.memory_buffer
                 inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
@@ -2443,7 +2405,7 @@ def megatron_rl_inference_mode(
 
         loop.run_until_complete(inference_interface.resume())
 
-        print(f"[{dist.get_rank()}:DP] Entered inference mode")
+        logger.debug(f"[{dist.get_rank()}] Entered inference mode")
         yield inference_interface
 
         with nvtx_range("suspend-engine"):
@@ -2452,8 +2414,8 @@ def megatron_rl_inference_mode(
         with nvtx_range("offload-kv-cache-after-inference"):
             if offload_kv_cache_during_training:
                 kv_cache = inference_interface._inference_engine.context.memory_buffer
-                print(
-                    f"[{dist.get_rank()}:DP] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
+                logger.debug(
+                    f"[{dist.get_rank()}] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
                 )
                 inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
             elif remove_kv_cache_during_training:
@@ -2472,7 +2434,7 @@ def megatron_rl_inference_mode(
         if has_lru_cache:
             rotary_module.forward.cache_clear()
 
-        print(f"[{dist.get_rank()}:DP] Exiting inference mode")
+        logger.debug(f"[{dist.get_rank()}] Exiting inference mode")
 
 def rl_inference_interface_shutdown():
     if _INFERENCE_INTERFACE is not None:

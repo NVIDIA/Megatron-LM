@@ -414,6 +414,8 @@ def validate_args(args, defaults={}):
         if args.rl_use_sequence_packing:
             assert args.seq_length <= args.rl_sequence_packing_bin_size, \
                 f"rl_sequence_packing_bin_size should be larger than or equal to seq_length"
+            assert args.micro_batch_size == 1, \
+                "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the packing bin size."
 
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
@@ -1560,9 +1562,11 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
-    group.add_argument('--inference-wandb-logging-step-interval', type=int, default=0,
-                       help='Step interval for logging inference metrics to wandb. '
-                            'Default to 0 to disable inference wandb logging.')
+    group.add_argument('--inference-logging-step-interval', type=int, default=0,
+                       help='Step interval for logging inference metrics. '
+                            'Default to 0 to disable inference logging.')
+    group.add_argument('--inference-wandb-logging', action=argparse.BooleanOptionalAction, required=False, default=False,
+                       help='Enable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int, default=12346,
                        help="This port will be used to setup the inference coordinator on node-0")
     return parser

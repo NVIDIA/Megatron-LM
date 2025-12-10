@@ -1050,8 +1050,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if (
             self.inference_logging_step_interval > 0
-            and step_count > 0
-            and step_count % self.inference_logging_step_interval == 0
+            and self.step_count > 0
+            and self.step_count % self.inference_logging_step_interval == 0
             and self.context.metrics_writer is not None
         ):
             kvcache_util_stats = self.context.get_kvcache_utilization_stats()
@@ -1189,7 +1189,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
         # Print context state.
-        if verbose:
+        if verbose and self.inference_logging_step_interval and step_count % self.inference_logging_step_interval == 1:
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
