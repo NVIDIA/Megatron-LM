@@ -458,6 +458,15 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
             _restore_dict_types(x_val, templ_val)
 
 
+@dataclass
+class MCoreMetadata(Metadata):
+    """Metadata with mcore specific data."""
+
+    # holds data related to flattened_range
+    # TODO: remove when flattened_range is properly removed
+    mcore_data: Optional[Dict[str, Dict[str, Any]]] = None  # Mcore related data about each tensor
+
+
 @dataclass(frozen=True)
 class MCoreSavePlan(SavePlan):
     """SavePlan with MCore specific data."""
@@ -530,9 +539,10 @@ class MCoreSavePlanner(DefaultSavePlanner):
     def create_global_plan(self, all_plans: List[MCoreSavePlan]) -> Tuple[List[SavePlan], Metadata]:
         """Merges MCore data for all plans."""
         global_plan, metadata = super().create_global_plan(all_plans)
-        metadata.mcore_data = dict(
+        mcore_data = dict(
             ChainMap(*(plan.mcore_data for plan in all_plans))  # type: ignore[arg-type]
         )
+        metadata = MCoreMetadata(mcore_data=mcore_data, **vars(metadata))
         return global_plan, metadata
 
     def create_decentralized_global_plan(self, local_plan: SavePlan) -> SavePlan:

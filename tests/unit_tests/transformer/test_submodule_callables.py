@@ -8,6 +8,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     DummyNode,
+    DummyState,
     build_data,
     compare_captures,
     deterministic_mode,
@@ -65,9 +66,14 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     callables, dw = build_layer_callables(model)
     attn, post_attn, dispatch, moe, combine, post_process = callables
     assert post_process is None
+    dummy_model = DummyState()
+    dummy_model.decoder = DummyState()
+    dummy_model.decoder.final_layernorm = None
     for i in range(microbatches):
         # build mock func/state
         node = DummyNode()
+        node.is_mtp = False
+        node.chunk_state.model = dummy_model
 
         # attn fwd
         hidden_states = attn(node, input_tensors[i])
@@ -137,7 +143,7 @@ class TestTransformerLayerSubmoduleCallables:
             "moe_permute_fusion": permute_fusion,
         }
         if dispatcher_type == "flex":
-            extra_kwargs["moe_enable_deepep"] = True
+            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
             extra_kwargs["moe_router_dtype"] = "fp32"
         config = get_test_config(extra_kwargs=extra_kwargs, moe_grouped_gemm=grouped_gemm)
         microbatches = 4

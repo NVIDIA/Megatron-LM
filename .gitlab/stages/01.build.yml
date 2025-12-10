@@ -1,5 +1,7 @@
 .build_rules:
   rules:
+    - if: $BUILD == "no"
+      when: never
     - when: on_success
   stage: test
 
@@ -51,11 +53,13 @@ test:build_image:
   parallel:
     matrix:
       - IMAGE: CI_MCORE_LTS_IMAGE
-        FILE: Dockerfile.ci.lts
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+        FILE: Dockerfile.ci.dev
+        IMAGE_TYPE: lts
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.09-py3
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.06-py3
+        IMAGE_TYPE: dev
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.09-py3
       - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10

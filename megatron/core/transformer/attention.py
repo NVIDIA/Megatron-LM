@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
@@ -23,12 +23,14 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
+    get_pg_rank,
     get_pg_size,
     is_fa_min_version,
     is_te_min_version,
@@ -48,14 +50,25 @@ except ImportError:
     rearrange = None
 
 try:
-    from flashattn_hopper.flash_attn_interface import _flash_attn_forward
-    from flashattn_hopper.flash_attn_interface import (
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
 
     HAVE_FA3 = True
-except:
+except ImportError as e:
     HAVE_FA3 = False
+
+if not HAVE_FA3:
+    try:
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            flash_attn_with_kvcache as flash_attn3_with_kvcache,
+        )
+
+        HAVE_FA3 = True
+    except ImportError as e:
+        pass
 
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
@@ -141,6 +154,7 @@ class Attention(MegatronModule, ABC):
 
         self.config = config
         self.layer_number = layer_number
+
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
 
@@ -165,16 +179,38 @@ class Attention(MegatronModule, ABC):
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
-        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        if self.config.num_query_groups < world_size:
+            # When num_kv_heads < tp_size, each TP rank (post AG) initially produces
+            # activations for 1 kv_head and (num_q_heads / num_kv_heads) q_heads.
+            # We then pull out the appropriate (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = 1
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, self.config.num_query_groups
+            )
+        else:
+            # When num_kv_heads >= tp_size, each TP rank produces activations for
+            # (num_kv_heads / tp_size) kv_heads and (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, world_size
+            )
+        self.world_size = world_size
 
         # To support both CUDA Graphs and key value with different hidden size
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
+        if self.config.num_query_groups < world_size:
+            # TE throws an assertion error if num_kv_heads / num_query_groups
+            # is not divisible by TP size.
+            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = world_size
+        else:
+            tmp_config = self.config
         self.core_attention = build_module(
             submodules.core_attention,
-            config=self.config,
+            config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
@@ -205,12 +241,17 @@ class Attention(MegatronModule, ABC):
 
         if (
             HAVE_TE
-            and self.config.fp8
-            and self.config.fp8_recipe != 'delayed'
-            and is_te_min_version("2.6.0dev0")
             and isinstance(self.linear_proj, TELinear)
+            and (
+                (
+                    self.config.fp8
+                    and self.config.fp8_recipe != 'delayed'
+                    and is_te_min_version("2.6.0dev0")
+                )
+                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
+            )
         ):
-            # For fp8 training, the output of the fused core_attn is saved by itself, and
+            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
             # linear_proj also saves the quantized tensor of this output. Here we set the
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
@@ -266,6 +307,19 @@ class Attention(MegatronModule, ABC):
             dim,
             dtype=dtype,
             device=torch.cuda.current_device(),
+        )
+
+    def _get_pp_layer_offset_for_inference(self):
+        """Return the pipeline parallel layer offset for inference."""
+        assert (
+            self.config.virtual_pipeline_model_parallel_size is None
+        ), "Virtual pipeline parallelism is not supported for inference"
+
+        # Import here to avoid circular imports
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+        return get_transformer_layer_offset(
+            self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
         )
 
     def _adjust_key_value_for_inference(
@@ -333,9 +387,15 @@ class Attention(MegatronModule, ABC):
                     inference_context.key_value_memory_dict[self.layer_number]
                 )
 
-        if not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0:
+        if (
+            not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0
+        ) and (not self.training or not is_te_min_version("2.2.0")):
             # This should mean that we are past the prompt forward_step
             # and so we need to turn off masking
+            # Note: in ModelOpt, we may use inference_context for speculative decoding
+            # in training. In that case, we do not want to turn off masking as we need
+            # customized attention mask for speculative decoding.
+
             attn_mask_type = AttnMaskType.no_mask
 
         if inference_context.is_static_batching():
@@ -406,6 +466,8 @@ class Attention(MegatronModule, ABC):
             key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
             value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
         else:
+            pp_layer_offset = self._get_pp_layer_offset_for_inference()
+
             # Apply rotary embeddings before appending KV cache.
             if inference_context.use_flashinfer_fused_rope and (rotary_pos_cos_sin is not None):
                 query, key = inference_context.apply_fused_qk_rotary_emb(
@@ -420,17 +482,23 @@ class Attention(MegatronModule, ABC):
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
 
             # Append key/value data tensors to cache.
-            inference_context.append_key_value_cache(self.layer_number, key, value)
+            inference_context.append_key_value_cache(
+                self.layer_number - pp_layer_offset, key, value
+            )
 
             _, max_seqlen_q = inference_context.cu_query_lengths()
             if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
                 # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
-                kv_cache, _, block_table = inference_context.key_value_cache(self.layer_number)
+                kv_cache, _, block_table = inference_context.key_value_cache(
+                    self.layer_number - pp_layer_offset
+                )
                 # Uncompress the KV cache for prefill/mixed mode
                 key, value = self.uncompress_kv_from_cache(kv_cache)
             else:
                 # Read key/value *pointer* tensors from cache.
-                key, value, block_table = inference_context.key_value_cache(self.layer_number)
+                key, value, block_table = inference_context.key_value_cache(
+                    self.layer_number - pp_layer_offset
+                )
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
     @abstractmethod
@@ -509,7 +577,7 @@ class Attention(MegatronModule, ABC):
             cu_seqlens_q (Tensor): Cumulative query sequence lengths.
             cu_seqlens_k (Tensor): Cumulative key sequence lengths.
             seqlens_k (Tensor): key sequence lengths.
-            block_table (Tensor): KV cache chunk ids for all samples.
+            block_table (Tensor): KV cache block ids for all samples.
         Return:
             (Tensor) Attention output.
         """
@@ -773,7 +841,7 @@ class Attention(MegatronModule, ABC):
 
         if (
             in_decode_mode
-            and self.config.enable_cuda_graph
+            and self.config.cuda_graph_impl == "local"
             and self.config.cuda_graph_scope != "full_iteration"
             and inference_context.is_static_batching()
         ):
@@ -1066,6 +1134,26 @@ class SelfAttention(Attention):
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
 
+        if self.config.num_query_groups < self.world_size:
+            # Note that weights are interleaved in the following manner:
+            # q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ...
+            # When tp_size > num_kv_heads, we split "q1 q2 k1 v1" over multiple
+            # ranks, so a rank does not have a clean partitioning of just the q_heads
+            # it needs. Instead, we perform the following steps:
+            # 1. Assemble the full "q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ..."
+            #    through an AG.
+            # 2. Pull out the right slice (e.g., "q1 q2 k1 v1" or "q3 q4 k2 v2").
+            # 3. Split q_heads (e.g., q1, q2), k_heads (e.g., k1), v_heads (e.g., v1).
+            # 4. Further index into query to get only the q_heads that this rank is
+            #    responsible for (e.g., q1).
+            # The block of code below performs steps 1 and 2.
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
+            idx = get_tensor_model_parallel_rank() // (
+                self.world_size // self.config.num_query_groups
+            )
+            size = mixed_qkv.size()[-1] // self.config.num_query_groups
+            mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
+
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
@@ -1104,6 +1192,18 @@ class SelfAttention(Attention):
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
+        if self.config.num_query_groups < self.world_size:
+            # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
+            # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
+            # This is step 4 in the list of steps above.
+            idx = get_tensor_model_parallel_rank() % (
+                self.world_size // self.config.num_query_groups
+            )
+            size = self.num_attention_heads_per_partition // (
+                self.world_size // self.config.num_query_groups
+            )
+            query = query[:, :, idx * size : (idx + 1) * size, :]
+
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)
 
@@ -1129,7 +1229,7 @@ class SelfAttention(Attention):
         self.linear_proj.backward_dw()
 
     def set_for_recompute_input_layernorm(self):
-        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
         set_save_original_input(self.linear_qkv)

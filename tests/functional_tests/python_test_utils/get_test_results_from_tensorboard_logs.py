@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
     default=False,
 )
 @click.option("--step-size", required=False, default=5, type=int, help="Step size of sampling")
-@click.option("--step-size", required=False, default=5, type=int, help="Step size of sampling")
 def collect_train_test_metrics(
     logs_dir: str,
     train_iters: str,

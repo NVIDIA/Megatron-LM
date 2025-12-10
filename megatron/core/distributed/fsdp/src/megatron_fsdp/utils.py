@@ -167,13 +167,10 @@ def get_mesh_names(device_mesh: Optional[DeviceMesh] = None) -> list[str]:
         submesh_dim_name
         for child_mesh, root_mesh in _mesh_resources.child_to_root_mapping.items()
         for submesh_dim_name in (child_mesh.mesh_dim_names or [])
-        if root_mesh == device_mesh
+        # Add flattened or other unaccounted for children of the root mesh.
+        if root_mesh == device_mesh and submesh_dim_name not in mesh_dim_names
     ]
-    # Combine without duplicate dimensions.
-    for dim_name in submesh_dim_names:
-        if dim_name not in mesh_dim_names:
-            mesh_dim_names.append(dim_name)
-    return mesh_dim_names
+    return mesh_dim_names + submesh_dim_names
 
 
 def contains_submesh(
@@ -675,6 +672,7 @@ class FSDPDistributedIndex:
         tp_dim: Optional[str] = None,
         hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
         hsdp_outer_dp_shard: bool = False,
+        expt_device_mesh: Optional[DeviceMesh] = None,
     ):
         """
         Args:
@@ -691,6 +689,8 @@ class FSDPDistributedIndex:
                 in hybrid FSDP. Specifying outer sharding will lift the bucket sharding
                 coordinate system to flattened ranks of (dp_shard, dp_outer) instead of
                 just sharding across dp_shard ranks and replicating across dp_outer ranks.
+            expt_device_mesh (Optional[DeviceMesh]): The expert parallel device mesh
+                to use for the DistributedIndex.
         """
         # Device mesh arguments.
         self.device_mesh = device_mesh
@@ -701,6 +701,11 @@ class FSDPDistributedIndex:
         self.use_hybrid_fsdp = dp_outer_dim is not None
         # Helper flag to denote if we are outer-sharding in hybrid FSDP.
         self.hsdp_outer_dp_shard = hsdp_outer_dp_shard
+        self.expt_device_mesh = expt_device_mesh
+
+        # Handling the situation where M-Core MoE EP=1
+        if self.expt_device_mesh is None:
+            self.expt_device_mesh = device_mesh
 
         # Hybrid FSDP Process Groups
         # Retrieve the FSDP process group from the DeviceMesh.
@@ -719,6 +724,14 @@ class FSDPDistributedIndex:
         # combination of the outer-FSDP and FSDP process groups.
         self.hybrid_fsdp_group = hybrid_fsdp_group
 
+        # Retrieve the expert parallel process groups from the DeviceMesh.
+        self.expt_fsdp_group = (
+            self.expt_device_mesh[self.dp_shard_dim].get_group()
+            if self.expt_device_mesh is not None
+            and contains_submesh(self.expt_device_mesh, self.dp_shard_dim)
+            else None
+        )
+
         """
         Store a persistent reference to the core device meshes that back Megatron-FSDP.
         This is necessary because _MeshEnv (_mesh_resources) may not persist:
@@ -732,26 +745,33 @@ class FSDPDistributedIndex:
         FIXME(@cspades): Identify the root cause of this behavior.
         """
         self.mesh_library = {}
-        # TP Mesh
+
+        def register_submesh(device_mesh, submesh, is_expert_parallel):
+            """Register a submesh with identifier: (*submesh, is_expert_parallel)
+            in the mesh library."""
+            if contains_submesh(device_mesh, submesh):
+                submesh_identifier = tuple(list(submesh) + [is_expert_parallel])
+                self.mesh_library[submesh_identifier] = device_mesh[submesh]
+
+        # Define common submesh patterns
         tp_submesh = (self.tp_dim,)
-        if contains_submesh(self.device_mesh, tp_submesh):
-            self.mesh_library[tp_submesh] = self.device_mesh[tp_submesh]
-        # HSDP-TP Mesh
         hsdp_tp_submesh = (self.dp_outer_dim, self.dp_shard_dim, self.tp_dim)
-        if contains_submesh(self.device_mesh, hsdp_tp_submesh):
-            self.mesh_library[hsdp_tp_submesh] = self.device_mesh[hsdp_tp_submesh]
-        # FSDP-TP Mesh
         fsdp_tp_submesh = (self.dp_shard_dim, self.tp_dim)
-        if contains_submesh(self.device_mesh, fsdp_tp_submesh):
-            self.mesh_library[fsdp_tp_submesh] = self.device_mesh[fsdp_tp_submesh]
-        # HSDP Mesh
         hsdp_submesh = (self.dp_outer_dim, self.dp_shard_dim)
-        if contains_submesh(self.device_mesh, hsdp_submesh):
-            self.mesh_library[hsdp_submesh] = self.device_mesh[hsdp_submesh]
-        # FSDP Mesh
         fsdp_submesh = (self.dp_shard_dim,)
-        if contains_submesh(self.device_mesh, fsdp_submesh):
-            self.mesh_library[fsdp_submesh] = self.device_mesh[fsdp_submesh]
+
+        # Register non-EP submeshes
+        register_submesh(self.device_mesh, tp_submesh, False)
+        register_submesh(self.device_mesh, hsdp_tp_submesh, False)
+        register_submesh(self.device_mesh, fsdp_tp_submesh, False)
+        register_submesh(self.device_mesh, hsdp_submesh, False)
+        register_submesh(self.device_mesh, fsdp_submesh, False)
+
+        # Register EP submeshes
+        if self.expt_device_mesh is not None:
+            register_submesh(self.expt_device_mesh, tp_submesh, True)
+            register_submesh(self.expt_device_mesh, fsdp_tp_submesh, True)
+            register_submesh(self.expt_device_mesh, fsdp_submesh, True)
 
         # Validate FSDP arguments.
         if self.fsdp_group is None:
@@ -776,36 +796,54 @@ class FSDPDistributedIndex:
                     "process groups or sub-meshes."
                 )
 
-    def get_submesh(self, mesh_dim_names: str | Sequence[str]) -> DeviceMesh:
+    def get_submesh(
+        self, mesh_dim_names: str | Sequence[str], is_expert_parallel: bool = False
+    ) -> DeviceMesh:
         """
-        Retrieve an Megatron-FSDP-registered sub-mesh by name(s).
+        Retrieve an Megatron-FSDP-registered submesh by name(s).
         """
         if isinstance(mesh_dim_names, str):
             mesh_dim_names = (mesh_dim_names,)
-        # Search for the sub-mesh in the mesh library.
-        device_submesh = self.mesh_library.get(tuple(mesh_dim_names), None)
+
+        # Construct submesh identifier: (*mesh_dim_names, is_expert_parallel)
+        submesh_identifier = tuple(list(mesh_dim_names) + [is_expert_parallel])
+
+        # Retrieve the submesh from the mesh library
+        device_submesh = self.mesh_library.get(submesh_identifier, None)
+
         if device_submesh is None:
-            if self.tp_dim is None:
-                # Warn about not specifying tp_dim for
-                # layers or frameworks that depend on this.
+            # Warn about not specifying tp_dim for layers or frameworks that depend on this.
+            if self.tp_dim is None and not is_expert_parallel:
                 logger.warning(
-                    "[FSDPDistributedIndex] Note: For TransformerEngine, or other machine learning "
-                    "frameworks like Megatron that assume TP=1, you must specify tp_dim to use "
-                    "Megatron-FSDP. Create a trivial TP dimension by setting the TP dimension size "
+                    "[FSDPDistributedIndex] Note: For TransformerEngine, or "
+                    "other machine learning frameworks like Megatron that assume "
+                    "TP=1, you must specify tp_dim to use Megatron-FSDP. "
+                    "Create a trivial TP dimension by setting the TP dimension size "
                     "to 1 in the DeviceMesh.\n"
                     f"DeviceMesh: {self.device_mesh}"
                 )
+            elif self.tp_dim is None and is_expert_parallel:
+                logger.warning(
+                    "[FSDPDistributedIndex] Note: For TransformerEngine, or "
+                    "other machine learning frameworks like Megatron that assume "
+                    "ETP=1, you must specify tp_dim to use Megatron-FSDP. "
+                    "Create a trivial ETP dimension by setting the ETP dimension size "
+                    "to 1 in the DeviceMesh.\n"
+                    f"DeviceMesh: {self.expt_device_mesh}"
+                )
+
             raise ValueError(
-                f"[FSDPDistributedIndex][get_submesh] No sub-mesh with "
-                f"mesh_dim_names={mesh_dim_names} has been registered with Megatron-FSDP."
+                f"[FSDPDistributedIndex][get_submesh] No submesh with "
+                f"mesh_dim_names={mesh_dim_names}, is_expert_parallel={is_expert_parallel} "
+                f"has been registered with Megatron-FSDP."
             )
+
         return device_submesh
 
     def get_dp_group(self, is_expert_parallel: bool = False) -> ProcessGroup:
         """Get the data parallel process group."""
         if is_expert_parallel:
-            # Expert parallel is not supported
-            return None
+            return self.expt_fsdp_group
         if self.use_hybrid_fsdp:
             return self.hybrid_fsdp_group
         return self.fsdp_group
@@ -813,8 +851,7 @@ class FSDPDistributedIndex:
     def get_fsdp_group(self, is_expert_parallel: bool = False) -> ProcessGroup:
         """Get the FSDP process group."""
         if is_expert_parallel:
-            # Expert parallel is not supported
-            return None
+            return self.expt_fsdp_group
         return self.fsdp_group
 
     def get_outer_fsdp_group(self) -> ProcessGroup:
@@ -826,7 +863,7 @@ class FSDPDistributedIndex:
     def get_root_mesh(self, is_expert_parallel: bool = False) -> DeviceMesh:
         """Get the device mesh."""
         if is_expert_parallel:
-            raise NotImplementedError("Expert parallel is not supported in Megatron-FSDP.")
+            return self.expt_device_mesh
         return self.device_mesh
 
     def get_logical_hybrid_fsdp_rank(self):
@@ -924,3 +961,29 @@ def create_updated_function_signature(original_function, **extended_kwargs: dict
 
     # Return the updated function signature.
     return inspect.Signature(params)
+
+
+def is_mcore_tensor_model_parallel(param: torch.Tensor) -> bool:
+    """
+    Check if the given parameter is Megatron-Core tensor model parallel.
+    """
+    return getattr(param, "_mcore_tp", False) or getattr(param, "tensor_model_parallel", False)
+
+
+def is_mcore_tensor_parallel_duplicated(param: torch.Tensor) -> bool:
+    """
+    Check if the given parameter is Megatron-Core tensor model parallel and duplicated.
+    """
+    return getattr(param, "_tp_duplicated", False)
+
+
+def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int]:
+    """
+    Get the partition dimension for a Megatron-Core tensor model parallel parameter.
+    """
+    if is_mcore_tensor_model_parallel(param):
+        if hasattr(param, "_tp_partition_dim"):
+            return param._tp_partition_dim
+        else:
+            return param.partition_dim
+    return None

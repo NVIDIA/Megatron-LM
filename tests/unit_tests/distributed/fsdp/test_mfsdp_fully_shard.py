@@ -1,10 +1,12 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import shutil
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
 import torch
-import transformer_engine.pytorch as te
+import transformer_engine as te
 from packaging import version
 from torch.nn.functional import mse_loss
 from torch.optim import Adam
@@ -111,13 +113,13 @@ class ToyTETransformer(torch.nn.Module):
         super().__init__()
         self.layers = torch.nn.ModuleList(
             [
-                te.TransformerLayer(
+                te.pytorch.TransformerLayer(
                     hidden_size=model_dim, ffn_hidden_size=model_dim, num_attention_heads=num_heads
                 )
                 for _ in range(num_layers)
             ]
         )
-        self.fc_out = te.Linear(model_dim, output_dim)
+        self.fc_out = te.pytorch.Linear(model_dim, output_dim)
 
     def forward(self, x):
         for layer in self.layers:
@@ -156,7 +158,7 @@ def build_toy_model_and_optimizer(model_type: str, init_model_with_meta_device: 
             toy_model = ToyTETransformer(
                 model_dim=DIM_SIZE, num_heads=2, num_layers=NUM_LAYERS, output_dim=DIM_SIZE
             )
-            fsdp_unit_modules = [te.TransformerLayer]
+            fsdp_unit_modules = [te.pytorch.TransformerLayer]
         toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
     # Return the toy model, optimizer, and FSDP unit modules.
@@ -325,27 +327,19 @@ class TestMegatronFsdpFullyShard:
                 # Because of uneven sharding, we need to gather the result from all ranks
                 # to verify if any gradients exist or not at this step of training.
                 grads_exist_gathered = [None] * sharding_group.size()
-                torch.distributed.gather_object(
-                    grads_exist,
-                    object_gather_list=grads_exist_gathered if sharding_group.rank() == 0 else None,
-                    group=sharding_group,
-                    group_dst=0,
+                torch.distributed.all_gather_object(
+                    object_list=grads_exist_gathered, obj=grads_exist, group=sharding_group
                 )
-                if sharding_group.rank() == 0:
-                    # Gradients exist on at least one of the optimizer sharding ranks.
-                    # Update grads_exist on Rank 0 only.
-                    grads_exist = any(grads_exist_gathered)
-                torch.distributed.barrier()
+                # Gradients exist on at least one of the optimizer sharding ranks.
+                grads_exist = any(grads_exist_gathered)
 
             # Gradients do not exist until synchronization is activated.
-            # Use collected result on Rank 0 only.
-            if sharding_group.rank() == 0:
-                if step == NUM_STEPS - 1:
-                    assert grads_exist, "Root module gradients should exist on final microbatch."
-                else:
-                    assert (
-                        not grads_exist
-                    ), "Root module gradients should not exist prior to optimization step."
+            if step == NUM_STEPS - 1:
+                assert grads_exist, "Root module gradients should exist on final microbatch."
+            else:
+                assert (
+                    not grads_exist
+                ), "Root module gradients should not exist prior to optimization step."
             torch.distributed.barrier()
 
             # Optimizer step. Apply accumulated gradients to the model weights.
@@ -508,7 +502,7 @@ class TestMegatronFsdpFullyShard:
         # Load model from checkpoint.
         ckpt_state_dict = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
         torch.distributed.checkpoint.load(state_dict=ckpt_state_dict, checkpoint_id=str(CKPT_DIR))
-        model.load_state_dict(ckpt_state_dict["model"])
+        model.load_state_dict(ckpt_state_dict["model"], strict=False)
         optimizer.load_state_dict(ckpt_state_dict["optimizer"])
         s2 = deepcopy(model.state_dict())
         o2 = deepcopy(optimizer.state_dict())

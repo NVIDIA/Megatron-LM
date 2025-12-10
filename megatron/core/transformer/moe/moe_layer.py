@@ -23,7 +23,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
-    from megatron.core.extensions.transformer_engine import te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 
     HAVE_TE = True
 except ImportError:
@@ -120,8 +120,34 @@ class MoELayer(BaseMoELayer):
             and "shared_experts" in config.recompute_modules
         )
 
-        # Initialize router
+        # Initialize router.
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+
+        # Initialize latent projections.
+        if self.config.moe_latent_size:
+            assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
+            self.fc1_latent_proj = TELinear(
+                self.config.hidden_size,
+                self.config.moe_latent_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
+            self.fc2_latent_proj = TELinear(
+                self.config.moe_latent_size,
+                self.config.hidden_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -176,6 +202,12 @@ class MoELayer(BaseMoELayer):
         """
         residual = hidden_states
         probs, routing_map = self.router(hidden_states)
+        # Project the hidden_states from hidden dimension down to latent dimenion.
+        if self.config.moe_latent_size:
+            assert (
+                not self.shared_expert_overlap
+            ), "Shared expert overlap not supported when MoE latent projections are used."
+            hidden_states, _ = self.fc1_latent_proj(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
@@ -189,35 +221,42 @@ class MoELayer(BaseMoELayer):
         """
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
-    def experts_compute(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, residual: torch.Tensor
-    ):
-        """Computes the output of the experts on the dispatched tokens.
+    def shared_experts_compute(self, hidden_states: torch.Tensor):
+        """Computes the output of the shared experts.
 
-        This method first post-processes the dispatched input to get permuted tokens
-        for each expert. It then passes the tokens through the local experts.
         If a shared expert is configured and not overlapped with communication,
-        it is also applied. The output from the experts is preprocessed for the
-        combine step.
+        it is computed here.
         """
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
             if self.shared_experts_recompute:
-                if self.config.fp8:
+                if self.config.fp8 or self.config.fp4:
                     shared_expert_output = te_checkpoint(
                         self.shared_experts,
                         False,
                         tensor_parallel.random.get_cuda_rng_tracker,
                         parallel_state.get_tensor_model_parallel_group(),
-                        residual,
+                        hidden_states,
                     )
                 else:
                     shared_expert_output = tensor_parallel.checkpoint(
-                        self.shared_experts, False, residual
+                        self.shared_experts, False, hidden_states
                     )
             else:
-                shared_expert_output = self.shared_experts(residual)
+                shared_expert_output = self.shared_experts(hidden_states)
+
+        return shared_expert_output
+
+    def routed_experts_compute(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, residual: torch.Tensor
+    ):
+        """Computes the output of the routed experts on the dispatched tokens.
+
+        This method first post-processes the dispatched input to get permuted tokens
+        for each expert. It then passes the tokens through the local experts.
+        The output from the experts is preprocessed for the combine step.
+        """
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
@@ -225,7 +264,7 @@ class MoELayer(BaseMoELayer):
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
-        return output, shared_expert_output, mlp_bias
+        return output, mlp_bias
 
     def combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Combines expert outputs via communication and adds shared expert output.
@@ -236,6 +275,10 @@ class MoELayer(BaseMoELayer):
         """
         output = self.token_dispatcher.token_combine(output)
         output = self.token_dispatcher.combine_postprocess(output)
+        # Project the output back from latent dimension to hidden dimension after combine
+        # in latent dimension.
+        if self.config.moe_latent_size:
+            output, _ = self.fc2_latent_proj(output)
         if shared_expert_output is not None:
             output = output + shared_expert_output
         return output
@@ -263,16 +306,17 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
+            shared_expert_output = self.shared_experts_compute(hidden_states)
             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
-            output, shared_expert_output, mlp_bias = self.experts_compute(
-                dispatched_input, probs, residual
-            )
+            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
+            assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
             output = self.combine(output, shared_expert_output)
+
             return output, mlp_bias
 
         if self.moe_layer_recompute:
-            if self.config.fp8:
+            if self.config.fp8 or self.config.fp4:
                 output, mlp_bias = te_checkpoint(
                     custom_forward,
                     False,
@@ -294,7 +338,7 @@ class MoELayer(BaseMoELayer):
             self.shared_experts.backward_dw()
 
     def set_for_recompute_pre_mlp_layernorm(self):
-        """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8."""
+        """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8/fp4."""
         # If shared_experts_recompute is used, nothing needs to be done because the checkpoint
         # function will save the original input tensors.
         if self.shared_experts is not None and not self.shared_experts_recompute:

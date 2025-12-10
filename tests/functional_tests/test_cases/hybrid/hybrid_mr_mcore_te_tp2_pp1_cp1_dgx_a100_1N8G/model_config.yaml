@@ -22,13 +22,13 @@ MODEL_ARGS:
   --seq-length: 1024
   --max-position-embeddings: 1024
   --train-iters: 50
-  --timing-log-level: 2
+  --timing-log-level: 0
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/bpe/merges.txt
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.00015

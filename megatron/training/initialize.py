@@ -128,7 +128,7 @@ def initialize_megatron(
             args.data_parallel_random_init,
             args.te_rng_tracker,
             args.inference_rng_tracker,
-            use_cudagraphable_rng=args.enable_cuda_graph or args.external_cuda_graph,
+            use_cudagraphable_rng=args.cuda_graph_impl != "none",
         )
 
         # Setup MoE aux loss scale value.
@@ -335,7 +335,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             device_id = None
 
         # Set to non-default stream for cudagraph capturing.
-        if args.external_cuda_graph:
+        if args.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
 
         # Call the init process
@@ -346,6 +346,12 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
+        if args.fake_process_group:
+            assert is_torch_min_version("2.3.0"), "Fake process group is only supported with PyTorch 2.3.0 and above."
+            from torch.testing._internal.distributed.fake_pg import FakeStore
+            store = FakeStore()
+            init_process_group_kwargs['backend'] = 'fake'
+            init_process_group_kwargs['store'] = store
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)

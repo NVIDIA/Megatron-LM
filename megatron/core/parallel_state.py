@@ -2,6 +2,7 @@
 
 """Model and data parallel groups."""
 
+import logging
 import os
 import warnings
 from datetime import timedelta
@@ -10,7 +11,9 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
-from .utils import GlobalMemoryBuffer, is_torch_min_version
+from .utils import GlobalMemoryBuffer, GlobalSymmetricMemoryBuffer, is_torch_min_version
+
+logger = logging.getLogger(__name__)
 
 try:
     import einops
@@ -18,6 +21,8 @@ try:
     HAVE_EINOPS = True
 except ImportError:
     HAVE_EINOPS = False
+
+logger = logging.getLogger(__name__)
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -127,6 +132,14 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
+# Global symmetric memory buffer for inference
+_GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
+
+# List of all process groups
+# Used for updating the timeout for all process groups
+# None represents the default process group
+_global_process_group_list = None
+
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
     """Set the NCCL process group options.
@@ -163,6 +176,35 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
         return None
 
 
+def update_pg_timeout(
+    timeout: timedelta, pg: Optional[torch._C._distributed_c10d.ProcessGroup] = None
+):
+    """Update the timeout for all process groups or a specific process group.
+       Synchronize the process groups before updating the timeout.
+    Args:
+        timeout(datetime.timedelta): The timeout to set for the process group(s)
+        pg(Optional[torch._C._distributed_c10d.ProcessGroup], default=None):
+            The process group to update the timeout for.
+            If None, all process groups are updated.
+    """
+    if hasattr(torch.distributed.distributed_c10d, "_set_pg_timeout"):
+        torch.distributed.barrier(pg)
+        torch.cuda.synchronize()
+        try:
+            if pg is None:
+                global _global_process_group_list
+                for group in _global_process_group_list:
+                    torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
+            else:
+                torch.distributed.distributed_c10d._set_pg_timeout(timeout, pg)
+        except Exception as e:
+            logger.error(f"Error updating pg timeout: {e}")
+            logger.error(f"Process group: {pg}")
+            logger.error(f"Timeout: {timeout}")
+            logger.error(f"Global process group list: {_global_process_group_list}")
+            raise e
+
+
 def create_group(
     ranks=None,
     timeout=None,
@@ -190,7 +232,14 @@ def create_group(
             # So need to unset timeout here if caller doesn't set value. Otherwise there is
             # type error.
             kwargs.pop("timeout")
-    return torch.distributed.new_group(**kwargs)
+    group = torch.distributed.new_group(**kwargs)
+    global _global_process_group_list
+    if _global_process_group_list is None:
+        # None stands for the default process group
+        _global_process_group_list = [None]
+    if torch.distributed.get_rank() in ranks:
+        _global_process_group_list.append(group)
+    return group
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -814,7 +863,7 @@ def initialize_model_parallel(
     # Apply SHARP to the dp group.
     if sharp_enabled_group == "dp":
         if rank == 0:
-            print(
+            logger.info(
                 "The number of process groups to use SHARP with depends on the type "
                 "of the network switch. Nvidia QM1 switch supports SAHRP up to 8 "
                 "process groups and QM2 supports up to 256 process groups. We apply "
@@ -1076,6 +1125,7 @@ def initialize_model_parallel(
     for ranks in expert_decoder_rank_generator.get_ranks('ep'):
         group = create_group(
             ranks,
+            timeout=timeout,
             pg_options=get_nccl_options("ep", nccl_comm_cfgs),
             group_desc="EXPERT_MODEL_PARALLEL_GROUP",
         )
@@ -1237,6 +1287,9 @@ def initialize_model_parallel(
     # put this. If we end up with a more generic initialization of megatron-core
     # we could stick it there
     _set_global_memory_buffer()
+
+    # initialize global symmetric memory buffer
+    _set_global_symmetric_memory_buffer()
 
 
 def is_initialized():
@@ -1848,23 +1901,25 @@ def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
         return 0
 
 
-def get_intra_distributed_optimizer_instance_group():
+def get_intra_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group of all GPUs in a distributed optimizer instance."""
-    assert (
-        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
-    ), "Intra distributed optimizer instance group is not initialized"
+    if check_initialized:
+        assert (
+            _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
+        ), "Intra distributed optimizer instance group is not initialized"
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
-def get_inter_distributed_optimizer_instance_group():
+def get_inter_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group spanning the different distributed optimizer instances.
     Attention and MLP/Expert share same inter-instance group, so only built
     inter_partial_expert_data_parallel_group, and return it at here.
     """
-    assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
-        "Attention and MLP/Expert share same inter distributed optimize instance group, "
-        "which has not been initialized"
-    )
+    if check_initialized:
+        assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
+            "Attention and MLP/Expert share same inter distributed optimize instance group, "
+            "which has not been initialized"
+        )
     return _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
 
 
@@ -1878,16 +1933,41 @@ def _set_global_memory_buffer():
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
 
+def _set_global_symmetric_memory_buffer():
+    """Initialize global buffer."""
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is None, "global memory buffer is already initialized"
+
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = GlobalSymmetricMemoryBuffer(
+        size_in_mb=256,  # todo: set from an argument?
+        process_group=get_tensor_model_parallel_group(),
+    )
+
+
 def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""
     assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
     return _GLOBAL_MEMORY_BUFFER
 
 
+def get_global_symmetric_memory_buffer():
+    """Return the global GlobalSymmetricMemoryBuffer object"""
+    assert (
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER is not None
+    ), "global symmetric memory buffer is not initialized"
+    return _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+
+
 def destroy_global_memory_buffer():
     """Sets the global memory buffer to None"""
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
+
+
+def destroy_global_symmetric_memory_buffer():
+    """Sets the global symmetric memory buffer to None"""
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
 
 def get_all_ranks():
@@ -1964,6 +2044,9 @@ def destroy_model_parallel():
 
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
+
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
     global _DATA_PARALLEL_GROUP_GLOO
     if (
@@ -2044,3 +2127,6 @@ def destroy_model_parallel():
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+
+    global _global_process_group_list
+    _global_process_group_list = None

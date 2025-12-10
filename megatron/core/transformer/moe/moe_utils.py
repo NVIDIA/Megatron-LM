@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
 from typing import List, Optional, Union
@@ -6,7 +6,11 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.fp4_utils import get_fp4_align_size
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -376,8 +380,20 @@ def unpermute(
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
-    # Scatter add the permuted_input back to the original positions
-    output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+    if torch.are_deterministic_algorithms_enabled():
+        # Use index_add which is deterministic when deterministic algorithms are enabled
+        # and is CUDA graph compatible
+        output_tokens = torch.zeros(
+            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+        )
+        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
+        # and is CUDA graph compatible unlike scatter_add
+        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
+    else:
+        # Scatter add the permuted_input back to the original positions
+        output_tokens.scatter_add_(
+            0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
+        )
     return output_tokens.to(dtype=input_dtype)
 
 
@@ -589,9 +605,21 @@ def topk_routing_with_score_function(
     if scaling_factor:
         probs = probs * scaling_factor
 
-    # TODO Try using element-wise operations instead of scatter?
-    routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
-    routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+    if torch.are_deterministic_algorithms_enabled():
+        # build [num_tokens, num_experts] from [num_tokens, topk]
+        routing_probs = torch.zeros_like(logits)
+        rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
+        routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
+
+        routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+        routing_map.index_put_(
+            (rows, top_indices), torch.ones_like(probs, dtype=routing_map.dtype), accumulate=False
+        )
+        routing_map = routing_map.bool()
+    else:
+        # TODO Try using element-wise operations instead of scatter?
+        routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     return routing_probs, routing_map
 
@@ -667,14 +695,20 @@ def apply_router_token_dropping(
     )
 
     # Create capacity mask based on drop policy
-    if drop_policy == "probs":
-        _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
-        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
-    elif drop_policy == "position":
-        _, capacity_indices = torch.topk(routing_map.int(), k=expert_capacity, dim=0, sorted=False)
-        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+    if expert_capacity > num_tokens:
+        # No need to drop tokens if capacity exceeds the number of tokens
+        capacity_mask = torch.ones_like(routing_probs).bool()
     else:
-        raise ValueError(f"Invalid drop_policy: {drop_policy}")
+        if drop_policy == "probs":
+            _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
+            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+        elif drop_policy == "position":
+            _, capacity_indices = torch.topk(
+                routing_map.int(), k=expert_capacity, dim=0, sorted=False
+            )
+            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+        else:
+            raise ValueError(f"Invalid drop_policy: {drop_policy}")
 
     # Apply capacity constraints
     if pad_to_capacity:
@@ -695,6 +729,7 @@ def save_to_aux_losses_tracker(
     num_layers: int,
     reduce_group: torch.distributed.ProcessGroup = None,
     avg_group: torch.distributed.ProcessGroup = None,
+    reduce_group_has_dp: bool = False,
 ):
     """Save the auxiliary loss for logging.
     Args:
@@ -703,7 +738,10 @@ def save_to_aux_losses_tracker(
         layer_number (int): Layer index of the loss.
         num_layers (int): The number of total layers.
         reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
-        mean_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+        avg_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+        reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
+            Set this to True if the reduce group has data parallel ranks. This flag is used to
+            ensure the correct reduction in aux loss tracking.
     """
     # Skip aux loss logging if layer_number is None.
     if layer_number is None:
@@ -716,6 +754,7 @@ def save_to_aux_losses_tracker(
     tracker[name]["values"][layer_number - 1] += loss.detach()  # Aggregate the loss for the layer.
     tracker[name]["reduce_group"] = reduce_group
     tracker[name]["avg_group"] = avg_group
+    tracker[name]["reduce_group_has_dp"] = reduce_group_has_dp
 
 
 def clear_aux_losses_tracker():
@@ -740,16 +779,18 @@ def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = No
         # Reduce aux losses across ranks.
         if tracker[name].get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
+            # Need to conduct reduction across data parallel ranks. When the reduce_group
+            # does not have 'dp' attribute, do it manually.
+            if not tracker[name].get('reduce_group_has_dp', False):
+                torch.distributed.all_reduce(
+                    values,
+                    group=parallel_state.get_data_parallel_group(with_context_parallel=False),
+                    op=torch.distributed.ReduceOp.AVG,
+                )
         if tracker[name].get('avg_group') is not None:
             torch.distributed.all_reduce(
                 values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
-        # This ensures proper loss averaging across all ranks including CP ranks
-        torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=True),
-            op=torch.distributed.ReduceOp.AVG,
-        )
 
 
 def track_moe_metrics(
@@ -777,6 +818,7 @@ def track_moe_metrics(
                     tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
+                    tracker[key]["reduce_group_has_dp"] = False
     reduce_aux_losses_tracker_across_ranks(track_names)
 
     # Get number of MoE layers
@@ -881,12 +923,16 @@ class RandomSTE(torch.autograd.Function):
     """
 
     generator = None
+    random_logits = None
 
     @staticmethod
     def forward(ctx, logits):
         """
         Forward pass returns random logits with rank-specific seed.
         """
+        if is_graph_capturing() and RandomSTE.random_logits is not None:
+            return RandomSTE.random_logits
+
         if RandomSTE.generator is None:
             global_rank = torch.distributed.get_rank()
             base_seed = 42
@@ -894,8 +940,8 @@ class RandomSTE(torch.autograd.Function):
             RandomSTE.generator = torch.Generator(device=logits.device)
             RandomSTE.generator.manual_seed(seed)
 
-        random_logits = logits.clone().normal_(generator=RandomSTE.generator)
-        return random_logits
+        RandomSTE.random_logits = logits.clone().normal_(generator=RandomSTE.generator)
+        return RandomSTE.random_logits
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -982,6 +1028,15 @@ def router_gating_linear(
     It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
     """
     return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+
+
+def get_align_size_for_quantization(config: TransformerConfig):
+    """Get the alignment size for quantization."""
+    if config.fp8:
+        return get_fp8_align_size(config.fp8_recipe)
+    elif config.fp4:
+        return get_fp4_align_size(config.fp4_recipe)
+    return 16
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
