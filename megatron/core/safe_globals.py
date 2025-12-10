@@ -3,6 +3,7 @@
 from argparse import Namespace
 from io import BytesIO
 from pathlib import PosixPath
+from signal import Signals
 from types import SimpleNamespace
 
 import torch
@@ -30,6 +31,7 @@ SAFE_GLOBALS = [
     RerunMode,
     RerunState,
     BytesIO,
+    Signals,
 ]
 
 

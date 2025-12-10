@@ -34,7 +34,6 @@ from megatron.core.utils import (
 )
 from megatron.core.activations import squared_relu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
-from megatron.training.dist_signal_handler import SIGNAL_MAP
 from megatron.training.utils import (
     get_device_arch_version,
     update_use_dist_ckpt,
@@ -47,6 +46,8 @@ from megatron.core.quantization.utils import (
     kitchen_quantization_recipe_config,
     load_quantization_recipe,
 )
+
+from megatron.training.argument_utils import ArgumentGroupFactory
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -2062,41 +2063,14 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    group = parser.add_argument_group(title='training')
+    from megatron.training.config import TrainingConfig
 
-    group.add_argument('--micro-batch-size', type=int, default=None,
-                       help='Batch size per model instance (local batch size). '
-                       'Global batch size is local batch size times data '
-                       'parallel size times number of micro batches.')
+    train_factory = ArgumentGroupFactory(TrainingConfig)
+    group = train_factory.build_group(parser, "training")
+
     group.add_argument('--batch-size', type=int, default=None,
                        help='Old batch size parameter, do not use. '
                        'Use --micro-batch-size instead')
-    group.add_argument('--global-batch-size', type=int, default=None,
-                       help='Training batch size. If set, it should be a '
-                       'multiple of micro-batch-size times data-parallel-size. '
-                       'If this value is None, then '
-                       'use micro-batch-size * data-parallel-size as the '
-                       'global batch size. This choice will result in 1 for '
-                       'number of micro-batches.')
-    group.add_argument('--rampup-batch-size', nargs='*', default=None,
-                       help='Batch size ramp up with the following values:'
-                       '  --rampup-batch-size <start batch size> '
-                       '                      <batch size incerement> '
-                       '                      <ramp-up samples> '
-                       'For example:'
-                       '   --rampup-batch-size 16 8 300000 \\ '
-                       '   --global-batch-size 1024'
-                       'will start with global batch size 16 and over '
-                       ' (1024 - 16) / 8 = 126 intervals will increase'
-                       'the batch size linearly to 1024. In each interval'
-                       'we will use approximately 300000 / 126 = 2380 samples.')
-    group.add_argument('--decrease-batch-size-if-needed', action='store_true', default=False,
-                       help='If set, decrease batch size if microbatch_size * dp_size'
-                       'does not divide batch_size. Useful for KSO (Keep Soldiering On)'
-                       'to continue making progress if number of healthy GPUs (and'
-                       'corresponding dp_size) does not support current batch_size.'
-                       'Old batch_size will be restored if training is re-started with'
-                       'dp_size that divides batch_size // microbatch_size.')
     group.add_argument('--recompute-activations', action='store_true',
                        help='recompute activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
@@ -2165,8 +2139,6 @@ def _add_training_args(parser):
                        help='Global step to start profiling.')
     group.add_argument('--profile-step-end', type=int, default=12,
                        help='Global step to stop profiling.')
-    group.add_argument('--iterations-to-skip', nargs='+', type=int, default=[],
-                       help='List of iterations to skip, empty by default.')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--disable-gloo-process-groups', action='store_false',
@@ -2209,47 +2181,19 @@ def _add_training_args(parser):
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None,
                        help='If set, initialize weights on the CPU. This eliminates init differences based on tensor parallelism.')
-    group.add_argument('--empty-unused-memory-level', default=0, type=int,
-                       choices=[0, 1, 2],
-                       help='Call torch.cuda.empty_cache() each iteration '
-                       '(training and eval), to reduce fragmentation.'
-                       '0=off, 1=moderate, 2=aggressive.')
     group.add_argument('--deterministic-mode', action='store_true',
                        help='Choose code that has deterministic execution. This usually '
                        'means slower execution, but is good for debugging and testing.')
-    group.add_argument('--check-weight-hash-across-dp-replicas-interval', type=int, default=None,
-                       help='Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked.')
     group.add_argument('--calculate-per-token-loss', action='store_true',
                        help=('Scale cross entropy loss by the number of non-padded tokens in the '
                              'global batch, versus the default behavior of assuming all tokens are non-padded.'))
-    group.add_argument('--train-sync-interval', type=int, default=None,
-                       help='Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU.')
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
-    group.add_argument('--train-iters', type=int, default=None,
-                       help='Total number of iterations to train over all '
-                       'training runs. Note that either train-iters or '
-                       'train-samples should be provided.')
-    group.add_argument('--train-samples', type=int, default=None,
-                       help='Total number of samples to train over all '
-                       'training runs. Note that either train-iters or '
-                       'train-samples should be provided.')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Report loss and timing interval.')
-    group.add_argument('--exit-interval', type=int, default=None,
-                       help='Exit the program after the iteration is divisible '
-                       'by this value.')
-    group.add_argument('--exit-duration-in-mins', type=int, default=None,
-                       help='Exit the program after this many minutes.')
-    group.add_argument('--exit-signal-handler', action='store_true',
-                       help='Dynamically save the checkpoint and shutdown the '
-                       'training if signal is received')
-    group.add_argument('--exit-signal', type=str, default='SIGTERM',
-                       choices=list(SIGNAL_MAP.keys()),
-                       help='Signal to use for exit signal handler. If not specified, defaults to SIGTERM.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
@@ -2343,22 +2287,6 @@ def _add_training_args(parser):
                        '--use-legacy-models to not use core models.')
     group.add_argument('--use-legacy-models', action='store_true',
                        help='Use the legacy Megatron models, not Megatron-Core models.')
-    group.add_argument('--manual-gc', action='store_true',
-                       help='Disable the threshold-based default garbage '
-                       'collector and trigger the garbage collection manually. '
-                       'Manual garbage collection helps to align the timing of '
-                       'the collection across ranks which mitigates the impact '
-                       'of CPU-associated jitters. When the manual gc is enabled, '
-                       'garbage collection is performed only at the start and the '
-                       'end of the validation routine by default.')
-    group.add_argument('--manual-gc-interval', type=int, default=0,
-                       help='Training step interval to trigger manual garbage '
-                       'collection. When the value is set to 0, garbage '
-                       'collection is not triggered between training steps.')
-    group.add_argument('--no-manual-gc-eval', action='store_false',
-                       help='When using manual garbage collection, disable '
-                       'garbage collection at the start and the end of each '
-                       'evaluation run.', dest='manual_gc_eval')
     group.add_argument('--disable-tp-comm-split-ag', action='store_false',
                        help='Disables the All-Gather overlap with fprop GEMM.',
                        dest='tp_comm_split_ag')
@@ -2853,20 +2781,10 @@ def _add_distributed_args(parser):
 
 
 def _add_validation_args(parser):
-    group = parser.add_argument_group(title='validation')
+    from megatron.training.config import ValidationConfig
 
-    group.add_argument('--full-validation', action='store_true', help='If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!')
-    group.add_argument('--multiple-validation-sets', action='store_true', help='If set, multiple datasets listed in the validation split are evaluated independently with a separate loss for each dataset in the list. This argument requires that no weights are included in the list')
-    group.add_argument('--eval-iters', type=int, default=100,
-                       help='Number of iterations to run for evaluation'
-                       'validation/test for.')
-    group.add_argument('--eval-interval', type=int, default=1000,
-                       help='Interval between running evaluation on '
-                       'validation set.')
-    group.add_argument("--test-mode", action="store_true", help='Run all real-time test alongside the experiment.')
-    group.add_argument('--skip-train', action='store_true',
-                       default=False, help='If set, bypass the training loop, '
-                       'optionally do evaluation for validation/test, and exit.')
+    val_factory = ArgumentGroupFactory(ValidationConfig)
+    group = val_factory.build_group(parser, "validation")
 
     return parser
 
