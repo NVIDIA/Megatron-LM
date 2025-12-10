@@ -1312,8 +1312,6 @@ def load_args_from_checkpoint(
 
     _set_arg('hybrid_override_pattern', force=True)
     _set_arg('spec', force=True)
-    _set_arg('hybrid_attention_ratio', force=True)
-    _set_arg('hybrid_mlp_ratio', force=True)
 
     _set_arg('num_experts', force=True)
     _set_arg('moe_layer_freq', force=True)
