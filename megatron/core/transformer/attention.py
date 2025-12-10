@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
@@ -23,6 +23,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -60,7 +61,7 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flash_attn_3.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -178,16 +179,38 @@ class Attention(MegatronModule, ABC):
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
-        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        if self.config.num_query_groups < world_size:
+            # When num_kv_heads < tp_size, each TP rank (post AG) initially produces
+            # activations for 1 kv_head and (num_q_heads / num_kv_heads) q_heads.
+            # We then pull out the appropriate (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = 1
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, self.config.num_query_groups
+            )
+        else:
+            # When num_kv_heads >= tp_size, each TP rank produces activations for
+            # (num_kv_heads / tp_size) kv_heads and (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, world_size
+            )
+        self.world_size = world_size
 
         # To support both CUDA Graphs and key value with different hidden size
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
+        if self.config.num_query_groups < world_size:
+            # TE throws an assertion error if num_kv_heads / num_query_groups
+            # is not divisible by TP size.
+            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = world_size
+        else:
+            tmp_config = self.config
         self.core_attention = build_module(
             submodules.core_attention,
-            config=self.config,
+            config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
@@ -971,6 +994,13 @@ class Attention(MegatronModule, ABC):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
         raise NotImplementedError("set_for_recompute_input_layernorm is not implemented.")
 
+    def clip_qk(self):
+        """
+        QK Clipping is a technique to clip the query and key attention logits to prevent the
+        attention logits from exploding.
+        """
+        raise NotImplementedError("clip_qk is not implemented.")
+
 
 class SelfAttention(Attention):
     """Self-attention layer class
@@ -1111,6 +1141,26 @@ class SelfAttention(Attention):
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
 
+        if self.config.num_query_groups < self.world_size:
+            # Note that weights are interleaved in the following manner:
+            # q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ...
+            # When tp_size > num_kv_heads, we split "q1 q2 k1 v1" over multiple
+            # ranks, so a rank does not have a clean partitioning of just the q_heads
+            # it needs. Instead, we perform the following steps:
+            # 1. Assemble the full "q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ..."
+            #    through an AG.
+            # 2. Pull out the right slice (e.g., "q1 q2 k1 v1" or "q3 q4 k2 v2").
+            # 3. Split q_heads (e.g., q1, q2), k_heads (e.g., k1), v_heads (e.g., v1).
+            # 4. Further index into query to get only the q_heads that this rank is
+            #    responsible for (e.g., q1).
+            # The block of code below performs steps 1 and 2.
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
+            idx = get_tensor_model_parallel_rank() // (
+                self.world_size // self.config.num_query_groups
+            )
+            size = mixed_qkv.size()[-1] // self.config.num_query_groups
+            mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
+
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
@@ -1149,6 +1199,18 @@ class SelfAttention(Attention):
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
+        if self.config.num_query_groups < self.world_size:
+            # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
+            # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
+            # This is step 4 in the list of steps above.
+            idx = get_tensor_model_parallel_rank() % (
+                self.world_size // self.config.num_query_groups
+            )
+            size = self.num_attention_heads_per_partition // (
+                self.world_size // self.config.num_query_groups
+            )
+            query = query[:, :, idx * size : (idx + 1) * size, :]
+
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)
 
@@ -1178,6 +1240,103 @@ class SelfAttention(Attention):
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
         set_save_original_input(self.linear_qkv)
+
+    def clip_qk(self):
+        """
+        QK Clipping is a technique to clip the query and key attention logits to prevent the
+        attention logits from exploding. This function is experimental on GQA.
+        """
+        if not self.config.qk_clip:
+            raise ValueError("qk_clip option needs to be enabled")
+
+        if self.core_attention.current_max_attn_logits is None:
+            raise ValueError("current_max_attn_logits is None")
+
+        assert self.core_attention.current_max_attn_logits.shape == (
+            self.num_attention_heads_per_partition,
+        ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
+                    but {self.core_attention.current_max_attn_logits.shape}"
+
+        grouped_max_attn_logits = torch.max(
+            self.core_attention.current_max_attn_logits.view(
+                self.num_query_groups_per_partition, -1
+            ),
+            dim=1,
+        ).values
+
+        # only update the weight if any head has
+        # current_max_attn_logits > qk_clip_threshold
+        if torch.any(grouped_max_attn_logits > self.config.qk_clip_threshold):
+            # Use num_query_groups_per_partition for tensor parallel scenarios
+
+            # qk_clip_balancing_eta (g, 1, 1)
+            assert grouped_max_attn_logits.shape == (
+                self.num_query_groups_per_partition,
+            ), f"current_max_attn_logits shape is not ({self.num_query_groups_per_partition},) \
+                but {grouped_max_attn_logits.shape}"
+            self.qk_clip_balancing_eta = torch.clamp(
+                self.config.qk_clip_threshold / grouped_max_attn_logits, max=1.0
+            ).view(self.num_query_groups_per_partition, 1, 1)
+            assert torch.all(self.qk_clip_balancing_eta <= 1.0)
+
+            # Handle different weight access patterns (main_param vs direct access)
+            if hasattr(self.linear_qkv.weight, 'main_param'):
+                self.linear_qkv.weight.main_param.data.copy_(
+                    self._clip_linear_qkv(self.linear_qkv.weight.main_param.data)
+                )
+
+            self.linear_qkv.weight.data.copy_(self._clip_linear_qkv(self.linear_qkv.weight.data))
+
+        # reset current_max_attn_logits
+        self.core_attention.current_max_attn_logits = None
+
+    def _clip_linear_qkv(self, weight):
+        """Apply qkclip to linear_qkv layer"""
+        # Reshape to (g, query_projection_size + 2 * kv_projection_size, -1)
+        weight_reshaped = weight.view(
+            self.num_query_groups_per_partition,
+            (self.query_projection_size + 2 * self.kv_projection_size)
+            // self.num_query_groups_per_partition,
+            -1,
+        )
+
+        # Split into query_projection_size and 2 * kv_projection_size parts:
+        # (n, a, -1) and (n, b, -1)
+        weight_q = weight_reshaped[
+            :, : self.query_projection_size // self.num_query_groups_per_partition, :
+        ]
+        weight_k = weight_reshaped[
+            :,
+            self.query_projection_size
+            // self.num_query_groups_per_partition : (
+                self.query_projection_size + self.kv_projection_size
+            )
+            // self.num_query_groups_per_partition,
+            :,
+        ]
+        weight_v = weight_reshaped[
+            :,
+            (self.query_projection_size + self.kv_projection_size)
+            // self.num_query_groups_per_partition :,
+            :,
+        ]
+
+        # extend the qk_clip_balancing_eta to the same shape as weight_q and weight_k
+        self.qk_clip_balancing_eta_extended = self.qk_clip_balancing_eta.repeat(
+            1, weight_q.size(1), 1
+        )
+
+        # Clipping
+        weight_q.mul_(torch.pow(self.qk_clip_balancing_eta_extended, self.config.qk_clip_alpha))
+        weight_k.mul_(torch.pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha))
+
+        # Concatenate back and reshape to original shape
+        weight_updated = torch.cat([weight_q, weight_k, weight_v], dim=1)
+        weight_updated = weight_updated.view(
+            self.query_projection_size + 2 * self.kv_projection_size, -1
+        )
+
+        return weight_updated
 
 
 class CrossAttention(Attention):
