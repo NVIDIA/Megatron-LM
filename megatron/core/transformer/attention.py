@@ -157,6 +157,7 @@ class Attention(MegatronModule, ABC):
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        self.batch_invariant_mode = config.batch_invariant_mode
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -626,11 +627,14 @@ class Attention(MegatronModule, ABC):
                     softcap=0.0,
                     rotary_interleaved=True,
                     scheduler_metadata=None,
-                    num_splits=0,
+                    num_splits=0 if not self.batch_invariant_mode else 1,
                     pack_gqa=None,
                     sm_margin=0,
                 )
             else:
+                assert (
+                    self.batch_invariant_mode is False
+                ), "Batch invariant mode is not supported for flash attention 2"
                 output_total = flash_attn_varlen_func(
                     q,
                     k,
@@ -681,10 +685,14 @@ class Attention(MegatronModule, ABC):
                     "cache_seqlens": seqlens_k,
                     "causal": True,
                     "page_table" if HAVE_FA3 else "block_table": block_table,
+                    "num_splits": 0 if not self.batch_invariant_mode else 1,
                 }
                 if HAVE_FA3:
                     output_total = flash_attn3_with_kvcache(**flash_attn_args)
                 else:
+                    assert (
+                        not self.batch_invariant_mode
+                    ), "Batch invariant mode is not supported for flash attention 2"
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 
