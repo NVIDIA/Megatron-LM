@@ -1230,6 +1230,7 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
+                "dense_mlp",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
@@ -1242,6 +1243,22 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            if self.external_cuda_graph or self.cuda_graph_impl == "transformer_engine":
+                assert (
+                    self.cuda_graph_scope is not None
+                ), "cuda_graph_scope must be set when enabling offloading."
+                assert (
+                    "attn" in self.cuda_graph_scope and "moe_router" in self.cuda_graph_scope
+                ) or (
+                    CudaGraphScope.attn in self.cuda_graph_scope
+                    and CudaGraphScope.moe_router in self.cuda_graph_scope
+                ), "attn and moe_router must be in cuda_graph_scope when enabling offloading."
+                assert (
+                    "attn_norm" not in self.offload_modules
+                ), "input of attn_norm is the start point of cuda graph, which can't be offloaded."
+                assert (
+                    "mlp_norm" not in self.offload_modules
+                ), "mlp_norm goes through the boundary of cuda graph, which can't be offloaded."
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
