@@ -648,16 +648,7 @@ class TextGenerationController:
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         return_log_probs = self._request_metadata["return_log_probs"][active_request_slice]
-        skip_prompt = self._request_metadata["skip_prompt_log_probs"][active_request_slice]
         top_n_log_probs = self._request_metadata["top_n_logprobs"][active_request_slice] > 0
-
-        to_check_prompt = (return_log_probs | top_n_log_probs) & ~skip_prompt
-
-        assert not (to_check_prompt.any() and context.materialize_only_last_token_logits), (
-            "Prompt log probs cannot be calculated if only last token logits are materialized. "
-            "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
-            "or skip_prompt_log_probs to True in SamplingParams."
-        )
 
         return return_log_probs.any(), top_n_log_probs.any()
 
