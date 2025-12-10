@@ -9,7 +9,6 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
@@ -19,7 +18,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, StragglerDetector
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args
@@ -32,6 +31,7 @@ from megatron.training.utils import (
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
+from megatron.training.datasets.sft_dataset import SFTDataset, MockSFTDataset
 from model_provider import model_provider
 
 try:
@@ -59,35 +59,44 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
     args = get_args()
     config = core_transformer_config_from_args(args)
-    # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage) and (
-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None, None
-
-    # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(
-        data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+    
+    if args.sft_sequence_packing:
+                
+        # get batches based on the TP rank you are on
+        batch = get_batch_on_this_tp_rank(
+            data_iterator,
+            mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+            vp_stage=vp_stage,
         )
-
-    cu_seqlens = batch.pop('cu_seqlens')
-    max_seqlen = batch.pop('max_seqlen')
-    local_cp_size = batch.pop('local_cp_size')
-    if local_cp_size is not None:
-        local_cp_size = int(local_cp_size.item())
-
-    if cu_seqlens is None and local_cp_size is None:
-        # slice batch along sequence dimension for context parallelism
+        
+        cu_seqlens = batch.pop('cu_seqlens')
+        cu_seqlens_padded = batch.pop('cu_seqlens_padded')
+        max_seqlen = int(batch.pop('max_seqlen').item())
+        # local_cp_size is None if we disable hybrid-cp
+        local_cp_size = int(batch.pop('local_cp_size').item()) if ('local_cp_size' in batch) else None
+   
+        if is_first_or_last_pipeline_stage(vp_stage):
+            batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, 
+                    cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size, vp_stage=vp_stage)
+            return (*batch.values(), packed_seq_params)
+        
+        else:
+            _, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, 
+                    cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size, only_packed_seq_params=True)
+            return None, None, None, None, None, packed_seq_params
+    else:
+        # TODO: this is pretty hacky, find a better way
+        if not is_first_or_last_pipeline_stage(vp_stage) and (
+        (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+            return None, None, None, None, None, None
+        batch = get_batch_on_this_tp_rank(
+        data_iterator,
+        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+        vp_stage=vp_stage
+        )
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
-    elif local_cp_size is None:  # Packed THD format
-        cu_seqlens = cu_seqlens[0]
-        assert max_seqlen.dim() == 1
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, max_seqlen)
-    else: # Hybrid CP format
-        batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-    
-    return (*batch.values(), packed_seq_params)
+        return (*batch.values(), packed_seq_params)
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -179,7 +188,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
-            if return_schedule_plan:
+            if return_schedule_plan:                
                 assert args.overlap_moe_expert_parallel_comm, \
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
                 schedule_plan = model.build_schedule_plan(
@@ -238,6 +247,9 @@ def core_gpt_dataset_config_from_args(args):
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
+        "sft_mock_dataset_config_json":args.sft_mock_dataset_config_json,
+        "sft_sequence_packing": args.sft_sequence_packing,
+        "hybrid_context_parallel_scheduler": args.hybrid_context_parallel_scheduler,
     }
 
     # add FIM args to the config
@@ -275,7 +287,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     config = core_gpt_dataset_config_from_args(args)
 
     if args.sft:
-        dataset_type = SFTDataset
+        if args.mock_data:
+            dataset_type = MockSFTDataset
+        else:
+            dataset_type = SFTDataset
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset

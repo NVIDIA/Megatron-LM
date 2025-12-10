@@ -1229,6 +1229,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
+        # we need to create a single stream for cp=1 and enable hybrid cp case
+        if (
+            self.config.hybrid_context_parallel
+            and getattr(TEDotProductAttention, "cp_stream") is None
+        ):
+            TEDotProductAttention.cp_stream = torch.cuda.Stream()
+
         if self.config.deterministic_mode:
             if int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")) != 0:
                 raise RuntimeError(
@@ -1335,7 +1342,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             elif packed_seq_params.local_cp_size is not None:
                 assert (
                     packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
+                ), f"local_cp_size must be == 1 if provided without cp_group, "
+                f"but got {packed_seq_params.local_cp_size}."
                 super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")

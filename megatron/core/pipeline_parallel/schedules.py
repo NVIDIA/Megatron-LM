@@ -10,6 +10,7 @@ from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
+from megatron.core.pipeline_parallel.data_schedule import PackingScheduler, wrap_dataloader
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_reset,
 )
@@ -37,7 +38,6 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
-from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -512,6 +512,69 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+def wrap_iterator_helper(
+    config,
+    data_iterator: Union[Iterator, List[Iterator]],
+    num_microbatches: int,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
+    """Warp data iterator for sequence packing if needed."""
+    if config.sft_sequence_packing:
+        num_total_tokens_this_GB, sequence_square_sum_this_GB = None, None
+        if config.hybrid_context_parallel:
+            if config.hybrid_context_parallel_scheduler == 'balanced':
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
+                    data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
+                )
+            elif config.hybrid_context_parallel_scheduler == 'only_packing_no_scheduling':
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
+                    data_iterator,
+                    config,
+                    PackingScheduler.ONLY_PACKING_NO_SCHEDULING,
+                    pg_collection=None,
+                )
+            else:
+                raise ValueError(
+                    f"Invalid hybrid context parallel scheduler: \
+                    {config.hybrid_context_parallel_scheduler}"
+                )
+        else:
+            if config.balanced_sequence_packing:
+                # enable balanced sequence packing scheduler, will be implemented later
+                pass
+            else:
+                # naive sequence packing scheduler
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
+                    data_iterator,
+                    config,
+                    PackingScheduler.NAIVE_SEQUENCE_PACKING,
+                    pg_collection=None,
+                )
+        return (
+            data_iterator,
+            num_microbatches,
+            num_total_tokens_this_GB,
+            sequence_square_sum_this_GB,
+        )
+    else:
+        return data_iterator, num_microbatches, None, None
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -594,6 +657,10 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
+    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
+    )
+
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
             forward_step_func,
@@ -610,24 +677,6 @@ def forward_backward_no_pipelining(
             no_sync_func,
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
-        )
-    elif config.hybrid_context_parallel:
-        forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            output_tensor_grad,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            first_val_step,
-            forward_only,
-            no_sync_func,
-            total_num_tokens,
-            check_first_val_step,
-            model_type,
         )
     else:
         with no_sync_func():
@@ -691,6 +740,9 @@ def forward_backward_no_pipelining(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    if config.sft_sequence_packing:
+        forward_data_store.append([num_total_tokens_this_GB, sequence_square_sum_this_GB])
 
     return forward_data_store
 
@@ -1048,6 +1100,10 @@ def forward_backward_pipelining_with_interleaving(
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
+    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
+    )
+
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
         # vp is ignored for clear_embedding_activation_buffer
@@ -1132,14 +1188,17 @@ def forward_backward_pipelining_with_interleaving(
     # If the final micro-batch group has fewer micro-batches than pipeline-parallel size,
     # the pipeline will have dependency bubbles.
     final_microbatch_group_size = num_microbatches % config.microbatch_group_size_per_vp_stage
-    if 0 < final_microbatch_group_size < pipeline_parallel_size:
-        msg = 'The remainder of M (the total micro-batches) divided by N (number of '
-        msg += 'contiguous micro-batches in a virtual pipeline stage) should be 0, '
-        msg += 'or larger than or equal to the pipeline-parallel size, but it is '
-        msg += f'{final_microbatch_group_size}. '
-        msg += 'Otherwise, it introduces dependency bubbles in the pipeline '
-        msg += 'and reduces throughput.'
-        raise RuntimeError(msg)
+    if not config.sft_sequence_packing:
+        # sft sequence packing allows num_microbatches to change dynamically,
+        # we don't need to check this
+        if 0 < final_microbatch_group_size < pipeline_parallel_size:
+            msg = 'The remainder of M (the total micro-batches) divided by N (number of '
+            msg += 'contiguous micro-batches in a virtual pipeline stage) should be 0, '
+            msg += 'or larger than or equal to the pipeline-parallel size, but it is '
+            msg += f'{final_microbatch_group_size}. '
+            msg += 'Otherwise, it introduces dependency bubbles in the pipeline '
+            msg += 'and reduces throughput.'
+            raise RuntimeError(msg)
 
     model_type = get_model_type(model[0])
 
@@ -2064,6 +2123,9 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
+    if config.sft_sequence_packing:
+        forward_data_store.append([num_total_tokens_this_GB, sequence_square_sum_this_GB])
+
     return forward_data_store
 
 
@@ -2180,6 +2242,10 @@ def forward_backward_pipelining_without_interleaving(
             "Invalid combination of p2p_communicator, pg_collection "
             "provide none or provide all the process groups"
         )
+
+    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
+    )
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2449,5 +2515,8 @@ def forward_backward_pipelining_without_interleaving(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    if config.sft_sequence_packing:
+        forward_data_store.append([num_total_tokens_this_GB, sequence_square_sum_this_GB])
 
     return forward_data_store

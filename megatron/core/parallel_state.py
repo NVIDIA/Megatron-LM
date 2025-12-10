@@ -429,7 +429,7 @@ def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
     hybrid_dp_cp_groups = {}
     # Generate group for every power of 2 up to the number of CP ranks
     # We limit the allowed group sizes in order to avoid excessive overhead.
-    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
+    group_sizes = [2**i for i in range(int(log2(len(ranks))))]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(
@@ -554,7 +554,6 @@ def initialize_model_parallel(
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
-    hybrid_context_parallel: bool = False,
     expert_model_parallel_size: int = 1,
     num_distributed_optimizer_instances: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
@@ -567,6 +566,7 @@ def initialize_model_parallel(
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
     hybrid_context_parallel: bool = False,
+    min_hybrid_context_parallel_size: int = 1,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -977,6 +977,22 @@ def initialize_model_parallel(
             )
             if rank in ranks:
                 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
+
+    if hybrid_context_parallel:
+        # PyTorch is performing lazy initialization of the communicator group.
+        # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
+        group_sizes = [
+            2**i
+            for i in range(
+                int(log2(min_hybrid_context_parallel_size)), int(log2(data_parallel_size))
+            )
+        ]
+        if group_sizes[-1] * 2 == data_parallel_size:
+            group_sizes.append(data_parallel_size)
+        for group_size in group_sizes:
+            group = get_hybrid_data_context_parallel_groups(group_size=group_size)
+            torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+            torch.cuda.synchronize()
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
@@ -1454,6 +1470,10 @@ def get_hybrid_data_context_parallel_groups(check_initialized=True, group_size=N
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP
+    elif group_size == 1:
+        if check_initialized:
+            assert _CONTEXT_PARALLEL_GROUP is not None
+        return _CONTEXT_PARALLEL_GROUP
     if check_initialized:
         assert _HYBRID_DP_CP_GROUPS is not None
     return _HYBRID_DP_CP_GROUPS[group_size]
