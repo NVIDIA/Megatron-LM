@@ -2206,6 +2206,9 @@ def _add_training_args(parser):
                              'global batch, versus the default behavior of assuming all tokens are non-padded.'))
     group.add_argument('--train-sync-interval', type=int, default=None,
                        help='Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU.')
+    group.add_argument('--repeat-te-gemms-check', action='store_true',
+                       help='If set, repeat transformer engine general_gemm and general_grouped_gemm calls to check consistency.')
+
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
