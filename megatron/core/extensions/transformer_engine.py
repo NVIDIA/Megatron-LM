@@ -1247,6 +1247,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
+        if config.qk_clip or config.log_max_attention_logit:
+            # qk-clip is only supported in TE 2.9.0 and later
+            assert is_te_min_version("2.9.0"), "qk-clip is only supported in TE 2.9.0 and later"
+
+            # TE 2.9.0 introduces return_max_logit for qk-clip getting the max attention logits
+            extra_kwargs["return_max_logit"] = True
+            self.current_max_attn_logits = None
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=kv_channels,
@@ -1316,6 +1324,22 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 **attention_bias_kwargs,
                 **packed_seq_kwargs,
             )
+
+            if self.config.qk_clip or self.config.log_max_attention_logit:
+                # qk-clip is only supported in TE 2.9.0 and later
+                assert is_te_min_version("2.9.0"), "qk-clip is only supported in TE 2.9.0 and later"
+
+                # Update Q K outside of TE Attention API
+                core_attn_out, batch_max_attention_logits = core_attn_out
+
+                # Update QK_Clip balancing eta
+                if self.current_max_attn_logits is None:
+                    self.current_max_attn_logits = batch_max_attention_logits
+                else:
+                    self.current_max_attn_logits = torch.max(
+                        self.current_max_attn_logits, batch_max_attention_logits
+                    )
+
         else:
             core_attn_out = super().forward(
                 query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs
