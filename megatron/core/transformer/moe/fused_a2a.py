@@ -3,6 +3,7 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+from megatron.core.utils import internal_api
 
 try:
     from deep_ep import Buffer
@@ -320,6 +321,7 @@ def init_hybrid_ep_buffer(
     )
 
 
+@internal_api
 class HybridEPDispatch(torch.autograd.Function):
     '''
     Fused dispatch operation for permute + dispatch a2a + permute using the HybridEP backend
@@ -335,7 +337,6 @@ class HybridEPDispatch(torch.autograd.Function):
         num_local_experts,
         num_sms_dispatch_api=24,
         num_sms_combine_api=24,
-        num_dispatched_tokens=None,
         num_permuted_tokens=None,
         pad_multiple=None,
     ):
@@ -354,11 +355,9 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_sms_combine_api,
                 fp8_dispatch,
             )
-        # Defaultly, the output token_per_expert and num_dispatched_tokens_tensor
-        # will be put on the CPU to avoid the potential sync in combine/backward pass,
-        # but if we provide the num_dispatched_tokens and num_permuted_tokens on CPU,
-        # we do not need to the D2H here.
-        use_host_meta = num_dispatched_tokens is None or num_permuted_tokens is None
+        # If we provide the num_permuted_tokens, we do not need to use sync to
+        # wait for the data in pinned memory ready
+        non_blocking = num_permuted_tokens is not None
         # Process the dispatch
         (
             dispatched_hidden,
@@ -373,14 +372,12 @@ class HybridEPDispatch(torch.autograd.Function):
             scaling_factor=None,
             num_of_experts_per_rank=num_local_experts,
             pad_multiple=pad_multiple,
-            num_dispatched_tokens=num_dispatched_tokens,
             num_permuted_tokens=num_permuted_tokens,
-            use_host_meta=use_host_meta,
+            non_blocking=non_blocking,
         )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
-        ctx.num_dispatched_tokens = num_dispatched_tokens
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -396,36 +393,27 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x,
-            probs=grad_probs,
-            handle=handle,
-            pad_multiple=ctx.pad_multiple,
-            num_dispatched_tokens=ctx.num_dispatched_tokens,
+            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
         )
         return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
 
 
+@internal_api
 class HybridEPCombine(torch.autograd.Function):
     '''
     Fused combine operation for permute + combine a2a + permute using the HybridEP backend
     '''
 
     @staticmethod
-    def forward(
-        ctx, x, handle, num_dispatched_tokens=None, num_permuted_tokens=None, pad_multiple=None
-    ):
+    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x,
-            handle=handle,
-            pad_multiple=pad_multiple,
-            num_dispatched_tokens=num_dispatched_tokens,
+            hidden=x, handle=handle, pad_multiple=pad_multiple
         )
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
-        ctx.num_dispatched_tokens = num_dispatched_tokens
         ctx.num_permuted_tokens = num_permuted_tokens
         return combined_hidden
 
@@ -440,7 +428,6 @@ class HybridEPCombine(torch.autograd.Function):
             scaling_factor=None,
             handle=handle,
             pad_multiple=ctx.pad_multiple,
-            num_dispatched_tokens=ctx.num_dispatched_tokens,
             num_permuted_tokens=ctx.num_permuted_tokens,
         )
         return dispatched_hidden, None, None, None, None
@@ -448,6 +435,7 @@ class HybridEPCombine(torch.autograd.Function):
 
 if HAVE_HYBRIDEP:
 
+    @internal_api
     def hybrid_ep_dispatch(
         x,
         routing_map,
@@ -456,7 +444,6 @@ if HAVE_HYBRIDEP:
         num_local_experts,
         num_sms_dispatch_api=24,
         num_sms_combine_api=24,
-        num_dispatched_tokens=None,
         num_permuted_tokens=None,
         pad_multiple=None,
     ):
@@ -479,10 +466,6 @@ if HAVE_HYBRIDEP:
                 Number of SMs used by the dispatch API.
             num_sms_combine_api (int):
                 Number of SMs used by the combine API.
-            num_dispatched_tokens (int):
-                Number of tokens after dispatch but before permute. HybridEP uses this
-                to allocate buffers. If not provided, HybridEP obtains the size from
-                a GPU tensor, which causes a D2H synchronization.
             num_permuted_tokens (int):
                 Number of tokens after permute. HybridEP uses this to allocate buffers.
                 If not provided, HybridEP obtains the size from a GPU tensor,
@@ -499,12 +482,12 @@ if HAVE_HYBRIDEP:
             num_local_experts,
             num_sms_dispatch_api,
             num_sms_combine_api,
-            num_dispatched_tokens,
             num_permuted_tokens,
             pad_multiple,
         )
 
-    def hybrid_ep_combine(x, handle, num_dispatched_tokens, num_permuted_tokens, pad_multiple):
+    @internal_api
+    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple):
         '''
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
@@ -514,10 +497,6 @@ if HAVE_HYBRIDEP:
                 Input hidden states to combine
             handle (EventHandle):
                 Communication handle from dispatch operation
-            num_dispatched_tokens (int):
-                The number of tokens after unpermute but before combine. HybridEP uses this
-                to allocate buffers. If not provided, HybridEP obtains the size from a GPU tensor,
-                which causes a D2H synchronization.
             num_permuted_tokens (int): The number of tokens before unpermute. HybridEP uses this
                 to allocate buffers. If not provided, HybridEP obtains the size from a GPU tensor,
                 which causes a D2H synchronization.
@@ -525,9 +504,7 @@ if HAVE_HYBRIDEP:
                 The alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
         '''
-        return HybridEPCombine.apply(
-            x, handle, num_dispatched_tokens, num_permuted_tokens, pad_multiple
-        )
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple)
 
 else:
     hybrid_ep_dispatch = None
