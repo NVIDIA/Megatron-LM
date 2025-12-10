@@ -26,11 +26,6 @@ NUM_ATTENTION_HEADS = 8
 def initialize_gpt_model(
     pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs
 ):
-    # These kwargs are passed through training.get_model for model construction,
-    # but are not part of TransformerConfig; strip them before building config.
-    config_kwargs.pop("pg_collection", None)
-    config_kwargs.pop("config", None)
-
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -68,11 +63,6 @@ def initialize_moe_model(
     use_grouped_mlp=False,
     **config_kwargs,
 ):
-    # These kwargs are passed through training.get_model for model construction,
-    # but are not part of TransformerConfig; strip them before building config.
-    config_kwargs.pop("pg_collection", None)
-    config_kwargs.pop("config", None)
-
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
     expert_num = 8
