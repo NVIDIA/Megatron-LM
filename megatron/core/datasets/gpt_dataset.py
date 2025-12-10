@@ -67,6 +67,19 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     data parallel size * context parallel size * sequence parallel size * 2.
     """
 
+    hybrid_context_parallel_scheduler: str = 'balanced'
+    """Scheduler for hybrid context parallel.
+    balanced: balanced scheduler for hybrid context parallel.
+    only_packing_no_scheduling: scheduling is already handled by the data sampler,
+    this scheduler only performs packing.
+    """
+
+    sft_mock_dataset_config_json: Optional[str] = None
+    """This config provides the necessary information for the mock dataset."""
+
+    sft_sequence_packing: bool = False
+    """Option to enable sequence packing for SFT training."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()

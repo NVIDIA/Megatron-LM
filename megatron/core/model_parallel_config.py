@@ -62,7 +62,7 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when using sft_sequence_packing.
     """
 
     hybrid_context_parallel: bool = False
@@ -70,6 +70,28 @@ class ModelParallelConfig:
     If true, enables hybrid context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
     Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    When enabling hybrid_context_parallel, sft_sequence_packing must be true.
+    """
+
+    hybrid_context_parallel_scheduler: str = 'balanced'
+    """
+    Scheduler for hybrid context parallel.
+    balanced: balanced scheduler for hybrid context parallel which provided by MCore.
+    only_packing_no_scheduling: scheduling is already handled by the data sampler,
+    this scheduler only performs packing.
+    """
+
+    sft_sequence_packing: bool = False
+    """
+    If true, enables sft sequence packing.
+    """
+
+    balanced_sequence_packing: bool = False
+    """
+    If true, enables balanced sequence packing.
+    This is used to pack samples with variable sequence lengths into a single sample
+    such that each packed sample has similar total sequence lengths.
+    This is useful to improve the efficiency of sequence packing.
     """
 
     expert_model_parallel_size: int = 1
