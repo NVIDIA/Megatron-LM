@@ -24,7 +24,6 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import internal_api
 
 
 @dataclass
@@ -145,7 +144,7 @@ class MoEMetricsTracker:
                 self.initialize_metric(name, num_layers, device=torch.cuda.current_device())
 
         # Reduce metrics across ranks
-        self.reduce_across_ranks(names_list, pg_collection=pg_collection)
+        self._reduce_across_ranks(names_list, pg_collection=pg_collection)
 
         # Compute number of MoE layers
         num_moe_layers = self._compute_num_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
@@ -168,7 +167,7 @@ class MoEMetricsTracker:
 
         return log_string
 
-    def reduce_across_ranks(
+    def _reduce_across_ranks(
         self,
         names: Optional[Union[str, List[str]]] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -378,131 +377,3 @@ class MoEMetricsTracker:
                 self._write_scalar_metric(
                     f"moe/{name}_layer_{i}", val, iteration, writer, wandb_writer
                 )
-
-
-def _compute_load_balance_discrepancy(
-    tokens_per_expert: torch.Tensor, num_experts: int
-) -> torch.Tensor:
-    """Compute Manhattan distance between token distribution and uniform distribution.
-
-    Manhattan distance (L1) = Σ|actual_ratio - uniform_ratio|
-
-    Range: [0, 2*(1 - 1/n)] where n = num_experts
-        - 0: perfect uniform distribution
-        - 2*(1 - 1/n): all tokens routed to one expert (e.g., 1.75 for 8 experts)
-    """
-    total_tokens = tokens_per_expert.sum()
-    if total_tokens == 0:
-        return torch.tensor(0.0, device=tokens_per_expert.device)
-
-    actual_distribution = tokens_per_expert.float() / total_tokens
-    uniform_distribution = torch.full_like(actual_distribution, 1.0 / num_experts)
-
-    return torch.sum(torch.abs(actual_distribution - uniform_distribution))
-
-
-# =============================================================================
-# Public API functions - used by router.py, cuda_graphs.py, tests, etc.
-# =============================================================================
-
-
-def save_to_aux_losses_tracker(
-    name: str,
-    loss: torch.Tensor,
-    layer_number: int,
-    num_layers: int,
-    reduce_group: torch.distributed.ProcessGroup = None,
-    avg_group: torch.distributed.ProcessGroup = None,
-    percentiles: Optional[List[float]] = None,
-) -> None:
-    """Save the auxiliary loss for logging."""
-    MoEMetricsTracker.get_instance().record(
-        name=name,
-        value=loss,
-        layer_number=layer_number,
-        num_layers=num_layers,
-        reduce_group=reduce_group,
-        avg_group=avg_group,
-        percentiles=percentiles,
-    )
-
-
-@internal_api
-def save_load_balance_discrepancy(
-    tokens_per_expert: torch.Tensor,
-    num_experts: int,
-    layer_number: int,
-    num_layers: int,
-    reduce_group: torch.distributed.ProcessGroup = None,
-    percentiles: Optional[List[float]] = None,
-) -> None:
-    """Compute load balance discrepancy and save to tracker.
-
-    Args:
-        tokens_per_expert: Number of tokens routed to each expert.
-        num_experts: Total number of experts.
-        layer_number: 1-based layer index.
-        num_layers: Total number of layers.
-        reduce_group: Process group for all-reduce operations.
-        percentiles: List of percentiles to compute (e.g., [0.5, 0.95] for p50, p95).
-    """
-    if layer_number is None:
-        return
-
-    # Default percentiles for load_balance_discrepancy
-    if percentiles is None:
-        percentiles = [0.5, 0.95]
-
-    discrepancy = _compute_load_balance_discrepancy(tokens_per_expert, num_experts)
-    save_to_aux_losses_tracker(
-        "load_balance_discrepancy",
-        discrepancy,
-        layer_number,
-        num_layers,
-        reduce_group=reduce_group,
-        percentiles=percentiles,
-    )
-
-
-def clear_aux_losses_tracker() -> None:
-    """Clear the auxiliary losses."""
-    MoEMetricsTracker.get_instance().clear()
-
-
-def get_moe_layer_wise_logging_tracker() -> Dict[str, dict]:
-    """Return the moe layer wise tracker in legacy dict format."""
-    return MoEMetricsTracker.get_instance().get_raw_tracker()
-
-
-# Deprecated: Use MoEMetricsTracker.get_instance().track() directly
-def track_moe_metrics(
-    loss_scale: float,
-    iteration: int,
-    writer,
-    wandb_writer=None,
-    total_loss_dict=None,  # Deprecated, ignored
-    per_layer_logging=False,
-    force_initialize: bool = False,
-    track_names: Optional[Union[str, List[str]]] = None,
-    num_layers: Optional[int] = None,
-    moe_layer_freq: Optional[Union[int, List[int]]] = None,
-    mtp_num_layers: Optional[int] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
-) -> str:
-    """Track the MoE metrics for logging.
-
-    Deprecated: Use MoEMetricsTracker.get_instance().track() directly.
-    """
-    return MoEMetricsTracker.get_instance().track(
-        loss_scale=loss_scale,
-        iteration=iteration,
-        writer=writer,
-        wandb_writer=wandb_writer,
-        per_layer_logging=per_layer_logging,
-        force_initialize=force_initialize,
-        names=track_names,
-        num_layers=num_layers,
-        moe_layer_freq=moe_layer_freq,
-        mtp_num_layers=mtp_num_layers,
-        pg_collection=pg_collection,
-    )

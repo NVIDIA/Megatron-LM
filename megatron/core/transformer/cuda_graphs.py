@@ -1827,14 +1827,14 @@ class TECudaGraphHelper:
         _set_capture_end()
 
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
-        from megatron.core.transformer.moe.moe_logging import clear_aux_losses_tracker
+        from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 
         torch.distributed.barrier()
         for model_chunk in self.model:
             model_chunk.zero_grad_buffer()
         for optimizer in self.optimizers:
             optimizer.zero_grad()
-        clear_aux_losses_tracker()
+        MoEMetricsTracker.get_instance().clear()
         reset_model_temporary_tensors(self.config, self.model)
 
         if FREEZE_GC:

@@ -1677,7 +1677,6 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
-        track_names.append("load_balance_discrepancy")
         moe_log_string = MoEMetricsTracker.get_instance().track(
             loss_scale=moe_loss_scale,
             iteration=iteration,

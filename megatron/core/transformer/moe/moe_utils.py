@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Union
 
 import torch
 
@@ -12,7 +12,9 @@ from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import deprecated
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -712,6 +714,80 @@ def apply_router_token_dropping(
         final_probs = routing_probs * final_map
 
     return final_probs, final_map
+
+
+def save_to_aux_losses_tracker(
+    name: str,
+    loss: torch.Tensor,
+    layer_number: int,
+    num_layers: int,
+    reduce_group: torch.distributed.ProcessGroup = None,
+    avg_group: torch.distributed.ProcessGroup = None,
+    percentiles: Optional[List[float]] = None,
+) -> None:
+    """Save the auxiliary loss for logging."""
+    MoEMetricsTracker.get_instance().record(
+        name=name,
+        value=loss,
+        layer_number=layer_number,
+        num_layers=num_layers,
+        reduce_group=reduce_group,
+        avg_group=avg_group,
+        percentiles=percentiles,
+    )
+
+
+def clear_aux_losses_tracker() -> None:
+    """Clear the auxiliary losses."""
+    MoEMetricsTracker.get_instance().clear()
+
+
+def reduce_aux_losses_tracker_across_ranks(
+    track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
+):
+    """Reduce the auxiliary losses across ranks."""
+    MoEMetricsTracker.get_instance()._reduce_across_ranks(track_names, pg_collection)
+
+
+def get_moe_layer_wise_logging_tracker():
+    """Return the moe layer wise tracker in legacy dict format."""
+    return MoEMetricsTracker.get_instance().get_raw_tracker()
+
+
+@deprecated(
+    version="0.15", removal_version="0.17", alternative="MoEMetricsTracker.get_instance().track()"
+)
+def track_moe_metrics(
+    loss_scale: float,
+    iteration: int,
+    writer,
+    wandb_writer=None,
+    total_loss_dict=None,
+    per_layer_logging=False,
+    force_initialize: bool = False,
+    track_names: Optional[List[str]] = None,
+    num_layers: Optional[int] = None,
+    moe_layer_freq: Optional[Union[int, List[int]]] = None,
+    mtp_num_layers: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> str:
+    """Track the MoE metrics for logging.
+
+    Deprecated: Use MoEMetricsTracker.get_instance().track() directly.
+    """
+    return MoEMetricsTracker.get_instance().track(
+        loss_scale=loss_scale,
+        iteration=iteration,
+        writer=writer,
+        wandb_writer=wandb_writer,
+        per_layer_logging=per_layer_logging,
+        force_initialize=force_initialize,
+        names=track_names,
+        num_layers=num_layers,
+        moe_layer_freq=moe_layer_freq,
+        mtp_num_layers=mtp_num_layers,
+        pg_collection=pg_collection,
+    )
 
 
 def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_rate):

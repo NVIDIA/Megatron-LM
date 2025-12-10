@@ -8,10 +8,7 @@ import torch
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.moe_logging import (
-    save_load_balance_discrepancy,
-    save_to_aux_losses_tracker,
-)
+from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
@@ -396,7 +393,7 @@ class TopKRouter(Router):
         num_layers = self.config.num_layers
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
-        save_to_aux_losses_tracker(
+        MoEMetricsTracker.get_instance().record(
             aux_loss_name,
             aux_loss / aux_loss_coeff,
             self.layer_number,
@@ -415,32 +412,6 @@ class TopKRouter(Router):
         else:
             activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation
-
-    def _log_load_balance_discrepancy(self, routing_map: torch.Tensor):
-        """Log the load balance discrepancy for monitoring.
-
-        Computes the L1 distance between actual token distribution and uniform distribution
-        across experts. This metric is logged per layer and aggregated across layers.
-
-        Args:
-            routing_map (torch.Tensor): The routing map with shape [num_tokens, num_experts].
-        """
-        tokens_per_expert = routing_map.sum(dim=0)
-        tokens_per_expert = reduce_from_tensor_model_parallel_region(
-            tokens_per_expert, self.tp_cp_group
-        )
-
-        num_layers = self.config.num_layers
-        if self.config.mtp_num_layers is not None:
-            num_layers += self.config.mtp_num_layers
-
-        save_load_balance_discrepancy(
-            tokens_per_expert,
-            self.config.num_moe_experts,
-            self.layer_number,
-            num_layers,
-            reduce_group=self.tp_cp_group,
-        )
 
     def apply_z_loss(self, logits):
         """Encourages the router's logits to remain small to enhance stability.
@@ -472,7 +443,7 @@ class TopKRouter(Router):
             num_layers = self.config.num_layers
             if self.config.mtp_num_layers is not None:
                 num_layers += self.config.mtp_num_layers
-            save_to_aux_losses_tracker(
+            MoEMetricsTracker.get_instance().record(
                 "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, num_layers
             )
         return logits
@@ -565,10 +536,6 @@ class TopKRouter(Router):
             probs = self._apply_global_aux_loss(
                 probs, scores_for_aux_loss, routing_map_for_aux_loss
             )
-
-        # Log load balance discrepancy for monitoring (always enabled during training)
-        if self.training:
-            self._log_load_balance_discrepancy(routing_map)
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map)
