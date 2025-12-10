@@ -179,6 +179,7 @@ class MambaModel(LanguageModule):
         runtime_gather_output: Optional[bool] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the Mamba model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -188,6 +189,8 @@ class MambaModel(LanguageModule):
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
+
+        assert packed_seq_params is None 
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 

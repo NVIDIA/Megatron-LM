@@ -166,6 +166,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             runtime_gather_output=True,  # Inference should always gather the logits
         )
 
+    @torch.no_grad()
     def dummy_forward(self):
         """Run a dummy forward pass through the model, with a single token.
         Use-case: Used in EP on ranks which do not have any work, but are needed

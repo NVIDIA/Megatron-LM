@@ -758,7 +758,8 @@ def get_environment_rollouts(
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
-
+        
+        logging.info(f"Rank: {dist.get_rank()} waiting to sync rollouts")
         with nvtx_range("sync-rollouts"):
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
@@ -1824,6 +1825,7 @@ def prepare_data_for_update(
 
         def logprobs_forward_step(data_iterator, model):
             if args.rl_use_sequence_packing:
+                assert False
                 bin_tensor = next(data_iterator)[0]
                 ( b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params, b_packed_seq_len ) = load_packed_data_by_index(bin_tensor.item())
             else:
@@ -1839,7 +1841,6 @@ def prepare_data_for_update(
 
             b_trajs = b_trajs.cuda()
             b_posids = b_posids.cuda()
-
             return get_logprobs(model, b_trajs, b_posids, None, no_grad=True, packed_seq_params=b_packed_seq_params, packed_seq_len=b_packed_seq_len), None
 
 
@@ -2557,7 +2558,7 @@ def megatron_rl_inference_mode(
 
         print(f"[{dist.get_rank()}:DP] Entered inference mode")
         yield inference_interface
-
+        print(f"[{dist.get_rank()}:DP] Attempting to suspend inference mode")
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
 

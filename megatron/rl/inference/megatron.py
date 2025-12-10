@@ -168,7 +168,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest):
-
+        print(f"[{dist.get_rank()}:DP] Starting base_generate.....")
         if any(isinstance(p, LLMChatMessage) for p in request.prompt):
             raise ValueError(
                 "MegatronLocal does not support chat requests."
@@ -193,13 +193,16 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             skip_prompt_log_probs=True,
             add_BOS=tokenizer.bos is not None,
         )
+        print(f"[{dist.get_rank()}:DP] adding requests to client.....")
         requests = [
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)
             for prompt in request.prompt
         ]
-        records = await asyncio.gather(
+        print(f"[{dist.get_rank()}:DP] added requests to client.....")
+        records = await asyncio.gather( 
             *requests
         )
+        print(f"[{dist.get_rank()}:DP] Done with requests.....")
         responses = [record[-1] for record in records]
         return [
             InferenceResponse(
@@ -237,7 +240,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                            "wandb module is available. Inference logging will be disabled.")
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model, inference_logging_step_interval, metrics_writer)
-        await inference_engine.start_listening_to_data_parallel_coordinator(inference_coordinator_port=41521, launch_inference_coordinator=True)
+        await inference_engine.start_listening_to_data_parallel_coordinator(inference_coordinator_port=41521, launch_inference_coordinator=True, verbose=True)
         if dist.get_rank() == 0:
             # TODO: We have to do this only on the rank 0 process, should be fixed in the future when we have support for multiple inference clients. !2278
             client = InferenceClient(inference_coordinator_port=41521)
@@ -247,7 +250,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._inference_engine = inference_engine
-
         return launched_server
 
     async def kill(self):

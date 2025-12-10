@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
+import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
@@ -1224,7 +1225,7 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
-            logging.info(output_str)
+            print(output_str)
 
         return {
             "active_request_ids": active_request_ids,
@@ -1465,6 +1466,9 @@ class DynamicInferenceEngine(AbstractEngine):
         is_stopped = self.stopped.is_set() or self.received_stop
         is_paused = self.paused.is_set() or self.received_pause
         is_suspended = self.suspend_signal
+
+        #print(f"[{dist.get_rank()}:EP] Entered barrier | local work = {local_work} | is_stopped={is_stopped} | is_paused={is_paused} | is_suspended={is_suspended}")
+
         if is_stopped or is_paused or is_suspended:
             # Signals can be received asynchronously on EP ranks.
             # We do not want a rank to pause/stop/suspend prematurely if one of it's peers
@@ -1482,6 +1486,7 @@ class DynamicInferenceEngine(AbstractEngine):
             max_global_work = local_work
 
         range_pop()
+        #print(f"[{dist.get_rank()}:EP] Exited barrier | global work = {max_global_work} | local work = {local_work}")
         return max_global_work > 0
 
     @trace_async_exceptions
@@ -1515,7 +1520,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 if ep_group_has_work and pending_requests == 0:
                     # run dummy forward pass if EP group as a whole has work,
                     # but this rank does not have any work.
+                    #print(f"[{dist.get_rank()}:EP] Running dummy forward pass to keep EP group alive.")
                     self.controller.dummy_forward()
+                    #print(f"[{dist.get_rank()}:EP] Completed dummy forward pass to keep EP group alive.")
                     continue
 
                 
@@ -1543,7 +1550,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     continue
 
                 # 4. Actual Step
+                #print(f"[{dist.get_rank()}:EP] Running actual step.")
                 await self.async_step(verbose=verbose)
+                #print(f"[{dist.get_rank()}:EP] Ran actual step.")
 
         except asyncio.CancelledError:
             pass
