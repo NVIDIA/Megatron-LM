@@ -1,9 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from pytest import fixture
 from unittest.mock import patch
 
 import torch
+from pytest import fixture
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.common.language_module.language_module import LanguageModule

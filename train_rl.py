@@ -10,16 +10,16 @@ import torch
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 from megatron.core import mpu
-from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
-    load_packed_data_by_index,
     get_logprobs,
     get_rl_runtime_state,
+    load_packed_data_by_index,
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
@@ -28,7 +28,9 @@ from model_provider import model_provider
 stimer = StragglerDetector()
 
 import logging
+
 logging.basicConfig(level=logging.INFO, force=True)
+
 
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
@@ -205,19 +207,19 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     if args.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
-        
-        (   
-            tokens, 
-            advantages, 
-            old_logprobs, 
-            loss_mask, 
-            position_ids, 
-            ref_logprobs, 
-            inference_logprobs, 
-            seq_starts, 
-            seq_lengths, 
+
+        (
+            tokens,
+            advantages,
+            old_logprobs,
+            loss_mask,
+            position_ids,
+            ref_logprobs,
+            inference_logprobs,
+            seq_starts,
+            seq_lengths,
             seq_indices,
-            packed_seq_params
+            packed_seq_params,
         ) = load_packed_data_by_index(bin_tensor.item())
 
         runtime_state = get_rl_runtime_state()
@@ -268,13 +270,18 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
         logprobs_or_hidden_states = get_logprobs(
-            model_to_use, tokens, position_ids, no_grad=False,
-            packed_seq_params=packed_seq_params
+            model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
         )
 
         if not is_pipeline_last_stage():
             output_tensor = logprobs_or_hidden_states
-            kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = None, None, None, None, None
+            kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         else:
             # Calculate loss using unified function
             current_logprobs = logprobs_or_hidden_states
@@ -370,7 +377,9 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    def _model_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+    def _model_builder(
+        args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
+    ):
         if getattr(args, "is_hybrid_model", False):
             return mamba_builder(
                 args,
@@ -395,5 +404,5 @@ if __name__ == "__main__":
         partial(model_provider, _model_builder),
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={}, 
+        args_defaults={},
     )
