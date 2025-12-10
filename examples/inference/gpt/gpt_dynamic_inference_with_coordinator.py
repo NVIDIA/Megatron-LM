@@ -92,7 +92,8 @@ async def main(
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
-        
+        # logging.info("Waiting for 20 seconds before starting to add requests. This is to mimic an RL style setup..")
+        # time.sleep(20)
         while True:
             current_time = time.time_ns() / 10**9
             if args.incoming_requests_per_step is None:

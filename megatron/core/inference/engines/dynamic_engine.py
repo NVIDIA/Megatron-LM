@@ -44,7 +44,7 @@ from megatron.core.inference.utils import Counter, await_process_event
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import get_asyncio_loop, internal_api, trace_async_exceptions
 
-from .async_zmq_barrier import AsyncZMQBarrier
+from .async_zmq_communicator import AsyncZMQCommunicator
 
 try:
     from tqdm import tqdm
@@ -474,9 +474,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # todo: modify to use actual IP of ep-rank 0....
         # todo: modify to find an empty port automatically... 
         if self.ep_world_size > 1:
-            self.expert_parallel_async_barrier = AsyncZMQBarrier(self.zmq_context,
-                                                                 rank=self.ep_rank,
-                                                                 world_size=self.ep_world_size)
+            self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(self.zmq_context,
+                                                                     process_group=parallel_state.get_expert_model_parallel_group())
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
@@ -1426,6 +1425,8 @@ class DynamicInferenceEngine(AbstractEngine):
             self.inference_coordinator_process.terminate()
         for socket in self.zmq_sockets:
             socket.close()
+        if hasattr(self, "expert_parallel_zmq_communicator"):
+            self.expert_parallel_zmq_communicator.close()
         self.zmq_context.term()
 
     @trace_async_exceptions
@@ -1481,7 +1482,7 @@ class DynamicInferenceEngine(AbstractEngine):
             local_work = 0
 
         if parallel_state.get_expert_model_parallel_world_size() > 1:
-            max_global_work = await self.expert_parallel_async_barrier.all_reduce_max(local_work)
+            max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
         else:
             max_global_work = local_work
 
