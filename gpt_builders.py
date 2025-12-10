@@ -21,7 +21,7 @@ import megatron.legacy.model  # isort: skip
 # NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
 
 
-def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
     print_rank_0('building GPT model ...')
     if config is None:
         if args.yaml_cfg is not None:
@@ -93,7 +93,6 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             rope_scaling=args.use_rope_scaling,
             mtp_block_spec=mtp_block_spec,
             vp_stage=vp_stage,
-            pg_collection=pg_collection,
         )
 
     return model
