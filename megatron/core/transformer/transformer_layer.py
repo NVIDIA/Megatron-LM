@@ -651,6 +651,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 not self.recompute_pre_mlp_layernorm
             ), "Recomputation is not supported for CUDA graph."
             cudagraph_outputs = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            nvtx_range_pop(suffix="mlp")
             return cudagraph_outputs + [residual]
         elif self.recompute_mlp:
             if self.config.fp8:
