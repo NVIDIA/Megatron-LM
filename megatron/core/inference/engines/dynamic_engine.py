@@ -20,7 +20,6 @@ from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 import torch.distributed as dist
 
-from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
@@ -41,8 +40,16 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter, await_process_event
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.utils import get_asyncio_loop, internal_api, trace_async_exceptions
+from megatron.core.utils import (
+    get_asyncio_loop,
+    get_pg_rank,
+    get_pg_size,
+    get_pg_src_rank,
+    internal_api,
+    trace_async_exceptions,
+)
 
 from .async_zmq_communicator import AsyncZMQCommunicator
 
@@ -139,6 +146,7 @@ class DynamicInferenceEngine(AbstractEngine):
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
         inference_logging_step_interval: int = 0,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
 
         assert isinstance(
@@ -161,6 +169,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self.enable_cuda_graph = (
                 controller.inference_wrapped_model.model.config.enable_cuda_graph
             )
+
+        if pg_collection is not None:
+            self.pg_collection = pg_collection
+        else:
+            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         # Initialization options.
         self.controller = controller
@@ -381,15 +394,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
         # Get world info.
-        dp_group = parallel_state.get_data_parallel_group()
-        dp_src = parallel_state.get_data_parallel_src_rank()
-        dp_size = parallel_state.get_data_parallel_world_size()
-        dp_rank = parallel_state.get_data_parallel_rank()
+        dp_group = self.pg_collection.dp
+        dp_src = get_pg_src_rank(dp_group)
+        dp_size = get_pg_size(self.pg_collection.dp)
+        dp_rank = get_pg_rank(self.pg_collection.dp)
 
-        mp_group = parallel_state.get_model_parallel_group()
-        mp_src = parallel_state.get_model_parallel_src_rank()
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        mp_group = self.pg_collection.mp
+        mp_src = get_pg_src_rank(mp_group)
+        tp_rank = get_pg_rank(self.pg_collection.tp)
+        pp_rank = get_pg_rank(self.pg_collection.pp)
 
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
@@ -403,7 +416,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 args=(
                     coordinator_ready_event,
                     inference_coordinator_port,
-                    parallel_state.get_data_parallel_world_size(),
+                    get_pg_size(self.pg_collection.dp),
                 ),
             )
             self.inference_coordinator_process.start()
@@ -677,14 +690,20 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate is None
             or request.sampling_params.num_tokens_total is None
         )
-        if request.sampling_params.return_prompt_top_n_logprobs:
-            assert (
-                request.sampling_params.return_log_probs
-            ), "return_prompt_top_n_logprobs requires sampling_params.return_log_probs to be True"
         if request.sampling_params.top_n_logprobs > 0:
             assert (
                 request.sampling_params.return_log_probs
             ), "top_n_logprobs requires sampling_params.return_log_probs to be True"
+        if (
+            request.sampling_params.return_log_probs
+            and not request.sampling_params.skip_prompt_log_probs
+        ):
+            assert not self.context.materialize_only_last_token_logits, (
+                "Prompt log probs cannot be calculated if only last token logits are materialized. "
+                "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
+                "or skip_prompt_log_probs to True in SamplingParams."
+            )
+
         if request.sampling_params.num_tokens_total is not None:
             request.sampling_params.num_tokens_to_generate = (
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)

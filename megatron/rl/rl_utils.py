@@ -64,6 +64,9 @@ from megatron.training.global_vars import (
 )
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -719,8 +722,8 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     assert (
-        n_prompts % mpu.get_expert_data_parallel_world_size() == 0
-    ), "n_prompts must be divisible by data_parallel_world_size"
+        n_prompts % mpu.get_data_parallel_world_size() == 0
+    ), f"n_prompts {n_prompts} must be divisible by data_parallel_world_size {mpu.get_data_parallel_world_size()}"
 
     with nvtx_range("rollout-collection"):
         loop = get_asyncio_loop()
@@ -798,7 +801,8 @@ def selective_log_softmax(logits, index):
         `torch.Tensor`:
             Gathered log probabilities with the same shape as `index`.
     """
-    if logits.dtype in [torch.float32, torch.float64]:
+    use_bik_logsoftmax = is_batch_invariant_mode_enabled()
+    if logits.dtype in [torch.float32, torch.float64] and not use_bik_logsoftmax:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption
         logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
@@ -1249,18 +1253,18 @@ def prepare_packed_trajectories(
     Returns:
         Trajectories, generation masks, and inference logprobs (all gathered from all ranks).
     """
-    world_size = mpu.get_expert_data_parallel_world_size()
+    world_size = mpu.get_data_parallel_world_size()
     # For packing, distribute trajectory preparation across ranks
     # Each rank prepares a portion, then we gather for packing
     total_rollouts = len(all_rollouts)
     rollouts_per_rank = total_rollouts // (world_size if world_size > 0 else 1)
-    rank = mpu.get_expert_data_parallel_rank()
+    rank = mpu.get_data_parallel_rank()
 
     # Each rank prepares its portion
     start_idx = rank * rollouts_per_rank
     end_idx = (
         start_idx + rollouts_per_rank
-        if rank < mpu.get_expert_data_parallel_world_size() - 1
+        if rank < mpu.get_data_parallel_world_size() - 1
         else total_rollouts
     )
     my_rollouts = all_rollouts[start_idx:end_idx]
@@ -1284,14 +1288,14 @@ def prepare_packed_trajectories(
         # Gather all trajectories
         trajs_list = [torch.empty_like(my_trajs) for _ in range(world_size)]
         torch.distributed.all_gather(
-            trajs_list, my_trajs, group=mpu.get_expert_data_parallel_group()
+            trajs_list, my_trajs, group=mpu.get_data_parallel_group()
         )
         trajs = torch.cat(trajs_list, dim=0)
 
         # Gather all generation masks
         masks_list = [torch.empty_like(my_generation_masks) for _ in range(world_size)]
         torch.distributed.all_gather(
-            masks_list, my_generation_masks, group=mpu.get_expert_data_parallel_group()
+            masks_list, my_generation_masks, group=mpu.get_data_parallel_group()
         )
         generation_masks = torch.cat(masks_list, dim=0)
 
@@ -1299,7 +1303,7 @@ def prepare_packed_trajectories(
         if my_inference_logprobs is not None:
             logprobs_list = [torch.empty_like(my_inference_logprobs) for _ in range(world_size)]
             torch.distributed.all_gather(
-                logprobs_list, my_inference_logprobs, group=mpu.get_expert_data_parallel_group()
+                logprobs_list, my_inference_logprobs, group=mpu.get_data_parallel_group()
             )
             inference_logprobs = torch.cat(logprobs_list, dim=0)
         else:
