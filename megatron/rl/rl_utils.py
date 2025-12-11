@@ -1319,11 +1319,11 @@ def prepare_data_for_update(
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
-        if (expert_data_parallel_world_size := mpu.get_expert_data_parallel_world_size()) > 0:
-            data_split_size = len(rollouts) // expert_data_parallel_world_size
+        if (data_parallel_world_size := mpu.get_data_parallel_world_size()) > 0:
+            data_split_size = len(rollouts) // data_parallel_world_size
             data_split_range = (
-                mpu.get_expert_data_parallel_rank() * data_split_size,
-                (mpu.get_expert_data_parallel_rank() + 1) * data_split_size,
+                mpu.get_data_parallel_rank() * data_split_size,
+                (mpu.get_data_parallel_rank() + 1) * data_split_size,
             )
             rollouts = rollouts[data_split_range[0] : data_split_range[1]]
 
@@ -1378,7 +1378,7 @@ def prepare_data_for_update(
                     packing_info,
                 ) = packer.pack_sequences(traj_list, generation_masks)
 
-                rank = mpu.get_expert_data_parallel_rank()
+                rank = mpu.get_data_parallel_rank()
                 # Debug: Check packing output
                 if rank == 0:
                     seq_per_bin = [len(indices) for indices in packing_info['bin_seq_indices']]
@@ -1396,7 +1396,7 @@ def prepare_data_for_update(
 
                 # Distribute packed bins across data parallel ranks
                 num_bins = packed_trajs.shape[0]
-                world_size = mpu.get_expert_data_parallel_world_size()
+                world_size = mpu.get_data_parallel_world_size()
 
                 # Choose distribution algorithm based on args.sequence_packing_algo
                 packing_algo = getattr(args, 'rl_sequence_packing_algo', 'fifo')
