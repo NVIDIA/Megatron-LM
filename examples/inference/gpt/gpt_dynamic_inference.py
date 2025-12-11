@@ -155,7 +155,7 @@ def get_inference_context(
         max_sequence_length = args.inference_max_seq_length
 
     metrics_writer = None
-    if args.inference_logging_step_interval > 0 and args.inference_logging_step_interval:
+    if args.inference_logging_step_interval > 0 and args.inference_wandb_logging:
         metrics_writer = get_wandb_writer()
 
     # Inference context.
