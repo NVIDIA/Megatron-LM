@@ -454,7 +454,7 @@ class MambaMixer(MegatronModule):
         if it exists.
         """
         sequence_packing_available, reason_for_no_sequence_packing = (
-            check_mamba_sequence_packing_support()
+            check_mamba_sequence_packing_support(for_inference_not_training=True)
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
@@ -652,7 +652,7 @@ class MambaMixer(MegatronModule):
         seq_idx = None
         if packed_seq_params is not None:
             sequence_packing_available, reason_for_no_sequence_packing = (
-                check_mamba_sequence_packing_support()
+                check_mamba_sequence_packing_support(for_inference_not_training=False)
             )
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = self._create_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
