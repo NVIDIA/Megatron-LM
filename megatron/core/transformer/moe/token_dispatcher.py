@@ -49,6 +49,8 @@ logger = logging.getLogger(__name__)
      num_global_tokens: num_local_tokens*TP*EP
 """
 
+logger = logging.getLogger(__name__)
+
 
 class MoETokenDispatcher:
     """
@@ -1265,7 +1267,6 @@ class _DeepepManager(_DispatchManager):
         # Check if there are enough tokens to pad
         enough_tokens_to_pad = torch.all(target_tokens_per_expert <= num_input_tokens)
         if not enough_tokens_to_pad:
-            logger = logging.getLogger(__name__)
             logger.warning(
                 "Not enough tokens to pad. The total number of tokens received in this rank "
                 "is smaller than the target number of tokens for each expert. "

@@ -99,6 +99,10 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
             )
 
+            # clear the lru_cache for the get_emb method. If not cleared, the cache of get_emb
+            # method causes a memory leak in NeMo-RL.
+            self.get_emb.cache_clear()
+
     @lru_cache(maxsize=32)
     def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
