@@ -793,7 +793,8 @@ def prepare_data_for_update(
     args = get_args()
     wandb_writer = get_wandb_writer()
     tb_writer = get_tensorboard_writer()
-    nvtx_range = get_nvtx_range()
+    nvtx_range = get_nvtx_range()                
+    runtime_state = get_rl_runtime_state()
     model = model[0]
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
@@ -833,7 +834,13 @@ def prepare_data_for_update(
                 (mpu.get_expert_data_parallel_rank() + 1) * data_split_size,
             )
             rollouts = rollouts[data_split_range[0] : data_split_range[1]]
-            advantages = advantages[data_split_range[0] : data_split_range[1]]
+            rewards = torch.tensor([[r.reward for r in group] for group in rollouts], device='cpu')
+            advantages = (rewards - rewards.mean(axis=1, keepdim=True)) / (
+                1e-4 + rewards.std(axis=1, keepdim=True)
+            )
+
+            # Flatten advantages for training and move to GPU
+            advantages = advantages.view(-1).cuda()
 
         with nvtx_range("prepare_trajectories"):
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
@@ -843,8 +850,6 @@ def prepare_data_for_update(
         # Build trajectories based on sequence packing or standard processing
         if args.rl_use_sequence_packing:
             with nvtx_range("sequence_packing", time=True):
-                
-                runtime_state = get_rl_runtime_state()
                 runtime_state.packing_context = packing_context = pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages)
     
                 compute_trajs = packing_context.packed_trajs
