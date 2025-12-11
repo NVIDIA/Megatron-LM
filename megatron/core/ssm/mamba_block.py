@@ -15,7 +15,7 @@ from torch import Tensor, nn
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.extensions.transformer_engine import TENorm, qtype_debug_log
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -279,6 +279,7 @@ class MambaStack(MegatronModule):
                 )
                 with inner_fp8_context:
                     if isinstance(layer, TransformerLayer):
+                        qtype_debug_log(f"[{layer_no}] transformer layer (may be moe)")
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -287,6 +288,7 @@ class MambaStack(MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                         )
                     else:  # MambaLayer
+                        qtype_debug_log(f"[{layer_no}] non-transformer layer")
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,

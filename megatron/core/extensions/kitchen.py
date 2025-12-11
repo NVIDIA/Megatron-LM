@@ -3,6 +3,7 @@
 import warnings
 from dataclasses import dataclass, fields
 from enum import Enum
+import os
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 import torch
@@ -156,6 +157,16 @@ class KitchenQuantizationParams:
             )
         else:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
+
+
+def quant_debug_log(kitchen_quant_params: KitchenQuantizationParams, prefix: str) -> None:
+    if os.getenv("QUANTIZATION_TYPE_DEBUG", "0") == "1":
+        from megatron.training import print_rank_0
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+        autocast_enabled = FP8GlobalStateManager.is_fp8_enabled()
+        print_rank_0(f"{prefix}, autocast_enabled={autocast_enabled} "
+                     f"quantization_type: {kitchen_quant_params.params_config_key} "
+                     f"match_context: {kitchen_quant_params.match_input}")
 
 
 def _get_extra_kitchen_kwargs(config: TransformerConfig):
@@ -346,6 +357,8 @@ class KitchenLinear(nvidia_kitchen.Linear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
+        if _is_first_microbatch:
+            quant_debug_log(self.kitchen_quant_params, f"  {self.__class__.__name__}")
         out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
@@ -667,6 +680,8 @@ class KitchenGroupedLinear(nvidia_kitchen.GroupedLinear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
+        if _is_first_microbatch:
+            quant_debug_log(self.kitchen_quant_params, f"  {self.__class__.__name__}")
         out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
@@ -993,6 +1008,8 @@ class KitchenLayerNormColumnParallelLinear(nvidia_kitchen.LayerNormLinear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
+        if _is_first_microbatch:
+            quant_debug_log(self.kitchen_quant_params, f"  {self.__class__.__name__}")
         out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
