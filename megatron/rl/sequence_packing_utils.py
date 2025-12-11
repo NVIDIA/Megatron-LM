@@ -1,6 +1,9 @@
 import torch
+import math
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
+from torch.utils.data import DataLoader, TensorDataset
+from dataclasses import dataclass, field
 from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 from megatron.training.utils import get_nvtx_range
@@ -11,37 +14,143 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def log_packing_efficiency(packing_context):
+
+@dataclass
+class PackingInfo:
+    """Information about how sequences are packed into bins.
+    
+    Attributes:
+        bin_seq_indices: List where each element contains the global sequence indices in that bin
+        seq_starts: Dict mapping bin index to list of start positions for each sequence in that bin
+        seq_lengths: List of all original sequence lengths (indexed by global sequence index)
+        seq_to_bin_idx: List mapping each global sequence index to its bin index
+        packing_algo: Algorithm used for distributing bins ('fifo' or 'round-robin')
+    """
+    bin_seq_indices: List[List[int]]
+    seq_starts: Dict[int, List[int]]
+    seq_lengths: List[int]
+    seq_to_bin_idx: List[Optional[int]]
+    packing_algo: str = 'fifo'
+
+
+@dataclass
+class PackingContext:
+    """Context containing all information needed for sequence packing during training.
+    
+    Attributes:
+        bin_size: Maximum size of each bin (in tokens)
+        packer: SequencePacker instance used for packing
+        packing_info: PackingInfo object with bin assignments and metadata
+        original_generation_masks: Generation masks for all sequences before packing
+        original_trajs: All trajectories before packing
+        packed_trajs: Packed trajectories tensor [num_bins, bin_size]
+        packed_position_ids: Position IDs for packed sequences [num_bins, bin_size]
+        packed_attention_mask: Attention mask for packed sequences [num_bins, 1, bin_size, bin_size]
+        packed_loss_mask: Loss mask for packed sequences [num_bins, bin_size]
+        bin_advantages: List of advantage tensors for each bin
+        cached_packed_seq_params: Pre-computed PackedSeqParams for each bin
+    """
+    bin_size: int
+    packer: 'SequencePacker'
+    packing_info: PackingInfo
+    original_generation_masks: torch.Tensor
+    original_trajs: torch.Tensor
+    packed_trajs: torch.Tensor
+    packed_position_ids: torch.Tensor
+    packed_attention_mask: torch.Tensor
+    packed_loss_mask: torch.Tensor
+    bin_advantages: List[torch.Tensor] = field(default_factory=list)
+    cached_packed_seq_params: List[Optional[PackedSeqParams]] = field(default_factory=list)
+
+
+def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext):
+    """Load packed data by index.
+
+    Args:
+        bin_idx: Index of the bin to load.
+    """
+    args = get_args()
+    # Get packing context (should always be available in packed mode)
+    idx = slice(bin_idx, bin_idx + 1)
+
+    # Get cached PackedSeqParams for proper attention masking in Transformer Engine
+    # These were pre-computed in prepare_data_for_update to avoid repeated tensor allocations
+    packed_seq_params = packing_context.cached_packed_seq_params[bin_idx]
+
+    # Extract packed data for this bin (already on GPU)
+    tokens = packing_context.packed_trajs[idx]
+    position_ids = packing_context.packed_position_ids[idx]
+
+    # Check if we have old_logprobs and ref_logprobs as attributes
+    old_logprobs = getattr(packing_context, 'old_logprobs', None)
+    if old_logprobs is not None:
+        old_logprobs = old_logprobs[idx]
+    
+    ref_logprobs = getattr(packing_context, 'ref_logprobs', None)
+    if ref_logprobs is not None:
+        ref_logprobs = ref_logprobs[idx]
+        
+    loss_mask = packing_context.packed_loss_mask[idx, 1:]
+
+    # Get sequence-level data for this bin
+    packing_info = packing_context.packing_info
+    seq_starts = packing_info.seq_starts[bin_idx]
+    seq_indices = packing_info.bin_seq_indices[bin_idx]
+
+    # Handle empty bins (used for padding to ensure all ranks have same iterations)
+    if not seq_indices:
+        seq_lengths = []
+        advantages = torch.tensor([], device='cuda')
+    else:
+        seq_lengths = [packing_info.seq_lengths[idx] for idx in seq_indices]
+        advantages = packing_context.bin_advantages[bin_idx]
+
+    # Extract packed inference_logprobs if available
+    packed_inference_logprobs = getattr(packing_context, 'packed_inference_logprobs', None)
+    if packed_inference_logprobs is not None and args.rl_inference_logprobs_is_correction:
+        inference_logprobs = packed_inference_logprobs[idx]
+    else:
+        inference_logprobs = None
+
+    return (
+        tokens,
+        advantages,
+        old_logprobs,
+        loss_mask,
+        position_ids,
+        ref_logprobs,
+        inference_logprobs,
+        seq_starts,
+        seq_lengths,
+        seq_indices,
+        packed_seq_params,
+    )
+
+
+def log_packing_efficiency(packing_context: PackingContext):
     # Log packing efficiency (for this rank's bins)
-    packing_info = packing_context['packing_info']
-    packed_trajs = packing_context['packed_trajs']
-    my_bin_seq_indices = packing_info['bin_seq_indices']
-    num_bins = len(packing_info['bin_seq_indices'])
-    total_tokens = sum(packing_info['seq_lengths'])  # All sequences
+    packing_info = packing_context.packing_info
+    packed_trajs = packing_context.packed_trajs
+    my_bin_seq_indices = packing_info.bin_seq_indices
+    num_bins = len(packing_info.bin_seq_indices)
+    total_tokens = sum(packing_info.seq_lengths)  # All sequences
     my_sequences = sum(len(indices) for indices in my_bin_seq_indices)
     my_tokens = sum(
-        packing_info['seq_lengths'][idx]
+        packing_info.seq_lengths[idx]
         for indices in my_bin_seq_indices
         for idx in indices
     )
     total_capacity = packed_trajs.shape[0] * packed_trajs.shape[1]
     packing_efficiency = my_tokens / total_capacity if total_capacity > 0 else 0
-    avg_seq_length = total_tokens / len(packing_info['seq_lengths'])
+    avg_seq_length = total_tokens / len(packing_info.seq_lengths)
     rank = mpu.get_expert_data_parallel_rank()
     expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
-
-    # Store global average sequences per bin in packing context
-    if num_bins > 0:
-        global_avg_seqs_per_bin = len(packing_info['seq_lengths']) / num_bins / expert_data_parallel_world_size
-    else:
-        global_avg_seqs_per_bin = 1  # Default to 1 if no bins
-    packing_context['global_avg_seqs_per_bin'] = global_avg_seqs_per_bin
 
     log_single_rank(logger, logging.INFO, f"[Sequence Packing] Statistics:")
     log_single_rank(
         logger,
         logging.INFO,
-        f"[Sequence Packing]  - Total sequences: {len(packing_info['seq_lengths'])}",
+        f"[Sequence Packing]  - Total sequences: {len(packing_info.seq_lengths)}",
     )
     log_single_rank(
         logger, logging.INFO, f"[Sequence Packing]  - Total bins: {num_bins}"
@@ -55,11 +164,6 @@ def log_packing_efficiency(packing_context):
         logger,
         logging.INFO,
         f"[Sequence Packing]  - Average sequence length: {avg_seq_length:.1f} tokens",
-    )
-    log_single_rank(
-        logger,
-        logging.INFO,
-        f"[Sequence Packing]  - Average sequences per bin: {global_avg_seqs_per_bin:.1f}",
     )
     log_single_rank(
         logger,
@@ -110,7 +214,7 @@ def log_packing_efficiency(packing_context):
             log_single_rank(
                 logger,
                 logging.INFO,
-                f"[Sequence Packing] Per-rank distribution ({packing_info['packing_algo']} algorithm):",
+                f"[Sequence Packing] Per-rank distribution ({packing_info.packing_algo} algorithm):",
             )
             log_single_rank(
                 logger,
@@ -196,22 +300,22 @@ def get_actual_sequence_lengths(sequences: torch.Tensor, pad_token: int) -> List
 
 
 def create_empty_bins(
-    num_empty_bins,
-    bin_size,
-    packed_trajs,
-    packed_position_ids,
-    packed_loss_mask,
-    packed_attention_mask,
+    num_empty_bins : int,
+    bin_size : int,
+    packed_trajs : torch.Tensor,
+    packed_position_ids : torch.Tensor,
+    packed_loss_mask : torch.Tensor,
+    packed_attention_mask : torch.Tensor,
     tokenizer,
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[Dict[str, Any]]]:
     """Create empty bins for padding to ensure all ranks have the same number of bins.
 
     Args:
         num_empty_bins: Number of empty bins to create
         bin_size: Size of each bin
         packed_trajs: Packed trajectories tensor (for dtype/device reference)
-        packed_position_ids: Packed position IDs tensor
-        packed_loss_mask: Packed loss mask tensor
+        packed_position_ids: Packed position IDs tensor (for dtype/device reference)
+        packed_loss_mask: Packed loss mask tensor (for dtype/device reference)
         packed_attention_mask: Packed attention mask tensor (can be None)
         tokenizer: Tokenizer for pad token
 
@@ -282,12 +386,12 @@ def create_empty_bins(
         empty_packing_info_entries,
     )
 
-def create_packed_seq_params(packing_context):
+def create_packed_seq_params(packing_context: PackingContext):
     cached_packed_seq_params = []
-    packing_info = packing_context['packing_info']
-    bin_size = packing_context['bin_size']
-    device = packing_context['packed_trajs'].device
-    for bin_idx in range(len(packing_context['packed_trajs'])):
+    packing_info = packing_context.packing_info
+    bin_size = packing_context.bin_size
+    device = packing_context.packed_trajs.device
+    for bin_idx in range(len(packing_context.packed_trajs)):
         params = create_packed_seq_params_for_bin(
             packing_info=packing_info,
             bin_idx=bin_idx,
@@ -298,7 +402,7 @@ def create_packed_seq_params(packing_context):
     return cached_packed_seq_params
 
 def create_packed_seq_params_for_bin(
-    packing_info: Dict[str, Any], bin_idx: int, bin_size: int, device: torch.device
+    packing_info: PackingInfo, bin_idx: int, bin_size: int, device: torch.device
 ) -> Optional[PackedSeqParams]:
     """Create PackedSeqParams for a single bin to enable proper attention masking in TE.
 
@@ -307,7 +411,7 @@ def create_packed_seq_params_for_bin(
     within a packed bin. This prevents attention leakage between unrelated sequences.
 
     Args:
-        packing_info: Dictionary containing packing metadata from SequencePacker
+        packing_info: PackingInfo object containing packing metadata from SequencePacker
         bin_idx: Index of the bin to create params for
         bin_size: Size of the bin (padded sequence length)
         device: Device to create tensors on
@@ -315,14 +419,14 @@ def create_packed_seq_params_for_bin(
     Returns:
         PackedSeqParams with cu_seqlens set for proper attention masking (or None if empty)
     """
-    seq_indices = packing_info['bin_seq_indices'][bin_idx]
+    seq_indices = packing_info.bin_seq_indices[bin_idx]
 
     # Handle empty bins (padding bins with no sequences)
     if not seq_indices:
         return None
 
     # Get actual sequence lengths for sequences in this bin
-    seq_lengths_in_bin = [packing_info['seq_lengths'][idx] for idx in seq_indices]
+    seq_lengths_in_bin = [packing_info.seq_lengths[idx] for idx in seq_indices]
 
     # Build cumulative sequence lengths for actual sequences
     # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
@@ -345,7 +449,7 @@ def create_packed_seq_params_for_bin(
 
 def pack_inference_logprobs(
     inference_logprobs: List[torch.Tensor],
-    packing_info: Dict[str, Any],
+    packing_info: PackingInfo,
     generation_masks: torch.Tensor,
     bin_size: int,
 ) -> torch.Tensor:
@@ -353,14 +457,14 @@ def pack_inference_logprobs(
 
     Args:
         inference_logprobs: List of inference logprobs tensors for each sequence
-        packing_info: Dictionary containing bin assignments and sequence positions
+        packing_info: PackingInfo object containing bin assignments and sequence positions
         generation_masks: Tensor indicating which tokens were generated
         bin_size: Size of each bin
 
     Returns:
         Packed inference logprobs tensor of shape [num_bins, bin_size - 1]
     """
-    num_bins = len(packing_info['bin_seq_indices'])
+    num_bins = len(packing_info.bin_seq_indices)
 
     # Create packed inference logprobs tensor (logprobs are 1 token shorter than sequences)
     packed_inference_logprobs = torch.zeros(
@@ -371,7 +475,7 @@ def pack_inference_logprobs(
     # This is needed because seq_to_bin_idx uses global bin indices,
     # but after distribution each rank only has a subset of bins
     seq_to_local_bin = {}
-    for local_bin_idx, seq_indices in enumerate(packing_info['bin_seq_indices']):
+    for local_bin_idx, seq_indices in enumerate(packing_info.bin_seq_indices):
         for seq_idx in seq_indices:
             seq_to_local_bin[seq_idx] = local_bin_idx
 
@@ -383,9 +487,9 @@ def pack_inference_logprobs(
         local_bin_idx = seq_to_local_bin[seq_idx]
 
         # Get the position of this sequence within the bin
-        seq_positions = packing_info['bin_seq_indices'][local_bin_idx]
+        seq_positions = packing_info.bin_seq_indices[local_bin_idx]
         seq_pos_in_bin = seq_positions.index(seq_idx)
-        seq_start = packing_info['seq_starts'][local_bin_idx][seq_pos_in_bin]
+        seq_start = packing_info.seq_starts[local_bin_idx][seq_pos_in_bin]
 
         # Get generation mask for this sequence to find where generation starts
         gen_mask = generation_masks[seq_idx]
@@ -402,7 +506,7 @@ def pack_inference_logprobs(
         # The inference logprobs start at the first generated token position
         pack_start = seq_start + first_gen_idx
         pack_end = min(
-            pack_start + len(seq_inf_logprobs), seq_start + packing_info['seq_lengths'][seq_idx] - 1
+            pack_start + len(seq_inf_logprobs), seq_start + packing_info.seq_lengths[seq_idx] - 1
         )
         actual_len = pack_end - pack_start
 
@@ -423,7 +527,7 @@ class SequencePacker:
 
     def pack_sequences(
         self, trajs: torch.Tensor, generation_masks: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
         """Pack sequences into bins using a greedy first-fit algorithm."""
         # Convert trajectories to list for packing
         sequences = [trajs[i] for i in range(trajs.shape[0])]
@@ -513,19 +617,14 @@ class SequencePacker:
         )
         loss_mask = torch.zeros((num_bins, self.bin_size), dtype=torch.float, device=device)
 
-        # TODO(jalbericiola): packing_info as a dataclass and not just a dict
         # Track packing information for unpacking later
-        packing_info = {
-            'bin_seq_indices': bin_seq_indices,  # Which original sequences are in each bin
-            'seq_starts': [],  # Start position of each sequence within its bin
-            'seq_lengths': seq_lengths,  # Original sequence lengths
-            'seq_to_bin_idx': [None] * len(sequences),  # Map from sequence index to bin index
-        }
+        seq_starts_dict: Dict[int, List[int]] = {}
+        seq_to_bin_idx: List[Optional[int]] = [None] * len(sequences)
 
         # Build seq_to_bin_idx mapping
         for bin_idx, seq_indices in enumerate(bin_seq_indices):
             for seq_idx in seq_indices:
-                packing_info['seq_to_bin_idx'][seq_idx] = bin_idx
+                seq_to_bin_idx[seq_idx] = bin_idx
 
         # Fill bins
         for bin_idx, (bin_seqs, seq_indices) in enumerate(zip(bins, bin_seq_indices)):
@@ -564,32 +663,31 @@ class SequencePacker:
                     loss_mask[bin_idx, start:end] *= gen_mask.float()
 
             seq_starts.append(current_pos)
-            packing_info['seq_starts'].append(seq_starts)
-
-        # Add bin_start_positions - a dict mapping bin_idx to list of start positions for each sequence in that bin
-        bin_start_positions = {}
-        for bin_idx in range(num_bins):
-            bin_start_positions[bin_idx] = packing_info['seq_starts'][bin_idx]
-        packing_info['bin_start_positions'] = bin_start_positions
+            seq_starts_dict[bin_idx] = seq_starts
 
         # Note: We'll store the actual padded length later when we know it
         # (it depends on the original trajectories passed to pack_sequences)
 
         # Invert attention mask, before inversion: (True = attend, False = mask)
         attention_mask = ~attention_mask
-        
-        # Store packing info for later unpacking
-        # Also store the actual padded length in packing_info for the unpacker
-        packing_info['original_padded_length'] = trajs.shape[1]
 
-        seq_per_bin = [len(indices) for indices in packing_info['bin_seq_indices']]
+        # Create the PackingInfo dataclass
+        packing_info = PackingInfo(
+            bin_seq_indices=bin_seq_indices,
+            seq_starts=seq_starts_dict,
+            seq_lengths=seq_lengths,
+            seq_to_bin_idx=seq_to_bin_idx,
+            packing_algo='fifo',  # Will be updated during distribution
+        )
+
+        seq_per_bin = [len(indices) for indices in packing_info.bin_seq_indices]
         log_single_rank(
             logger, logging.DEBUG, (f"Initial packing output (before distribution):")
         )
         log_single_rank(
             logger,
             logging.DEBUG,
-            f"  - Total bins created: {len(packing_info['bin_seq_indices'])}",
+            f"  - Total bins created: {len(packing_info.bin_seq_indices)}",
         )
         log_single_rank(
             logger, logging.DEBUG, f"  - Total sequences packed: {sum(seq_per_bin)}"
@@ -608,8 +706,8 @@ def distribute_packed_bins(
     packed_position_ids: torch.Tensor,
     packed_attention_mask: torch.Tensor,
     packed_loss_mask: torch.Tensor,
-    packing_info: Dict[str, Any],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+    packing_info: PackingInfo,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
     """Distribute packed bins across the data parallel ranks."""
     rank = mpu.get_expert_data_parallel_rank()
     world_size = mpu.get_expert_data_parallel_world_size()
@@ -662,8 +760,8 @@ def distribute_packed_bins(
         if packed_attention_mask is not None:
             my_packed_attention_mask.append(packed_attention_mask[old_idx])
         my_packed_loss_mask.append(packed_loss_mask[old_idx])
-        my_bin_seq_indices.append(packing_info['bin_seq_indices'][old_idx])
-        my_seq_starts[new_idx] = packing_info['seq_starts'][old_idx]
+        my_bin_seq_indices.append(packing_info.bin_seq_indices[old_idx])
+        my_seq_starts[new_idx] = packing_info.seq_starts[old_idx]
 
     # Stack the selected bins
     packed_trajs = (
@@ -728,14 +826,13 @@ def distribute_packed_bins(
         )
 
     # Create updated packing info for this rank
-    packing_info = {
-        'bin_seq_indices': my_bin_seq_indices,
-        'seq_starts': my_seq_starts,
-        'seq_lengths': packing_info['seq_lengths'],  # Keep all sequence lengths
-        'seq_to_bin_idx': packing_info['seq_to_bin_idx'],  # Keep mapping
-        'original_padded_length': packing_info['original_padded_length'],
-        'packing_algo': packing_algo,
-    }
+    new_packing_info = PackingInfo(
+        bin_seq_indices=my_bin_seq_indices,
+        seq_starts=my_seq_starts,
+        seq_lengths=packing_info.seq_lengths,  # Keep all sequence lengths
+        seq_to_bin_idx=packing_info.seq_to_bin_idx,  # Keep mapping
+        packing_algo=packing_algo,
+    )
 
     # Add empty bins if this rank has fewer than max_bins_per_rank
     current_bins = len(my_bin_indices)
@@ -774,10 +871,10 @@ def distribute_packed_bins(
         # Add empty entries to packing_info
         for i, entry in enumerate(empty_packing_entries):
             bin_idx = current_bins + i
-            packing_info['bin_seq_indices'].append(entry['bin_seq_indices'])
-            packing_info['seq_starts'][bin_idx] = entry['seq_starts']
+            new_packing_info.bin_seq_indices.append(entry['bin_seq_indices'])
+            new_packing_info.seq_starts[bin_idx] = entry['seq_starts']
 
-    return packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info
+    return packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, new_packing_info
 
 
 def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages):
@@ -814,10 +911,6 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
             inference_logprobs = torch.cat(logprobs_list, dim=0)
 
     with nvtx_range("pack_sequences", time=True):
-
-        
-        packing_context = {}
-        
         # Create packer with max sequences per bin limit to prevent extreme imbalance
         max_sequences_per_bin = getattr(
             args, 'rl_sequence_packing_max_sequences_per_bin', 100
@@ -852,34 +945,137 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
             packing_info,
         )
 
-    packing_context = {}
-    packing_context['bin_size'] = bin_size
-    packing_context['packer'] = packer  # Store for reuse
-    packing_context['packing_info'] = packing_info
-    packing_context['original_generation_masks'] = generation_masks
-    packing_context['original_trajs'] = trajs
-    packing_context['packed_trajs'] = packed_trajs
-    packing_context['packed_position_ids'] = packed_position_ids
-    packing_context['packed_attention_mask'] = packed_attention_mask
-    packing_context['packed_loss_mask'] = packed_loss_mask
-
-    packing_context['bin_advantages'] = []
-    for seq_indices in packing_info['bin_seq_indices']:
+    # Create bin_advantages list
+    bin_advantages = []
+    for seq_indices in packing_info.bin_seq_indices:
         if seq_indices:
-            packing_context['bin_advantages'].append(global_advantages[seq_indices])
+            bin_advantages.append(global_advantages[seq_indices])
         else:
-            packing_context['bin_advantages'].append(
+            bin_advantages.append(
                 torch.tensor([], dtype=global_advantages.dtype, device=global_advantages.device)
             )
 
     # Pre-compute all PackedSeqParams for all bins ONCE to avoid repeated
     # tensor allocations that cause CUDA memory fragmentation and periodic spikes
-    packing_context['cached_packed_seq_params'] = create_packed_seq_params(packing_context)
+    # Create a temporary packing context to pass to create_packed_seq_params
+    temp_context = PackingContext(
+        bin_size=bin_size,
+        packer=packer,
+        packing_info=packing_info,
+        original_generation_masks=generation_masks,
+        original_trajs=trajs,
+        packed_trajs=packed_trajs,
+        packed_position_ids=packed_position_ids,
+        packed_attention_mask=packed_attention_mask,
+        packed_loss_mask=packed_loss_mask,
+        bin_advantages=bin_advantages,
+    )
+    cached_packed_seq_params = create_packed_seq_params(temp_context)
+
+    # Create the final PackingContext
+    packing_context = PackingContext(
+        bin_size=bin_size,
+        packer=packer,
+        packing_info=packing_info,
+        original_generation_masks=generation_masks,
+        original_trajs=trajs,
+        packed_trajs=packed_trajs,
+        packed_position_ids=packed_position_ids,
+        packed_attention_mask=packed_attention_mask,
+        packed_loss_mask=packed_loss_mask,
+        bin_advantages=bin_advantages,
+        cached_packed_seq_params=cached_packed_seq_params,
+    )
 
     log_packing_efficiency(packing_context)
 
     return packing_context
 
+
+def get_microbatch_dataloader(packing_context: PackingContext) -> Tuple[DataLoader, int]:
+    args = get_args()
+    num_bins_this_rank = len(packing_context.packed_trajs)
+    dp_world_size = mpu.get_data_parallel_world_size()
+
+    # Ratio of collected sequences to the global batch size
+    pct_of_sequences_per_batch = len(packing_context.packing_info.seq_lengths) / args.global_batch_size
+    pct_of_bins_per_batch = pct_of_sequences_per_batch
+
+    # Ceiling division means we will reuse some bins
+    # If we did floor we would leave some behind
+    local_bins_per_step = math.ceil(pct_of_bins_per_batch * num_bins_this_rank)
+    effective_global_batch_size = local_bins_per_step * dp_world_size
+
+    # Store packing plan in runtime state for the training loop to use
+    optimizer_steps = -(-num_bins_this_rank // local_bins_per_step)
+
+    from megatron.core.num_microbatches_calculator import (
+        get_num_microbatches,
+        reconfigure_num_microbatches_calculator,
+    )
+
+    old_num_microbatches = get_num_microbatches()
+
+    reconfigure_num_microbatches_calculator(
+        rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+        rampup_batch_size=args.rampup_batch_size,
+        global_batch_size=effective_global_batch_size,
+        micro_batch_size=args.micro_batch_size,
+        data_parallel_size=dp_world_size,
+        decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+    )
+
+    new_num_microbatches = get_num_microbatches()
+
+    log_single_rank(
+        logger, logging.INFO, f"[Sequence Packing] Multi-step training plan:"
+    )
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[Sequence Packing]  - Target sequences per step: {args.global_batch_size}",
+    )
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[Sequence Packing]  - Bins per rank per step: {pct_of_sequences_per_batch}*{num_bins_this_rank}={local_bins_per_step}",
+    )
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[Sequence Packing]  - Total optimizer steps: {optimizer_steps}",
+    )
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[Sequence Packing]  - Microbatches per step: {new_num_microbatches} (was {old_num_microbatches})",
+    )
+
+    bin_seq_indices = packing_context.packing_info.bin_seq_indices
+    for step in range(min(3, optimizer_steps)):
+        start_idx = step * local_bins_per_step
+        end_idx = min(start_idx + local_bins_per_step, num_bins_this_rank)
+        step_bins = end_idx - start_idx
+
+        actual_seqs = sum(
+            len(bin_seq_indices[bin_idx])
+            for bin_idx in range(start_idx, end_idx)
+            if bin_idx < len(bin_seq_indices)
+        )
+        est_global_seqs = actual_seqs * dp_world_size
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[Sequence Packing]  - Step {step + 1}: {step_bins} bins, ~{est_global_seqs} sequences globally",
+        )
+
+    if optimizer_steps > 3:
+        log_single_rank(logger, logging.INFO, f"  - ... ({optimizer_steps - 3} more steps)")
+
+    bin_indices = torch.arange(num_bins_this_rank)
+    dataset = TensorDataset(bin_indices)
+    loader = DataLoader(dataset, batch_size=args.micro_batch_size, shuffle=False, collate_fn=lambda x: x[0])
+    return loader, optimizer_steps
 
 def update_sequence_packing_metrics(args):
     """Update bin tracking for sequence packing mode."""

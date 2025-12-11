@@ -39,8 +39,13 @@ from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import get_asyncio_loop, log_single_rank
 from megatron.rl.sequence_packing_utils import (
+    get_microbatch_dataloader,
     pack_inference_logprobs, 
-    pack_all_trajectories
+    pack_all_trajectories,
+    load_packed_data_by_index,
+    update_sequence_packing_metrics,
+    get_sequence_packing_tensorboard_metrics,
+    get_sequence_packing_log_info
 )
 from megatron.rl.agent.api import (
     EvaluationRequest,
@@ -204,73 +209,6 @@ def align_unpacked_inference_logprobs(
     group_stats.mean_inf_prob = inf_probs.mean().item()
 
     return padded_inference_logprobs
-
-
-def load_packed_data_by_index(bin_idx: int):
-    """Load packed data by index.
-
-    Args:
-        bin_idx: Index of the bin to load.
-    """
-    runtime_state = get_rl_runtime_state()
-    args = get_args()
-    packing_context = runtime_state.packing_context
-    # Get packing context (should always be available in packed mode)
-    idx = slice(bin_idx, bin_idx + 1)
-
-    # Get cached PackedSeqParams for proper attention masking in Transformer Engine
-    # These were pre-computed in prepare_data_for_update to avoid repeated tensor allocations
-    packed_seq_params = packing_context['cached_packed_seq_params'][bin_idx]
-
-    # Extract packed data for this bin (already on GPU)
-    tokens = packing_context['packed_trajs'][idx]
-    position_ids = packing_context['packed_position_ids'][idx]
-
-    if 'old_logprobs' in packing_context:
-        old_logprobs = packing_context['old_logprobs'][idx]
-    else:
-        old_logprobs = None
-    if 'ref_logprobs' in packing_context:
-        ref_logprobs = packing_context['ref_logprobs'][idx]
-    else:
-        ref_logprobs = None
-    loss_mask = packing_context['packed_loss_mask'][idx, 1:]
-
-    # Get sequence-level data for this bin
-    packing_info = packing_context['packing_info']
-    seq_starts = packing_info['seq_starts'][bin_idx]
-    seq_indices = packing_info['bin_seq_indices'][bin_idx]
-
-    # Handle empty bins (used for padding to ensure all ranks have same iterations)
-    if not seq_indices:
-        seq_lengths = []
-        advantages = torch.tensor([], device='cuda')
-    else:
-        seq_lengths = [packing_info['seq_lengths'][idx] for idx in seq_indices]
-        if 'bin_advantages' in packing_context:
-            advantages = packing_context['bin_advantages'][bin_idx]
-        else:
-            advantages = None
-
-    # Extract packed inference_logprobs if available
-    if 'packed_inference_logprobs' in packing_context and args.rl_inference_logprobs_is_correction:
-        inference_logprobs = packing_context['packed_inference_logprobs'][idx]
-    else:
-        inference_logprobs = None
-
-    return (
-        tokens,
-        advantages,
-        old_logprobs,
-        loss_mask,
-        position_ids,
-        ref_logprobs,
-        inference_logprobs,
-        seq_starts,
-        seq_lengths,
-        seq_indices,
-        packed_seq_params,
-    )
 
 
 def get_agent(args):
@@ -853,7 +791,6 @@ def prepare_data_for_update(
         Cycled iterator over dataset batches. In GRPO we might want to go over the same data multiple times.
     """
     args = get_args()
-    timers = get_timers()
     wandb_writer = get_wandb_writer()
     tb_writer = get_tensorboard_writer()
     nvtx_range = get_nvtx_range()
@@ -910,8 +847,8 @@ def prepare_data_for_update(
                 runtime_state = get_rl_runtime_state()
                 runtime_state.packing_context = packing_context = pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages)
     
-                compute_trajs = packing_context['packed_trajs']
-                compute_position_ids = packing_context['packed_position_ids']
+                compute_trajs = packing_context.packed_trajs
+                compute_position_ids = packing_context.packed_position_ids
                 # Use batch_size=1 for packed computation to enable proper attention masking
                 # via PackedSeqParams (TE needs cu_seqlens per bin)
                 logprobs_batch_size = 1
@@ -954,7 +891,7 @@ def prepare_data_for_update(
                     # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
                     bin_tensor = next(data_iterator)[0]
                     (b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params) = (
-                        load_packed_data_by_index(bin_tensor.item())
+                        load_packed_data_by_index(bin_tensor.item(), packing_context)
                     )
                 else:
                     batch_data = next(data_iterator)
@@ -1071,22 +1008,22 @@ def prepare_data_for_update(
         if args.rl_use_sequence_packing:
             with nvtx_range("pack_logprobs", time=True):
                 # Store logprobs on gpu in packing context
-                packing_context['old_logprobs'] = old_logprobs.cuda()
-                packing_context['ref_logprobs'] = ref_logprobs.cuda()
+                # Since PackingContext is a dataclass, we add these as new attributes
+                packing_context.old_logprobs = old_logprobs.cuda()
+                packing_context.ref_logprobs = ref_logprobs.cuda()
 
-            with nvtx_range("pack_inference_logprobs", time=True):
                 if inference_logprobs is not None and args.rl_inference_logprobs_is_correction:
                     # Pack the inference logprobs using the helper function
                     packed_inference_logprobs = pack_inference_logprobs(
                         inference_logprobs=inference_logprobs,
-                        packing_info=packing_context['packing_info'],
+                        packing_info=packing_context.packing_info,
                         generation_masks=generation_masks,
                         bin_size=args.seq_length,
                     )
 
                     # Store packed inference logprobs in packing context
-                    packing_context['packed_inference_logprobs'] = packed_inference_logprobs.cuda()
-                    packing_context['has_inference_logprobs'] = True
+                    packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
+                    packing_context.has_inference_logprobs = True
         else:
             with nvtx_range("align_inference_logprobs", time=True):
                 if inference_logprobs is not None:
@@ -1104,93 +1041,11 @@ def prepare_data_for_update(
 
         with nvtx_range("create_dataloader"):
             if args.rl_use_sequence_packing:
-
-                num_bins_this_rank = len(packing_context['packed_trajs'])
-                dp_world_size = mpu.get_data_parallel_world_size()
-
-                # Ratio of collected sequences to the global batch size
-                pct_of_sequences_per_batch = global_rollout_count / args.global_batch_size
-                pct_of_bins_per_batch = pct_of_sequences_per_batch
-
-                # Ceiling division means we will reuse some bins
-                # If we did floor we would leave some behind
-                local_bins_per_step = math.ceil(pct_of_bins_per_batch * num_bins_this_rank)
-                effective_global_batch_size = local_bins_per_step * dp_world_size
-
-                # Store packing plan in runtime state for the training loop to use
-                runtime_state = get_rl_runtime_state()
-                runtime_state.global_batches_per_collection = optimizer_steps = -(-num_bins_this_rank // local_bins_per_step)
-
-                from megatron.core.num_microbatches_calculator import (
-                    get_num_microbatches,
-                    reconfigure_num_microbatches_calculator,
-                )
-
-                old_num_microbatches = get_num_microbatches()
-
-                reconfigure_num_microbatches_calculator(
-                    rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-                    rampup_batch_size=args.rampup_batch_size,
-                    global_batch_size=effective_global_batch_size,
-                    micro_batch_size=args.micro_batch_size,
-                    data_parallel_size=dp_world_size,
-                    decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
-                )
-
-                new_num_microbatches = get_num_microbatches()
-
-                log_single_rank(
-                    logger, logging.INFO, f"[Sequence Packing] Multi-step training plan:"
-                )
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"[Sequence Packing]  - Target sequences per step: {args.global_batch_size}",
-                )
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"[Sequence Packing]  - Bins per rank per step: {pct_of_sequences_per_batch}*{num_bins_this_rank}={local_bins_per_step}",
-                )
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"[Sequence Packing]  - Total optimizer steps: {optimizer_steps}",
-                )
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"[Sequence Packing]  - Microbatches per step: {new_num_microbatches} (was {old_num_microbatches})",
-                )
-
-                bin_seq_indices = packing_context['packing_info']['bin_seq_indices']
-                for step in range(min(3, runtime_state.global_batches_per_collection)):
-                    start_idx = step * local_bins_per_step
-                    end_idx = min(start_idx + local_bins_per_step, num_bins_this_rank)
-                    step_bins = end_idx - start_idx
-
-                    actual_seqs = sum(
-                        len(bin_seq_indices[bin_idx])
-                        for bin_idx in range(start_idx, end_idx)
-                        if bin_idx < len(bin_seq_indices)
-                    )
-                    est_global_seqs = actual_seqs * dp_world_size
-                    log_single_rank(
-                        logger,
-                        logging.INFO,
-                        f"[Sequence Packing]  - Step {step + 1}: {step_bins} bins, ~{est_global_seqs} sequences globally",
-                    )
-
-                if optimizer_steps > 3:
-                    log_single_rank(logger, logging.INFO, f"  - ... ({optimizer_steps - 3} more steps)")
-
-                bin_indices = torch.arange(num_bins_this_rank)
-                dataset = TensorDataset(bin_indices)
-                loader = DataLoader(dataset, batch_size=args.micro_batch_size, shuffle=False, collate_fn=lambda x: x[0])
+               loader, optimizer_steps = get_microbatch_dataloader(packing_context)
+               runtime_state.global_batches_per_collection = optimizer_steps
             else:
-                runtime_state = get_rl_runtime_state()
                 runtime_state.packing_context = None
-                runtime_state.global_batches_per_collection = (args.grpo_samples_per_iteration) // args.global_batch_size
+                runtime_state.global_batches_per_collection = global_rollout_count / args.global_batch_size
                 dataset_tensors = [
                     compute_trajs,
                     advantages,
@@ -1611,4 +1466,3 @@ def get_iteration_sequence_count(args):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(sequences_tensor, group=mpu.get_data_parallel_group())
     return int(sequences_tensor.item())
-

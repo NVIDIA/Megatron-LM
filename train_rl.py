@@ -194,7 +194,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         data_iterator : Input data iterator
         model (GPTModel): The GPT Model
     """
-
+    runtime_state = get_rl_runtime_state()
     args = get_args()
     timers = get_timers()
 
@@ -220,9 +220,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             seq_lengths,
             seq_indices,
             packed_seq_params,
-        ) = load_packed_data_by_index(bin_tensor.item())
+        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context)
 
-        runtime_state = get_rl_runtime_state()
         runtime_state.increment_sequences(len(seq_indices))
     else:
         # Extract unpacked data
@@ -251,7 +250,6 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
         )
 
-        runtime_state = get_rl_runtime_state()
         runtime_state.increment_sequences(tokens.shape[0])
 
     # Common logic for both paths
