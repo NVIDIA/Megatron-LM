@@ -120,6 +120,8 @@ class MoELayer(BaseMoELayer):
             and "shared_experts" in config.recompute_modules
         )
 
+        self.tp_group = pg_collection.tp
+
         # Initialize router.
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
 

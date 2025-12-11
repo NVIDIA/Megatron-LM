@@ -272,6 +272,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
 
         self.submodules_config = submodules
         self.layer_number = layer_number + get_transformer_layer_offset(
