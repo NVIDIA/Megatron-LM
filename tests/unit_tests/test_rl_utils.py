@@ -13,7 +13,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
-from megatron.rl import rl_utils
+from megatron.rl import rl_utils, sequence_packing_utils
 from megatron.rl.agent.api import TokenRollout
 from megatron.training import arguments, global_vars
 from tests.unit_tests.test_utilities import Utils
@@ -71,7 +71,7 @@ def test_get_logprobs():
     global_vars.set_args(args)
 
     tokens = torch.ones((BATCH, SEQ), dtype=torch.long)
-    logprobs = rl_utils.get_logprobs(MockModel(), tokens, position_ids=None, attention_mask=None)
+    logprobs = rl_utils.get_logprobs(MockModel(), tokens, position_ids=None)
     # We chop off 1 element from the sequence dimension.
     assert logprobs.shape == (BATCH, SEQ - 1)
     # As we return ones as logits, all logprobs should be the same.
@@ -86,14 +86,15 @@ def test_get_logprobs_with_sequence_packing():
     global_vars.set_args(args)
 
     tokens = torch.ones((BATCH, SEQ), dtype=torch.long)
-    logprobs = rl_utils.get_logprobs(MockModel(), tokens, position_ids=None, attention_mask=None)
+    logprobs = rl_utils.get_logprobs(MockModel(), tokens, position_ids=None)
     # We chop off 1 element from the sequence dimension.
     assert logprobs.shape == (BATCH, SEQ - 1)
     # As we return ones as logits, all logprobs should be the same.
     assert torch.all(logprobs == logprobs[0, 0]).item()
 
 
-def test_prepare_trajectories():
+@patch('torch.distributed.get_rank', return_value=0)
+def test_prepare_trajectories(mock_rank):
     # Make sure sequence packing is disabled for this test
     import megatron.training.global_vars as global_vars
 
@@ -142,8 +143,8 @@ def test_prepare_trajectories():
     expected_trajs = torch.tensor([[1, 2, 43, 42, 42, 42, 42], [1, 2, 43, 42, 42, 42, 42]])
     torch.testing.assert_close(trajs, expected_trajs)
 
-
-def test_prepare_trajectories_with_packing():
+@patch('torch.distributed.get_rank', return_value=0)
+def test_prepare_trajectories_with_packing(mock_rank):
     """Test that rollouts data is properly prepared with sequence packing enabled."""
     # Initialize args for sequence packing
     args = arguments.parse_args(ignore_unknown_args=True)
@@ -321,7 +322,7 @@ def test_sequence_packing_basic():
 
     tokenizer = MockTokenizer()
     bin_size = 16
-    packer = rl_utils.SequencePacker(bin_size=bin_size, pad_token=tokenizer.pad)
+    packer = sequence_packing_utils.SequencePacker(bin_size=bin_size, pad_token=tokenizer.pad)
 
     # Create test sequences of varying lengths, all padded to same length
     max_len = 5
@@ -390,7 +391,7 @@ def test_sequence_packing_with_generation_masks():
 
     tokenizer = MockTokenizer()
     bin_size = 20
-    packer = rl_utils.SequencePacker(bin_size=bin_size, pad_token=tokenizer.pad)
+    packer = sequence_packing_utils.SequencePacker(bin_size=bin_size, pad_token=tokenizer.pad)
 
     # Create test data with generation masks
     sequences = [torch.tensor([1, 2, 3, tokenizer.eod]), torch.tensor([4, 5, 6, 7, tokenizer.eod])]
@@ -471,7 +472,8 @@ def test_sequence_packing_empty_bins():
         assert len(info['seq_starts']) == 0  # No sequence starts
 
 
-def test_prepare_trajectories_with_sequence_packing():
+@patch('torch.distributed.get_rank', return_value=0)
+def test_prepare_trajectories_with_sequence_packing(mock_rank):
     """Test prepare_trajectories with sequence packing enabled."""
     # Set up args with sequence packing
     args = arguments.parse_args(ignore_unknown_args=True)
@@ -550,7 +552,7 @@ def test_sequence_packing_integration():
     bin_size = 16
 
     # Test that we can pack sequences and get expected outputs
-    packer = rl_utils.SequencePacker(bin_size=bin_size, pad_token=tokenizer.pad)
+    packer = sequence_packing_utils.SequencePacker(bin_size=bin_size, pad_token=tokenizer.pad)
 
     # Create test data - need to pad to same length for stacking
     max_len = 5
