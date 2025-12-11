@@ -530,9 +530,7 @@ class TopKRouter(Router):
             with torch.no_grad():
                 if padding_mask is not None:
                     routing_map = routing_map & (~padding_mask)
-                    self.local_tokens_per_expert += routing_map.sum(dim=0)
-                else:
-                    self.local_tokens_per_expert += routing_map.sum(dim=0)
+                self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function

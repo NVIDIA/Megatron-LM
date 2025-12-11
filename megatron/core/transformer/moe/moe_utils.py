@@ -91,9 +91,6 @@ def switch_load_balancing_loss_func(
         topk (int): The number of experts selected for each token.
         num_experts (int): The number of experts.
         moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                               Shape [num_tokens]. True = padding (exclude),
-                                               False = valid (include). Defaults to None.
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
     """

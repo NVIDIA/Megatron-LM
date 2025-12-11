@@ -12,7 +12,6 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
-    PaddingMaskInfo,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
 )
@@ -184,16 +183,6 @@ class MoELayer(BaseMoELayer):
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
-
-        Note: The padding_mask transformation from [bsz, seq_length] to [seq_length, bsz]
-        is done in the forward() method before calling this method.
-
-        Args:
-            hidden_states (torch.Tensor): Input tensor with shape [seq_length, bsz, hidden_size].
-            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                Shape = [seq_length, bsz] (after transformation in forward()).
-                True = padding (exclude), False = valid (include).
-                Defaults to None (all tokens are valid).
         """
         probs, routing_map = self.router(hidden_states, padding_mask=padding_mask)
         return probs, routing_map
