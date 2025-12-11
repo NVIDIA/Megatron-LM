@@ -2386,6 +2386,14 @@ def calculate_grpo_loss(
     return loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below
 
 
+def print_memory_stats(prefix: str):
+    gpu_mem = torch.cuda.memory_allocated() / 1024**3
+    gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3
+    print(
+        f"[{dist.get_rank()}:DP] {prefix}: allocated={gpu_mem:.2f} GB, reserved={gpu_mem_reserved:.2f} GB"
+    )
+
+
 @contextmanager
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
@@ -2446,11 +2454,22 @@ def megatron_rl_inference_mode(
                 assert (
                     reset_cuda_graphs
                 ), "reset_cuda_graphs must be True when offloading kv cache during training"
+                print_memory_stats("Before restoring kv cache and mamba states to GPU")
+                context = inference_interface._inference_engine.context
                 print(
-                    f"[{dist.get_rank()}:DP] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
+                    f"[{dist.get_rank()}:DP] Restoring kv cache ({context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
+                kv_cache = context.memory_buffer
+                context.memory_buffer = kv_cache.data.cuda()
+                if context.is_hybrid_model:
+                    mamba_conv_states_gb = context.mamba_conv_states.numel() * context.mamba_conv_states.element_size() / 1024**3
+                    mamba_ssm_states_gb = context.mamba_ssm_states.numel() * context.mamba_ssm_states.element_size() / 1024**3
+                    print(
+                        f"[{dist.get_rank()}:DP] Restoring mamba conv states ({mamba_conv_states_gb:.2f} GB) and ssm states ({mamba_ssm_states_gb:.2f} GB) to GPU"
+                    )
+                    context.mamba_conv_states = context.mamba_conv_states.data.cuda()
+                    context.mamba_ssm_states = context.mamba_ssm_states.data.cuda()
+                print_memory_stats("After restoring kv cache and mamba states to GPU")
             elif remove_kv_cache_during_training:
                 if inference_interface._inference_engine.context.memory_buffer is None:
                     inference_interface._inference_engine.context.build_memory_buffer()
@@ -2476,11 +2495,49 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("offload-kv-cache-after-inference"):
             if offload_kv_cache_during_training:
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
+                # Print GPU memory before offload
+                print_memory_stats("Before offloading kv cache and mamba states to CPU")
+                total_gb_offloaded = 0
+                context = inference_interface._inference_engine.context
+                kv_cache = context.memory_buffer
+                kv_cache_gb = kv_cache.numel() * kv_cache.element_size() / 1024**3
                 print(
-                    f"[{dist.get_rank()}:DP] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
+                    f"[{dist.get_rank()}:DP] Offloading kv cache ({kv_cache_gb:.2f} GB) to CPU"
                 )
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
+                # There might be other references to the kv_cache, in which case 
+                # simply calling kv_cache.cpu() would not free GPU memory.
+                # Just to be safe, we call .cpu() on kv_cache.data. 
+                # Of course, this isn't foolproof either, but the chances of 
+                # external references to kv_cache.data are very low.
+                context.memory_buffer.data = kv_cache.data.cpu()
+                total_gb_offloaded += kv_cache_gb
+                if context.is_hybrid_model:
+                    print(
+                        f"[{dist.get_rank()}:DP] Offloading mamba conv states ({mamba_conv_gb:.2f} GB) and ssm states ({mamba_ssm_gb:.2f} GB) to CPU"
+                    )
+                    context.mamba_conv_states.data = context.mamba_conv_states.data.cpu()
+                    context.mamba_ssm_states.data = context.mamba_ssm_states.data.cpu()
+                    mamba_conv_gb = (
+                        context.mamba_conv_states.numel()
+                        * context.mamba_conv_states.element_size()
+                        / 1024**3
+                    )
+                    mamba_ssm_gb = (
+                        context.mamba_ssm_states.numel()
+                        * context.mamba_ssm_states.element_size()
+                        / 1024**3
+                    )
+                    total_gb_offloaded += mamba_conv_gb + mamba_ssm_gb
+                # Print GPU memory after offload
+                gpu_mem_after = torch.cuda.memory_allocated() / 1024**3
+                gpu_mem_reserved_after = torch.cuda.memory_reserved() / 1024**3
+                print(
+                    f"[{dist.get_rank()}:DP] Offloaded total of {total_gb_offloaded:.2f} GB to CPU"
+                )
+                print_memory_stats("After offloading kv cache and mamba states to CPU")
+
+
+
             elif remove_kv_cache_during_training:
                 inference_interface._inference_engine.context.memory_buffer = None
 
