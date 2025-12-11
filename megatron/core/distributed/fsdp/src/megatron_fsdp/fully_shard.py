@@ -61,6 +61,9 @@ class ShardingStrategy(IntEnum):
 def experimental_api(func: Callable) -> Callable:
     """
     Mark a function or class as experimental API in Megatron CI/CD.
+
+    TODO(@cspades): Copied from megatron.core.utils to avoid depending on MCore
+    for Megatron-FSDP. Should remove when the API is no longer experimental.
     """
     func._experimental_api = True
     return func
