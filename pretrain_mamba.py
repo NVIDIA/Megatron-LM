@@ -64,7 +64,9 @@ def get_batch(data_iterator, vp_stage=None):
         'max_seqlen': None,
     }
 
-    if data_iterator is None:
+    # TODO(duncan): Is there a more efficient way to access is_packed_sequence here?
+    is_packed_sequence = get_args().sft  # SFT always uses packed sequence
+    if not is_first_or_last_pipeline_stage(vp_stage) and not is_packed_sequence:
         return empty_batch.values()
 
     batch = get_batch_on_this_tp_rank(data_iterator)
@@ -235,10 +237,10 @@ def forward_step(data_iterator, model: MambaModel):
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank(vp_stage=None, sft=False):
+def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif sft:
+    elif is_packed_sequence:
         return True
     else:
         return is_first_or_last_pipeline_stage(vp_stage)
@@ -293,8 +295,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     args = get_args()
     config = core_gpt_dataset_config_from_args(args)
 
+    is_packed_sequence = False
     if args.sft:
         dataset_type = SFTDataset
+        is_packed_sequence = True  # SFT always uses packed sequence
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset
@@ -306,7 +310,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
-        partial(is_dataset_built_on_rank, vp_stage=vp_stage, sft=args.sft),
+        partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence),
         config
     ).build()
 
