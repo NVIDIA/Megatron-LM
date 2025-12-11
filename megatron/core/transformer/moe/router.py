@@ -334,7 +334,7 @@ class TopKRouter(Router):
                 routing_map=routing_map,
                 reduce_group=self.tp_cp_group,
                 with_padding_mask=with_padding_mask,
-                topk=self.topk*bsz,
+                topk=self.topk * bsz,
             )
         )
 
