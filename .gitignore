@@ -8,3 +8,11 @@ slurm*
 logs
 .vscode
 local/
+.gitmodules
+wandb/
+onelogger.log
+onelogger.err
+.venv
+runs/
+/test_cases/
+**/dist/

@@ -129,23 +129,39 @@ def main():
                         dest='checking')
 
     known_args, _ = parser.parse_known_args()
+
+    # Handle old arg values.
+    def update_loader_saver(key):
+        old_value = getattr(known_args, key)
+        if old_value == "megatron":
+            setattr(known_args, key, "legacy")
+        if old_value == "mcore":
+            setattr(known_args, key, "core")
+    update_loader_saver("loader")
+    update_loader_saver("saver")
+
+    # Load loader/saver plugins.
     loader = load_plugin('loader', known_args.loader)
     saver = load_plugin('saver', known_args.saver)
 
+    # Parser loader/saver args.
     loader.add_arguments(parser)
     saver.add_arguments(parser)
-
     args = parser.parse_args()
 
+    # Initialize queue
     queue = mp.Queue(maxsize=args.max_queue_size)
 
+    # Start saver process.
     print("Starting saver...")
     saver_proc = mp.Process(target=saver.save_checkpoint, args=(queue, args))
     saver_proc.start()
 
+    # Run loader.
     print("Starting loader...")
     loader.load_checkpoint(queue, args)
 
+    # Finish saver process.
     print("Waiting for saver to complete...")
     saver_proc.join()
 

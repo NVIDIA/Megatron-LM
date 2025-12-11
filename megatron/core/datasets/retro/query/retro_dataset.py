@@ -13,19 +13,25 @@ this dataset.
 """
 
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 
 from megatron.core.datasets.retro.db.dataset import DBDataset
 from megatron.core.datasets.retro.db.utils import get_merged_train_dataset as get_db_dataset
-from megatron.core.datasets.retro.external_libs import h5py
 from megatron.core.datasets.retro.utils import BlockPathMap, log_retro_rank_0
 from megatron.core.models.retro import RetroConfig
 
 from .gpt_chunk_dataset import GPTChunkDataset, build_gpt_chunk_datasets_from_gpt_datasets
 from .utils import get_query_dir
+
+try:
+    import h5py
+
+    HAVE_H5PY = True
+except ImportError:
+    HAVE_H5PY = False
 
 
 class RetroDataset(torch.utils.data.Dataset):
@@ -40,10 +46,12 @@ class RetroDataset(torch.utils.data.Dataset):
     Args:
         num_queried_samples (int): Total number of queried samples.
         num_neighbors (int): Total number of saved neighbors.
-        num_retrieved_chunks (int): Number of retrieved chunks (e.g., 2 for neighbor + continuation).
+        num_retrieved_chunks (int): Number of retrieved chunks
+            (e.g., 2 for neighbor + continuation).
         block_size (int): Number of neighbor entries per file.
         db_dataset (DBDataset): Chunk database used for retrieval.
-        chunk_dataset (GPTChunkDataset): GPT chunk dataset, which is a wrapper around a standard GPT dataset that breaks each sample into chunks.
+        chunk_dataset (GPTChunkDataset): GPT chunk dataset, which is a wrapper
+            around a standard GPT dataset that breaks each sample into chunks.
         neighbor_path_map (BlockPathMap): Mapping of neighbor ID to file path.
     """
 
@@ -82,8 +90,13 @@ class RetroDataset(torch.utils.data.Dataset):
             sample_idx (int): Index of sample in dataset.
 
         Returns:
-            A dict consisting of GPT sample (attribute 'text') and corresponding neighbor chunk IDs ('neighbor_chunks', for indexing chunk database) and neighbor token IDs (corresponding chunk database GPT tokens).
+            A dict consisting of GPT sample (attribute 'text') and corresponding neighbor chunk IDs
+            ('neighbor_chunks', for indexing chunk database) and neighbor token IDs
+            (corresponding chunk database GPT tokens).
         """
+        if not HAVE_H5PY:
+            raise ImportError("h5py is required to use the RetroDataset. Please install h5py.")
+
         n_chunks_per_sample = self.chunk_dataset.n_chunks_per_sample
 
         # Wrap sample idx around number of queried samples.
@@ -94,14 +107,13 @@ class RetroDataset(torch.utils.data.Dataset):
 
         # Sample idx to chunk idxs.
         chunk_idxs = list(
-            range(sample_idx * n_chunks_per_sample, (sample_idx + 1) * n_chunks_per_sample,)
+            range(sample_idx * n_chunks_per_sample, (sample_idx + 1) * n_chunks_per_sample)
         )
 
         # Collect retrieved tokens.
         all_retrieved_chunk_ids = []
         all_retrieved_token_ids = []
         for chunk_idx in chunk_idxs:
-
             # Neighbor chunk ids.
             neighbor_path = self.neighbor_path_map[chunk_idx]
             with h5py.File(neighbor_path, "r") as f:
@@ -144,13 +156,15 @@ class RetroDataset(torch.utils.data.Dataset):
 
 
 def get_retro_datasets(
-    config: RetroConfig, gpt_datasets: dict, sample_length: int, eod_token_id: int,
+    config: RetroConfig, gpt_datasets: dict, sample_length: int, eod_token_id: int
 ) -> Tuple[Optional[RetroDataset], Optional[RetroDataset], Optional[RetroDataset]]:
     """Get train, valid, test retro datasets.
 
     Args:
         config (RetroConfig): Retro preprocessing config.
-        gpt_datasets (dict): Mapping of data split key ('train', 'valid', or 'test') to the original sequence-length GPT dataset (i.e., not the chunk dataset).
+        gpt_datasets (dict): Mapping of data split key
+            ('train', 'valid', or 'test') to the original sequence-length
+            GPT dataset (i.e., not the chunk dataset).
         sample_length (int): Alias to `sequence_length`.
         eod_token_id (int): GPT EOD token ID.
 
@@ -177,7 +191,6 @@ def get_retro_datasets(
     retro_dataset_map: Dict[str, Optional[RetroDataset]] = {}
     query_dir = get_query_dir(config.retro_project_dir)
     for data_key, chunk_ds_info in chunk_ds_info_map.items():
-
         # Skip unused datasets.
         if chunk_ds_info is None:
             retro_dataset_map[data_key] = None
@@ -190,7 +203,7 @@ def get_retro_datasets(
         # preprocessing and pretraining.
         chunk_dataset = chunk_ds_info["dataset"]
         chunk_ds_info["neighbor_dir"] = os.path.join(
-            query_dir, config.retro_neighbor_dirs[data_key],
+            query_dir, config.retro_neighbor_dirs[data_key]
         )
         neighbor_dir = chunk_ds_info["neighbor_dir"]
         neighbor_path_map = BlockPathMap.from_dir(
@@ -235,8 +248,4 @@ def get_retro_datasets(
             neighbor_path_map=neighbor_path_map,
         )
 
-    return (
-        retro_dataset_map["train"],
-        retro_dataset_map["valid"],
-        retro_dataset_map["test"],
-    )
+    return (retro_dataset_map["train"], retro_dataset_map["valid"], retro_dataset_map["test"])

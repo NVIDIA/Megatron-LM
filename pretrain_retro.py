@@ -4,13 +4,15 @@
 
 from functools import partial
 import torch
+from importlib import import_module
 
 from megatron.training import get_args
-from megatron.training import get_timers
 from megatron.training import get_tokenizer
+from megatron.training import get_timers
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import tensor_parallel
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.datasets.retro.query.retro_dataset import get_retro_datasets
@@ -44,7 +46,7 @@ def core_model_provider(pre_process=True, post_process=True):
     else:
         block_spec = get_retro_decoder_block_spec(config, use_transformer_engine=True)
 
-    print_rank_0('building GPT model ...')
+    print_rank_0('building Retro model ...')
     model = RetroModel(
         config=config,
         transformer_layer_spec=block_spec,
@@ -82,7 +84,12 @@ def get_batch(data_iterator):
     """Generate a batch"""
 
     args = get_args()
-    tokenizer = get_tokenizer()
+
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
+        
     config = get_retro_config()
 
     # Items and their type.
@@ -178,6 +185,11 @@ def train_valid_test_datasets_provider(train_valid_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
 
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
+
     # Dataset config.
     retro_config = get_retro_config()
     data_config = MultiSplitGPTDatasetConfig(
@@ -193,10 +205,12 @@ def train_valid_test_datasets_provider(train_valid_test_num_samples):
         split_preprocessing=retro_config.retro_split_preprocessing,
         path_to_cache=args.data_cache_path,
         return_document_ids=False,
-        tokenizer=get_tokenizer(),
+        tokenizer=tokenizer,
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
 
     # GPT datasets.

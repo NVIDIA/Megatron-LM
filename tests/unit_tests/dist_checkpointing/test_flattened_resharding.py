@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import io
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
@@ -18,6 +19,10 @@ from megatron.core.dist_checkpointing.strategies.resharding import (
     restore_nd_flattened_tensors_formulation,
 )
 from megatron.core.dist_checkpointing.strategies.torch import get_reformulation_metadata
+from megatron.core.dist_checkpointing.validation import (
+    determine_global_metadata,
+    validate_sharding_integrity,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -27,21 +32,20 @@ class TestFlattenedResharding:
         pass
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()   
-        
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev  # Issue #2854
     @pytest.mark.parametrize(
-        ('src_tp_pp', 'dest_tp_pp',),
-        [
-            ((2, 4), (2, 4)),
-            ((2, 4), (2, 2)),
-            ((2, 4), (4, 2)),
-            ((8, 1), (1, 2)),
-        ]
+        ('src_tp_pp', 'dest_tp_pp'),
+        [((2, 4), (2, 4)), ((2, 4), (2, 2)), ((2, 4), (4, 2)), ((8, 1), (1, 2))],
     )
     def test_partition_change_save_load(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
         Utils.initialize_model_parallel(*src_tp_pp)
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_flattened_partition_change_save_load') as ckpt_dir:
-            
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_flattened_partition_change_save_load'
+        ) as ckpt_dir:
+
             state_dict = self._build_state_dict()
 
             save(state_dict, ckpt_dir)
@@ -57,30 +61,34 @@ class TestFlattenedResharding:
 
         Utils.destroy_model_parallel()
 
-
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev  # Issue #2854
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp', 'expected_ckpt_offsets_by_rank'),
         [
-            ((2, 4), (2, 2), {
-                0: [(0, 0, 0), (0, 0, 10)],  # TP 0, DP 0, PP 0
-                1: [(4, 0, 0), (4, 0, 10)],  # TP 1, DP 0, PP 0
-                2: [(0, 0, 0), (0, 0, 10)],  # TP 0, DP 1, PP 0
-                3: [(4, 0, 0), (4, 0, 10)],  # TP 1, DP 1, PP 0
-                4: [(0, 0, 20), (0, 0, 30)],  # TP 0, DP 0, PP 1
-                5: [(4, 0, 20), (4, 0, 30)],  # TP 1, DP 0, PP 1
-                6: [(0, 0, 20), (0, 0, 30)],  # TP 0, DP 1, PP 1
-                7: [(4, 0, 20), (4, 0, 30)],  # TP 1, DP 1, PP 1
-            }),
-            ((8, 1), (1, 2), {
-                rank: [(tp, 0, 0) for tp in range(8)]
-                for rank in range(8)
-            })
-        ]
+            (
+                (2, 4),
+                (2, 2),
+                {
+                    0: [(0, 0, 0), (0, 0, 10)],  # TP 0, DP 0, PP 0
+                    1: [(4, 0, 0), (4, 0, 10)],  # TP 1, DP 0, PP 0
+                    2: [(0, 0, 0), (0, 0, 10)],  # TP 0, DP 1, PP 0
+                    3: [(4, 0, 0), (4, 0, 10)],  # TP 1, DP 1, PP 0
+                    4: [(0, 0, 20), (0, 0, 30)],  # TP 0, DP 0, PP 1
+                    5: [(4, 0, 20), (4, 0, 30)],  # TP 1, DP 0, PP 1
+                    6: [(0, 0, 20), (0, 0, 30)],  # TP 0, DP 1, PP 1
+                    7: [(4, 0, 20), (4, 0, 30)],  # TP 1, DP 1, PP 1
+                },
+            ),
+            ((8, 1), (1, 2), {rank: [(tp, 0, 0) for tp in range(8)] for rank in range(8)}),
+        ],
     )
-    def test_reformulate_nd_flattened_tensors(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, expected_ckpt_offsets_by_rank):
+    def test_reformulate_nd_flattened_tensors(
+        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, expected_ckpt_offsets_by_rank
+    ):
         Utils.initialize_model_parallel(*src_tp_pp, order='tp-dp-pp')
         with TempNamedDir(tmp_path_dist_ckpt / 'test_reformulate_nd_flattened_tensors') as ckpt_dir:
-            
+
             state_dict = self._build_state_dict()
 
             ckpt_local_shape = state_dict['sd_key_flat'].local_shape
@@ -93,36 +101,40 @@ class TestFlattenedResharding:
             load_state_dict = self._build_state_dict(random=True)
 
             reformulation_metadata = get_reformulation_metadata(load_state_dict, ckpt_dir)
-            reformulated_state_dict, formulation_restore_data = apply_nd_flattened_tensors_reformulation(load_state_dict, reformulation_metadata)
+            reformulated_state_dict, formulation_restore_data = (
+                apply_nd_flattened_tensors_reformulation(load_state_dict, reformulation_metadata)
+            )
             assert isinstance(reformulated_state_dict['sd_key_unflat'], ShardedTensor)
             assert isinstance(reformulated_state_dict['sd_key_flat'], dict)
 
-            assert reformulated_state_dict['sd_key_flat'].keys() == set((offset, ckpt_local_shape) for offset in expected_ckpt_offsets_by_rank[Utils.rank]), \
-                (reformulated_state_dict['sd_key_flat'].keys(), ckpt_local_shape, expected_ckpt_offsets_by_rank[Utils.rank])
+            assert reformulated_state_dict['sd_key_flat'].keys() == set(
+                (offset, ckpt_local_shape) for offset in expected_ckpt_offsets_by_rank[Utils.rank]
+            ), (
+                reformulated_state_dict['sd_key_flat'].keys(),
+                ckpt_local_shape,
+                expected_ckpt_offsets_by_rank[Utils.rank],
+            )
 
             # We can even load the reformulated state dict with a high-level API
-            loaded_state_dict = load(reformulated_state_dict, ckpt_dir, validate_access_integrity=False)
-            loaded_state_dict = restore_nd_flattened_tensors_formulation(loaded_state_dict, formulation_restore_data)
+            loaded_state_dict = load(
+                reformulated_state_dict, ckpt_dir, validate_access_integrity=False
+            )
+            loaded_state_dict = restore_nd_flattened_tensors_formulation(
+                loaded_state_dict, formulation_restore_data
+            )
             expected_state_dict = {k: v.data for k, v in self._build_state_dict().items()}
             diffs = diff(expected_state_dict, loaded_state_dict)
             assert not any(diffs), diffs
 
         Utils.destroy_model_parallel()
 
-
-    @pytest.mark.parametrize(
-        ('src_tp_pp',),
-        [
-            ((2, 4),),
-            ((8, 1),),
-            ((1, 1),),
-            ((1, 4),),
-        ]
-    )
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev  # Issue #2854
+    @pytest.mark.parametrize(('src_tp_pp',), [((2, 4),), ((8, 1),), ((1, 1),), ((1, 4),)])
     def test_load_tensor_metadata(self, tmp_path_dist_ckpt, src_tp_pp):
         Utils.initialize_model_parallel(*src_tp_pp, order='tp-dp-pp')
         with TempNamedDir(tmp_path_dist_ckpt / 'test_reformulate_nd_flattened_tensors') as ckpt_dir:
-            
+
             state_dict = self._build_state_dict()
 
             save(state_dict, ckpt_dir)
@@ -141,7 +153,9 @@ class TestFlattenedResharding:
             for sh_ten in sharded_metadata.values():
                 sh_ten.replica_id = Utils.rank
             loaded_state_dict = load(sharded_metadata, ckpt_dir)
-            assert torch.all(loaded_state_dict['unflat'] == torch.arange(8 * 5 * 40).reshape(8, 5, 40))
+            assert torch.all(
+                loaded_state_dict['unflat'] == torch.arange(8 * 5 * 40).reshape(8, 5, 40)
+            )
             assert torch.all(loaded_state_dict['flat'] == torch.arange(8 * 5 * 40))
 
         Utils.destroy_model_parallel()
@@ -169,7 +183,7 @@ class TestFlattenedResharding:
         end_jitter = dp_rank + 1 if dp_rank + 1 < dp_size else 0
         local_dp_slice = slice(
             local_ten_size_by_dp * dp_rank + start_jitter,
-            local_ten_size_by_dp * (dp_rank + 1) + end_jitter
+            local_ten_size_by_dp * (dp_rank + 1) + end_jitter,
         )
         local_flat_ten = local_ten.flatten()[local_dp_slice]
         if dp_rank == dp_size - 1:
@@ -191,7 +205,70 @@ class TestFlattenedResharding:
                 local_ten.shape,
                 (0, tp_rank, tp_size),
                 (2, pp_rank, pp_size),
-                flattened_range=local_dp_slice
+                flattened_range=local_dp_slice,
             ),
         }
         return state_dict
+
+    def test_flattened_tensors_are_properly_validated(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel()
+        # Global tensor of shape (6, 6) is built from:
+        # ranks 0, 1, 2 tensors of length 1, 2, 3
+        # and then ranks 3, ..., 7 tensors of length 6
+        local_flat_ten = torch.ones(Utils.rank + 1 if Utils.rank <= 2 else 6) * Utils.rank
+
+        global_flattened_len = 6 + (Utils.world_size - 3) * 6
+        if Utils.world_size == 8:
+            assert global_flattened_len == 1 + 2 + 3 + 5 * 6
+            local_ten_shape = (1, 6)
+        else:
+            local_ten_shape = (global_flattened_len,)
+
+        if Utils.rank == 0:
+            local_dp_slice_start = 0
+        elif Utils.rank == 1:
+            local_dp_slice_start = 1
+        elif Utils.rank == 2:
+            local_dp_slice_start = 3
+        else:
+            local_dp_slice_start = 0
+        local_dp_slice = slice(local_dp_slice_start, local_dp_slice_start + len(local_flat_ten))
+
+        state_dict = {
+            'sd_key_flat': ShardedTensor.from_rank_offsets_flat(
+                'flat',
+                local_flat_ten,
+                local_ten_shape,
+                *((0, max(0, Utils.rank - 2), 6),) if Utils.world_size == 8 else (),
+                flattened_range=local_dp_slice,
+                replica_id=0,
+            )
+        }
+        validate_sharding_integrity(determine_global_metadata(state_dict)[1])
+        if Utils.rank == 1:
+            old_state_dict = state_dict
+            state_dict = {}
+
+        with (
+            pytest.raises(CheckpointingException) if Utils.rank == 0 else nullcontext()
+        ) as exc_info:
+            validate_sharding_integrity(determine_global_metadata(state_dict)[1])
+        if Utils.rank == 0:
+            assert 'Flattened ranges dont cover the whole shard ShardedTensor' in str(
+                exc_info.value
+            )
+
+        if Utils.rank == 1:
+            state_dict = old_state_dict
+
+        if Utils.rank == 4:
+            state_dict = {}
+
+        with (
+            pytest.raises(CheckpointingException) if Utils.rank == 0 else nullcontext()
+        ) as exc_info:
+            validate_sharding_integrity(determine_global_metadata(state_dict)[1])
+        if Utils.rank == 0:
+            assert 'Invalid access pattern' in str(exc_info.value)
+
+        Utils.destroy_model_parallel()

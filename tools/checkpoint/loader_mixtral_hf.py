@@ -8,6 +8,8 @@ import transformers
 from tqdm import tqdm
 import types
 
+from tools.checkpoint.utils import _ConverterFakeProcessGroup
+
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Mixtral HF loader.')
@@ -128,7 +130,8 @@ def set_layer_state(args, model, hf_model, layer_idx):
 def load_checkpoint_to_model(args):
     '''Set model params.'''
 
-    from pretrain_gpt import model_provider
+    from model_provider import model_provider
+    from gpt_builders import gpt_builder
     from transformers import MixtralForCausalLM, MixtralConfig
 
     # Load Huggingface model.
@@ -136,7 +139,7 @@ def load_checkpoint_to_model(args):
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(True, True).to(args.params_dtype)
+    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)
@@ -188,7 +191,8 @@ def _load_checkpoint(queue, args):
                 '--no-initialization',
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--transformer-impl', 'transformer_engine',
-                '--load', args.load_dir
+                '--load', args.load_dir,
+                '--no-one-logger',
                 ]
 
     margs = parse_args()
@@ -237,6 +241,12 @@ def _load_checkpoint(queue, args):
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
+    
+    # For backward compatibility during local parallel states refactoring
+    fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
+    fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
+    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+    mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
     fused_kernels.load(margs)
 
     # Metadata.

@@ -3,13 +3,13 @@
 """Base class for decoder and encoder attention modules."""
 
 from megatron.core.models.retro.config import RetroConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import CrossAttention, CrossAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 
 
 class BaseRetroCrossAttention(MegatronModule):
-
     """Base class for Retro cross attention, for both encoder & decoder layers.
 
     This class collects the retro arguments below (i.e., num neighbors, chunk
@@ -21,6 +21,7 @@ class BaseRetroCrossAttention(MegatronModule):
         submodules (CrossAttentionSubmodules): Cross attention submodules.
         layer_number (int): Layer number within transformer block.
         attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
+        pg_collection (ProcessGroupCollection): Model communication process groups.
     """
 
     def __init__(
@@ -29,6 +30,7 @@ class BaseRetroCrossAttention(MegatronModule):
         submodules: CrossAttentionSubmodules,
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(config=config)
 
@@ -37,6 +39,7 @@ class BaseRetroCrossAttention(MegatronModule):
             submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
+            pg_collection=pg_collection,
         )
 
         self.retro_num_neighbors = config.retro_num_neighbors

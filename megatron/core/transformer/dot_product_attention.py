@@ -2,17 +2,24 @@
 
 
 import math
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import attention_mask_func
+from megatron.core.transformer.utils import (
+    attention_mask_func,
+    is_layer_window_attention,
+    make_sharded_tensors_for_checkpoint,
+)
 from megatron.core.utils import divide
 
 
@@ -21,7 +28,8 @@ class DotProductAttention(MegatronModule):
     Region where selective activation recomputation is applied.
     This region is memory intensive but less compute intensive which
     makes activation checkpointing more efficient for LLMs (20B+).
-    See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.
+    See Reducing Activation Recomputation in Large Transformer Models:
+    https://arxiv.org/abs/2205.05198 for more details.
 
     We use the following notation:
      h: hidden size
@@ -38,6 +46,9 @@ class DotProductAttention(MegatronModule):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         attention_dropout: float = None,
+        softmax_scale: float = None,
+        cp_comm_type: str = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(config=config)
 
@@ -47,10 +58,6 @@ class DotProductAttention(MegatronModule):
             self.config.context_parallel_size == 1
         ), "Context parallelism is only supported by TEDotProductAttention!"
 
-        assert (
-            self.config.window_size is None
-        ), "Sliding Window Attention is only supported by TEDotProductAttention!"
-
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type  # unused for now
@@ -58,17 +65,35 @@ class DotProductAttention(MegatronModule):
         projection_size = self.config.kv_channels * self.config.num_attention_heads
 
         # Per attention head and per partition values.
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
+        else:
+            assert hasattr(
+                pg_collection, 'tp'
+            ), "DotProductAttention pg_collection must have tp process group"
+
+        world_size = pg_collection.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
         self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
         coeff = None
-        self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
+        if softmax_scale is None:
+            self.softmax_scale = 1.0 / math.sqrt(self.hidden_size_per_attention_head)
+        else:
+            self.softmax_scale = softmax_scale
+
         if self.config.apply_query_key_layer_scaling:
             coeff = self.layer_number
-            self.norm_factor *= coeff
+            self.softmax_scale /= coeff
+
+        if is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, layer_number
+        ):
+            window_size = self.config.window_size
+        else:
+            window_size = None
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             input_in_fp16=self.config.fp16,
@@ -78,6 +103,7 @@ class DotProductAttention(MegatronModule):
             mask_func=attention_mask_func,
             softmax_in_fp32=self.config.attention_softmax_in_fp32,
             scale=coeff,
+            window_size=window_size,
         )
 
         # Dropout. Note that for a single iteration, this layer will generate
@@ -87,6 +113,30 @@ class DotProductAttention(MegatronModule):
             self.config.attention_dropout if attention_dropout is None else attention_dropout
         )
 
+        if self.config.softmax_type == "vanilla":
+            self.softmax_offset = None
+        elif self.config.softmax_type == "off-by-one":
+            self.softmax_offset = torch.zeros(
+                self.num_attention_heads_per_partition,
+                device=torch.cuda.current_device(),
+                dtype=self.config.params_dtype,
+            )
+        elif self.config.softmax_type == "learnable":
+            self.register_parameter(
+                "softmax_offset",
+                torch.nn.Parameter(
+                    torch.empty(
+                        self.num_attention_heads_per_partition,
+                        device=torch.cuda.current_device(),
+                        dtype=self.config.params_dtype,
+                    )
+                ),
+            )
+            if config.perform_initialization:
+                self.softmax_offset = config.init_method(self.softmax_offset)
+        else:
+            raise ValueError("Softmax type not supported")
+
     def forward(
         self,
         query: Tensor,
@@ -94,12 +144,15 @@ class DotProductAttention(MegatronModule):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
-        packed_seq_params: PackedSeqParams = None,
+        attention_bias: Tensor = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
+        """Forward."""
         assert packed_seq_params is None, (
             "Packed sequence is not supported by DotProductAttention."
             "Please use TEDotProductAttention instead."
         )
+        assert attention_bias is None, "Attention bias is not supported for DotProductAttention."
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
@@ -120,24 +173,19 @@ class DotProductAttention(MegatronModule):
             )
 
         # [b, np, sq, sk]
-        output_size = (
-            query.size(1),
-            query.size(2),
-            query.size(0),
-            key.size(0),
-        )
+        output_size = (query.size(1), query.size(2), query.size(0), key.size(0))
 
         # [sq, b, np, hn] -> [sq, b * np, hn]
         # This will be a simple view when doing normal attention, but in group query attention
-        # the key and value tensors are repeated to match the queries so you can't use simple strides
-        # to extract the queries.
+        # the key and value tensors are repeated to match the queries so you can't use
+        # simple strides to extract the queries.
         query = query.reshape(output_size[2], output_size[0] * output_size[1], -1)
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key = key.view(output_size[3], output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
         matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
-            (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu",
+            (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
         )
 
         # Raw attention scores. [b * np, sq, sk]
@@ -146,7 +194,7 @@ class DotProductAttention(MegatronModule):
             query.transpose(0, 1),  # [b * np, sq, hn]
             key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
             beta=0.0,
-            alpha=(1.0 / self.norm_factor),
+            alpha=self.softmax_scale,
         )
 
         # change view to [b, np, sq, sk]
@@ -157,8 +205,9 @@ class DotProductAttention(MegatronModule):
         # ===========================
 
         # attention scores and attention mask [b, np, sq, sk]
-        attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
-
+        attention_probs: Tensor = self.scale_mask_softmax(
+            attention_scores, attention_mask, self.softmax_offset
+        )
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
 
@@ -176,12 +225,7 @@ class DotProductAttention(MegatronModule):
         # [sk, b, np, hn] --> [b, np, sq, hn]
 
         # context layer shape: [b, np, sq, hn]
-        output_size = (
-            value.size(1),
-            value.size(2),
-            query.size(0),
-            value.size(3),
-        )
+        output_size = (value.size(1), value.size(2), query.size(0), value.size(3))
 
         # change view [sk, b * np, hn]
         value = value.view(value.size(0), output_size[0] * output_size[1], -1)
@@ -203,3 +247,18 @@ class DotProductAttention(MegatronModule):
         context = context.view(*new_context_shape)
 
         return context
+
+    def sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
+    ) -> ShardedStateDict:
+        """Sharded state dict for the learnable softmax offset parameter"""
+        if self.config.softmax_type == "learnable":
+            state_dict = self.state_dict(prefix="", keep_vars=True)
+        else:
+            state_dict = {}
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+        )

@@ -4,23 +4,19 @@ export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_APPLY_QK_LAYER_SCALING=0
 
-INPUT_METADATA_PATH="placeholder"
+INPUT_IMAGE_PATH="placeholder"
 GROUNDTRUTH_PATH="placeholder"
+NUM_FRAMES=1
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --input-image-path)
+        -i|--input-image-path)
             INPUT_IMAGE_PATH="$2"
             shift
             shift
             ;;
-        --input-metadata-path)
-            INPUT_METADATA_PATH="$2"
-            shift
-            shift
-            ;;
-        -g|--groundtruth-path)
-            GROUNDTRUTH_PATH="$2"
+        --num-frames)
+            NUM_FRAMES="$2"
             shift
             shift
             ;;
@@ -34,12 +30,7 @@ while [[ $# -gt 0 ]]; do
             shift
             shift
             ;;
-        -t|--tokenizer-path)
-            TOKENIZER_PATH="$2"
-            shift
-            shift
-            ;;
-        --task)
+        -t|--task)
             TASK="$2"
             shift
             shift
@@ -57,14 +48,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Please modify these as needed.
-NUM_PARTITIONS=100
-START=2
+NUM_PARTITIONS=0
+START=0
 END=0
 
 for PARTITION_ID in $( eval echo {$START..$END} )
 do
-    torchrun --nproc_per_node 4 examples/multimodal/run_text_generation.py \
-        --img-embedding-idx 1 \
+    torchrun --nproc_per_node 8 examples/multimodal/run_text_generation.py \
         --apply-layernorm-1p \
         --attention-softmax-in-fp32 \
         --use-flash-attn \
@@ -92,12 +82,13 @@ do
         --max-position-embeddings 4096 \
         --no-masked-softmax-fusion \
         --load ${MODEL_PATH} \
-        --tokenizer-type MistralTokenizer \
-        --tokenizer-model ${TOKENIZER_PATH} \
+        --tokenizer-type MultimodalTokenizer \
+        --tokenizer-model mistralai/Mistral-7B-Instruct-v0.3 \
+        --tokenizer-prompt-format mistral \
         --bf16 \
         --micro-batch-size 1 \
         --seq-length 2048 \
-        --out-seq-length 700 \
+        --out-seq-length 12 \
         --temperature 1.0 \
         --img-h 336 \
         --img-w 336 \
@@ -107,11 +98,12 @@ do
         --no-load-rng \
         --no-load-optim \
         --input-image-path ${INPUT_IMAGE_PATH} \
-        --input-metadata-path ${INPUT_METADATA_PATH} \
         --num-partitions ${NUM_PARTITIONS} \
         --partition-id ${PARTITION_ID} \
-        --output-path ${OUTPUT_PATH}-${TASK}-${PARTITION_ID}.jsonl \
+        --output-path ${OUTPUT_PATH} \
         --gt-path ${GROUNDTRUTH_PATH} \
         --task ${TASK} \
-        --disable-vision-class-token
+        --disable-vision-class-token \
+        --num-frames ${NUM_FRAMES} \
+        --ckpt-format torch
 done

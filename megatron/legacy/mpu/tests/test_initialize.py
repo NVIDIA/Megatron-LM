@@ -21,8 +21,8 @@ def test_initialize_model_parallel(tensor_model_parallel_size):
 
     # Checks.
     def check(group, world_size, rank):
-        assert world_size == torch.distributed.get_world_size(group=group)
-        assert rank == torch.distributed.get_rank(group=group)
+        assert world_size == group.size()
+        assert rank == group.rank()
 
     # Model parallel.
     world_size = tensor_model_parallel_size_

@@ -1,11 +1,39 @@
 {
+    "COMMENT": "Sources for these prompts include https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain/viewer and https://huggingface.co/datasets/HuggingFaceM4/M3IT",
     "Captioning": {
         "raw": [
             "Can you briefly explain what you see in the image?",
             "Describe what's happening in this image in one short sentence.",
             "Write a short caption that accurately represents the content of this image.",
             "Please generate a descriptive caption for the image provided.",
-            "How would you summarize the scene depicted in the picture in short?"
+            "How would you summarize the scene depicted in the picture in short?",
+            "Describe the image briefly.",
+            "Write a succinct description of the image, capturing its main components, the relationships between them, and any notable details.",
+            "Create a concise caption that accurately describes the main elements in the image provided.",
+            "Write a brief, yet comprehensive, description of the image.",
+            "Describe the image in a clear and concise manner.",
+            "For the given image, provide a one-sentence summary that captures the most important details.",
+            "Generate a short caption for the picture.",
+            "Write a short and informative description that highlights the primary subjects and actions occurring in the given image.",
+            "Provide a concise and informative caption for the image, focusing on the primary subjects.",
+            "Write a clear description of the image, make sure the key features are well covered.",
+            "Offer a succinct explanation of the picture presented."
+        ]
+    },
+    "CaptioningPretraining": {
+        "raw": [
+            "Generate a short caption of the image.",
+            "Describe the image concisely.",
+            "Provide a brief description of the given image."
+        ],
+        "llava": [
+            "Give a brief description of image.",
+            "Give a brief description of the image.",
+            "Provide a brief description of the given image.",
+            "Provide a one-sentence caption for the provided image.",
+            "Write a terse but informative summary of the picture.",
+            "Describe the image concisely.",
+            "Generate a clear and concise summary of the photo."
         ]
     },
     "OCR": {
@@ -15,15 +43,6 @@
             "Converting the text embedded in this image into a readable document.",
             "Transcribe all the text you find.",
             "Can you extract all visible text from the image here?"
-        ]
-    },
-    "VQA": {
-        "raw": [
-            "Given the image, answer the following question with few words.",
-            "Answer the following question: ",
-            "What is the answer to this question?",
-            "Write the answer: ",
-            "Please answer this question: "
         ]
     }
 }

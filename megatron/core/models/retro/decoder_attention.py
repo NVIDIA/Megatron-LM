@@ -3,26 +3,27 @@
 """Retro's cross attention modules for the decoder block."""
 
 from functools import partial
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.utils import get_all_true_mask
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.utils import deprecate_inference_params
 
 
 class RetroDecoderCrossAttention(BaseRetroCrossAttention):
-
     """Retro decoder's chunked cross attention operator.
 
     See this paper for more details: https://arxiv.org/abs/2112.04426.
@@ -49,7 +50,9 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         submodules (CrossAttentionSubmodules): Cross attention submodules.
         layer_number (int): Layer number within transformer block.
         attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
-        encoder_block_spec (ModuleSpec): The first Retro decoder layer is provided with a transformer block spec to construct the neighbor encoder.
+        encoder_block_spec (ModuleSpec): The first Retro decoder layer is
+            provided with a transformer block spec to construct the neighbor encoder.
+        pg_collection (ProcessGroupCollection): Model communication process groups.
     """
 
     def __init__(
@@ -59,17 +62,23 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         encoder_block_spec: ModuleSpec = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(
             config=config,
             submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
+            pg_collection=pg_collection,
         )
 
         if encoder_block_spec:
             self.encoder = TransformerBlock(
-                config=config, spec=encoder_block_spec, pre_process=True, post_process=False,
+                config=config,
+                spec=encoder_block_spec,
+                pre_process=True,
+                post_process=False,
+                pg_collection=pg_collection,
             )
             # self._encoder_key = 'encoder' # ... necessary?
         else:
@@ -80,8 +89,10 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         hidden_states: Tensor,
         attention_mask: Tensor,
         key_value_states: Tensor = None,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
         # rotary_pos_emb: Tensor = None, # ... unsupported for retro.
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> dict:
         """Cross attention for Retro decoder.
 
@@ -97,34 +108,36 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         Args:
             hidden_states (Tensor): Transformer layer hidden states.
             attention_mask (Tensor): Attention mask.
-            key_value_states (Tensor): Neighbor embeddings if first decoder layer, else encoder output.
-            inference_params (InferenceParams): Inference params.
+            key_value_states (Tensor): Neighbor embeddings if first decoder layer,
+                else encoder output.
+            inference_context (BaseInferenceContext): Inference context.
 
         Returns:
-            A dict consisting of the attention output and context, along with other scalars necessary for performing the downstream bias-dropout-add.
+            A dict consisting of the attention output and context, along with
+                other scalars necessary for performing the downstream bias-dropout-add.
         """
 
         # hidden_states: [ ns, bs, d ]
         # key_value_states: [ r, k*bs*l, d ]
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         ns, bs, d = hidden_states.shape
         l = int(np.ceil(ns / self.retro_chunk_length))
 
         # Retrieve neighbors.
         if self.encoder:
-
             # Sequence length remainder.
             first_ns = ns % self.retro_chunk_length
 
             # Case 1: Sequence length not divisible by chunk length.
             if first_ns > 0:
-
                 # Split sequence into first partial chunk & remaining chunks.
-                first_chunk, rest_chunk = hidden_states[:first_ns], hidden_states[first_ns:]
+                first_chunk, rest_chunk = (hidden_states[:first_ns], hidden_states[first_ns:])
 
                 # Pad partial chunk with zeros.
                 first_chunk = torch.nn.functional.pad(
-                    first_chunk, (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns), 'constant', 0,
+                    first_chunk, (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns), "constant", 0
                 )
 
                 # Concatenate padded chunk with remaining chunks.
@@ -157,7 +170,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 attention_mask=attention_mask,
                 context=chunked_output,
                 context_mask=chunked_output_mask,
-                inference_params=inference_params,
+                inference_context=inference_context,
             )  # [ r, k*bs*l, d ]
             key_value_states = key_value_states.reshape(
                 self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d
@@ -169,7 +182,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
         # Pad attending tokens to sequence length.
         padded_chunks = torch.nn.functional.pad(
-            attending_chunks, (0, 0, 0, 0, 0, self.retro_chunk_length - 1), 'constant', 0,
+            attending_chunks, (0, 0, 0, 0, 0, self.retro_chunk_length - 1), "constant", 0
         )
 
         # Permute attending chunks.
@@ -210,7 +223,6 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
 
 class RetroDecoderBiasDropoutAdd(MegatronModule):
-
     """Retro decoder's bias-dropout-add operator.
 
     This operator takes care of reshaping and permuting the output from the
@@ -220,9 +232,7 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
         config (RetroConfig): Retro config.
     """
 
-    def __init__(
-        self, config: RetroConfig,
-    ):
+    def __init__(self, config: RetroConfig):
         super().__init__(config=config)
         self.retro_chunk_length = config.retro_chunk_length
 
@@ -238,7 +248,8 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
         """Per-chunk bias-dropout-add.
 
         Args:
-            x_with_bias (dict): Attention output and bias, along with other Retro relevant parameters.
+            x_with_bias (dict): Attention output and bias, along with other Retro
+                relevant parameters.
             residual (Tensor): Transformer layer residual.
             prob (float): Dropout probability.
             retro_chunk_length (int): Retro chunk length (e.g., 64).
@@ -259,7 +270,6 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
 
         # Re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
-
             # Bias-dropout-add.
             x = bias_dropout_add(
                 (
@@ -282,7 +292,7 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
             )
 
             # Prepend zeros for non-attending tokens.
-            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0,)[
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), "constant", 0)[
                 :ns
             ]  # [ ns, bs, d ]
 

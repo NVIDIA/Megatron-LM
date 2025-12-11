@@ -1,0 +1,252 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: 'Test Template'
+description: 'Template for running NeMo tests in a containerized environment'
+
+inputs:
+  container-image:
+    description: 'Container image to use for test'
+    required: true
+  timeout:
+    description: 'Max runtime of test in minutes'
+    required: false
+    default: '30'
+  script:
+    description: 'Test script to execute'
+    required: true
+  is-optional:
+    description: 'Pass this job on failure.'
+    required: false
+    default: 'false'
+  is_unit_test:
+    description: 'Upload coverage as unit test'
+    required: false
+    default: 'false'
+  tag:
+    description: Latest or legacy test suite
+    required: true
+  test_case:
+    description: Test case to launch
+    required: true
+  model:
+    description: Model to launch
+    required: false
+  PAT:
+    description: 'GitHub Personal Access Token'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Change ownership of /home/runner/
+      shell: bash
+      run: sudo chown -R $(whoami) /home/runner/
+
+    - name: Setup python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+
+    - name: Install uuidgen
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        apt-get update
+        apt-get install -y uuid-runtime
+
+    - name: Create run-script (unit test)
+      shell: bash -x -e -u -o pipefail {0}
+      if: inputs.is_unit_test == 'true'
+      run: |
+        echo "::group::Create run-script"
+        cmd=$(cat <<'RUN_TEST_EOF'
+        #!/bin/bash
+
+        export PYTHONPATH=$(pwd)
+        export NEMORUN_HOME=$(pwd)
+        pip install --no-cache-dir uv
+        uv sync --only-group test
+        uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
+          --scope unit-tests \
+          --model unit-tests \
+          --test-case "${{ inputs.test_case }}" \
+          --environment dev \
+          --platform dgx_h100 \
+          --tag ${{ inputs.tag }} \
+          --container-image ${{ inputs.container-image }}
+
+        RUN_TEST_EOF
+        )
+        echo "$cmd" | tee "job.sh"
+        echo "::endgroup::"
+
+    - name: Get PR info
+      id: get-pr-info
+      if: startsWith(github.ref, 'refs/heads/pull-request/')
+      uses: nv-gha-runners/get-pr-info@main
+
+    - name: Install GH CLI
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        apt-get update
+        apt-get install -y gh
+
+    - name: Has Run tests label
+      shell: bash -x -e -u -o pipefail {0}
+      id: has-run-tests-label
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+        HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
+        echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
+
+    - name: Has Run functional tests label
+      shell: bash -x -e -u -o pipefail {0}
+      id: has-run-functional-tests-label
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+        HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "false"
+        echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
+
+    - name: Create run-script (e2e test)
+      shell: bash -x -e -u -o pipefail {0}
+      if: inputs.is_unit_test == 'false'
+      env:
+        MODEL: ${{ inputs.model }}
+      run: |
+        echo "::group::Create run-script"
+        cmd=$(cat <<'RUN_TEST_EOF'
+        #!/bin/bash
+        set -euxo pipefail
+
+        if [ "${{ steps.has-run-tests-label.outputs.main }}" == "true" ]; then
+          ARGS=(
+            --scope mr-github
+            --enable-lightweight-mode
+          )
+        elif [ "${{ steps.has-run-functional-tests-label.outputs.main }}" == "true" ]; then
+          ARGS=(
+            --scope mr-github
+          )
+        else
+          ARGS=(
+            --scope mr-github-slim
+          )
+        fi
+
+        export PYTHONPATH=$(pwd)
+        export NEMORUN_HOME=$(pwd)
+        pip install --no-cache-dir uv
+        uv sync --only-group test
+        uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
+          ${ARGS[@]} \
+          --model ${{ inputs.model }} \
+          --test-case ${{ inputs.test_case }} \
+          --environment dev \
+          --platform dgx_h100 \
+          --container-image ${{ inputs.container-image }} \
+          --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts \
+
+        RUN_TEST_EOF
+        )
+        echo "$cmd" | tee "job.sh"
+        echo "::endgroup::"
+
+    - name: Set timeout
+      shell: bash -x -e -u -o pipefail {0}
+      id: timeout_in_seconds
+      run: |
+        echo "::group::Set timeout"
+        echo "main=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
+        echo "::endgroup::"
+
+    - name: Pull container
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        echo "::group::Pull container"
+        docker pull ${{ inputs.container-image }}
+        echo "::endgroup::"
+
+    - name: Run main script
+      shell: bash -x -e -u -o pipefail {0}
+      id: run-main-script
+      run: |
+        echo "::group::Run main script"
+        EXIT_CODE=0
+        /bin/bash job.sh || EXIT_CODE=$?
+        echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
+        exit $EXIT_CODE
+        echo "::endgroup::"
+
+    - name: Check result
+      id: check
+      shell: bash -x -e -u -o pipefail {0}
+      if: always()
+      env:
+        IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
+      run: |
+        echo "::group::Check result"
+
+        logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(uuidgen)
+        echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
+
+        if [[ "$IS_UNIT_TEST" == "true" ]]; then
+          coverage_report=coverage-${{ inputs.is_unit_test == 'true' && 'unit-test' || 'e2e' }}-${{ github.run_id }}-$(uuidgen)
+        else
+          coverage_report=none
+        fi
+        echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
+
+        EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
+        IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
+
+        if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is-optional }}" == "true" ]]; then
+          echo "::warning:: Test failed, but displayed as successful because it is marked as optional."
+          IS_SUCCESS=true
+        fi
+
+        if [[ "$IS_SUCCESS" == "false" ]]; then
+          echo Test did not finish successfully.
+          exit 1
+        fi
+
+        if [[ "$coverage_report" != "none" ]]; then
+          uv run coverage report -i
+        fi
+
+        exit $EXIT_CODE
+        echo "::endgroup::"
+
+    - name: Upload coverage
+      uses: actions/upload-artifact@v4
+      if: ${{ always() && steps.check.outputs.coverage_report != 'none' }}
+      with:
+        name: ${{ steps.check.outputs.coverage_report }}
+        path: |
+          coverage.xml
+          .coverage
+        include-hidden-files: true
+
+    - name: Upload logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: ${{ steps.check.outputs.logs_report }}
+        path: ${{ inputs.is_unit_test == 'true' && 'logs' || 'assets_dir' }}
+        include-hidden-files: true

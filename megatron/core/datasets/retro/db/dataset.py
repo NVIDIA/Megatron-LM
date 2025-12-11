@@ -10,18 +10,25 @@ from typing import List
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    HAVE_TQDM = False
 
 
 class DBDataset(torch.utils.data.Dataset):
     """Dataset for iterating chunks.
-    
+
     Args:
         db_path (str): Path of HDF5-format chunk database.
         indexed_datasets (List[IndexedDataset]): Indexed datasets used to build database.
-        chunks (np.ndarray): Array of chunk indexes, for indexing into indexed datasets. Format [dataset_idx, doc_id, start_idx, end_idx, bert_length].
+        chunks (np.ndarray): Array of chunk indexes, for indexing into indexed datasets.
+            Format [dataset_idx, doc_id, start_idx, end_idx, bert_length].
         chunk_length (int): Max GPT chunk length (e.g., 64).
         eod_token_id (int): EOD token ID.
     """
@@ -34,7 +41,6 @@ class DBDataset(torch.utils.data.Dataset):
         chunk_length: int,
         eod_token_id: int,
     ):
-
         assert chunks.shape[1] == 5, (
             "expected 5 columns (dataset_idx, "
             "doc_idx, token_start_idx, token_end_idx, bert_chunk_length); "
@@ -85,10 +91,7 @@ class DBDataset(torch.utils.data.Dataset):
             token_ids = token_ids.tolist()
             token_ids += [self.eod_token_id] * (self.max_chunk_length - chunk_length)
 
-        return {
-            "doc_id": doc_id,
-            "text": np.array(token_ids, dtype=np.int64),
-        }
+        return {"doc_id": doc_id, "text": np.array(token_ids, dtype=np.int64)}
 
     def load_doc_tuples(self) -> None:
         """Load the dataset & document ids.
@@ -96,6 +99,9 @@ class DBDataset(torch.utils.data.Dataset):
         Load the dataset id & document id of each chunk in the database, to
         be used for causality filtering during querying.
         """
+        if not HAVE_TQDM:
+            raise ImportError("tqdm is required to use the DBDataset. Please install tqdm.")
+
         self.doc_tuples = np.zeros(shape=(len(self), 2), dtype="uint32")
         block_size = int(1e6)
         for start_idx in tqdm(

@@ -1,13 +1,13 @@
 from types import SimpleNamespace
 
 from megatron.training.global_vars import set_args
-from megatron.training.training import build_train_valid_test_data_iterators
 from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+from megatron.training.training import build_train_valid_test_data_iterators
 from tests.unit_tests.test_utilities import Utils
 
 
 def mock_train_valid_test_datasets_provider(train_val_test_num_samples):
-    return 1, 2, 3
+    return iter([1]), iter([2]), iter([3])
 
 
 def create_test_args():
@@ -23,6 +23,9 @@ def create_test_args():
     args.consumed_valid_samples = 1
     args.dataloader_type = "external"
     args.skip_train = False
+    args.full_validation = False
+    args.multiple_validation_sets = False
+    args.perform_rl_step = False
 
     return args
 
@@ -37,9 +40,10 @@ class TestTraining:
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
             mock_train_valid_test_datasets_provider
         )
-
-        assert (train_iter, valid_iter, test_iter) == (1, 2, 3)
-
+        train_data = next(train_iter)
+        valid_data = next(valid_iter)
+        test_data = next(test_iter)
+        assert (train_data, valid_data, test_data) == (1, 2, 3)
 
     def test_closed_formula_vocab_size_with_padding(self):
         def old_round_impl(after, multiple):
@@ -54,12 +58,16 @@ class TestTraining:
         for vocab in range(1, 600000, 1000):
             for mult in [1, 17, 32, 64, 128]:
                 args.make_vocab_size_divisible_by = mult
-                assert old_round_impl(vocab, mult) == _vocab_size_with_padding(vocab, args, False), (vocab, mult)
+                assert old_round_impl(vocab, mult) == _vocab_size_with_padding(
+                    vocab, args, False
+                ), (vocab, mult)
 
         for vocab in range(1, 10_000, 500):
-            for mult in range(1, 1024+1):
+            for mult in range(1, 1024 + 1):
                 args.make_vocab_size_divisible_by = mult
-                assert old_round_impl(vocab, mult) == _vocab_size_with_padding(vocab, args, False), (vocab, mult)
+                assert old_round_impl(vocab, mult) == _vocab_size_with_padding(
+                    vocab, args, False
+                ), (vocab, mult)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

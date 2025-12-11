@@ -3,8 +3,8 @@
 """Specs for Retro decoder."""
 
 import typing
+from typing import Optional
 
-from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -25,7 +25,7 @@ from megatron.core.transformer.transformer_block import (
 )
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -34,13 +34,16 @@ try:
 except ImportError:
     import warnings
 
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
+    warnings.warn(f"Apex is not installed. Falling back to Torch Norm")
+    LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    import transformer_engine as te  # pylint: disable=unused-import
+
+    from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
         TENorm,
@@ -64,7 +67,8 @@ def get_retro_decoder_layer_te_spec(
     provided for the first Retro decoder layer.
 
     Args:
-        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for the first Retro decoder layer.
+        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for
+            the first Retro decoder layer.
 
     Returns:
         A module spec with Transformer Engine modules.
@@ -73,9 +77,7 @@ def get_retro_decoder_layer_te_spec(
     spec.submodules.pre_cross_attn_layernorm = TENorm
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
-        params={
-            "encoder_block_spec": encoder_block_spec,
-        },
+        params={"encoder_block_spec": encoder_block_spec},
         submodules=CrossAttentionSubmodules(
             linear_q=TEColumnParallelLinear,
             linear_kv=TEColumnParallelLinear,
@@ -99,7 +101,8 @@ def get_retro_decoder_layer_local_spec(
     provided for the first Retro decoder layer.
 
     Args:
-        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for the first Retro decoder layer.
+        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided
+            for the first Retro decoder layer.
 
     Returns:
         A module spec with local modules.
@@ -108,9 +111,7 @@ def get_retro_decoder_layer_local_spec(
     spec.submodules.pre_cross_attn_layernorm = LNImpl
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
-        params={
-            "encoder_block_spec": encoder_block_spec,
-        },
+        params={"encoder_block_spec": encoder_block_spec},
         submodules=CrossAttentionSubmodules(
             linear_q=ColumnParallelLinear,
             linear_kv=ColumnParallelLinear,
@@ -123,31 +124,41 @@ def get_retro_decoder_layer_local_spec(
 
 
 def get_retro_decoder_block_spec(
-    config: RetroConfig, use_transformer_engine: bool
+    config: RetroConfig,
+    use_transformer_engine: bool,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """Retro decoder block spec.
 
     Retro decoder block implementation details:
-    - The retro decoder block consists of interleaved GPT layers and customized Retro decoder layers.
-    - The Retro decoder layers are spaced three layers apart, and start on layer 6 or 9 (depending on the total number of layers).
-    - The first decoder layer instantiates an encoder block, and it therefore passes in an encoder_block_spec.
+    - The retro decoder block consists of interleaved GPT layers
+        and customized Retro decoder layers.
+    - The Retro decoder layers are spaced three layers apart,
+        and start on layer 6 or 9 (depending on the total number of layers).
+    - The first decoder layer instantiates an encoder block,
+        and it therefore passes in an encoder_block_spec.
 
     Args:
         config (RetroConfig): Retro config.
         use_transformer_engine (bool): If True, use Transformer Engine (instead of local modules.
+        vp_stage (Optional[int]): Virtual pipeline stage number.
+        pp_rank (Optional[int]): Pipeline parallel rank.
 
     Returns:
         Transformer block submodules for the given spec.
     """
 
-    # Num layers.
     assert (
-        parallel_state.get_pipeline_model_parallel_world_size() == 1
+        config.pipeline_model_parallel_size == 1
     ), "retro does not currently support pipeline parallelism."
+
     assert (
-        parallel_state.get_virtual_pipeline_model_parallel_world_size() is None
+        config.virtual_pipeline_model_parallel_size is None
     ), "retro does not currently support virtual pipeline parallelism."
-    num_layers = get_num_layers_to_build(config)
+
+    # Num layers.
+    num_layers = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
 
     # Retro layer numbers.
     retro_layer_start = 6 if num_layers <= 15 else 9

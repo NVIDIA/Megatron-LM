@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 ##
-# Compile megatron.core.datasets.helpers dependencies before BlendedDataset import
+# Compile megatron.core.datasets.helpers_cpp dependencies before BlendedDataset import
 ##
 
 from types import SimpleNamespace
@@ -25,7 +25,7 @@ def test_mock_multimodal_dataset():
         torch.distributed.barrier()
     else:
         compile_helpers()
-        
+
     config = MultimodalDatasetConfig(
         random_seed=1234,
         sequence_length=1024,
@@ -36,6 +36,7 @@ def test_mock_multimodal_dataset():
         image_w=336,
         split="990,9,1",
         tokenizer=_NullTokenizer(vocab_size=_MOCK_VOCAB_SIZE),
+        mid_level_dataset_surplus=0.005,
     )
 
     datasets = BlendedMegatronDatasetBuilder(

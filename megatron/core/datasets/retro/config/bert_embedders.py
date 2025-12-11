@@ -4,7 +4,6 @@
 
 import abc
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 import torch
@@ -22,7 +21,9 @@ class Embedder(abc.ABC):
         """Embed a text dataset.
 
         Args:
-            text_dataset (torch.utils.data.Dataset): Text dataset to embed. Each sample of the text dataset should output a dict with a key 'text' and a string value.
+            text_dataset (torch.utils.data.Dataset): Text dataset to embed.
+                Each sample of the text dataset should output a dict with a key 'text'
+                and a string value.
 
         Returns:
             A 2D ndarray with shape (len(text_dataset), dimension(embedder)).

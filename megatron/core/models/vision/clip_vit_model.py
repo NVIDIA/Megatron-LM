@@ -6,11 +6,20 @@ import torch
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.common.vision_module.vision_module import VisionModule
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    from megatron.core.extensions.transformer_engine import TENorm
+
+    NORM_IMPL = TENorm
+except:
+    NORM_IMPL = torch.nn.LayerNorm
 
 
 # Note: This is under development and is missing features like position embedding interpolation.
@@ -26,19 +35,33 @@ class CLIPViTModel(VisionModule):
         patch_dim (int): Image patch size.
         img_h (int): Input image height.
         img_w (int): Input image width.
+        pg_collection (ProcessGroupCollection): Model communication process groups
+        vp_stage (int): Virtual pipeline stage
     """
 
     def __init__(
         self,
         transformer_config: TransformerConfig,
         transformer_layer_spec: ModuleSpec,
-        ln_pre_impl: Union[ModuleSpec, type] = TENorm,
+        ln_pre_impl: Union[ModuleSpec, type] = NORM_IMPL,
+        ln_post_impl: Union[ModuleSpec, type] = NORM_IMPL,
         add_class_token: bool = True,
         class_token_len: int = 1,
         patch_dim: int = 14,
         img_h: int = 336,
         img_w: int = 336,
+        model_subtype: str = "clip",
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
+
+        error_msg = f"CLIPViTModel model subtype {model_subtype} is not supported."
+        assert model_subtype in ["clip", "siglip", "internvit", "internvit300M"], error_msg
+
+        if model_subtype == "siglip":
+            assert class_token_len == 0, "SigLIP does not support class tokens."
+            assert not add_class_token, "SigLIP does not support class tokens."
+
         super().__init__(config=transformer_config)
 
         if has_config_logger_enabled(transformer_config):
@@ -61,41 +84,73 @@ class CLIPViTModel(VisionModule):
 
         self.seq_length = self.num_patches + (self.class_token_len if self.add_class_token else 0)
 
+        self.ln_pre = None
+        self.ln_post = None
+        self.pg_collection = pg_collection
+        self.vp_stage = vp_stage
+        if model_subtype == "clip":
+            self.ln_pre = build_module(
+                ln_pre_impl,
+                config=transformer_config,
+                hidden_size=self.visual_hidden_size,
+                eps=transformer_config.layernorm_epsilon,
+            )
+            conv_bias = False
+            padding = 0
+        elif model_subtype == "siglip":
+            self.ln_post = build_module(
+                ln_post_impl,
+                config=transformer_config,
+                hidden_size=self.visual_hidden_size,
+                eps=transformer_config.layernorm_epsilon,
+            )
+            conv_bias = True
+            padding = "valid"
+        elif model_subtype.startswith("internvit"):
+            conv_bias = True
+            padding = 0
+        else:
+            raise ValueError(f"unsupported vision model type {model_subtype}")
+
         self.conv1 = torch.nn.Conv2d(
             in_channels=3,
             out_channels=self.visual_hidden_size,
             kernel_size=self.patch_dim,
             stride=self.patch_dim,
-            bias=False,
+            bias=conv_bias,
+            padding=padding,
         )
 
         self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
 
-        self.position_embeddings = torch.nn.Embedding(self.seq_length, self.visual_hidden_size)
+        self.position_embeddings = torch.nn.Embedding(
+            self.seq_length, self.visual_hidden_size, dtype=transformer_config.params_dtype
+        )
 
         self.add_class_token = add_class_token
         if self.add_class_token:
             self.class_token = torch.nn.Parameter(
-                torch.randn(1, self.class_token_len, self.visual_hidden_size)
+                torch.randn(
+                    1,
+                    self.class_token_len,
+                    self.visual_hidden_size,
+                    dtype=transformer_config.params_dtype,
+                )
             )
-
-        self.ln_pre = build_module(
-            ln_pre_impl,
-            config=transformer_config,
-            hidden_size=self.visual_hidden_size,
-            eps=transformer_config.layernorm_epsilon,
-        )
 
         self.model_type = ModelType.encoder_or_decoder
 
         # Transformer layers.
-        # TODO: Follow-up changes will make pre and post_process configurable. They are needed for supporting pipeline parallelism.
-        # Note: a final layer norm and/or linear layer present in some implementations are omitted here. They can be added separately where needed.
+        # TODO: Make pre_process and post_process configurable.
+        # NOTE: a final layer norm and/or linear layer in some implementations are omitted here.
+        # They can be added separately where needed.
         self.decoder = TransformerBlock(
             config=transformer_config,
             spec=transformer_layer_spec,
             pre_process=True,
             post_process=False,
+            pg_collection=self.pg_collection,
+            vp_stage=self.vp_stage,
         )
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
@@ -114,7 +169,7 @@ class CLIPViTModel(VisionModule):
 
         Args:
             x (torch.Tensor): input data of shape [batch, img_h, img_w]
-            attention_mask (torch.Tensor with dtype=bool): Attention mask to use. If none, all ones.
+            attention_mask (torch.Tensor with dtype=bool): Attention mask to use.
 
         Returns:
             x (torch.Tensor): output after final transformer block of shape [b, s, h].
@@ -133,20 +188,74 @@ class CLIPViTModel(VisionModule):
 
         assert x.shape[1] == self.seq_length, f"{x.shape[1]} != {self.seq_length}"
         x = x + self.position_embeddings(self.position_ids)
-        x = self.ln_pre(x)
+        if self.ln_pre:
+            x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # [b, s, h] -> [s, b, h]
-        x = (
-            x.contiguous()
-        )  # contiguous() call required as `permute` can sparsify the tensor and this breaks pipelining
-
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                1, 1, self.seq_length, self.seq_length
-            ).cuda()  # [1, 1, s, s]
-            attention_mask = attention_mask < 0.5  # to bool
+        # `permute` can make the tensor non-contiguous, breaking pipelining.
+        x = x.contiguous()
 
         x = self.decoder(x, attention_mask)
         x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
         x = x.contiguous()
-
+        if self.ln_post:
+            x = self.ln_post(x)
         return x
+
+
+def get_num_image_embeddings(
+    img_h,
+    img_w,
+    patch_dim,
+    vision_model_type,
+    disable_vision_class_token,
+    class_token_len,
+    pixel_shuffle,
+    use_tile_tags=False,
+    max_num_tiles=0,
+    tokenizer_type=None,
+):
+    """Get the number of image embeddings per image tile."""
+    if vision_model_type == "siglip":
+        keep_class_token = False
+    elif vision_model_type in ("clip", "internvit", "internvit300M"):
+        keep_class_token = not disable_vision_class_token
+    elif vision_model_type.startswith("radio"):
+        keep_class_token = not disable_vision_class_token
+    elif vision_model_type == "cradio-g":
+        class_token_len = 8
+        keep_class_token = not disable_vision_class_token
+    elif vision_model_type.startswith("hf://"):
+        from megatron.core.models.huggingface.module import get_hf_model_type
+
+        model_type = get_hf_model_type(vision_model_type)
+
+        if "siglip" in model_type:
+            keep_class_token = False
+        else:
+            raise NotImplementedError(f"unsupported huggingface vision model: {vision_model_type}")
+    else:
+        raise NotImplementedError(f"unknown vision model type {vision_model_type}")
+
+    num_patches_per_dim_h = img_h // patch_dim
+    num_patches_per_dim_w = img_w // patch_dim
+    num_patches = num_patches_per_dim_h * num_patches_per_dim_w
+    num_image_embeddings_per_tile = num_patches + (class_token_len if keep_class_token else 0)
+
+    if pixel_shuffle:
+        num_image_embeddings_per_tile = int(num_image_embeddings_per_tile * (0.5**2))
+
+    if use_tile_tags:
+        if tokenizer_type in ("llama3p1", "chatml", "qwen2p0", "qwen2p5"):
+            num_image_embeddings_per_tile += 5
+        elif tokenizer_type.startswith("nemotron5"):
+            num_image_embeddings_per_tile += 6
+        else:
+            raise ValueError("tokenizer type not defined")
+
+        if 10 < max_num_tiles < 100:
+            if tokenizer_type.startswith("qwen"):
+                num_image_embeddings_per_tile += 1  # add padding 0
+        elif max_num_tiles > 100:
+            raise ValueError(f"max number of tiles {max_num_tiles} not supported")
+
+    return num_image_embeddings_per_tile

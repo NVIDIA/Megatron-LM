@@ -11,7 +11,6 @@ Building a chunk database consists of.
   - Save chunk offsets to disk for each indexed dataset.
 """
 
-import glob
 import os
 import types
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -19,11 +18,9 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.retro.config import RetroPreprocessingConfig
-from megatron.core.datasets.retro.external_libs import h5py
 from megatron.core.datasets.retro.utils import (
     extract_data_config,
     get_blocks_by_rank,
@@ -40,9 +37,22 @@ from .utils import (
     get_individual_doc_offsets,
     get_merged_db_path_map,
     init_indexed_dataset_infos,
-    load_indexed_datasets,
     save_indexed_dataset_infos,
 )
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    HAVE_TQDM = False
+
+try:
+    import h5py
+
+    HAVE_H5PY = True
+except ImportError:
+    HAVE_H5PY = False
 
 
 def build_partial_db(
@@ -64,7 +74,8 @@ def build_partial_db(
     from each document.
 
     Args:
-        config (types.SimpleNamespace): Subset of Retro config, containing 'chunk_length', 'gpt_eod', 'gpt_detokenize', 'bert_tokenize', and 'task_validate'.
+        config (types.SimpleNamespace): Subset of Retro config, containing
+            'chunk_length', 'gpt_eod', 'gpt_detokenize', 'bert_tokenize', and 'task_validate'.
         dataset_idx (int): Index of this dataset out of all blended datasets.
         n_datasets (int): Total number of blended datasets.
         indexed_dataset (IndexedDataset): Indexed dataset to be chunked.
@@ -83,6 +94,9 @@ def build_partial_db(
         - Dict mapping document ID to number of valid chunks.
     """
 
+    if not HAVE_TQDM:
+        raise ImportError("tqdm is required to use the RetroDataset. Please install tqdm.")
+
     # Document start/end indexes.
     doc_range = block["range"]
     n_docs = doc_range[1] - doc_range[0]
@@ -95,23 +109,13 @@ def build_partial_db(
     if proc_id in progress_proc_ids:
         log_retro_rank_0(
             " > building partial chunk db, proc %d / %d, docs %d:%d / %d."
-            % (
-                proc_id,
-                n_procs,
-                doc_start_id,
-                doc_end_id,
-                n_docs,
-            )
+            % (proc_id, n_procs, doc_start_id, doc_end_id, n_docs)
         )
 
     # Progress bars (snapshot of overall progress).
     doc_id_iter = range(doc_start_id, doc_end_id)
     pbar = (
-        tqdm(
-            doc_id_iter,
-            "parse doc chunks",
-            miniters=len(doc_id_iter) // 20,
-        )
+        tqdm(doc_id_iter, "parse doc chunks", miniters=len(doc_id_iter) // 20)
         if proc_id in progress_proc_ids
         else doc_id_iter
     )
@@ -121,7 +125,6 @@ def build_partial_db(
     chunk_db_invalid: List[Tuple] = []
     doc_size_map = {}
     for doc_id in pbar:
-
         # Progress description.
         try:
             pbar.set_description(
@@ -152,13 +155,10 @@ def build_partial_db(
         # Re-tokenize each chunk to Bert/Wordpiece (empty bert -> 'invalid').
         doc_size_map[doc_id] = 0
         for i, chunk_start_idx in enumerate(chunk_start_idxs):
-
             # Re-tokenize.
             chunk_end_idx = chunk_end_idxs[i]
             gpt_token_ids = indexed_dataset.get(
-                idx=doc_id,
-                offset=chunk_start_idx,
-                length=chunk_end_idx - chunk_start_idx,
+                idx=doc_id, offset=chunk_start_idx, length=chunk_end_idx - chunk_start_idx
             )
             text = config.gpt_detokenize(gpt_token_ids.tolist())
             bert_token_ids = config.bert_tokenize(text)
@@ -169,14 +169,7 @@ def build_partial_db(
             else:
                 _chunk_db = chunk_db_valid
                 doc_size_map[doc_id] += 1
-            _chunk_db.append(
-                (
-                    doc_id,
-                    chunk_start_idx,
-                    chunk_end_idx,
-                    len(bert_token_ids),
-                )
-            )
+            _chunk_db.append((doc_id, chunk_start_idx, chunk_end_idx, len(bert_token_ids)))
 
     return proc_id, chunk_db_valid, chunk_db_invalid, doc_size_map
 
@@ -195,12 +188,13 @@ def build_block_db(
     """Split each document within block into consecutive retro_gpt_chunk_length size chunks.
 
     Args:
-        config (RetroPreprocessingConfig): For DB building, we make use of attributes 'chunk_length', 'gpt_eod', 'gpt_detokenize', 'bert_tokenize', and 'task_validate'.
+        config (RetroPreprocessingConfig): For DB building, we make use of attributes
+            'chunk_length', 'gpt_eod', 'gpt_detokenize', 'bert_tokenize', and 'task_validate'.
         dataset_idx (int): Index of this dataset out of all blended datasets.
         n_datasets (int): Total number of blended datasets.
         indexed_dataset (IndexedDataset): Indexed dataset to be chunked.
         n_procs (int): Total number of parallel processes.
-        executor (ProcessPoolExecutor): Executor for launching parallel processes.
+            executor (ProcessPoolExecutor): Executor for launching parallel processes.
         n_missing_blocks (int):  Total number of blocks to be processed.
         block_idx (int): Block index out of all blocks to be processed.
         block (dict): Range information such as start/end points for chunking idnexed dataset.
@@ -214,7 +208,7 @@ def build_block_db(
     """
 
     # Build partial dbs.
-    log_retro_rank_0(' > build partial dbs.')
+    log_retro_rank_0(" > build partial dbs.")
     futures = []
     for proc_id in range(n_procs):  # not true process id
         futures.append(
@@ -251,7 +245,7 @@ def build_block_db(
     ]
 
     # Convert to numpy.
-    log_retro_rank_0(' > converting chunk db to numpy.')
+    log_retro_rank_0(" > converting chunk db to numpy.")
     chunk_db_valid = np.array(chunk_db_valid, dtype="uint32")
     chunk_db_invalid = np.array(chunk_db_invalid, dtype="uint32")
 
@@ -269,10 +263,7 @@ def build_block_db(
 
 
 def save_block_db(
-    block: dict,
-    chunk_db_valid: np.ndarray,
-    chunk_db_invalid: np.ndarray,
-    doc_offsets: np.ndarray,
+    block: dict, chunk_db_valid: np.ndarray, chunk_db_invalid: np.ndarray, doc_offsets: np.ndarray
 ) -> None:
     """Save block of chunked tokens to disk. These blocks are later used for
     training and adding to the vector index.
@@ -283,6 +274,9 @@ def save_block_db(
         chunk_db_invalid (np.ndarray): Array of invalid chunk indexes.
         doc_offsets (np.ndarray): Array of document offsets by chunks.
     """
+    if not HAVE_H5PY:
+        raise ImportError("h5py is required to use the RetroDataset. Please install h5py.")
+
     log_retro_rank_0(" > saving individual db.")
     with h5py.File(block["path"], "w") as f:
         dset = f.create_dataset("chunks_valid", data=chunk_db_valid)
@@ -291,10 +285,7 @@ def save_block_db(
 
 
 def build_individual_db(
-    config: RetroPreprocessingConfig,
-    dataset_idx: int,
-    n_datasets: int,
-    dataset_info: dict,
+    config: RetroPreprocessingConfig, dataset_idx: int, n_datasets: int, dataset_info: dict
 ) -> None:
     """Process a single indexed dataset & extract chunks.
 
@@ -302,7 +293,8 @@ def build_individual_db(
         config (RetroPreprocessingConfig): Retro preprocessing config.
         dataset_idx (int): Dataset index within blended dataset.
         n_datasets (int): Total number of datasets within blended dataset.
-        dataset_info (dict): Metadata for dataset (see `save_indexed_dataset_infos()` in `utils.py` for more detail).
+        dataset_info (dict): Metadata for dataset
+            (see `save_indexed_dataset_infos()` in `utils.py` for more detail).
     """
 
     # Make directory.
@@ -348,9 +340,7 @@ def build_individual_db(
     # Process documents in parallel.
     with ProcessPoolExecutor(max_workers=n_procs) as executor:
         for block_idx, block in enumerate(active_blocks):
-
             if block is not None:
-
                 # Build block DB.
                 chunk_db_valid, chunk_db_invalid, doc_offsets = build_block_db(
                     config=config,
@@ -374,7 +364,6 @@ def build_individual_db(
                     )
 
                 else:
-
                     # Load existing block DB.
                     with h5py.File(block["path"]) as f:
                         existing_chunks_valid = np.copy(f["chunks_valid"])
@@ -395,8 +384,7 @@ def build_individual_db(
 
 
 def build_individual_dbs(
-    config: RetroPreprocessingConfig,
-    indexed_dataset_infos: List[Dict],
+    config: RetroPreprocessingConfig, indexed_dataset_infos: List[Dict]
 ) -> None:
     """Iterate each indexed dataset & process its chunks.
 
@@ -408,15 +396,10 @@ def build_individual_dbs(
     # Build individual DBs.
     log_retro_rank_0(" > build individual chunk dbs.")
     for ds_idx, ds_info in enumerate(indexed_dataset_infos):
-
         # Progress.
         log_retro_rank_0(
             " > building individual db, dataset %d / %d ... '%s'."
-            % (
-                ds_idx,
-                len(indexed_dataset_infos),
-                ds_info["prefix"],
-            )
+            % (ds_idx, len(indexed_dataset_infos), ds_info["prefix"])
         )
 
         # Process single dataset.
@@ -430,7 +413,8 @@ def update_chunk_counts(
 
     Args:
         config (RetroPreprocessingConfig): Retro preprocessing config.
-        indexed_dataset_infos (List[Dict]): Preprocessing metadata for each dataset (i.e., 'prefix', 'ratio', 'n_chunks', etc.).
+        indexed_dataset_infos (List[Dict]): Preprocessing metadata for each dataset
+            (i.e., 'prefix', 'ratio', 'n_chunks', etc.).
     """
 
     if torch.distributed.get_rank() != 0:
@@ -446,7 +430,6 @@ def update_chunk_counts(
     # Set n_chunks (including n_chunks_sampled for unambiguity).
     log_retro_rank_0(" > compute n_chunks.")
     for ds_index, ds_info in enumerate(indexed_dataset_infos):
-
         db_paths = get_individual_db_paths(config.retro_project_dir, ds_info["prefix"])
 
         # Update counts.
@@ -487,9 +470,13 @@ def merge_dbs(project_dir: str, indexed_dataset_infos: List[Dict], db_type: str)
 
     Args:
         project_dir (str): Retro project dir.
-        indexed_dataset_infos (List[Dict]): Preprocessing metadata for each dataset (i.e., 'prefix', 'ratio', 'n_chunks', etc.).
+        indexed_dataset_infos (List[Dict]): Preprocessing metadata for each dataset
+            (i.e., 'prefix', 'ratio', 'n_chunks', etc.).
         db_type (str): DB type (e.g., 'sampled', 'train', or 'valid').
     """
+
+    if not HAVE_H5PY:
+        raise ImportError("h5py is required to use the RetroDataset. Please install h5py.")
 
     if torch.distributed.get_rank() != 0:
         return
@@ -519,9 +506,7 @@ def merge_dbs(project_dir: str, indexed_dataset_infos: List[Dict], db_type: str)
 
     # Delete existing chunk db if incorrect size.
     if os.path.exists(db_path):
-
         try:
-
             f = h5py.File(db_path)
             n_alloc = len(f["chunks"])  # total allocated
             n_written = f["n_written"][0].item()  # total written
@@ -541,7 +526,6 @@ def merge_dbs(project_dir: str, indexed_dataset_infos: List[Dict], db_type: str)
 
     # Build merged chunk db.
     if not os.path.exists(db_path):
-
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         f = h5py.File(db_path, "w")
 
@@ -562,7 +546,7 @@ def merge_dbs(project_dir: str, indexed_dataset_infos: List[Dict], db_type: str)
         for ds_idx, ds_info in enumerate(indexed_dataset_infos):
             log_retro_rank_0(
                 " > merging dbs; '%s', dataset %d / %d ... '%s'."
-                % (db_type, ds_idx, len(indexed_dataset_infos), ds_info["prefix"]),
+                % (db_type, ds_idx, len(indexed_dataset_infos), ds_info["prefix"])
             )
             individual_chunk_db: np.ndarray = get_individual_chunk_db(project_dir, ds_idx, ds_info)
             individual_doc_offsets: np.ndarray = (
@@ -619,7 +603,8 @@ def build_merged_dbs(project_dir: str, indexed_dataset_infos: List[Dict]) -> Non
 
     Args:
         project_dir (str): Retro project dir.
-        indexed_dataset_infos (List[Dict]): Preprocessing metadata for each dataset (i.e., 'prefix', 'ratio', 'n_chunks', etc.).
+        indexed_dataset_infos (List[Dict]): Preprocessing metadata for each dataset
+            (i.e., 'prefix', 'ratio', 'n_chunks', etc.).
     """
     merge_dbs(project_dir, indexed_dataset_infos, "sampled")
     merge_dbs(project_dir, indexed_dataset_infos, "train")
@@ -629,7 +614,8 @@ def build_merged_dbs(project_dir: str, indexed_dataset_infos: List[Dict]) -> Non
 def build_db(config: RetroPreprocessingConfig) -> None:
     """Extract token chunks from each indexed dataset.
 
-    Iterate each document of each indexed dataset, extract that document's chunks, and save to a 'DB' (hdf5 file).
+    Iterate each document of each indexed dataset, extract that document's chunks,
+        and save to a 'DB' (hdf5 file).
 
     Args:
         config (RetroPreprocessingConfig): Retro preprocessing config.

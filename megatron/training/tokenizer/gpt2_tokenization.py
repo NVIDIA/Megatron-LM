@@ -142,7 +142,8 @@ class GPT2Tokenizer(object):
             kwargs['max_len'] = min(kwargs.get('max_len', int(1e12)), max_len)
         # Instantiate tokenizer.
         if special_tokens_file and 'special_tokens' not in kwargs:
-            special_tokens = open(special_tokens_file, encoding='utf-8').read().split('\n')[:-1]
+            with open(special_tokens_file, encoding='utf-8') as f:
+                special_tokens = f.read().split('\n')[:-1]
         else:
             special_tokens = kwargs.pop('special_tokens', [])
         tokenizer = cls(
@@ -156,12 +157,14 @@ class GPT2Tokenizer(object):
     def __init__(self, vocab_file, merges_file, errors='replace',
                  special_tokens=None, max_len=None):
         self.max_len = max_len if max_len is not None else int(1e12)
-        self.encoder = json.load(open(vocab_file))
+        with open(vocab_file) as f:
+            self.encoder = json.load(f)
         self.decoder = {v: k for k, v in self.encoder.items()}
         self.errors = errors  # how to handle errors in decoding
         self.byte_encoder = bytes_to_unicode()
         self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
-        bpe_data = open(merges_file, encoding='utf-8').read().split('\n')[1:-1]
+        with open(merges_file, encoding='utf-8') as f:
+            bpe_data = f.read().split('\n')[1:-1]
         bpe_merges = [tuple(merge.split()) for merge in bpe_data]
         self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))
         self.cache = {}

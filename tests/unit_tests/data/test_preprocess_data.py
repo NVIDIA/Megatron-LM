@@ -82,14 +82,12 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
     dummy_jsonl(path_to_raws)
 
     # build the datasets
-    build_datasets(
-        path_to_raws, path_to_data, extra_args=extra_args,
-    )
+    build_datasets(path_to_raws, path_to_data, extra_args=extra_args)
 
     # merge the datasets
     merge_datasets(path_to_data)
 
-    sys.argv = [sys.argv[0], "--input", None, "--output-prefix", None,] + extra_args
+    sys.argv = [sys.argv[0], "--input", None, "--output-prefix", None] + extra_args
     encoder = Encoder(build_args())
     encoder.initializer()
 
@@ -184,7 +182,7 @@ def gpt2_merge(odir):
         writer.write(requests.get(PRETRAINED_MERGES_ARCHIVE_MAP['gpt2']).content)
     return path
 
-@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
+
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
 
@@ -193,9 +191,9 @@ def test_preprocess_data_gpt():
             "--tokenizer-type",
             "GPT2BPETokenizer",
             "--vocab-file",
-            gpt2_vocab(temp_dir),
+            "/opt/data/tokenizers/megatron/gpt2-vocab.json",
             "--merge-file",
-            gpt2_merge(temp_dir),
+            "/opt/data/tokenizers/megatron/gpt2-merges.txt",
             "--append-eod",
             "--workers",
             "10",
@@ -214,7 +212,9 @@ def bert_vocab(odir):
         writer.write(requests.get(__HUGGINGFACE_BERT_BASE_UNCASED_VOCAB).content)
     return path
 
-@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
+
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_preprocess_data_bert():
     with tempfile.TemporaryDirectory() as temp_dir:
 
@@ -223,7 +223,7 @@ def test_preprocess_data_bert():
             "--tokenizer-type",
             "BertWordPieceLowerCase",
             "--vocab-file",
-            bert_vocab(temp_dir),
+            "/opt/data/tokenizers/megatron/gpt2-vocab.json",
             "--split-sentences",
             "--workers",
             "10",

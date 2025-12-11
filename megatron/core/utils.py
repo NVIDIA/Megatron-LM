@@ -1,8 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Utility functions used throughout Megatron core"""
+
 import array
+import asyncio
+import functools
 import hashlib
+import inspect
 import logging
 import math
 import operator
@@ -12,18 +16,467 @@ import sys
 import threading
 import time
 import traceback
+import warnings
+from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
-from functools import reduce
+from functools import lru_cache, reduce, wraps
+from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
+import numpy
 import torch
+
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+
+    HAVE_TORCH_SYMM_MEM = True
+except ImportError:
+    HAVE_TORCH_SYMM_MEM = False
+
+try:
+    import triton  # pylint: disable=unused-import
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
+from megatron.core import config
+from megatron.core.package_info import __version__ as mcore_version
+
+try:
+    from torch.distributed._tensor import DTensor
+    from torch.distributed.tensor.placement_types import Shard
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except ImportError:
+    HAVE_PACKAGING = False
+
+try:
+    import nvtx
+
+    HAVE_NVTX = True
+except ImportError:
+    HAVE_NVTX = False
+
 logger = logging.getLogger(__name__)
+
+
+try:
+    _torch_version = PkgVersion(torch.__version__)
+except Exception:
+    # This is a WAR for building docs, where torch is not actually imported
+    _torch_version = PkgVersion("0.0.0") if HAVE_PACKAGING else "0.0.0"
+_te_version = None
+_fa_version = None
+_mamba_ssm_version = None
+_causal_conv1d_version = None
+
+
+@contextmanager
+def null_decorator(*args, **kwargs):
+    """
+    No-op decorator.
+    """
+    if len(kwargs) == 0 and len(args) == 1 and callable(args[0]):
+        return args[0]
+    else:
+
+        def inner(func):
+            return func
+
+        return inner
+
+
+class ExperimentalNotEnabledError(Exception):
+    """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
+
+
+def experimental_fn(introduced_with_version: str):
+    """A decorator that marks a function as experimental.
+    Experimental functions may change quickly and do not guarantee backwards
+    compatiblity.
+
+    Experimental functions have a limited lifetime and should
+    either be productionized or deprecated.
+
+    Args:
+        introduced_with_version (str): A version-like string of Mcore at time of
+            introduction.
+
+    Raises:
+        ExperimentalNotEnabledError: Error raised when experimental function
+            was called without enabling the experimental flag.
+    """
+    logged_functions = set()
+
+    def validator(func: Callable, max_lifetime: int = 3) -> Callable:
+        """Validates the request to the experimental function.
+
+        Args:
+            func (Callable): Callee
+            max_lifetime (int, optional): Number of minor version that the experimental
+                function is allowed to exist. Defaults to 3.
+
+        Raises:
+            ExperimentalNotEnabledError: Error raised when experimental function
+                was called without enabling the experimental flag.
+
+        Returns:
+            Callable: The callee function.
+        """
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "packaging is not installed. Please install it with `pip install packaging`."
+            )
+        if (
+            PkgVersion(introduced_with_version).minor + max_lifetime
+            < PkgVersion(mcore_version).minor
+        ):
+            logger.warning(
+                "%s has reached end of life. Please migrate to a non-experimental function.",
+                func.__name__,
+            )
+
+        @wraps(func)
+        def wrapped_func(*args, **kwargs):
+            if config.is_experimental_enabled() is not True:
+                raise ExperimentalNotEnabledError(f"Flag config.ENABLE_EXPERIMENTAL not enabled.")
+            # log once on one rank
+            if func.__name__ not in logged_functions:
+                logged_functions.add(func.__name__)
+                log_single_rank(
+                    logger, logging.INFO, "ENABLE_EXPERIMENTAL is True, running experimental code."
+                )
+
+            return func(*args, **kwargs)
+
+        return wrapped_func
+
+    return validator
+
+
+def experimental_cls(introduced_with_version: str):
+    """A decorator that marks a Class as experimental.
+    Experimental Classes may change quickly and do not guarantee backwards
+    compatiblity.
+
+    Experimental classes have a limited lifetime and should
+    either be productionized or deprecated.
+
+    Args:
+        introduced_with_version (str): A version-like string of Mcore at time of
+            introduction.
+
+    Raises:
+        ExperimentalNotEnabledError: Error raised when experimental class
+            was called without enabling the experimental flag.
+    """
+    logged_classes = set()
+
+    def validator(cls: Callable, max_lifetime: int = 3) -> Callable:
+        """Validates the request to the experimental function.
+
+        Args:
+            func (Callable): Callee
+            max_lifetime (int, optional): Number of minor version that the experimental
+                function is allowed to exist. Defaults to 3.
+
+        Raises:
+            ExperimentalNotEnabledError: Error raised when experimental function
+                was called without enabling the experimental flag.
+
+        Returns:
+            Callable: The callee function.
+        """
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "packaging is not installed. Please install it with `pip install packaging`."
+            )
+
+        if (
+            PkgVersion(introduced_with_version).minor + max_lifetime
+            < PkgVersion(mcore_version).minor
+        ):
+            logger.warning(
+                "%s has reached end of life. Please migrate to a non-experimental function.",
+                cls.__name__,
+            )
+
+        def wrapped_func(cls):
+            def guard(super: super, attr: str):
+                """Pass-through to callee attribute if experimental flag is enabled.
+
+                Args:
+                    super (super): Parent class of callee.
+                    attr (str): Attribute of callee that is being called.
+
+                Raises:
+                    ExperimentalNotEnabledError: Raised if flag is not set.
+
+                Returns:
+                    Attribute of callee.
+                """
+                if attr == "is_experimental":
+                    return config.is_experimental_enabled()
+
+                if config.is_experimental_enabled() is not True:
+                    raise ExperimentalNotEnabledError(
+                        f"Flag config.ENABLE_EXPERIMENTAL not enabled."
+                    )
+                # log once on one rank
+                if cls.__name__ not in logged_classes:
+                    logged_classes.add(cls.__name__)
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        "ENABLE_EXPERIMENTAL is True, running experimental code.",
+                    )
+                return super.__getattribute__(attr)
+
+            class ClassInterceptor(type):
+                """Metaclass to intercept calls from the uninitialized class."""
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.__class__ = type(cls.__qualname__, (ClassInterceptor,), {})
+
+                def __getattribute__(self, attr):
+                    """Intercepts calls like A.hello_world()"""
+                    return guard(super(), attr)
+
+            class Proxy(cls, metaclass=ClassInterceptor):
+                """Proxies calls from caller to the callee by relaying all
+                attribute calls through a guarding mechanism.
+
+                We use `__getattribute__` for relaying calls. Opposed to `__getattr__`,
+                this is called regardless of whether the attribute exists or not.
+
+                We need to distinguish two cases: callee is an instance vs. a class.
+
+                If callee is an instance, `__getattribute__` will look and find attributes
+                at the class level.
+
+                If callee is a class, `__getattribute__` will look for attributes at
+                _its_ class, which is `type`. Here, it won't find attributes.
+                We solve this a metaclass mixin which swaps `type` with a custom class
+                that supersets the callee's class. For mixins, any methods provided on
+                parent classes will be provided to the metaclass. We add a
+                `__getattribute__` to the metaclass as to allow it to fetch it from the
+                callees class.
+
+                """
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.__class__ = type(cls.__qualname__, (Proxy,), {})
+
+                def __getattribute__(self, attr):
+                    """Intercepts calls like a.hello_world()"""
+                    return guard(super(), attr)
+
+            return Proxy
+
+        return wrapped_func(cls)
+
+    return validator
+
+
+def get_torch_version():
+    """Get pytorch version from __version__; if not available use pip's. Use caching."""
+
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_torch_version_str():
+        import torch
+
+        if hasattr(torch, "__version__"):
+            return str(torch.__version__)
+        else:
+            return version("torch")
+
+    global _torch_version
+    if _torch_version is None:
+        _torch_version = PkgVersion(get_torch_version_str())
+    return _torch_version
+
+
+def get_te_version():
+    """Get TE version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    try:
+        import transformer_engine as te
+
+        HAVE_TE = True
+    except ImportError:
+        HAVE_TE = False
+
+    def get_te_version_str():
+        import transformer_engine as te
+
+        if hasattr(te, "__version__"):
+            return str(te.__version__)
+        else:
+            return version("transformer-engine")
+
+    global _te_version
+    if _te_version is None and HAVE_TE:
+        _te_version = PkgVersion(get_te_version_str())
+    return _te_version
+
+
+def is_te_min_version(version, check_equality=True):
+    """Check if minimum version of `transformer-engine` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    if check_equality:
+        return get_te_version() >= PkgVersion(version)
+    return get_te_version() > PkgVersion(version)
+
+
+def get_torch_version():
+    """Get torch version from __version__."""
+
+    global _torch_version
+    return _torch_version
+
+
+def is_torch_min_version(version, check_equality=True):
+    """Check if minimum version of `torch` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_torch_version() >= PkgVersion(version)
+    return get_torch_version() > PkgVersion(version)
+
+
+def get_fa_version():
+    """Get Flash attention version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_fa_version_str():
+        import flash_attn as fa
+
+        if hasattr(fa, "__version__"):
+            return str(fa.__version__)
+        else:
+            return version("flash-attn")
+
+    global _fa_version
+    if _fa_version is None:
+        _fa_version = PkgVersion(get_fa_version_str())
+    return _fa_version
+
+
+def is_fa_min_version(version, check_equality=True):
+    """Check if minimum version of `flash-attn` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_fa_version() >= PkgVersion(version)
+    return get_fa_version() > PkgVersion(version)
+
+
+def get_mamba_version():
+    """Get mamba version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_mamba_version_str():
+        import mamba_ssm
+
+        if hasattr(mamba_ssm, "__version__"):
+            return str(mamba_ssm.__version__)
+        else:
+            return version("mamba_ssm")
+
+    global _mamba_ssm_version
+    if _mamba_ssm_version is None:
+        _mamba_ssm_version = PkgVersion(get_mamba_version_str())
+    return _mamba_ssm_version
+
+
+def is_mamba_min_version(version, check_equality=True):
+    """Check if minimum version of `mamba_ssm` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_mamba_version() >= PkgVersion(version)
+    return get_mamba_version() > PkgVersion(version)
+
+
+def get_causal_conv1d_version():
+    """Get causal_conv1d version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_causal_conv1d_version_str():
+        import causal_conv1d
+
+        if hasattr(causal_conv1d, "__version__"):
+            return str(causal_conv1d.__version__)
+        else:
+            return version("causal_conv1d")
+
+    global _causal_conv1d_version
+    if _causal_conv1d_version is None:
+        _causal_conv1d_version = PkgVersion(get_causal_conv1d_version_str())
+    return _causal_conv1d_version
+
+
+def is_causal_conv1d_min_version(version, check_equality=True):
+    """Check if minimum version of `causal_conv1d` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_causal_conv1d_version() >= PkgVersion(version)
+    return get_causal_conv1d_version() > PkgVersion(version)
+
+
+def check_mamba_sequence_packing_support() -> Tuple[bool, Optional[str]]:
+    """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
+    if not is_causal_conv1d_min_version("1.5.3.post1"):
+        return False, "causal_conv1d >= 1.5.3.post1 is required"
+    elif not is_mamba_min_version("2.2.6.post3"):
+        return False, "mamba_ssm >= 2.2.6.post3 is required"
+    return True, None
 
 
 def ensure_divisibility(numerator, denominator):
@@ -36,6 +489,87 @@ def divide(numerator, denominator):
     the division value."""
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
+
+
+def deprecate_inference_params(inference_context, inference_params):
+    """Print warning for deprecated `inference_params`."""
+    if inference_context is None and inference_params is not None:
+        warnings.warn(
+            "`inference_params` renamed to `inference_context`, and will be "
+            "removed in `megatron-core` 0.13."
+        )
+        return inference_params
+    return inference_context
+
+
+def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
+    """Issue a deprecation warning if tp_group is None and return the default tp group."""
+    # TODO(zijiey): remove this function later.
+    if not torch.distributed.is_initialized():
+        return None
+
+    if tp_group is None:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            warnings.warn(
+                "Warning: tp_group is None, using default tp group. "
+                "Passing tp_group will be mandatory soon",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if is_expert:
+            tp_group = parallel_state.get_expert_tensor_parallel_group(
+                check_initialized=check_initialized
+            )
+        else:
+            tp_group = parallel_state.get_tensor_model_parallel_group(
+                check_initialized=check_initialized
+            )
+    return tp_group
+
+
+def get_pg_size(group=None):
+    """Get world size for a distributed group.
+
+    Args:
+        group: Process group to get world size for. If None, uses default group.
+
+    Returns:
+        int: World size (1 if distributed not initialized or group is None, else group.size())
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 1
+    return group.size()
+
+
+def get_pg_rank(group=None):
+    """Get rank for a distributed group.
+
+    Args:
+        group: Process group to get rank for. If None, uses default group.
+
+    Returns:
+        int: Rank (0 if distributed not initialized or group is None, else group.rank())
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 0
+    return group.rank()
+
+
+def get_pg_src_rank(group=None):
+    """Calculate the global rank corresponding to the first local rank
+    in the given process group.
+
+    Args:
+        group: Process group to query. If None or distributed is not initialized,
+            returns 0.
+
+    Returns:
+        int: The first (source) global rank in the group.
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 0
+    ranks = torch.distributed.get_process_group_ranks(group)
+    return ranks[0]
 
 
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
@@ -67,18 +601,21 @@ def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False)
 
 
 def get_model_type(model):
-    return get_attr_wrapped_model(model, 'model_type')
+    """Returns model_type attribute"""
+    return get_attr_wrapped_model(model, "model_type")
 
 
 def get_model_xattn(model):
+    """Returns whether the model has the xattn_needed attribute"""
     try:
-        return get_attr_wrapped_model(model, 'xattn_needed')
+        return get_attr_wrapped_model(model, "xattn_needed")
     except RuntimeError:
         return False
 
 
 def get_model_config(model):
-    return get_attr_wrapped_model(model, 'config', allow_none=False)
+    """Returns the config attribute, allowed to return None"""
+    return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
 class GlobalMemoryBuffer:
@@ -89,66 +626,150 @@ class GlobalMemoryBuffer:
     def __init__(self):
         self.buffer = {}
 
-    def get_tensor(self, tensor_shape, dtype, name):
+    def get_tensor(self, tensor_shape, dtype, name, mem_alloc_context: Optional[Callable] = None):
+        """
+        Returns (potentially) a sub-tensor from the self.buffer for the given shape.
+        """
         required_len = reduce(operator.mul, tensor_shape, 1)
         if (
             self.buffer.get((name, dtype), None) is None
             or self.buffer[(name, dtype)].numel() < required_len
         ):
-            self.buffer[(name, dtype)] = torch.empty(
-                required_len, dtype=dtype, device=torch.cuda.current_device(), requires_grad=False
-            )
+            mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
+            with mem_alloc_context():
+                self.buffer[(name, dtype)] = torch.empty(
+                    required_len,
+                    dtype=dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
 
 
+class GlobalSymmetricMemoryBuffer:
+    """
+    Global symmetric memory buffer used in inference.
+    This buffer is used by mcore-inference's low-latency
+    NVLS all-gather and reduce-scatter collectives.
+    """
+
+    def __init__(self, size_in_mb, process_group):
+        if not HAVE_TORCH_SYMM_MEM or not HAVE_TRITON:
+            # This should be hit if the user is running an older
+            # version of torch, or if they do not have triton
+            # installed.
+            self.symm_buffer = None
+            self.symm_mem_hdl = None
+        else:
+            numel = int(size_in_mb * 1024 * 1024)  # size in bytes
+            try:
+                symm_mem.enable_symm_mem_for_group(process_group.group_name)
+                self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
+                self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
+            except RuntimeError as e:
+                # If symmetric memory initialization fails, set buffer and handle to None
+                # This should happen if the process group is not contained within NVlink
+                self.symm_buffer = None
+                self.symm_mem_hdl = None
+
+    def _can_allocate(self, numel, dtype) -> bool:
+        """
+        Returns whether enough symmetric memory is available
+        for the given tensor shape and dtype.
+        """
+        if self.symm_mem_hdl is None:
+            return False
+        size_of_dtype = torch.tensor([], dtype=dtype).element_size()
+        required_len = numel * size_of_dtype
+        return required_len <= self.symm_buffer.numel()
+
+    def _allocate(self, numel, dtype) -> torch.Tensor:
+        """
+        Allocates a sub-tensor from the self.symm_buffer for the given numel and dtype"""
+        required_bytes = numel * torch.tensor([], dtype=dtype).element_size()
+        return self.symm_buffer[0:required_bytes].view(dtype).view(numel)
+
+    def maybe_get_tensor(self, tensor_shape, dtype):
+        """
+        Returns (potentially) a sub-tensor from the self.symm_buffer for the given shape.
+        If enough symmetric memory is not available, returns None.
+        """
+        if self.symm_mem_hdl is None:
+            return {"tensor": None, "handle": None}
+        numel = reduce(operator.mul, tensor_shape, 1)
+        if not self._can_allocate(numel, dtype):
+            return {"tensor": None, "handle": None}
+        return {
+            "tensor": self._allocate(numel, dtype).view(*tensor_shape),
+            "handle": self.symm_mem_hdl,
+        }
+
+
 def _kernel_make_viewless_tensor(inp, requires_grad):
-    '''Make a viewless tensor.
+    """Make a viewless tensor.
 
     View tensors have the undesirable side-affect of retaining a reference
     to the originally-viewed tensor, even after manually setting the '.data'
     field. This method creates a new tensor that links to the old tensor's
     data, without linking the viewed tensor, referenced via the '._base'
     field.
-    '''
-    out = torch.empty(
-        (1,),
-        dtype=inp.dtype,
-        device=inp.device,
-        requires_grad=requires_grad,
-    )
+    """
+    out = torch.empty((1,), dtype=inp.dtype, device=inp.device, requires_grad=requires_grad)
     out.data = inp.data
     return out
 
 
+class WrappedTensor:
+    """
+    A wrapper for tensors that enables caller functions to pass an indirect reference
+    to callee functions. By wrapping the tensor, the caller's direct reference is removed,
+    allowing the tensor to be garbage collected once the callee unwraps and frees it.
+    """
+
+    def __init__(self, tensor: torch.Tensor):
+        self._wrapper = [tensor]
+
+    def unwrap(self):
+        """
+        Returns the wrapped tensor while deleting the internal reference.
+        Can only be called once.
+        """
+        if len(self._wrapper) == 0:
+            raise RuntimeError(f"WrappedTensor has already been unwrapped")
+        return self._wrapper.pop(0)
+
+
 class MakeViewlessTensor(torch.autograd.Function):
-    '''
+    """
     Autograd function to make a viewless tensor.
 
     This function should be used in cases where the computation graph needs
     to be propagated, but we only want a viewless tensor (e.g.,
     ParallelTransformer's hidden_states). Call this function by passing
     'keep_graph = True' to 'make_viewless_tensor()'.
-    '''
+    """
 
     @staticmethod
     def forward(ctx, inp, requires_grad):
+        """Runs the fwd pass of _kernel_make_viewless_tensor"""
         return _kernel_make_viewless_tensor(inp, requires_grad)
 
     @staticmethod
     def backward(ctx, grad_output):
+        """No-op"""
         return grad_output, None
 
 
 def make_viewless_tensor(inp, requires_grad, keep_graph):
-    '''
+    """
     Entry-point for creating viewless tensors.
 
     This method should be used, rather than calling 'MakeViewlessTensor'
     or '_kernel_make_viewless_tensor' directly. This method acts as a
     switch for determining if an autograd function or a regular method
     should be used to create the tensor.
-    '''
+    """
 
     # return tensor as-is, if not a 'view'
     if inp._base is None:
@@ -162,8 +783,8 @@ def make_viewless_tensor(inp, requires_grad, keep_graph):
 
 
 def assert_viewless_tensor(tensor, extra_msg=None):
-    '''Assert that a tensor is not a view (i.e., its '._base' field is
-    not set).'''
+    """Assert that a tensor is not a view (i.e., its '._base' field is
+    not set)."""
     if isinstance(tensor, list):
         [assert_viewless_tensor(t) for t in tensor]
         return tensor
@@ -172,17 +793,17 @@ def assert_viewless_tensor(tensor, extra_msg=None):
     assert tensor._base is None, (
         "Ensure tensor._base is None before setting tensor.data or storing "
         "tensor to memory buffer. Otherwise, a memory leak will occur (and "
-        "likely accumulate over iterations). %s"
-    ) % extra_msg
+        f"likely accumulate over iterations). {extra_msg}"
+    )
     return tensor
 
 
 def safely_set_viewless_tensor_data(tensor, new_data_tensor):
-    '''Safely set tensor's '.data' field.
+    """Safely set tensor's '.data' field.
 
     Check first that the tensor is viewless (i.e., '._base' not set). If not,
     raise an exception.
-    '''
+    """
     assert_viewless_tensor(
         tensor,
         extra_msg="FYI, tensor._base has shape %s, and new_data_tensor has shape %s."
@@ -193,25 +814,18 @@ def safely_set_viewless_tensor_data(tensor, new_data_tensor):
 
 def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
-
-    def init_(tensor):
-        return torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
-
-    return init_
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=sigma)
 
 
-def scaled_init_method_normal(sigma, num_layers):
+def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
     """Init method based on N(0, sigma/sqrt(2*num_layers)."""
-    std = sigma / math.sqrt(2.0 * num_layers)
+    std = sigma / math.sqrt(multiplier * num_layers)
 
-    def init_(tensor):
-        return torch.nn.init.normal_(tensor, mean=0.0, std=std)
-
-    return init_
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
 
 
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
-    """If torch distributed is initialized, log only on rank
+    """If torch distributed is initialized, write log on only one rank
 
     Args:
         logger (logging.Logger): The logger to write the logs
@@ -229,7 +843,13 @@ def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs:
         logger.log(*args, **kwargs)
 
 
-def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any):
+def log_on_each_pipeline_stage(
+    logger: logging.Logger,
+    *args: Any,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    **kwargs: Any,
+):
     """Log on first rank in each pipeline stage
 
     Args:
@@ -241,17 +861,24 @@ def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any
     """
     assert torch.distributed.is_initialized()
 
-    if (
-        parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
-        and parallel_state.get_tensor_model_parallel_rank() == 0
-    ):
+    if tp_group is None and dp_cp_group is None:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    elif tp_group is not None and dp_cp_group is not None:
+        tp_rank = tp_group.rank()
+        dp_cp_rank = dp_cp_group.rank()
+    else:
+        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+
+    if tp_rank == 0 and dp_cp_rank == 0:
         logger.log(*args, **kwargs)
 
 
-def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:
+def check_param_hashes_across_dp_replicas(
+    model: List[torch.nn.Module], cross_check: bool = False
+) -> bool:
     """Computes hashes of all parameters in model, all-gathers hashes across DP replicas,
-    and then checks for equality between the locally-computed hashes and the hashes
-    from DP replica 0.
+    and then checks for equality between the locally-computed hashes and those of other ranks.
 
     NOTE: This function computes SHA-1 hashes on the CPU and thus needs to move all param
     tensors from GPU to CPU first; as a result, this function is not intended to be called
@@ -260,70 +887,113 @@ def check_param_hashes_across_dp_replicas(model: List[torch.nn.Module]) -> bool:
     Args:
         model (List[torch.nn.Module]): List of model chunks whose parameter hashes need to
             be checked.
+        cross_check (bool): If true, will check whether hashes match across all DP replicas.
 
     Returns:
-        True if all param hashes match with corresponding hash on DP replica 0, False
-        otherwise.
+        True if all param hashes match with corresponding hash on DP replica 0 or
+        across all replicas if cross_check is enabled, False otherwise.
     """
 
     # Compute per-parameter hashes on this rank.
-    params = []
-    local_param_hashes = []
+    # Keep track of expert and non-expert parameters separately since they need to be
+    # all-gathered across different sets of ranks.
+    non_expert_params, expert_params = [], []
+    local_non_expert_param_hashes, local_expert_param_hashes = [], []
     for model_chunk_id, model_chunk in enumerate(model):
         for param_name, param in model_chunk.named_parameters():
             param_hash = torch.frombuffer(
                 array.array(
-                    'B', hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
+                    "B", hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
                 ),
                 dtype=torch.uint8,
             )
-            params.append((model_chunk_id, param_name, param))
-            local_param_hashes.append(param_hash)
-    local_param_hashes = torch.stack(local_param_hashes)
+            if getattr(param, "allreduce", True):
+                non_expert_params.append((model_chunk_id, param_name, param))
+                local_non_expert_param_hashes.append(param_hash)
+            else:
+                expert_params.append((model_chunk_id, param_name, param))
+                local_expert_param_hashes.append(param_hash)
 
-    # Collect per-parameter hashes across all ranks in DP group.
-    all_param_hashes = [
-        torch.zeros_like(local_param_hashes)
-        for _ in range(parallel_state.get_data_parallel_world_size())
-    ]
-    torch.distributed.all_gather(
-        all_param_hashes, local_param_hashes, group=parallel_state.get_data_parallel_group_gloo()
-    )
+    # Use data-modulo-expert parallel group to all-gather expert param hashes, regular
+    # data-parallel group for non-expert param hashes.
+    all_param_hashes_match = True
+    for params, local_param_hashes, all_gather_group in zip(
+        [non_expert_params, expert_params],
+        [local_non_expert_param_hashes, local_expert_param_hashes],
+        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
+    ):
+        # Collect per-parameter hashes across all ranks in group.
+        assert len(params) == len(local_param_hashes)
+        if len(params) == 0:
+            continue
+        local_param_hashes = torch.stack(local_param_hashes).cuda()
+        all_param_hashes = [
+            torch.zeros_like(local_param_hashes) for _ in range(all_gather_group.size())
+        ]
+        torch.distributed.all_gather(all_param_hashes, local_param_hashes, group=all_gather_group)
 
-    # Make sure local per-parameter hash matches DP rank 0.
-    param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
-    if not param_hashes_match:
-        for i, (model_chunk_id, param_name, param) in enumerate(params):
-            if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
-                rank = torch.distributed.get_rank()
-                logger.info(
-                    f"[Rank {rank}] Hash not matching for {param_name} in model chunk {model_chunk_id}"
-                )
-    return param_hashes_match
+        # Make sure local per-parameter hash matches DP rank 0.
+        param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
+        if not param_hashes_match:
+            for i, (model_chunk_id, param_name, param) in enumerate(params):
+                if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
+                    rank = torch.distributed.get_rank()
+                    logger.info(
+                        f"[Rank {rank}] Hash not matching for {param_name} in model chunk"
+                        f"{model_chunk_id}"
+                    )
+        if cross_check:
+            # Make sure all ranks have the same hash.
+            all_param_hashes_match &= all(
+                map(lambda x: torch.equal(local_param_hashes, x), all_param_hashes)
+            )
+        else:
+            all_param_hashes_match &= param_hashes_match
+
+    return all_param_hashes_match
 
 
 def make_tp_sharded_tensor_for_checkpoint(
     tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
 ):
-    """Helper for instantiating a ShardedTensor where the `tp_axis` dimension is sharded across TP group.
+    """Helper for instantiating a ShardedTensor where the `tp_axis` dimension
+    is sharded across TP group.
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
     """
-
     prepend_axis_num = len(prepend_offsets)
 
+    new_offsets = []
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+    new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
+
+    if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        # TP + FSDP2 sharding
+        dp_replica_id = 0
+        tensor = tensor._local_tensor
+
+        if tp_axis == 0:
+            # both FSDP2 and TP shards axis 0
+            # default MCore uses tp-cp-ep-dp-pp
+            # FSDP2 is compatibile with TP, CP
+            new_offsets[0] = (prepend_axis_num, tp_rank * dp_size + dp_rank, tp_size * dp_size)
+        else:
+            # FSDP2 shards axis 0 and TP shards some other axis
+            new_offsets.append((prepend_axis_num, dp_rank, dp_size))
+
     if replica_id is None:
-        replica_id = (0, 0, parallel_state.get_data_parallel_rank(with_context_parallel=True))
+        replica_id = (0, 0, dp_replica_id)
 
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
-        (
-            tp_axis + prepend_axis_num,
-            parallel_state.get_tensor_model_parallel_rank(),
-            parallel_state.get_tensor_model_parallel_world_size(),
-        ),
+        *new_offsets,
         replica_id=replica_id,
         prepend_axis_num=prepend_axis_num,
         **kwargs,
@@ -338,30 +1008,72 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     prepend_axis_num = len(prepend_offsets)
 
+    new_offsets = []
+    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+    if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        # FSDP2 sharding
+        dp_replica_id = 0
+        tensor = get_full_tensor_if_necessary(tensor)
+        new_offsets.append((prepend_axis_num, dp_rank, dp_size))
+
     if replica_id is None:
-        replica_id = (
-            0,
-            parallel_state.get_tensor_model_parallel_rank(),
-            parallel_state.get_data_parallel_rank(with_context_parallel=True),
-        )
+        replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
 
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
+        *new_offsets,
         replica_id=replica_id,
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
 
 
-def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
+def get_full_tensor_if_necessary(tensor):
+    """For DTensor gets full tensor if some ranks will not have a local copy"""
+    need_full_tensor = False
+    for i in range(tensor.device_mesh.ndim):
+        if (
+            isinstance(tensor.placements[i], Shard)
+            and tensor.device_mesh.shape[i] > tensor.shape[tensor.placements[i].dim]
+        ):
+            need_full_tensor = True
+            break
 
+    tensor = tensor.full_tensor() if need_full_tensor else tensor._local_tensor
+
+    return tensor
+
+
+def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
+    """Returns the local shard of the given tensor if it is a DTensor."""
+    with torch.no_grad():
+        return tensor.to_local() if HAVE_DTENSOR and isinstance(tensor, DTensor) else tensor
+
+
+def get_data_parallel_group_if_dtensor(
+    tensor: Union[torch.Tensor, "DTensor"], data_parallel_group: "ProcessGroup" = None
+) -> Optional["ProcessGroup"]:
+    """Gets the data parallel group of the given tensor if it is a DTensor."""
+    if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        current_group = tensor.device_mesh.get_group()
+        assert data_parallel_group is None or current_group == data_parallel_group
+        return current_group
+    return None
+
+
+def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
+    """Ensure grad_output is stored in a contiguous buffer."""
     # Doing gather + slicing during the NeMo forward pass can make this tensor
     # not be contiguous. PyTorch only checks if the tensor is contiguous, and only
     # clones it if it's not contiguous:
     # https://github.com/pytorch/pytorch/blob/c47cf9bc7f9e02f649ab4ed53fe4d35732c92ab6/torch/_refs/__init__.py#L2761
     grad_output = grad_output.contiguous()
+    all_gathered_input = all_gathered_input.contiguous()
     # Convert the tensor shapes to 2D for execution compatibility
     if grad_output.dim() == 3:
         grad_output = grad_output.view(
@@ -374,10 +1086,23 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
     return grad_output, all_gathered_input
 
 
-def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
-    """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the AllGather and GEMM's.
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+except Exception:
+    dist_all_gather_func = torch.distributed._all_gather_base
 
-    Should only be used when pipeline model parallelism and gradient accumulation fusion are enabled.
+
+def drain_embedding_wgrad_compute(
+    config, embedding_activation_buffer, grad_output_buffer, weight, tp_group
+):
+    """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the
+    AllGather and GEMM's.
+
+    Should only be used when pipeline model parallelism and gradient accumulation
+    fusion are enabled.
     """
 
     assert len(embedding_activation_buffer) == len(
@@ -386,23 +1111,17 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
 
     import fused_weight_gradient_mlp_cuda
 
-    from megatron.core.parallel_state import (
-        get_global_memory_buffer,
-        get_tensor_model_parallel_group,
-        get_tensor_model_parallel_world_size,
-    )
+    from megatron.core.parallel_state import get_global_memory_buffer
 
     input = embedding_activation_buffer.pop(0)
-    world_size = get_tensor_model_parallel_world_size()
+    world_size = tp_group.size()
     dim_size = list(input.size())
     dim_size[0] = dim_size[0] * world_size
 
     all_gathered_input = [None, None]
     if config.sequence_parallel:
         all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
-        handle = torch.distributed._all_gather_base(
-            all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
-        )
+        handle = dist_all_gather_func(all_gather_buffer, input, group=tp_group, async_op=False)
 
         all_gathered_input[0] = all_gather_buffer
         all_gather_buffer = None
@@ -412,10 +1131,12 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
     input = None
 
     def wgrad_compute(all_gathered_input, grad_output, weight):
-
         grad_output, all_gathered_input = prepare_input_tensors_for_wgrad_compute(
             grad_output, all_gathered_input
         )
+
+        if hasattr(weight, "__fsdp_param__"):
+            weight.main_grad = weight.get_main_grad()
 
         if config.gradient_accumulation_fusion:
             if weight.main_grad.dtype == torch.float32:
@@ -438,9 +1159,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         if config.sequence_parallel:
             name = "mpu_" + str((i + 1) % 2)
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
-            handle = torch.distributed._all_gather_base(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
-            )
+            handle = dist_all_gather_func(all_gather_buffer, input, group=tp_group, async_op=True)
 
             all_gathered_input[(i + 1) % 2] = all_gather_buffer
             all_gather_buffer = None
@@ -461,28 +1180,28 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
 
 
 def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
+    """Multi tensor op applier"""
     return op(2048 * 32, noop_flag_buffer, tensor_lists, *args)
 
 
-## computes l2 norm for a list of contiguous tensors
-## works as a drop-in replacement for amp_C.multi_tensor_l2norm
+# computes l2 norm for a list of contiguous tensors
+# works as a drop-in replacement for amp_C.multi_tensor_l2norm
 def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, *args):
+    """
+    Computes l2 norm for a list of contiguous tensors
+    works as a drop-in replacement for amp_C.multi_tensor_l2norm
+    """
     l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
     l2_reduced = torch.norm(torch.tensor(l2))
-    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device='cuda')
+    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device="cuda")
     return l2_cuda, None
 
 
-## works as a drop-in replacement for amp_C.multi_tensor_scale
+# works as a drop-in replacement for amp_C.multi_tensor_scale
 def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
-    inputs, targets = tensor_lists[0], tensor_lists[1]
-    if inputs == targets:
-        for i in range(len(targets)):
-            ## for parity with apex implementation
-            targets[i] *= scale
-    else:
-        for i in range(len(targets)):
-            targets[i] = inputs[i] * scale
+    """Works as a drop-in replacement for amp_C.multi_tensor_scale."""
+    for src, dst in zip(tensor_lists[0], tensor_lists[1]):
+        dst.copy_(src * scale)
 
 
 class _ValueWithRank:
@@ -704,7 +1423,7 @@ class StragglerDetector:
             amp (float, optional): Set to 3.0 if we only use timers in fwd pass.
                                    Defaults to 3.0.
             port (int, optional): Control port, useful only for rank-0. Defaults to 65535.
-            prefill (int, optional): Howmany Events to pre-populate. Defaults to 1024.
+            prefill (int, optional): How many Events to pre-populate. Defaults to 1024.
             enabled (bool, optional): Whether or not collection is enabled on startup.
                                       Defaults to False.
         """
@@ -908,13 +1627,7 @@ class StragglerDetector:
             et_flops = apir_flops / self.amp  # Estimated TFLOPs, not tracing backward
 
             o_dt = self._min_max(
-                ptime,
-                btime,
-                float(temp),
-                float(power),
-                float(util),
-                float(clock),
-                et_flops,
+                ptime, btime, float(temp), float(power), float(util), float(clock), et_flops
             )
             if self.rank == 0 and o_dt is not None and o_dt.aflops is not None:
                 now = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
@@ -945,7 +1658,7 @@ class StragglerDetector:
                     line = f"^^^^ Top    {self.mmcnt} Ranks with highest Etpt(TF):"
                     shift = self.world - self.mmcnt
                     for i in range(self.mmcnt):
-                        line += f" {o_dt.aflops[i+shift]},"
+                        line += f" {o_dt.aflops[i + shift]},"
                     logger.info(line)
                 ret = True
 
@@ -961,7 +1674,7 @@ class StragglerDetector:
         indirectly from report() is the only way to activate the change that is made
         via rank-0
         """
-        # If no change just commnunicate the current
+        # If no change just communicate the current
         off = self._off
         if self.rank == 0 and self.toggle:
             off = not self._off
@@ -991,12 +1704,12 @@ class StragglerDetector:
         collection state. The actual toggling happens at the end of
         calling report() when _check_toggle() is called.
         """
-        resp = f"HTTP/1.0 200 OK\r\nConnection: Close\r\nContent-length: "
+        resp = r"HTTP/1.0 200 OK\r\nConnection: Close\r\nContent-length: "
 
         if self.rank == 0:
             state = "OFF" if self._off else "ON"
             logger.info(
-                f"Controller ready to recv " f"commands on port {self.port}. Current state {state}"
+                f"Controller ready to recv commands on port {self.port}. Current state {state}"
             )
             while True and self.sock is not None:
                 try:
@@ -1167,7 +1880,7 @@ class StragglerDetector:
 
     @property
     def configured(self) -> bool:
-        """Can be called to check if the the instance is already configured
+        """Can be called to check if the instance is already configured
 
         Returns:
             bool: returns True if configure was called and was a success, else False
@@ -1247,3 +1960,466 @@ class StragglerDetector:
 __straggler__ = StragglerDetector()
 """StragglerDetector: private module variable, not be directly accessed
 """
+
+
+def is_submodule(module, parent_module, strict=True):
+    """
+    Check if a module is a submodule of another module.
+    """
+    if strict:
+        if module is parent_module:
+            return False
+    for m in parent_module.modules():
+        if m is module:
+            return True
+    return False
+
+
+########################
+### context parallel ###
+########################
+
+
+def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
+    """Slice batch input along sequence dimension into multiple chunks,
+    which are parallelized across GPUs in a context parallel group.
+    """
+
+    # With causal masking, each token only attends to its prior tokens. Simply split
+    # sequence into CP chunks can result in severe load imbalance. That's to say, chunks
+    # at the end of sequence have bigger workload than others. To address this issue,
+    # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
+    # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
+    # that we can get balanced workload among GPUs in a context parallel group.
+    cp_size = parallel_state.get_context_parallel_world_size()
+    if cp_size > 1:
+        cp_rank = parallel_state.get_context_parallel_rank()
+        for key, val in batch.items():
+            if val is not None:
+                seq_dim = 1 if key != "attention_mask" else 2
+                val = val.view(
+                    *val.shape[0:seq_dim],
+                    2 * cp_size,
+                    val.shape[seq_dim] // (2 * cp_size),
+                    *val.shape[(seq_dim + 1) :],
+                )
+                index = torch.zeros(2, dtype=torch.int64, device=val.device)
+                index[0].fill_(cp_rank)
+                index[1].fill_(2 * cp_size - cp_rank - 1)
+                val = val.index_select(seq_dim, index)
+                val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+                batch[key] = val
+
+    return batch
+
+
+######################
+### NVTX profiling ###
+######################
+
+_nvtx_enabled: bool = False  # Whether NVTX range profiling is enabled
+_nvtx_range_messages: list[str] = []  # Messages associated with active NVTX ranges
+
+
+def configure_nvtx_profiling(enabled: bool) -> None:
+    """Configure NVTX range profiling to be enabled or disabled.
+
+    Args:
+        enabled (bool): Whether to enable NVTX range profiling
+    """
+    global _nvtx_enabled
+    _nvtx_enabled = enabled
+
+
+def _nvtx_range_get_func_path():
+    """Get the path of a function. Assumes being called from nvtx_range_push/pop.
+
+    Returns:
+        str: Module path and function name joined by a dot
+    """
+    # Get the caller's caller frame (go back 2 frames)
+    frame = inspect.currentframe().f_back.f_back
+    caller_func = inspect.getframeinfo(frame).function
+    module = inspect.getmodule(frame)
+
+    return f"{module.__name__}.{caller_func}"
+
+
+def nvtx_range_push(msg=None, suffix=None) -> None:
+    """Push NVTX range onto stack. If msg is not provided, use the calling function's path.
+
+    Args:
+        msg (str, optional): Message to associate with range
+        suffix (str, optional): Suffix to append to the message
+    """
+    if not _nvtx_enabled:
+        return
+
+    if msg is None:
+        msg = _nvtx_range_get_func_path()
+    if suffix is not None:
+        msg = f"{msg}.{suffix}"
+
+    # Track messages to ensure consistency when popping
+    _nvtx_range_messages.append(msg)
+
+    # Push NVTX range
+    torch.cuda.nvtx.range_push(msg)
+
+
+def nvtx_range_pop(msg=None, suffix=None) -> None:
+    """Pop NVTX range from stack. If msg is not provided, use the calling function's path.
+
+    Args:
+        msg (str, optional): Message to associate with range
+        suffix (str, optional): Suffix to append to the message
+    """
+    if not _nvtx_enabled:
+        return
+
+    if msg is None:
+        msg = _nvtx_range_get_func_path()
+    if suffix is not None:
+        msg = f"{msg}.{suffix}"
+
+    # Update list of NVTX range messages and check for consistency
+    if not _nvtx_range_messages:
+        raise RuntimeError("Attempted to pop NVTX range from empty stack")
+    last_msg = _nvtx_range_messages.pop()
+    if msg is not None and msg != last_msg:
+        raise ValueError(
+            f"Attempted to pop NVTX range from stack with msg={msg}, "
+            f"but last range has msg={last_msg}"
+        )
+
+    # Pop NVTX range
+    torch.cuda.nvtx.range_pop()
+
+
+@lru_cache(maxsize=None)
+def _nvtx_decorator_get_func_path(func):
+    """Get the path of a function.
+
+    Args:
+        func (Callable): Function to get path for.
+
+    Returns:
+        str: Module path and function name joined by a dot
+    """
+    caller_func = func.__name__
+    module = inspect.getmodule(func)
+
+    return f"{module.__name__}.{caller_func}"
+
+
+def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
+    """Decorator to add NVTX range to a function.
+
+    Args:
+        message (str, optional): Custom message for the NVTX range. If None, uses function path
+        color (str, optional): Color for the NVTX range. Defaults to None
+
+    Returns:
+        Callable: Decorated function with NVTX profiling if enabled
+
+    Example:
+        @nvtx_decorator()
+        def my_function():
+            pass
+
+        @nvtx_decorator(message="Custom Range", color="blue")
+        def another_function():
+            pass
+    """
+
+    def decorator(func: Callable) -> Callable:
+        if _nvtx_enabled:
+            return nvtx.annotate(
+                message=message or _nvtx_decorator_get_func_path(func), color=color
+            )(func)
+        return func
+
+    return decorator
+
+
+def unwrap_model(model, module_instances=None):
+    """Unwrap_model to return the final model instance"""
+    if module_instances is None:
+        from megatron.core.distributed import DistributedDataParallel as DDP
+        from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+            FullyShardedDataParallel as megatron_FSDP,
+        )
+        from megatron.core.transformer.module import Float16Module
+
+        module_instances = (DDP, torch_FSDP, megatron_FSDP, Float16Module)
+
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+    unwrapped_model = []
+    for model_module in model:
+        while isinstance(model_module, module_instances):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model
+
+
+def maybe_cat(a, b, dim=0, *, required=False):
+    """Concatenates `a` and `b` along `dim` if `a` and `b` exist."""
+    xs = [t for t in (a, b) if t is not None]
+    if not xs:
+        if required:
+            raise ValueError("both tensors are None")
+        return None
+    return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
+
+
+_ASYNC_IO_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
+    """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
+    global _ASYNC_IO_LOOP
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            if _ASYNC_IO_LOOP is not None:
+                return _ASYNC_IO_LOOP
+            else:
+                _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+    return loop
+
+
+_ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
+
+
+def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = False):
+    """Decorator to be applied to every coroutine that runs in a separate task.
+
+    This is needed because asyncio tasks do not propagate exceptions.
+    Coroutines running inside separate tasks will fail silently if not decorated.
+
+    Passing in `verbose=True` will print additional lifetime logging information about the task.
+    Such functionality is relied on by some users, and can be enabled as shown below:
+    ```
+        @trace_async_exceptions(verbose=True)
+        async def my_coroutine(...):
+            ...
+    ```
+    """
+
+    def _log_verbose(name: str, start: float) -> None:
+        elapsed = (time.perf_counter() - start) * 1000.0
+        cnt, tot = _ASYNC_TASK_STATS[name]
+        _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
+        avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
+
+        log10 = numpy.log10(max(cnt, 1))
+        if numpy.isclose(log10, round(log10)):
+            logger.info(
+                f"{name} completed in {elapsed:.3f} ms, "
+                f"lifetime avg: {avg:.3f} ms, "
+                f"lifetime cnt: {cnt + 1}"
+            )
+
+    def _decorate(fn: Callable):
+        if asyncio.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                if verbose:
+                    start = time.perf_counter()
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"Exception in async function {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
+
+        elif inspect.isasyncgenfunction(fn):
+
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                if verbose:
+                    start = time.perf_counter()
+                agen = fn(*args, **kwargs)
+                try:
+                    async for item in agen:
+                        yield item
+                except Exception as e:
+                    logger.error(f"Exception in async generator {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
+
+        else:
+            raise TypeError("trace_async_exceptions must be used on async functions or generators")
+        return wrapper
+
+    return _decorate if func is None else _decorate(func)
+
+
+def get_mamba_inference_state_config_from_model(model) -> Optional["MambaInferenceStateConfig"]:
+    """Returns Mamba inference state config from the model if it is a hybrid model."""
+    from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+        MambaInferenceStateConfig,
+    )
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+        return MambaInferenceStateConfig(
+            layer_type_list=layer_type_list,
+            mamba_conv_states_shape=mamba_conv_states_shape,
+            mamba_ssm_states_shape=mamba_ssm_states_shape,
+        )
+    return None
+
+
+# ============================================================================
+# Backward Compatibility Decorators
+# ============================================================================
+
+
+def deprecated(
+    version: str,
+    removal_version: Optional[str] = None,
+    alternative: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Callable:
+    """
+    Mark a function as deprecated.
+
+    This decorator:
+    1. Adds deprecation metadata to the function
+    2. Issues a DeprecationWarning when the function is called
+    3. Allows the compatibility checker to track deprecation lifecycle
+
+    Args:
+        version: Version where deprecation starts (e.g., "1.0.0")
+        removal_version: Version where function will be removed (e.g., "2.0.0")
+        alternative: Name of the recommended replacement function
+        reason: Optional explanation for the deprecation
+
+    Returns:
+        Decorator function
+
+    Example:
+        @deprecated(
+            version="1.0.0",
+            removal_version="2.0.0",
+            alternative="new_train_model",
+            reason="Improved performance and cleaner API"
+        )
+        def old_train_model(config):
+            pass
+    """
+
+    def decorator(func: Callable) -> Callable:
+        # Add metadata
+        func._deprecated = True
+        func._deprecated_version = version
+        func._removal_version = removal_version
+        func._alternative = alternative
+        func._deprecation_reason = reason
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Build warning message
+            msg_parts = [f"{func.__name__} is deprecated since version {version}."]
+
+            if alternative:
+                msg_parts.append(f"Use {alternative} instead.")
+
+            if removal_version:
+                msg_parts.append(f"Will be removed in version {removal_version}.")
+
+            if reason:
+                msg_parts.append(f"Reason: {reason}")
+
+            warnings.warn(" ".join(msg_parts), DeprecationWarning, stacklevel=2)
+
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def internal_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as internal API (not for external use).
+
+    Use this decorator for:
+    - Internal APIs not intended for public consumption
+    - Experimental features that may change without notice
+    - Implementation details that are not part of the stable API
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks.
+
+    Args:
+        func: The function or class to mark as internal
+
+    Returns:
+        The original function/class with an internal API marker
+
+    Example:
+        @internal_api
+        def _internal_helper():
+            '''For internal use only'''
+            pass
+
+        @internal_api
+        class ExperimentalFeature:
+            '''This API may change without notice'''
+            pass
+    """
+    func._internal_api = True
+    return func
+
+
+def experimental_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as experimental API.
+
+    Use this decorator for:
+    - Experimental features that may change without notice
+    - New APIs under active development
+    - Features that are not yet stable
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks, allowing rapid iteration during development.
+
+    Args:
+        func: The function or class to mark as experimental
+
+    Returns:
+        The original function/class with an experimental API marker
+
+    Example:
+        @experimental_api
+        def new_experimental_feature():
+            '''This API is experimental and may change'''
+            pass
+
+        @experimental_api
+        class ExperimentalModel:
+            '''This model is under active development'''
+            pass
+    """
+    func._experimental_api = True
+    return func

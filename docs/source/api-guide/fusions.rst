@@ -58,7 +58,7 @@ fusions.fused\_cross\_entropy\_loss module
 
 This module uses PyTorch JIT to fuse the cross entropy loss calculation and batches communication calls.
 
-.. automodule:: core.fusions.fused_softmax
+.. automodule:: core.fusions.fused_cross_entropy
    :members:
    :undoc-members:
    :show-inheritance:

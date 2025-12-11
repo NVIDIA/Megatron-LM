@@ -1,0 +1,15 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  SKIP_PYTEST: 1
+MODEL_ARGS:
+  trainer.num_nodes: 1
+  trainer.devices: 8
+  trainer.max_steps: 50
+  trainer.val_check_interval: 50
+  trainer.limit_val_batches: 50
+  trainer.strategy.tensor_model_parallel_size: 1
+  trainer.strategy.pipeline_model_parallel_size: 1
+  data.micro_batch_size: 4
+  data.global_batch_size: 64
+  data.seq_length: 512
+TEST_TYPE: regular

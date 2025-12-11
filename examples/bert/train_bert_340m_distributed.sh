@@ -30,6 +30,7 @@ BERT_MODEL_ARGS=(
     --num-attention-heads 16 
     --seq-length 512 
     --max-position-embeddings 512 
+    --attention-backend auto # Can use (flash/fused/unfused/local)
 )
 
 TRAINING_ARGS=(
@@ -75,3 +76,4 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]}
+    

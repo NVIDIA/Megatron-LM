@@ -31,5 +31,5 @@ def get_neighbor_dir(project_dir: str, key: str, dataset: MegatronDataset) -> st
         Path to directory containing this dataset's neighbors within Retro project.
     """
     return os.path.join(
-        get_query_dir(project_dir), os.path.basename(f"{key}_{dataset.unique_description_hash}"),
+        get_query_dir(project_dir), os.path.basename(f"{key}_{dataset.unique_description_hash}")
     )

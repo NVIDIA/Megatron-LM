@@ -1,0 +1,13 @@
+diff --git a/setup.py b/setup.py
+index 63ce332..4e13462 100644
+--- a/setup.py
++++ b/setup.py
+@@ -37,7 +37,7 @@ if __name__ == '__main__':
+                  '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
+     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
+     sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
+-    include_dirs = ['csrc/']
++    include_dirs = ['csrc/', '/usr/local/cuda/include/cccl/']
+     library_dirs = []
+     nvcc_dlink = []
+     extra_link_args = []

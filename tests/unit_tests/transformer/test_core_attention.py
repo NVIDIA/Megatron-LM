@@ -2,10 +2,10 @@
 
 
 import pytest
-
 import torch
 
 from megatron.core.transformer.attention import CrossAttention
+
 """ 
 
 @pytest.fixture

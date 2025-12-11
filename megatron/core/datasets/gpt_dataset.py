@@ -12,27 +12,25 @@ import torch
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
-from megatron.core.datasets.utils_s3 import S3Config, is_s3_path
+from megatron.core.tokenizers import MegatronTokenizerBase
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
-
-_PAD_TOKEN_ID = -1
 
 
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets"""
 
-    reset_position_ids: bool = None
+    reset_position_ids: Optional[bool] = None
     """Option to reset the position IDs in the dataset at an interval"""
 
-    reset_attention_mask: bool = None
+    reset_attention_mask: Optional[bool] = None
     """Option to reset the attention mask from the dataset"""
 
-    eod_mask_loss: bool = None
+    eod_mask_loss: Optional[bool] = None
     """Option to enable the EOD mask loss"""
 
     create_attention_mask: bool = True
@@ -48,8 +46,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        output tokens are both of the desired sequence length
     """
 
-    s3_cache_path: str = None
-    """Path for caching indices for s3 dataloading."""
+    object_storage_cache_path: Optional[str] = None
+    """Path for caching indices for s3 or msc dataloading."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -72,7 +70,8 @@ class GPTDataset(MegatronDataset):
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When
+            None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
@@ -103,16 +102,9 @@ class GPTDataset(MegatronDataset):
         self.cached_loss_mask = None
         self.cached_position_ids = None
 
-        try:
-            self._pad_token_id = self.config.tokenizer.pad
-        except Exception:
-            self._pad_token_id = _PAD_TOKEN_ID
-
-        (
-            self.document_index,
-            self.sample_index,
-            self.shuffle_index,
-        ) = self._build_document_sample_shuffle_indices()
+        (self.document_index, self.sample_index, self.shuffle_index) = (
+            self._build_document_sample_shuffle_indices()
+        )
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
@@ -141,12 +133,15 @@ class GPTDataset(MegatronDataset):
         Returns:
             IndexedDataset: The underlying IndexedDataset
         """
-        if is_s3_path(dataset_path):
+        if is_object_storage_path(dataset_path):
+            assert config.object_storage_cache_path is not None
             return IndexedDataset(
                 dataset_path,
                 multimodal=False,
                 mmap=config.mmap_bin_files,
-                s3_config=S3Config(path_to_idx_cache=config.s3_cache_path),
+                object_storage_config=ObjectStorageConfig(
+                    path_to_idx_cache=config.object_storage_cache_path
+                ),
             )
         return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
 
@@ -201,7 +196,7 @@ class GPTDataset(MegatronDataset):
                 self.masks_and_position_ids_are_cached = True
         else:
             attention_mask = self.cached_attention_mask
-            loss_mask = self.cached_loss_mask
+            loss_mask = self.cached_loss_mask.clone()
             position_ids = self.cached_position_ids
 
         # For padded sequences, mask the loss
@@ -320,7 +315,8 @@ class GPTDataset(MegatronDataset):
             -- A random permutation of index range of the sample index
 
         Returns:
-            Tuple[numpy.ndarray, numpy.ndarray]: The document index, the sample index, and the shuffle index
+            Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: The document index, the sample
+            index, and the shuffle index
         """
         path_to_cache = self.config.path_to_cache
         if path_to_cache is None and not self.config.mock:
@@ -329,10 +325,8 @@ class GPTDataset(MegatronDataset):
             )
 
         if path_to_cache:
-            get_path_to = lambda suffix: os.path.join(
-                path_to_cache,
-                f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}-{suffix}",
-            )
+            base = f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}"
+            get_path_to = lambda affix: os.path.join(path_to_cache, f"{base}-{affix}")
             path_to_description = get_path_to("description.txt")
             path_to_document_index = get_path_to("document_index.npy")
             path_to_sample_index = get_path_to("sample_index.npy")
@@ -355,13 +349,11 @@ class GPTDataset(MegatronDataset):
             not cache_hit
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
         ):
-
             log_single_rank(
                 logger,
                 logging.INFO,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
-            self.built_anew_on_cache_miss = True
             t_beg = time.time()
 
             sequence_length = self.config.sequence_length
@@ -414,10 +406,6 @@ class GPTDataset(MegatronDataset):
                 self.indices, num_epochs, numpy_random_state, separate_final_epoch
             )
 
-            drop_last_partial_sequence = True
-            if self.index_split == Split.valid:
-                drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
-
             # Build the sample index
             from megatron.core.datasets import helpers
 
@@ -429,11 +417,13 @@ class GPTDataset(MegatronDataset):
             assert document_index.dtype == numpy.int32
             assert self.dataset.sequence_lengths.dtype == numpy.int32
             if len(document_index) * 2 > len(self.dataset.sequence_lengths):
-                # Heuristic: if "access density" of sequence_lengths is relatively high,
-                # force loading the mmap-ed array into memory by taking a copy.
+                # If "access density" of sequence_lengths is high, force load the mmap-ed array
+                # into memory by making a copy.
+                #
                 # System performance benefits come from two aspects:
-                # 1. **sequentially** pre-loading the whole file if we're gonna read a large fraction anyways.
-                # 2. GIL is held when calling into c++ code; making the c++ func faster improves parallelism.
+                #   1. We sequentially pre-load the whole file, most of which we expect to read
+                #   2. The GIL is held when entering the c++ program, improving the speed of which
+                #      improves parallelism
                 sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
             else:
                 sequence_lengths_for_cpp = self.dataset.sequence_lengths
@@ -469,7 +459,7 @@ class GPTDataset(MegatronDataset):
                 log_single_rank(
                     logger,
                     logging.WARNING,
-                    f"Unable to save the {type(self).__name__} indexes because path_to_cache is None",
+                    f"Unable to save {type(self).__name__} indexes because path_to_cache is None",
                 )
 
             t_end = time.time()
@@ -492,7 +482,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the document index from {os.path.basename(path_to_document_index)}",
         )
         t_beg = time.time()
-        document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode='r')
+        document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -502,7 +492,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}",
         )
         t_beg = time.time()
-        sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode='r')
+        sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -512,7 +502,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the shuffle index from {os.path.basename(path_to_shuffle_index)}",
         )
         t_beg = time.time()
-        shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode='r')
+        shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -573,6 +563,7 @@ def _build_document_index(
     Returns:
         numpy.ndarray: The document index
     """
+
     if not separate_final_epoch or num_epochs == 1:
         document_index = numpy.mgrid[0:num_epochs, 0 : len(documents)][1]
         document_index[:] = documents
@@ -594,13 +585,15 @@ def _build_shuffle_index(
     Args:
         num_samples (int): The size of the first shuffle range [0, num_samples)
 
-        total_size (int): The size of the entire index. If larger than 'num_samples', it defines the second shuffle range [num_samples, total_size)
+        total_size (int): The size of the entire index. If larger than 'num_samples', it defines
+            the second shuffle range [num_samples, total_size)
 
         numpy_random_state (numpy.random.RandomState): The NumPy random state
 
     Returns:
         numpy.ndarray: The shuffle index
     """
+
     dtype_ = numpy.uint32
     if total_size >= (numpy.iinfo(numpy.uint32).max - 1):
         dtype_ = numpy.int64
@@ -637,7 +630,8 @@ def _get_ltor_masks_and_position_ids(
 
         eod_mask_loss (bool): Switch to enable the EOD mask loss
 
-        create_attention_mask (bool): Switch to enable the attention masks generation. Can be disabled if attention kernel generates masks by itself.
+        create_attention_mask (bool): Switch to enable the attention masks generation. Can be
+            disabled if attention kernel generates masks by itself.
 
     Returns:
         torch.Tensor: Attention mask needed to be used for Attention
@@ -693,12 +687,26 @@ def _get_ltor_masks_and_position_ids(
 
 
 class MockGPTLowLevelDataset:
+    """The mock GPT low level dataset
+
+    This class is meant to generate tokenized data in the classic "Megatron-LM" GPT style. Notably,
+    we add the end of document token to each element indexed in __getitem__
+
+    Args:
+        tokenizer (MegatronTokenizerBase): The tokenizer the special token information of which
+        we use to augment the mock data.
+    """
 
     seed: int = 0
-    size: int = 100000
-    max_sequence_length: int = 4096
+    """The hard-coded random seed to use to set the NumPy RNG"""
 
-    def __init__(self, tokenizer: MegatronTokenizer) -> None:
+    size: int = 100000
+    """The hard-coded number of samples to generate"""
+
+    max_sequence_length: int = 4096
+    """The hard-coded max sequence length to generate"""
+
+    def __init__(self, tokenizer: MegatronTokenizerBase) -> None:
         self.tokenizer = tokenizer
         rng = numpy.random.default_rng(seed=self.seed)
         self.sequence_lengths = rng.integers(
@@ -716,6 +724,18 @@ class MockGPTLowLevelDataset:
         return sample
 
     def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
+        """This function is n abstraction over __getitem__ with support for slicing
+
+        Args:
+            idx (int): The index into the dataset
+
+            offset (int): The integer token offset in the sequence
+
+            length (Optional[int]): The number of tokens to grab from the sequence
+
+        Returns:
+            numpy.ndarray: The sequence tokens at the index
+        """
         if length is None:
             length = self.sequence_lengths[idx] - offset
         return self[idx][offset : offset + length]
@@ -725,7 +745,8 @@ class MockGPTDataset(GPTDataset):
     """The mock GPT dataset
 
     Args:
-        indexed_dataset (MockGPTLowLevelDataset): The MockGPTLowLevelDataset around which to build the MockGPTDataset
+        indexed_dataset (MockGPTLowLevelDataset): The MockGPTLowLevelDataset around which to build
+            the MockGPTDataset
 
         dataset_path (Optional[str]): This argument is of no consequence for the MockGPTDataset
 
@@ -749,7 +770,14 @@ class MockGPTDataset(GPTDataset):
     ) -> None:
         assert config.mock
 
-        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+        super().__init__(
+            dataset,  # type: ignore[arg-type]
+            dataset_path,
+            indices,
+            num_samples,
+            index_split,
+            config,
+        )
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: MockGPTLowLevelDataset) -> int:
@@ -764,13 +792,14 @@ class MockGPTDataset(GPTDataset):
         return len(low_level_dataset)
 
     @staticmethod
-    def build_low_level_dataset(
+    def build_low_level_dataset(  # type: ignore[override]
         dataset_path: Optional[str], config: GPTDatasetConfig
     ) -> MockGPTLowLevelDataset:
         """Abstract method implementation
 
         Args:
-            dataset_path (Optional[str]): This argument is of no consequence for the MockGPTLowLevelDataset
+            dataset_path (Optional[str]): This argument is of no consequence for the
+                MockGPTLowLevelDataset
 
             config (GPTDatasetConfig): The config
 

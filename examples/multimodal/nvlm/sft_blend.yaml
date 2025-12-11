@@ -1,0 +1,23 @@
+__module__: megatron.energon
+__class__: Metadataset
+splits:
+  train:
+    datasets:
+      - weight: 0.01  # # Datasets are weighted according to their size. Weights sum up to 1.
+        path: <path to coco>
+        subflavors:
+          augmentation: False
+
+      - weight: 0.02
+        path: <path to clevr-math dataset>
+        subflavors:
+          augmentation: False
+
+      # Please refer to Table 6 in https://arxiv.org/pdf/2409.11402 for full list of SFT datasets.
+      # Please refer to https://nvidia.github.io/Megatron-Energon/data_prep.html on preparing datasets in the Megatron Energon format.
+  val:
+    datasets:
+      - weight: 1.
+        path: <path to validation dataset>
+        subflavors:
+          augmentation: False

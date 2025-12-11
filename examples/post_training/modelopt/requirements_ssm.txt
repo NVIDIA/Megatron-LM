@@ -1,0 +1,2 @@
+mamba-ssm>=2.2.5
+causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d

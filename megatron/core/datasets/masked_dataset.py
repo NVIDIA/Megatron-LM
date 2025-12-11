@@ -5,7 +5,7 @@ import os
 import time
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy
 import torch
@@ -33,7 +33,7 @@ class MaskedWordPieceDatasetConfig(BlendedMegatronDatasetConfig):
     """The maximum length N-gram to consider masking or permuting"""
 
     masking_do_full_word: bool = None
-    """Whether we mask the the whole word or its component parts"""
+    """Whether we mask the whole word or its component parts"""
 
     masking_do_permutation: bool = None
     """Whether we shuffle a subset of candidate N-grams in addition"""
@@ -84,13 +84,15 @@ class MaskedWordPieceDataset(MegatronDataset):
     first token/piece.
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
+        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the
+                                          MegatronDataset
 
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset.
+                                     When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
@@ -154,15 +156,7 @@ class MaskedWordPieceDataset(MegatronDataset):
         )
         path_to_description = get_path_to("description.txt")
         path_to_sample_index = get_path_to("sample_index.npy")
-        cache_hit = all(
-            map(
-                os.path.isfile,
-                [
-                    path_to_description,
-                    path_to_sample_index,
-                ],
-            )
-        )
+        cache_hit = all(map(os.path.isfile, [path_to_description, path_to_sample_index]))
 
         if self.num_samples is not None:
             num_epochs = numpy.iinfo(numpy.int32).max - 1
@@ -175,7 +169,6 @@ class MaskedWordPieceDataset(MegatronDataset):
                 logging.INFO,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
-            self.built_anew_on_cache_miss = True
 
             os.makedirs(path_to_cache, exist_ok=True)
 
@@ -282,7 +275,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         ngram_nvals = numpy.arange(self.config.masking_max_ngram, dtype=numpy.int64) + 1
 
-        # By default, the N-gram probabilites are inversely proportional to N
+        # By default, the N-gram probabilities are inversely proportional to N
         # e.g. N = 3
         #    -> P = array([0.54545455, 0.27272727, 0.18181818])
         nprobs = 1.0 / ngram_nvals
@@ -362,7 +355,6 @@ class MaskedWordPieceDataset(MegatronDataset):
         numpy_random_state.shuffle(candidate_ngrams)
 
         if self.config.masking_do_permutation:
-
             n_swappings = n_maskings
 
             permuted_indices = set()
@@ -424,7 +416,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         masked_spans = sorted(masked_spans, key=lambda x: x[0][0])
 
-        return masked_token_ids, masked_positions, masked_labels, boundaries, masked_spans
+        return (masked_token_ids, masked_positions, masked_labels, boundaries, masked_spans)
 
     @abstractmethod
     def _get_token_mask(self, numpy_random_state: numpy.random.RandomState) -> Optional[int]:

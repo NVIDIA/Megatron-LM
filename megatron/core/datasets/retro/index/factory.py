@@ -23,7 +23,7 @@ class IndexFactory:
         Returns:
             An `Index` sub-type corresponding to the `index_type`.
         """
-        return {"faiss-base": FaissBaseIndex, "faiss-par-add": FaissParallelAddIndex,}[index_type]
+        return {"faiss-base": FaissBaseIndex, "faiss-par-add": FaissParallelAddIndex}[index_type]
 
     @classmethod
     def get_index(cls, index_type: str) -> Index:

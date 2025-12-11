@@ -8,16 +8,16 @@ from typing import Callable, List, Optional, Tuple, Type
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.utils import get_all_true_mask
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import deprecate_inference_params
 
 
 class RetroEncoderCrossAttention(BaseRetroCrossAttention):
-
     """Retro encoder's cross attention operator.
 
     See this paper for more details: https://arxiv.org/abs/2112.04426.
@@ -36,8 +36,10 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
         hidden_states: Tensor,
         attention_mask: Tensor,
         key_value_states: Tensor = None,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
         # rotary_pos_emb: Tensor = None, # unsupported for retro.
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> List[Tuple[Tensor, Optional[Tensor], Tensor]]:
         """Cross attention for Retro encoder.
 
@@ -53,11 +55,13 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
             hidden_states (Tensor): Transformer layer hidden states.
             attention_mask (Tensor): Attention mask.
             key_value_states (Tensor): Neighbor embeddings.
-            inference_params (InferenceParams): Inference params.
+            inference_context (BaseInferenceContext): Inference context.
 
         Returns:
             List of tuples, where each tuple is (attention_output, attention_bias, residual).
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Input shape. [ r, bs*l*k, d ]
         ns, bs, d = hidden_states.shape
@@ -96,14 +100,13 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
             residual = chunked_output
 
             # Collect tensors.
-            attention_output_tuples.append((attention_output, attention_bias, residual,))
+            attention_output_tuples.append((attention_output, attention_bias, residual))
 
         # Output. (List[Tuple[( [ r, bs*l, d ], [ d ] )]])
         return attention_output_tuples
 
 
 class RetroEncoderBiasDropoutAdd(MegatronModule):
-
     """Retro encoder's bias-dropout-add operator.
 
     This operator applies bias-dropout-add individually on each neighboring
@@ -113,9 +116,7 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
         config (RetroConfig): Retro config.
     """
 
-    def __init__(
-        self, config: RetroConfig,
-    ):
+    def __init__(self, config: RetroConfig):
         super().__init__(config=config)
         self.retro_num_neighbors = config.retro_num_neighbors
 
@@ -186,7 +187,6 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
 
 
 class RetroEncoderLayerNorm(MegatronModule):
-
     """Retro encoder's layernorm operator.
 
     This operator applies layernorm individually on each neighboring chunk that
@@ -198,9 +198,7 @@ class RetroEncoderLayerNorm(MegatronModule):
         submodules (Type): Layer norm class. (Named 'submodules' to fit external interface.)
     """
 
-    def __init__(
-        self, config: RetroConfig, submodules: Type, **kwargs: dict,
-    ):
+    def __init__(self, config: RetroConfig, submodules: Type, **kwargs: dict):
         super().__init__(config=config)
         norm_class = submodules
         self.norm = norm_class(config=config, **kwargs)
@@ -211,7 +209,7 @@ class RetroEncoderLayerNorm(MegatronModule):
 
         Args:
             input (Tensor): Input chunks, concatenated into a single tensor.
-        
+
         Returns:
             Output of the layer norm.
         """

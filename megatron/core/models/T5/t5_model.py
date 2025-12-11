@@ -1,23 +1,27 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import logging
 from typing import List, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.enums import ModelType
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.relative_pos_embedding import RelativePositionEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.transformer.enums import AttnMaskType, ModelType
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.core.utils import deprecate_inference_params, get_tensor_model_parallel_group_if_none
 
 
 class T5LMHead(MegatronModule):
@@ -28,8 +32,8 @@ class T5LMHead(MegatronModule):
         parallel_output (bool): wether output logits being distributed or not.
         vocab_size (int): vocabulary size
         pre_process (bool): Include embedding layer
-        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
-            shared.
+        share_embeddings_and_output_weights (bool): When True, input
+            embeddings and output logit weights are shared.
     """
 
     def __init__(
@@ -39,6 +43,7 @@ class T5LMHead(MegatronModule):
         vocab_size: int,
         pre_process: bool = True,
         share_embeddings_and_output_weights: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(T5LMHead, self).__init__(config=config)
 
@@ -56,6 +61,7 @@ class T5LMHead(MegatronModule):
             skip_bias_add=not share_embeddings_and_output_weights,
             gather_output=not self.parallel_output,
             skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
+            tp_group=tp_group,
         )
 
     def forward(self, hidden_states: Tensor, word_embeddings_weight: Tensor) -> Tensor:
@@ -81,9 +87,11 @@ class T5Model(LanguageModule):
 
         encoder_config (TransformerConfig): encoder transformer config
 
-        transformer_encoder_layer_spec (ModuleSpec): transformer layer customization specs for encoder
+        transformer_encoder_layer_spec (ModuleSpec): transformer layer
+            customization specs for encoder
 
-        transformer_decoder_layer_spec (ModuleSpec): transformer layer customization specs for decoder
+        transformer_decoder_layer_spec (ModuleSpec): transformer layer
+            customization specs for decoder
 
         vocab_size (int): vocabulary size
 
@@ -95,25 +103,30 @@ class T5Model(LanguageModule):
 
         fp16_lm_cross_entropy (bool, optional): Defaults to False
 
-        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
+        parallel_output (bool): Do not gather the outputs,
+            keep them split across tensor parallel ranks
 
-        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
-            shared. Defaults to False.
+        share_embeddings_and_output_weights (bool): When True,
+            input embeddings and output logit weights are shared. Defaults to False.
 
-        position_embedding_type (string): Position embedding type. Options ['learned_absolute', 'rope'].
+        position_embedding_type (string): Position embedding type.
+            Options ['learned_absolute', 'rope'].
             Defaults is 'learned_absolute'.
 
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
 
-        seq_len_interpolation_factor (float): scale of linearly interpolating RoPE for longer sequences.
-            The value must be a float larger than 1.0. Defaults to None.
+        seq_len_interpolation_factor (float): scale of linearly interpolating
+            RoPE for longer sequences. The value must be a float larger than 1.0.
+            Defaults to None.
 
-        add_encoder (bool): Create the encoder (used with pipeline parallelism). When using pipelining,
-            the encoder will only be created on a subset of the pipeline ranks.
+        add_encoder (bool): Create the encoder (used with pipeline parallelism).
+            When using pipelining, the encoder will only be created on a subset
+            of the pipeline ranks.
 
-        add_decoder (bool): Include an output layer (used with pipeline parallelism). As with `add_encoder`, when
-            using this model and pipelining, the decoder will only be created on a subset of the pipeline ranks.
+        add_decoder (bool): Include an output layer (used with pipeline parallelism).
+            As with `add_encoder`, when using this model and pipelining,
+            the decoder will only be created on a subset of the pipeline ranks.
     """
 
     def __init__(
@@ -129,11 +142,16 @@ class T5Model(LanguageModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+        position_embedding_type: Literal[
+            'learned_absolute', 'rope', 'relative'
+        ] = 'learned_absolute',
         rotary_percent: float = 1.0,
         seq_len_interpolation_factor: Optional[float] = None,
+        relative_attention_num_buckets: int = 32,
+        relative_attention_max_distance: int = 128,
         add_encoder: bool = True,
         add_decoder: bool = True,
+        pg_collection: ProcessGroupCollection = None,
     ):
 
         super(T5Model, self).__init__(config=config)
@@ -153,13 +171,22 @@ class T5Model(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'pp']
+            )
+        self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
 
-        # Tells schedules.py that this model has a skip connection between the encoder's output and the decoder
+        self.model_type = ModelType.encoder_or_decoder
+
+        # Tells schedules.py that this model has a skip connection
+        # between the encoder's output and the decoder
         # (and hence both the encoder and decoder's tensors are required for correct backprop).
         self.xattn_needed = True
 
-        # specify the position embeddings as a member variable in the T5 class
-        # so that they are easy to find for `finalize_model_grads._allreduce_position_embedding_grads`
+        # specify the position embeddings as a member
+        # variable in the T5 class so that they are easy to
+        # find for `finalize_model_grads._allreduce_position_embedding_grads`
         self.position_embeddings = None
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
@@ -167,8 +194,12 @@ class T5Model(LanguageModule):
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=self.position_embedding_type,
+                tp_group=self.tp_group,
             )
-            self.position_embeddings = self.embedding.position_embeddings
+            if position_embedding_type == "learned_absolute":
+                self.position_embeddings = self.embedding.position_embeddings
+            else:
+                self.position_embeddings = None
 
         # Rotary Position Embeddings
         if self.position_embedding_type == 'rope':
@@ -178,6 +209,24 @@ class T5Model(LanguageModule):
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=pg_collection.cp,
+            )
+
+        # Relative Position Embeddings
+        if self.position_embedding_type == 'relative':
+            self.encoder_relative_pos_emb = RelativePositionEmbedding(
+                bidirectional=True,
+                init_method=self.config.init_method,
+                num_attention_heads=self.config.num_attention_heads,
+                relative_attention_num_buckets=relative_attention_num_buckets,
+                relative_attention_max_distance=relative_attention_max_distance,
+            )
+            self.decoder_relative_pos_emb = RelativePositionEmbedding(
+                bidirectional=False,
+                init_method=self.config.init_method,
+                num_attention_heads=self.config.num_attention_heads,
+                relative_attention_num_buckets=relative_attention_num_buckets,
+                relative_attention_max_distance=relative_attention_max_distance,
             )
 
         # Transformer encoder
@@ -191,6 +240,7 @@ class T5Model(LanguageModule):
                 spec=encoder_spec,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
+                pg_collection=pg_collection,
             )
         else:
             self.encoder = None
@@ -202,6 +252,7 @@ class T5Model(LanguageModule):
                 spec=decoder_spec,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
+                pg_collection=pg_collection,
             )
         else:
             self.decoder = None
@@ -214,6 +265,7 @@ class T5Model(LanguageModule):
                 self.vocab_size,
                 self.pre_process,
                 self.share_embeddings_and_output_weights,
+                tp_group=self.tp_group,
             )
             self.output_layer = self.lm_head.output_layer
 
@@ -230,7 +282,10 @@ class T5Model(LanguageModule):
         lm_labels: Tensor = None,
         encoder_hidden_states: Tensor = None,
         output_encoder_hidden_only: bool = False,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
         """Forward pass.
 
@@ -241,19 +296,13 @@ class T5Model(LanguageModule):
             decoder_attn_mask (Tensor): self-attention mask for decoder
             encoder_decoder_attn_mask (Tensor): cross-attention mask between encoder and decoder
             lm_labels (Tensor): labels for decoder output
-            inference_params (InferenceParams): relevant arguments for inferencing
+            inference_context (BaseInferenceContext): relevant arguments for inferencing
 
         Returns:
             Tensor: loss tensor
         """
 
-        (
-            encoder_attn_mask,
-            decoder_attn_mask,
-            encoder_decoder_attn_mask,
-        ) = t5_extended_attention_mask(
-            [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
-        )
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         ## Encoder forward
         if encoder_hidden_states is None:
@@ -274,17 +323,41 @@ class T5Model(LanguageModule):
             rotary_pos_emb = None
             if self.position_embedding_type == 'rope':
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_params, self.encoder, encoder_input, self.config
+                    inference_context, self.encoder, encoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+            # Relative positional embeddings
+            encoder_attention_bias_parallel = None
+            if self.position_embedding_type == 'relative':
+                query_seq_length = RelativePositionEmbedding.get_relative_seq_len(
+                    inference_context, self.encoder, encoder_input, self.config
+                )
+                key_seq_length = query_seq_length
+                attention_bias = self.encoder_relative_pos_emb(query_seq_length, key_seq_length)
+
+                # Scatter attention_bias to TP ranks
+                # First, reshape [1, num_head, seqlen_q, seqlen_kv] to
+                # [1, seqlen_q, seqlen_kv, num_head] to be scatter along
+                # the last (num_heads dimension)
+                attention_bias = torch.permute(attention_bias, (0, 2, 3, 1))
+                # Then, scatter to TP region
+                attention_bias_parallel = scatter_to_tensor_model_parallel_region(
+                    attention_bias, self.tp_group
+                )
+                # Lastly, revert the dimension back to [1, num_head, seqlen_q, seqlen_kv]
+                encoder_attention_bias_parallel = torch.permute(
+                    attention_bias_parallel, (0, 3, 1, 2)
+                )
 
             # Run encoder.
             if self.add_encoder:
                 encoder_hidden_states = self.encoder(
                     hidden_states=encoder_input,
                     attention_mask=encoder_attn_mask,
-                    inference_params=inference_params,
+                    inference_context=inference_context,
                     rotary_pos_emb=rotary_pos_emb,
+                    attention_bias=encoder_attention_bias_parallel,
                 )
             else:
                 encoder_hidden_states = self.encoder_hidden_state
@@ -309,9 +382,30 @@ class T5Model(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.decoder, decoder_input, self.config
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+        # Relative positional embeddings
+        decoder_attention_bias_parallel = None
+        if self.position_embedding_type == 'relative':
+            query_seq_length = RelativePositionEmbedding.get_relative_seq_len(
+                inference_context, self.decoder, decoder_input, self.config
+            )
+            key_seq_length = query_seq_length
+            attention_bias = self.decoder_relative_pos_emb(query_seq_length, key_seq_length)
+
+            # Scatter attention_bias to TP ranks
+            # First, reshape [1, num_head, seqlen_q, seqlen_kv] to
+            # [1, seqlen_q, seqlen_kv, num_head] to be scatter along
+            # the last (num_heads dimension)
+            attention_bias = torch.permute(attention_bias, (0, 2, 3, 1))
+            # Then, scatter to TP region
+            attention_bias_parallel = scatter_to_tensor_model_parallel_region(
+                attention_bias, self.tp_group
+            )
+            # Lastly, revert the dimension back to [1, num_head, seqlen_q, seqlen_kv]
+            decoder_attention_bias_parallel = torch.permute(attention_bias_parallel, (0, 3, 1, 2))
 
         # Run decoder.
         decoder_hidden_states = self.decoder(
@@ -319,14 +413,17 @@ class T5Model(LanguageModule):
             attention_mask=decoder_attn_mask,
             context=encoder_hidden_states,
             context_mask=encoder_decoder_attn_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            attention_bias=decoder_attention_bias_parallel,
         )
 
         if self.post_process:
-            lm_logits = self.lm_head(
-                decoder_hidden_states, self.shared_embedding_or_output_weight()
-            )
+            output_weight = None
+            if self.share_embeddings_and_output_weights:
+                output_weight = self.shared_embedding_or_output_weight()
+            lm_logits = self.lm_head(decoder_hidden_states, word_embeddings_weight=output_weight)
+
             if lm_labels is None:
                 # [s b h] => [b s h]
                 return lm_logits.transpose(0, 1).contiguous()
@@ -377,80 +474,42 @@ class T5Model(LanguageModule):
         return None
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
-        assert not sharded_offsets, "Unexpected sharded offsets"
-        sharded_state_dict = {}
+        """Sharded state dict implementation handling duplication of encoder and decoder layers.
 
-        if self.pre_process:
-            embedding_prefix = f'{prefix}embedding.'
-            embedding_sharded_state_dict = self.embedding.sharded_state_dict(
-                prefix=embedding_prefix, metadata=metadata
-            )
-            sharded_state_dict.update(embedding_sharded_state_dict)
+        Some layers (output, embedding) are shared between the encoder and decoder.
+        This method sets the replica_id for them to ensure there is only one
+        layer instance with replica_id (0, 0, 0).
 
-        encoder_prefix = f'{prefix}encoder.'
-        encoder_sharded_state_dict = self.encoder.sharded_state_dict(
-            prefix=encoder_prefix, metadata=metadata
-        )
-        sharded_state_dict.update(encoder_sharded_state_dict)
+        Args:
+            prefix (str): Module name prefix.
+            sharded_offsets (tuple): PP related offsets, expected to be empty at this module level.
+            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
 
-        decoder_prefix = f'{prefix}decoder.'
-        decoder_sharded_state_dict = self.decoder.sharded_state_dict(
-            prefix=decoder_prefix, metadata=metadata
-        )
-        sharded_state_dict.update(decoder_sharded_state_dict)
-
-        if self.post_process:
-            output_layer_prefix = f'{prefix}output_layer.'
-            output_layer_weight_key = f'{output_layer_prefix}weight'
-            output_layer_bias_key = f'{output_layer_prefix}bias'
-            if self.share_embeddings_and_output_weights:
-                if not self.pre_process:
-                    # when sharing embeddings with last stage, we need to use the weights from the first stage
-                    # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
-                    tensor = self.shared_embedding_or_output_weight()
-                    first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
-                    dp_rank = parallel_state.get_data_parallel_rank()
-                    dp_size = parallel_state.get_data_parallel_world_size()
-                    last_stage_word_emb_replica_id = (
-                        dp_rank + dp_size
-                    )  # copy of first stage embedding
-
-                    sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                        tensor=tensor,
-                        key=first_stage_word_emb_key,
-                        replica_id=last_stage_word_emb_replica_id,
-                        allow_shape_mismatch=True,
-                    )
-
-                    sharded_state_dict[output_layer_weight_key] = sharded_output_layer_tensor
-                # output_layer.weight is shared, but we still need to process output_layer.bias
-                sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=self.lm_head.output_layer.bias,
-                    key=output_layer_bias_key,
-                    allow_shape_mismatch=True,
-                )
-                sharded_state_dict[output_layer_bias_key] = sharded_output_layer_tensor
-            else:
-                output_layer_state_dict = self.output_layer.state_dict(
-                    prefix=output_layer_prefix, keep_vars=True
-                )
-                output_layer_tensor = output_layer_state_dict[output_layer_weight_key]
-                # independent output layer
-                sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=output_layer_tensor,
-                    key=output_layer_weight_key,
-                    replica_id=parallel_state.get_data_parallel_rank(),
-                    allow_shape_mismatch=True,
-                )
-
-                sharded_state_dict[output_layer_weight_key] = sharded_output_layer_tensor
-
-        return sharded_state_dict
+        Returns:
+            ShardedStateDict: sharded state dict for the T5Model
+        """
+        sharded_sd = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        return sharded_sd
 
 
 def t5_extended_attention_mask(attention_mask_list: List[Tensor]) -> List[Tensor]:
+    """Creates the extended attention mask
+
+    Converts the attention mask of dimension [batch size, seq_len, seq_len]
+    to [batch size, 1, seq_len, seq_len]
+
+    Args:
+        attention_mask (Tensor): The input attention mask
+
+    Returns:
+        Tensor: The extended binary attention mask
+    """
+
     def attn_mask_postprocess(attn_mask):
         # [b, 1, s, s]
         extended_attention_mask = attn_mask.unsqueeze(1)

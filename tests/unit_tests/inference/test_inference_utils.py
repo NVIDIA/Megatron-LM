@@ -1,5 +1,6 @@
 from megatron.core.inference.utils import Counter
 
+
 class TestInferenceUtils:
 
     def test_counter(self):
