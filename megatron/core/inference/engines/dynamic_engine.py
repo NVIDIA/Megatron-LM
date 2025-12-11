@@ -482,13 +482,12 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.barrier(mp_group)
 
         # initialize ep barrier 
-        self.ep_rank = parallel_state.get_expert_model_parallel_rank() 
-        self.ep_world_size = parallel_state.get_expert_model_parallel_world_size()
-        # todo: modify to use actual IP of ep-rank 0....
-        # todo: modify to find an empty port automatically... 
+        self.ep_rank = get_pg_rank(self.pg_collection.ep)  
+        self.ep_world_size = get_pg_size(self.pg_collection.ep)
+        
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(self.zmq_context,
-                                                                     process_group=parallel_state.get_expert_model_parallel_group())
+                                                                     process_group=self.pg_collection.ep)
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
@@ -1500,7 +1499,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # When all ranks receive the signal, global work will be zero, and we can process the signal safely.
             local_work = 0
 
-        if parallel_state.get_expert_model_parallel_world_size() > 1:
+        if self.ep_world_size > 1:
             max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
         else:
             max_global_work = local_work

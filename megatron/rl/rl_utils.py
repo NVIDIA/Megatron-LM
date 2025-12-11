@@ -2604,11 +2604,6 @@ def megatron_rl_inference_mode(
                 context.memory_buffer.data = kv_cache.data.cpu()
                 total_gb_offloaded += kv_cache_gb
                 if context.is_hybrid_model:
-                    print(
-                        f"[{dist.get_rank()}:DP] Offloading mamba conv states ({mamba_conv_gb:.2f} GB) and ssm states ({mamba_ssm_gb:.2f} GB) to CPU"
-                    )
-                    context.mamba_conv_states.data = context.mamba_conv_states.data.cpu()
-                    context.mamba_ssm_states.data = context.mamba_ssm_states.data.cpu()
                     mamba_conv_gb = (
                         context.mamba_conv_states.numel()
                         * context.mamba_conv_states.element_size()
@@ -2619,6 +2614,11 @@ def megatron_rl_inference_mode(
                         * context.mamba_ssm_states.element_size()
                         / 1024**3
                     )
+                    print(
+                        f"[{dist.get_rank()}:DP] Offloading mamba conv states ({mamba_conv_gb:.2f} GB) and ssm states ({mamba_ssm_gb:.2f} GB) to CPU"
+                    )
+                    context.mamba_conv_states.data = context.mamba_conv_states.data.cpu()
+                    context.mamba_ssm_states.data = context.mamba_ssm_states.data.cpu()
                     total_gb_offloaded += mamba_conv_gb + mamba_ssm_gb
                 # Print GPU memory after offload
                 gpu_mem_after = torch.cuda.memory_allocated() / 1024**3
