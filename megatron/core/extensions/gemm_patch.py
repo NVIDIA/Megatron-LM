@@ -23,9 +23,6 @@ _GLOBAL_IS_PATCHED_ = None
 orig_general_gemm = transformer_engine.pytorch.cpp_extensions.gemm.general_gemm
 orig_general_grouped_gemm = transformer_engine.pytorch.cpp_extensions.gemm.general_grouped_gemm
 
-CKSUM_TOLERANCE = 0.01
-EPSILON = 1e-5
-
 DTYPES = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}
 
 
@@ -54,8 +51,6 @@ def new_general_gemm(A, B, workspace, out=None, accumulate=False, bias=None, **k
     A wrapper for general_gemm that calls the original method twice
     and compares results for consistency.
     """
-    cksum = [0, 0]
-    # Run twice for comparison.
     for run_idx in range(2):
         is_first_iter = run_idx == 0
         need_output_copy = out is not None and (bias is out or accumulate)
@@ -73,33 +68,22 @@ def new_general_gemm(A, B, workspace, out=None, accumulate=False, bias=None, **k
             A, B, workspace, out=out_arg, accumulate=accumulate, bias=bias_arg, **kwargs
         )
         out_res = res[0]
-        cksum[run_idx] = out_res.sum(dtype=torch.float32).item()
         if is_first_iter:
             rerun_res = out_res
             continue
-
-    # Check the consistency of the first and second run and return.
-    same_cksum = math.fabs(cksum[1] - cksum[0]) / (math.fabs(cksum[1]) + EPSILON) <= CKSUM_TOLERANCE
-    if not same_cksum:
+    if not torch.equal(rerun_res.view(torch.uint8), out_res.view(torch.uint8)):
         logger.log(
             logging.ERROR,
-            f"RANK {get_rank_info()}: DIFFERENT CHECKSUM ON 2ND RUN for dtype "
-            f"{get_dtype(A)}. {cksum[1]} != {cksum[0]}, "
-            f"shapes A:{list(A.size())},B:{list(B.size())},out:{list(out_res.shape)}",
-        )
-    elif not torch.equal(rerun_res, out_res):
-        logger.log(
-            logging.ERROR,
-            f"RANK {get_rank_info()}: DIFFERENT BITWISE on 2ND RUN for dtype "
-            f"{get_dtype(A)}. "
-            f"shapes A:{list(A.size())},B:{list(B.size())},out:{list(out_res.shape)}",
+            f"RANK {get_rank_info()}: DIFFERENT BITWISE on 2ND RUN FOR OPERATION "
+            f"A:({get_dtype(A)},{list(A.size())}) x B:({get_dtype(B)},{list(B.size())}) "
+            f"-> OUT:({get_dtype(out_res)},{list(out_res.size())})",
         )
     del rerun_res
     return res
 
 
 def new_general_grouped_gemm(
-    A, B, out, out_dtype, workspaces, grad=False, accumulate=False, bias=None, **kwargs
+    A, B, out, out_dtype, *args, grad=False, accumulate=False, bias=None, **kwargs
 ):
     """
     A wrapper for general_grouped_gemm that calls the original method twice
@@ -123,7 +107,7 @@ def new_general_grouped_gemm(
             B,
             out_first_iter if is_first_iter else out,
             out_dtype,
-            workspaces,
+            *args,
             grad=grad if is_second_iter else False,
             accumulate=accumulate,
             bias=bias_first_iter if is_first_iter else bias,
@@ -136,13 +120,13 @@ def new_general_grouped_gemm(
 
     # Check comparison and return
     for tidx in range(len(output)):
-        if not torch.equal(output[tidx], saved_output[tidx]):
+        if not torch.equal(output[tidx].view(torch.uint8), saved_output[tidx].view(torch.uint8)):
             logging.log(
                 logging.ERROR,
-                f"RANK {get_rank_info()}: DIFFERENT GROUPED_GEMM RESULT ON 2ND RUN FOR OP "
-                f"GroupedGEMM group {tidx} = {get_dtype(A[tidx])}({list(A[tidx].size())}) "
-                f"x {get_dtype(B[tidx])}({list(B[tidx].size())}) -> "
-                f"{get_dtype(output[tidx])}({list(output[tidx].size())})",
+                f"RANK {get_rank_info()}: DIFFERENT GROUPED_GEMM RESULT ON 2ND RUN FOR "
+                f"GROUP {tidx}, A:({get_dtype(A[tidx])},{list(A[tidx].size())}) "
+                f"x B:({get_dtype(B[tidx])},{list(B[tidx].size())}) -> "
+                f"OUT: ({get_dtype(output[tidx])},{list(output[tidx].size())})",
             )
     return res
 
