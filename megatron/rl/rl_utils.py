@@ -1020,9 +1020,9 @@ def prepare_data_for_update(
                 if inference_logprobs is not None and args.rl_inference_logprobs_is_correction:
                     # Pack the inference logprobs using the helper function
                     packed_inference_logprobs = pack_inference_logprobs(
-                        inference_logprobs=inference_logprobs,
+                        inference_logprobs=packing_context.original_inference_logprobs,
                         packing_info=packing_context.packing_info,
-                        generation_masks=generation_masks,
+                        generation_masks=packing_context.original_generation_masks,
                         bin_size=args.seq_length,
                     )
 

@@ -43,6 +43,7 @@ class PackingContext:
         packing_info: PackingInfo object with bin assignments and metadata
         original_generation_masks: Generation masks for all sequences before packing
         original_trajs: All trajectories before packing
+        original_inference_logprobs: Inference logprobs for all sequences before packing (optional)
         packed_trajs: Packed trajectories tensor [num_bins, bin_size]
         packed_position_ids: Position IDs for packed sequences [num_bins, bin_size]
         packed_attention_mask: Attention mask for packed sequences [num_bins, 1, bin_size, bin_size]
@@ -59,6 +60,7 @@ class PackingContext:
     packed_position_ids: torch.Tensor
     packed_attention_mask: torch.Tensor
     packed_loss_mask: torch.Tensor
+    original_inference_logprobs: Optional[torch.Tensor] = None
     bin_advantages: List[torch.Tensor] = field(default_factory=list)
     cached_packed_seq_params: List[Optional[PackedSeqParams]] = field(default_factory=list)
 
@@ -968,6 +970,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         packed_position_ids=packed_position_ids,
         packed_attention_mask=packed_attention_mask,
         packed_loss_mask=packed_loss_mask,
+        original_inference_logprobs=inference_logprobs,
         bin_advantages=bin_advantages,
     )
     cached_packed_seq_params = create_packed_seq_params(temp_context)
@@ -983,6 +986,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         packed_position_ids=packed_position_ids,
         packed_attention_mask=packed_attention_mask,
         packed_loss_mask=packed_loss_mask,
+        original_inference_logprobs=inference_logprobs,
         bin_advantages=bin_advantages,
         cached_packed_seq_params=cached_packed_seq_params,
     )
