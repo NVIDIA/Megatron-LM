@@ -686,7 +686,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.return_log_probs
             and not request.sampling_params.skip_prompt_log_probs
         ):
-            assert not self.materialize_only_last_token_logits, (
+            assert not self.context.materialize_only_last_token_logits, (
                 "Prompt log probs cannot be calculated if only last token logits are materialized. "
                 "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
                 "or skip_prompt_log_probs to True in SamplingParams."
