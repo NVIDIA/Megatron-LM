@@ -101,8 +101,6 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
-  # Needed for easy access to optimizer states
-  --dist-ckpt-save-pre-mcore-014: true
   # rerun settings
   --rerun-mode: validate_results
 MODEL_ARGS:

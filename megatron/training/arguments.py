@@ -2538,11 +2538,6 @@ def _add_checkpointing_args(parser):
                             ' Check StrictHandling docs for flags meaning.'
                             ' NOTE: This flag controls only distributed checkpoint'
                             ' load from storage, not loading state dict into the model.')
-    group.add_argument('--dist-ckpt-save-pre-mcore-014', action='store_true',
-                       help='Revert checkpointing simplifications introduced in Megatron-Core'
-                            ' v0.14. This option affects only checkpoint saving format and will'
-                            ' be removed soon (checkpoint load format is determined based on'
-                            ' checkpoint metadata).')
     group.add_argument('--dist-ckpt-optim-fully-reshardable', action='store_true',
                        help='Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP)'
                             ' as opposed to plain DP reshardability.')
