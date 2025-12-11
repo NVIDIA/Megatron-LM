@@ -334,12 +334,10 @@ class TopKRouter(Router):
                 routing_map=routing_map,
                 reduce_group=self.tp_cp_group,
                 with_padding_mask=with_padding_mask,
-                topk=self.topk,
+                topk=self.topk*bsz,
             )
         )
-        if with_padding_mask:
-            local_num_tokens //= bsz
-            total_num_tokens //= bsz
+
         aux_loss = (
             switch_load_balancing_loss_func(
                 probs=scores_for_aux_loss,
