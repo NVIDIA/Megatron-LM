@@ -250,6 +250,8 @@ class MockSFTLowLevelDataset:
         # because an eod token will be appended at the end later in SFTDataset
         sample = np.arange(2, length + 1 , dtype=np.int64)
         return sample
+
+
 class MockSFTDataset(SFTDataset):
     """The mock dataset used during SFT"""
 
@@ -273,6 +275,15 @@ class MockSFTDataset(SFTDataset):
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        num_microbatch_left = -1
+        cp_size = -1
+        if isinstance(idx, tuple):
+            # print(f"{idx=}")
+            if len(idx) == 2:
+                idx, num_microbatch_left = idx
+            elif len(idx) == 3:
+                idx, num_microbatch_left, cp_size = idx
+
         sft_sequence_packing = self.config.sft_sequence_packing
         tokenizer = self.config.tokenizer
         max_seq_len = self.config.sequence_length
@@ -320,6 +331,8 @@ class MockSFTDataset(SFTDataset):
                 'attention_mask': attention_mask,
                 'loss_mask': loss_mask,
                 'position_ids': position_ids,
+                'num_micro_batches_left': num_microbatch_left,
+                'local_cp_size': cp_size,
             }
         else:
             ret = {
@@ -327,6 +340,8 @@ class MockSFTDataset(SFTDataset):
                 'labels': target,
                 'loss_mask': loss_mask,
                 'position_ids': position_ids,
+                'num_micro_batches_left': num_microbatch_left,
+                'local_cp_size': cp_size,
             }
 
         if sft_sequence_packing:

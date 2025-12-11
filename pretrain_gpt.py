@@ -73,7 +73,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             vp_stage=vp_stage,
         )
         
-        
+        # print(f"rank={torch.distributed.get_rank()}, {batch=}")
         
         cu_seqlens = batch.pop('cu_seqlens')
         cu_seqlens_padded = batch.pop('cu_seqlens_padded')
@@ -317,7 +317,6 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     # pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
     store = None
-
     pretrain(
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),

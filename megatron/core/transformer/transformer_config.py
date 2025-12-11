@@ -42,6 +42,8 @@ class TransformerConfig(ModelParallelConfig):
     # model architecture
     ####################
 
+    vocab_size: int = 0
+
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
 

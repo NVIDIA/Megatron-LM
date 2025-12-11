@@ -26,6 +26,8 @@ USE_TE_CE=1
 USE_FLASH_ATTN=0
 USE_FSDP=0
 PROFILE=0
+PROFILE_MEMORY=1
+PROFILE_MEMORY_PATH="/m2v_model/wuguohao03/nv_teamwork/Megatron-LM/logs/output/interactive_hybrid_cp/profile"
 # PROFILE_RANKS=[0,1,2,3,4,5,6,7,8]
 TRAIN_ITERS=10
 USE_MOCK_DATA=1
@@ -175,8 +177,11 @@ fi
 
     # --use-gpu-timer \
     # --gpu-timer-interval 1 \
+    # 
 
 OPTIONS=" \
+    `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory; fi` \
+    `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory-path $PROFILE_MEMORY_PATH; fi` \
     --no-check-for-nan-in-loss-and-grad \
     --recompute-activations \
     --recompute-granularity full \
@@ -185,6 +190,7 @@ OPTIONS=" \
     --use-gpu-timer \
     --gpu-timer-interval 1 \
     --hybrid-context-parallel \
+    --hybrid-context-parallel-scheduler only_packing_no_scheduling \
     --sft-sequence-packing \
     --max-seqlen-per-dp-cp-rank $MAX_SEQLEN_PER_DP_CP_RANK \
     --sft \

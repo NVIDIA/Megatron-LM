@@ -1367,6 +1367,7 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+    kw_args['vocab_size'] = args.vocab_size
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
     kw_args['layernorm_epsilon'] = args.norm_epsilon
@@ -2249,10 +2250,14 @@ def _add_training_args(parser):
                        '-o <path/to/output_file> --force-overwrite true '
                        '--capture-range=cudaProfilerApi '
                        '--capture-range-end=stop`.')
-    group.add_argument('--profile-step-start', type=int, default=10,
+    group.add_argument('--profile-step-start', type=int, default=4,
                        help='Global step to start profiling.')
-    group.add_argument('--profile-step-end', type=int, default=12,
+    group.add_argument('--profile-step-end', type=int, default=6,
                        help='Global step to stop profiling.')
+    group.add_argument('--profile-memory', action='store_true',
+                       default=False, help='Record memory info for analysis purpose. ')
+    group.add_argument('--profile-memory-path', type=str, default=None,
+                       help='filepath to saveRecord memory info. ')
     group.add_argument('--iterations-to-skip', nargs='+', type=int, default=[],
                        help='List of iterations to skip, empty by default.')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,

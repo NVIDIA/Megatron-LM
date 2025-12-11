@@ -2170,9 +2170,9 @@ def forward_backward_pipelining_without_interleaving(
             )
             torch.distributed.send(info_tensor, dst=next_rank)
 
-    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
-        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
-    )
+    # data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+    #     wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
+    # )
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:

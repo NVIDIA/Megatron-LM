@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 
 from megatron.core import parallel_state
 from megatron.core.datasets.megatron_dataset import MegatronDataset
@@ -409,6 +410,7 @@ def wrap_dataloader(
 
             # batch is a list of samples: List[MegatronDataset]
             batch = next(data_iterator)
+            # print(f"{batch=}")
             num_micro_batches = batch[0]["num_micro_batches_left"] + 1
 
             batch_all = [batch] + [next(data_iterator) for _ in range(num_micro_batches - 1)]
@@ -503,87 +505,89 @@ def wrap_dataloader(
                 new_samples.append(new_sample)
 
         # TODO(tailaim): do we need to move this to collate function?
-        if scheduler is PackingScheduler.ONLY_PACKING_NO_SCHEDULING:
+        print(f"{scheduler_type=}")
+        if scheduler_type is PackingScheduler.ONLY_PACKING_NO_SCHEDULING:
             # allreduce to get the total number of microbatches
             mfu_info_to_broadcast_this_hdp_group = torch.tensor(
                 [num_total_tokens, sequence_square_sum], dtype=torch.int64, device=dev
             )
             torch.distributed.all_reduce(mfu_info_to_broadcast_this_hdp_group, group=dp_cp_group)
             num_total_tokens_this_GB = mfu_info_to_broadcast_this_hdp_group[0].item()
+            print(f"{num_total_tokens_this_GB=}")
             sequence_square_sum_this_GB = mfu_info_to_broadcast_this_hdp_group[1].item()
 
-    # broadcast num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB,
-    #  and packed_seq_params to tp group
-    if pp_group.size() > 2 and tp_group.rank() == 0:
-        if pp_group.rank() == 0:
-            tensor_list = [
-                torch.tensor(
-                    [num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB],
-                    dtype=torch.int64,
-                ).cuda()
-            ]
-            for sample in new_samples:
-                tensor_list.append(sample["max_seqlen"].unsqueeze(0))
-            for sample in new_samples:
-                tensor_list.append(
-                    sample["local_cp_size"].unsqueeze(0)
-                    if scheduler_type is PackingScheduler.HYBRID_CP
-                    else torch.tensor([-1], dtype=torch.int32).cuda()
-                )
-            for sample in new_samples:
-                tensor_list.append(sample["cu_seqlens"])
-                tensor_list.append(sample["cu_seqlens_padded"])
-            info_to_broadcast_this_pp_group = torch.cat(tensor_list, dim=0).to(
-                device=dev, dtype=torch.int64
-            )
-            info_length_tensor = torch.tensor(
-                info_to_broadcast_this_pp_group.shape[0], dtype=torch.int32
-            ).cuda()
-            _broadcast_to_pp_group(info_length_tensor)
-            _broadcast_to_pp_group(info_to_broadcast_this_pp_group)
-        else:
-            info_length_tensor = torch.tensor(0, dtype=torch.int32).cuda()
-            _broadcast_to_pp_group(info_length_tensor)
-            info_to_broadcast_this_pp_group = torch.empty(
-                info_length_tensor.item(), dtype=torch.int64
-            ).cuda()
-            _broadcast_to_pp_group(info_to_broadcast_this_pp_group)
-            if pp_group.rank() != pp_group.size() - 1:
-                info_numpy = info_to_broadcast_this_pp_group.cpu().numpy()
-                num_micro_batches = info_numpy[0]
-                num_total_tokens_this_GB = info_numpy[1]
-                sequence_square_sum_this_GB = info_numpy[2]
-                max_seqlens = info_numpy[3 : 3 + num_micro_batches]
-                local_cp_sizes = info_numpy[3 + num_micro_batches : 3 + 2 * num_micro_batches]
-                cu_seqlens_list = []
-                cu_seqlens_padded_list = []
-                indices = np.where(info_numpy == 0)[0]
-                for i in range(num_micro_batches):
-                    cu_seqlens_list.append(info_numpy[indices[i * 2] : indices[i * 2 + 1]])
-                    if i == num_micro_batches - 1:
-                        cu_seqlens_padded_list.append(info_numpy[indices[i * 2 + 1] :])
-                    else:
-                        cu_seqlens_padded_list.append(
-                            info_numpy[indices[i * 2 + 1] : indices[i * 2 + 2]]
-                        )
+    # # broadcast num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB,
+    # #  and packed_seq_params to tp group
+    # if pp_group.size() > 2 and tp_group.rank() == 0:
+    #     if pp_group.rank() == 0:
+    #         tensor_list = [
+    #             torch.tensor(
+    #                 [num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB],
+    #                 dtype=torch.int64,
+    #             ).cuda()
+    #         ]
+    #         for sample in new_samples:
+    #             tensor_list.append(sample["max_seqlen"].unsqueeze(0))
+    #         for sample in new_samples:
+    #             tensor_list.append(
+    #                 sample["local_cp_size"].unsqueeze(0)
+    #                 if scheduler_type is PackingScheduler.HYBRID_CP
+    #                 else torch.tensor([-1], dtype=torch.int32).cuda()
+    #             )
+    #         for sample in new_samples:
+    #             tensor_list.append(sample["cu_seqlens"])
+    #             tensor_list.append(sample["cu_seqlens_padded"])
+    #         info_to_broadcast_this_pp_group = torch.cat(tensor_list, dim=0).to(
+    #             device=dev, dtype=torch.int64
+    #         )
+    #         info_length_tensor = torch.tensor(
+    #             info_to_broadcast_this_pp_group.shape[0], dtype=torch.int32
+    #         ).cuda()
+    #         _broadcast_to_pp_group(info_length_tensor)
+    #         _broadcast_to_pp_group(info_to_broadcast_this_pp_group)
+    #     else:
+    #         info_length_tensor = torch.tensor(0, dtype=torch.int32).cuda()
+    #         _broadcast_to_pp_group(info_length_tensor)
+    #         info_to_broadcast_this_pp_group = torch.empty(
+    #             info_length_tensor.item(), dtype=torch.int64
+    #         ).cuda()
+    #         _broadcast_to_pp_group(info_to_broadcast_this_pp_group)
+    #         if pp_group.rank() != pp_group.size() - 1:
+    #             info_numpy = info_to_broadcast_this_pp_group.cpu().numpy()
+    #             num_micro_batches = info_numpy[0]
+    #             num_total_tokens_this_GB = info_numpy[1]
+    #             sequence_square_sum_this_GB = info_numpy[2]
+    #             max_seqlens = info_numpy[3 : 3 + num_micro_batches]
+    #             local_cp_sizes = info_numpy[3 + num_micro_batches : 3 + 2 * num_micro_batches]
+    #             cu_seqlens_list = []
+    #             cu_seqlens_padded_list = []
+    #             indices = np.where(info_numpy == 0)[0]
+    #             for i in range(num_micro_batches):
+    #                 cu_seqlens_list.append(info_numpy[indices[i * 2] : indices[i * 2 + 1]])
+    #                 if i == num_micro_batches - 1:
+    #                     cu_seqlens_padded_list.append(info_numpy[indices[i * 2 + 1] :])
+    #                 else:
+    #                     cu_seqlens_padded_list.append(
+    #                         info_numpy[indices[i * 2 + 1] : indices[i * 2 + 2]]
+    #                     )
 
-                new_samples = []
-                for i in range(num_micro_batches):
-                    new_sample = {}
-                    new_sample["max_seqlen"] = torch.tensor(
-                        max_seqlens[i], dtype=torch.int32
-                    ).cuda()
-                    if local_cp_sizes[i] != -1:
-                        new_sample["local_cp_size"] = torch.tensor(
-                            local_cp_sizes[i], dtype=torch.int32
-                        ).cuda()
-                    new_sample["cu_seqlens"] = torch.tensor(
-                        cu_seqlens_list[i], dtype=torch.int32
-                    ).cuda()
-                    new_sample["cu_seqlens_padded"] = torch.tensor(
-                        cu_seqlens_padded_list[i], dtype=torch.int32
-                    ).cuda()
-                    new_samples.append(new_sample)
+    #             new_samples = []
+    #             for i in range(num_micro_batches):
+    #                 new_sample = {}
+    #                 new_sample["max_seqlen"] = torch.tensor(
+    #                     max_seqlens[i], dtype=torch.int32
+    #                 ).cuda()
+    #                 if local_cp_sizes[i] != -1:
+    #                     new_sample["local_cp_size"] = torch.tensor(
+    #                         local_cp_sizes[i], dtype=torch.int32
+    #                     ).cuda()
+    #                 new_sample["cu_seqlens"] = torch.tensor(
+    #                     cu_seqlens_list[i], dtype=torch.int32
+    #                 ).cuda()
+    #                 new_sample["cu_seqlens_padded"] = torch.tensor(
+    #                     cu_seqlens_padded_list[i], dtype=torch.int32
+    #                 ).cuda()
+    #                 new_samples.append(new_sample)
 
     if tp_group.size() > 1:
         if tp_group.rank() == 0:
@@ -1611,6 +1615,59 @@ def nearest_pow2(n: int) -> int:
     return lower if (n - lower) < (upper - n) else upper
 
 
+def simulate_memory(chunks_list, config):
+    from megatron.pipeline_simulator.hotsim.model import Model
+    from megatron.pipeline_simulator.hotsim.memory_model import MemoryModel
+    from megatron.pipeline_simulator.hotsim.training_config import TrainingConfig
+    from megatron.pipeline_simulator.hotsim.schedule import build_splitfuse_schedule
+    model = Model(
+        name="Llama",
+        vocab_size=config.vocab_size,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.ffn_hidden_size,
+        num_hidden_layers=config.num_layers,
+        num_attention_heads=config.num_attention_heads,
+    )
+    ckpt_type = "no"
+    if config.recompute_granularity == "full":
+        ckpt_type = "full"
+    # if config.kaimm_recompute_mlp_activation_func and config.kaimm_recompute_norm:
+    #     if config.kaimm_recompute_mlp_fc1:
+    #         ckpt_type = "partial+fc1"
+    #     else:
+    #         ckpt_type = "partial"
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        num_gpus = torch.distributed.get_world_size()
+    else:
+        num_gpus = parallel_state.get_tensor_model_parallel_world_size() \
+             * parallel_state.get_pipeline_model_parallel_world_size() \
+             * parallel_state.get_data_parallel_world_size()
+    train_config = TrainingConfig(
+        model=model,
+        num_gpus=num_gpus,
+        microbatch_size=1,
+        tensor_parallel_size=parallel_state.get_tensor_model_parallel_world_size(),
+        context_parallel_size=parallel_state.get_context_parallel_world_size(),
+        data_parallel_size=parallel_state.get_data_parallel_world_size(),
+        pipeline_parallel_size=parallel_state.get_pipeline_model_parallel_world_size(),
+        expert_parallel_size=parallel_state.get_expert_model_parallel_world_size(),
+        num_model_chunks=1,
+        ckpt=ckpt_type,
+        offload_ratio=0,
+        # offload_ratio=config.kaimm_offload_activation_ratio,
+    )
+
+    actions_by_rank = build_splitfuse_schedule(
+        config.pipeline_model_parallel_size, chunks_list
+    )
+
+    memory_model = MemoryModel(train_config)
+    memory_model.setup(chunks_list, actions_by_rank)
+    memory_model.run()
+    return max(memory_model.peak_memory_histogram)
+
+
 def simulate_time(fwd_costs, bwd_costs, PP, VPP):
     # PP = mpu.get_pipeline_model_parallel_world_size()
     schedule = SplitFuseSchedule(PP, fwd_costs, bwd_costs)
@@ -1710,7 +1767,8 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
             sample_id_seqlens, self.get_total_workload, self.total_hdp_gpus, config=config
         )
 
-        # print(f"{best_sample_ids=}")
+        # print(best_indices_buckets[-1][0][0])
+        # breakpoint()
 
         mi = -1
         for i in range(len(best_indices_buckets)):
@@ -1719,30 +1777,38 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                 break
         assert mi != -1
         best_sample_ids = best_sample_ids[mi]
+        best_indices_buckets = best_indices_buckets[mi]
+
+        # print(f"{len(best_indices_buckets)=}, {len(best_sample_ids)=}")
+        assert len(best_indices_buckets) == len(best_sample_ids)
+        # print(f"{best_sample_ids=}, {len(best_indices_buckets)=}, {len(best_indices_buckets[0])=}, {len(best_indices_buckets[1])=}")
+        # breakpoint()
 
         def transpose_2d_list(matrix):
             return [list(row) for row in zip(*matrix)]
 
         local_sample_id_groups = transpose_2d_list(best_sample_ids)
+        local_best_indices_buckets = transpose_2d_list(best_indices_buckets)
         # groups = 
         for microbatch_idx in range(len(local_sample_id_groups)):
             sample_id_groups.append([])
             groups.append([])
-            # cp_sizes.append([])
+            cp_sizes.append([])
             for dp_rank in range(len(local_sample_id_groups[microbatch_idx])):
                 sample_id_groups[microbatch_idx].append([])
                 groups[microbatch_idx].append([])
-                # cp_sizes[microbatch_idx].append([])
+                cp_sizes[microbatch_idx].append([])
                 for local_sample_idx in local_sample_id_groups[microbatch_idx][dp_rank]:
                     sample_id_groups[microbatch_idx][dp_rank].append(sample_id_seqlens[local_sample_idx][0])
                     groups[microbatch_idx][dp_rank].append(sample_id_seqlens[local_sample_idx][1])
-                    # cp_sizes[microbatch_idx][dp_rank].append(sample_id_seqlens[local_sample_idx][1])
+                    cp_sizes[microbatch_idx][dp_rank].append(local_best_indices_buckets[microbatch_idx][dp_rank].cp_size)
 
 
-        if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {groups=}")
+        # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {groups=}")
+        if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}")
         # breakpoint()
 
-        return groups, sample_id_groups
+        return groups, sample_id_groups, cp_sizes
 
     def split_sample(
         self,
@@ -2196,7 +2262,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
 
                 bubble_time_list = []
                 if empty_bucket_flag:
-                    print_rank0(f"error, found empty bucket, skip")
+                    print(f"error, found empty bucket, skip")
                     max_sum_per_iter = sys.float_info.max / 10.0
                 else:
                     for m in range(len(fwd_flops_for_dp_per_m)):
@@ -2222,6 +2288,8 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                         
                         max_iter_sum_among_dp_list.append(max_iter_sum_among_dp)
                         max_sum_per_iter = max(max_sum_per_iter, max_iter_sum_among_dp)
+
+                        peak_memory = simulate_memory(seq_len_for_dp, config)
 
                         forward_cost_cmp = torch.tensor(forward_cost_cmp).flatten().tolist()
                         backward_cost_cmp = torch.tensor(backward_cost_cmp).flatten().tolist()
@@ -2252,6 +2320,11 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                             "pp_bubble_over_compute_time":pp_bubble_over_compute_time,
                             "imbalanced_bubble_over_compute_time":imbalanced_bubble_over_compute_time,
                         })
+
+                        # print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
+                        if peak_memory >= 70 * 1024**3:
+                            max_sum_per_iter = sys.float_info.max / 10.0    # skip this m
+
                     # if torch.distributed.get_rank() == 0:
                     #     for k in range(len(bubble_time_list)):
                     #         for key in bubble_time_list[k].keys():

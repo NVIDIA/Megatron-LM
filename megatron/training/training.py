@@ -2387,6 +2387,18 @@ def train(
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
                 nsys_nvtx_context.__enter__()
 
+        if args.profile_memory and torch.distributed.get_rank() in args.profile_ranks:
+            if iteration == args.profile_step_start:
+                print(f"start profile")
+                torch.cuda.memory._record_memory_history(max_entries=8000000)
+            if iteration == args.profile_step_end:
+                filepath = args.profile_memory_path
+                filename = f"memory_record_DP{mpu.get_data_parallel_rank()}_TP{mpu.get_tensor_model_parallel_rank()}_PP{mpu.get_pipeline_model_parallel_rank()}_rank{torch.distributed.get_rank()}.json"
+                filename = os.path.join(filepath, filename)
+                print(f"end profile, {filename=}")
+                torch.cuda.memory._dump_snapshot(f"{filename}")
+                torch.cuda.memory._record_memory_history(enabled=None)
+
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
         ft_integration.on_checkpointing_end(is_async_finalization=True)

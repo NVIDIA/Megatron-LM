@@ -696,16 +696,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             )
             print(
                 f"[MoE all_to_all debug] "
-                f"input_splits={self.input_splits}, sum={sum(self.input_splits) \
-                if self.input_splits is not None else None}, "
-                f"output_splits={self.output_splits}, sum={sum(self.output_splits) \
-                if self.output_splits is not None else None}"
+                f"input_splits={self.input_splits}, sum={sum(self.input_splits) if self.input_splits is not None else None}, "
+                f"output_splits={self.output_splits}, sum={sum(self.output_splits) if self.output_splits is not None else None}"
             )
             print(
                 f"[MoE all_to_all debug] "
                 f"tokens_per_expert={self.tokens_per_expert}, "
-                f"sum={self.tokens_per_expert.sum() if \
-                hasattr(self.tokens_per_expert, 'sum') else None}"
+                f"sum={self.tokens_per_expert.sum() if hasattr(self.tokens_per_expert, 'sum') else None}"
             )
             torch.set_printoptions(profile="full")
             print(f"hidden_states shape: {self.hidden_shape}")
