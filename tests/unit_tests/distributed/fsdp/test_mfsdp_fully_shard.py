@@ -164,13 +164,6 @@ def build_toy_model(model_type: str, init_model_with_meta_device: bool, seed=Non
     return toy_model, fsdp_unit_modules
 
 
-def build_toy_optimizer(model: torch.nn.Module):
-    """
-    Helper function to build a toy optimizer for testing Megatron-FSDP.
-    """
-    return Adam(params=model.parameters(), lr=0.01)
-
-
 def build_distributed_environment(mesh_dim_config: tuple):
     """
     Helper function to build a distributed environment for testing Megatron-FSDP.
@@ -272,7 +265,7 @@ class TestMegatronFsdpFullyShard:
 
         # Construct toy model.
         toy_model, fsdp_unit_modules = build_toy_model(model_type, init_model_with_meta_device)
-        toy_adam = build_toy_optimizer(toy_model)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -402,7 +395,7 @@ class TestMegatronFsdpFullyShard:
         """
         # Test model.
         toy_model, fsdp_unit_modules = build_toy_model(model_type, False, seed=0)
-        toy_adam = build_toy_optimizer(toy_model)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -482,7 +475,7 @@ class TestMegatronFsdpFullyShard:
         # Initialize a new model for checkpoint loading. Set a different seed to force a different model init,
         # to ensure the checkpoint loading is accurate and non-trivial.
         toy_model, fsdp_unit_modules = build_toy_model(model_type, False, seed=1)
-        toy_adam = build_toy_optimizer(toy_model)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -614,7 +607,7 @@ class TestMegatronFsdpFullyShard:
         )
 
         # Initialize the distributed optimizer on the MegatronFSDP model.
-        toy_adam = build_toy_optimizer(mfsdp_model)
+        toy_adam = Adam(params=mfsdp_model.parameters(), lr=0.01)
         optimizer = fully_shard_optimizer(optimizer=toy_adam)
 
         # Mock input and target.

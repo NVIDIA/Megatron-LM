@@ -63,33 +63,25 @@ Transform your PyTorch model to use Fully Sharded Data Parallelism with just a f
 ```python
 import torch
 from megatron_fsdp import (
-    fully_shard,
     fully_shard_model,
     fully_shard_optimizer,
 )
 
 """
-Enable FSDP with Megatron-FSDP via fully_shard().
+Enable FSDP with Megatron-FSDP via the `fully_shard_*` API.
 """
-model: torch.nn.Module = YourModel()
-optimizer: torch.optim.Optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-model, optimizer = fully_shard(
+# Shard your model.
+model = fully_shard_model(
     model,
-    optimizer,
-    fsdp_unit_modules=[YourModelLayerClass], # Sub-modules to shard.
+    fsdp_unit_modules=[
+        YourModelLayerClass,
+        "import.path.to.model.class.YourModelLayerClass",
+    ],
     ...
 )
-
-"""
-Alternatively, you can use fully_shard_model() followed by fully_shard_optimizer()!
-"""
-mfsdp_model = fully_shard_model(
-    model,
-    fsdp_unit_modules=[YourModelLayerClass],
-    ...
-)
+# Shard your optimizer.
 optimizer = fully_shard_optimizer(
-    torch.optim.Adam(mfsdp_model.parameters(), lr=1e-3)
+    torch.optim.Adam(model.parameters(), lr=1e-3)
 )
 
 # Your model is now ready for distributed training!
@@ -100,7 +92,9 @@ optimizer = fully_shard_optimizer(
 `fully_shard` / `fully_shard_model` / `fully_shard_optimizer` are simple entrypoints into `MegatronFSDP`.
 
 - No need to call `fully_shard` on all the sub-modules, just pass your sub-module classes or import paths to `fully_shard`!
-- One liner for the sharding change, which seamlessly preserves the identity of your training loop.
+- Seamlessly preserves the identity of your training loop with only a few lines of code and multiple options for initialization:
+  - `fully_shard_*` is a two-line change when sharding the model and optimizer separately.
+  - `fully_shard` is a one-line change for previously-initialized models and optimizers.
 
 Compare this with FSDP2:
 
@@ -108,13 +102,14 @@ Compare this with FSDP2:
 import torch
 from torch.distributed.fsdp import fully_shard
 
-# Your existing model and optimizer
+# Your existing model and optimizer.
 model = YourModel()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-# Enable FSDP with FSDP2
+# Enable FSDP with FSDP2.
 for module in model.modules():
-    if isinstance(module, YourTransformerBlock): # Sub-Modules to shard
+    # Sub-Modules to shard.
+    if isinstance(module, YourModelLayerClass):
         fully_shard(module)
 fully_shard(model)
 
@@ -123,12 +118,18 @@ fully_shard(model)
 
 ## `fully_shard` / `MegatronFSDP` API - Advanced Features
 
-Megatron-FSDP's API has a comprehensive set of arguments for fine-tuning your model's performance and memory usage:
+Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fine-tuning your model's performance:
 
 ```python
 import torch
-from megatron_fsdp import fully_shard
+from megatron_fsdp import (
+    fully_shard_model,
+    fully_shard_optimizer,
+)
 
+"""
+Megatron-FSDP DeviceMesh Distributed Environment
+"""
 # Initialize DeviceMesh.
 device_mesh = torch.distributed.device_mesh.init_device_mesh(
     "cuda",
@@ -150,12 +151,16 @@ expert_device_mesh = torch.distributed.device_mesh.init_device_mesh(
     mesh_dim_names=("dp_shard", "tp"),
 )
 
-# Fully-shards your model and distributes your optimizer.
-model, optimizer = fully_shard(
+"""
+Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
+class that schedules the sharding lifecycle of the model parameters and gradients
+during training and inference.
+
+The original `torch.nn.Module` can be accessed at `MegatronFSDP.module`.
+"""
+model = fully_shard_model(
     # PyTorch (Root) Module
     model,
-    # PyTorch Optimizer
-    optimizer,
     # Sharded Modules
     fsdp_unit_modules=[...],
     # Device Mesh
@@ -164,8 +169,8 @@ model, optimizer = fully_shard(
     dp_shard_dim="dp_shard_cp",
     # Set this required argument to use HSDP instead of FSDP. Otherwise, set this to None.
     dp_outer_dim="dp_outer",
-    # Only required for TP-sensitive models (i.e. Megatron-LM / TransformerEngine) or when using DTensor-based TP.
-    # Otherwise, set this to None.
+    # Only required for TP-sensitive models (i.e. Megatron-LM / TransformerEngine)
+    # or when using DTensor-based TP. Otherwise, set this to None.
     tp_dim="tp",
     # Only required when using HSDP. Otherwise, set this to None.
     hybrid_fsdp_group=hsdp_group,
@@ -188,13 +193,52 @@ model, optimizer = fully_shard(
     preproc_state_dict_for_dcp_ckpt=True,
 )
 
+# Initialize your optimizer on the Megatron-FSDP model distributed Parameter(s).
+# If your optimizer has already been initialized, either use the `fully_shard`
+# entrypoint, or use `optimizer.add_param_group({"params": model.parameters()})`
+# after resetting your optimizer state via `optimizer.param_groups.clear()`
+# and `optimizer.state.clear()`.
+optimizer = torch.optim.Optimizer(model.parameters())
+
+"""
+Fully-shard your optimizer, which just modifies your `optimizer.step()`, `optimizer.zero_grad()`,
+and distributed optimizer parameters to punctually trigger scheduled FSDP operations for Megatron-FSDP.
+
+These operations can be customized precisely via extended arguments to `step()` and `zero_grad()`:
+
+    optimizer.step(
+        ...,
+        # Sync all gradients before the optimizer step. Not necessary and disabled
+        # automatically when `sync_model_each_microbatch=True` in MegatronFSDP, in
+        # which case we already synchronize gradients every step but lose performance.
+        sync_grad_before_optimizer_step=True,
+        # After `optimizer.step()`, install optimized weights into MegatronFSDP's buffers.
+        install_optimized_model_weights=True,
+    )
+
+    optimizer.zero_grad(
+        ...,
+        # Also zero out MegatronFSDP's gradient accumulation buffers.
+        zero_grad_buffer=True
+    )
+"""
+fully_shard_optimizer(
+    # PyTorch Optimizer
+    optimizer,
+    # Preprocess state dict for DCP checkpointing. Required for Torch Distributed Checkpoint.
+    preproc_state_dict_for_dcp_ckpt=True,
+)
+
+"""
+Megatron-FSDP Model Checkpointing
+"""
 # Save model and optimizer state.
 torch.distributed.checkpoint.save({"model": model.state_dict(), "optimizer": optimizer.state_dict()}, checkpoint_id=str(CKPT_DIR))
 
 # Load model and optimizer state.
 ckpt_state_dict = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
 torch.distributed.checkpoint.load(state_dict=ckpt_state_dict, checkpoint_id=str(CKPT_DIR))
-# model.load_state_dict(strict=False) is only necessary to ignore TE FP8 extra state
+# `model.load_state_dict(strict=False)` is only necessary to ignore TE FP8 extra state
 # that is missing from the DCP checkpoint but present in TEBaseModule.
 # Megatron-FSDP does not support TE FP8 extra state checkpointing with DCP.
 model.load_state_dict(ckpt_state_dict["model"], strict=False)
