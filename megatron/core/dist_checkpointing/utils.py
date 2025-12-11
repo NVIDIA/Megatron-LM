@@ -6,6 +6,9 @@ from contextlib import contextmanager
 from time import time
 from typing import Dict, Optional, Tuple
 
+# TODO: add guard
+from torch.distributed.tensor import DTensor
+
 from .dict_utils import dict_list_map_inplace, extract_matching_values, nested_values
 from .mapping import (
     LocalNonpersistentObject,
@@ -140,6 +143,22 @@ def extract_sharded_base(
             - state dict with all other objects (keeping the original state dict structure)
     """
     return extract_matching_values(sharded_state_dict, lambda v: isinstance(v, ShardedBase))
+
+
+def extract_sharded_base_or_dtensor(
+    sharded_state_dict: ShardedStateDict,
+) -> Tuple[ShardedStateDict, StateDict]:
+    """Extract a dict consisting of only ShardedBase or DTensors from a given state dict.
+
+    Args:
+        sharded_state_dict: state dict possibly containing ShardedBase or DTensor objects
+
+    Returns:
+        Tuple[ShardedStateDict, StateDict]: tuple of:
+            - state dict with all ShardedBase and DTensor objects (keeping the original structure)
+            - state dict with all other objects (keeping the original state dict structure)
+    """
+    return extract_matching_values(sharded_state_dict, lambda v: isinstance(v, (ShardedBase, DTensor)))
 
 
 def extract_nonpersistent(

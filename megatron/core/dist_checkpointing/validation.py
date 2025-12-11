@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
+from torch.distributed.tensor import DTensor  # TODO: add guard
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
@@ -440,8 +441,11 @@ def validate_sharding_integrity(
     for key, shardings in key_shardings.items():
         if isinstance(shardings[0][1], ShardedObject):
             _validate_objects_for_key(shardings)
-        else:
+        elif isinstance(shardings[0][1], ShardedTensor):
             _validate_sharding_for_key(shardings)
+        else:
+            assert isinstance(shardings[0][1], DTensor), type(shardings[0][1])
+            print('No verification available')
 
 
 def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
