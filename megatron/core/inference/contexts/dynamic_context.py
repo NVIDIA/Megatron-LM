@@ -682,15 +682,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         # TODO: Add other necessary configs from inference_config
 
-        # Max sequence length. (todo: why does inference config have default value
-        # for inference_max_seq_length?)
-        model_max_seq_len = model.get_max_sequence_length()
+        # Max sequence length.
+        def get_model_attr(key):
+            try:
+                return getattr(model, key)
+            except Exception as e:
+                raise e
+
+        position_embedding_type = get_model_attr("position_embedding_type")
+        model_max_seq_len = get_model_attr("max_sequence_length")
         inf_max_seq_len = inference_config.inference_max_seq_length
-        if inf_max_seq_len:
-            max_sequence_length = min(model_max_seq_len, inf_max_seq_len)
+        if position_embedding_type == "learned_absolute":
+            if inf_max_seq_len:
+                max_sequence_length = min(model_max_seq_len, inf_max_seq_len)
+            else:
+                max_sequence_length = model_max_seq_len
+            assert max_batch_size <= model_max_seq_len
         else:
-            max_sequence_length = model_max_seq_len
-        assert max_batch_size <= model_max_seq_len
+            max_sequence_length = (
+                inference_config.inference_max_seq_length or model_config.max_sequence_length
+            )
         max_sequence_length = max(max_sequence_length, max_batch_size)
 
         # Context.
