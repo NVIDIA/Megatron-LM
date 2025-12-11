@@ -687,8 +687,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         def get_model_attr(key):
             try:
                 return getattr(model, key)
-            except Exception as e:
-                raise e
+            except AttributeError as e:
+                raise Exception(f"{model.__class__.__name__} does not contain attribute '{key}'.")
 
         position_embedding_type = get_model_attr("position_embedding_type")
         model_max_seq_len = get_model_attr("max_sequence_length")
