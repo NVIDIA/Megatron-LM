@@ -280,11 +280,13 @@ class TopKRouter(Router):
         if aux_loss_coeff == 0:
             return probs
 
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = get_tokens_per_expert_and_token_count(
-            routing_map=routing_map,
-            reduce_group=self.tp_cp_group,
-            topk=self.topk,
-            with_padding_mask=with_padding_mask,
+        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+            get_tokens_per_expert_and_token_count(
+                routing_map=routing_map,
+                reduce_group=self.tp_cp_group,
+                topk=self.topk,
+                with_padding_mask=with_padding_mask,
+            )
         )
         aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
@@ -327,11 +329,13 @@ class TopKRouter(Router):
 
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
 
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = get_tokens_per_expert_and_token_count(
-            routing_map=routing_map,
-            reduce_group=self.tp_cp_group,
-            with_padding_mask=with_padding_mask,
-            topk=self.topk,
+        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+            get_tokens_per_expert_and_token_count(
+                routing_map=routing_map,
+                reduce_group=self.tp_cp_group,
+                with_padding_mask=with_padding_mask,
+                topk=self.topk,
+            )
         )
 
         aux_loss = (
@@ -346,7 +350,6 @@ class TopKRouter(Router):
             )
             / bsz
         )
-
 
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -371,16 +374,17 @@ class TopKRouter(Router):
             return probs
 
         # Use unified function to compute tokens_per_expert and num_tokens
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = get_tokens_per_expert_and_token_count(
-            routing_map=routing_map,
-            reduce_group=self.tp_dp_cp_group,
-            with_padding_mask=with_padding_mask,
-            topk=self.topk,
+        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+            get_tokens_per_expert_and_token_count(
+                routing_map=routing_map,
+                reduce_group=self.tp_dp_cp_group,
+                with_padding_mask=with_padding_mask,
+                topk=self.topk,
+            )
         )
         self.global_tokens_per_expert += global_tokens_per_expert
         self.ga_steps += 1
         averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
-
 
         global_aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,

@@ -2,11 +2,11 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
-from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
 try:
@@ -179,11 +179,12 @@ def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_
         capacity = min_capacity
     return capacity
 
+
 def get_tokens_per_expert_and_token_count(
-    routing_map: torch.Tensor, 
-    reduce_group: torch.distributed.ProcessGroup, 
+    routing_map: torch.Tensor,
+    reduce_group: torch.distributed.ProcessGroup,
     topk: int = None,
-    with_padding_mask: bool = False
+    with_padding_mask: bool = False,
 ) -> torch.Tensor:
     local_tokens_per_expert = routing_map.sum(dim=0)
     global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
@@ -196,6 +197,7 @@ def get_tokens_per_expert_and_token_count(
         local_num_tokens = routing_map.shape[0]
         total_num_tokens = local_num_tokens * reduce_group.size()
     return global_tokens_per_expert, local_num_tokens, total_num_tokens
+
 
 class MoEAuxLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
