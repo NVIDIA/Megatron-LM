@@ -975,9 +975,13 @@ def maybe_log_training_metrics(
         advantages = wandb_writer.Table(
             columns=['advantages'], data=[[x] for x in group_stats.advantages]
         )
+        stats = torch.cuda.memory_stats()
+        # 1024*1024 = 1048576
+        n_split_megabytes = stats.get("inactive_split_bytes.all.current", 0)/1048576
         wandb_writer.log(
             {
                 **{
+                    'split_megabytes': n_split_megabytes,
                     'group_means_hist': wandb_writer.plot.histogram(
                         group_table, 'group_means', 'Group Means'
                     ),
