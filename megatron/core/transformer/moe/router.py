@@ -327,6 +327,7 @@ class TopKRouter(Router):
             return probs
 
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
+        routing_map = routing_map.reshape(seq_length, -1)
 
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
@@ -336,7 +337,9 @@ class TopKRouter(Router):
                 topk=self.topk,
             )
         )
-
+        if with_padding_mask:
+            local_num_tokens //= bsz
+            total_num_tokens //= bsz
         aux_loss = (
             switch_load_balancing_loss_func(
                 probs=scores_for_aux_loss,
@@ -393,7 +396,6 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_fusion,
-            padding_mask=None,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -597,7 +599,10 @@ class TopKRouter(Router):
                 padding_mask=padding_mask,
             )
             probs = self._apply_aux_loss(
-                probs, scores_for_aux_loss, routing_map_for_aux_loss, padding_mask=padding_mask
+                probs,
+                scores_for_aux_loss,
+                routing_map_for_aux_loss,
+                with_padding_mask=padding_mask is not None,
             )
             probs = self._apply_seq_aux_loss(
                 probs,
@@ -605,10 +610,13 @@ class TopKRouter(Router):
                 routing_map_for_aux_loss,
                 seq_length,
                 bsz,
-                padding_mask=padding_mask,
+                with_padding_mask=padding_mask is not None,
             )
             probs = self._apply_global_aux_loss(
-                probs, scores_for_aux_loss, routing_map_for_aux_loss, padding_mask=padding_mask
+                probs,
+                scores_for_aux_loss,
+                routing_map_for_aux_loss,
+                with_padding_mask=padding_mask is not None,
             )
 
         # Optionally apply expert bias
