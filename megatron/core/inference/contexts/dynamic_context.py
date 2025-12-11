@@ -32,6 +32,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import internal_api
+from megatron.core.utils import get_attr_wrapped_model
 
 from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -684,16 +685,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # TODO: Add other necessary configs from inference_config
 
         # Max sequence length.
-        def get_model_attr(key):
-            try:
-                return getattr(model, key)
-            except AttributeError as e:
-                raise Exception(f"{model.__class__.__name__} does not contain attribute '{key}'.")
-
-        position_embedding_type = get_model_attr("position_embedding_type")
-        model_max_seq_len = get_model_attr("max_sequence_length")
+        position_embedding_type = get_attr_wrapped_model(model, "position_embedding_type")
+        model_max_seq_len = get_attr_wrapped_model(model, "max_sequence_length")
         inf_max_seq_len = inference_config.inference_max_seq_length
+
         if position_embedding_type == "learned_absolute":
+            # When using absolute position embeddings, it is critical that the
+            # context's `max_sequence_length` is less than or equal to the model's
+            # `max_sequence_length`. Otherwise, the context's `position_ids` will
+            # contain ids greater than the dimension of the position embedding
+            # tensor, which will result in an index error.
             if inf_max_seq_len:
                 max_sequence_length = min(model_max_seq_len, inf_max_seq_len)
             else:
