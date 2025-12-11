@@ -39,8 +39,8 @@ from .utils import (
     FSDPDistributedIndex,
     get_global_memory_buffer,
     get_mcore_tensor_parallel_partition_dim,
-    is_mcore_tensor_model_parallel,
     is_mcore_tensor_parallel_duplicated,
+    using_tensor_parallel,
 )
 
 logger = logging.getLogger(__name__)
@@ -1583,7 +1583,7 @@ class ParamAndGradBuffer:
             NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
                 logging.info(
                     f"[Rank {torch.distributed.get_rank()}] Created NCCL memory pool for \
                         UserBuffer Registration"
@@ -1600,26 +1600,26 @@ class ParamAndGradBuffer:
                 # Outer/Inter-FSDP group when using hybrid FSDP
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
 
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
                 logging.info(
                     f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):"
                 )
             # All ranks in each group must participate in the collective to avoid deadlock.
             for i, group in enumerate(self.ubr_groups):
-                if torch.distributed.get_rank() == 0:
+                if torch.distributed.get_rank() == self.dist_index.representative_rank():
                     logging.info(
                         f"Group [{i+1}/{len(self.ubr_groups)}] \
                             group.group_desc: {group.group_desc}, group.size(): {group.size()}"
                     )
                 torch.distributed.barrier(group=group, async_op=False)
-                if torch.distributed.get_rank() == 0:
+                if torch.distributed.get_rank() == self.dist_index.representative_rank():
                     logging.info(
                         f"Call Success with the group [{i+1}/{len(self.ubr_groups)}] \
                             group.group_desc: {group.group_desc}"
                     )
             # Call barrier from the global communitcator group
             torch.distributed.barrier(async_op=False)
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
                 logging.info(f"Call Success with the global communicator group")
 
         # If using nccl_ub, it returns a function that registers buffers to the NCCL memory pool
@@ -1755,7 +1755,7 @@ class ParamAndGradBuffer:
             f"Total pad: {_bytes_to_mb(total_padded_bytes)}"
         )
 
-        if torch.distributed.get_rank() == 0:
+        if torch.distributed.get_rank() == self.dist_index.representative_rank():
             logger.info("\n".join(log_lines))
 
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
@@ -1998,7 +1998,7 @@ class ParamAndGradBuffer:
                 f"CUDA params numel: {cuda_params_numel / 1_000_000:.2f} M, "
                 f"CPU params numel: {cpu_params_numel / 1_000_000:.2f} M"
             )
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
                 logger.info(log_str)
 
         # Initialize the model weight buffer data of each parameter group.
@@ -3500,15 +3500,13 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
 
         def override_sharded_param_to_function_closure(p, to_function):
             def override_sharded_param_to_function(*args, **kwargs):
-                bucket_id = all_gather_pipeline.buffer.param_to_param_group[p]
-                status = all_gather_pipeline.bucket_status[bucket_id]
-                if status == BucketStatus.READY_TO_USE:
-                    return to_function(*args, **kwargs)
-                raise RuntimeError(
-                    "This parameter is already shard by MCore FSDP and the "
-                    "shared-state parameter does not support 'to' function."
-                    "please define the dtype and device of the parameter before FSDP wrap."
-                )
+                if p._typed_storage()._size() == 0:
+                    warnings.warn(
+                        "The parameter may be sharded by Megatron-FSDP, "
+                        "no actual 'to' operation is performed."
+                    )
+                    return torch.empty([])
+                return to_function(*args, **kwargs)
 
             return override_sharded_param_to_function
 
@@ -3516,15 +3514,13 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
 
         def override_sharded_param_cpu_function_closure(p, cpu_function):
             def override_sharded_param_cpu_function(*args, **kwargs):
-                bucket_id = all_gather_pipeline.buffer.param_to_param_group[p]
-                status = all_gather_pipeline.bucket_status[bucket_id]
-                if status == BucketStatus.READY_TO_USE:
-                    return cpu_function(*args, **kwargs)
-                warnings.warn(
-                    "The parameters are sharded by MCore FSDP, and no actual cpu "
-                    "operation is performed."
-                )
-                return torch.empty([], device="cpu")
+                if p._typed_storage()._size() == 0:
+                    warnings.warn(
+                        "The parameter may be sharded by Megatron-FSDP, "
+                        "no actual 'cpu' operation is performed."
+                    )
+                    return torch.empty([], device="cpu")
+                return cpu_function(*args, **kwargs)
 
             return override_sharded_param_cpu_function
 
@@ -3743,7 +3739,9 @@ def make_fsdp_dtensor(
     orig_param = param
 
     # Handle tensor model parallel specific logic
-    if is_mcore_tensor_model_parallel(param):
+    if not isinstance(param, DTensor) and using_tensor_parallel(
+        dist_index, is_expert_parallel=is_expert_param
+    ):
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
             "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel " "is True."
@@ -3751,35 +3749,34 @@ def make_fsdp_dtensor(
 
         tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
         global_shape = list(param.shape)
-        if tp_mesh.mesh.numel() > 1:
-            if is_mcore_tensor_parallel_duplicated(param):
-                placements = [Replicate()]
-                if force_sync_tp_duplicated_param:
-                    if local_tensor.numel() > 0:
-                        torch.distributed.broadcast(
-                            local_tensor, group=tp_mesh.get_group(), group_src=0
-                        )
-                elif run_check:
-                    # TODO: Implement consistency check for duplicated TP parameters
-                    pass
-            else:
-                tp_dim = get_mcore_tensor_parallel_partition_dim(param)
-                assert tp_dim is not None, (
-                    "[Megatron-FSDP] Parameter is not tensor model parallel, "
-                    "yet tensor_model_parallel is True."
-                )
-                placements = [Shard(tp_dim)]
-                global_shape[tp_dim] *= tp_mesh.mesh.numel()
-
-            # Construct TP-sharded DTensor using Megatron-style placement
-            param = DTensor.from_local(
-                local_tensor=local_tensor,
-                device_mesh=tp_mesh,
-                placements=placements,
-                run_check=run_check,
-                shape=global_shape,
-                stride=torch.empty(global_shape).stride(),
+        if is_mcore_tensor_parallel_duplicated(param):
+            placements = [Replicate()]
+            if force_sync_tp_duplicated_param:
+                if local_tensor.numel() > 0:
+                    torch.distributed.broadcast(
+                        local_tensor, group=tp_mesh.get_group(), group_src=0
+                    )
+            elif run_check:
+                # TODO: Implement consistency check for duplicated TP parameters
+                pass
+        else:
+            tp_dim = get_mcore_tensor_parallel_partition_dim(param)
+            assert tp_dim is not None, (
+                "[Megatron-FSDP] Parameter is not tensor model parallel, "
+                "yet tensor_model_parallel is True."
             )
+            placements = [Shard(tp_dim)]
+            global_shape[tp_dim] *= tp_mesh.mesh.numel()
+
+        # Construct TP-sharded DTensor using Megatron-style placement
+        param = DTensor.from_local(
+            local_tensor=local_tensor,
+            device_mesh=tp_mesh,
+            placements=placements,
+            run_check=False,
+            shape=global_shape,
+            stride=torch.empty(global_shape).stride(),
+        )
 
     # Get FSDP-configured mesh and placements from provided param
     device_mesh, placements = _get_fsdp_tensor_spec(
