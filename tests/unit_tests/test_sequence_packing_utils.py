@@ -91,8 +91,9 @@ def test_sequence_packing_basic():
 
     rewards = torch.tensor([1.0, 2.0, 3.0, 4.0])
 
+    sequences_tensor = torch.stack(sequences)
     packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info = (
-        packer.pack_sequences(sequences, generation_masks)
+        packer.pack_sequences(sequences_tensor, generation_masks)
     )
 
     assert packed_trajs is not None
@@ -133,8 +134,9 @@ def test_sequence_packing_with_generation_masks():
         [False, True, True, True, True],
     ])
 
+    padded_sequences_tensor = torch.stack(padded_sequences)
     packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info = (
-        packer.pack_sequences(padded_sequences, generation_masks)
+        packer.pack_sequences(padded_sequences_tensor, generation_masks)
     )
 
     assert packed_trajs.shape[0] == 1
@@ -211,8 +213,9 @@ def test_sequence_packing_integration():
         torch.tensor([False, True, True, True, True]),
     ]
 
+    sequences_tensor = torch.stack(sequences)
     packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info = (
-        packer.pack_sequences(sequences, generation_masks)
+        packer.pack_sequences(sequences_tensor, generation_masks)
     )
 
     assert packed_trajs is not None

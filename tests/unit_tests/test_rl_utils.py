@@ -1,5 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
+os.environ['WANDB_MODE'] = "disabled"
+os.environ['LOG_TO_WANDB'] = "false"
+os.environ['WORLD_SIZE'] = "1"
+os.environ['LOCAL_RANK'] = "0"
+
 from unittest.mock import patch
 
 import torch
@@ -11,6 +17,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.enums import ModelType
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils, sequence_packing_utils
@@ -29,6 +36,7 @@ class MockModel(LanguageModule):
         self.seq = seq
         self.vocab = vocab
         self.config = TransformerConfig(num_attention_heads=1, num_layers=1)
+        self.model_type = ModelType.encoder_or_decoder
 
     def __call__(self, x, position_ids, attention_mask, **kwargs):
         del position_ids
@@ -46,6 +54,9 @@ class MockModel(LanguageModule):
     def state_dict(self):
         return {}
 
+    def set_input_tensor(self, input_tensor):
+        pass
+
 
 class MockTokenizer:
     def __init__(self):
@@ -62,6 +73,7 @@ class MockTokenizer:
 def mock_pipeline_stuff():
     with patch('megatron.rl.rl_utils.is_pipeline_last_stage', return_value=True):
         yield
+
 
 
 def test_get_logprobs():
@@ -311,6 +323,72 @@ def test_grpo_loss_truncation():
     # ratios: [[2., 0.5],[20., 1.]]
     torch.testing.assert_close(truncated_from_above, torch.tensor([[True, False], [True, False]]))
     torch.testing.assert_close(truncated_from_below, torch.tensor([[False, True], [False, False]]))
+
+def test_prepare_data_for_update():
+    """Test that getting logprobs at least does not crash."""
+    Utils.initialize_model_parallel()
+
+    args = arguments.parse_args(ignore_unknown_args=True)
+    setattr(args, 'data_parallel_size', 1)
+    setattr(args, 'micro_batch_size', 2)
+    setattr(args, 'global_batch_size', 2)
+    setattr(args, 'seq_length', 4)
+    setattr(args, 'curr_iteration', 1)
+    global_vars.unset_global_variables()
+    global_vars.set_global_variables(args, build_tokenizer=False)
+
+    model = MockModel()
+    tokenizer = MockTokenizer()
+
+    try:
+        r1 = TokenRollout(
+            trajectory=[1, 2, 3],
+            reward=3.14,
+            generation_mask=[False, True, True],
+            logprobs=[0.1, 0.2, 0.3],
+            env_id='MEGAENV',
+            problem_id="2",
+        )
+        r2 = TokenRollout(
+            trajectory=[1, 2, 3, 4],
+            reward=0.14,
+            generation_mask=[False, True, True, True],
+            logprobs=[0.1, 0.2, 0.3, -1.2],
+            env_id='MEGAENV',
+            problem_id="2",
+        )
+        rollouts = [[r1, r2]]
+        try:
+            data_iter = rl_utils.prepare_data_for_update([model], {}, rollouts, tokenizer)
+        except AssertionError as e:
+            # We expect trajectories to come padded there.
+            assert str(e).startswith('Rollout is not the correct length')
+
+        r1 = TokenRollout(
+            trajectory=torch.Tensor([1, 2, 3, tokenizer.eod]).cuda(),
+            reward=3.14,
+            generation_mask=torch.Tensor([False, True, True, True]).cuda(),
+            logprobs=torch.Tensor([-0.2, -0.3, -3.2]).cuda(),
+            env_id='MEGAENV',
+            problem_id="2",
+        )
+        r2 = TokenRollout(
+            trajectory=torch.Tensor([1, 2, 234, tokenizer.eod]).cuda(),
+            reward=0.14,
+            generation_mask=torch.Tensor([False, True, True, True]).cuda(),
+            logprobs=torch.Tensor([-0.2, -0.3, -1.2]),
+            env_id='MEGAENV',
+            problem_id="2",
+        )
+        rollouts = [[r1, r2]]
+        data_iter = rl_utils.prepare_data_for_update([model], {}, rollouts, tokenizer)
+
+        _, _, old_logprobs, _, _, _, _ = next(data_iter)
+        # All logits are ones in the MockModel.
+        # All probabilities should be uniform.
+        torch.testing.assert_close(old_logprobs.exp(), torch.ones_like(old_logprobs) / VOCAB)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @patch('torch.distributed.get_rank', return_value=0)
