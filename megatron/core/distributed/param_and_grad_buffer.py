@@ -774,11 +774,9 @@ class _ParamAndGradBuffer:
             if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 # Assign param.data to appropriate segment of self.param_data.
                 if self.param_data is not None:
-                    new_param_data = self._get(
-                        param.data.shape, param_start_index, buffer_type=BufferType.PARAM
-                    )
                     if is_nvfp4tensor(param):
                         # NVFP4 2D: map only rowwise packed bytes (uint8) into the param buffer
+                        # Buffer was allocated with packed size, so use packed_shape for _get
                         from ..fp4_utils import modify_nvfp4_rowwise_storage
                         packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
                         rowwise_bytes_view = self._get(
@@ -786,8 +784,14 @@ class _ParamAndGradBuffer:
                         )
                         modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
                     elif is_float8tensor(param):
+                        new_param_data = self._get(
+                            param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                        )
                         modify_underlying_storage(param, new_param_data)
                     else:
+                        new_param_data = self._get(
+                            param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                        )
                         old_param_data = param.data
                         param.data = new_param_data
                         assert old_param_data._base is None
