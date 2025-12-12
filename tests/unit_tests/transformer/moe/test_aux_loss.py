@@ -654,8 +654,8 @@ class TestPaddingMaskAuxLoss:
             )
 
             # Create padding mask: first half valid, second half padding
-            padding_mask = torch.ones((seq_len, batch_size), dtype=torch.bool, device='cuda')
-            padding_mask[seq_len // 2 :, :] = False
+            padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')
+            padding_mask[seq_len // 2 :, :] = True
 
             # Test with padding mask
             router.weight.grad = None
@@ -725,8 +725,8 @@ class TestPaddingMaskAuxLoss:
             )
 
             # Create padding mask: first half valid, second half padding
-            padding_mask = torch.ones((seq_len, batch_size), dtype=torch.bool, device='cuda')
-            padding_mask[seq_len // 2 :, :] = False
+            padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')
+            padding_mask[seq_len // 2 :, :] = True
 
             # Test with padding mask
             router.weight.grad = None

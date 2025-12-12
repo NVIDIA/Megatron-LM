@@ -264,7 +264,7 @@ class MoELayer(BaseMoELayer):
         4. Combine: The outputs from the experts are combined and returned.
 
         Args:
-            hidden_states (torch.Tensor): The input tensor to the MoE layer.
+            hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
@@ -276,6 +276,9 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, padding_mask=None):

@@ -434,6 +434,9 @@ class GPTModel(LanguageModule):
         Args:
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
+            padding_mask (Tensor, optional): Padding mask for MoE routing.
+                Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
+                Only used for MoE layers to exclude padding tokens from routing computations.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
