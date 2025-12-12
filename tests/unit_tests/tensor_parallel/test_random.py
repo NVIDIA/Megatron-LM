@@ -5,6 +5,7 @@ from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
     checkpoint,
+    convert_cuda_rng_state,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
@@ -31,6 +32,98 @@ def test_cuda_rng_states_tracker():
     torch.cuda.manual_seed(seed)
     rng_state = torch.cuda.get_rng_state()
     assert torch.equal(rng_tracker.get_states()['state2'], rng_state)
+
+
+def test_convert_cuda_rng_state():
+    ## Get the default rng state
+    torch.cuda.manual_seed(999)
+    randn = torch.randn(10, device="cuda")
+    rng_state = torch.cuda.get_rng_state()
+
+    try:
+        from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
+    except ImportError:
+        TECudaRNGStatesTracker = None
+
+    ## from non-graphable RNG to graphable RNG
+    # get state from non-graphable RNG
+    tracker = CudaRNGStatesTracker(use_cudagraphable_rng=False)
+    tracker.add("state1", 123)
+    for i in range(3):
+        with tracker.fork("state1"):
+            randn = torch.randn(10, device="cuda")
+    state = convert_cuda_rng_state(tracker.states_["state1"], to_graphable=True)
+    rand_tensors = []
+    for i in range(3):
+        with tracker.fork("state1"):
+            randn = torch.randn(10, device="cuda")
+            rand_tensors.append(randn)
+
+    # set state to local graph RNG
+    cudagraphable_tracker = CudaRNGStatesTracker(use_cudagraphable_rng=True)
+    cudagraphable_tracker.set_states({"state1": state.clone_state()})
+    for i in range(3):
+        with cudagraphable_tracker.fork("state1"):
+            randn = torch.randn(10, device="cuda")
+            assert torch.equal(randn, rand_tensors[i])
+
+    # set state to TE RNG
+    if TECudaRNGStatesTracker is not None:
+        te_tracker = TECudaRNGStatesTracker()
+        te_tracker.set_states({"state1": state})
+        for i in range(3):
+            with te_tracker.fork("state1"):
+                randn = torch.randn(10, device="cuda")
+                assert torch.equal(randn, rand_tensors[i])
+
+    ## from graphable RNG to non-graphable RNG
+    # get state from graphable RNG
+    cudagraphable_tracker = CudaRNGStatesTracker(use_cudagraphable_rng=True)
+    cudagraphable_tracker.add("state2", 123)
+    for i in range(3):
+        with cudagraphable_tracker.fork("state2"):
+            randn = torch.randn(10, device="cuda")
+    state = convert_cuda_rng_state(cudagraphable_tracker.states_["state2"], to_graphable=False)
+    rand_tensors = []
+    for i in range(3):
+        with cudagraphable_tracker.fork("state2"):
+            randn = torch.randn(10, device="cuda")
+            rand_tensors.append(randn)
+
+    # set state to non-graphable RNG
+    tracker = CudaRNGStatesTracker(use_cudagraphable_rng=False)
+    tracker.set_states({"state2": state})
+    for i in range(3):
+        with tracker.fork("state2"):
+            randn = torch.randn(10, device="cuda")
+            assert torch.equal(randn, rand_tensors[i])
+
+    ## from TE RNG to non-graphable RNG
+    if TECudaRNGStatesTracker is not None:
+        # get state from TE RNG
+        cudagraphable_tracker = TECudaRNGStatesTracker()
+        cudagraphable_tracker.add("state3", 123)
+        for i in range(3):
+            with cudagraphable_tracker.fork("state3"):
+                randn = torch.randn(10, device="cuda")
+        state = convert_cuda_rng_state(cudagraphable_tracker.states_["state3"], to_graphable=False)
+        rand_tensors = []
+        for i in range(3):
+            with cudagraphable_tracker.fork("state3"):
+                randn = torch.randn(10, device="cuda")
+                rand_tensors.append(randn)
+
+        # set state to non-graphable RNG
+        tracker = CudaRNGStatesTracker(use_cudagraphable_rng=False)
+        tracker.set_states({"state3": state})
+        for i in range(3):
+            with tracker.fork("state3"):
+                randn = torch.randn(10, device="cuda")
+                assert torch.equal(randn, rand_tensors[i])
+
+    ## After all tests, check if the default rng state is still the same.
+    rng_state_final = torch.cuda.get_rng_state()
+    assert torch.equal(rng_state, rng_state_final)
 
 
 def test_model_parallel_cuda_manual_seed():
