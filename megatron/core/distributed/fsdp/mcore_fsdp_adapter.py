@@ -123,6 +123,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.broadcast_params = self.module.broadcast_params
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
+        self.module.config = config
 
         self.sync_rng_states_across_tp_group()
 
