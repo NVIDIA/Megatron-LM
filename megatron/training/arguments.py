@@ -1535,6 +1535,11 @@ def _add_inference_args(parser):
                        type=int, default=256,
                        help='KV cache block size. '
                        'It should be a multiple of 256')
+    group.add_argument('--inference-dynamic-batching-max-requests',
+                       type=int, default=None,
+                       help='Override the inference context\'s `max_requests`. '
+                       'By default, `max_requests` is set to the number of '
+                       'blocks in the context\'s memory buffer.')
     group.add_argument('--inference-dynamic-batching-max-tokens',
                        type=int, default=None,
                        help='Override the inference context\'s default `max_tokens`.')
