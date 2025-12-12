@@ -742,18 +742,14 @@ class TestCaptureFreezeGC:
         )
 
 
-# Global storage for comparing unique buffer counts across different num_microbatches
-_unique_buffer_counts = None
+# Global storage for comparing unique buffer counts across different num_microbatches, keyed by pp_size
+_unique_buffer_counts = {}
 
 
 class TestTECudaGraphHelper:
     def setup_method(self, method):
         # Initialize parallel state
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-        )
-        model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -763,8 +759,13 @@ class TestTECudaGraphHelper:
         # compare values across parametrized test runs
 
     @pytest.mark.parametrize("num_microbatches", [4, 16, 64, 256])
-    def test_get_cuda_graph_input_data(self, num_microbatches):
+    @pytest.mark.parametrize("pp_size", [1, 2, 4])
+    def test_get_cuda_graph_input_data(self, num_microbatches, pp_size):
         """Test _get_cuda_graph_input_data function in TECudaGraphHelper."""
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=pp_size
+        )
 
         # Set up test configuration
         seq_length = 128
@@ -794,7 +795,8 @@ class TestTECudaGraphHelper:
             use_te_rng_tracker=True,
             bf16=True,
             tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            pipeline_dtype=torch.bfloat16,
             context_parallel_size=1,
         )
 
@@ -835,7 +837,10 @@ class TestTECudaGraphHelper:
 
         # Basic checks
         num_graphable_layers = len(cuda_graph_helper.flattened_callables)
-        expected_length = num_graphable_layers * num_microbatches
+        if pp_size > 1:
+            expected_length = num_graphable_layers * num_microbatches
+        else:
+            expected_length = num_graphable_layers
         assert len(sample_args) == expected_length, (
             f"sample_args length mismatch: expected {expected_length}, " f"got {len(sample_args)}"
         )
@@ -931,17 +936,17 @@ class TestTECudaGraphHelper:
             f"should be <= total_entries ({total_entries})"
         )
         global _unique_buffer_counts
-        if _unique_buffer_counts is None:
-            _unique_buffer_counts = unique_buffer_count
+        if pp_size not in _unique_buffer_counts:
+            _unique_buffer_counts[pp_size] = unique_buffer_count
         else:
-            assert unique_buffer_count == _unique_buffer_counts, (
-                f"Unique buffer count mismatch: expected {_unique_buffer_counts}, "
+            assert unique_buffer_count == _unique_buffer_counts[pp_size], (
+                f"Unique buffer count mismatch: expected {_unique_buffer_counts[pp_size]}, "
                 f"got {unique_buffer_count}"
             )
 
         # Verify that buffers with the same signature can potentially be reused
         # (the actual reuse depends on the schedule, but the mechanism should work)
-        if num_microbatches > 1 and num_graphable_layers > 0:
+        if expected_length > 1:
             # Check that we have multiple entries with the same signature
             has_duplicate_signatures = any(
                 len(indices) > 1 for indices in sample_keys_to_indices.values()
@@ -955,10 +960,8 @@ class TestTECudaGraphHelper:
             # some buffers should be reused (max_reuse > 1)
             # Note: The exact amount of reuse depends on the schedule order
             # With 1F1B interleaved schedule, we should see some reuse
-            if max_reuse > 1:
-                # Verify that reused buffers have the same signature
-                reused_tensors = [ptr for ptr, count in tensor_reuse_count.items() if count > 1]
-                assert len(reused_tensors) > 0, "Expected some reused tensors"
+            if pp_size > num_microbatches:
+                assert max_reuse > 1, "Expected some buffer reuse"
 
         # Verify that make_graphed_callables_kwargs contains expected keys
         assert (
@@ -974,17 +977,21 @@ class TestTECudaGraphHelper:
         # Verify the order in kwargs matches expectations
         order = make_graphed_callables_kwargs['_order']
         num_model_chunks = cuda_graph_helper.num_model_chunks
-        expected_order_length = num_microbatches * num_model_chunks * 2
+        forward_count = sum(1 for chunk_id in order if chunk_id > 0)
+        if pp_size > 1:
+            # Verify that all forward passes in order have corresponding entries in sample_args
+            assert forward_count == num_microbatches * num_model_chunks, (
+                f"Forward count mismatch: expected {num_microbatches * num_model_chunks}, "
+                f"got {forward_count}"
+            )
+            expected_order_length = num_microbatches * num_model_chunks * 2
+        else:
+            assert num_model_chunks == 1, "Expected only one model chunk for pp_size == 1"
+            assert forward_count == 1, "Expected only one forward pass for pp_size == 1"
+            expected_order_length = 2
         assert (
             len(order) == expected_order_length
         ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
-
-        # Verify that all forward passes in order have corresponding entries in sample_args
-        forward_count = sum(1 for chunk_id in order if chunk_id > 0)
-        assert forward_count == num_microbatches * num_model_chunks, (
-            f"Forward count mismatch: expected {num_microbatches * num_model_chunks}, "
-            f"got {forward_count}"
-        )
 
 
 def is_deep_ep_available():

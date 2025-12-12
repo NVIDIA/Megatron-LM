@@ -49,6 +49,8 @@ logger = logging.getLogger(__name__)
      num_global_tokens: num_local_tokens*TP*EP
 """
 
+logger = logging.getLogger(__name__)
+
 
 class MoETokenDispatcher:
     """
@@ -983,11 +985,8 @@ class _HybridEPManager(_DispatchManager):
         if self.drop_and_pad:
             assert self.capacity_factor is not None
         self.capacity = None
-        # The up-bound for the number of tokens after dispatch op, -1 means no up-bound,
-        # which will cause a CPU sync
-        self.num_dispatched_tokens = None
-        # Actually the sum of tokens_per_expert, the up-bound for the number of tokens
-        # after permute op, -1 means no up-bound, will cause a CPU sync
+        # Actually the the up-bound for the number of tokens
+        # after permute op, None means no up-bound, will cause a CPU sync
         self.num_permuted_tokens = None
 
         # Metadata
@@ -1016,12 +1015,9 @@ class _HybridEPManager(_DispatchManager):
                 num_experts=self.num_experts,
                 capacity_factor=self.capacity_factor,
             )
-            # We cannot predict the actual number of tokens after the dispatch op,
-            # so we set it to the worst case in drop_and_pad mode
-            self.num_dispatched_tokens = self.capacity * self.group.size() * self.num_local_experts
             # In drop_and_pad mode, the number of tokens after the permute op
             # can be computed on the CPU
-            self.num_permuted_tokens = self.num_dispatched_tokens
+            self.num_permuted_tokens = self.capacity * self.group.size() * self.num_local_experts
             self.tokens_per_expert = torch.full(
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
@@ -1050,7 +1046,6 @@ class _HybridEPManager(_DispatchManager):
                 num_local_experts=self.num_local_experts,
                 num_sms_dispatch_api=self.config.moe_hybridep_num_sms,
                 num_sms_combine_api=self.config.moe_hybridep_num_sms,
-                num_dispatched_tokens=self.num_dispatched_tokens,
                 num_permuted_tokens=self.num_permuted_tokens,
                 pad_multiple=self.pad_multiple,
             )
@@ -1072,7 +1067,6 @@ class _HybridEPManager(_DispatchManager):
         hidden_states = hybrid_ep_combine(
             x=hidden_states,
             handle=self.handle,
-            num_dispatched_tokens=self.num_dispatched_tokens,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
@@ -1082,7 +1076,6 @@ class _HybridEPManager(_DispatchManager):
         self.handle = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None
-            self.num_dispatched_tokens = None
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1274,7 +1267,6 @@ class _DeepepManager(_DispatchManager):
         # Check if there are enough tokens to pad
         enough_tokens_to_pad = torch.all(target_tokens_per_expert <= num_input_tokens)
         if not enough_tokens_to_pad:
-            logger = logging.getLogger(__name__)
             logger.warning(
                 "Not enough tokens to pad. The total number of tokens received in this rank "
                 "is smaller than the target number of tokens for each expert. "

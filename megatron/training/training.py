@@ -2,6 +2,7 @@
 
 """Pretrain utilities."""
 
+import copy
 import dataclasses
 from datetime import datetime, timedelta
 import functools
@@ -11,7 +12,7 @@ import logging
 import math
 import os
 import sys
-from typing import List, Optional
+from typing import Any, Optional
 
 import torch.distributed
 
@@ -33,7 +34,7 @@ try:
 except ImportError:
     has_rl_utils = False
 try:
-    from megatron.post_training.algos.distillation import (
+    from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
     )
 
@@ -48,8 +49,12 @@ except ImportError:
 
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_linear_attention_variant,
+)
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    get_attr_wrapped_model,
     get_model_config,
     StragglerDetector,
 )
@@ -76,7 +81,7 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
@@ -88,7 +93,8 @@ from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
-from megatron.legacy.data.data_samplers import build_pretraining_data_loader
+from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
@@ -163,21 +169,31 @@ def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
-            counts = {'M': 0, '*': 0, '-': 0}
+            counts = {'M': 0, '*': 0, '-': 0, 'E':0}
             for layer_type in args.hybrid_override_pattern:
                 if layer_type in counts:
                     counts[layer_type] += 1
-            return counts['*'], counts['M'], counts['-']
+            return counts['*'], counts['M'], counts['-'], counts['E']
         else:
             num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
             num_mlp_layers = round(args.num_layers * args.hybrid_mlp_ratio)
             num_mamba_layers = args.num_layers - num_attn_layers - num_mlp_layers
-            return num_attn_layers, num_mamba_layers, num_mlp_layers
+            num_moe_layers = 0
+            return num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers
 
     def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
         return 4 * expansion * scale_factor * batch_size * seq_len * hidden_size**2
+
+    def moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                        shared_expert_ffn_hidden_size, num_experts_routed_to, swiglu=False):
+        """Calculate FLOPs for an MoE layer."""
+        scale_factor = 3.0 / 2.0 if swiglu else 1.0
+        routed_flops = (4 * batch_size * seq_len * hidden_size *
+                        moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+        shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+        return routed_flops + shared_flops
 
     def attn_layer_flops(
         batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
@@ -217,12 +233,13 @@ def num_floating_point_operations(args, batch_size):
         )
 
     def hybrid_flops(batch_size, seq_len, hidden_size,
-                     num_attn_layers, num_mamba_layers, num_mlp_layers,
+                     num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
-                     num_attn_heads=32,gqa=True,
+                     num_attn_heads=32, gqa=True,
                      gqa_groups=8, kv_channels=None,
                      mlp_expansion=4.0, swiglu=False,
+                     moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
                      vocab_size=256000):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
@@ -233,6 +250,8 @@ def num_floating_point_operations(args, batch_size):
                 num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
                                                      mamba_state_dim, mamba_head_dim,
                                                      mamba_num_groups, mamba_num_heads) +
+                num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                                                 shared_expert_ffn_hidden_size, num_experts_routed_to, swiglu) +
                 (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
         )
         return flops_fwd * 3
@@ -377,8 +396,7 @@ def num_floating_point_operations(args, batch_size):
                 )
             )
 
-        linear_attention_variants = ["gated_delta_net"]
-        if args.experimental_attention_variant in linear_attention_variants:
+        if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
@@ -431,7 +449,10 @@ def num_floating_point_operations(args, batch_size):
                     )
                 )
             else:
-                raise ValueError(f"Invalid linear_attention_type: {args.linear_attention_type}")
+                raise ValueError(
+                    "Invalid experimental_attention_variant: "
+                    f"{args.experimental_attention_variant}"
+                )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -482,7 +503,7 @@ def num_floating_point_operations(args, batch_size):
     # Main entrypoint for FLOPs calculation.
     if args.is_hybrid_model:
         # Calculate the number of each type of layer.
-        num_attn_layers, num_mamba_layers, num_mlp_layers = calculate_layer_counts()
+        num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = calculate_layer_counts()
 
         # Compute hybrid model FLOPs.
         return hybrid_flops(
@@ -492,6 +513,7 @@ def num_floating_point_operations(args, batch_size):
             num_attn_layers=num_attn_layers,
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
+            num_moe_layers=num_moe_layers,
             mamba_state_dim=args.mamba_state_dim,
             mamba_head_dim=args.mamba_head_dim,
             mamba_num_groups=args.mamba_num_groups,
@@ -502,6 +524,11 @@ def num_floating_point_operations(args, batch_size):
             kv_channels=args.kv_channels,
             mlp_expansion=args.ffn_hidden_size / args.hidden_size,
             swiglu=args.swiglu,
+            moe_ffn_hidden_size=(args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None
+                                 else args.ffn_hidden_size),
+            shared_expert_ffn_hidden_size=(0 if args.moe_shared_expert_intermediate_size is None
+                                           else args.moe_shared_expert_intermediate_size),
+            num_experts_routed_to=args.moe_router_topk,
             vocab_size=args.padded_vocab_size,
         )
     else:
@@ -596,30 +623,6 @@ def preprocess_common_state_dict(common_state_dict):
 
     return preprocessed_common_state_dict
 
-
-def get_no_weight_decay_cond(no_weight_decay_cond_type, default_skip_embedding_weight_decay):
-    """Get the no weight decay condition function."""
-
-    # Default case: no_weight_decay_cond_type is None
-    no_weight_decay_cond_fn = None
-
-    if no_weight_decay_cond_type == 'apply_wd_to_qk_layernorm':
-        # Qwen3-Next applies weight decay to qk layernorm as a special case
-        def apply_wd_to_qk_layernorm_fn(name, param):
-            if "q_layernorm" in name or "k_layernorm" in name:
-                no_wd = False
-            else:
-                no_wd = (
-                    name.endswith(".bias")
-                    or len(param.shape) == 1
-                    or (default_skip_embedding_weight_decay and "embedding" in name)
-                )
-            return no_wd
-        no_weight_decay_cond_fn = apply_wd_to_qk_layernorm_fn
-    elif no_weight_decay_cond_type is not None:
-        raise ValueError(f"Invalid no_weight_decay_cond_type: {no_weight_decay_cond_type}")
-
-    return no_weight_decay_cond_fn
 
 def pretrain(
     train_valid_test_dataset_provider,
@@ -757,15 +760,8 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    no_weight_decay_cond = get_no_weight_decay_cond(
-        args.no_weight_decay_cond_type,
-        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
-    )
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider,
-        model_type,
-        checkpointing_context=checkpointing_context,
-        no_weight_decay_cond=no_weight_decay_cond,
+        model_provider, model_type, checkpointing_context=checkpointing_context
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -913,6 +909,9 @@ def pretrain(
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
+
+    if getattr(args, 'perform_rl_step', False):
+        rl_utils.rl_inference_interface_shutdown()
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -1179,12 +1178,45 @@ def get_optimizer_param_scheduler(optimizer):
     return opt_param_scheduler
 
 
+def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
+    """Return a Megatron optimizer config object from Megatron's arguments."""
+
+    config = None
+    if args.optimizer == 'adam' or 'muon' in args.optimizer:
+        # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
+        # So for now we keep using adam config that's back compat with old way
+        kwargs = {}
+        for f in dataclasses.fields(AdamOptimizerConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        config = AdamOptimizerConfig(**kwargs)
+    elif args.optimizer == 'sgd':
+        kwargs = {}
+        for f in dataclasses.fields(SGDOptimizerConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        config = SGDOptimizerConfig(**kwargs)
+    else:
+        raise ValueError("Invalid optimizer type!")
+
+    # Construct the appropriate config_overrides object.
+    # TODO: add more logic here as needed down the road.
+    if args.decoupled_lr is not None:
+        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
+        decoupled_optimizer_config = copy.deepcopy(config)
+        decoupled_optimizer_config.lr = args.decoupled_lr
+        if args.decoupled_min_lr is not None:
+            decoupled_optimizer_config.min_lr = args.decoupled_min_lr
+        config_overrides = {decoupled_param_key: decoupled_optimizer_config}
+    else:
+        config_overrides = None
+
+    return config, config_overrides
+
+
 def setup_model_and_optimizer(
     model_provider_func,
     model_type,
-    no_weight_decay_cond=None,
-    scale_lr_cond=None,
-    lr_mult=1.0,
     checkpointing_context=None,
 ):
     """Setup model and optimizer."""
@@ -1196,33 +1228,25 @@ def setup_model_and_optimizer(
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
+    config, config_overrides = get_megatron_optimizer_config(args)
     config.timers = timers
 
     if 'muon' not in config.optimizer:
+        # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
+        # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
+        # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
         optimizer = get_megatron_optimizer(
             config,
             model,
-            no_weight_decay_cond,
-            scale_lr_cond,
-            lr_mult,
+            config_overrides=config_overrides,
             use_gloo_process_groups=args.enable_gloo_process_groups,
-            # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
-            #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
-            default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
     else:
         optimizer = get_megatron_muon_optimizer(
             config,
             model,
-            no_weight_decay_cond,
-            scale_lr_cond,
-            lr_mult,
+            config_overrides=config_overrides,
             use_gloo_process_groups=args.enable_gloo_process_groups,
             layer_wise_distributed_optimizer='dist' in config.optimizer,
         )
@@ -1366,7 +1390,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if has_nvidia_modelopt:
             # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
-                model, args.seq_length, args.micro_batch_size, args.decoder_seq_length
+                model,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
             )
         else:
             adjust_tensor_shapes_fn = None
@@ -1450,28 +1477,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
-                if args.sft:
-                    # in mcore the normalization happens on micro batch instead of global
-                    val = torch.vstack(val)
-                    val = val[:, 0] / val[:, 1]
-                    val = val.mean()
-                    torch.distributed.all_reduce(
-                        val,
-                        group=mpu.get_data_parallel_group(with_context_parallel=True)
-                    )
-                    val /= torch.distributed.get_world_size(
-                        group=mpu.get_data_parallel_group(with_context_parallel=True)
-                    )
-                    loss_reduced[key] = val
-                else:
-                    # there is one dict per microbatch. in new reporting, we average
-                    # over the total number of tokens across the global batch.
-                    val = torch.vstack(val).sum(dim=0)
-                    torch.distributed.all_reduce(
-                        val,
-                        group=mpu.get_data_parallel_group(with_context_parallel=True)
-                    )
-                    loss_reduced[key] = val[0] / val[1]
+                # there is one dict per microbatch. in new reporting, we average
+                # over the total number of tokens across the global batch.
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(
+                    val,
+                    group=mpu.get_data_parallel_group(with_context_parallel=True)
+                )
+                loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
@@ -1495,7 +1508,6 @@ def training_log(
     loss_dict,
     total_loss_dict,
     learning_rate,
-    decoupled_learning_rate,
     iteration,
     loss_scale,
     report_memory_flag,
@@ -1504,6 +1516,7 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1600,8 +1613,6 @@ def training_log(
         writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'learning-rate': learning_rate}, iteration)
-        if args.decoupled_lr is not None:
-            writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
         if args.skipped_train_samples > 0:
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
@@ -1681,6 +1692,12 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
+
+        if args.is_hybrid_model:
+            layers = args.hybrid_override_pattern.count('E')
+        else:
+            layers = args.num_layers
+
         track_moe_metrics(
             loss_scale=moe_loss_scale,
             iteration=iteration,
@@ -1690,9 +1707,10 @@ def training_log(
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
-            num_layers=args.num_layers,
+            num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
+            pg_collection=pg_collection,
         )
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
@@ -1761,14 +1779,6 @@ def training_log(
                 wandb_writer.log({'power/gpu': power}, iteration)
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f' learning rate: {learning_rate:.6E} |'
-        if args.decoupled_lr is not None and (
-            mpu.is_pipeline_first_stage(ignore_virtual=True)
-            or mpu.is_pipeline_last_stage(ignore_virtual=True)
-        ):
-            assert decoupled_learning_rate is not None
-            log_string += f' decoupled learning rate: {decoupled_learning_rate:.6E} |'
-        else:
-            assert decoupled_learning_rate is None
         log_string += f' global batch size: {batch_size:5d} |'
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
@@ -2170,6 +2180,9 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
+    if args.hybrid_context_parallel:
+        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
+
     if args.run_workload_inspector_server:
         try:
             from workload_inspector.utils.webserver import run_server
@@ -2187,6 +2200,8 @@ def train(
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()
+
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
 
     # Tracking loss.
     total_loss_dict = {}
@@ -2442,6 +2457,8 @@ def train(
                 train_data_iterator = rl_utils.setup_grpo_data_iterator(
                     model, optimizer, iteration, ref_state_dict, buffered_rollouts
                 )
+                # Buffered rollouts are used as a state container for setups when
+                # we use previously-generated data for an update.
                 buffered_rollouts = train_data_iterator
 
         ft_integration.on_training_step_start()
@@ -2538,19 +2555,15 @@ def train(
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
         learning_rate = None
-        decoupled_learning_rate = None
         for param_group in optimizer.param_groups:
             if len(param_group['params']) == 0:
                 continue
-            if param_group['is_decoupled_lr']:
-                decoupled_learning_rate = param_group['lr']
-            else:
+            if param_group['default_config']:
                 learning_rate = param_group['lr']
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
             learning_rate,
-            decoupled_learning_rate,
             iteration,
             loss_scale,
             report_memory_flag,
@@ -2559,6 +2572,7 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            pg_collection=model_pg_collection,
         )
 
         # Evaluation.
@@ -2661,6 +2675,8 @@ def train(
             wandb_writer.finish()
         ft_integration.shutdown()
         one_logger_utils.finish()
+        if getattr(args, 'perform_rl_step', False):
+            rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
 
     return iteration, num_floating_point_operations_so_far
@@ -2981,34 +2997,40 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     # Construct the data pipeline
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
-        # Build datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None,
-            vp_stage=vp_stage,
-        )
-        valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+        # Build datasets and dataloders.
+        if getattr(args, 'perform_rl_step', True):
+            # we don't need to build any dataloaders for RL training
+            train_dataloader = None
+            valid_dataloaders = None
+            test_dataloader = None
+            do_train = args.train_iters > 0
+            do_valid = (args.full_validation or args.eval_iters > 0)
+            do_test = (args.full_validation or args.eval_iters > 0)
+        else:
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+                build_train_valid_test_datasets_provider,
+                vp_stage=vp_stage,
+            )
+            valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+            if not args.skip_train:
+                train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+            valid_dataloaders = []
+            for valid_d in valid_ds:
+                if args.skip_train or args.full_validation:
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                else:
+                    if args.multiple_validation_sets:
+                        # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                        # correct and needs to be calculated/set per validation set
+                        raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+            if not args.multiple_validation_sets:
+                assert len(valid_dataloaders) == 1
+            test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            do_train = train_dataloader is not None and args.train_iters > 0
+            do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
+            do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 
-        # Build dataloders.
-        train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
-
-        valid_dataloaders = []
-        for valid_d in valid_ds:
-            if args.skip_train or args.full_validation:
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
-            else:
-                if args.multiple_validation_sets:
-                    # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                    # correct and needs to be calculated/set per validation set
-                    raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
-        if not args.multiple_validation_sets:
-            assert len(valid_dataloaders) == 1
-        test_dataloader = build_pretraining_data_loader(test_ds, 0)
-
-        # Flags to know if we need to do training/validation/testing.
-        do_train = train_dataloader is not None and args.train_iters > 0
-        do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
-        do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
         )
