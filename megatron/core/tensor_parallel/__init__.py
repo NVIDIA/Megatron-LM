@@ -29,6 +29,7 @@ from .mappings import (
 from .random import (
     CheckpointWithoutOutput,
     checkpoint,
+    convert_cuda_rng_state,
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
     get_expert_parallel_rng_tracker_name,
@@ -64,6 +65,7 @@ __all__ = [
     "scatter_to_sequence_parallel_region",
     # random.py
     "checkpoint",
+    "convert_cuda_rng_state",
     "get_cuda_rng_tracker",
     "model_parallel_cuda_manual_seed",
     "get_expert_parallel_rng_tracker_name",
