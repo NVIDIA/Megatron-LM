@@ -96,7 +96,7 @@ def get_dynamic_inference_engine(
     args: Namespace,
     model: MegatronModule,
     inference_logging_step_interval: int = 0,
-    metrics_writer=None,
+    metrics_writer = None
 ) -> AbstractEngine:
     """Get the relevant backend for running inference.
 
