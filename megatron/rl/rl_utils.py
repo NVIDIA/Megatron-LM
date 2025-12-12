@@ -40,7 +40,8 @@ from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import get_asyncio_loop, log_single_rank
 from megatron.rl.sequence_packing_utils import (
     get_microbatch_dataloader,
-    pack_inference_logprobs, 
+    pack_inference_logprobs,
+    compute_packed_inference_logprobs_stats,
     pack_all_trajectories,
     load_packed_data_by_index,
     update_sequence_packing_metrics,
@@ -990,8 +991,9 @@ def prepare_data_for_update(
                 packing_context.old_logprobs = old_logprobs.cuda()
                 packing_context.ref_logprobs = ref_logprobs.cuda()
 
-                if inference_logprobs is not None and args.rl_inference_logprobs_is_correction:
+                if inference_logprobs is not None:
                     # Pack the inference logprobs using the helper function
+                    # We do this for logging purposes even if is_correction is disabled
                     packed_inference_logprobs = pack_inference_logprobs(
                         inference_logprobs=packing_context.original_inference_logprobs,
                         packing_info=packing_context.packing_info,
@@ -999,9 +1001,18 @@ def prepare_data_for_update(
                         bin_size=args.seq_length,
                     )
 
+                    # Compute statistics for logging using packed data
+                    compute_packed_inference_logprobs_stats(
+                        old_logprobs=old_logprobs,
+                        packed_inference_logprobs=packed_inference_logprobs,
+                        packed_loss_mask=packing_context.packed_loss_mask,
+                        group_stats=group_stats,
+                    )
+
                     # Store packed inference logprobs in packing context
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
-                    packing_context.has_inference_logprobs = True
+                    # Only mark as having inference logprobs for IS correction if enabled
+                    packing_context.has_inference_logprobs = args.rl_inference_logprobs_is_correction
         else:
             with nvtx_range("align_inference_logprobs", time=True):
                 if inference_logprobs is not None:

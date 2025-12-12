@@ -85,11 +85,12 @@ def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext, log
     position_ids = packing_context.packed_position_ids[idx]
 
     # Check if we have old_logprobs and ref_logprobs as attributes
-    old_logprobs = packing_context.old_logprobs
+    # These are set after logprobs computation, so they may not exist during initial forward pass
+    old_logprobs = getattr(packing_context, 'old_logprobs', None)
     if old_logprobs is not None:
         old_logprobs = old_logprobs[idx]
     
-    ref_logprobs = packing_context.ref_logprobs
+    ref_logprobs = getattr(packing_context, 'ref_logprobs', None)
     if ref_logprobs is not None:
         ref_logprobs = ref_logprobs[idx]
         
@@ -519,6 +520,54 @@ def pack_inference_logprobs(
             ]
 
     return packed_inference_logprobs
+
+
+def compute_packed_inference_logprobs_stats(
+    old_logprobs: torch.Tensor,
+    packed_inference_logprobs: torch.Tensor,
+    packed_loss_mask: torch.Tensor,
+    group_stats: Any,
+) -> None:
+    """Compute statistics for packed inference logprobs for logging purposes.
+
+    Compares packed inference logprobs with old logprobs using the packed loss mask
+    to identify valid positions. Updates group_stats with computed metrics.
+
+    Args:
+        old_logprobs: Old logprobs tensor in packed format [num_bins, seq_len-1]
+        packed_inference_logprobs: Packed inference logprobs [num_bins, seq_len-1]
+        packed_loss_mask: Loss mask indicating valid positions [num_bins, seq_len]
+        group_stats: Statistics object to update with computed metrics
+    """
+    # Ensure all tensors are on the same device (CPU for stats computation)
+    old_logprobs = old_logprobs.cpu()
+    packed_inference_logprobs = packed_inference_logprobs.cpu()
+    packed_loss_mask = packed_loss_mask.cpu()
+
+    # Use packed_loss_mask to identify valid positions for stats (shift by 1 for logprobs)
+    mask = packed_loss_mask[:, 1:].bool()
+
+    # Ensure shapes match
+    if mask.shape != old_logprobs.shape:
+        return
+
+    n_elems = mask.sum()
+    if n_elems > 0:
+        ratios = (old_logprobs - packed_inference_logprobs).exp()[mask]
+        abs_diffs = (old_logprobs.exp() - packed_inference_logprobs.exp()).abs()[mask]
+
+        group_stats.min_piold_to_inf_prob = ratios.min().item()
+        group_stats.max_piold_to_inf_prob = ratios.max().item()
+        group_stats.mean_piold_to_inf_prob = (ratios.sum() / n_elems).item()
+        group_stats.min_inf_train_prob_abs_diff = abs_diffs.min().item()
+        group_stats.max_inf_train_prob_abs_diff = abs_diffs.max().item()
+        group_stats.mean_inf_train_prob_abs_diff = (abs_diffs.sum() / n_elems).item()
+
+        inf_probs = packed_inference_logprobs.exp()[mask]
+        group_stats.min_inf_prob = inf_probs.min().item()
+        group_stats.max_inf_prob = inf_probs.max().item()
+        group_stats.mean_inf_prob = inf_probs.mean().item()
+
 
 class SequencePacker:
     """Packs multiple sequences into bins to minimize padding and improve GPU utilization."""
