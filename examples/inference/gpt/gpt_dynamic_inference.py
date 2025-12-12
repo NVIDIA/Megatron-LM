@@ -174,6 +174,7 @@ def get_inference_context(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
@@ -617,11 +618,11 @@ def main():
         )
         print(
             f"{setup_prefix} … "
-            f"throughput: {throughput:.3f} tok/s",
+            f"throughput: {throughput:.3f} tok/s … ",
             f"total time: {total_time:.3f}s … "
             f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
             f"steps: {engine.step_count:d} … "
-            f"capture {capture_str} … "
+            f"capture {capture_str}"
         )
         print("~~~")
 

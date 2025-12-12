@@ -90,6 +90,7 @@ class DynamicEngineTestConfig:
 
     context_buffer_size_gb: float = 0.1  # enough room for all tokens.
     context_block_size_tokens: int = 256
+    context_max_requests: Optional[int] = None
     context_max_tokens: Optional[int] = None
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
@@ -223,6 +224,7 @@ class TestDynamicInferenceEngine:
             use_cuda_graphs_for_non_decode_steps=not test_config.model_provider == "mamba",
             buffer_size_gb=test_config.context_buffer_size_gb,
             block_size_tokens=test_config.context_block_size_tokens,
+            max_requests=test_config.context_max_requests,
             max_tokens=test_config.context_max_tokens,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
             mamba_inference_state_config=mamba_inference_state_config,
@@ -1345,3 +1347,28 @@ class TestDynamicInferenceEngine:
                     assert (
                         abs(log_prob - top_n_dict[token_str]) < 0.1
                     ), f"Request {request.request_id}, token {i}: log_prob mismatch {log_prob} vs {top_n_dict[token_str]}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("max_requests", [None, 4])
+    @torch.inference_mode()
+    def test_max_requests(self, max_requests: int | None):
+        """Test max requests."""
+        env = self._run_test(
+            context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
+        )
+        step_count = env.engine.step_count
+        context = env.engine.context
+        if max_requests is None:
+            assert context.max_active_requests == 408
+            assert step_count == 22
+        else:
+            assert max_requests < len(env.requests), (
+                f"Test is only useful if max_requests ({max_requests}) < "
+                f"num_requests ({len(env.requests)})."
+            )
+            assert context.max_active_requests == 4
+            assert step_count == 34
+        assert context.block_allocator.active_count == 409

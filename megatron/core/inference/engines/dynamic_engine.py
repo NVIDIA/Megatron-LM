@@ -1029,6 +1029,7 @@ class DynamicInferenceEngine(AbstractEngine):
         is_decode_only = self.context.is_decode_only()
         pre_step_context_state = {
             "is_decode_only": is_decode_only,
+            "max_active_requests": self.context.max_active_requests,
             "total_request_count": self.context.total_request_count,
             "paused_request_count": self.context.paused_request_count,
             "active_token_count": self.context.active_token_count,
@@ -1194,7 +1195,7 @@ class DynamicInferenceEngine(AbstractEngine):
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f%s ... "
-                "reqs: a %d/%d, p %d/%d, w %d, f %d ... "
+                "reqs: a %d/%d, p %d, w %d, f %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
@@ -1215,9 +1216,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     ),
                     context_state["total_request_count"] - context_state["paused_request_count"],
-                    context_state["total_active_block_count"],
+                    context_state["max_active_requests"],
                     context_state["paused_request_count"],
-                    context_state["total_paused_block_count"],
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
                     context_state["total_active_used_blocks"],
