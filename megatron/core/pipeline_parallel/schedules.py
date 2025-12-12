@@ -2,6 +2,7 @@
 
 import contextlib
 from functools import partial
+from itertools import zip_longest
 from typing import Callable, Iterator, List, Optional, Union
 
 import torch
@@ -841,6 +842,88 @@ def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, s
     if num_warmup_microbatches > 0:
         order.extend(backward_order[-num_warmup_microbatches:])
     return order
+
+
+def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
+    """
+    Get the order for overlap_moe_expert_parallel_comm schedule for the original
+    chunk-wise order list.
+    """
+
+    def _add_order(new_order, chunk_id_list, c_id, layer_id, is_wgrad=False, index=None):
+        if is_wgrad:
+            new_order.append(layer_id - 0.5)
+        else:
+            new_order.append(layer_id)
+        if c_id > 0:
+            chunk_id_list.append([abs(c_id) - 1, index])
+        else:
+            chunk_id_list.append(None)
+
+    new_order = []
+    chunk_id_list = []
+    add_order = partial(_add_order, new_order, chunk_id_list)
+    first_backward_idx, last_forward_idx = None, None
+    for idx, c_id in enumerate(order):
+        if first_backward_idx is None and c_id < 0:
+            first_backward_idx = idx
+        if c_id > 0:
+            last_forward_idx = idx
+    assert (
+        first_backward_idx is not None
+        and last_forward_idx is not None
+        and first_backward_idx < last_forward_idx
+    ), "Invalid order"
+    for idx, c_id in enumerate(order[first_backward_idx + 1 : last_forward_idx]):
+        if idx % 2 == 0:
+            assert c_id > 0, "Invalid order"
+        else:
+            assert c_id < 0, "Invalid order"
+
+    def get_layer_range(c_id):
+        num_layers = num_layers_per_chunk[abs(c_id) - 1]
+        num_layers_previous_chunks = sum(num_layers_per_chunk[: abs(c_id) - 1])
+        if c_id > 0:
+            return list(
+                range(num_layers_previous_chunks + 1, num_layers_previous_chunks + num_layers + 1)
+            )
+        return list(range(-num_layers_previous_chunks - num_layers, -num_layers_previous_chunks))
+
+    # warmup stage
+    for c_id in order[:first_backward_idx]:
+        layer_range = get_layer_range(c_id)
+        new_order += layer_range
+        chunk_id_list.extend([abs(c_id) - 1, i] for i in range(len(layer_range)))
+
+    # 1f1b overlap stage
+    for c_id_b, c_id_f in zip(
+        order[first_backward_idx : last_forward_idx + 1 : 2],
+        order[first_backward_idx + 1 : last_forward_idx + 1 : 2],
+    ):
+        layer_range_f = get_layer_range(c_id_f)
+        layer_range_b = get_layer_range(c_id_b)
+        index = 0
+        for l_b, l_f in zip_longest(layer_range_b, layer_range_f, fillvalue=0):
+            # always forward graph before backward graph
+            if l_f != 0:
+                add_order(c_id_f, l_f, index=index)
+            if l_b != 0:
+                add_order(c_id_b, l_b)
+                if capture_wgrad_graph and index < len(layer_range_b) - 1:
+                    add_order(c_id_b, l_b, is_wgrad=True)
+            index += 1
+        # last wgrad backward
+        if capture_wgrad_graph and layer_range_b:
+            add_order(c_id_b, layer_range_b[-1], is_wgrad=True)
+
+    # cool down stage, backward graphs only
+    for c_id in order[last_forward_idx + 1 :]:
+        for l_b in get_layer_range(c_id):
+            add_order(c_id, l_b)
+            if capture_wgrad_graph:
+                add_order(c_id, l_b, is_wgrad=True)
+
+    return new_order, chunk_id_list
 
 
 def forward_backward_pipelining_with_interleaving(
