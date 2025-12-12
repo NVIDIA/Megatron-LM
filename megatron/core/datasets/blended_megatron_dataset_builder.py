@@ -221,7 +221,7 @@ class BlendedMegatronDatasetBuilder(object):
                                 and self.config.fast_cache_load
                             )
                             else True
-                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load
+                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
                         megatron_datasets[i],
                         weights_i,
                         size_i,
@@ -319,7 +319,7 @@ class BlendedMegatronDatasetBuilder(object):
                                 and self.config.fast_cache_load
                             )
                             else True
-                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load
+                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
                         megatron_datasets,
                         weights,
                         size,
@@ -377,7 +377,7 @@ class BlendedMegatronDatasetBuilder(object):
         megatron_datasets = [[] for _ in range(len(Split))]
         num_dataset_builder_threads = self.config.num_dataset_builder_threads
 
-        # NOTE(asolergi-nv): Skip rank-0 first dataset building if we are using --dataloader-fast-cache-load
+        # NOTE(asolergi-nv): Skip rank-0 first dataset building if we are using --dataloader-fast-cache-load # pylint: disable=C0301
         if torch.distributed.is_initialized() and not (
             isinstance(self.config, GPTDatasetConfig) and self.config.fast_cache_load
         ):
@@ -443,7 +443,7 @@ class BlendedMegatronDatasetBuilder(object):
                 and (isinstance(self.cls, GPTDatasetConfig) and self.config.fast_cache_load)
             )
             else synchronize_ranks
-        )  # NOTE(asolergi-nv): Set synchronize_ranks to False if we are using --dataloader-fast-cache-load
+        )  # NOTE(asolergi-nv): Set synchronize_ranks to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
         # short-cut if we are not building on this rank
         if torch.distributed.is_initialized() and not self.is_built_on_rank():
             for i in range(len(Split)):
@@ -466,7 +466,7 @@ class BlendedMegatronDatasetBuilder(object):
                 indexed_indices = None
                 if not (
                     isinstance(self.config, GPTDatasetConfig) and self.config.fast_cache_load
-                ):  # NOTE(asolergi-nv): Skip indexed_indices building if we are using --dataloader-fast-cache-load
+                ):  # NOTE(asolergi-nv): Skip indexed_indices building if we are using --dataloader-fast-cache-load # pylint: disable=C0301
                     beg = int(round(split[i][0] * float(num_elements)))
                     end = int(round(split[i][1] * float(num_elements)))
                     indexed_indices = numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32)

@@ -256,7 +256,9 @@ class _IndexReader(object):
             self.dtype_size = DType.size(self.dtype)
             self.sequence_count = sequences_per_dataset[0]
             self.document_count = sequences_per_dataset[1]
-            offset = 34  # 9 bytes from the header + 8 bytes from the version + 1 bytes for the dtype code + 8 bytes for the sequence count + 8 bytes for the document count
+            offset = 34  # 9 bytes from the header + 8 bytes from the version
+            # + 1 bytes for the dtype code + 8 bytes for the sequence count
+            # + 8 bytes for the document count = 34 bytes
         else:
             with open(idx_path, "rb") as stream:
                 header = stream.read(9)
@@ -644,7 +646,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         multimodal: bool,
         mmap: bool,
         object_storage_config: Optional[ObjectStorageConfig],
-        fast_cache_load: bool,
+        fast_cache_load: bool = False,
         sequences_per_dataset: Optional[Tuple[int, int]] = None,
         dtype_code: int = None,
     ) -> None:

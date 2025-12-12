@@ -54,10 +54,14 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Option to use the fast cache loading path. Requires all the dataset caches to be built."""
 
     sequences_per_dataset: Optional[Dict[str, int]] = None
-    """If provided, the sequence and document counts for each dataset. Check --path-to-sequences-per-dataset-json"""
+    """If provided, the sequence and document counts for each dataset. 
+       Check --per-dataset-sequences-path
+    """
 
     defer_npy_index_mmap: bool = False
-    """Option to defer the mmap of the dataset indexes until the first access. Requires all the dataset caches to be built."""
+    """Option to defer the mmap of the dataset indexes until the first access.
+       Requires all the dataset caches to be built.
+    """
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -72,10 +76,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         if self.fast_cache_load:
             assert (
                 self.path_to_cache is not None
-            ), "--data-cache-path must be provided when using --dataloader-fast-cache-load"
+            ), "--data-cache-path must be provided when using --dataloader-fast-cache-load."
             assert (
                 self.blend is None
-            ), f"--dataloader-fast-cache-load and --data-path cannot be used together. Use --per-split-data-args-path or --train-data-path, --valid-data-path, --test-data-path"
+            ), f"--dataloader-fast-cache-load and --data-path cannot be used together. \
+            Use --per-split-data-args-path or --train-data-path, --valid-data-path and \
+            --test-data-path instead."
 
         self.token_dtype_code = (
             None
@@ -85,7 +91,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         if self.sequences_per_dataset is not None:
             assert (
                 self.token_dtype_code is not None
-            ), "Tokenizer vocab size is not set, deactivate --path-to-sequences-per-dataset-json or fix the tokenizer"
+            ), "Tokenizer vocab size is not set, deactivate --per-dataset-sequences-path or \
+            fix the tokenizer."
 
 
 class GPTDataset(MegatronDataset):
@@ -190,8 +197,8 @@ class GPTDataset(MegatronDataset):
             int: The length of the dataset
         """
         if self.config.defer_npy_index_mmap:
-            # NOTE(asolergi-nv): We need the number of samples of every GPTDataset to build/hit the BlendedDataset cache
-            # NOTE(asolergi-nv): Uses logic from megatron/core/datasets/helpers.cpp::build_sample_idx to compute the number of samples
+            # NOTE(asolergi-nv): We need the number of samples of every GPTDataset to build/hit the BlendedDataset cache # pylint: disable=C0301
+            # NOTE(asolergi-nv): Uses logic from megatron/core/datasets/helpers.cpp::build_sample_idx to compute the number of samples # pylint: disable=C0301
             num_tokens_per_epoch = self._get_num_tokens_per_epoch()
             num_epochs = self._get_num_epochs(num_tokens_per_epoch)
 

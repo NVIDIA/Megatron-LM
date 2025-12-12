@@ -1,8 +1,10 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """
 Script to build a json file with the sequences per dataset to use with the --per-dataset-sequences-path. Accepts the same arguments as the training script.
 
 Usage:
-python3 tools/build_sequences_per_dataset_file.py --per-split-data-args-path my-training-dataset-blend.json --per-dataset-sequences-path my-training-dataset-blend-sequences-per-dataset.json
+python3 tools/build_sequences_per_dataset.py --per-split-data-args-path my-training-dataset-blend.json --per-dataset-sequences-path my-training-dataset-blend-sequences-per-dataset.json
 
 """
 
@@ -103,7 +105,7 @@ if __name__ == "__main__":
                        'we pass in a file path from which we read those arguments. '
                        'This is useful when the list of data is too big. Format is a '
                        'json file with `train`, `valid, `test` keys')
-    parser.add_argument('--path-to-sequences-per-dataset-json', type=str, required=True,
+    parser.add_argument('--per-dataset-sequences-path', type=str, required=True,
                        help='Path to the output json file with the sequences per dataset.')
     args = parser.parse_args()
 
