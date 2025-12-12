@@ -238,6 +238,7 @@ if __name__ == "__main__":
             enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
             enable_chunked_prefill=not args.disable_chunked_prefill,
+            inference_logging_step_interval=args.inference_logging_step_interval,
         )
 
         if dist.get_rank() == 0:

@@ -174,6 +174,7 @@ def get_inference_context(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
@@ -397,6 +398,10 @@ def run_inference(
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
 
+    # Resume engine (NOOP if not suspended).
+    if engine.is_suspended:
+        engine.resume()
+
     return {
         "step_times" : step_times,
         "add_times" : add_times,
@@ -486,6 +491,11 @@ def main():
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
     for _ in range(args.inference_repeat_n):
+
+        # Reset engine.
+        engine.reset()
+
+        # Trial.
         t = get_curr_time()
         result = run_inference(requests, engine)
         step_times = result["step_times"]
@@ -617,11 +627,11 @@ def main():
         )
         print(
             f"{setup_prefix} … "
-            f"throughput: {throughput:.3f} tok/s",
+            f"throughput: {throughput:.3f} tok/s … ",
             f"total time: {total_time:.3f}s … "
             f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
             f"steps: {engine.step_count:d} … "
-            f"capture {capture_str} … "
+            f"capture {capture_str}"
         )
         print("~~~")
 

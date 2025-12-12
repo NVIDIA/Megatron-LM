@@ -1,5 +1,4 @@
-dist\_checkpointing package
-===========================
+# dist_checkpointing package
 
 A library for saving and loading the distributed checkpoints.
 A *distributed checkpoint* in Megatron Core uses the ``torch_dist`` format,
@@ -14,25 +13,24 @@ resharding of models across heterogeneous training setups.
 Using the library requires defining sharded state_dict dictionaries with functions from  *mapping* and *optimizer* modules.
 Those state dicts can be saved or loaded with a *serialization* module using strategies from *strategies* module.
 
-Safe Checkpoint Loading
------------------------
+## Safe Checkpoint Loading
 
 Since **PyTorch 2.6**, the default behavior of `torch.load` is `weights_only=True`.
 This ensures that only tensors and allow-listed classes are loaded, reducing the risk of arbitrary code execution.
 
 If you encounter an error such as:
 
-.. code-block:: bash
-
-   WeightsUnpickler error: Unsupported global: GLOBAL argparse.Namespace was not an allowed global by default.
+```bash
+WeightsUnpickler error: Unsupported global: GLOBAL argparse.Namespace was not an allowed global by default.
+```
 
 you can fix it by explicitly allow-listing the missing class in your script:
 
-.. code-block:: python
+```python
+import torch, argparse
 
-   import torch, argparse
-
-   torch.serialization.add_safe_globals([argparse.Namespace])
+torch.serialization.add_safe_globals([argparse.Namespace])
+```
 
 Checkpointing Distributed Optimizer
 -----------------------------------
@@ -74,70 +72,69 @@ You can combine formats to optimize both flexibility and performance:
    3. Save at least one checkpoint under the new model parallel configuration.
    4. (Optional) To continue the training with updated model parallelism and better checkpointing performance, stop training and switch back to ``dp_reshardable`` format by removing ``--dist-ckpt-optim-fully-reshardable``.
 
-Subpackages
------------
+## Subpackages
 
-.. toctree::
-   :maxdepth: 4
+```{toctree}
+:maxdepth: 4
 
-   dist_checkpointing.strategies
+dist_checkpointing.strategies
+```
 
-Submodules
-----------
+## Submodules
 
-dist\_checkpointing.serialization module
-----------------------------------------
+### dist_checkpointing.serialization module
 
-.. automodule:: core.dist_checkpointing.serialization
-   :members:
-   :undoc-members:
-   :show-inheritance:
+```{automodule} core.dist_checkpointing.serialization
+:members:
+:undoc-members:
+:show-inheritance:
+```
 
-dist\_checkpointing.mapping module
-----------------------------------
+### dist_checkpointing.mapping module
 
-.. automodule:: core.dist_checkpointing.mapping
-   :members:
-   :undoc-members:
-   :show-inheritance:
+```{automodule} core.dist_checkpointing.mapping
+:members:
+:undoc-members:
+:show-inheritance:
+```
 
-dist\_checkpointing.optimizer module
-------------------------------------
+### dist_checkpointing.optimizer module
 
-.. automodule:: core.dist_checkpointing.optimizer
-   :members:
-   :undoc-members:
-   :show-inheritance:
+```{automodule} core.dist_checkpointing.optimizer
+:members:
+:undoc-members:
+:show-inheritance:
+```
 
-dist\_checkpointing.core module
--------------------------------
+### dist_checkpointing.core module
 
-.. automodule:: core.dist_checkpointing.core
-   :members:
-   :undoc-members:
-   :show-inheritance:
+```{automodule} core.dist_checkpointing.core
+:members:
+:undoc-members:
+:show-inheritance:
+```
 
-dist\_checkpointing.dict\_utils module
---------------------------------------
+### dist_checkpointing.dict_utils module
 
-.. automodule:: core.dist_checkpointing.dict_utils
-   :members:
-   :undoc-members:
-   :show-inheritance:
+```{automodule} core.dist_checkpointing.dict_utils
+:members:
+:undoc-members:
+:show-inheritance:
+```
 
+### dist_checkpointing.utils module
 
-dist\_checkpointing.utils module
---------------------------------
+```{automodule} core.dist_checkpointing.utils
+:members:
+:undoc-members:
+:show-inheritance:
+```
 
-.. automodule:: core.dist_checkpointing.utils
-   :members:
-   :undoc-members:
-   :show-inheritance:
+## Module contents
 
-Module contents
----------------
+```{automodule} core.dist_checkpointing
+:members:
+:undoc-members:
+:show-inheritance:
+```
 
-.. automodule:: core.dist_checkpointing
-   :members:
-   :undoc-members:
-   :show-inheritance:
