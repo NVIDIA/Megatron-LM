@@ -482,9 +482,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
-        self.engine_loop_task = loop.create_task(
-            self.run_engine_with_coordinator(loop=loop)
-        )
+        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
     @contextmanager
     @staticmethod
@@ -1073,11 +1071,7 @@ class DynamicInferenceEngine(AbstractEngine):
         return result, context_state, step_time, self.step_count
 
     async def async_bookkeep(
-        self,
-        step_result: Optional[Dict],
-        context_state: Dict,
-        step_time: float,
-        step_count: int,
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float, step_count: int
     ):
         """Uses `asyncio` for continuous bookkeeping.
 
@@ -1184,7 +1178,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
         # Print context state.
-        if self.inference_logging_step_interval > 0 and step_count % self.inference_logging_step_interval == 0:
+        if (
+            self.inference_logging_step_interval > 0
+            and step_count % self.inference_logging_step_interval == 0
+        ):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
@@ -1236,7 +1233,7 @@ class DynamicInferenceEngine(AbstractEngine):
         }
 
     async def async_step(
-        self
+        self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -1427,9 +1424,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_context.term()
 
     @trace_async_exceptions
-    async def run_engine(
-        self, *, loop: Optional[asyncio.AbstractEventLoop] = None,
-    ):
+    async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = False
@@ -1452,7 +1447,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
-        self, *, loop: Optional[asyncio.AbstractEventLoop] = None,
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None
     ):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
