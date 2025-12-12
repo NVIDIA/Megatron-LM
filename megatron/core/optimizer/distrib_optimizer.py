@@ -361,8 +361,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
 
                     # Generate sharded model param.
-                    if is_float8tensor(model_param) and config.fp8_recipe != "delayed":
-                        # MXFP8Tensor and BlockwiseQTensor don't support view(-1)
+                    if (is_float8tensor(model_param) and config.fp8_recipe != "delayed") or is_nvfp4tensor(model_param):
+                        # MXFP8Tensor, BlockwiseQTensor and NVFP4Tensor don't support view(-1)
                         shard_model_param = None
                     else:
                         shard_model_param = model_param.detach().view(-1)[
@@ -2649,6 +2649,4 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for model_chunk in self.model_chunks:
                     model_chunk.start_param_sync()
         if timers is not None:
-            timers('params-all-gather').stop()
-
-        return update_successful
+            timers('params-all-gath
