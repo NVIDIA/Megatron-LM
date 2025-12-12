@@ -57,24 +57,23 @@ myst_enable_extensions = [
 ]
 myst_heading_anchors = 5  # Generates anchor links for headings up to level 5
 
-# TODO(ppetrakian): enable autodoc2.
 # -- Options for Autodoc2 ---------------------------------------------------
 sys.path.insert(0, os.path.abspath(".."))
 
-# autodoc2_packages = [
-#     {
-#         "path": "../megatron/core",  # Path to your package relative to conf.py
-#         "exclude_dirs": ["converters"],  # list of directory names to exclude
-#     }
-# ]
-# autodoc2_render_plugin = "myst"  # Use MyST for rendering docstrings
-# autodoc2_output_dir = "apidocs"  # Output directory for autodoc2 (relative to docs/)
-# # This is a workaround that uses the parser located in autodoc2_docstrings_parser.py to allow autodoc2 to
-# # render google style docstrings.
-# # Related Issue: https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33
-# autodoc2_docstring_parser_regexes = [
-#     (r".*", "docs.autodoc2_docstrings_parser"),
-# ]
+autodoc2_packages = [
+    {
+        "path": "../megatron/core",  # Path to your package relative to conf.py
+        "exclude_dirs": ["converters"],  # list of directory names to exclude
+    }
+]
+autodoc2_render_plugin = "myst"  # Use MyST for rendering docstrings
+autodoc2_output_dir = "apidocs"  # Output directory for autodoc2 (relative to docs/)
+# This is a workaround that uses the parser located in autodoc2_docstrings_parser.py to allow autodoc2 to
+# render google style docstrings.
+# Related Issue: https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33
+autodoc2_docstring_parser_regexes = [
+    (r".*", "docs.autodoc2_docstrings_parser"),
+]
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
