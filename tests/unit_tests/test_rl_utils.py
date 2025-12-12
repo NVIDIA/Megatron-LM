@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+
 os.environ['WANDB_MODE'] = "disabled"
 os.environ['LOG_TO_WANDB'] = "false"
 os.environ['WORLD_SIZE'] = "1"
@@ -12,12 +13,12 @@ import torch
 from pytest import fixture
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.enums import ModelType
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.enums import ModelType
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils, sequence_packing_utils
@@ -73,7 +74,6 @@ class MockTokenizer:
 def mock_pipeline_stuff():
     with patch('megatron.rl.rl_utils.is_pipeline_last_stage', return_value=True):
         yield
-
 
 
 def test_get_logprobs():
@@ -154,6 +154,7 @@ def test_prepare_trajectories(mock_rank):
 
     expected_trajs = torch.tensor([[1, 2, 43, 42, 42, 42, 42], [1, 2, 43, 42, 42, 42, 42]])
     torch.testing.assert_close(trajs, expected_trajs)
+
 
 @patch('torch.distributed.get_rank', return_value=0)
 def test_prepare_trajectories_with_packing(mock_rank):
@@ -323,6 +324,7 @@ def test_grpo_loss_truncation():
     # ratios: [[2., 0.5],[20., 1.]]
     torch.testing.assert_close(truncated_from_above, torch.tensor([[True, False], [True, False]]))
     torch.testing.assert_close(truncated_from_below, torch.tensor([[False, True], [False, False]]))
+
 
 def test_prepare_data_for_update():
     """Test that getting logprobs at least does not crash."""
