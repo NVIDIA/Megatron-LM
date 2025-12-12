@@ -4,6 +4,7 @@ import dataclasses
 import enum
 import inspect
 import io
+import logging
 import os
 import pickle
 import warnings
@@ -58,6 +59,7 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
     is_torch_min_version,
+    log_single_rank,
 )
 
 try:
@@ -72,6 +74,8 @@ except ImportError:
     HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+
+logger = logging.getLogger(__name__)
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -289,10 +293,10 @@ def _get_should_context_be_quantized_params(
 
 def qtype_debug_log(prefix: str) -> None:
     if os.getenv("QUANTIZATION_TYPE_DEBUG", "0") == "1":
-        from megatron.training import print_rank_0
         if not HAVE_TE:
             quantization_type = "none"
-            print_rank_0(f"{prefix}, quantization_type: {quantization_type}")
+            log_single_rank(logger, logging.INFO,
+                            f"{prefix}, quantization_type: {quantization_type}")
             return
         if not FP8GlobalStateManager.is_fp8_enabled():
             quantization_type = "none"
@@ -308,7 +312,8 @@ def qtype_debug_log(prefix: str) -> None:
             quantization_type = "fp8_block_scaling"
         else:
             quantization_type = "unknown"
-        print_rank_0(f"{prefix}, quantization_type: {quantization_type}")
+        log_single_rank(logger, logging.INFO,
+                        f"{prefix}, quantization_type: {quantization_type}")
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):

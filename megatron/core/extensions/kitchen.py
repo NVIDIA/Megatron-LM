@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 import warnings
 from dataclasses import dataclass, fields
 from enum import Enum
@@ -27,7 +28,7 @@ from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.utils import get_tensor_model_parallel_group_if_none, log_single_rank
 
 # Parsing constant
 _KITCHEN_CONFIG_TYPE_KEY = "kitchen_config_type"
@@ -44,6 +45,7 @@ except ImportError:
     QLinearParams = MagicMock()
     get_qlinear_params_from_qat_params = MagicMock()
 
+logger = logging.getLogger(__name__)
 
 class KitchenConfigType(Enum):
     """Configuration object types in config dictionary"""
@@ -161,12 +163,12 @@ class KitchenQuantizationParams:
 
 def quant_debug_log(kitchen_quant_params: KitchenQuantizationParams, prefix: str) -> None:
     if os.getenv("QUANTIZATION_TYPE_DEBUG", "0") == "1":
-        from megatron.training import print_rank_0
         from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
         autocast_enabled = FP8GlobalStateManager.is_fp8_enabled()
-        print_rank_0(f"{prefix}, autocast_enabled={autocast_enabled} "
-                     f"quantization_type: {kitchen_quant_params.params_config_key} "
-                     f"match_context: {kitchen_quant_params.match_input}")
+        log_single_rank(logger, logging.INFO,
+                        f"{prefix}, autocast_enabled={autocast_enabled} "
+                        f"quantization_type: {kitchen_quant_params.params_config_key} "
+                        f"match_context: {kitchen_quant_params.match_input}")
 
 
 def _get_extra_kitchen_kwargs(config: TransformerConfig):
