@@ -42,12 +42,12 @@ from megatron.core.inference.utils import Counter, await_process_event
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import (
+    experimental_api,
     get_asyncio_loop,
     get_pg_rank,
     get_pg_size,
     get_pg_src_rank,
     internal_api,
-    experimental_api,
     trace_async_exceptions,
 )
 
