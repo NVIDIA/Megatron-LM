@@ -777,9 +777,7 @@ class _ParamAndGradBuffer:
                     new_param_data = self._get(
                         param.data.shape, param_start_index, buffer_type=BufferType.PARAM
                     )
-                    if is_float8tensor(param):
-                        modify_underlying_storage(param, new_param_data)
-                    elif is_nvfp4tensor(param):
+                    if is_nvfp4tensor(param):
                         # NVFP4 2D: map only rowwise packed bytes (uint8) into the param buffer
                         from ..fp4_utils import modify_nvfp4_rowwise_storage
                         packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
@@ -787,6 +785,8 @@ class _ParamAndGradBuffer:
                             packed_shape, param_start_index, buffer_type=BufferType.PARAM
                         )
                         modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                    elif is_float8tensor(param):
+                        modify_underlying_storage(param, new_param_data)
                     else:
                         old_param_data = param.data
                         param.data = new_param_data

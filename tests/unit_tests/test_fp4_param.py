@@ -1,8 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import contextlib
 import os
 import sys
+from datetime import timedelta
 
 import pytest
 import torch
@@ -15,6 +15,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
+import megatron.core.parallel_state as ps
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -24,7 +25,67 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
-from tests.unit_tests.test_utilities import Utils
+
+
+class Utils:
+    """Minimal test utilities for distributed setup."""
+
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    rank = int(os.environ.get('LOCAL_RANK', '0'))
+    inited = False
+
+    @staticmethod
+    def initialize_distributed():
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
+        if not torch.distributed.is_initialized() and Utils.rank >= 0:
+            print(
+                f'Initializing torch.distributed with rank: {Utils.rank}, '
+                f'world_size: {Utils.world_size}'
+            )
+            torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
+            torch.distributed.init_process_group(
+                backend='nccl',
+                world_size=Utils.world_size,
+                rank=Utils.rank,
+                timeout=timedelta(minutes=1),
+            )
+            torch.distributed.barrier()
+        Utils.inited = True
+
+    @staticmethod
+    def destroy_model_parallel():
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        if not Utils.inited:
+            return
+        torch.distributed.barrier()
+        ps.destroy_model_parallel()
+        Utils.inited = False
+
+    @staticmethod
+    def initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        **kwargs,
+    ):
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
+        ps.destroy_model_parallel()
+        Utils.initialize_distributed()
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            virtual_pipeline_model_parallel_size,
+            **kwargs,
+        )
+        Utils.inited = True
 
 _SEED = 1234
 fp8_available, reason_for_no_fp8 = check_fp8_support()
@@ -259,4 +320,18 @@ class TestFP4Param:
             "num_layers_at_end_in_bf16": 1,
         }
         self.run_test(tp_size=tp_size, **kwargs)
+
+
+if __name__ == "__main__":
+    # Run tests directly without pytest
+    test = TestFP4Param()
+    test.setup_method(None)
+    try:
+        print("Running test_nvfp4 with dp_overlap=(False, False)...")
+        test.run_test(tp_size=2, overlap_param_gather=False, overlap_grad_reduce=False)
+        test.teardown_method(None)
+        print("PASSED: test_nvfp4 (no overlap)")
+    except Exception as e:
+        print(f"FAILED: {e}")
+        raise
 
