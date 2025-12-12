@@ -2649,4 +2649,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for model_chunk in self.model_chunks:
                     model_chunk.start_param_sync()
         if timers is not None:
-            timers('params-all-gath
+            timers('params-all-gather').stop()
+
+        return update_successful
