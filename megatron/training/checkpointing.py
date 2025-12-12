@@ -1700,14 +1700,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not release and not args.finetune and not args.no_load_rng and not ignore_rng_state:
         try:
             cuda_rng_tracker = tensor_parallel.get_cuda_rng_tracker()
-            try:
-                from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
-            except ImportError:
-                TECudaRNGStatesTracker = None
-            use_cudagraphable_rng = (
-                TECudaRNGStatesTracker is not None
-                and isinstance(cuda_rng_tracker, TECudaRNGStatesTracker)
-            ) or getattr(cuda_rng_tracker, 'use_cudagraphable_rng', False)
+            graph_safe_rng = tensor_parallel.is_graph_safe_cuda_rng_tracker(cuda_rng_tracker)
             if 'rng_state' in state_dict:
                 if args.ckpt_format == "fsdp_dtensor":
                     # FSDP DTensor checkpoints store rng_state in a different format.
@@ -1734,7 +1727,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if not rng_state['rng_tracker_states']:
                     raise KeyError
                 rng_tracker_states = {
-                    k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=use_cudagraphable_rng)
+                    k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
                     for k, v in rng_state['rng_tracker_states'].items()
                 }
             else:  # backward compatability
@@ -1746,7 +1739,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if not state_dict['rng_tracker_states']:
                     raise KeyError
                 rng_tracker_states = {
-                    k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=use_cudagraphable_rng)
+                    k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
                     for k, v in state_dict['rng_tracker_states'].items()
                 }
             cuda_rng_tracker.set_states(rng_tracker_states)

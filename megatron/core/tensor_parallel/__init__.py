@@ -33,6 +33,7 @@ from .random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
     get_expert_parallel_rng_tracker_name,
+    is_graph_safe_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
 from .utils import (
@@ -69,6 +70,7 @@ __all__ = [
     "get_cuda_rng_tracker",
     "model_parallel_cuda_manual_seed",
     "get_expert_parallel_rng_tracker_name",
+    "is_graph_safe_cuda_rng_tracker",
     "CheckpointWithoutOutput",
     # utils.py
     "split_tensor_along_last_dim",
