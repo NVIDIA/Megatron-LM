@@ -111,6 +111,41 @@ def _set_cuda_rng_state(new_state: torch.Tensor, device: int = -1, graph_safe: b
     _lazy_call(cb)
 
 
+def convert_cuda_rng_state(
+    state: Union[torch.Tensor, torch.Generator], to_graphable: bool = False
+) -> Union[torch.Tensor, torch.Generator]:
+    """
+    Convert the cuda rng state tensor to the graphable version,
+    or from the graphable version to the non-graphable tensor version.
+    """
+    if to_graphable:
+        if isinstance(state, torch.Tensor):
+            # Convert to the graphable version.
+            # Store current rng state.
+            orig_cuda_rng_state = _get_cuda_rng_state(graph_safe=False)
+            # Set rng state to the desired one
+            _set_cuda_rng_state(state, graph_safe=False)
+            # Get the graphable state
+            graphable_state = _get_cuda_rng_state(clone=True, graph_safe=True)
+            # And set the state to the original state we started with.
+            _set_cuda_rng_state(orig_cuda_rng_state, graph_safe=False)
+            return graphable_state
+        elif isinstance(state, torch.Generator):
+            # already graphable, just return it.
+            return state
+        else:
+            raise ValueError(f"Invalid state type: {type(state)}")
+    else:
+        if isinstance(state, torch.Tensor):
+            # already non-graphable, just return it.
+            return state
+        elif isinstance(state, torch.Generator):
+            # Convert to the non-graphable tensor version.
+            return state.get_state()
+        else:
+            raise ValueError(f"Invalid state type: {type(state)}")
+
+
 def get_expert_parallel_rng_tracker_name():
     """Get the expert parallel rng tracker name"""
     global _EXPERT_PARALLEL_RNG_TRACKER_NAME
@@ -377,10 +412,24 @@ def model_parallel_cuda_manual_seed(
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 
+def is_graph_safe_cuda_rng_tracker(cuda_rng_tracker):
+    """Check if the cuda rng tracker is graph safe version."""
+    if HAVE_TE and is_te_min_version("1.5.0"):
+        from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
+
+        if isinstance(cuda_rng_tracker, TECudaRNGStatesTracker):
+            return True
+    if getattr(cuda_rng_tracker, "use_cudagraphable_rng", False):
+        return True
+    return False
+
+
 def _get_all_rng_states():
     """Get all the rng states."""
     cpu_rng_state = torch.get_rng_state()
-    cuda_rng_state = _get_cuda_rng_state()
+    cuda_rng_state = _get_cuda_rng_state(
+        graph_safe=is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
+    )
     cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
     return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker
 
@@ -388,7 +437,9 @@ def _get_all_rng_states():
 def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker):
     """Set all the rng states."""
     torch.set_rng_state(cpu_rng_state)
-    _set_cuda_rng_state(cuda_rng_state)
+    _set_cuda_rng_state(
+        cuda_rng_state, graph_safe=is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
+    )
     get_cuda_rng_tracker().set_states(cuda_rng_state_tracker)
 
 
