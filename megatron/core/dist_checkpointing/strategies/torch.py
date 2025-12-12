@@ -80,7 +80,17 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 
 MSC_PREFIX = "msc://"
 
+
 _metadata_fn: str = ".metadata"
+
+from dataclasses import dataclass
+@dataclass
+class MCoreMetadata(Metadata):
+    """Metadata with mcore specific data."""
+
+    # holds data related to flattened_range
+    # TODO: remove when flattened_range is properly removed
+    mcore_data: Optional[Dict[str, Dict[str, Any]]] = None  # Mcore related data about each tensor
 
 
 # dummy class needed to load old checkpoint weights
@@ -88,6 +98,7 @@ class MCoreSavePlan:
     """ """
 
     pass
+
 
 
 def register_default_torch_strategies():

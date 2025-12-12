@@ -220,6 +220,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
         print(f"[{dist.get_rank()}:DP] Done with requests.....")
         responses = [record[-1] for record in records]
+        for p, r in zip(request.prompt, responses):
+            print(f"Prompt: {p} \n Generated: {r.generated_text}")
         return [
             InferenceResponse(
                 response=r.generated_text,
