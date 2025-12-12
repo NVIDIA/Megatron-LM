@@ -12,7 +12,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -24,14 +24,15 @@ from wandb import wandb_run
 
 from megatron.core import mpu
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
-from megatron.core.inference.utils import get_event_loop
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.optimizer import MegatronOptimizer
-from megatron.core.parallel_state import get_tensor_model_parallel_src_rank
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, get_tensor_model_parallel_world_size
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.utils import get_asyncio_loop
 from megatron.rl.agent.api import (
     EvaluationRequest,
     EvaluationResponse,
@@ -54,6 +55,9 @@ from megatron.training.global_vars import (
 )
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -446,6 +450,7 @@ class SequencePacker:
         )
         loss_mask = torch.zeros((num_bins, self.bin_size), dtype=torch.float, device=device)
 
+        # TODO(jalbericiola): packing_info as a dataclass and not just a dict
         # Track packing information for unpacking later
         packing_info = {
             'bin_seq_indices': bin_seq_indices,  # Which original sequences are in each bin
@@ -510,6 +515,55 @@ class SequencePacker:
         attention_mask = ~attention_mask
 
         return packed_sequences, position_ids, attention_mask, loss_mask, packing_info
+
+
+def create_packed_seq_params_for_bin(
+    packing_info: Dict[str, Any],
+    bin_idx: int,
+    bin_size: int,
+    device: torch.device,
+) -> Optional[PackedSeqParams]:
+    """Create PackedSeqParams for a single bin to enable proper attention masking in TE.
+
+    When using Transformer Engine with sequence packing, we need to provide cu_seqlens
+    (cumulative sequence lengths) so that TE knows the boundaries between sequences
+    within a packed bin. This prevents attention leakage between unrelated sequences.
+
+    Args:
+        packing_info: Dictionary containing packing metadata from SequencePacker
+        bin_idx: Index of the bin to create params for
+        bin_size: Size of the bin (padded sequence length)
+        device: Device to create tensors on
+
+    Returns:
+        PackedSeqParams with cu_seqlens set for proper attention masking (or None if empty)
+    """
+    seq_indices = packing_info['bin_seq_indices'][bin_idx]
+
+    # Handle empty bins (padding bins with no sequences)
+    if not seq_indices:
+        return None
+
+    # Get actual sequence lengths for sequences in this bin
+    seq_lengths_in_bin = [packing_info['seq_lengths'][idx] for idx in seq_indices]
+
+    # Build cumulative sequence lengths for actual sequences
+    # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
+    cu_seqlens_list = np.cumsum([0] + seq_lengths_in_bin)
+
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
+
+    max_seqlen = max(seq_lengths_in_bin) if seq_lengths_in_bin else bin_size
+
+    return PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=None,
+        cu_seqlens_kv_padded=None,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+    )
 
 
 def get_agent(args):
@@ -607,11 +661,11 @@ def get_environment_rollouts(
     ), "n_prompts must be divisible by data_parallel_world_size"
 
     with nvtx_range("rollout-collection"):
-        loop = get_event_loop()
+        loop = get_asyncio_loop()
         with megatron_rl_inference_mode(
             model,
             optimizer,
-            args.enable_cuda_graph,
+            args.cuda_graph_impl,
             args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
             args.rl_offload_kv_cache_during_training,
@@ -681,7 +735,8 @@ def selective_log_softmax(logits, index):
         `torch.Tensor`:
             Gathered log probabilities with the same shape as `index`.
     """
-    if logits.dtype in [torch.float32, torch.float64]:
+    use_bik_logsoftmax = is_batch_invariant_mode_enabled()
+    if logits.dtype in [torch.float32, torch.float64] and not use_bik_logsoftmax:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption
         logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
@@ -701,7 +756,7 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
+def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, packed_seq_params=None, packed_seq_len=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -709,6 +764,12 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
         tokens: inputs for which we want to get logprobs.
         position_ids: position ids that come with tokens.
         attention_mask: attention mask that comes with tokens.
+        no_grad: whether to run in no_grad mode.
+        packed_seq_params: Optional PackedSeqParams for sequence packing with TE.
+            When provided with qkv_format='thd', the input tokens are sliced to
+            remove padding before the forward pass, and outputs are padded back.
+        packed_seq_len: Optional length of the packed sequence (excluding padding).
+            Required when packed_seq_params is provided to avoid CPU-GPU synchronization.
 
     Returns:
         Logprobs of input sequences.
@@ -721,6 +782,51 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
         with nvtx_range("forward-pass", time=False):
             # TODO(vitalyk): use fp16/bf16 as a function argument. Do not use args.
             args = get_args()
+            
+            # Handle THD format: slice off padding before forward, pad back after
+            original_seq_len = tokens.shape[1]
+            attention_mask_for_forward = attention_mask
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                # Get the actual token count (excluding padding)
+                if packed_seq_len is not None:
+                    actual_len = packed_seq_len
+                else:
+                    actual_len = packed_seq_params.cu_seqlens_q[-1].item()
+                
+                if actual_len == 0:
+                    # No real tokens, skip packed path
+                    packed_seq_params = None
+                else:
+                    # When sequence parallelism is enabled, the sequence length must be 
+                    # divisible by the tensor parallel world size for reduce-scatter ops
+                    if model.config.sequence_parallel:
+                        tp_world_size = get_tensor_model_parallel_world_size()
+                        if actual_len % tp_world_size != 0:
+                            actual_len = ((actual_len + tp_world_size - 1) // tp_world_size) * tp_world_size
+                            # Update cu_seqlens to match the padded length.
+                            # The last entry of cu_seqlens must equal the tensor's sequence dimension.
+                            # Without this, TE attention/rotary ops see mismatched dimensions.
+                            if packed_seq_params.cu_seqlens_q[-1].item() != actual_len:
+                                # Clone to avoid modifying cached params
+                                new_cu_seqlens = packed_seq_params.cu_seqlens_q.clone()
+                                new_cu_seqlens[-1] = actual_len
+                                packed_seq_params = PackedSeqParams(
+                                    qkv_format=packed_seq_params.qkv_format,
+                                    cu_seqlens_q=new_cu_seqlens,
+                                    cu_seqlens_kv=new_cu_seqlens,
+                                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                                    cu_seqlens_kv_padded=packed_seq_params.cu_seqlens_kv_padded,
+                                    max_seqlen_q=packed_seq_params.max_seqlen_q,
+                                    max_seqlen_kv=packed_seq_params.max_seqlen_kv,
+                                )
+                    
+                    # Slice inputs to remove padding (or pad if needed for SP alignment)
+                    # dimension 0 is batch, with seq packing BS=1
+                    tokens = tokens[:, :actual_len]
+                    position_ids = position_ids[:, :actual_len]
+                    # attention_mask is not used with THD format (cu_seqlens handles it)
+                    attention_mask_for_forward = None
+            
             # This is a hack to fix megatron's behaviour when flash-decode affects the training code flow.
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
@@ -728,14 +834,29 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
                 logits = model(
                     tokens,
                     position_ids,
-                    attention_mask,
+                    attention_mask_for_forward,
+                    packed_seq_params=packed_seq_params,
                     runtime_gather_output=True,
                     fp32_output=not (args.fp16 or args.bf16),
                 )
             model.config.flash_decode = flash_decode
+            
+            # Pad logits back to original sequence length if we sliced
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                if logits.shape[1] < original_seq_len:
+                    pad_len = original_seq_len - logits.shape[1]
+                    # Pad with zeros (these positions will be masked out anyway)
+                    logits = torch.nn.functional.pad(logits, (0, 0, 0, pad_len), value=0)
+                # Also need to restore tokens for the log_softmax below
+                tokens_for_softmax = torch.nn.functional.pad(
+                    tokens, (0, original_seq_len - tokens.shape[1]), value=0
+                )
+            else:
+                tokens_for_softmax = tokens
+            
             # We do not need logprobs for the n+1 token.
         with nvtx_range("log-softmax", time=False):
-            logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+            logprobs = selective_log_softmax(logits[:, :-1, :], tokens_for_softmax[:, 1:])
 
     return logprobs
 
@@ -879,6 +1000,8 @@ def maybe_log_training_metrics(
                     'advantages_hist': wandb_writer.plot.histogram(
                         advantages, 'advantages', 'Advantages'
                     ),
+                    'nonzero_groups_ratio': np.count_nonzero(group_stats.advantages)
+                            / len(group_stats.advantages),
                     'min_piold_to_inf_prob': group_stats.min_piold_to_inf_prob,
                     'max_piold_to_inf_prob': group_stats.max_piold_to_inf_prob,
                     'mean_piold_to_inf_prob': group_stats.mean_piold_to_inf_prob,
@@ -1006,7 +1129,7 @@ def prepare_trajectories(
     args = get_args()
     # Only process if we have inference_logprobs
     if inference_logprobs and any(lp is not None for lp in inference_logprobs):
-        if args.use_sequence_packing:
+        if args.rl_use_sequence_packing:
             # For sequence packing, we need to pad all logprobs to the same size
             padded_logprobs = []
             for logprobs in inference_logprobs:
@@ -1207,14 +1330,14 @@ def prepare_data_for_update(
         # [g, group_size]
         # Making an assumption that all groups are of the same size!
         # For packing mode, use all rollouts to compute rewards
-        rollouts_for_rewards = all_rollouts if args.use_sequence_packing else rollouts
+        rollouts_for_rewards = all_rollouts if args.rl_use_sequence_packing else rollouts
         rewards = torch.tensor(
             [[rollout.reward for rollout in group] for group in rollouts_for_rewards], device='cpu'
         )
 
         # We flatten them for logging.
         with nvtx_range("prepare_trajectories"):
-            if args.use_sequence_packing:
+            if args.rl_use_sequence_packing:
                 trajs, generation_masks, inference_logprobs = prepare_packed_trajectories(
                     all_rollouts, tokenizer, args
                 )
@@ -1228,14 +1351,14 @@ def prepare_data_for_update(
         # Sequence packing or standard processing
         packing_context = {}  # Store all packing-related data
 
-        if args.use_sequence_packing:
+        if args.rl_use_sequence_packing:
             with nvtx_range("sequence_packing"):
                 timers('sequence-packing-overhead', log_level=1).start()
 
-                bin_size = args.sequence_packing_bin_size
+                bin_size = args.rl_sequence_packing_bin_size
 
                 # Create packer with max sequences per bin limit to prevent extreme imbalance
-                max_sequences_per_bin = getattr(args, 'sequence_packing_max_sequences_per_bin', 100)
+                max_sequences_per_bin = getattr(args, 'rl_sequence_packing_max_sequences_per_bin', 100)
                 packer = SequencePacker(
                     bin_size=bin_size,
                     pad_token=tokenizer.pad,
@@ -1276,7 +1399,7 @@ def prepare_data_for_update(
                 world_size = mpu.get_expert_data_parallel_world_size()
 
                 # Choose distribution algorithm based on args.sequence_packing_algo
-                packing_algo = getattr(args, 'sequence_packing_algo', 'fifo')
+                packing_algo = getattr(args, 'rl_sequence_packing_algo', 'fifo')
 
                 if packing_algo == 'round-robin':
                     # Round-robin assignment: rank i gets bins [i, i+world_size, i+2*world_size, ...]
@@ -1470,6 +1593,22 @@ def prepare_data_for_update(
                 # Store my_bin_seq_indices for later use
                 packing_context['my_bin_seq_indices'] = my_bin_seq_indices
 
+                # Pre-compute all PackedSeqParams for all bins ONCE to avoid repeated
+                # tensor allocations that cause CUDA memory fragmentation and periodic spikes
+                cached_packed_seq_params = []
+                device = packing_context['packed_trajs'].device
+                for bin_idx in range(len(packing_context['packed_trajs'])):
+                    params = create_packed_seq_params_for_bin(
+                        packing_info=packing_info,
+                        bin_idx=bin_idx,
+                        bin_size=args.rl_sequence_packing_bin_size,
+                        device=device,
+                    )
+                    # Compute seq_len here (one-time .item() call during caching is fine)
+                    seq_len = params.cu_seqlens_q[-1].item() if params is not None else 0
+                    cached_packed_seq_params.append((params, seq_len))
+                packing_context['cached_packed_seq_params'] = cached_packed_seq_params
+
                 # Log packing efficiency (for this rank's bins)
                 total_tokens = sum(packing_info['seq_lengths'])  # All sequences
                 my_sequences = sum(len(indices) for indices in my_bin_seq_indices)
@@ -1596,7 +1735,7 @@ def prepare_data_for_update(
             )
             original_loss_mask[~generation_masks] = 0.0
 
-        if not args.use_sequence_packing:
+        if not args.rl_use_sequence_packing:
             # Use original masks if not packing
             attention_mask = original_attention_mask
             loss_mask = original_loss_mask
@@ -1606,7 +1745,7 @@ def prepare_data_for_update(
             timers('compute-logprobs', log_level=0).start()
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
             # Use packed sequences if packing is enabled for performance benefits
-            if args.use_sequence_packing and 'packed_trajs' in packing_context:
+            if args.rl_use_sequence_packing and 'packed_trajs' in packing_context:
                 compute_trajs = packing_context['packed_trajs']
                 compute_position_ids = packing_context['packed_position_ids']
                 compute_attention_mask = packing_context['packed_attention_mask']
@@ -1618,8 +1757,11 @@ def prepare_data_for_update(
                 use_packed_computation = False
 
         with nvtx_range("create-logprobs-dataloader"):
+            # Use batch_size=1 for packed computation to enable proper attention masking
+            # via PackedSeqParams (TE needs cu_seqlens per bin)
+            logprobs_batch_size = 1 if use_packed_computation else args.micro_batch_size
             data_iter = DataLoader(
-                TensorDataset(compute_trajs, compute_position_ids), batch_size=args.micro_batch_size
+                TensorDataset(compute_trajs, compute_position_ids), batch_size=logprobs_batch_size
             )
             old_logprobs = []
 
@@ -1627,16 +1769,27 @@ def prepare_data_for_update(
             for batch_idx, (b_trajs, b_posids) in enumerate(data_iter):
                 # Get attention mask slice
                 if compute_attention_mask is not None:
-                    start_idx = batch_idx * args.micro_batch_size
+                    start_idx = batch_idx * logprobs_batch_size
                     end_idx = min(
-                        start_idx + args.micro_batch_size, compute_attention_mask.shape[0]
+                        start_idx + logprobs_batch_size, compute_attention_mask.shape[0]
                     )
                     b_attn_mask = compute_attention_mask[start_idx:end_idx].cuda()
                 else:
                     b_attn_mask = None
 
+                b_trajs = b_trajs.cuda()
+                b_posids = b_posids.cuda()
+
+                # Get cached packed_seq_params for proper attention masking in TE
+                b_packed_seq_params = None
+                b_packed_seq_len = 0
+                if use_packed_computation and 'cached_packed_seq_params' in packing_context:
+                    b_packed_seq_params, b_packed_seq_len = packing_context['cached_packed_seq_params'][batch_idx]
+
                 logprobs = get_logprobs(
-                    model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask, no_grad=True
+                    model, b_trajs, b_posids, b_attn_mask, no_grad=True,
+                    packed_seq_params=b_packed_seq_params,
+                    packed_seq_len=b_packed_seq_len
                 )
                 old_logprobs.append(logprobs.detach().cpu())
 
@@ -1657,27 +1810,25 @@ def prepare_data_for_update(
         # Inference logprobs 2 tokens shorter than old_logprobs.
         # One token difference is because we remove the first one in get_logprobs(), the other one is eod padding, if I got it correct. The difference should be one token if we are cut by the sequence length.
 
-        # Handle inference logprobs alignment (skip if using sequence packing)
-        if (
-            inference_logprobs is not None
-            and args.rl_inference_logprobs_is_correction
-            and not args.use_sequence_packing
-        ):
+        if inference_logprobs is not None and not args.rl_use_sequence_packing:
             inference_logprobs = align_unpacked_inference_logprobs(
                 inference_logprobs=inference_logprobs,
                 old_logprobs_for_data=old_logprobs_for_data,
                 generation_masks=generation_masks,
                 group_stats=group_stats,
             )
-        else:
-            if not args.use_sequence_packing:
-                # Keep inference_logprobs as None instead of zeros
+            # We run the above to fill in the inference/train side mismatch stats.
+            # We do the above for logging purposes.
+            # Nullify logprobs if not used in IS correction,
+            if not args.rl_inference_logprobs_is_correction:
                 inference_logprobs = None
+        elif not args.rl_use_sequence_packing:
             # For sequence packing, inference_logprobs will be handled separately
+            inference_logprobs = None
 
         # Handle packing of inference_logprobs for sequence packing mode
         if (
-            args.use_sequence_packing
+            args.rl_use_sequence_packing
             and inference_logprobs is not None
             and args.rl_inference_logprobs_is_correction
         ):
@@ -1687,14 +1838,12 @@ def prepare_data_for_update(
                     inference_logprobs=inference_logprobs,
                     packing_info=packing_context['packing_info'],
                     generation_masks=generation_masks,
-                    bin_size=args.sequence_packing_bin_size,
+                    bin_size=args.rl_sequence_packing_bin_size,
                 )
 
                 # Store packed inference logprobs in packing context
                 packing_context['packed_inference_logprobs'] = packed_inference_logprobs.cuda()
                 packing_context['has_inference_logprobs'] = True
-
-        # TODO(vitalyk): add a test for prepare_data_for_update.
 
         with torch.no_grad(), nvtx_range("compute_ref_logprobs"):
             # We need to load the ref model state dict and compute the logprobs for the ref model
@@ -1708,16 +1857,27 @@ def prepare_data_for_update(
             for batch_idx, (b_trajs, b_posids) in enumerate(data_iter):
                 # Get attention mask slice
                 if compute_attention_mask is not None:
-                    start_idx = batch_idx * args.micro_batch_size
+                    start_idx = batch_idx * logprobs_batch_size
                     end_idx = min(
-                        start_idx + args.micro_batch_size, compute_attention_mask.shape[0]
+                        start_idx + logprobs_batch_size, compute_attention_mask.shape[0]
                     )
                     b_attn_mask = compute_attention_mask[start_idx:end_idx].cuda()
                 else:
                     b_attn_mask = None
 
+                b_trajs = b_trajs.cuda()
+                b_posids = b_posids.cuda()
+
+                # Get cached packed_seq_params for proper attention masking in TE
+                b_packed_seq_params = None
+                b_packed_seq_len = 0
+                if use_packed_computation and 'cached_packed_seq_params' in packing_context:
+                    b_packed_seq_params, b_packed_seq_len = packing_context['cached_packed_seq_params'][batch_idx]
+
                 logprobs = get_logprobs(
-                    model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask, no_grad=True
+                    model, b_trajs, b_posids, b_attn_mask, no_grad=True,
+                    packed_seq_params=b_packed_seq_params,
+                    packed_seq_len=b_packed_seq_len
                 )
                 ref_logprobs.append(logprobs.detach().cpu())
 
@@ -1754,7 +1914,7 @@ def prepare_data_for_update(
 
             timers('prepare-advantages').stop()
         with nvtx_range("create_dataloader"):
-            if args.use_sequence_packing:
+            if args.rl_use_sequence_packing:
                 # Store packing context in runtime state for forward_step
                 runtime_state = get_rl_runtime_state()
                 runtime_state.packing_context = packing_context
@@ -2049,14 +2209,14 @@ def evaluate_and_print_results_rl(
         with megatron_rl_inference_mode(
             model,
             optimizer,
-            args.enable_cuda_graph,
+            args.cuda_graph_impl,
             args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
             args.rl_offload_kv_cache_during_training,
             args.rl_remove_kv_cache_during_training,
         ) as inference_interface:
 
-            loop = get_event_loop()
+            loop = get_asyncio_loop()
 
             rank = torch.distributed.get_rank()
             if rank == 0:
@@ -2206,7 +2366,7 @@ def calculate_grpo_loss(
 
     ref_diff = ref_logprobs - current_logprobs
     kl_term = ref_diff.exp() - ref_diff - 1
-    entropy_term = current_logprobs.exp() * current_logprobs
+    entropy_term = -current_logprobs.exp() * current_logprobs
 
     is_weights = torch.tensor(1.0, dtype=old_logprobs.dtype).to(old_logprobs.device)
     if inference_logprobs is not None:
@@ -2220,7 +2380,7 @@ def calculate_grpo_loss(
     loss = (
         -is_weights * torch.min(ratios * advantages, clamped_ratios * advantages)
         + kl_beta * kl_term
-        + entropy_weight * entropy_term
+        - entropy_weight * entropy_term
     )
 
     return loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below
@@ -2230,7 +2390,7 @@ def calculate_grpo_loss(
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
-    enable_cuda_graph: bool,
+    cuda_graph_impl: str,
     reset_cuda_graphs: bool,
     offload_optimizer_during_inference: bool,
     offload_kv_cache_during_training: bool,
@@ -2241,7 +2401,7 @@ def megatron_rl_inference_mode(
     Args:
         model: model to prepare.
         optimizer: optimizer used to train the model.
-        enable_cuda_graph: use cuda graphs or not.
+        cuda_graph_impl: which cuda graph implementation to use.
         reset_cuda_graphs: rebuild cuda graphs for each inference stage or not.
         offload_optimizer_during_inference: move optimizer to cpu during inference or not.
         offload_kv_cache_during_training: manually offload kv cache to host before training or not.
@@ -2252,7 +2412,7 @@ def megatron_rl_inference_mode(
 
     """
     args = get_args()
-    loop = get_event_loop()
+    loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
     print(f"[{dist.get_rank()}:DP] Entering inference mode")
@@ -2275,8 +2435,9 @@ def megatron_rl_inference_mode(
             with nvtx_range("offload-optimizer-before-inference"):
                 optimizer.offload_to_cpu()
 
-        if enable_cuda_graph:
-            toggle_cuda_graphs(lang_module, True, reset_cuda_graphs=reset_cuda_graphs)
+        # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
+        if cuda_graph_impl != "none":
+            toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
 
         inference_interface = get_inference_interface(args, loop, model)
 
@@ -2286,25 +2447,28 @@ def megatron_rl_inference_mode(
                     reset_cuda_graphs
                 ), "reset_cuda_graphs must be True when offloading kv cache during training"
                 print(
-                    f"[{dist.get_rank()}:DP] Restoring kv cache ({inference_interface._coordinator.engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
+                    f"[{dist.get_rank()}:DP] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
-                kv_cache = inference_interface._coordinator.engine.context.memory_buffer
-                inference_interface._coordinator.engine.context.memory_buffer = kv_cache.cuda()
+                kv_cache = inference_interface._inference_engine.context.memory_buffer
+                inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
             elif remove_kv_cache_during_training:
-                if inference_interface._coordinator.engine.context.memory_buffer is None:
-                    inference_interface._coordinator.engine.context.build_memory_buffer()
+                if inference_interface._inference_engine.context.memory_buffer is None:
+                    inference_interface._inference_engine.context.build_memory_buffer()
 
-        if enable_cuda_graph and not _CudagraphGlobalRecord.cudagraph_created:
+        # TODO: Improve this if statement once a change is made to CUDA graph handling.
+        cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
+        if cuda_graph_impl != "none" and not cuda_graph_exists:
             with nvtx_range("wait-for-decode-only"):
-                while not inference_interface._coordinator.engine.context.is_decode_only():
+                while not inference_interface._inference_engine.context.is_decode_only():
                     active_requests, finished_requests, step_time = loop.run_until_complete(
-                        inference_interface._coordinator.engine.async_step()
+                        inference_interface._inference_engine.async_step()
                     )
             with nvtx_range("build-cuda-graphs"):
-                inference_interface._coordinator.engine.build_cuda_graphs(reset_context=False)
+                inference_interface._inference_engine.create_cuda_graphs(reset_context=True)
 
-        inference_interface.resume()
+        loop.run_until_complete(inference_interface.resume())
 
+        print(f"[{dist.get_rank()}:DP] Entered inference mode")
         yield inference_interface
 
         with nvtx_range("suspend-engine"):
@@ -2312,16 +2476,17 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("offload-kv-cache-after-inference"):
             if offload_kv_cache_during_training:
-                kv_cache = inference_interface._coordinator.engine.context.memory_buffer
+                kv_cache = inference_interface._inference_engine.context.memory_buffer
                 print(
                     f"[{dist.get_rank()}:DP] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
                 )
-                inference_interface._coordinator.engine.context.memory_buffer = kv_cache.cpu()
+                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
             elif remove_kv_cache_during_training:
-                inference_interface._coordinator.engine.context.memory_buffer = None
+                inference_interface._inference_engine.context.memory_buffer = None
 
-        if enable_cuda_graph:
-            toggle_cuda_graphs(lang_module, False, reset_cuda_graphs=reset_cuda_graphs)
+        # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
+        if cuda_graph_impl != "none":
+            toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):
@@ -2334,6 +2499,12 @@ def megatron_rl_inference_mode(
 
         print(f"[{dist.get_rank()}:DP] Exiting inference mode")
 
+def rl_inference_interface_shutdown():
+    if _INFERENCE_INTERFACE is not None:
+        loop = get_asyncio_loop()
+        loop.run_until_complete(_INFERENCE_INTERFACE.kill())
+    else:
+        logger.warning("No inference interface to shutdown. This should not happen.")
 
 def get_iteration_sequence_count(args):
     """Get the total number of sequences processed in this iteration across all ranks."""
@@ -2348,7 +2519,7 @@ def get_iteration_sequence_count(args):
 
 def update_sequence_packing_metrics(args):
     """Update bin tracking for sequence packing mode."""
-    if args.use_sequence_packing:
+    if args.rl_use_sequence_packing:
         bin_count = (
             mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
         )
