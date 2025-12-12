@@ -670,7 +670,31 @@ class PagedTensor:
             paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
 
 
-class PP_ScheduleFunction(torch.autograd.Function):
+class PP_PreScheduleFunction(torch.autograd.Function):
+    """
+    This function is used to update the pp schedule.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, offload_manager): # after forward
+        # pylint: disable=missing-function-docstring
+        ctx.offload_manager = offload_manager
+        # Wait for offload to complete before starting the next layer
+        offload_manager.wait_for_offload_to_complete()
+        return tensor
+
+    @staticmethod
+    def backward(ctx, *grad_output): # before backward
+        # pylint: disable=missing-function-docstring
+        # Initiate reload for next layer
+        if ctx.offload_manager.status == 'captured' and ctx.offload_manager.current_schedule_index < len(ctx.offload_manager._pp_schedule):
+            next_schedule_layer = ctx.offload_manager._pp_schedule[ctx.offload_manager.current_schedule_index]
+            if next_schedule_layer < 0:
+                ctx.offload_manager.reload_packed_tensors(-next_schedule_layer)
+
+        return grad_output + (None, None)
+
+class PP_PostScheduleFunction(torch.autograd.Function):
     """
     This function is used to update the pp schedule.
     """
@@ -684,19 +708,8 @@ class PP_ScheduleFunction(torch.autograd.Function):
         if ctx.vp_stage is None:
             ctx.vp_stage = 0
         ctx.layer_no, ctx.microbatch_no = offload_manager.update_pp_schedule(ctx.vp_stage+1)
-        current_stream = torch.cuda.current_stream()
-        if offload_manager._pack_stream_status == 'offloading':
-            current_stream.wait_stream(offload_manager.pack_stream)
-            offload_manager._pack_stream_status = 'idle'
 
-            # Deallocate original tensor after offload is complete
-            while len(offload_manager.packed_tensors_offload_in_progress) > 0:
-                packed_tensor = offload_manager.packed_tensors_offload_in_progress.pop(0)
-                if isinstance(packed_tensor._original_tensor, MXFP8Tensor):
-                    packed_tensor._original_tensor._columnwise_data = None
-                else:
-                    packed_tensor._original_tensor = None
-
+        # Initiate offload for current layer and reload for next layer
         if offload_manager.status == 'captured':
             current_schedule_layer = offload_manager.get_schedule_layer(ctx.vp_stage+1, ctx.layer_no, ctx.microbatch_no)
             next_schedule_layer = ctx.offload_manager._pp_schedule[ctx.offload_manager.current_schedule_index+1]
@@ -720,29 +733,11 @@ class PP_ScheduleFunction(torch.autograd.Function):
             ctx.offload_manager.update_pp_schedule(-(ctx.vp_stage+1), -ctx.layer_no, -ctx.microbatch_no)
         ctx.offload_manager.current_schedule_index += 1
         current_stream = torch.cuda.current_stream()
+
+        ctx.offload_manager.wait_for_offload_to_complete()
         if ctx.offload_manager._unpack_stream_status == 'reloading':
             current_stream.wait_stream(ctx.offload_manager.unpack_stream)
             ctx.offload_manager._unpack_stream_status = 'idle'
-
-        if ctx.offload_manager.status == 'captured' and ctx.offload_manager.current_schedule_index < len(ctx.offload_manager._pp_schedule):
-            next_schedule_layer = ctx.offload_manager._pp_schedule[ctx.offload_manager.current_schedule_index]
-            if next_schedule_layer < 0:
-                # For last layer last microbatch, wait for offload to complete before reloading
-                if ctx.offload_manager._pack_stream_status == 'offloading':
-                    assert len(ctx.offload_manager.packed_tensors_offload_in_progress) > 0, f"packed_tensors_offload_in_progress is empty"
-                    offloaded_tensor = ctx.offload_manager.packed_tensors_offload_in_progress[0]
-                    if next_schedule_layer == -offloaded_tensor.schedule_layer:
-                        current_stream.wait_stream(ctx.offload_manager.pack_stream)
-                        ctx.offload_manager._pack_stream_status = 'idle'
-                        # Deallocate original tensor after offload is complete
-                        while len(ctx.offload_manager.packed_tensors_offload_in_progress) > 0:
-                            packed_tensor = ctx.offload_manager.packed_tensors_offload_in_progress.pop(0)
-                            if isinstance(packed_tensor._original_tensor, MXFP8Tensor):
-                                packed_tensor._original_tensor._columnwise_data = None
-                            else:
-                                packed_tensor._original_tensor = None
-
-                ctx.offload_manager.reload_packed_tensors(-next_schedule_layer)
         
         return grad_output + (None, None)
 
@@ -863,7 +858,22 @@ class PackedOffloadManager:
             else:
                 pass
         assert len(self.packed_tensors_to_offload) == 0, f"packed_tensors_to_offload is not empty {self.packed_tensors_to_offload}"
-        
+
+    def wait_for_offload_to_complete(self):
+        """Wait for offload to complete."""
+        current_stream = torch.cuda.current_stream()
+        if self._pack_stream_status == 'offloading':
+            current_stream.wait_stream(self.pack_stream)
+            self._pack_stream_status = 'idle'
+
+            # Deallocate original tensor after offload is complete
+            while len(self.packed_tensors_offload_in_progress) > 0:
+                packed_tensor = self.packed_tensors_offload_in_progress.pop(0)
+                if isinstance(packed_tensor._original_tensor, MXFP8Tensor):
+                    packed_tensor._original_tensor._columnwise_data = None
+                else:
+                    packed_tensor._original_tensor = None
+
     def reload_packed_tensors(self, pp_schedule_layer):
         """Reload the packed tensors."""
         current_stream = torch.cuda.current_stream()
@@ -1086,7 +1096,10 @@ class PackedOffloadContext:
 def packed_moe_expert_offloading_group_start(tensor, name=None):
     """Mark the start of a layer group and prepare for offload/reload."""
     rank = torch.distributed.get_rank()
-    return tensor
+    offload_manager = PackedOffloadManager.get_instance()
+    if not offload_manager.enabled:
+        return tensor
+    return PP_PreScheduleFunction.apply(tensor, offload_manager)
 
 def get_packed_moe_expert_offloading_context(name=None, max_num_tokens=None, num_tokens_tensor=None):
     """Get the fine-grained offload context"""
@@ -1107,7 +1120,7 @@ def packed_moe_expert_offloading_group_commit(tensor, name=None):
     offload_manager.device = tensor.device
     if not offload_manager.enabled:
         return tensor
-    return PP_ScheduleFunction.apply(tensor, offload_manager)
+    return PP_PostScheduleFunction.apply(tensor, offload_manager)
 
 def packed_moe_expert_offloading_init_chunk_handler(vp_size, vp_stage):
     """Initialize the chunk handler, called at the start of a microbatch forward pass."""

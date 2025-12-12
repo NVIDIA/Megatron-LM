@@ -906,6 +906,8 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states = fine_grained_offloading_group_start(
                 permuted_local_hidden_states, name="expert_fc1"
             )
+        if self.config.packed_moe_expert_offloading:
+            permuted_local_hidden_states = packed_moe_expert_offloading_group_start(permuted_local_hidden_states, name="expert_fc1")
         if self.packed_offload_expert_fc1:
             offload_context = get_packed_moe_expert_offloading_context(name="expert_fc1", max_num_tokens=permuted_local_hidden_states.shape[0], num_tokens_tensor=tokens_per_expert.sum())
         else:
