@@ -42,6 +42,7 @@ from megatron.core.inference.utils import Counter, await_process_event
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import (
+    experimental_api,
     get_asyncio_loop,
     get_pg_rank,
     get_pg_size,
@@ -111,6 +112,7 @@ class RequestEntry:
 
 
 # pylint: disable=line-too-long
+@experimental_api
 class DynamicInferenceEngine(AbstractEngine):
     """The dynamic inference engine.
 
@@ -342,7 +344,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self,
         inference_coordinator_port: int,
         launch_inference_coordinator: bool = True,
-        verbose: bool = False,
         *,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
@@ -376,7 +377,6 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
-            verbose (bool): Whether to run in verbose mode.
         """
 
         assert HAVE_ZMQ, (
@@ -484,9 +484,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
-        self.engine_loop_task = loop.create_task(
-            self.run_engine_with_coordinator(loop=loop, verbose=verbose)
-        )
+        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
     @contextmanager
     @staticmethod
@@ -1051,8 +1049,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if (
             self.inference_logging_step_interval > 0
-            and step_count > 0
-            and step_count % self.inference_logging_step_interval == 0
+            and self.step_count > 0
+            and self.step_count % self.inference_logging_step_interval == 0
             and self.context.metrics_writer is not None
         ):
             kvcache_util_stats = self.context.get_kvcache_utilization_stats()
@@ -1076,13 +1074,7 @@ class DynamicInferenceEngine(AbstractEngine):
         return result, context_state, step_time, self.step_count
 
     async def async_bookkeep(
-        self,
-        step_result: Optional[Dict],
-        context_state: Dict,
-        step_time: float,
-        step_count: int,
-        *,
-        verbose: bool = False,
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float, step_count: int
     ):
         """Uses `asyncio` for continuous bookkeeping.
 
@@ -1091,7 +1083,6 @@ class DynamicInferenceEngine(AbstractEngine):
             context_state (Dict): is_decode_only, total/paused request count, active token count.
             step_time (float): How long this step took.
             step_count (int): The count of the step.
-            verbose (bool): Whether to run in verbose mode.
 
         Returns:
             A dictionary containing:
@@ -1190,7 +1181,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
         # Print context state.
-        if verbose:
+        if (
+            self.inference_logging_step_interval > 0
+            and step_count % self.inference_logging_step_interval == 0
+        ):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
@@ -1241,15 +1235,12 @@ class DynamicInferenceEngine(AbstractEngine):
         }
 
     async def async_step(
-        self, *, verbose: bool = False
+        self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
         match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
-
-        Args:
-            verbose (bool): Whether to run in verbose mode.
 
         Returns:
             A tuple comprised of:
@@ -1258,18 +1249,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 3. The step time in seconds.
         """
         last_step_data = await self.async_forward()
-        ret = await self.async_bookkeep(*last_step_data, verbose=verbose)
+        ret = await self.async_bookkeep(*last_step_data)
         # Keep for compatibility with current test suite.
         return ret
 
     def step_modern(
-        self, *, verbose: bool = False
+        self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
-        return self._loop.run_until_complete(self.async_step(verbose=verbose))
+        return self._loop.run_until_complete(self.async_step())
 
     def step_legacy(
-        self, sampling_params: SamplingParams, *, verbose: bool = False
+        self, sampling_params: SamplingParams
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
         warnings.warn(
@@ -1277,7 +1268,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "0.16. Please use `step_modern()` going forward, which will eventually "
             "be renamed to `step()`."
         )
-        result = self._loop.run_until_complete(self.async_step(verbose=verbose))
+        result = self._loop.run_until_complete(self.async_step())
         active_requests = [self.get_request(i) for i in result["active_request_ids"]]
         finished_requests = [r.merge() for r in result["finished_request_records"]]
         return active_requests, finished_requests, result["step_time"]
@@ -1435,9 +1426,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_context.term()
 
     @trace_async_exceptions
-    async def run_engine(
-        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
-    ):
+    async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = False
@@ -1454,13 +1443,13 @@ class DynamicInferenceEngine(AbstractEngine):
                             )
                         )
                     )
-                await self.async_step(verbose=verbose)
+                await self.async_step()
         except asyncio.CancelledError:
             pass
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
-        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None
     ):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
@@ -1504,7 +1493,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)
                     continue
 
-                await self.async_step(verbose=verbose)
+                await self.async_step()
 
         except asyncio.CancelledError:
             pass
