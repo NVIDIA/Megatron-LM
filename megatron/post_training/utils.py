@@ -6,7 +6,6 @@ import modelopt.torch.quantization as mtq
 from megatron.core import parallel_state
 from megatron.training.utils import unwrap_model
 from modelopt.torch.quantization.utils import is_quantized
-from modelopt.torch.utils import atomic_print
 
 def get_current_memory_info():
     """Get current memory usage."""
@@ -81,7 +80,6 @@ def print_distributed_quant_summary(model, msg=""):
         mtq.print_quant_summary(unwrapped_model)
         return
 
-    @atomic_print
     def _print_rank_summary():
         TP_rank = parallel_state.get_tensor_model_parallel_rank()
         EP_rank = parallel_state.get_expert_model_parallel_rank()
