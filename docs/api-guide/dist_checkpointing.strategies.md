@@ -5,37 +5,3 @@ Package defining different checkpoint formats (backends) and saving/loading algo
 Strategies can be used for implementing new checkpoint formats or implementing new (more optimal for a given use case) ways of saving/loading of existing formats.
 Strategies are passed to `dist_checkpointing.load` and `dist_checkpointing.save` functions and control the actual saving/loading procedure.
 
-## Submodules
-
-### dist_checkpointing.strategies.base module
-
-```{automodule} core.dist_checkpointing.strategies.base
-:members:
-:undoc-members:
-:show-inheritance:
-```
-
-### dist_checkpointing.strategies.tensorstore module
-
-```{automodule} core.dist_checkpointing.strategies.tensorstore
-:members:
-:undoc-members:
-:show-inheritance:
-```
-
-### dist_checkpointing.strategies.two_stage module
-
-```{automodule} core.dist_checkpointing.strategies.two_stage
-:members:
-:undoc-members:
-:show-inheritance:
-```
-
-## Module contents
-
-```{automodule} core.dist_checkpointing.strategies
-:members:
-:undoc-members:
-:show-inheritance:
-```
-
