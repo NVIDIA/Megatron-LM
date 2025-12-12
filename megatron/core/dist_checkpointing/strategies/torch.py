@@ -83,6 +83,13 @@ MSC_PREFIX = "msc://"
 _metadata_fn: str = ".metadata"
 
 
+# dummy class needed to load mcore v0.15 checkpoints with optim. states
+class MCoreMetadata:
+    """ """
+
+    pass
+
+
 # dummy class needed to load old checkpoint weights
 class MCoreSavePlan:
     """ """
