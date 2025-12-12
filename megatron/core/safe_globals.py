@@ -1,7 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 from argparse import Namespace
+from io import BytesIO
 from pathlib import PosixPath
+from signal import Signals
 from types import SimpleNamespace
 
 import torch
@@ -10,6 +12,7 @@ from numpy.core.multiarray import _reconstruct
 from numpy.dtypes import UInt32DType
 
 from megatron.core.enums import ModelType
+from megatron.core.optimizer import OptimizerConfig
 from megatron.core.rerun_state_machine import RerunDiagnostic, RerunMode, RerunState
 from megatron.core.transformer.enums import AttnBackend
 
@@ -23,9 +26,12 @@ SAFE_GLOBALS = [
     Namespace,
     AttnBackend,
     ModelType,
+    OptimizerConfig,
     RerunDiagnostic,
     RerunMode,
     RerunState,
+    BytesIO,
+    Signals,
 ]
 
 

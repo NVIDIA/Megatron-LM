@@ -1,10 +1,12 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
 import torch
 
+from megatron.core.jit import jit_fuser
+from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -66,6 +68,8 @@ class Router(ABC, MegatronModule):
         """Reset the router parameters."""
         if self.config.perform_initialization:
             self.config.init_method(self.weight)
+            if self.bias is not None:
+                self.config.init_method(self.bias)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
         setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
         if self.bias is not None:
@@ -401,6 +405,7 @@ class TopKRouter(Router):
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
             valid_token_count=local_num_tokens,
+            reduce_group_has_dp=True,
         )
         return probs
 
@@ -412,6 +417,7 @@ class TopKRouter(Router):
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
+        reduce_group_has_dp: bool = False,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -424,6 +430,9 @@ class TopKRouter(Router):
             valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
                 If None, uses activation.shape[0]. Defaults to None.
+            reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
+                Set this to True if the reduce group has data parallel ranks. This flag is used to
+                ensure the correct reduction in aux loss tracking.
         """
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the
@@ -438,6 +447,7 @@ class TopKRouter(Router):
             self.layer_number,
             num_layers,
             reduce_group=reduce_group,
+            reduce_group_has_dp=reduce_group_has_dp,
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
@@ -514,6 +524,18 @@ class TopKRouter(Router):
             return input * self.input_jitter(input.shape)
         else:
             return input
+
+    @jit_fuser
+    def _apply_expert_bias(self, routing_map: torch.Tensor):
+        """
+        Update expert bias and tokens_per_expert
+        Prevent extra local tokens accumulation on evaluation or activation recomputation
+        """
+        if self.enable_expert_bias and torch.is_grad_enabled():
+            with torch.no_grad():
+              if padding_mask is not None:
+                    routing_map = routing_map & (~padding_mask)
+                self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function
@@ -597,13 +619,8 @@ class TopKRouter(Router):
                 with_padding_mask=padding_mask is not None,
             )
 
-        # Update expert bias and tokens_per_expert
-        # Prevent extra local tokens accumulation on evaluation or activation recomputation
-        if self.enable_expert_bias and torch.is_grad_enabled():
-            with torch.no_grad():
-                if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+        # Optionally apply expert bias
+        self._apply_expert_bias(routing_map)
 
         return probs, routing_map
 

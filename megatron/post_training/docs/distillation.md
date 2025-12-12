@@ -20,7 +20,7 @@ We require the following pieces of data:
 * Tokenizer
 * Dataset
 
-It also requires the installation of the [NVIDIA Model Optimizer library](https://github.com/NVIDIA/TensorRT-Model-Optimizer) (minimum version 0.15)
+It also requires the installation of the [NVIDIA Model Optimizer library](https://github.com/NVIDIA/Model-Optimizer)
 
 ### Teacher checkpoint format
 
@@ -66,7 +66,7 @@ be distinguished separately using the additional flag `--export-kd-teacher-ckpt-
 
 ## Distillation API and design
 
-Knowledge Distillation is done via the [NVIDIA Model Optimizer library](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+Knowledge Distillation is done via the [NVIDIA Model Optimizer library](https://github.com/NVIDIA/Model-Optimizer).
 
 The model creation step wraps the base model as the student in a
 `modelopt.torch.distill.DistillationModel` wrapper which also contains the teacher model.
@@ -75,7 +75,7 @@ Model Optimizer modifies the model using the loss criterion present in the disti
 defines a loss function between two module attribute names of the teacher and student model, respectively.
 
 Default loss function used between logits is a KL-Divergence Loss and loss used among intermediate tensors is Cosine-Similarity,
-both defined in `megatron/inference/algos/distillation.py`.
+both defined in `modelopt.torch.distill.plugins.megatron`.
 
 ## Restrictions
 

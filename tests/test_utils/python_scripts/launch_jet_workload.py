@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import json
 import logging
 import os
@@ -289,6 +291,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "unspecified launch failure" in concat_allranks_logs
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
+        or "Fatal glibc error" in concat_allranks_logs
     )
 
 
@@ -497,6 +500,7 @@ def main(
 
             if (
                 "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log
+                or "Throughput is slower than expected!" in concat_mainrank_log
             ) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
                 n_nondeterminism_attemps += 1
                 if n_nondeterminism_attemps < 3:

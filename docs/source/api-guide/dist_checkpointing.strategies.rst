@@ -33,14 +33,6 @@ dist\_checkpointing.strategies.two\_stage module
    :undoc-members:
    :show-inheritance:
 
-dist\_checkpointing.strategies.zarr module
-------------------------------------------
-
-.. automodule:: core.dist_checkpointing.strategies.zarr
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
 Module contents
 ---------------
 
