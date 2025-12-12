@@ -47,6 +47,7 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    experimental_api,
     trace_async_exceptions,
 )
 
@@ -111,6 +112,7 @@ class RequestEntry:
 
 
 # pylint: disable=line-too-long
+@experimental_api
 class DynamicInferenceEngine(AbstractEngine):
     """The dynamic inference engine.
 
