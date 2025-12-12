@@ -668,12 +668,9 @@ class _ParamAndGradBuffer:
         for param in params[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order.
 
-            # NVFP4 2D: only rowwise packed bytes are stored (uint8), last dim halved.
-            if is_nvfp4tensor(param):
-                packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
-                this_numel = packed_shape.numel()
-            else:
-                this_numel = param.data.nelement()
+            # Use full numel for buffer allocation (gradients need full precision).
+            # NVFP4 param storage is handled separately via _rowwise_data.
+            this_numel = param.data.nelement()
             param_start_index = _pad_start_of_param_if_needed(param_start_index)
 
             # Create bucket with collected parameters if current param needs its own bucket.
@@ -775,8 +772,9 @@ class _ParamAndGradBuffer:
                 # Assign param.data to appropriate segment of self.param_data.
                 if self.param_data is not None:
                     if is_nvfp4tensor(param):
-                        # NVFP4 2D: map only rowwise packed bytes (uint8) into the param buffer
-                        # Buffer was allocated with packed size, so use packed_shape for _get
+                        # NVFP4 2D: map only rowwise packed bytes (uint8) into the param buffer.
+                        # Buffer is allocated with full numel for gradients; we only use the
+                        # first half (packed size) for NVFP4 param storage.
                         from ..fp4_utils import modify_nvfp4_rowwise_storage
                         packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
                         rowwise_bytes_view = self._get(
