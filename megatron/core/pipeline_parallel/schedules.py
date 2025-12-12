@@ -849,6 +849,7 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
     Get the order for overlap_moe_expert_parallel_comm schedule for the original
     chunk-wise order list.
     """
+
     def _add_order(new_order, chunk_id_list, c_id, layer_id, is_wgrad=False, index=None):
         if is_wgrad:
             new_order.append(layer_id - 0.5)
@@ -858,6 +859,7 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
             chunk_id_list.append([abs(c_id) - 1, index])
         else:
             chunk_id_list.append(None)
+
     new_order = []
     chunk_id_list = []
     add_order = partial(_add_order, new_order, chunk_id_list)
@@ -920,7 +922,6 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
             add_order(c_id, l_b)
             if capture_wgrad_graph:
                 add_order(c_id, l_b, is_wgrad=True)
-
 
     return new_order, chunk_id_list
 

@@ -17,6 +17,7 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
+from megatron.core.transformer.enums import CudaGraphScope
 
 
 class ModelChunkState:
@@ -178,6 +179,11 @@ class TransformerLayerSchedulePlan:
             )
         else:
             self.mtp_post_process = NoopScheduleNode()
+
+        # mlp and combine may receive dgrad from attn, which is managed by cuda graph.
+        if CudaGraphScope.attn in self.config.cuda_graph_scope:
+            self.mlp.manual_grads_release = False
+            self.moe_combine.manual_grads_release = False
 
     def get_fp8_context(self):
         """
@@ -351,6 +357,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self.post_process = PostProcessNode(
                 model, self._model_chunk_state, self._event, comp_stream
             )
+
+        # pre/postprocess may receive dgrad from attn, which is managed by cuda graph.
+        if CudaGraphScope.attn in model.config.cuda_graph_scope:
+            self.pre_process.manual_grads_release = False
+            if self.post_process:
+                self.post_process.manual_grads_release = False
 
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
         if module is None:

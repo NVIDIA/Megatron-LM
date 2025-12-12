@@ -1540,9 +1540,9 @@ class TECudaGraphHelper:
             order (List[int]): The forward/backward execution order from
                 convert_schedule_table_to_order(). Positive integers represent forward passes
                 (1-indexed chunk ID), negative integers represent backward passes.
-            chunk_id_list (List[Tuple[int, int]]): The list of chunk IDs and layer IDs in the order. This is useful only
-                when overlap_moe_expert_parallel_comm is enabled, the order maps each layers'
-                idx to their original chunk id.
+            chunk_id_list (List[Tuple[int, int]]): The list of chunk IDs and layer IDs in the
+                order. This is useful only when overlap_moe_expert_parallel_comm is enabled,
+                the order maps each layers' idx to their original chunk id.
 
         Returns:
             Tuple[List[Tuple], List[Dict]]: A tuple containing:
@@ -1666,7 +1666,8 @@ class TECudaGraphHelper:
                     if sample_args[per_callable_fwd_idx] is None:
                         layer_idx = per_callable_fwd_idx - sample_start_idx
                         if chunk_id_list:
-                            # the chunk_id is actually layer id, use chunk_id_list to map back to the chunk.
+                            # the chunk_id is actually layer id, chunk_id_list maps it
+                            # back to the original chunk id.
                             model_chunk_idx = chunk_id_list[idx][0]
                             layer_idx = chunk_id_list[idx][1]
                         sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
@@ -1793,7 +1794,6 @@ class TECudaGraphHelper:
 
         # Generate sample arguments and keyword arguments for capturing.
         sample_args, sample_kwargs = self._get_sample_arguments(order, chunk_id_list)
-
 
         def get_make_graphed_callables_kwargs():
             kwargs = {'allow_unused_input': True, '_order': order}

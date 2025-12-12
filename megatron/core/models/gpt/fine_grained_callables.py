@@ -58,9 +58,9 @@ def should_free_input(name, is_moe, config):
     if not is_moe:
         return False
     enable_deepep = (
-            config.moe_token_dispatcher_type == "flex"
-            and config.moe_flex_dispatcher_backend == "deepep"
-        )
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "deepep"
+    )
     enable_hybridep = (
         config.moe_token_dispatcher_type == "flex"
         and config.moe_flex_dispatcher_backend == "hybridep"
@@ -309,9 +309,10 @@ class TransformerLayerNode(ScheduleNode):
                 module.backward_dw()
 
         # the output grad memory is last used in wgrad compute, should be safe to release.
-        assert self.delay_grads_release, "output grad memory should be valid before wgrad."
-        for tensor in self.output_grads:
-            tensor.untyped_storage().resize_(0)
+        if self.manual_grads_release:
+            assert self.delay_grads_release, "output grad memory should be valid before wgrad."
+            for tensor in self.output_grads:
+                tensor.untyped_storage().resize_(0)
         self.output_grads = None
 
         self.bwd_dw_callables = None
@@ -361,6 +362,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         layer.config.moe_token_dispatcher_type == "flex"
         and layer.config.moe_flex_dispatcher_backend == "hybridep"
     )
+
     class _BackwardDWWrapper:
         def __init__(self):
             self.graphed_backward_dw_callable = None
