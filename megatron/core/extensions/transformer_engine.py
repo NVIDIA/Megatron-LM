@@ -1107,6 +1107,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         softmax_scale: Optional[float] = None,
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
+        num_splits: Optional[int] = None,
         cp_comm_type: str = "p2p",
         pg_collection: ProcessGroupCollection = None,
     ):
@@ -1119,6 +1120,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.config = config
         self.te_forward_mask_type = False
         self.qkv_format: str = "sbhd"
+        # Default to 1 split when batch-invariant mode is enabled, unless explicitly overridden
+        self.num_splits: Optional[int] = (
+            1 if (num_splits is None and self.config.batch_invariant_mode) else num_splits
+        )
 
         if self.config.apply_query_key_layer_scaling != bool(
             int(os.getenv("NVTE_APPLY_QK_LAYER_SCALING", "0"))
@@ -1281,8 +1286,17 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attn_mask_type: AttnMaskType,
         attention_bias: Tensor = None,
         packed_seq_params: PackedSeqParams = None,
+        num_splits: Optional[int] = None,
     ):
         """Forward."""
+        # Default to constructor-provided num_splits unless explicitly overridden
+        if num_splits is None:
+            num_splits = self.num_splits
+        if num_splits is not None:
+            assert is_te_min_version("2.10.0"), (
+                f"Transformer-Engine v{get_te_version()} must be >= 2.10.0 to support" "num_splits."
+            )
+
         packed_seq_kwargs = (
             {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
             if packed_seq_params is not None
@@ -1315,15 +1329,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     attn_mask_type = AttnMaskType.padding_causal
                 elif attn_mask_type == AttnMaskType.no_mask:
                     attn_mask_type = AttnMaskType.padding
-            core_attn_out = super().forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type.name,
-                **attention_bias_kwargs,
-                **packed_seq_kwargs,
+            _fa_kwargs = dict(
+                attn_mask_type=attn_mask_type.name, **attention_bias_kwargs, **packed_seq_kwargs
             )
+            if num_splits is not None:
+                _fa_kwargs["num_splits"] = num_splits
+
+            core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
             if self.config.qk_clip or self.config.log_max_attention_logit:
                 # qk-clip is only supported in TE 2.9.0 and later
@@ -1341,9 +1353,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     )
 
         else:
-            core_attn_out = super().forward(
-                query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs
-            )
+            _fa_kwargs = dict(**attention_bias_kwargs, **packed_seq_kwargs)
+            if num_splits is not None:
+                _fa_kwargs["num_splits"] = num_splits
+            core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
         return core_attn_out
 

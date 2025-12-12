@@ -76,3 +76,4 @@ MODEL_ARGS:
   --save-interval: 1000000
   --eval-interval: 1000000
   --finetune: true
+  --inference-logging-step-interval: 1
