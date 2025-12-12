@@ -291,12 +291,15 @@ def _get_should_context_be_quantized_params(
             qparams.training_recipe, is_context_quantized
         )
 
+
 def qtype_debug_log(prefix: str) -> None:
+    """Logs the precision of based on the autocast context"""
     if os.getenv("QUANTIZATION_TYPE_DEBUG", "0") == "1":
         if not HAVE_TE:
             quantization_type = "none"
-            log_single_rank(logger, logging.INFO,
-                            f"{prefix}, quantization_type: {quantization_type}")
+            log_single_rank(
+                logger, logging.INFO, f"{prefix}, quantization_type: {quantization_type}"
+            )
             return
         if not FP8GlobalStateManager.is_fp8_enabled():
             quantization_type = "none"
@@ -312,8 +315,7 @@ def qtype_debug_log(prefix: str) -> None:
             quantization_type = "fp8_block_scaling"
         else:
             quantization_type = "unknown"
-        log_single_rank(logger, logging.INFO,
-                        f"{prefix}, quantization_type: {quantization_type}")
+        log_single_rank(logger, logging.INFO, f"{prefix}, quantization_type: {quantization_type}")
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
