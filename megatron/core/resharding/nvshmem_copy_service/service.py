@@ -273,6 +273,9 @@ class RemoteCopyService:
         Can be called multiple times after a single schedule() call
         to repeat the same communication pattern.
         """
+        #import torch
+        #torch.save(self.send_requests, f"send_requests_{torch.distributed.get_rank()}.pt")
+        #torch.save(self.receive_requests, f"receive_requests_{torch.distributed.get_rank()}.pt")
 
         if not self.initialized:
             raise RuntimeError("RemoteCopyService not initialized")

@@ -259,10 +259,10 @@ def build_centralized_reshard_plan(
 
     # Build the plan on global rank 0 and broadcast to all ranks
     if my_global_rank == 0:
-        plans_for_all_ranks = {r: ReshardPlan([], [], []) for r in range(world_size)}
+        plans_for_all_ranks = {r: ReshardPlan([], []) for r in range(world_size)}
         # Global monotonically increasing ID for non-local transfers.
         # This is shared between the corresponding send/recv ops so that
-        # advanced backends (e.g., NVSHMEM) can build richer schedules.
+        # NVSHMEM can build schedule.
         next_task_id = 0
 
         for dst_rank in range(world_size):
@@ -282,50 +282,38 @@ def build_centralized_reshard_plan(
                     resolved_name, src_metadata, dst_metadata, dst_rank
                 )
                 for src_rank, src_slice, dst_slice in sources:
-                    if src_rank == dst_rank and src_metadata.name == dst_metadata.name:
-                        plans_for_all_ranks[dst_rank].local_copy_ops.append(
-                            (dst_metadata.name, None, None, src_slice, dst_slice)
-                        )
-                    else:
-                        task_id = next_task_id
-                        next_task_id += 1
+                    task_id = next_task_id
+                    next_task_id += 1
 
-                        plans_for_all_ranks[dst_rank].recv_ops.append(
-                            TransferOp(
-                                param_name=dst_metadata.name,
-                                peer_rank=src_rank,
-                                is_send=False,
-                                my_slice=dst_slice,
-                                peer_slice=src_slice,
-                                task_id=task_id,
-                            )
+                    plans_for_all_ranks[dst_rank].recv_ops.append(
+                        TransferOp(
+                            param_name=dst_metadata.name,
+                            peer_rank=src_rank,
+                            is_send=False,
+                            my_slice=dst_slice,
+                            peer_slice=src_slice,
+                            task_id=task_id,
                         )
-                        plans_for_all_ranks[src_rank].send_ops.append(
-                            TransferOp(
-                                param_name=src_metadata.name,
-                                peer_rank=dst_rank,
-                                is_send=True,
-                                my_slice=src_slice,
-                                peer_slice=dst_slice,
-                                task_id=task_id,
-                            )
+                    )
+                    plans_for_all_ranks[src_rank].send_ops.append(
+                        TransferOp(
+                            param_name=src_metadata.name,
+                            peer_rank=dst_rank,
+                            is_send=True,
+                            my_slice=src_slice,
+                            peer_slice=dst_slice,
+                            task_id=task_id,
                         )
+                    )
         plans_list = [plans_for_all_ranks[r] for r in range(world_size)]
     else:
         plans_list = [None] * world_size
     torch.distributed.broadcast_object_list(plans_list, src=0)
     my_plan = plans_list[my_global_rank]
 
-    # Fill in actual parameter references for local copies
-    for i, (param_name, _, _, src_slice, dst_slice) in enumerate(my_plan.local_copy_ops):
-        src_param = my_src_params.get(param_name)
-        dst_param = my_dst_params.get(param_name)
-        if src_param is not None and dst_param is not None:
-            my_plan.local_copy_ops[i] = (param_name, src_param, dst_param, src_slice, dst_slice)
-
     logger.info(
         f"Rank {my_global_rank}: Received plan - {len(my_plan.recv_ops)} recvs, "
-        f"{len(my_plan.send_ops)} sends, {len(my_plan.local_copy_ops)} local copies"
+        f"{len(my_plan.send_ops)} sends"
     )
 
     return my_plan

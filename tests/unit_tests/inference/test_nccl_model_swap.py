@@ -114,8 +114,7 @@ def _set_pg_collection(module, tp_group, dp_group):
     module.pg_collection = types.SimpleNamespace(tp=tp_group, dp=dp_group, ep=None, pp=None)
     return module
 
-#"nvshmem"
-@pytest.mark.parametrize("refit_backend", ["nvshmem"])
+@pytest.mark.parametrize("refit_backend", ["nvshmem","nccl","gloo"])
 @pytest.mark.parametrize(
     "src_tp,src_pp,src_ep,dst_tp,dst_pp,dst_ep,num_experts",
     [
@@ -123,17 +122,17 @@ def _set_pg_collection(module, tp_group, dp_group):
         (2, 1, 1, 1, 1, 1, None),  # TP2 -> TP1
         (1, 1, 1, 2, 1, 1, None),  # TP1 -> TP2
         # PP only changes
-        # (1, 2, 1, 1, 1, 1, None),  # PP2 -> PP1
-        # (1, 1, 1, 1, 2, 1, None),  # PP1 -> PP2
-        # # Both TP and PP change
-        # (2, 2, 1, 1, 1, 1, None),  # TP2,PP2 -> TP1,PP1
-        # (1, 1, 1, 2, 2, 1, None),  # TP1,PP1 -> TP2,PP2
-        # (2, 1, 1, 1, 2, 1, None),  # TP2,PP1 -> TP1,PP2
-        # (1, 2, 1, 2, 1, 1, None),  # TP1,PP2 -> TP2,PP1
-        # (1, 1, 2, 1, 1, 4, 4),  # EP2 -> EP4
-        # (1, 1, 2, 1, 1, 1, 4),
-        # (1, 1, 1, 1, 1, 2, 4),
-        # (1, 1, 2, 1, 2, 2, 4),
+        (1, 2, 1, 1, 1, 1, None),  # PP2 -> PP1
+        (1, 1, 1, 1, 2, 1, None),  # PP1 -> PP2
+        # Both TP and PP change
+        (2, 2, 1, 1, 1, 1, None),  # TP2,PP2 -> TP1,PP1
+        (1, 1, 1, 2, 2, 1, None),  # TP1,PP1 -> TP2,PP2
+        (2, 1, 1, 1, 2, 1, None),  # TP2,PP1 -> TP1,PP2
+        (1, 2, 1, 2, 1, 1, None),  # TP1,PP2 -> TP2,PP1
+        (1, 1, 2, 1, 1, 4, 4),  # EP2 -> EP4
+        (1, 1, 2, 1, 1, 1, 4),   # EP2 -> EP1
+        (1, 1, 1, 1, 1, 2, 4),
+        (1, 1, 2, 1, 2, 2, 4),
     ],
 )
 def test_nccl_swap_gpt_parametrized(
