@@ -885,7 +885,7 @@ def prepare_data_for_update(
                     global_advantages, 
                     args.seq_length, 
                     args.rl_sequence_packing_max_sequences_per_bin,
-                    args.sequence_packing_algo
+                    args.rl_sequence_packing_algo
                     )
     
                 compute_trajs = packing_context.packed_trajs
