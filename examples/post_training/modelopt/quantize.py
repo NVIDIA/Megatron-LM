@@ -319,20 +319,9 @@ if __name__ == "__main__":
     def _hf_dataset_forword_loop_func(model):
         dataloader = get_calib_dataloader(args.calib_size)
 
-        if args.force_all_expert_routing:
-            for name, module in model.named_modules():
-                if isinstance(module, TopKRouter):
-                    module.topk = module.num_experts
-
-
         for prompt in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
             generated_ids = simple_generate(model, tokens.input_ids.cuda(), osl=1)
-
-            if args.force_all_expert_routing:
-                for name, module in model.named_modules():
-                    if isinstance(module, TopKRouter):
-                        module.topk = module.config.moe_router_topk
 
     unwrapped_model = unwrap_model(model)[0]
 
