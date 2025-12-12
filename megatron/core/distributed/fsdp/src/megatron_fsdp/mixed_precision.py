@@ -28,6 +28,7 @@ try:
 
     HAVE_TE = True
 except (ImportError, ModuleNotFoundError):
+    TransformerEngineBaseModule = None
     HAVE_TE = False
     logger.info("Using Megatron-FSDP without Transformer Engine.")
 
