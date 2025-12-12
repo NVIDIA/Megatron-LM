@@ -130,7 +130,14 @@ def _teacher_provider(config: Namespace, model_kwargs: Dict[str, Any]) -> MCoreG
     return teacher
 
 
-def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, config=None) -> MCoreGPTModel | MCoreMambaModel:
+def modelopt_gpt_mamba_builder(
+    args,
+    pre_process,
+    post_process,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
+) -> MCoreGPTModel | MCoreMambaModel:
     """Builds the model.
 
     Args:
@@ -139,6 +146,9 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
         post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
         vp_stage (int, optional): The virtual pipeline stage.
         config (TransformerConfig, optional): The configuration object.
+        pg_collection (ProcessGroupCollection, optional): Collection of process groups
+            used for tensor/context/pipeline/data parallelism. If provided, it will be
+            attached to the returned model for downstream routing/resharding utilities.
 
     Returns:
         MCoreGPTModel | MCoreMambaModel: The returned model
@@ -221,6 +231,7 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
+            "pg_collection": pg_collection,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
     elif args.export_model_type == "MambaModel" or args.is_hybrid_model:
@@ -244,6 +255,7 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
             "position_embedding_type": args.position_embedding_type,
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
+            "pg_collection": pg_collection,
         }
 
         model = MCoreMambaModel(config=config, **model_kwargs)
