@@ -11,6 +11,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core import mpu
 import logging
+import typing
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ class PackingInfo:
     seq_starts: Dict[int, List[int]]
     seq_lengths: List[int]
     seq_to_bin_idx: List[Optional[int]]
-    packing_algo: str = 'fifo'
+    packing_algo: typing.Literal['fifo', 'round-robin']
 
 
 @dataclass
@@ -52,7 +53,7 @@ class PackingContext:
         cached_packed_seq_params: Pre-computed PackedSeqParams for each bin
     """
     bin_size: int
-    packer: 'SequencePacker'
+    packer: SequencePacker
     packing_info: PackingInfo
     original_generation_masks: torch.Tensor
     original_trajs: torch.Tensor
@@ -65,7 +66,7 @@ class PackingContext:
     cached_packed_seq_params: List[Optional[PackedSeqParams]] = field(default_factory=list)
 
 
-def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext):
+def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext, logprobs_is_correction: bool):
     """Load packed data by index.
 
     Args:
@@ -84,11 +85,11 @@ def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext):
     position_ids = packing_context.packed_position_ids[idx]
 
     # Check if we have old_logprobs and ref_logprobs as attributes
-    old_logprobs = getattr(packing_context, 'old_logprobs', None)
+    old_logprobs = packing_context.old_logprobs
     if old_logprobs is not None:
         old_logprobs = old_logprobs[idx]
     
-    ref_logprobs = getattr(packing_context, 'ref_logprobs', None)
+    ref_logprobs = packing_context.ref_logprobs
     if ref_logprobs is not None:
         ref_logprobs = ref_logprobs[idx]
         
@@ -109,7 +110,7 @@ def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext):
 
     # Extract packed inference_logprobs if available
     packed_inference_logprobs = getattr(packing_context, 'packed_inference_logprobs', None)
-    if packed_inference_logprobs is not None and args.rl_inference_logprobs_is_correction:
+    if packed_inference_logprobs is not None and logprobs_is_correction:
         inference_logprobs = packed_inference_logprobs[idx]
     else:
         inference_logprobs = None
@@ -960,20 +961,14 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
     # Pre-compute all PackedSeqParams for all bins ONCE to avoid repeated
     # tensor allocations that cause CUDA memory fragmentation and periodic spikes
     # Create a temporary packing context to pass to create_packed_seq_params
-    temp_context = PackingContext(
-        bin_size=bin_size,
-        packer=packer,
-        packing_info=packing_info,
-        original_generation_masks=generation_masks,
-        original_trajs=trajs,
-        packed_trajs=packed_trajs,
-        packed_position_ids=packed_position_ids,
-        packed_attention_mask=packed_attention_mask,
-        packed_loss_mask=packed_loss_mask,
-        original_inference_logprobs=inference_logprobs,
-        bin_advantages=bin_advantages,
-    )
-    cached_packed_seq_params = create_packed_seq_params(temp_context)
+    cached_packed_seq_params = [
+        create_packed_seq_params_for_bin(
+                packing_info=packing_info,
+                bin_idx=bin_idx,
+                bin_size=bin_size,
+                device=packed_trajs.device,
+            ) for bin_idx in range(len(packed_trajs))
+    ]
 
     # Create the final PackingContext
     packing_context = PackingContext(

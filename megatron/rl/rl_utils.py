@@ -899,8 +899,9 @@ def prepare_data_for_update(
                 if args.rl_use_sequence_packing:
                     # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
                     bin_tensor = next(data_iterator)[0]
+                    #TODO(jalbericiola): change for named tuple
                     (b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params) = (
-                        load_packed_data_by_index(bin_tensor.item(), packing_context)
+                        load_packed_data_by_index(bin_tensor.item(), packing_context, args.rl_inference_logprobs_is_correction)
                     )
                 else:
                     batch_data = next(data_iterator)
