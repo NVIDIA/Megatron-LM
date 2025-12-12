@@ -49,7 +49,7 @@ pre:create_ci_branches:
   stage: .pre
   image: python:3.10
   variables:
-    GIT_STRATEGY: "clone"
+    GIT_STRATEGY: 'clone'
   script:
     - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
     - git switch --force-create $branch
@@ -80,7 +80,7 @@ pre:create_ci_branches_dev:
   stage: .pre
   image: python:3.10
   variables:
-    GIT_STRATEGY: "clone"
+    GIT_STRATEGY: 'clone'
   script:
     - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
     - git switch --force-create $branch
@@ -103,7 +103,7 @@ pre:label_merge_request:
     - cd gitlab-mr-labeler
     - go install .
     - cd ..
-    - go install github.com/itchyny/gojq/cmd/gojq@latest
+    - go install github.com/itchyny/gojq/cmd/gojq@v0.12.17
   script:
     - set -x
     - |
@@ -137,7 +137,7 @@ pre:maybe_cherry_pick_to_main:
   stage: .pre
   image: nentangso/alpine-git-curl-jq
   variables:
-    GIT_STRATEGY: "clone"
+    GIT_STRATEGY: 'clone'
   script:
     - |
       set -x
@@ -202,7 +202,7 @@ pre:maybe_cherry_pick_commit:
   stage: .pre
   image: nentangso/alpine-git-curl-jq
   variables:
-    GIT_STRATEGY: "clone"
+    GIT_STRATEGY: 'clone'
   script:
     - set -x
     - set +e
