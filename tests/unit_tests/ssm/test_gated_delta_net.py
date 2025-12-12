@@ -29,6 +29,7 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
+from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
 try:
     import fla
@@ -131,6 +132,68 @@ class TestGatedDeltaNet:
         assert (
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
+
+    def test_gpu_forward_thd(self):
+        # Input shape
+        sequence_length = 32
+        micro_batch_size = 4
+        cu_seqlens = [0, 32, 64, 96, 128]
+        # sbhd input shape: [sequence length, batch size, hidden size]
+        sub_sequence_length = sequence_length // self.cp_size // self.sp_size
+        hidden_states_sbhd = torch.rand(
+            (sub_sequence_length, micro_batch_size, self.gdn.config.hidden_size)
+        )
+        hidden_states_sbhd = hidden_states_sbhd.cuda().bfloat16()
+        # thd input shape: [sequence length * batch size, 1, hidden size]
+        hidden_states_thd = hidden_states_sbhd.transpose(0, 1).contiguous()
+        hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
+        attention_mask = None
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+
+        output, _ = self.gdn(hidden_states_thd, attention_mask, packed_seq_params=packed_seq_params)
+
+        assert output.shape[0] == sub_sequence_length * micro_batch_size
+        assert output.shape[1] == 1
+        assert output.shape[2] == self.gdn.config.hidden_size
+
+    def test_gpu_forward_thd_correctness(self):
+        if self.sp_size > 1:
+            pytest.skip("Sequence parallel is not supported for this test case.")
+
+        atol, rtol = 3e-4, 3e-4
+
+        # Input shape
+        sequence_length = 32
+        micro_batch_size = 4
+        cu_seqlens = [0, 32, 64, 96, 128]
+        # sbhd input shape: [sequence length, batch size, hidden size]
+        sub_sequence_length = sequence_length // self.cp_size
+        hidden_states_sbhd = torch.rand(
+            (sub_sequence_length, micro_batch_size, self.gdn.config.hidden_size)
+        )
+        attention_mask_sbhd = None
+        hidden_states_sbhd = hidden_states_sbhd.cuda().bfloat16()
+        # thd input shape: [sequence length * batch size, 1, hidden size]
+        hidden_states_thd = hidden_states_sbhd.transpose(0, 1).contiguous()
+        hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
+        attention_mask_thd = None
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+
+        # SBHD format
+        output_sbhd, _ = self.gdn(hidden_states_sbhd, attention_mask_sbhd)
+        # THD format
+        output_thd, _ = self.gdn(
+            hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
+        )
+        _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
+        rank = torch.distributed.get_rank()
+        torch.testing.assert_close(
+            _output_sbhd,
+            output_thd,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"Output mismatch ({rank=}): {msg}",
+        )
 
 
 @pytest.mark.parametrize(
