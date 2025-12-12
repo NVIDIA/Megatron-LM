@@ -40,7 +40,7 @@ class PackingContext:
     
     Attributes:
         bin_size: Maximum size of each bin (in tokens)
-        packer: SequencePacker instance used for packing
+        packer: 'SequencePacker' instance used for packing
         packing_info: PackingInfo object with bin assignments and metadata
         original_generation_masks: Generation masks for all sequences before packing
         original_trajs: All trajectories before packing
@@ -53,7 +53,7 @@ class PackingContext:
         cached_packed_seq_params: Pre-computed PackedSeqParams for each bin
     """
     bin_size: int
-    packer: SequencePacker
+    packer: 'SequencePacker'
     packing_info: PackingInfo
     original_generation_masks: torch.Tensor
     original_trajs: torch.Tensor
