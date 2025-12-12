@@ -922,15 +922,13 @@ def prepare_data_for_update(
                     None,
                 )
 
-            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+            dtype = (
+                torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+            )
 
-                dtype = (
-                    torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
-                )
-
-                old_logprobs = []
-
-                # Compute logprobs
+            def _compute_logprobs_batch():
+                """Compute logprobs for all batches in the data loader."""
+                logprobs_list = []
                 data_iterator = iter(data_loader)
                 for i in range(len(data_loader)):
                     output_tensor = forward_backward_func(
@@ -945,13 +943,13 @@ def prepare_data_for_update(
                         adjust_tensor_shapes_fn=None,
                     )
                     if is_pipeline_last_stage():
-                        old_logprobs.append(output_tensor[0].detach())
+                        logprobs_list.append(output_tensor[0].detach())
 
                 if is_pipeline_last_stage():
-                    old_logprobs = torch.concat(old_logprobs, dim=0)
-                    assert old_logprobs.dtype == dtype
+                    logprobs = torch.concat(logprobs_list, dim=0)
+                    assert logprobs.dtype == dtype
                 else:
-                    old_logprobs = torch.empty(
+                    logprobs = torch.empty(
                         len(compute_trajs),
                         args.seq_length - 1,
                         dtype=dtype,
@@ -959,11 +957,14 @@ def prepare_data_for_update(
                     )
 
                 dist.broadcast(
-                    old_logprobs,
+                    logprobs,
                     src=get_pipeline_model_parallel_last_rank(),
                     group=get_pipeline_model_parallel_group(),
                 )
-                old_logprobs = old_logprobs.cpu()
+                return logprobs.cpu()
+
+            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+                old_logprobs = _compute_logprobs_batch()
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
@@ -971,41 +972,8 @@ def prepare_data_for_update(
                     k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
                 }
                 model.load_state_dict(ref_state_dict)
-                ref_logprobs = []
 
-                # Compute reference logprobs
-                data_iterator = iter(data_loader)
-                for i in range(len(data_loader)):
-                    output_tensor = forward_backward_func(
-                        forward_step_func=logprobs_forward_step,
-                        data_iterator=data_iterator,
-                        model=model,
-                        num_microbatches=1,
-                        seq_length=args.seq_length,
-                        micro_batch_size=logprobs_batch_size,
-                        decoder_seq_length=args.decoder_seq_length,
-                        forward_only=True,
-                        adjust_tensor_shapes_fn=None,
-                    )
-                    if is_pipeline_last_stage():
-                        ref_logprobs.append(output_tensor[0].detach())
-
-                if is_pipeline_last_stage():
-                    ref_logprobs = torch.concat(ref_logprobs, dim=0)
-                    assert ref_logprobs.dtype == dtype
-                else:
-                    ref_logprobs = torch.empty(
-                        len(compute_trajs),
-                        args.seq_length - 1,
-                        dtype=dtype,
-                        device=torch.cuda.current_device(),
-                    )
-                dist.broadcast(
-                    ref_logprobs,
-                    src=get_pipeline_model_parallel_last_rank(),
-                    group=get_pipeline_model_parallel_group(),
-                )
-                ref_logprobs = ref_logprobs.cpu()
+                ref_logprobs = _compute_logprobs_batch()
 
                 # logprobs are [b, seq, h] now.
                 model.load_state_dict(cur_st_dict)
