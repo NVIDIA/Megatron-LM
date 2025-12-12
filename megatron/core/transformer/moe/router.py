@@ -403,8 +403,8 @@ class TopKRouter(Router):
             global_aux_loss,
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
-            valid_token_count=local_num_tokens,
             reduce_group_has_dp=True,
+            valid_token_count=local_num_tokens,
         )
         return probs
 
@@ -415,8 +415,8 @@ class TopKRouter(Router):
         aux_loss: torch.Tensor,
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
-        valid_token_count: Optional[Union[int, torch.Tensor]] = None,
         reduce_group_has_dp: bool = False,
+        valid_token_count: Optional[Union[int, torch.Tensor]] = None,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -426,12 +426,12 @@ class TopKRouter(Router):
             aux_loss (torch.Tensor): Computed aux loss.
             aux_loss_name (str): Name of the aux loss for logging.
             reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
-            valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
-                padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
-                If None, uses activation.shape[0]. Defaults to None.
             reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
                 Set this to True if the reduce group has data parallel ranks. This flag is used to
                 ensure the correct reduction in aux loss tracking.
+            valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
+                padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
+                If None, uses activation.shape[0]. Defaults to None.
         """
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the
