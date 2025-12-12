@@ -154,8 +154,8 @@ def core_gpt_dataset_config_from_args(args):
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
     sequences_per_dataset = None
-    if args.path_to_sequences_per_dataset_json is not None:
-        with open(args.path_to_sequences_per_dataset_json, "r") as f:
+    if args.per_dataset_sequences_path is not None:
+        with open(args.per_dataset_sequences_path, "r") as f:
             sequences_per_dataset = json.load(f)
 
     return GPTDatasetConfig(
@@ -175,9 +175,9 @@ def core_gpt_dataset_config_from_args(args):
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
         allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
-        fast_cache=args.dataloader_fast_cache_load,
+        fast_cache_load=args.dataloader_fast_cache_load,
         sequences_per_dataset=sequences_per_dataset,
-        defer_memmap=args.defer_memmap,
+        defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
     )
 
 

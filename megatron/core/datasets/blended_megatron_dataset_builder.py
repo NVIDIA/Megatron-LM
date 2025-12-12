@@ -10,6 +10,7 @@ import torch
 
 from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split, normalize
 from megatron.core.utils import log_single_rank
@@ -213,7 +214,14 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
-                        False if self.config.fast_cache else True,  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load
+                        (
+                            False
+                            if (
+                                isinstance(self.config, GPTDatasetConfig)
+                                and self.config.fast_cache_load
+                            )
+                            else True
+                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load
                         megatron_datasets[i],
                         weights_i,
                         size_i,
@@ -304,7 +312,14 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
-                        False if self.config.fast_cache else True,  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load
+                        (
+                            False
+                            if (
+                                isinstance(self.config, GPTDatasetConfig)
+                                and self.config.fast_cache_load
+                            )
+                            else True
+                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load
                         megatron_datasets,
                         weights,
                         size,
@@ -362,8 +377,10 @@ class BlendedMegatronDatasetBuilder(object):
         megatron_datasets = [[] for _ in range(len(Split))]
         num_dataset_builder_threads = self.config.num_dataset_builder_threads
 
-        # NOTE(asolergi-nv): Directly build on all ranks if we are using --dataloader-fast-cache-load
-        if torch.distributed.is_initialized() and not self.config.fast_cache:
+        # NOTE(asolergi-nv): Skip rank-0 first dataset building if we are using --dataloader-fast-cache-load
+        if torch.distributed.is_initialized() and not (
+            isinstance(self.config, GPTDatasetConfig) and self.config.fast_cache_load
+        ):
             rank = torch.distributed.get_rank()
             # First, build on rank 0
             if rank == 0:
@@ -419,6 +436,14 @@ class BlendedMegatronDatasetBuilder(object):
         Returns:
             List[Optional[MidLevelDataset]]: The MidLevelDataset (or None) per split
         """
+        synchronize_ranks = (
+            False
+            if (
+                synchronize_ranks
+                and (isinstance(self.cls, GPTDatasetConfig) and self.config.fast_cache_load)
+            )
+            else synchronize_ranks
+        )  # NOTE(asolergi-nv): Set synchronize_ranks to False if we are using --dataloader-fast-cache-load
         # short-cut if we are not building on this rank
         if torch.distributed.is_initialized() and not self.is_built_on_rank():
             for i in range(len(Split)):
@@ -426,7 +451,6 @@ class BlendedMegatronDatasetBuilder(object):
                     torch.distributed.barrier()
             return [None] * len(Split)
 
-        synchronize_ranks = False if (synchronize_ranks and self.config.fast_cache) else synchronize_ranks # NOTE(asolergi-nv): Set synchronize_ranks to False if we are using --dataloader-fast-cache-load
         # Build the low level dataset
         low_level_dataset = self.cls.build_low_level_dataset(dataset_path, self.config)
 
@@ -440,7 +464,9 @@ class BlendedMegatronDatasetBuilder(object):
                 mid_level_datasets.append(None)
             else:
                 indexed_indices = None
-                if not self.config.fast_cache: # NOTE(asolergi-nv): Skip indexed_indices building if we are using --dataloader-fast-cache-load
+                if not (
+                    isinstance(self.config, GPTDatasetConfig) and self.config.fast_cache_load
+                ):  # NOTE(asolergi-nv): Skip indexed_indices building if we are using --dataloader-fast-cache-load
                     beg = int(round(split[i][0] * float(num_elements)))
                     end = int(round(split[i][1] * float(num_elements)))
                     indexed_indices = numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32)

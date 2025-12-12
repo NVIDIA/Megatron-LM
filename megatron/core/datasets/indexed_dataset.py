@@ -242,16 +242,21 @@ class _IndexReader(object):
         dtype_code (int): The dtype code of the tokenized documents.
     """
 
-    def __init__(self, idx_path: str, multimodal: bool, sequences_per_dataset: Optional[Tuple[int, int]] = None, dtype_code: int = None) -> None:
+    def __init__(
+        self,
+        idx_path: str,
+        multimodal: bool,
+        sequences_per_dataset: Optional[Tuple[int, int]] = None,
+        dtype_code: int = None,
+    ) -> None:
         log_single_rank(logger, logging.INFO, f"Load the {type(self).__name__} from {idx_path}")
 
         if sequences_per_dataset:
             self.dtype = DType.dtype_from_code(dtype_code)
             self.dtype_size = DType.size(self.dtype)
-            
             self.sequence_count = sequences_per_dataset[0]
             self.document_count = sequences_per_dataset[1]
-            offset = 34
+            offset = 34  # 9 bytes from the header + 8 bytes from the version + 1 bytes for the dtype code + 8 bytes for the sequence count + 8 bytes for the document count
         else:
             with open(idx_path, "rb") as stream:
                 header = stream.read(9)
@@ -317,9 +322,6 @@ class _IndexReader(object):
             )
             t_end = time.time()
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
-
-        assert self.sequence_lengths.shape[0] == len(self)
-        assert self.sequence_lengths.shape[0] == self.sequence_count
 
         log_single_rank(logger, logging.INFO, f"> total number of sequences: {len(self)}")
         log_single_rank(
@@ -584,8 +586,8 @@ class IndexedDataset(torch.utils.data.Dataset):
             `object_storage_config.path_to_idx_cache` and streams data from the data (.bin) file
             in `object_storage_config.bin_chunk_nbytes` blocks. Note that `mmap` must be disabled
             for S3 data loading. Defaults to None.
-        
-        fast_cache (bool): Whether to use the fast cache mode.
+
+        fast_cache_load (bool): Whether to use the fast cache mode.
 
         sequences_per_dataset (Optional[Tuple[int, int]]): The sequences per dataset.
 
@@ -599,7 +601,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         mmap: bool = True,
         object_storage_config: Optional[ObjectStorageConfig] = None,
         s3_config: Optional[S3Config] = None,
-        fast_cache: bool = False,
+        fast_cache_load: bool = False,
         sequences_per_dataset: Optional[Tuple[int, int]] = None,
         dtype_code: int = None,
     ) -> None:
@@ -621,7 +623,20 @@ class IndexedDataset(torch.utils.data.Dataset):
             cache_idx_path = get_index_cache_path(idx_path, object_storage_config)
             cache_index_file(idx_path, cache_idx_path)
 
-        self.initialize(path_prefix, multimodal, mmap, object_storage_config, fast_cache, sequences_per_dataset, dtype_code)
+        self.initialize(
+            path_prefix,
+            multimodal,
+            mmap,
+            object_storage_config,
+            fast_cache_load,
+            sequences_per_dataset,
+            dtype_code,
+        )
+
+        if not fast_cache_load:
+            assert self.index.sequence_lengths.shape[0] == self.index.document_indices[-1]
+            assert self.index.sequence_lengths.shape[0] == len(self.index)
+            assert self.index.sequence_lengths.shape[0] == self.index.sequence_count
 
     def initialize(
         self,
@@ -629,7 +644,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         multimodal: bool,
         mmap: bool,
         object_storage_config: Optional[ObjectStorageConfig],
-        fast_cache: bool,
+        fast_cache_load: bool,
         sequences_per_dataset: Optional[Tuple[int, int]] = None,
         dtype_code: int = None,
     ) -> None:
@@ -647,8 +662,8 @@ class IndexedDataset(torch.utils.data.Dataset):
 
             object_storage_config (Optional[ObjectStorageConfig]): See IndexedDataset docstring
                 for details.
-            
-            fast_cache (bool): Whether to use the fast cache mode.
+
+            fast_cache_load (bool): Whether to use the fast cache mode.
 
             sequences_per_dataset (Optional[Tuple[int, int]]): The sequences per dataset.
 
@@ -656,7 +671,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         """
         idx_path = get_idx_path(path_prefix)
         bin_path = get_bin_path(path_prefix)
-        if object_storage_config is None and not fast_cache:
+        if object_storage_config is None and not fast_cache_load:
             assert os.path.exists(idx_path) and os.path.exists(
                 bin_path
             ), "One or both of the .idx and .bin files cannot be found at the "
