@@ -2296,6 +2296,13 @@ def _add_training_args(parser):
                        help='The communicator group names to use high priority streams.')
     group.add_argument('--use-te-activation-func', action='store_true',
                        help='Use activation function kernel from Transformer Engine in MLP module.')
+    group.add_argument('--batch-invariant-mode', action='store_true',
+                       help='Use batch-invariant kernels for deterministic forward execution regardless '
+                       'of batch size. Ensures bitwise identical results when the same inputs are '
+                       'processed in different batch configurations. This is more strict than deterministic-mode '
+                       'which only ensures bitwise identical results when the same inputs are processed in the same batch configuration. '
+                       'This will significantly affect speed of training and inference as the kernels are not full optimized.')
+
 
     return parser
 
@@ -2523,11 +2530,6 @@ def _add_checkpointing_args(parser):
                             ' Check StrictHandling docs for flags meaning.'
                             ' NOTE: This flag controls only distributed checkpoint'
                             ' load from storage, not loading state dict into the model.')
-    group.add_argument('--dist-ckpt-save-pre-mcore-014', action='store_true',
-                       help='Revert checkpointing simplifications introduced in Megatron-Core'
-                            ' v0.14. This option affects only checkpoint saving format and will'
-                            ' be removed soon (checkpoint load format is determined based on'
-                            ' checkpoint metadata).')
     group.add_argument('--dist-ckpt-optim-fully-reshardable', action='store_true',
                        help='Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP)'
                             ' as opposed to plain DP reshardability.')
