@@ -40,6 +40,7 @@ from tests.unit_tests.dist_checkpointing import (
     init_checkpointing_mock_args,
 )
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -710,6 +711,7 @@ def _test_parallel_attention_correctness(
     seed=123,
     sequence_length=256,
     micro_batch_size=4,
+    sequence_packing=False,
 ):
     # Model initialization function
     def initialize_gpt_model(
@@ -803,17 +805,24 @@ def _test_parallel_attention_correctness(
         def get_tensor_on_this_rank(tensor):
             if cp > 1:
                 tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
+            if sequence_packing:
+                tensor = tensor.transpose(0, 1).contiguous().view(-1, 1, *tensor.shape[2:])
             if tp > 1 and sp:
-                sp_seg = sequence_length // tp // cp
+                sp_seg = tensor.shape[0] // tp
                 tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
             return tensor
 
         # Calculate parallel model output
+        if sequence_packing:
+            cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
+            packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+        else:
+            packed_seq_params = None
         input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
         input_hidden_states = input_hidden_states.detach().requires_grad_(True)
         parallel_attention = gpt_model[0].decoder.layers[0].self_attention
         output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
-            input_hidden_states, attention_mask=None
+            input_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
         )
         output_hidden_states_parallel.sum().backward()
         input_grad_parallel = input_hidden_states.grad.detach()
@@ -879,6 +888,7 @@ def _test_parallel_attention_correctness(
 
 
 # TODO(yuzhongw): Add test case for fallback_to_eager_attn
+@pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize("apply_rope_fusion", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
@@ -893,7 +903,7 @@ def _test_parallel_attention_correctness(
 @pytest.mark.parametrize("qk_layernorm", [False, True])
 @pytest.mark.parametrize("output_gate", [False, True])
 def test_parallel_attention_correctness(
-    tmp_path_dist_ckpt, apply_rope_fusion, tp, sp, cp, qk_layernorm, output_gate
+    tmp_path_dist_ckpt, sequence_packing, apply_rope_fusion, tp, sp, cp, qk_layernorm, output_gate
 ):
     transformer_config = TransformerConfig(
         num_layers=1,
@@ -922,6 +932,7 @@ def test_parallel_attention_correctness(
         cp=cp,
         seed=123,
         sequence_length=256,
+        sequence_packing=sequence_packing,
     )
 
 
