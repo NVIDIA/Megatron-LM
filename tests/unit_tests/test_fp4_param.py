@@ -278,8 +278,7 @@ class TestFP4Param:
 
             # Compare with fp4_param_gather=False to verify numerical consistency
             loss_list_ref = self._run_test_helper(tp_size, fp4_param_gather=False, **kwargs)
-            # FP4 has lower precision than FP8, so we use a larger tolerance
-            torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(loss_list, loss_list_ref, atol=0, rtol=0)
 
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="NVFP4 is supported since Blackwell architecture"
