@@ -176,11 +176,11 @@ class MambaLayer(GraphableMegatronModule):
         # Training and validation mode CUDA graphs
         if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
             return True
-        # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
         elif not self.training and (
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
-            and kwargs['inference_context'].is_decode_only()
+            and kwargs.get('inference_context') is not None
         ):
-            return True
+            using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+            return using_cuda_graph
         return False
