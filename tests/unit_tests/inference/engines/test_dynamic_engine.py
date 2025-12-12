@@ -43,12 +43,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
-    check_mamba_sequence_packing_support,
     get_mamba_inference_state_config_from_model,
     is_fa_min_version,
     is_te_min_version,
@@ -59,7 +59,7 @@ from tests.unit_tests.test_utilities import Utils
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
     if model_provider == "mamba":
         sequence_packing_available, reason_for_no_sequence_packing = (
-            check_mamba_sequence_packing_support()
+            _check_mamba_sequence_packing_support()
         )
         if not sequence_packing_available:
             pytest.skip(reason_for_no_sequence_packing)

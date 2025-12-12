@@ -36,8 +36,9 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import (
-    check_mamba_sequence_packing_support,
     deprecate_inference_params,
+    is_causal_conv1d_min_version,
+    is_mamba_min_version,
     log_single_rank,
 )
 
@@ -454,7 +455,7 @@ class MambaMixer(MegatronModule):
         if it exists.
         """
         sequence_packing_available, reason_for_no_sequence_packing = (
-            check_mamba_sequence_packing_support(for_inference_not_training=True)
+            _sequence_packing_support(for_inference_not_training=True)
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
@@ -652,7 +653,7 @@ class MambaMixer(MegatronModule):
         seq_idx = None
         if packed_seq_params is not None:
             sequence_packing_available, reason_for_no_sequence_packing = (
-                check_mamba_sequence_packing_support(for_inference_not_training=False)
+                _check_mamba_sequence_packing_support(for_inference_not_training=False)
             )
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = self._create_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
@@ -1243,3 +1244,22 @@ def _split_tensor_factory(
     return ShardedTensorFactory(
         orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
     )
+
+
+def _check_mamba_sequence_packing_support(
+    for_inference_not_training: bool = True
+) -> Tuple[bool, Optional[str]]:
+    """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
+    if for_inference_not_training:
+        # https://github.com/Dao-AILab/causal-conv1d/commit/d87608f78f87d1288a7821d9e6ff4b10a8d5bf07
+        conv1d_min = "1.5.3.post1"
+        # https://github.com/state-spaces/mamba/commit/4f77d5306e19f5c7ae37665a44c3e61e24cafcb5
+        mamba_min = "2.2.6.post3"
+    else:
+        conv1d_min = "1.4.0"
+        mamba_min = "2.0.0"
+    if not is_causal_conv1d_min_version(conv1d_min):
+        return False, f"causal_conv1d >= {conv1d_min} is required"
+    elif not is_mamba_min_version(mamba_min):
+        return False, f"mamba_ssm >= {mamba_min} is required"
+    return True, None

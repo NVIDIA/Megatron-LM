@@ -470,23 +470,6 @@ def is_causal_conv1d_min_version(version, check_equality=True):
     return get_causal_conv1d_version() > PkgVersion(version)
 
 
-def check_mamba_sequence_packing_support(
-    for_inference_not_training: bool = True
-) -> Tuple[bool, Optional[str]]:
-    """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
-    if for_inference_not_training:
-        conv1d_min = "1.5.3.post1"
-        mamba_min = "2.2.6.post3"
-    else:
-        conv1d_min = "1.4.0"
-        mamba_min = "2.0.0"
-    if not is_causal_conv1d_min_version(conv1d_min):
-        return False, f"causal_conv1d >= {conv1d_min} is required"
-    elif not is_mamba_min_version(mamba_min):
-        return False, f"mamba_ssm >= {mamba_min} is required"
-    return True, None
-
-
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
