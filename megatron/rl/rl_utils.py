@@ -23,10 +23,19 @@ from torch.utils.tensorboard import SummaryWriter
 from wandb import wandb_run
 
 from megatron.core import mpu
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.optimizer import MegatronOptimizer
+from megatron.core.parallel_state import (
+    get_tensor_model_parallel_src_rank, 
+    get_pipeline_model_parallel_last_rank, 
+    get_pipeline_model_parallel_group, 
+    get_tensor_model_parallel_world_size
+)
+from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, get_tensor_model_parallel_world_size
 from megatron.core.rerun_state_machine import RerunDataIterator
@@ -566,6 +575,62 @@ def create_packed_seq_params_for_bin(
     )
 
 
+def load_packed_data_by_index(bin_idx: int):
+    """Load packed data by index.
+
+    Args:
+        bin_idx: Index of the bin to load.
+    """
+    runtime_state = get_rl_runtime_state()
+    args = get_args()
+    packing_context = runtime_state.packing_context
+    # Get packing context (should always be available in packed mode)
+    idx = slice(bin_idx, bin_idx + 1)
+    # Extract packed data for this bin (already on GPU)
+    tokens = packing_context['packed_trajs'][idx]
+    position_ids = packing_context['packed_position_ids'][idx]
+
+    if 'old_logprobs' in packing_context:
+        old_logprobs = packing_context['old_logprobs'][idx]
+    else:
+        old_logprobs = None
+    if 'ref_logprobs' in packing_context:
+        ref_logprobs = packing_context['ref_logprobs'][idx]
+    else:
+        ref_logprobs = None
+    loss_mask = packing_context['packed_loss_mask'][idx, 1:]
+
+    # Get sequence-level data for this bin
+    packing_info = packing_context['packing_info']
+    seq_starts = packing_info['seq_starts'][bin_idx]
+    seq_indices = packing_info['bin_seq_indices'][bin_idx]
+
+    # Handle empty bins (used for padding to ensure all ranks have same iterations)
+    if not seq_indices:
+        seq_lengths = []
+        advantages = torch.tensor([], device='cuda')
+    else:
+        seq_lengths = [packing_info['seq_lengths'][idx] for idx in seq_indices]
+        if 'bin_advantages' in packing_context:
+            advantages = packing_context['bin_advantages'][bin_idx]
+        else:
+            advantages = None
+
+    # Extract packed inference_logprobs if available
+    if (
+        'packed_inference_logprobs' in packing_context
+        and args.rl_inference_logprobs_is_correction
+    ):
+        inference_logprobs = packing_context['packed_inference_logprobs'][idx]
+    else:
+        inference_logprobs = None
+
+    # Get cached PackedSeqParams for proper attention masking in Transformer Engine
+    # These were pre-computed in prepare_data_for_update to avoid repeated tensor allocations
+    packed_seq_params, packed_seq_len = packing_context['cached_packed_seq_params'][bin_idx]
+
+    return tokens, advantages, old_logprobs, loss_mask, position_ids, ref_logprobs, inference_logprobs, seq_starts, seq_lengths, seq_indices, packed_seq_params, packed_seq_len
+
 def get_agent(args):
     """Get an agent based on environment configuration.
 
@@ -657,8 +722,8 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     assert (
-        n_prompts % mpu.get_expert_data_parallel_world_size() == 0
-    ), "n_prompts must be divisible by data_parallel_world_size"
+        n_prompts % mpu.get_data_parallel_world_size() == 0
+    ), f"n_prompts {n_prompts} must be divisible by data_parallel_world_size {mpu.get_data_parallel_world_size()}"
 
     with nvtx_range("rollout-collection"):
         loop = get_asyncio_loop()
@@ -696,7 +761,8 @@ def get_environment_rollouts(
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
-
+        
+        logging.info(f"Rank: {dist.get_rank()} waiting to sync rollouts")
         with nvtx_range("sync-rollouts"):
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
@@ -819,7 +885,6 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, pac
                                     max_seqlen_q=packed_seq_params.max_seqlen_q,
                                     max_seqlen_kv=packed_seq_params.max_seqlen_kv,
                                 )
-                    
                     # Slice inputs to remove padding (or pad if needed for SP alignment)
                     # dimension 0 is batch, with seq packing BS=1
                     tokens = tokens[:, :actual_len]
@@ -830,35 +895,40 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, pac
             # This is a hack to fix megatron's behaviour when flash-decode affects the training code flow.
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
+            fp32_output = not (args.fp16 or args.bf16)
             with torch.no_grad() if no_grad else nullcontext():
-                logits = model(
+                logits_or_hidden_states = model(
                     tokens,
                     position_ids,
                     attention_mask_for_forward,
                     packed_seq_params=packed_seq_params,
                     runtime_gather_output=True,
-                    fp32_output=not (args.fp16 or args.bf16),
+                    fp32_output=fp32_output,
                 )
             model.config.flash_decode = flash_decode
             
-            # Pad logits back to original sequence length if we sliced
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                if logits.shape[1] < original_seq_len:
-                    pad_len = original_seq_len - logits.shape[1]
-                    # Pad with zeros (these positions will be masked out anyway)
-                    logits = torch.nn.functional.pad(logits, (0, 0, 0, pad_len), value=0)
-                # Also need to restore tokens for the log_softmax below
-                tokens_for_softmax = torch.nn.functional.pad(
-                    tokens, (0, original_seq_len - tokens.shape[1]), value=0
-                )
-            else:
-                tokens_for_softmax = tokens
-            
-            # We do not need logprobs for the n+1 token.
-        with nvtx_range("log-softmax", time=False):
-            logprobs = selective_log_softmax(logits[:, :-1, :], tokens_for_softmax[:, 1:])
 
-    return logprobs
+        if not is_pp_last_stage(get_pipeline_model_parallel_group()):
+            return logits_or_hidden_states
+        else:
+            logits = logits_or_hidden_states
+            with nvtx_range("log-softmax", time=False):
+                # Pad logits back to original sequence length if we sliced
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                    if logits.shape[1] < original_seq_len:
+                        pad_len = original_seq_len - logits.shape[1]
+                        # Pad with zeros (these positions will be masked out anyway)
+                        logits = torch.nn.functional.pad(logits, (0, 0, 0, pad_len), value=0)
+                    # Also need to restore tokens for the log_softmax below
+                    tokens_for_softmax = torch.nn.functional.pad(
+                        tokens, (0, original_seq_len - tokens.shape[1]), value=0
+                    )
+                else:
+                    tokens_for_softmax = tokens
+                
+                # We do not need logprobs for the n+1 token.
+                logprobs = selective_log_softmax(logits[:, :-1, :], tokens_for_softmax[:, 1:])
+            return logprobs
 
 
 def compute_group_stats(
@@ -1183,18 +1253,18 @@ def prepare_packed_trajectories(
     Returns:
         Trajectories, generation masks, and inference logprobs (all gathered from all ranks).
     """
-    world_size = mpu.get_expert_data_parallel_world_size()
+    world_size = mpu.get_data_parallel_world_size()
     # For packing, distribute trajectory preparation across ranks
     # Each rank prepares a portion, then we gather for packing
     total_rollouts = len(all_rollouts)
     rollouts_per_rank = total_rollouts // (world_size if world_size > 0 else 1)
-    rank = mpu.get_expert_data_parallel_rank()
+    rank = mpu.get_data_parallel_rank()
 
     # Each rank prepares its portion
     start_idx = rank * rollouts_per_rank
     end_idx = (
         start_idx + rollouts_per_rank
-        if rank < mpu.get_expert_data_parallel_world_size() - 1
+        if rank < mpu.get_data_parallel_world_size() - 1
         else total_rollouts
     )
     my_rollouts = all_rollouts[start_idx:end_idx]
@@ -1218,14 +1288,14 @@ def prepare_packed_trajectories(
         # Gather all trajectories
         trajs_list = [torch.empty_like(my_trajs) for _ in range(world_size)]
         torch.distributed.all_gather(
-            trajs_list, my_trajs, group=mpu.get_expert_data_parallel_group()
+            trajs_list, my_trajs, group=mpu.get_data_parallel_group()
         )
         trajs = torch.cat(trajs_list, dim=0)
 
         # Gather all generation masks
         masks_list = [torch.empty_like(my_generation_masks) for _ in range(world_size)]
         torch.distributed.all_gather(
-            masks_list, my_generation_masks, group=mpu.get_expert_data_parallel_group()
+            masks_list, my_generation_masks, group=mpu.get_data_parallel_group()
         )
         generation_masks = torch.cat(masks_list, dim=0)
 
@@ -1233,7 +1303,7 @@ def prepare_packed_trajectories(
         if my_inference_logprobs is not None:
             logprobs_list = [torch.empty_like(my_inference_logprobs) for _ in range(world_size)]
             torch.distributed.all_gather(
-                logprobs_list, my_inference_logprobs, group=mpu.get_expert_data_parallel_group()
+                logprobs_list, my_inference_logprobs, group=mpu.get_data_parallel_group()
             )
             inference_logprobs = torch.cat(logprobs_list, dim=0)
         else:
@@ -1319,11 +1389,11 @@ def prepare_data_for_update(
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
-        if (expert_data_parallel_world_size := mpu.get_expert_data_parallel_world_size()) > 0:
-            data_split_size = len(rollouts) // expert_data_parallel_world_size
+        if (data_parallel_world_size := mpu.get_data_parallel_world_size()) > 0:
+            data_split_size = len(rollouts) // data_parallel_world_size
             data_split_range = (
-                mpu.get_expert_data_parallel_rank() * data_split_size,
-                (mpu.get_expert_data_parallel_rank() + 1) * data_split_size,
+                mpu.get_data_parallel_rank() * data_split_size,
+                (mpu.get_data_parallel_rank() + 1) * data_split_size,
             )
             rollouts = rollouts[data_split_range[0] : data_split_range[1]]
 
@@ -1349,7 +1419,9 @@ def prepare_data_for_update(
         original_trajs = trajs
 
         # Sequence packing or standard processing
+        runtime_state = get_rl_runtime_state()
         packing_context = {}  # Store all packing-related data
+        runtime_state.packing_context = packing_context
 
         if args.rl_use_sequence_packing:
             with nvtx_range("sequence_packing"):
@@ -1378,7 +1450,7 @@ def prepare_data_for_update(
                     packing_info,
                 ) = packer.pack_sequences(traj_list, generation_masks)
 
-                rank = mpu.get_expert_data_parallel_rank()
+                rank = mpu.get_data_parallel_rank()
                 # Debug: Check packing output
                 if rank == 0:
                     seq_per_bin = [len(indices) for indices in packing_info['bin_seq_indices']]
@@ -1396,7 +1468,7 @@ def prepare_data_for_update(
 
                 # Distribute packed bins across data parallel ranks
                 num_bins = packed_trajs.shape[0]
-                world_size = mpu.get_expert_data_parallel_world_size()
+                world_size = mpu.get_data_parallel_world_size()
 
                 # Choose distribution algorithm based on args.sequence_packing_algo
                 packing_algo = getattr(args, 'rl_sequence_packing_algo', 'fifo')
@@ -1735,12 +1807,6 @@ def prepare_data_for_update(
             )
             original_loss_mask[~generation_masks] = 0.0
 
-        if not args.rl_use_sequence_packing:
-            # Use original masks if not packing
-            attention_mask = original_attention_mask
-            loss_mask = original_loss_mask
-            position_ids = original_position_ids
-
         with torch.no_grad(), nvtx_range("compute_logprobs"):
             timers('compute-logprobs', log_level=0).start()
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
@@ -1753,47 +1819,79 @@ def prepare_data_for_update(
             else:
                 compute_trajs = original_trajs
                 compute_position_ids = original_position_ids
-                compute_attention_mask = original_attention_mask
+                compute_attention_mask = None
                 use_packed_computation = False
+
+        # Wrap forward_backward_func for Full iteration CUDA graph
+        forward_backward_func = get_forward_backward_func()
+        if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+            forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+
+        def logprobs_forward_step(data_iterator, model):
+            if args.rl_use_sequence_packing:
+                assert False
+                bin_tensor = next(data_iterator)[0]
+                ( b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params, b_packed_seq_len ) = load_packed_data_by_index(bin_tensor.item())
+            else:
+                batch_data = next(data_iterator)
+                if len(batch_data) == 2:
+                    b_trajs, b_posids = batch_data
+                else:
+                    b_trajs, b_posids, _ = batch_data
+                b_packed_seq_params = None
+                b_packed_seq_len = 0
+                b_trajs = b_trajs.cuda()
+                b_posids = b_posids.cuda()
+
+            b_trajs = b_trajs.cuda()
+            b_posids = b_posids.cuda()
+            return get_logprobs(model, b_trajs, b_posids, None, no_grad=True, packed_seq_params=b_packed_seq_params, packed_seq_len=b_packed_seq_len), None
+
 
         with nvtx_range("create-logprobs-dataloader"):
             # Use batch_size=1 for packed computation to enable proper attention masking
             # via PackedSeqParams (TE needs cu_seqlens per bin)
             logprobs_batch_size = 1 if use_packed_computation else args.micro_batch_size
-            data_iter = DataLoader(
-                TensorDataset(compute_trajs, compute_position_ids), batch_size=logprobs_batch_size
-            )
+            if args.rl_use_sequence_packing:
+                data_iter = DataLoader(
+                    TensorDataset(torch.arange(len(compute_trajs))), batch_size=logprobs_batch_size
+                )
+            else:
+                data_iter = DataLoader(
+                    TensorDataset(compute_trajs, compute_position_ids), batch_size=logprobs_batch_size
+                )
+
+            dtype = torch.bfloat16 if args.bf16 else ( torch.float16 if args.fp16 else torch.float32 )
+
             old_logprobs = []
 
             # Compute logprobs
-            for batch_idx, (b_trajs, b_posids) in enumerate(data_iter):
-                # Get attention mask slice
-                if compute_attention_mask is not None:
-                    start_idx = batch_idx * logprobs_batch_size
-                    end_idx = min(
-                        start_idx + logprobs_batch_size, compute_attention_mask.shape[0]
-                    )
-                    b_attn_mask = compute_attention_mask[start_idx:end_idx].cuda()
-                else:
-                    b_attn_mask = None
-
-                b_trajs = b_trajs.cuda()
-                b_posids = b_posids.cuda()
-
-                # Get cached packed_seq_params for proper attention masking in TE
-                b_packed_seq_params = None
-                b_packed_seq_len = 0
-                if use_packed_computation and 'cached_packed_seq_params' in packing_context:
-                    b_packed_seq_params, b_packed_seq_len = packing_context['cached_packed_seq_params'][batch_idx]
-
-                logprobs = get_logprobs(
-                    model, b_trajs, b_posids, b_attn_mask, no_grad=True,
-                    packed_seq_params=b_packed_seq_params,
-                    packed_seq_len=b_packed_seq_len
+            data_iterator = iter(data_iter)
+            for iteration, i in enumerate(range(len(data_iter))):
+                output_tensor = forward_backward_func(
+                    forward_step_func=logprobs_forward_step, 
+                    data_iterator=data_iterator, 
+                    model=model,
+                    num_microbatches=1,
+                    seq_length=args.seq_length,
+                    micro_batch_size=args.micro_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    forward_only=True,
+                    adjust_tensor_shapes_fn=None,
                 )
-                old_logprobs.append(logprobs.detach().cpu())
+                if is_pp_last_stage(get_pipeline_model_parallel_group()):
+                    old_logprobs.append(
+                        output_tensor[0].detach()
+                    )
 
-            old_logprobs = torch.concat(old_logprobs, dim=0)
+            if is_pp_last_stage(get_pipeline_model_parallel_group()):
+                old_logprobs = torch.concat(old_logprobs, dim=0)
+                assert old_logprobs.dtype == dtype
+            else:
+                old_logprobs = torch.empty(len(compute_trajs), args.seq_length-1, dtype=dtype, device=torch.cuda.current_device())
+
+            dist.broadcast(old_logprobs, src=get_pipeline_model_parallel_last_rank(), group=get_pipeline_model_parallel_group())
+            old_logprobs = old_logprobs.cpu()
 
             # Handle packed vs unpacked logprobs
             if use_packed_computation and 'packing_info' in packing_context:
@@ -1854,34 +1952,31 @@ def prepare_data_for_update(
             ref_logprobs = []
 
             # Compute reference logprobs
-            for batch_idx, (b_trajs, b_posids) in enumerate(data_iter):
-                # Get attention mask slice
-                if compute_attention_mask is not None:
-                    start_idx = batch_idx * logprobs_batch_size
-                    end_idx = min(
-                        start_idx + logprobs_batch_size, compute_attention_mask.shape[0]
-                    )
-                    b_attn_mask = compute_attention_mask[start_idx:end_idx].cuda()
-                else:
-                    b_attn_mask = None
-
-                b_trajs = b_trajs.cuda()
-                b_posids = b_posids.cuda()
-
-                # Get cached packed_seq_params for proper attention masking in TE
-                b_packed_seq_params = None
-                b_packed_seq_len = 0
-                if use_packed_computation and 'cached_packed_seq_params' in packing_context:
-                    b_packed_seq_params, b_packed_seq_len = packing_context['cached_packed_seq_params'][batch_idx]
-
-                logprobs = get_logprobs(
-                    model, b_trajs, b_posids, b_attn_mask, no_grad=True,
-                    packed_seq_params=b_packed_seq_params,
-                    packed_seq_len=b_packed_seq_len
+            data_iterator = iter(data_iter)
+            for iteration, i in enumerate(range(len(data_iter))):
+                output_tensor = forward_backward_func(
+                    forward_step_func=logprobs_forward_step, 
+                    data_iterator=data_iterator, 
+                    model=model,
+                    num_microbatches=1,
+                    seq_length=args.seq_length,
+                    micro_batch_size=args.micro_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    forward_only=True,
+                    adjust_tensor_shapes_fn=None,
                 )
-                ref_logprobs.append(logprobs.detach().cpu())
+                if is_pp_last_stage(get_pipeline_model_parallel_group()):
+                    ref_logprobs.append(
+                        output_tensor[0].detach()
+                    )
 
-            ref_logprobs = torch.concat(ref_logprobs, dim=0)
+            if is_pp_last_stage(get_pipeline_model_parallel_group()):
+                ref_logprobs = torch.concat(ref_logprobs, dim=0)
+                assert ref_logprobs.dtype == dtype
+            else:
+                ref_logprobs = torch.empty(len(compute_trajs), args.seq_length-1, dtype=dtype, device=torch.cuda.current_device())
+            dist.broadcast(ref_logprobs, src=get_pipeline_model_parallel_last_rank(), group=get_pipeline_model_parallel_group())
+            ref_logprobs = ref_logprobs.cpu()
 
             # Handle packed vs unpacked logprobs
             if use_packed_computation and 'packing_info' in packing_context:
@@ -1916,9 +2011,6 @@ def prepare_data_for_update(
         with nvtx_range("create_dataloader"):
             if args.rl_use_sequence_packing:
                 # Store packing context in runtime state for forward_step
-                runtime_state = get_rl_runtime_state()
-                runtime_state.packing_context = packing_context
-
                 packing_info = packing_context['packing_info']
                 packing_context['bin_advantages'] = []
                 for bin_idx, seq_indices in enumerate(packing_info['bin_seq_indices']):
@@ -2386,6 +2478,14 @@ def calculate_grpo_loss(
     return loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below
 
 
+def print_memory_stats(prefix: str):
+    gpu_mem = torch.cuda.memory_allocated() / 1024**3
+    gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3
+    print(
+        f"[{dist.get_rank()}:DP] {prefix}: allocated={gpu_mem:.2f} GB, reserved={gpu_mem_reserved:.2f} GB"
+    )
+
+
 @contextmanager
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
@@ -2446,11 +2546,22 @@ def megatron_rl_inference_mode(
                 assert (
                     reset_cuda_graphs
                 ), "reset_cuda_graphs must be True when offloading kv cache during training"
+                print_memory_stats("Before restoring kv cache and mamba states to GPU")
+                context = inference_interface._inference_engine.context
                 print(
-                    f"[{dist.get_rank()}:DP] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
+                    f"[{dist.get_rank()}:DP] Restoring kv cache ({context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
+                kv_cache = context.memory_buffer
+                context.memory_buffer = kv_cache.data.cuda()
+                if context.is_hybrid_model:
+                    mamba_conv_states_gb = context.mamba_conv_states.numel() * context.mamba_conv_states.element_size() / 1024**3
+                    mamba_ssm_states_gb = context.mamba_ssm_states.numel() * context.mamba_ssm_states.element_size() / 1024**3
+                    print(
+                        f"[{dist.get_rank()}:DP] Restoring mamba conv states ({mamba_conv_states_gb:.2f} GB) and ssm states ({mamba_ssm_states_gb:.2f} GB) to GPU"
+                    )
+                    context.mamba_conv_states = context.mamba_conv_states.data.cuda()
+                    context.mamba_ssm_states = context.mamba_ssm_states.data.cuda()
+                print_memory_stats("After restoring kv cache and mamba states to GPU")
             elif remove_kv_cache_during_training:
                 if inference_interface._inference_engine.context.memory_buffer is None:
                     inference_interface._inference_engine.context.build_memory_buffer()
@@ -2470,17 +2581,55 @@ def megatron_rl_inference_mode(
 
         print(f"[{dist.get_rank()}:DP] Entered inference mode")
         yield inference_interface
-
+        print(f"[{dist.get_rank()}:DP] Attempting to suspend inference mode")
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
 
         with nvtx_range("offload-kv-cache-after-inference"):
             if offload_kv_cache_during_training:
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
+                # Print GPU memory before offload
+                print_memory_stats("Before offloading kv cache and mamba states to CPU")
+                total_gb_offloaded = 0
+                context = inference_interface._inference_engine.context
+                kv_cache = context.memory_buffer
+                kv_cache_gb = kv_cache.numel() * kv_cache.element_size() / 1024**3
                 print(
-                    f"[{dist.get_rank()}:DP] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
+                    f"[{dist.get_rank()}:DP] Offloading kv cache ({kv_cache_gb:.2f} GB) to CPU"
                 )
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
+                # There might be other references to the kv_cache, in which case 
+                # simply calling kv_cache.cpu() would not free GPU memory.
+                # Just to be safe, we call .cpu() on kv_cache.data. 
+                # Of course, this isn't foolproof either, but the chances of 
+                # external references to kv_cache.data are very low.
+                context.memory_buffer.data = kv_cache.data.cpu()
+                total_gb_offloaded += kv_cache_gb
+                if context.is_hybrid_model:
+                    mamba_conv_gb = (
+                        context.mamba_conv_states.numel()
+                        * context.mamba_conv_states.element_size()
+                        / 1024**3
+                    )
+                    mamba_ssm_gb = (
+                        context.mamba_ssm_states.numel()
+                        * context.mamba_ssm_states.element_size()
+                        / 1024**3
+                    )
+                    print(
+                        f"[{dist.get_rank()}:DP] Offloading mamba conv states ({mamba_conv_gb:.2f} GB) and ssm states ({mamba_ssm_gb:.2f} GB) to CPU"
+                    )
+                    context.mamba_conv_states.data = context.mamba_conv_states.data.cpu()
+                    context.mamba_ssm_states.data = context.mamba_ssm_states.data.cpu()
+                    total_gb_offloaded += mamba_conv_gb + mamba_ssm_gb
+                # Print GPU memory after offload
+                gpu_mem_after = torch.cuda.memory_allocated() / 1024**3
+                gpu_mem_reserved_after = torch.cuda.memory_reserved() / 1024**3
+                print(
+                    f"[{dist.get_rank()}:DP] Offloaded total of {total_gb_offloaded:.2f} GB to CPU"
+                )
+                print_memory_stats("After offloading kv cache and mamba states to CPU")
+
+
+
             elif remove_kv_cache_during_training:
                 inference_interface._inference_engine.context.memory_buffer = None
 
