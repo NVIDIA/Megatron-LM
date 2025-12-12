@@ -765,7 +765,7 @@ class TestDynamicInferenceEngine:
             test_config = DynamicEngineTestConfig(num_requests=8, use_fixed_output_lengths=True)
             env = self._build_test_env(test_config)
 
-            engine_task = asyncio.create_task(env.engine.run_engine()
+            engine_task = asyncio.create_task(env.engine.run_engine())
 
             request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
 
