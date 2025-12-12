@@ -718,7 +718,7 @@ class PP_PostScheduleFunction(torch.autograd.Function):
                 ctx.offload_manager.offload_packed_tensors(current_schedule_layer)
                 if next_schedule_layer < 0:
                     # reload for next backward layer
-                    ctx.offload_manager.reload_packed_tensors(-next_schedule_layer)
+                    ctx.offload_manager.reload_packed_tensors(-next_schedule_layer, no_wait=True)
             else:
                 ctx.offload_manager.remove_packed_tensor_from_offload()
 
@@ -874,10 +874,12 @@ class PackedOffloadManager:
                 else:
                     packed_tensor._original_tensor = None
 
-    def reload_packed_tensors(self, pp_schedule_layer):
+    def reload_packed_tensors(self, pp_schedule_layer, no_wait=False):
         """Reload the packed tensors."""
-        current_stream = torch.cuda.current_stream()
-        self.unpack_stream.wait_stream(current_stream)
+        # Avoid waiting for main stream if reload is immediately after offload since offload is already waiting for main stream
+        if not no_wait or self.unpack_stream != self.pack_stream:
+            current_stream = torch.cuda.current_stream()
+            self.unpack_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(self.unpack_stream):
             if self.status == 'captured':
