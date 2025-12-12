@@ -187,6 +187,7 @@ def get_inference_context(
         cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
+        use_selective_log_softmax=args.use_selective_log_softmax,
     )
 
     return context
@@ -494,6 +495,7 @@ def main():
         total_output_tokens = result["total_output_tokens"]
         torch.cuda.synchronize()
         total_time = get_curr_time() - t
+        print(f"Total time: {total_time:.3f}s")
         stats = torch.cuda.memory_stats()
         throughput = total_output_tokens / total_time
         throughputs.append(throughput)

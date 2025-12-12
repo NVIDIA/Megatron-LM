@@ -241,6 +241,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_metadata_types (Optional[List[Tuple[str, torch.dtype, bool]]]): A list of the
             per-request metadata types to track. Each entry is a tuple consisting of the string
             label, the target dtype, and whether to store the data on GPU.
+        use_selective_log_softmax (Optional[bool]): If True, use selective log-softmax optimization
+            to reduce memory footprint when computing log probabilities. This optimization avoids
+            materializing the full log_softmax tensor by computing logsumexp and gathering only
+            the logits for tokens of interest. Defaults to True.
     """
 
     DEFAULT_MAX_TOKENS = 16384
@@ -272,6 +276,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
+        use_selective_log_softmax: Optional[bool] = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -282,6 +287,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
         self.metrics_writer = metrics_writer
+        self.use_selective_log_softmax = use_selective_log_softmax
 
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
@@ -1921,34 +1927,106 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return newly_paused_request_ids
 
+    def _selective_log_softmax(self, logits: Tensor, indices: Tensor) -> Tensor:
+        """Compute log softmax probabilities for selected tokens only.
+
+        This is a memory-efficient implementation that avoids materializing the full
+        log_softmax tensor (seq_len, vocab_size) by computing logsumexp row-by-row
+        and only gathering the logits for tokens of interest.
+
+        Based on: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/
+
+        The key optimization is that instead of computing:
+            log_probs = log_softmax(logits)  # allocates (seq_len, vocab_size)
+            selected = log_probs[seq_idx, token_idx]
+
+        We compute:
+            logsumexp_values = logsumexp(logits, dim=-1)  # computed row-by-row
+            selected_logits = logits[seq_idx, token_idx]
+            selected = selected_logits - logsumexp_values  # log_softmax identity
+
+        This reduces peak memory from O(seq_len * vocab_size) to O(vocab_size).
+
+        Args:
+            logits: Tensor of shape (seq_len, vocab_size)
+            indices: Tensor of shape (seq_len,) with token indices to select
+
+        Returns:
+            Tensor of shape (seq_len,) with log probabilities for selected tokens
+        """
+        # Cast to float32 for numerical stability (matching original behavior)
+        logits_float = logits.float()
+
+        # Compute logsumexp row by row to reduce peak memory consumption.
+        # This avoids allocating a full (seq_len, vocab_size) tensor for exp(logits).
+        logsumexp_values = torch.stack([torch.logsumexp(row, dim=-1) for row in logits_float])
+
+        # Gather the logits for the selected tokens
+        seq_idx = torch.arange(logits_float.size(0), device=logits.device)
+        selected_logits = logits_float[seq_idx, indices]
+
+        # log_softmax(x_i) = x_i - logsumexp(x)
+        token_logprobs = selected_logits - logsumexp_values
+
+        return token_logprobs
+
     def calculate_log_probs(
         self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> Tuple[List[List[float]], Tensor]:
+    ) -> Tuple[List[List[float]], Optional[Tensor]]:
         """Calculate log probs for all active requests and return them.
-
-        TODO: @wdykas support top-n log probs.
 
         Args:
             logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
             new_tokens (Tensor): The newly sampled tokens.
-            only_last_token_logits (bool): If set, the logits are from only the last token in each request
+            only_last_token_logits (bool): If set, the logits are from only the last token
+                in each request.
 
         Returns:
-            List of lists where each inner list contains log probs for a request in the
-            same order as the active requests (from paused_request_count to total_request_count).
-            log_probs (Tensor): Used to compute top n logprobs later if required.
+            Tuple containing:
+                - List of lists where each inner list contains log probs for a request in the
+                  same order as the active requests (from paused_request_count to total_request_count).
+                - log_probs (Optional[Tensor]): Full log_probs tensor if computed (for top-n logprobs),
+                  or None if using selective log softmax optimization.
         """
+        logits_squeezed = logits.squeeze(0).float()  # [sequence_length, vocab_size]
 
-        # Calculate log_probs (sequence_length x vocab_size)
-        logits_squeezed = logits.squeeze(0).float()
+        # Use selective log softmax when enabled to reduce peak memory by avoiding
+        # materialization of the full (seq_len, vocab_size) log_softmax tensor.
+        # Reference: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/
+        if self.use_selective_log_softmax:
+            # Memory-efficient path: only compute log probs for selected tokens
+            if only_last_token_logits or self.is_decode_only():
+                # Decode case: just need log probs for new_tokens
+                selected_log_probs = self._selective_log_softmax(
+                    logits_squeezed[: len(new_tokens)], new_tokens
+                )
+                return [[lp] for lp in selected_log_probs.tolist()], None
 
+            # Prefill case: compute token indices first
+            active_token_ids = self.token_to_input_ids[: self.active_token_count].roll(-1, 0)
+            active_query_lengths = self.request_query_lengths[
+                self.paused_request_count : self.total_request_count
+            ]
+            new_token_idx = active_query_lengths.cumsum(0) - 1
+            active_token_ids[new_token_idx] = new_tokens
+
+            selected_log_probs = self._selective_log_softmax(
+                logits_squeezed[: self.active_token_count], active_token_ids
+            )
+
+            # Split the log probs across request boundaries
+            selected_log_probs_list = selected_log_probs.cpu().split(
+                active_query_lengths.tolist(), dim=0
+            )
+            return [lp.tolist() for lp in selected_log_probs_list], None
+
+        # Standard path: compute full log_softmax (higher memory usage but needed for top-n logprobs)
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
             log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
             selected_log_probs = log_probs[seq_idx, new_tokens]
             return [[lp] for lp in selected_log_probs.tolist()], log_probs
 
-        log_probs = F.log_softmax(logits_squeezed, dim=-1)
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
         # prefill requests and then set the token ids explicitly for the newly generated tokens.
@@ -1979,6 +2057,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         new_token_idx = active_query_lengths.cumsum(0) - 1
         active_token_ids[new_token_idx] = new_tokens
 
+        log_probs = F.log_softmax(logits_squeezed, dim=-1)
         # Extract the log probs for only the selected tokens.
         # (sequence_length x vocab_size) -> (sequence_length)
         seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
