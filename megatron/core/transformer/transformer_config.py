@@ -496,6 +496,12 @@ class TransformerConfig(ModelParallelConfig):
     """[Compatibility alias for moe_router_padding_for_quantization]
     Enabling this will also enable moe_router_padding_for_quantization."""
 
+    moe_permute_padding_for_quantization: Optional[bool] = False
+    """Enable padding during MoE token permutation and corresponding unpadding during unpermutation
+    so that the number of tokens in each expert's permuted block is aligned to a multiple of 16 / 32
+    for quantized precisions such as FP8 and FP4. This can remove explicit padding/
+    unpadding around GroupedMLP kernels, which improves throughput and reduces peak memory usage."""
+
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
     When using group-limited routing:
@@ -1418,6 +1424,22 @@ class TransformerConfig(ModelParallelConfig):
                     "allgather and alltoall_seq dispatcher does not support "
                     "moe_router_padding_for_quantization."
                 )
+
+        if self.moe_permute_padding_for_quantization:
+            if self.fp8 is None and self.fp4 is None:
+                raise ValueError(
+                    "moe_permute_padding_for_quantization requires a quantized precision recipe(e.g., fp8 or fp4) to be enabled."
+                )
+
+            if not self.moe_permute_fusion:
+                raise ValueError(
+                    "moe_permute_padding_for_quantization currently requires fused permute."
+                )
+
+            from megatron.core.transformer.moe.moe_utils import fused_permute_and_pad_with_probs
+
+            if fused_permute_and_pad_with_probs is None:
+                raise ValueError("fused_permute_and_pad_with_probs is not available. Please install TE >= 2.12.0.")
 
         if (
             self.moe_router_topk == 1
