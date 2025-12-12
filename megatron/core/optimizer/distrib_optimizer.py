@@ -47,14 +47,9 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
+from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
-from ..fp4_utils import is_nvfp4tensor
-try:
-    # Prefer TE's native casting path if available
-    from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_nvfp4 as _te_cast_nvfp4
-    HAVE_TE_NVFP4_CAST = True
-except Exception:
-    HAVE_TE_NVFP4_CAST = False
+
 
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
@@ -2477,14 +2472,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 *self._get_fp8_params_and_shard_fp32_from_fp8(), self.data_parallel_group
             )
         elif self.ddp_config.fp4_param_gather:
-            # Quantize FP32 master shards back to NVFP4 model params (row/col + tiles)
-            if HAVE_TE_NVFP4_CAST:
-                nvfp4_params, shard_fp32, shard_offsets = self._get_nvfp4_params_and_shard_fp32_from_nvfp4()
-                # If any shard is partial, TE function will raise; we allow full casts only for now
-                try:
-                    _te_cast_nvfp4(nvfp4_params, shard_fp32, shard_offsets, self.data_parallel_group)
-                except NotImplementedError:
-                    pass
+            # Quantize FP32 master shards back to NVFP4 model params (rowwise + rowwise_scale_inv + rowwise_amax)
+            quantize_nvfp4_param_shard(
+                *self._get_nvfp4_params_and_shard_fp32_from_nvfp4(), self.data_parallel_group
+            )
         else:
             pass
         # Utility method for copying group params.
@@ -2506,6 +2497,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     if is_float8tensor(model_param):
                         # FP8 params are quantized in the above "quantize_param_shard" function.
+                        continue
+                    elif is_nvfp4tensor(model_param):
+                        # NVFP4 params are quantized in the above "_te_cast_nvfp4" function.
                         continue
                     else:
                         shard_model_param.data.copy_(shard_main_param)

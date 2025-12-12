@@ -83,49 +83,43 @@ def modify_nvfp4_rowwise_storage(fp4_tensor: torch.Tensor, new_rowwise_data: tor
     new_rowwise_data.detach().copy_(old_rowwise)
     setattr(fp4_tensor, "_rowwise_data", new_rowwise_data)
 
-
-def get_nvfp4_columnwise_packed_shape(shape: torch.Size) -> torch.Size:
-    """Return packed byte shape for NVFP4 columnwise storage.
-
-    Columnwise bytes are stored as a 2D tensor: (K, M/2), where M=prod(shape[:-1]), K=shape[-1].
-    """
-    if len(shape) == 0:
-        return shape
-    M = 1
-    for d in list(shape)[:-1]:
-        M *= int(d)
-    K = int(shape[-1])
-    assert M % 2 == 0, "NVFP4 requires flattened non-inner dimension divisible by 2"
-    return torch.Size([K, M // 2])
-
-
-def modify_nvfp4_columnwise_storage(fp4_tensor: torch.Tensor, new_columnwise_data: torch.Tensor) -> None:
-    """Replace NVFP4 tensor's columnwise raw data with a new uint8 storage view."""
-    if not is_nvfp4tensor(fp4_tensor):
-        raise ValueError("modify_nvfp4_columnwise_storage expects an NVFP4 tensor")
-    old_col = getattr(fp4_tensor, "_columnwise_data", None)
-    if old_col is None:
-        raise RuntimeError("NVFP4 tensor is missing columnwise data to replace")
-    assert (
-        old_col.dtype == new_columnwise_data.dtype == torch.uint8
-    ), "Columnwise NVFP4 storage must be uint8"
-    new_columnwise_data.detach().copy_(old_col)
-    setattr(fp4_tensor, "_columnwise_data", new_columnwise_data)
-
-
 def quantize_nvfp4_param_shard(
     model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
 ):
     """Cast shard FP32 master weights to NVFP4 model params (rowwise/columnwise).
 
-    NOTE: This is a placeholder stub. Proper NVFP4 shard quantization requires
-    TE kernel support for nibble-accurate partial updates and coordinated tile updates.
-    """
-    raise NotImplementedError(
-        "NVFP4 shard quantization path is not implemented in MCore yet. "
-        "It requires TE NVFP4 shard casting support."
-    )
+    This function wraps Transformer Engine's cast_master_weights_to_nvfp4, which handles:
+    - Two-level NVFP4 scaling (global FP32 scale + per-block FP8 E4M3 scale)
+    - Partial casting with nibble-accurate updates
+    - Coordinated amax reduction across data parallel group
 
+    Args:
+        model_params: List of NVFP4 model parameters (NVFP4Tensor).
+        main_params: List of FP32 master weights (shards).
+        start_offsets: List of starting offsets in the full model weight for each shard.
+        data_parallel_group: Distributed group for amax reduction.
+        fsdp_shard_model_params: Optional list of FSDP sharded model params.
+    """
+    if not HAVE_TE_FP4_TENSOR_CLASS:
+        raise RuntimeError(
+            "NVFP4 shard quantization requires Transformer Engine >= 2.7.0.dev0"
+        )
+
+    try:
+        from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_nvfp4
+    except ImportError:
+        raise RuntimeError(
+            "cast_master_weights_to_nvfp4 not available in this Transformer Engine version"
+        )
+
+    if len(model_params) == 0:
+        return
+
+    args = [model_params, main_params, start_offsets, data_parallel_group]
+    if fsdp_shard_model_params is not None:
+        args.append(fsdp_shard_model_params)
+
+    cast_master_weights_to_nvfp4(*args)
 
 if HAVE_TE:
     from megatron.core import parallel_state
