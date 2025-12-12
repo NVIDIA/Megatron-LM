@@ -137,6 +137,40 @@ def get_rl_runtime_state():
     return _rl_runtime_state
 
 
+def update_inference_logprobs_group_stats(
+    old_logprobs: torch.Tensor,
+    inference_logprobs: torch.Tensor,
+    mask: torch.Tensor,
+    group_stats: Any,
+) -> None:
+    """Update group statistics with inference/train logprobs comparison metrics.
+
+    This is the common statistics computation used by both packed and unpacked cases.
+
+    Args:
+        old_logprobs: Old logprobs tensor (train side)
+        inference_logprobs: Inference logprobs tensor (aligned to match old_logprobs shape)
+        mask: Boolean mask indicating valid positions for statistics
+        group_stats: Statistics object to update with computed metrics
+    """
+    n_elems = mask.sum()
+    if n_elems > 0:
+        ratios = (old_logprobs - inference_logprobs).exp()[mask]
+        abs_diffs = (old_logprobs.exp() - inference_logprobs.exp()).abs()[mask]
+
+        group_stats.min_piold_to_inf_prob = ratios.min().item()
+        group_stats.max_piold_to_inf_prob = ratios.max().item()
+        group_stats.mean_piold_to_inf_prob = (ratios.sum() / n_elems).item()
+        group_stats.min_inf_train_prob_abs_diff = abs_diffs.min().item()
+        group_stats.max_inf_train_prob_abs_diff = abs_diffs.max().item()
+        group_stats.mean_inf_train_prob_abs_diff = (abs_diffs.sum() / n_elems).item()
+
+        inf_probs = inference_logprobs.exp()[mask]
+        group_stats.min_inf_prob = inf_probs.min().item()
+        group_stats.max_inf_prob = inf_probs.max().item()
+        group_stats.mean_inf_prob = inf_probs.mean().item()
+
+
 def align_unpacked_inference_logprobs(
     inference_logprobs: List[torch.Tensor],
     old_logprobs_for_data: torch.Tensor,
@@ -187,30 +221,17 @@ def align_unpacked_inference_logprobs(
             pad_size = old_logprobs_for_data.shape[1] - truncated_mask.shape[1]
             truncated_mask = torch.nn.functional.pad(truncated_mask, (0, pad_size), value=False)
 
-    # Compute statistics
-    n_elems = truncated_mask.sum()
-
-    ratios = (old_logprobs_for_data - padded_inference_logprobs).exp()[truncated_mask]
-    abs_diffs = (old_logprobs_for_data.exp() - padded_inference_logprobs.exp()).abs()[
-        truncated_mask
-    ]
-
-    # Two probability values cannot be more than 1.0 apart
+    # Sanity check: Two probability values cannot be more than 1.0 apart
+    abs_diffs = (old_logprobs_for_data.exp() - padded_inference_logprobs.exp()).abs()[truncated_mask]
     assert all(abs_diffs <= 1.0)
 
-    # Update group statistics
-    group_stats.min_piold_to_inf_prob = ratios.min().item()
-    group_stats.max_piold_to_inf_prob = ratios.max().item()
-    group_stats.mean_piold_to_inf_prob = (ratios.sum() / n_elems).item()
-    group_stats.min_inf_train_prob_abs_diff = abs_diffs.min().item()
-    group_stats.max_inf_train_prob_abs_diff = abs_diffs.max().item()
-    group_stats.mean_inf_train_prob_abs_diff = (abs_diffs.sum() / n_elems).item()
-
-    # Compute inference probability statistics
-    inf_probs = padded_inference_logprobs.exp()[truncated_mask]
-    group_stats.min_inf_prob = inf_probs.min().item()
-    group_stats.max_inf_prob = inf_probs.max().item()
-    group_stats.mean_inf_prob = inf_probs.mean().item()
+    # Update group statistics using common helper
+    update_inference_logprobs_group_stats(
+        old_logprobs=old_logprobs_for_data,
+        inference_logprobs=padded_inference_logprobs,
+        mask=truncated_mask,
+        group_stats=group_stats,
+    )
 
     return padded_inference_logprobs
 

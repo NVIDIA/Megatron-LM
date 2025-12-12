@@ -539,6 +539,9 @@ def compute_packed_inference_logprobs_stats(
         packed_loss_mask: Loss mask indicating valid positions [num_bins, seq_len]
         group_stats: Statistics object to update with computed metrics
     """
+    # Lazy import to avoid circular dependency (rl_utils imports from this module)
+    from megatron.rl.rl_utils import update_inference_logprobs_group_stats
+
     # Ensure all tensors are on the same device (CPU for stats computation)
     old_logprobs = old_logprobs.cpu()
     packed_inference_logprobs = packed_inference_logprobs.cpu()
@@ -551,22 +554,13 @@ def compute_packed_inference_logprobs_stats(
     if mask.shape != old_logprobs.shape:
         return
 
-    n_elems = mask.sum()
-    if n_elems > 0:
-        ratios = (old_logprobs - packed_inference_logprobs).exp()[mask]
-        abs_diffs = (old_logprobs.exp() - packed_inference_logprobs.exp()).abs()[mask]
-
-        group_stats.min_piold_to_inf_prob = ratios.min().item()
-        group_stats.max_piold_to_inf_prob = ratios.max().item()
-        group_stats.mean_piold_to_inf_prob = (ratios.sum() / n_elems).item()
-        group_stats.min_inf_train_prob_abs_diff = abs_diffs.min().item()
-        group_stats.max_inf_train_prob_abs_diff = abs_diffs.max().item()
-        group_stats.mean_inf_train_prob_abs_diff = (abs_diffs.sum() / n_elems).item()
-
-        inf_probs = packed_inference_logprobs.exp()[mask]
-        group_stats.min_inf_prob = inf_probs.min().item()
-        group_stats.max_inf_prob = inf_probs.max().item()
-        group_stats.mean_inf_prob = inf_probs.mean().item()
+    # Update group statistics using common helper
+    update_inference_logprobs_group_stats(
+        old_logprobs=old_logprobs,
+        inference_logprobs=packed_inference_logprobs,
+        mask=mask,
+        group_stats=group_stats,
+    )
 
 
 class SequencePacker:

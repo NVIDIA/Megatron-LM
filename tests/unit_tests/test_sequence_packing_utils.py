@@ -232,3 +232,174 @@ def test_sequence_packing_integration():
 
     assert torch.all(packed_trajs[0, 12:] == tokenizer.pad)
 
+
+class MockGroupStats:
+    """Mock group stats object for testing."""
+    def __init__(self):
+        self.min_piold_to_inf_prob = None
+        self.max_piold_to_inf_prob = None
+        self.mean_piold_to_inf_prob = None
+        self.min_inf_train_prob_abs_diff = None
+        self.max_inf_train_prob_abs_diff = None
+        self.mean_inf_train_prob_abs_diff = None
+        self.min_inf_prob = None
+        self.max_inf_prob = None
+        self.mean_inf_prob = None
+
+
+def test_update_inference_logprobs_group_stats():
+    """Test the common statistics computation helper function."""
+    # Create matching logprobs (should give ratio ~1.0)
+    old_logprobs = torch.tensor([[-0.5, -0.3, -0.2, 0.0]])
+    inference_logprobs = torch.tensor([[-0.5, -0.3, -0.2, 0.0]])
+    mask = torch.tensor([[True, True, True, False]])
+
+    group_stats = MockGroupStats()
+
+    rl_utils.update_inference_logprobs_group_stats(
+        old_logprobs=old_logprobs,
+        inference_logprobs=inference_logprobs,
+        mask=mask,
+        group_stats=group_stats,
+    )
+
+    # When logprobs match exactly, ratio should be 1.0 and diff should be 0.0
+    assert abs(group_stats.mean_piold_to_inf_prob - 1.0) < 1e-6
+    assert abs(group_stats.mean_inf_train_prob_abs_diff) < 1e-6
+
+
+def test_update_inference_logprobs_group_stats_empty_mask():
+    """Test statistics computation with empty mask."""
+    old_logprobs = torch.tensor([[-0.5, -0.3]])
+    inference_logprobs = torch.tensor([[-0.5, -0.3]])
+    mask = torch.tensor([[False, False]])  # Empty mask
+
+    group_stats = MockGroupStats()
+
+    rl_utils.update_inference_logprobs_group_stats(
+        old_logprobs=old_logprobs,
+        inference_logprobs=inference_logprobs,
+        mask=mask,
+        group_stats=group_stats,
+    )
+
+    # With empty mask, stats should remain None
+    assert group_stats.mean_piold_to_inf_prob is None
+
+
+def test_update_inference_logprobs_group_stats_with_mismatch():
+    """Test statistics when inference and old logprobs differ."""
+    # Old logprobs
+    old_logprobs = torch.tensor([[-0.5, -0.5, -0.5]])
+    # Inference logprobs with different values
+    inference_logprobs = torch.tensor([[-1.0, -1.0, -1.0]])
+    mask = torch.tensor([[True, True, True]])
+
+    group_stats = MockGroupStats()
+
+    rl_utils.update_inference_logprobs_group_stats(
+        old_logprobs=old_logprobs,
+        inference_logprobs=inference_logprobs,
+        mask=mask,
+        group_stats=group_stats,
+    )
+
+    # With different logprobs, ratio should not be 1.0
+    # exp(-0.5) / exp(-1.0) = exp(0.5) ≈ 1.65
+    assert group_stats.mean_piold_to_inf_prob > 1.0
+
+    # Abs diff should be non-zero
+    assert group_stats.mean_inf_train_prob_abs_diff > 0.0
+
+
+def test_compute_packed_inference_logprobs_stats():
+    """Test compute_packed_inference_logprobs_stats with packed data."""
+    # Create packed data (simulating 2 bins)
+    # old_logprobs shape: [num_bins, seq_len-1]
+    old_logprobs = torch.tensor([
+        [-0.5, -0.3, -0.2, 0.0, 0.0, 0.0, 0.0],  # bin 0
+        [-0.4, -0.6, -0.1, 0.0, 0.0, 0.0, 0.0],  # bin 1
+    ])
+
+    # packed_inference_logprobs with same values (should give ratio ~1.0)
+    packed_inference_logprobs = torch.tensor([
+        [-0.5, -0.3, -0.2, 0.0, 0.0, 0.0, 0.0],  # bin 0
+        [-0.4, -0.6, -0.1, 0.0, 0.0, 0.0, 0.0],  # bin 1
+    ])
+
+    # packed_loss_mask: [num_bins, seq_len] - indicates valid positions
+    # Note: function shifts by 1, so packed_loss_mask[:, 1:] is used
+    packed_loss_mask = torch.tensor([
+        [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],  # bin 0: 3 valid tokens
+        [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],  # bin 1: 3 valid tokens
+    ])
+
+    group_stats = MockGroupStats()
+
+    sequence_packing_utils.compute_packed_inference_logprobs_stats(
+        old_logprobs=old_logprobs,
+        packed_inference_logprobs=packed_inference_logprobs,
+        packed_loss_mask=packed_loss_mask,
+        group_stats=group_stats,
+    )
+
+    # Verify statistics were computed
+    assert group_stats.min_piold_to_inf_prob is not None
+    assert group_stats.max_piold_to_inf_prob is not None
+    assert group_stats.mean_piold_to_inf_prob is not None
+
+    # When logprobs match exactly, ratio should be 1.0
+    assert abs(group_stats.mean_piold_to_inf_prob - 1.0) < 1e-6
+    assert abs(group_stats.mean_inf_train_prob_abs_diff) < 1e-6
+
+
+def test_compute_packed_inference_logprobs_stats_with_mismatch():
+    """Test compute_packed_inference_logprobs_stats when values differ."""
+    # old_logprobs
+    old_logprobs = torch.tensor([
+        [-0.5, -0.5, -0.5, 0.0, 0.0, 0.0, 0.0],
+    ])
+
+    # Different inference logprobs
+    packed_inference_logprobs = torch.tensor([
+        [-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0],
+    ])
+
+    # packed_loss_mask
+    packed_loss_mask = torch.tensor([
+        [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+    ])
+
+    group_stats = MockGroupStats()
+
+    sequence_packing_utils.compute_packed_inference_logprobs_stats(
+        old_logprobs=old_logprobs,
+        packed_inference_logprobs=packed_inference_logprobs,
+        packed_loss_mask=packed_loss_mask,
+        group_stats=group_stats,
+    )
+
+    # With different logprobs, ratio should not be 1.0
+    assert group_stats.mean_piold_to_inf_prob > 1.0
+    assert group_stats.mean_inf_train_prob_abs_diff > 0.0
+
+
+def test_compute_packed_inference_logprobs_stats_shape_mismatch():
+    """Test that function handles shape mismatch gracefully."""
+    # Mismatched shapes
+    old_logprobs = torch.tensor([[-0.5, -0.3, -0.2]])  # 3 elements
+    packed_inference_logprobs = torch.tensor([[-0.5, -0.3, -0.2]])
+    packed_loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0, 1.0, 1.0]])  # 6 elements -> 5 after shift
+
+    group_stats = MockGroupStats()
+
+    # Should not raise, but stats should remain None due to shape mismatch
+    sequence_packing_utils.compute_packed_inference_logprobs_stats(
+        old_logprobs=old_logprobs,
+        packed_inference_logprobs=packed_inference_logprobs,
+        packed_loss_mask=packed_loss_mask,
+        group_stats=group_stats,
+    )
+
+    # Stats should remain None due to shape mismatch
+    assert group_stats.mean_piold_to_inf_prob is None
