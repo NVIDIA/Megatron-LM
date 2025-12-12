@@ -265,7 +265,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args, model, inference_logging_step_interval, metrics_writer
         )
         await inference_engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=41521, launch_inference_coordinator=True, verbose=True
+            inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
         if dist.get_rank() == 0:
             # TODO: We have to do this only on the rank 0 process, should be fixed in the future when we have support for multiple inference clients. !2278
