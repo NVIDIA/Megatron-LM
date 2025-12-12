@@ -434,7 +434,7 @@ class TestDynamicInferenceEngine:
         # the only thing that differs between requests is num_tokens_to_generate,
         # and engine.async_step() doesn't use this sampling param's
         # num_tokens_to_generate.
-        result = env.engine.step_modern(verbose=False)
+        result = env.engine.step_modern()
 
         # Suspend + resume.
         if (
@@ -767,7 +767,7 @@ class TestDynamicInferenceEngine:
             test_config = DynamicEngineTestConfig(num_requests=8, use_fixed_output_lengths=True)
             env = self._build_test_env(test_config)
 
-            engine_task = asyncio.create_task(env.engine.run_engine(verbose=False))
+            engine_task = asyncio.create_task(env.engine.run_engine())
 
             request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
 
@@ -1260,7 +1260,7 @@ class TestDynamicInferenceEngine:
 
         # Step engine until all requests are finished
         while env.engine.has_unfinished_requests():
-            result = env.engine.step_modern(verbose=False)
+            result = env.engine.step_modern()
 
         # Validate results
         for request in requests_to_add:

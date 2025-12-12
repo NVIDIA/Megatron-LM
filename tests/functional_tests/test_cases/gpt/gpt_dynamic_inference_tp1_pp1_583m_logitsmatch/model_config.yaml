@@ -54,6 +54,7 @@ MODEL_ARGS:
   --incoming-requests-per-step: 32
   --termination-id: -1
   --inference-repeat-n: 3
+  --inference-logging-step-interval: 1
 METRICS:
   - "generated_tokens"
   - "logprobs"

@@ -155,7 +155,7 @@ def get_inference_context(
         max_sequence_length = args.inference_max_seq_length
 
     metrics_writer = None
-    if args.inference_wandb_logging_step_interval > 0:
+    if args.inference_logging_step_interval > 0 and args.inference_wandb_logging:
         metrics_writer = get_wandb_writer()
 
     # Inference context.
@@ -311,7 +311,7 @@ def run_inference(
         # Step inference engine (i.e., generate a token for each active request).
         # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
         try:
-            result = engine.step_modern(verbose=True)
+            result = engine.step_modern()
         except EngineSuspendedError as e:
             result = e
             pass # ignore error in order to call 'engine.resume()' below.
@@ -480,7 +480,7 @@ def main():
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=not args.disable_chunked_prefill,
-        inference_logging_step_interval=args.inference_wandb_logging_step_interval,
+        inference_logging_step_interval=args.inference_logging_step_interval,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)

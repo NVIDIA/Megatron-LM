@@ -78,5 +78,6 @@ MODEL_ARGS:
   --output-path: ${TENSORBOARD_PATH}
   --prompt-file: ./tests/functional_tests/test_cases/gpt/gpt_static_inference_tp1_pp1_16b_multiprompt_tokensmatch/test_prompts.jsonl
   --incoming-requests-per-sec: -1 # all requests arrive up front.
+  --inference-logging-step-interval: 1
 METRICS:
   - "generated_text"
