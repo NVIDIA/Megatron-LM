@@ -860,6 +860,8 @@ def prepare_data_for_update(
                 (mpu.get_expert_data_parallel_rank() + 1) * data_split_size,
             )
             rollouts = rollouts[data_split_range[0] : data_split_range[1]]
+            # First we calculate them on a global level and then we split and recalculate on a local level.
+            # Sequence packing and reporting needs it global but non-packing wants it local.
             rewards = torch.tensor([[r.reward for r in group] for group in rollouts], device='cpu')
             advantages = (rewards - rewards.mean(axis=1, keepdim=True)) / (
                 1e-4 + rewards.std(axis=1, keepdim=True)
@@ -876,15 +878,23 @@ def prepare_data_for_update(
         # Build trajectories based on sequence packing or standard processing
         if args.rl_use_sequence_packing:
             with nvtx_range("sequence_packing", time=True):
-                runtime_state.packing_context = packing_context = pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages)
+                runtime_state.packing_context = packing_context = pack_all_trajectories(
+                    trajs, 
+                    generation_masks, 
+                    inference_logprobs, 
+                    global_advantages, 
+                    args.seq_length, 
+                    args.rl_sequence_packing_max_sequences_per_bin,
+                    args.sequence_packing_algo
+                    )
     
                 compute_trajs = packing_context.packed_trajs
                 compute_position_ids = packing_context.packed_position_ids
                 # Use batch_size=1 for packed computation to enable proper attention masking
                 # via PackedSeqParams (TE needs cu_seqlens per bin)
-                logprobs_batch_size = 1
                 dataset = TensorDataset(torch.arange(len(compute_trajs)))
-                data_loader = DataLoader(dataset, batch_size=logprobs_batch_size)
+                data_loader = DataLoader(dataset, batch_size=1)
+                logprobs_batch_size = 1
         else:
             # Always compute standard masks for the original data (we'll need them later)
             with nvtx_range("get_ltor_masks_and_position_ids"):
@@ -900,11 +910,11 @@ def prepare_data_for_update(
                 original_loss_mask[~generation_masks] = 0.0
                 compute_trajs = trajs
                 compute_position_ids = original_position_ids
-                logprobs_batch_size = args.micro_batch_size
                 data_loader = DataLoader(
                     TensorDataset(compute_trajs, compute_position_ids),
-                    batch_size=logprobs_batch_size,
+                    batch_size=args.micro_batch_size,
                 )
+                logprobs_batch_size = args.micro_batch_size
 
 
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):

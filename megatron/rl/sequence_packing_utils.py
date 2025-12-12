@@ -12,6 +12,10 @@ from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core import mpu
 import logging
 import typing
+from megatron.core.num_microbatches_calculator import (
+        get_num_microbatches,
+        reconfigure_num_microbatches_calculator,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +48,11 @@ class PackingContext:
         packing_info: PackingInfo object with bin assignments and metadata
         original_generation_masks: Generation masks for all sequences before packing
         original_trajs: All trajectories before packing
-        original_inference_logprobs: Inference logprobs for all sequences before packing (optional)
         packed_trajs: Packed trajectories tensor [num_bins, bin_size]
         packed_position_ids: Position IDs for packed sequences [num_bins, bin_size]
         packed_attention_mask: Attention mask for packed sequences [num_bins, 1, bin_size, bin_size]
         packed_loss_mask: Loss mask for packed sequences [num_bins, bin_size]
+        original_inference_logprobs: Inference logprobs for all sequences before packing (optional)
         bin_advantages: List of advantage tensors for each bin
         cached_packed_seq_params: Pre-computed PackedSeqParams for each bin
     """
@@ -94,6 +98,8 @@ def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext, log
     if ref_logprobs is not None:
         ref_logprobs = ref_logprobs[idx]
         
+    # Slice from position 1 because logprobs predict the next token, so they are
+    # shifted by 1 relative to the input tokens (logprobs has shape [batch, seq_len-1])
     loss_mask = packing_context.packed_loss_mask[idx, 1:]
 
     # Get sequence-level data for this bin
@@ -572,7 +578,7 @@ class SequencePacker:
         self.max_sequences_per_bin = max_sequences_per_bin
 
     def pack_sequences(
-        self, trajs: torch.Tensor, generation_masks: torch.Tensor = None
+        self, trajs: torch.Tensor, generation_masks: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
         """Pack sequences into bins using a greedy first-fit algorithm."""
         # Convert trajectories to list for packing
@@ -586,13 +592,6 @@ class SequencePacker:
         sequences = [sequences_tensor[i, :length] for i, length in enumerate(seq_lengths)]
 
         sorted_indices = sorted(range(len(sequences)), key=lambda i: seq_lengths[i], reverse=True)
-
-        args = get_args()
-        # Check that sequences can fit in bins
-        # TODO(jalbericiola): this should probably be moved to the arguments file
-        assert (
-            args.seq_length <= self.bin_size
-        ), f"seq_length ({args.seq_length}) must be <= bin_size ({self.bin_size})"
 
         bins = []
         bin_seq_indices = []  # Track which sequences are in each bin
@@ -723,7 +722,7 @@ class SequencePacker:
             seq_starts=seq_starts_dict,
             seq_lengths=seq_lengths,
             seq_to_bin_idx=seq_to_bin_idx,
-            packing_algo='fifo',  # Will be updated during distribution
+            packing_algo='fifo'
         )
 
         seq_per_bin = [len(indices) for indices in packing_info.bin_seq_indices]
@@ -757,14 +756,11 @@ def distribute_packed_bins(
     """Distribute packed bins across the data parallel ranks."""
     rank = mpu.get_expert_data_parallel_rank()
     world_size = mpu.get_expert_data_parallel_world_size()
-    args = get_args()
     tokenizer = get_tokenizer()
 
     # Distribute packed bins across data parallel ranks
     num_bins, bin_size = packed_trajs.shape
-
-    # Choose distribution algorithm based on args.sequence_packing_algo
-    packing_algo = getattr(args, 'rl_sequence_packing_algo', 'fifo')
+    packing_algo = packing_info.packing_algo
 
     if packing_algo == 'round-robin':
         # Round-robin assignment: rank i gets bins [i, i+world_size, i+2*world_size, ...]
@@ -923,12 +919,10 @@ def distribute_packed_bins(
     return packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, new_packing_info
 
 
-def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages):
-    args = get_args()
+def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo):
     tokenizer = get_tokenizer()
     expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
     nvtx_range = get_nvtx_range()
-    bin_size = args.seq_length
 
     with nvtx_range("regather_trajectories", time=True):
         # Regather trajectories from all ranks for packing
@@ -958,9 +952,6 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
 
     with nvtx_range("pack_sequences", time=True):
         # Create packer with max sequences per bin limit to prevent extreme imbalance
-        max_sequences_per_bin = getattr(
-            args, 'rl_sequence_packing_max_sequences_per_bin', 100
-        )
         packer = SequencePacker(
             bin_size=bin_size,
             pad_token=tokenizer.pad,
@@ -975,6 +966,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
             packed_loss_mask,
             packing_info,
         ) = packer.pack_sequences(trajs, generation_masks)
+        packing_info.packing_algo = packing_algo
 
         # Distribute packed bins across the data parallel ranks
         (
@@ -1041,20 +1033,14 @@ def get_microbatch_dataloader(packing_context: PackingContext) -> Tuple[DataLoad
 
     # Ratio of collected sequences to the global batch size
     pct_of_sequences_per_batch = len(packing_context.packing_info.seq_lengths) / args.global_batch_size
-    pct_of_bins_per_batch = pct_of_sequences_per_batch
 
     # Ceiling division means we will reuse some bins
     # If we did floor we would leave some behind
-    local_bins_per_step = math.ceil(pct_of_bins_per_batch * num_bins_this_rank)
+    local_bins_per_step = math.ceil(pct_of_sequences_per_batch * num_bins_this_rank)
     effective_global_batch_size = local_bins_per_step * dp_world_size
 
     # Store packing plan in runtime state for the training loop to use
     optimizer_steps = -(-num_bins_this_rank // local_bins_per_step)
-
-    from megatron.core.num_microbatches_calculator import (
-        get_num_microbatches,
-        reconfigure_num_microbatches_calculator,
-    )
 
     old_num_microbatches = get_num_microbatches()
 
