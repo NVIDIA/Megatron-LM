@@ -849,6 +849,18 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
     Get the order for overlap_moe_expert_parallel_comm schedule for the original
     chunk-wise order list.
     """
+    def _add_order(new_order, chunk_id_list, c_id, layer_id, is_wgrad=False, index=None):
+        if is_wgrad:
+            new_order.append(layer_id - 0.5)
+        else:
+            new_order.append(layer_id)
+        if c_id > 0:
+            chunk_id_list.append([abs(c_id) - 1, index])
+        else:
+            chunk_id_list.append(None)
+    new_order = []
+    chunk_id_list = []
+    add_order = partial(_add_order, new_order, chunk_id_list)
     first_backward_idx, last_forward_idx = None, None
     for idx, c_id in enumerate(order):
         if first_backward_idx is None and c_id < 0:
@@ -875,10 +887,13 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
             )
         return list(range(-num_layers_previous_chunks - num_layers, -num_layers_previous_chunks))
 
-    new_order = []
+    # warmup stage
     for c_id in order[:first_backward_idx]:
-        new_order += get_layer_range(c_id)
+        layer_range = get_layer_range(c_id)
+        new_order += layer_range
+        chunk_id_list.extend([abs(c_id) - 1, i] for i in range(len(layer_range)))
 
+    # 1f1b overlap stage
     for c_id_b, c_id_f in zip(
         order[first_backward_idx : last_forward_idx + 1 : 2],
         order[first_backward_idx + 1 : last_forward_idx + 1 : 2],
@@ -887,29 +902,27 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
         layer_range_b = get_layer_range(c_id_b)
         index = 0
         for l_b, l_f in zip_longest(layer_range_b, layer_range_f, fillvalue=0):
+            # always forward graph before backward graph
             if l_f != 0:
-                new_order.append(l_f)
+                add_order(c_id_f, l_f, index=index)
             if l_b != 0:
-                new_order.append(l_b)
+                add_order(c_id_b, l_b)
                 if capture_wgrad_graph and index < len(layer_range_b) - 1:
-                    new_order.append(l_b - 0.5)
+                    add_order(c_id_b, l_b, is_wgrad=True)
             index += 1
         # last wgrad backward
         if capture_wgrad_graph and layer_range_b:
-            new_order.append(layer_range_b[-1] - 0.5)
+            add_order(c_id_b, layer_range_b[-1], is_wgrad=True)
 
+    # cool down stage, backward graphs only
     for c_id in order[last_forward_idx + 1 :]:
-        base_layer_range = get_layer_range(c_id)
-        if capture_wgrad_graph:
-            layer_range = [None for _ in range(2 * len(base_layer_range))]
-            for i in range(len(base_layer_range)):
-                layer_range[2 * i] = base_layer_range[i]
-                layer_range[2 * i + 1] = base_layer_range[i] - 0.5
-        else:
-            layer_range = base_layer_range
-        new_order += layer_range
+        for l_b in get_layer_range(c_id):
+            add_order(c_id, l_b)
+            if capture_wgrad_graph:
+                add_order(c_id, l_b, is_wgrad=True)
 
-    return new_order
+
+    return new_order, chunk_id_list
 
 
 def forward_backward_pipelining_with_interleaving(
