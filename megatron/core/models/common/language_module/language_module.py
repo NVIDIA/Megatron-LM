@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
-from typing import Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -14,6 +14,7 @@ try:
 except:
     te_parallel_cross_entropy = None
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -21,10 +22,15 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version, make_tp_sharded_tensor_for_checkpoint
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+from megatron.core.utils import (
+    get_tensor_model_parallel_group_if_none,
+    is_te_min_version,
+    make_tp_sharded_tensor_for_checkpoint,
+)
 
 
 class LanguageModule(MegatronModule):
@@ -44,6 +50,7 @@ class LanguageModule(MegatronModule):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp
+        self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
         self.pp_group = pg_collection.pp
         assert hasattr(self.pg_collection, 'embd'), (
             "pg_collection must have a embd. In previous version, it used default "
@@ -119,6 +126,68 @@ class LanguageModule(MegatronModule):
             check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
 
+    def compute_output_layer_and_language_model_loss(
+        self,
+        hidden: Tensor,
+        labels: Optional[Tensor],
+        weight: Tensor = None,
+        sequence_parallel_enabled: bool = False,
+        column_parallel_linear: torch.nn.Module = None,
+        col_linear_kwargs: Dict[str, Any] = {},
+        reduction: Literal["none", "sum", "mean"] = "none",
+        ignore_index: int = -100,
+    ) -> Tensor:
+        """Computes the language model logits and loss (Cross entropy across vocabulary)
+
+        Args:
+            hidden (Tensor): The hidden states from the transformer model
+            labels (Optional[Tensor]): The labels of dimension [batch size, seq length]
+            weight (Tensor): The weight tensor of shape [vocab size, hidden size].
+                Required if using fused linear cross entropy.
+            column_parallel_linear (torch.nn.Module): The column parallel linear
+                layer to use for computing logits when not using fused linear cross entropy.
+            col_linear_kwargs (Dict[str, Any]): Additional kwargs for column parallel linear layer
+            reduction (Optional[str]): The reduction method. Defaults to "none", and can be
+                one of "none", "sum", "mean".
+            ignore_index (Optional[int]): The index to ignore in the loss calculation.
+                Defaults to -100.
+
+        Returns:
+            Tensor: Loss tensor of dimensions [batch size, sequence_length].
+        """
+        if (
+            self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == 'linear'
+        ):
+            assert (
+                weight is not None
+            ), "weight cannot be None when using fused linear cross entropy."
+            assert (
+                labels is not None
+            ), "labels cannot be None when using fused linear cross entropy."
+            # [b s] => [s b]
+            labels = labels.transpose(0, 1).contiguous()
+            loss = linear_cross_entropy(
+                hidden,
+                weight,
+                labels,
+                tp_group=self.pg_collection.tp,
+                sequence_parallel=sequence_parallel_enabled,
+                reduction=reduction,
+                ignore_index=ignore_index,
+            )
+
+            # [s b] => [b, s]
+            loss = loss.view_as(labels).transpose(0, 1).contiguous()
+            return loss
+        else:
+            assert (
+                column_parallel_linear is not None
+            ), "column_parallel_linear cannot be None when not using fused linear cross entropy."
+            logits, _ = column_parallel_linear(hidden, **col_linear_kwargs)
+
+            return self.compute_language_model_loss(labels, logits)
+
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
 
@@ -138,8 +207,7 @@ class LanguageModule(MegatronModule):
                     # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
                     is_cg_capturable = (
                         hasattr(self.config, 'cuda_graph_scope')
-                        and self.config.cuda_graph_scope
-                        and 'full_iteration' in self.config.cuda_graph_scope
+                        and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
                     )
                     if is_cg_capturable and not is_te_min_version("2.7.0"):
                         from megatron.core.utils import get_te_version
@@ -278,6 +346,10 @@ class LanguageModule(MegatronModule):
             ShardedStateDict: sharded state dict for the LanguageModel
         """
         assert not sharded_offsets, "Unexpected sharded offsets"
+
+        # Guard for cases metadata is not provided
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
@@ -286,7 +358,7 @@ class LanguageModule(MegatronModule):
 
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
-                sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key
+                sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key, metadata
             )
         elif self.post_process:
             # Make sure the output layer follows the embeddings padding logic
@@ -303,6 +375,7 @@ class LanguageModule(MegatronModule):
         sharded_state_dict: ShardedStateDict,
         output_layer_weight_key: str,
         first_stage_word_emb_key: str,
+        metadata: Optional[dict] = None,
     ) -> None:
         """Ties the embedding and output weights in a given sharded state dict.
 
@@ -312,9 +385,11 @@ class LanguageModule(MegatronModule):
                 This entry will be replaced with a tied version
             first_stage_word_emb_key (str): this must be the same as the
                 ShardedTensor.key of the first stage word embeddings.
+            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
 
         Returns: None, acts in-place
         """
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         if not self.post_process:
             # No output layer
             assert output_layer_weight_key not in sharded_state_dict, sharded_state_dict.keys()
@@ -347,4 +422,6 @@ class LanguageModule(MegatronModule):
             key=first_stage_word_emb_key,
             replica_id=last_stage_word_emb_replica_id,
             allow_shape_mismatch=True,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )

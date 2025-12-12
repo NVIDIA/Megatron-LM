@@ -167,13 +167,10 @@ def get_mesh_names(device_mesh: Optional[DeviceMesh] = None) -> list[str]:
         submesh_dim_name
         for child_mesh, root_mesh in _mesh_resources.child_to_root_mapping.items()
         for submesh_dim_name in (child_mesh.mesh_dim_names or [])
-        if root_mesh == device_mesh
+        # Add flattened or other unaccounted for children of the root mesh.
+        if root_mesh == device_mesh and submesh_dim_name not in mesh_dim_names
     ]
-    # Combine without duplicate dimensions.
-    for dim_name in submesh_dim_names:
-        if dim_name not in mesh_dim_names:
-            mesh_dim_names.append(dim_name)
-    return mesh_dim_names
+    return mesh_dim_names + submesh_dim_names
 
 
 def contains_submesh(
@@ -772,6 +769,8 @@ class FSDPDistributedIndex:
 
         # Register EP submeshes
         if self.expt_device_mesh is not None:
+            register_submesh(self.device_mesh, hsdp_submesh, True)
+            register_submesh(self.device_mesh, hsdp_tp_submesh, True)
             register_submesh(self.expt_device_mesh, tp_submesh, True)
             register_submesh(self.expt_device_mesh, fsdp_tp_submesh, True)
             register_submesh(self.expt_device_mesh, fsdp_submesh, True)

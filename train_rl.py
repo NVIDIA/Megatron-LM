@@ -1,5 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
-"""Train GPT with rl."""
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import inspect
 import os
@@ -15,7 +14,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
-from megatron.rl.rl_utils import calculate_grpo_loss, get_logprobs
+from megatron.rl.rl_utils import calculate_grpo_loss, get_logprobs, get_rl_runtime_state
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
@@ -178,6 +177,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         data_iterator : Input data iterator
         model (GPTModel): The GPT Model
     """
+
     args = get_args()
     timers = get_timers()
 
@@ -197,7 +197,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         bin_idx = bin_tensor.item()
 
         # Get packing context (should always be available in packed mode)
-        packing_context = args._packing_context
+        runtime_state = get_rl_runtime_state()
+        packing_context = runtime_state.packing_context
 
         idx = slice(bin_idx, bin_idx + 1)
         # Extract packed data for this bin (already on GPU)
@@ -234,11 +235,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         else:
             inference_logprobs = None
 
-        args._latest_batch_num_sequences = len(seq_indices)
-        # Accumulate sequences processed on this rank for the current iteration
-        if not hasattr(args, '_sequences_this_iteration_on_rank'):
-            args._sequences_this_iteration_on_rank = 0
-        args._sequences_this_iteration_on_rank += int(args._latest_batch_num_sequences)
+        runtime_state = get_rl_runtime_state()
+        runtime_state.increment_sequences(len(seq_indices))
     else:
         # Extract unpacked data
         (
@@ -262,11 +260,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
         )
 
-        args._latest_batch_num_sequences = tokens.shape[0]
-        # Accumulate sequences processed on this rank for the current iteration
-        if not hasattr(args, '_sequences_this_iteration_on_rank'):
-            args._sequences_this_iteration_on_rank = 0
-        args._sequences_this_iteration_on_rank += int(args._latest_batch_num_sequences)
+        runtime_state = get_rl_runtime_state()
+        runtime_state.increment_sequences(tokens.shape[0])
 
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
@@ -375,9 +370,9 @@ if __name__ == "__main__":
             return _gpt_builder(args, pre_process, post_process, vp_stage)
 
     pretrain(
-        train_valid_test_datasets_provider,  # This is currently a mock dataset that will be overriden inside of the train_step call for rl.
+        None,  # we don't need to build any datasets for RL training
         partial(model_provider, _model_builder),
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        args_defaults={}, 
     )

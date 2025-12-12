@@ -1,6 +1,7 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import io
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -10,6 +11,37 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.tokenizers import MegatronTokenizer
+
+
+def serialize_tensor(tensor: torch.Tensor) -> bytes:
+    """Serialize tensor to bytes.
+
+    Args:
+        tensor (Tensor): Tensor.
+
+    Returns:
+        (bytes) Byte representation of tensor.
+    """
+    buffer = io.BytesIO()
+    torch.save(tensor, buffer)
+    buffer.seek(0)
+    tensor_bytes = buffer.read()
+    return tensor_bytes
+
+
+def deserialize_tensor(tensor_bytes: bytes) -> torch.Tensor:
+    """Deserialize tensor from bytes.
+
+    Args:
+        tensor_bytes (bytes): Byte representation of tensor.
+
+    Returns:
+        (Tensor) Tensor.
+    """
+    buffer = io.BytesIO(tensor_bytes)
+    tensor = torch.load(buffer)
+    return tensor
 
 
 # class syntax
@@ -59,14 +91,47 @@ class InferenceRequest:
             )
             self.sampling_params = self.inference_parameters
 
-    def serializable(self):
-        """
-        Converts the instance into a serializable dictionary.
+    def serialize(self) -> dict:
+        """Converts the instance into a serializable dictionary.
+
         Returns:
-            dict: A dictionary representation of the instance suitable for serialization.
+            (dict) A dictionary representation of the instance suitable for
+                serialization.
         """
 
-        return asdict(self)
+        # Dataclass to dict.
+        obj = asdict(self)
+        obj["status"] = self.status.name if self.status else None
+
+        # Serialize tensors.
+        obj = {
+            k: (("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor) else v)
+            for k, v in obj.items()
+        }
+
+        return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "InferenceRequest":
+        """Deserialize request.
+
+        Args:
+            obj (dict): Serialized request data.
+
+        Returns:
+            (InferenceRequest) Deserialized request.
+        """
+
+        # Initialize request.
+        request = cls(**obj)
+        request.status = None if obj["status"] is None else Status[obj["status"]]
+
+        # Deserialize tensors.
+        for k, v in obj.items():
+            if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
+                setattr(request, k, deserialize_tensor(v[1]))
+
+        return request
 
 
 class DynamicInferenceEventType(Enum):
@@ -101,8 +166,8 @@ class DynamicInferenceEvent:
     def __post_init__(self):
 
         # Timestamp.
-        assert self.timestamp is None, "timestamp automatically set."
-        self.timestamp = time.time()
+        if self.timestamp is None:
+            self.timestamp = time.time()
 
         # Validate type.
         assert isinstance(self.type, DynamicInferenceEventType)
@@ -119,6 +184,48 @@ class DynamicInferenceEvent:
     def __str__(self):
         payload_str = "" if self.payload is None else f", {type(self.payload).__name__}"
         return f"[{self.timestamp:.3f}] {self.type.name}{payload_str}"
+
+    def serialize(self) -> dict:
+        """Converts the instance into a serializable dictionary.
+
+        Returns:
+            (dict) A dictionary representation of the instance suitable for
+                serialization.
+        """
+
+        # Dataclass to dict.
+        obj = asdict(self)
+        obj["type"] = self.type.name
+
+        # Serialize payload.
+        if self.payload:
+            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+
+            obj["payload"] = ContextErrorFactory.serialize(self.payload)
+
+        return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "DynamicInferenceEvent":
+        """Deserialize event.
+
+        Args:
+            obj (dict): Serialized event data.
+
+        Returns:
+            (DynamicInferenceEvent) Deserialized event.
+        """
+
+        # Initialize event.
+        event = cls(**{**obj, "type": DynamicInferenceEventType[obj["type"]]})
+
+        # Deserialize payload.
+        if obj["payload"]:
+            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+
+            event.payload = ContextErrorFactory.deserialize(obj["payload"])
+
+        return event
 
 
 @dataclass(kw_only=True)
@@ -139,6 +246,7 @@ class DynamicInferenceRequest(InferenceRequest):
     finished_chunk_token_count = 0
 
     def __post_init__(self):
+        self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
             self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
 
@@ -161,6 +269,66 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"num events {len(self.events)}",
             )
         )
+
+    def serialize(self):
+        """Converts the instance into a serializable dictionary.
+
+        Returns:
+            (dict) A dictionary representation of the instance suitable for
+                serialization.
+        """
+        obj = super().serialize()
+        obj["events"] = [e.serialize() for e in self.events]
+        return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "DynamicInferenceRequest":
+        """Deserialize request.
+
+        Args:
+            obj (dict): Serialized request data.
+
+        Returns:
+            (DynamicInferenceRequest) Deserialized request.
+        """
+        request = super().deserialize(obj)
+        request.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
+        return request
+
+    @property
+    def tracked_metadata(self) -> List[Any]:
+        """Obtain an ordered list of all request metadata to be tracked by the context.
+
+        This consists of metadata that is used to inform text generation.
+        The values of such fields are tensorized and kept aligned with the current active batch.
+
+        Note that while the general request object is mutable, this metadata is
+        inherently assumed to remain immutable once the request becomes active.
+        """
+        sp = self.sampling_params
+        if sp.termination_id is None:
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                warnings.warn(
+                    f"DynamicInferenceRequest {self.request_id} has no termination_id set "
+                    "in its sampling_params. Defaulting to -1."
+                )
+            sp.termination_id = -1
+        return [getattr(sp, field) for field in self.get_metadata_labels().keys()]
+
+    @staticmethod
+    def get_metadata_labels() -> Dict[str, int]:
+        """Provides human-readable labels for the tracked metadata fields."""
+        ret = [
+            "temperature",
+            "top_k",
+            "top_p",
+            "termination_id",
+            "return_log_probs",
+            "skip_prompt_log_probs",
+            "top_n_logprobs",
+            "return_prompt_top_n_logprobs",
+        ]
+        return {k: v for v, k in enumerate(ret)}
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
         """Add event."""
@@ -197,6 +365,158 @@ class DynamicInferenceRequest(InferenceRequest):
     def failed(self) -> bool:
         """Request experienced non-transient error."""
         return self.status == Status.FAILED
+
+
+@dataclass(kw_only=True)
+class DynamicInferenceRequestRecord:
+    """History of DynamicInferenceRequest objects over multiple suspend and
+    resumes."""
+
+    requests: list[DynamicInferenceRequest] = field(default_factory=list)
+    latency: Optional[float] = None
+
+    @classmethod
+    def from_request(cls, request: DynamicInferenceRequest) -> "DynamicInferenceRequestRecord":
+        """Initialize record from a single request.
+
+        Args:
+            request (DynamicInferenceRequest): Initial request.
+
+        Returns:
+            (DynamicInferenceRequestRecord) A record.
+        """
+        record = cls()
+        record.requests.append(request)
+        return record
+
+    def __getitem__(self, idx: int) -> DynamicInferenceRequest:
+        """Get request by index.
+
+        Args:
+            idx (int): Request index.
+
+        Returns:
+            (DynamicInferenceRequest) Request object.
+        """
+        return self.requests[idx]
+
+    @property
+    def request_id(self) -> int:
+        """Get request id.
+
+        Returns:
+            (int) Request id.
+        """
+        return self.requests[0].request_id
+
+    def suspend(self, tokenizer: MegatronTokenizer):
+        """Suspend request by storing references to previous prompt, generations,
+        and sampling params.
+
+        Args:
+            tokenizer (MegatronTokenizer): The tokenizer.
+        """
+
+        old_request = self[-1]
+
+        # New prompt (concatenate prompt + generated tokens).
+        new_prompt_tokens = torch.cat(
+            (
+                old_request.prompt_tokens,
+                torch.tensor(
+                    old_request.generated_tokens,
+                    dtype=old_request.prompt_tokens.dtype,
+                    device=old_request.prompt_tokens.device,
+                ),
+            ),
+            dim=0,
+        )
+        new_prompt_str = tokenizer.detokenize(new_prompt_tokens.tolist())
+
+        # New sampling params.
+        new_sampling_params = SamplingParams(
+            **{
+                **asdict(old_request.sampling_params),
+                "num_tokens_to_generate": (
+                    old_request.sampling_params.num_tokens_to_generate
+                    - len(old_request.generated_tokens)
+                ),
+            }
+        )
+
+        # New request.
+        new_request = DynamicInferenceRequest(
+            request_id=old_request.request_id,
+            prompt=new_prompt_str,
+            prompt_tokens=new_prompt_tokens,
+            sampling_params=new_sampling_params,
+        )
+        self.requests.append(new_request)
+
+    def merge(self, tokenizer: MegatronTokenizer) -> DynamicInferenceRequest:
+        """Merge requests into a single suspend-agnostic request object.
+
+        Args:
+            tokenizer (MegatronTokenizer): The tokenizer.
+
+        Returns:
+            (DynamicInferenceRequest) Merged request.
+        """
+
+        def merge_lists(key):
+            if getattr(self.requests[0], key) is None:
+                return None
+            else:
+                return [v for r in self.requests for v in getattr(r, key)]
+
+        prompt_tokens = self.requests[0].prompt_tokens
+        generated_tokens = merge_lists("generated_tokens")
+
+        # Merged request.
+        request = DynamicInferenceRequest(
+            request_id=self.requests[0].request_id,
+            prompt=tokenizer.detokenize(prompt_tokens.tolist()),
+            prompt_tokens=prompt_tokens,
+            prompt_log_probs=self.requests[0].prompt_log_probs,
+            prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
+            generated_text=tokenizer.detokenize(generated_tokens),
+            generated_tokens=generated_tokens,
+            generated_length=len(generated_tokens),
+            generated_log_probs=merge_lists("generated_log_probs"),
+            generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
+            sampling_params=self.requests[0].sampling_params,
+            tpot=merge_lists("tpot"),
+            status=self.requests[-1].status,
+            latency=self.latency,
+            events=merge_lists("events"),
+        )
+
+        return request
+
+    def serialize(self) -> dict:
+        """Converts the instance into a serializable dictionary.
+
+        Returns:
+            (dict) A dictionary representation of the instance suitable for
+                serialization.
+        """
+        obj = asdict(self)
+        obj["requests"] = [r.serialize() for r in self.requests]
+        return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "DynamicInferenceRequestRecord":
+        """Deserialize record.
+
+        Args:
+            obj (dict): Serialized record data.
+
+        Returns:
+            (DynamicInferenceRequestRecord) Deserialized record.
+        """
+        request = cls(**obj)
+        request.requests = [DynamicInferenceRequest.deserialize(r) for r in obj["requests"]]
+        return request
 
 
 @dataclass(kw_only=True)

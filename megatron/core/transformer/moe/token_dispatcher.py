@@ -8,8 +8,6 @@ import torch
 
 from megatron.core import utils
 from megatron.core.config import is_experimental_enabled
-from megatron.core.fp4_utils import get_fp4_align_size
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
@@ -18,6 +16,7 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
     fused_dispatch,
@@ -27,6 +26,7 @@ from megatron.core.transformer.moe.fused_a2a import (
 )
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
+    get_align_size_for_quantization,
     get_capacity,
     maybe_move_tensor_to_cpu,
     pad_routing_map,
@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
      num_local_tokens: S/TP*B
      num_global_tokens: num_local_tokens*TP*EP
 """
+
+logger = logging.getLogger(__name__)
 
 
 class MoETokenDispatcher:
@@ -203,14 +205,6 @@ class MoETokenDispatcher:
         """Set shared expert to the dispatcher."""
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
-
-    def get_align_size_for_quantization(self):
-        """Get the alignment size for quantization."""
-        if self.config.fp8:
-            return get_fp8_align_size(self.config.fp8_recipe)
-        elif self.config.fp4:
-            return get_fp4_align_size(self.config.fp4_recipe)
-        return 16
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -445,7 +439,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         }
         if (
             config.cuda_graph_impl == "transformer_engine"
-            and 'moe_preprocess' in config.cuda_graph_scope
+            and CudaGraphScope.moe_preprocess in config.cuda_graph_scope
         ):
             self.cuda_dtoh_point = "before_ep_alltoall"
         else:
@@ -624,7 +618,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         if self.config.moe_router_padding_for_quantization:
-            pad_multiple = self.get_align_size_for_quantization()
+            pad_multiple = get_align_size_for_quantization(self.config)
             if is_experimental_enabled() and self.config.moe_permute_fusion:
                 self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
             else:
@@ -991,11 +985,8 @@ class _HybridEPManager(_DispatchManager):
         if self.drop_and_pad:
             assert self.capacity_factor is not None
         self.capacity = None
-        # The up-bound for the number of tokens after dispatch op, -1 means no up-bound,
-        # which will cause a CPU sync
-        self.num_dispatched_tokens = None
-        # Actually the sum of tokens_per_expert, the up-bound for the number of tokens
-        # after permute op, -1 means no up-bound, will cause a CPU sync
+        # Actually the the up-bound for the number of tokens
+        # after permute op, None means no up-bound, will cause a CPU sync
         self.num_permuted_tokens = None
 
         # Metadata
@@ -1024,12 +1015,9 @@ class _HybridEPManager(_DispatchManager):
                 num_experts=self.num_experts,
                 capacity_factor=self.capacity_factor,
             )
-            # We cannot predict the actual number of tokens after the dispatch op,
-            # so we set it to the worst case in drop_and_pad mode
-            self.num_dispatched_tokens = self.capacity * self.group.size() * self.num_local_experts
             # In drop_and_pad mode, the number of tokens after the permute op
             # can be computed on the CPU
-            self.num_permuted_tokens = self.num_dispatched_tokens
+            self.num_permuted_tokens = self.capacity * self.group.size() * self.num_local_experts
             self.tokens_per_expert = torch.full(
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
@@ -1047,8 +1035,8 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        if self.config.fp8:
-            self.pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+        if self.config.fp8 or self.config.fp4:
+            self.pad_multiple = get_align_size_for_quantization(self.config)
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
             hybrid_ep_dispatch(
                 x=hidden_states,
@@ -1058,7 +1046,6 @@ class _HybridEPManager(_DispatchManager):
                 num_local_experts=self.num_local_experts,
                 num_sms_dispatch_api=self.config.moe_hybridep_num_sms,
                 num_sms_combine_api=self.config.moe_hybridep_num_sms,
-                num_dispatched_tokens=self.num_dispatched_tokens,
                 num_permuted_tokens=self.num_permuted_tokens,
                 pad_multiple=self.pad_multiple,
             )
@@ -1080,14 +1067,15 @@ class _HybridEPManager(_DispatchManager):
         hidden_states = hybrid_ep_combine(
             x=hidden_states,
             handle=self.handle,
-            num_dispatched_tokens=self.num_dispatched_tokens,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
-        # Release the used handle/num_permuted_tokens which could change in each iteration
+        # Release the used handle/num_permuted_tokens which could change in each iteration.
+        # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
+        # num_dispatched_tokens, because their values never change.
         self.handle = None
-        self.num_permuted_tokens = None
-        self.num_dispatched_tokens = None
+        if not self.drop_and_pad:
+            self.num_permuted_tokens = None
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1269,7 +1257,7 @@ class _DeepepManager(_DispatchManager):
         """
         Pad the routing map to the nearest multiple of the pad_multiple.
         """
-        pad_multiple = self.get_align_size_for_quantization()
+        pad_multiple = get_align_size_for_quantization(self.config)
 
         num_input_tokens = routing_map.shape[0]
         target_tokens_per_expert = (
@@ -1279,7 +1267,6 @@ class _DeepepManager(_DispatchManager):
         # Check if there are enough tokens to pad
         enough_tokens_to_pad = torch.all(target_tokens_per_expert <= num_input_tokens)
         if not enough_tokens_to_pad:
-            logger = logging.getLogger(__name__)
             logger.warning(
                 "Not enough tokens to pad. The total number of tokens received in this rank "
                 "is smaller than the target number of tokens for each expert. "
@@ -1331,14 +1318,6 @@ class _DeepepManager(_DispatchManager):
             fused=self.permute_fusion,
         )
         return hidden_states
-
-    def get_align_size_for_quantization(self):
-        """Get the alignment size for quantization."""
-        if self.config.fp8:
-            return get_fp8_align_size(self.config.fp8_recipe)
-        elif self.config.fp4:
-            return get_fp4_align_size(self.config.fp4_recipe)
-        return 16
 
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):

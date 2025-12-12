@@ -8,10 +8,11 @@ from megatron.training import get_tokenizer
 from megatron.training.utils import unwrap_model
 
 
-def report_draft_acceptance_length(model, osl: int = 64, draft_length: int = 7):
+def report_draft_acceptance_length(model, osl: int = 64, draft_steps: int = 7):
     """Report MTBench acceptance length."""
     tokenizer = get_tokenizer()._tokenizer
     unwrapped_model = unwrap_model(model)[0]
+    parallel_draft_step = unwrapped_model.eagle_config.parallel_draft_step if hasattr(unwrapped_model, "eagle_config") else 1
 
     if unwrapped_model.training:
         return
@@ -33,15 +34,15 @@ def report_draft_acceptance_length(model, osl: int = 64, draft_length: int = 7):
             conversations, return_tensors="pt", add_generation_prompt=True
         ).to(torch.cuda.current_device())
         output_ids, actual_osl, steps = simple_speculative_generate(
-            unwrapped_model, input_ids, osl=osl, draft_length=draft_length, disable_tqdm=True
+            unwrapped_model, input_ids, osl=osl, steps=draft_steps, disable_tqdm=True
         )
         total_osl += actual_osl
         total_steps += steps
         if torch.distributed.get_rank() == 0:
             al = actual_osl / steps
-            ar = al / draft_length
+            ar = al / (draft_steps + parallel_draft_step - 1)
             print(
-                "Rank {:3}/{:3} {:12} AL {:.1f} AR {:.2f} STEPS {:5}/{:5} DRAFT {:2}".format(
+                "Rank {:3}/{:3} {:12} AL {:.1f} AR {:.2f} STEPS {:5}/{:5} DRAFT {:2} PARALLEL {:2}".format(
                     torch.distributed.get_rank(),
                     torch.distributed.get_world_size(),
                     category,
@@ -49,15 +50,16 @@ def report_draft_acceptance_length(model, osl: int = 64, draft_length: int = 7):
                     ar,
                     steps,
                     actual_osl,
-                    draft_length,
+                    draft_steps,
+                    parallel_draft_step,
                 ),
                 flush=True,
             )
     if torch.distributed.get_rank() == 0:
         al = total_osl / total_steps
-        ar = al / draft_length
+        ar = al / (draft_steps + parallel_draft_step - 1)
         print(
-            "Rank {:3}/{:3} {:12} AL {:.1f} AR {:.2f} STEPS {:5}/{:5} DRAFT {:2}".format(
+            "Rank {:3}/{:3} {:12} AL {:.1f} AR {:.2f} STEPS {:5}/{:5} DRAFT {:2} PARALLEL {:2}".format(
                 torch.distributed.get_rank(),
                 torch.distributed.get_world_size(),
                 "average",
@@ -65,7 +67,8 @@ def report_draft_acceptance_length(model, osl: int = 64, draft_length: int = 7):
                 ar,
                 total_steps,
                 total_osl,
-                draft_length,
+                draft_steps,
+                parallel_draft_step,
             ),
             flush=True,
         )

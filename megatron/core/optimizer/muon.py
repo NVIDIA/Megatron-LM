@@ -3,12 +3,11 @@
 """Megatron muon optimizer wrapper to handle tensor-parallel."""
 
 import logging
-from typing import Any, Callable, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 import torch
 from torch.optim.optimizer import ParamsT
 
-from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank
@@ -21,7 +20,7 @@ from .optimizer import (
     FP32Optimizer,
     MegatronOptimizer,
 )
-from .optimizer_config import OptimizerConfig
+from .optimizer_config import OptimizerConfig, ParamKey
 
 try:
     from emerging_optimizers.orthogonalized_optimizers import (
@@ -76,7 +75,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}',
             )
             size = [grad.size(-2), grad.size(-1)]
-            if partition_dim:
+            if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
             orth_grad = newton_schulz_tp(
                 grad,
@@ -95,15 +94,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
 
+        weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         super().__init__(
             params,
             lr,
             momentum_beta,
-            use_nesterov,
-            weight_decay,
-            use_decoupled_weight_decay,
-            fp32_matmul_prec,
-            scaled_orthogonalize_fn,
+            use_nesterov=use_nesterov,
+            weight_decay=weight_decay,
+            weight_decay_method=weight_decay_method,
+            fp32_matmul_prec=fp32_matmul_prec,
+            scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
@@ -129,8 +129,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             tp_group = None
         partition_dim = None if self.mode == "blockwise" else getattr(p, "partition_dim", None)
         if partition_dim == -1:
-            # llm-shower use different default value for partition_dim than TE.
-            # Because -1 is a valid index for ndarray, we decided to not overload it.
+            # emerging-optimizers use None instead of -1 to indicate no tensor parallel
             partition_dim = None
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
@@ -165,9 +164,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 def get_megatron_muon_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
-    no_weight_decay_cond: Optional[Callable] = None,
-    scale_lr_cond: Optional[Callable] = None,
-    lr_mult: float = 1.0,
+    config_overrides: Optional[Dict[ParamKey, OptimizerConfig]] = None,
     use_gloo_process_groups: bool = True,
     layer_wise_distributed_optimizer: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
@@ -178,17 +175,15 @@ def get_megatron_muon_optimizer(
     Args:
         config (OptimizerConfig): optimizer configuration object.
         model_chunks (List[MegatronModule]): model chunks to get optimizer for.
-        no_weight_decay_cond (func, optional): function to determine whether a parameter
-            should not perform weight decay. Defaults to None.
-        scale_lr_cond (func, optional): function to determine whether a parameter
-            should have a scaled learning rate. Defaults to None.
-        lr_mult (float, optional): learning rate multiplier for parameters that
-            satisfy scale_lr_cond. Defaults to 1.0.
         use_gloo_process_groups (bool): if false, disable use of Gloo process groups
             in underlying Megatron optimizers.
         layer_wise_distributed_optimizer (bool): if true, use layer-wise distributed optimizer.
             Defaults to False.
     """
+    # Muon currently use adam config. setting str here to call regular get for adam creation
+    # side effect is muon optimizer will have wrong name, i.e. config.optimizer == 'adam'
+    config.optimizer = 'adam'
+
     assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
 
     # dist-optim is not supported due to strong coupling with how DDP init grad buffer
@@ -200,8 +195,6 @@ def get_megatron_muon_optimizer(
     # before this function receive properly created collection
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
@@ -233,9 +226,10 @@ def get_megatron_muon_optimizer(
             # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
-            # TODO(deyuf): might not be sufficient for future algorithm. revisit this conditioning
-            if not getattr(param, 'is_embedding_or_output_parameter', False) and not (
-                len(param.shape) == 1
+            # TODO(deyuf): currently only allow 2D non-embedding weight to avoid breaking
+            if (
+                not getattr(param, 'is_embedding_or_output_parameter', False)
+                and len(param.shape) == 2
             ):
                 linear_params.append(param)
             else:
@@ -245,16 +239,7 @@ def get_megatron_muon_optimizer(
     for param in nonlinear_params:
         param.requires_grad = False
 
-    linear_param_groups = _get_param_groups(
-        model_chunks,
-        no_weight_decay_cond,
-        scale_lr_cond,
-        lr_mult,
-        lr=config.lr,
-        min_lr=config.min_lr,
-        decoupled_lr=config.decoupled_lr,
-        decoupled_min_lr=config.decoupled_min_lr,
-    )
+    linear_param_groups = _get_param_groups(model_chunks, config, config_overrides)
 
     optimizer = TensorParallelMuon(
         linear_param_groups,
@@ -272,13 +257,6 @@ def get_megatron_muon_optimizer(
         pg_collection=pg_collection,
         mode=config.muon_tp_mode,
     )
-
-    # set config here to:
-    # 1. get adam for rest of layer
-    # 2. avoid ChainedOptimizer check fail that assert all optimizers are same kind
-    # side effect is muon optimizer will have wrong name str, i.e. config.optimizer == 'adam'
-    # TODO(deyuf): allow user to select optimizer mix and relax ChainedOptimizer design
-    config.optimizer = 'adam'
 
     # Needed for torch_dist ckpt_format, unlike torch ckpt_format
     # For other emerging optimizers, need to implement init_state_fn as well
@@ -330,7 +308,10 @@ def get_megatron_muon_optimizer(
 
     # call original get. linear params will be skipped since they're freezed
     chained_adam = get_megatron_optimizer(
-        config, model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult, use_gloo_process_groups
+        config,
+        model_chunks,
+        config_overrides=config_overrides,
+        use_gloo_process_groups=use_gloo_process_groups,
     )
 
     # unfreeze everything
@@ -338,6 +319,7 @@ def get_megatron_muon_optimizer(
         param.requires_grad = True
 
     # chain everything together
+    init_fns = [muon_init_state_fn] + len(chained_adam.chained_optimizers) * [adam_init_state_fn]
     optimizers += chained_adam.chained_optimizers
 
     if layer_wise_distributed_optimizer:
@@ -345,9 +327,6 @@ def get_megatron_muon_optimizer(
         if reset_config_bf16:
             config.bf16 = True
         return LayerWiseDistributedOptimizer(
-            optimizers,
-            config,
-            pg_collection,
-            init_state_fn_list=[muon_init_state_fn, adam_init_state_fn],
+            optimizers, config, pg_collection, init_state_fn_list=init_fns
         )
     return ChainedOptimizer(optimizers)
