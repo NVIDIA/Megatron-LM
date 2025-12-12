@@ -398,6 +398,10 @@ def run_inference(
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
 
+    # Resume engine (NOOP if not suspended).
+    if engine.is_suspended:
+        engine.resume()
+
     return {
         "step_times" : step_times,
         "add_times" : add_times,
@@ -487,6 +491,11 @@ def main():
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
     for _ in range(args.inference_repeat_n):
+
+        # Reset engine.
+        engine.reset()
+
+        # Trial.
         t = get_curr_time()
         result = run_inference(requests, engine)
         step_times = result["step_times"]
