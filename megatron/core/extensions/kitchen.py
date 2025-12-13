@@ -397,9 +397,9 @@ class CompoundParamsConfigSchema:
 class KitchenQuantizationParams:
     """Quantization parameters used for kitchen extensions"""
 
-    qlinear_params: Optional[QLinearParams]
-    qattention_params: Optional[QAttentionParams]
-    qfa_params: Optional[QFlashAttentionParams]
+    qlinear_params: Optional[QLinearParams] = None
+    qattention_params: Optional[QAttentionParams] = None
+    qfa_params: Optional[QFlashAttentionParams] = None
     # Could be extended with sparsity, etc.
     # match_input is what selected the config.
     match_input: MatchContext
