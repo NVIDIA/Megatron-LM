@@ -61,13 +61,21 @@ def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
     Note that since we are also random hadamard transform for NVFP4 training, we want
     fused group nvfp4 quantize plus hadamard transform. Hadamard transform will leverage
     tensor core instructions for better performance, while group quantize kernels also
-    prefer a more aligned size in token dimension M. Therefore, we apply align size 64
-    here for better performance in MOE.
+    prefer a more aligned size in token dimension M. The efficiently leverage grouped 
+    kernels, padding needs to be 64 multiple, but 128 multiple will bring even faster.
+
+    When it comes to MOE cuda graph support, the number of tokens for each expert should
+    be a buffer on device memory, which means that we don't know the M dimension in host, 
+    therefore we cannot calculate the zero padded scaling factors shape to compile with the 
+    scaling factor layout for NVFP4 GEMM. If we already zero pad the tokens to 128 multiple,
+    there is not need for such padding, therefore benefits CUDA graph support. 
 
     Paper link: https://arxiv.org/pdf/2509.25149
+    Scaling factor layout CuBLAS: https://docs.nvidia.com/cuda/cublas/#d-block-scaling-factors-layout
+    TE NVFP4 Grouped Quantization: https://github.com/NVIDIA/TransformerEngine/pull/2411 
     """
     # pylint: disable=unused-argument
-    return 64
+    return 128
 
 
 def dequantize_fp4_tensor(fp4_tensor: torch.Tensor) -> torch.Tensor:
