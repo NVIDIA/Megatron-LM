@@ -192,3 +192,87 @@ class TestInterleaveTransformerBlock:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+
+class TestMoELayerFP16:
+    """Test MoE layer with FP16 precision."""
+
+    def setup_method(self, method):
+        pass
+
+    @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
+    @pytest.mark.parametrize("num_moe_experts", [2, 4])
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 1), (2, 2), (4, 2)])
+    def test_moe_layer_fp16_forward_backward(
+        self, num_moe_experts, moe_token_dispatcher_type, tp_size, ep_size
+    ):
+        """Test MoE layer forward and backward pass with fp16 params and inputs."""
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+        hidden_size = 64
+        sequence_length = 32
+        micro_batch_size = 2
+
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=num_moe_experts,
+            use_cpu_initialization=False,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0.01,
+            moe_grouped_gemm=False,  # Use SequentialMLP for fp16 test
+            moe_ffn_hidden_size=256,
+            add_bias_linear=False,
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=ep_size,
+            sequence_parallel=tp_size > 1,
+            fp16=True,
+            params_dtype=torch.float16,
+        )
+
+        transformer_layer_spec = get_gpt_layer_local_spec(
+            num_experts=num_moe_experts, moe_grouped_gemm=False
+        )
+
+        moe_layer = MoELayer(
+            transformer_config, transformer_layer_spec.submodules.mlp.submodules
+        ).cuda()
+
+        hidden_states = torch.randn(
+            sequence_length,
+            micro_batch_size,
+            hidden_size,
+            device=torch.cuda.current_device(),
+            dtype=torch.float16,
+            requires_grad=True,
+        )
+
+        # Forward pass
+        output, _ = moe_layer(hidden_states)
+
+        assert output.dtype == torch.float16, f"Expected fp16 output, got {output.dtype}"
+        assert output.shape == hidden_states.shape, f"Output shape mismatch"
+
+        # Backward pass
+        loss = output.sum()
+        loss.backward()
+
+        assert hidden_states.grad is not None, "Input gradients should exist"
+        assert (
+            hidden_states.grad.dtype == torch.float16
+        ), f"Expected fp16 gradients, got {hidden_states.grad.dtype}"
+
+        for name, param in moe_layer.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"Gradient for {name} should exist"
+
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
