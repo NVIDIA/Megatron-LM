@@ -34,7 +34,7 @@ MEGATRON_FORMAT_DIR=/workspace/checkpoints/mixtral-mcore-TP${TARGET_TP_SIZE}PP${
 
 python tools/checkpoint/convert.py \
 --model-type GPT \
---loader loader_mixtral_hf \
+--loader mixtral_hf \
 --saver mcore \
 --target-tensor-parallel-size ${TARGET_TP_SIZE} \
 --target-pipeline-parallel-size ${TARGET_PP_SIZE} \
@@ -110,7 +110,7 @@ To finetuning pretrained Mixtral 8x7B, use the following scripts:
 
 ```bash
 PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:24.04-py3
-CHECKPOINT_PATH="" # Speicfy path to checkpoint dir
+CHECKPOINT_PATH="" # Specify path to checkpoint dir
 TOKENIZER_MODEL="" # Specify path to tokenizer.model
 DATA_PATH="" # Specify path to data
 
@@ -124,7 +124,7 @@ docker run \
     bash examples/mixtral/train_mixtral_8x7b_distributed.sh $CHECKPOINT_PATH $TOKENIZER_MODEL $DATA_PATH
 ```
 
-The above functionality also applys to Mixtral 8x22B actually, you should set the model config (including hidden_size/head_num/num_layers/ffn_hidden_size) properly according to the original [config](https://huggingface.co/mistralai/Mixtral-8x22B-v0.1/blob/main/config.json).
+The above functionality also applies to Mixtral 8x22B actually, you should set the model config (including hidden_size/head_num/num_layers/ffn_hidden_size) properly according to the original [config](https://huggingface.co/mistralai/Mixtral-8x22B-v0.1/blob/main/config.json).
 
 ## Acknowledgements
 Contributors outside NVIDIA for the huggingface converter and example of Mixtral models in Megatron-Core:
