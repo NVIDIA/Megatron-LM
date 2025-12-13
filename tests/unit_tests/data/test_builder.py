@@ -335,6 +335,7 @@ def test_builder():
 @pytest.mark.parametrize("sequences_per_dataset", [True, False])
 @pytest.mark.parametrize("defer_npy_index_mmap", [True, False])
 @pytest.mark.parametrize("vocab_size", [131072, 20000])
+@pytest.mark.parametrize("mid_level_dataset_surplus", [0.005, 0.01, 0])
 def test_fast_builder(
     use_split,
     add_weights,
@@ -342,6 +343,7 @@ def test_fast_builder(
     sequences_per_dataset,
     defer_npy_index_mmap,
     vocab_size,
+    mid_level_dataset_surplus,
     sequence_length: int = 100,
     number_of_files: int = 10,
     number_of_documents: int = 10,
@@ -439,6 +441,7 @@ def test_fast_builder(
             "reset_attention_mask": False,
             "eod_mask_loss": False,
             "create_attention_mask": False,
+            "mid_level_dataset_surplus": mid_level_dataset_surplus,
         }
         config = GPTDatasetConfig(**data_args)
 
@@ -483,12 +486,12 @@ def test_fast_builder(
                     ds_slow.dataset.index.sequence_pointers, ds_fast.dataset.index.sequence_pointers
                 )
             elif isinstance(ds_slow, BlendedDataset):
+                assert torch.all(ds_slow[0]["tokens"] == ds_fast[0]["tokens"])
+                assert torch.all(ds_slow[-1]["tokens"] == ds_fast[-1]["tokens"])
                 numpy.testing.assert_array_equal(ds_slow.dataset_index, ds_fast.dataset_index)
                 numpy.testing.assert_array_equal(
                     ds_slow.dataset_sample_index, ds_fast.dataset_sample_index
                 )
-                assert torch.all(ds_slow[0]["tokens"] == ds_fast[0]["tokens"])
-                assert torch.all(ds_slow[-1]["tokens"] == ds_fast[-1]["tokens"])
                 for ds_slow_i, ds_fast_i in zip(ds_slow.datasets, ds_fast.datasets):
                     assert torch.all(ds_slow_i[0]["tokens"] == ds_fast_i[0]["tokens"])
                     assert torch.all(ds_slow_i[-1]["tokens"] == ds_fast_i[-1]["tokens"])

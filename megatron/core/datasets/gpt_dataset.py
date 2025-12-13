@@ -50,17 +50,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
-    fast_cache_load: bool = False
-    """Option to use the fast cache loading path. Requires all the dataset caches to be built."""
-
     sequences_per_dataset: Optional[Dict[str, int]] = None
     """If provided, the sequence and document counts for each dataset. 
        Check --per-dataset-sequences-path
-    """
-
-    defer_npy_index_mmap: bool = False
-    """Option to defer the mmap of the dataset indexes until the first access.
-       Requires all the dataset caches to be built.
     """
 
     def __post_init__(self) -> None:
@@ -72,16 +64,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
-
-        if self.fast_cache_load:
-            assert (
-                self.path_to_cache is not None
-            ), "--data-cache-path must be provided when using --dataloader-fast-cache-load."
-            assert (
-                self.blend is None
-            ), f"--dataloader-fast-cache-load and --data-path cannot be used together. \
-            Use --per-split-data-args-path or --train-data-path, --valid-data-path and \
-            --test-data-path instead."
 
         self.token_dtype_code = (
             None
@@ -400,7 +382,6 @@ class GPTDataset(MegatronDataset):
             # NOTE(asolergi-nv): Direct path to lazy memmap the indexes
             base = f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}"
             get_path_to = lambda affix: os.path.join(self.config.path_to_cache, f"{base}-{affix}")
-            path_to_description = get_path_to("description.txt")
             self.path_to_document_index = get_path_to("document_index.npy")
             self.path_to_sample_index = get_path_to("sample_index.npy")
             self.path_to_shuffle_index = get_path_to("shuffle_index.npy")
