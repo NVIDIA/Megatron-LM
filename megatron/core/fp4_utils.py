@@ -65,10 +65,12 @@ def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
     kernels, padding needs to be 64 multiple, but 128 multiple will bring even faster.
 
     When it comes to MOE cuda graph support, the number of tokens for each expert should
-    be a buffer on device memory, which means that we don't know the M dimension in host, 
-    therefore we cannot calculate the zero padded scaling factors shape to compile with the 
-    scaling factor layout for NVFP4 GEMM. If we already zero pad the tokens to 128 multiple,
-    there is not need for such padding, therefore benefits CUDA graph support. 
+    be a buffer on device memory, which means that we don't know the token dimension for 
+    each expertin host, therefore we cannot calculate the zero padded scaling factors shape 
+    on host to comply with the NVFP4 GEMM scaling factor layout. However, if we have already 
+    zero padded the tokens to 128 multiple, then there is no need for such padding, so that
+    host doesn't need to copy the token distribution from device to host (which will break
+    the CUDA graph).
 
     Paper link: https://arxiv.org/pdf/2509.25149
     Scaling factor layout CuBLAS: https://docs.nvidia.com/cuda/cublas/#d-block-scaling-factors-layout
