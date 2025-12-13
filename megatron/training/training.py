@@ -1833,6 +1833,12 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
+def force_param_sync(model_chunks: list[DDP]) -> None:
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.start_param_sync(force_sync=True)
+
+
 def save_checkpoint_and_time(
     iteration,
     model,
@@ -1858,7 +1864,7 @@ def save_checkpoint_and_time(
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
-        disable_forward_pre_hook(model)
+        force_param_sync(model)
     save_checkpoint(
         iteration,
         model,
@@ -1875,8 +1881,6 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
-    if should_disable_forward_pre_hook(args):
-        enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
 
