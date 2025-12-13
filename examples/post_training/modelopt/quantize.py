@@ -8,20 +8,41 @@ import sys
 import warnings
 
 import torch
+import torch.distributed
 from datasets import load_dataset
 from tqdm import tqdm
+import copy
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 import modelopt.torch.quantization as mtq
+
+try:
+    import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
+except ImportError:
+    mtq_psx = None
+    warnings.warn(
+        "psx_formats is not installed. PSX formats quantization configs will not be available.",
+    )
+
+try:
+    import modelopt.torch.quantization.plugins.luts as mtq_luts
+except ImportError:
+    mtq_luts = None
+    warnings.warn(
+        "luts is not installed. LUTs quantization configs will not be available.",
+    )
+
+
 from modelopt.torch.export import import_mcore_gpt_from_hf
 
+from megatron.core import parallel_state
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
-from megatron.post_training.utils import report_current_memory_info
+from megatron.post_training.utils import report_current_memory_info, print_distributed_quant_summary
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
@@ -29,7 +50,7 @@ from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
 
-
+# TODO deprecate these aliases in the next release
 QUANT_CFG_CHOICES = {
     "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
     "fp8": mtq.FP8_DEFAULT_CFG,
@@ -38,7 +59,23 @@ QUANT_CFG_CHOICES = {
     "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
     "nvfp4": mtq.NVFP4_DEFAULT_CFG,
 }
+for k in mtq.config.choices:
+    QUANT_CFG_CHOICES[k] = getattr(mtq, k)
 
+KV_QUANT_CFG_CHOICES = {
+    "none": "none",
+    "fp8": "FP8_KV_CFG",
+    "fp8_affine": "FP8_AFFINE_KV_CFG",
+    "nvfp4": "NVFP4_KV_CFG",
+    "nvfp4_affine": "NVFP4_AFFINE_KV_CFG",
+    "nvfp4_rotate": "NVFP4_KV_ROTATE_CFG"
+}
+
+if mtq_psx is not None:
+    QUANT_CFG_CHOICES.update({k: getattr(mtq_psx, k) for k in mtq_psx.choices})
+
+if mtq_luts is not None:
+    QUANT_CFG_CHOICES.update({k: getattr(mtq_luts, k) for k in mtq_luts.choices})
 
 def add_text_generate_ptq_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
@@ -81,6 +118,18 @@ def add_text_generate_ptq_args(parser):
         action="store_true",
         help="Forcing all experts to be routed during the calibration.",
     )
+    group.add_argument(
+        "--num-first-layers-to-skip-quant",
+        type=int,
+        default=None,
+        help="Number of first layers to skip quantization.",
+    )
+    group.add_argument(
+        "--num-last-layers-to-skip-quant",
+        type=int,
+        default=None,
+        help="Number of last layers to skip quantization.",
+    )
     add_modelopt_args(parser)
     return parser
 
@@ -97,6 +146,62 @@ def check_arguments():
         args.moe_grouped_gemm = False
 
 
+def _is_first_layers(name: str, num_layers: int = 1, num_layers_to_disable: int = 1) -> bool:
+    if "layers." not in name:
+        return False
+    try:
+        layer_idx = int(name.split("layers.")[-1].split(".")[0])
+    except ValueError:
+        return False
+    return layer_idx < num_layers_to_disable
+
+def _is_last_layers(name: str, num_layers: int = 1, num_layers_to_disable: int = 1) -> bool:
+    if "layers." not in name:
+        return False
+    try:
+        layer_idx = int(name.split("layers.")[-1].split(".")[0])
+    except ValueError:
+        return False
+    return layer_idx >= num_layers - num_layers_to_disable
+
+def get_first_layers_disabled_config(config, num_layers: int = 1, num_layers_to_disable: int = 1):
+    """Get a config for `mtq.quantize` with first & last `num_layers_to_disable` layers disabled.
+
+    The layers to disable are the first & last `num_layers_to_disable` layers.
+    """
+    config = copy.deepcopy(config)
+    quant_cfg = config.get("quant_cfg", {})
+    quant_cfg.update(
+        {
+            functools.partial(
+                _is_first_layers,
+                num_layers=num_layers,
+                num_layers_to_disable=num_layers_to_disable,
+            ): {"enable": False}
+        }
+    )
+    config["quant_cfg"] = quant_cfg
+    return config
+
+def get_last_layers_disabled_config(config, num_layers: int = 1, num_layers_to_disable: int = 1):
+    """Get a config for `mtq.quantize` with last `num_layers_to_disable` layers disabled.
+
+    The layers to disable are the last `num_layers_to_disable` layers.
+    """
+    config = copy.deepcopy(config)
+    quant_cfg = config.get("quant_cfg", {})
+    quant_cfg.update(
+        {
+            functools.partial(
+                _is_last_layers,
+                num_layers=num_layers,
+                num_layers_to_disable=num_layers_to_disable,
+            ): {"enable": False}
+        }
+    )
+    config["quant_cfg"] = quant_cfg
+    return config
+
 def get_modelopt_torch_quantization_config():
     """Return a quantization config."""
     args = get_args()
@@ -108,8 +213,6 @@ def get_modelopt_torch_quantization_config():
         "axis": None,
         "enable": True,
     }
-    # Disable mamba-mixer quantization for now.
-    mtq_config["quant_cfg"]["*mixer.*"] = {"enable": False}
     if args.export_quant_cfg == "fp8":
         # Enable Medusa heads and kv-cache quantization
         mtq_config["quant_cfg"]["*medusa_heads**"] = fp8_config
@@ -125,10 +228,30 @@ def get_modelopt_torch_quantization_config():
     # Customization
     if args.disable_qkv_quant:
         mtq_config["quant_cfg"]["*self_attention*"] = {"enable": False}
-    if args.export_kv_cache_quant and not args.compress:
-        mtq_config["quant_cfg"]["*linear_qkv.output_quantizer"] = fp8_config
+
+    # KV Cache Quantization
+    enable_quant_kv_cache = args.export_kv_cache_quant != "none"
+    if enable_quant_kv_cache and not args.compress:
+        kv_cache_quant_cfg = getattr(mtq, KV_QUANT_CFG_CHOICES[args.export_kv_cache_quant])["quant_cfg"]
+        mtq_config = mtq.utils.update_quant_cfg_with_kv_cache_quant(
+                mtq_config, kv_cache_quant_cfg
+    )
+
+    # Weight Only Quantization
     if args.weight_only:
         mtq_config["quant_cfg"]["*input_quantizer"] = {"enable": False}
+    if args.num_first_layers_to_skip_quant is not None:
+        mtq_config = get_first_layers_disabled_config(
+            mtq_config,
+            num_layers=args.num_layers,
+            num_layers_to_disable=args.num_first_layers_to_skip_quant,
+        )
+    if args.num_last_layers_to_skip_quant is not None:
+        mtq_config = get_last_layers_disabled_config(
+            mtq_config,
+            num_layers=args.num_layers,
+            num_layers_to_disable=args.num_last_layers_to_skip_quant,
+        )
 
     return mtq_config
 
@@ -196,23 +319,18 @@ if __name__ == "__main__":
     def _hf_dataset_forword_loop_func(model):
         dataloader = get_calib_dataloader(args.calib_size)
 
-        if args.force_all_expert_routing:
-            for name, module in model.named_modules():
-                if isinstance(module, TopKRouter):
-                    module.topk = module.num_experts
-
         for prompt in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
             generated_ids = simple_generate(model, tokens.input_ids.cuda(), osl=1)
 
-            if args.force_all_expert_routing:
-                for name, module in model.named_modules():
-                    if isinstance(module, TopKRouter):
-                        module.topk = module.config.moe_router_topk
-
     unwrapped_model = unwrap_model(model)[0]
 
-    if args.export_quant_cfg in QUANT_CFG_CHOICES:
+    if args.force_all_expert_routing:
+        warnings.warn("--force-all-expert-routing will be deprecated in the next release and is no longer needed.")
+
+    if args.export_quant_cfg is not None:
+        if args.export_quant_cfg not in QUANT_CFG_CHOICES:
+            raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
         ptq_forward_loop_func = _hf_dataset_forword_loop_func
@@ -230,19 +348,10 @@ if __name__ == "__main__":
             mtq.compress(unwrapped_model)
             print_rank_0("Weights are now compressed to low-bit!")
 
-    print_rank_0(f"Fake Quantized Model:\n {unwrapped_model}")
-
-    if torch.distributed.get_rank() == 0:
-        for k, v in unwrapped_model.state_dict().items():
-            if "amax" not in k and "_scale" not in k:
-                continue
-            if isinstance(v, torch.Tensor):
-                v_amax = torch.max(torch.abs(v.clone().detach().to(torch.bfloat16)))
-                print("{:80} {:32} {:32} max {:.4e}".format(k, str(v.dtype), str(v.shape), v_amax))
-            else:
-                print("{:80}".format(k))
+        print_distributed_quant_summary(model, "Quantized Model:")
 
     _custom_prompt_forward_loop_func(unwrapped_model)
 
-    if args.save is not None and args.export_quant_cfg in QUANT_CFG_CHOICES:
+    if args.save is not None:
         save_checkpoint(1, model, None, None, 0, release=True)
+
