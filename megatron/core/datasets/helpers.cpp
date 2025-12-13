@@ -166,7 +166,8 @@ py::array_t<T> build_sample_idx(
   // Remove bound checks.
   auto sizes = sizes_.unchecked<1>();
   auto document_idx = document_idx_.unchecked<1>();
-
+  
+  // NOTE(asolergi-nv): This is the logic used to compute the number of samples in the GPTDataset when leveraging defer_npy_index_mmap
   // Build the sample idx as a contiguous 1-D array of type T.
   int64_t num_samples = 0;
   if (drop_last_partial_sequence == true) {
