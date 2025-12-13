@@ -6,6 +6,10 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_block import MambaStack
@@ -14,10 +18,15 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    TECudaGraphHelper,
+    _CudagraphGlobalRecord,
+)
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.training.global_vars import destroy_global_vars
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -495,6 +504,258 @@ class TestParallelMambaBlockCudagraphs:
             assert len(parallel_mamba_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
 
             del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+
+# Global storage for comparing unique buffer counts across different num_microbatches,
+# keyed by (pp_size, vpp_size)
+_unique_buffer_counts = {}
+
+
+class TestTECudaGraphHelper:
+    def setup_method(self, method):
+        # Initialize parallel state
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
+        # compare values across parametrized test runs
+
+    @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
+    @pytest.mark.parametrize("pp_size", [1, 2, 4])
+    @pytest.mark.parametrize("vpp_size", [None, 2])
+    def test_get_cuda_graph_input_data(self, num_microbatches, pp_size, vpp_size):
+        """Test _get_cuda_graph_input_data function in TECudaGraphHelper."""
+
+        if vpp_size and pp_size == 1:
+            pytest.skip("vpp_size must be None when pp_size is 1")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vpp_size,
+        )
+
+        # Set up test configuration
+        seq_length = 128
+        micro_batch_size = 2
+        num_layers = 8
+        vocab_size = 1024
+        hidden_size = 64
+        num_attention_heads = 4
+
+        # Initialize num_microbatches calculator
+        init_num_microbatches_calculator(
+            rank=0,
+            rampup_batch_size=None,
+            global_batch_size=micro_batch_size * num_microbatches,
+            micro_batch_size=micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+
+        # Create transformer config directly
+        transformer_config = TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            use_te_rng_tracker=True,
+            bf16=True,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vpp_size,
+            pipeline_dtype=torch.bfloat16,
+            context_parallel_size=1,
+        )
+
+        # Create model
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+
+        model = []
+        for i in range(vpp_size or 1):
+            this_model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=vocab_size,
+                max_sequence_length=seq_length,
+                parallel_output=True,
+                position_embedding_type="rope",
+                vp_stage=i if vpp_size else None,
+            ).cuda()
+            model.append(this_model)
+
+        # Initialize TECudaGraphHelper
+        cuda_graph_helper = TECudaGraphHelper(
+            model=model,
+            config=transformer_config,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            optimizers=[],
+        )
+
+        # Call _get_cuda_graph_input_data (which internally calls _get_sample_arguments)
+        sample_args, make_graphed_callables_kwargs = cuda_graph_helper._get_cuda_graph_input_data()
+
+        # Extract sample_kwargs from the kwargs dict
+        # For TE >= 1.10.0, sample_kwargs should always be present
+        assert (
+            'sample_kwargs' in make_graphed_callables_kwargs
+        ), "sample_kwargs should be present in make_graphed_callables_kwargs for TE >= 1.10.0"
+        sample_kwargs = make_graphed_callables_kwargs['sample_kwargs']
+
+        # Basic checks
+        num_graphable_layers = len(cuda_graph_helper.flattened_callables)
+        expected_length = num_graphable_layers * num_microbatches
+        assert len(sample_args) == expected_length, (
+            f"sample_args length mismatch: expected {expected_length}, " f"got {len(sample_args)}"
+        )
+        assert len(sample_kwargs) == expected_length, (
+            f"sample_kwargs length mismatch: expected {expected_length}, "
+            f"got {len(sample_kwargs)}"
+        )
+
+        # Check that all elements are not None
+        for i, (args_item, kwargs_item) in enumerate(zip(sample_args, sample_kwargs)):
+            assert args_item is not None, f"sample_args[{i}] is None"
+            assert kwargs_item is not None, f"sample_kwargs[{i}] is None"
+            assert isinstance(args_item, tuple), f"sample_args[{i}] should be a tuple"
+            assert isinstance(kwargs_item, dict), f"sample_kwargs[{i}] should be a dict"
+            assert len(args_item) > 0, f"sample_args[{i}] should not be empty"
+            # Check that hidden_states is present
+            assert "hidden_states" in kwargs_item or (
+                len(args_item) > 0 and torch.is_tensor(args_item[0])
+            ), f"sample_args[{i}] or sample_kwargs[{i}] should contain hidden_states"
+
+        # Check tensor properties
+        for i, (args_item, kwargs_item) in enumerate(zip(sample_args, sample_kwargs)):
+            # Get hidden_states from args or kwargs
+            if len(args_item) > 0 and torch.is_tensor(args_item[0]):
+                hidden_states = args_item[0]
+            elif "hidden_states" in kwargs_item:
+                hidden_states = kwargs_item["hidden_states"]
+            else:
+                continue
+
+            assert torch.is_tensor(hidden_states), f"hidden_states at index {i} should be a tensor"
+            # Check shape matches expected (accounting for TP/CP)
+            expected_seq_len = seq_length // transformer_config.context_parallel_size
+            if transformer_config.sequence_parallel:
+                expected_seq_len = expected_seq_len // transformer_config.tensor_model_parallel_size
+            assert hidden_states.shape[0] == expected_seq_len, (
+                f"hidden_states seq_len mismatch at index {i}: "
+                f"expected {expected_seq_len}, got {hidden_states.shape[0]}"
+            )
+            assert hidden_states.shape[1] == micro_batch_size, (
+                f"hidden_states batch_size mismatch at index {i}: "
+                f"expected {micro_batch_size}, got {hidden_states.shape[1]}"
+            )
+            assert hidden_states.shape[2] == transformer_config.hidden_size, (
+                f"hidden_states hidden_size mismatch at index {i}: "
+                f"expected {transformer_config.hidden_size}, got {hidden_states.shape[2]}"
+            )
+
+        # Memory optimization check: verify that buffers with same signature are reused
+        # Create a mapping of sample_keys to indices
+        sample_keys_to_indices = {}
+        for idx, (args_item, kwargs_item) in enumerate(zip(sample_args, sample_kwargs)):
+            # Create sample_keys similar to the function
+            args_keys = tuple((t.shape, t.dtype, t.layout) for t in args_item if torch.is_tensor(t))
+            kwargs_keys = tuple(
+                (k, v.shape, v.dtype, v.layout)
+                for k, v in sorted(kwargs_item.items())
+                if torch.is_tensor(v)
+            )
+            sample_keys = args_keys + kwargs_keys
+
+            if sample_keys not in sample_keys_to_indices:
+                sample_keys_to_indices[sample_keys] = []
+            sample_keys_to_indices[sample_keys].append(idx)
+
+        # Check that buffers with same signature share references (memory optimization)
+        # The optimization reuses buffers when:
+        # 1. They have the same signature (shape, dtype, layout)
+        # 2. The backward pass of the original buffer has completed
+        # 3. A new forward pass with matching signature needs a buffer
+        # Count how many times each tensor is reused
+        unique_tensors = set()
+        tensor_reuse_count = {}
+        for idx, (args_item, kwargs_item) in enumerate(zip(sample_args, sample_kwargs)):
+            # Get the first tensor from args (hidden_states)
+            if len(args_item) > 0 and torch.is_tensor(args_item[0]):
+                tensor_ptr = args_item[0].data_ptr()
+                unique_tensors.add(tensor_ptr)
+                tensor_reuse_count[tensor_ptr] = tensor_reuse_count.get(tensor_ptr, 0) + 1
+
+        # With memory optimization, we should see some buffers reused
+        # (i.e., some tensors should appear multiple times)
+        max_reuse = max(tensor_reuse_count.values()) if tensor_reuse_count else 0
+        total_entries = len(sample_args)
+        unique_buffer_count = len(unique_tensors)
+
+        # Verify that memory optimization is working:
+        # - The number of unique buffers should be <= total entries
+        # - With the 1F1B schedule and multiple microbatches, we should see some buffer reuse
+        # - The number of unique buffers should be bounded as num_microbatches grows.
+        assert unique_buffer_count <= total_entries, (
+            f"Memory optimization check: unique_buffer_count ({unique_buffer_count}) "
+            f"should be <= total_entries ({total_entries})"
+        )
+        global _unique_buffer_counts
+        # Use (pp_size, vpp_size) as key to track unique buffer counts per configuration
+        config_key = (pp_size, vpp_size)
+        if config_key not in _unique_buffer_counts:
+            _unique_buffer_counts[config_key] = unique_buffer_count
+        else:
+            assert unique_buffer_count == _unique_buffer_counts[config_key], (
+                f"Unique buffer count mismatch: expected {_unique_buffer_counts[config_key]}, "
+                f"got {unique_buffer_count}"
+            )
+
+        # Verify that buffers with the same signature can potentially be reused
+        # (the actual reuse depends on the schedule, but the mechanism should work)
+        if expected_length > 1:
+            # Check that we have multiple entries with the same signature
+            has_duplicate_signatures = any(
+                len(indices) > 1 for indices in sample_keys_to_indices.values()
+            )
+            assert has_duplicate_signatures, (
+                "Memory optimization: expected duplicate signatures for buffer reuse, "
+                "but all signatures are unique"
+            )
+
+            # We tested with a large number of microbatches, so we should see some buffer reuse.
+            assert max_reuse > 1, "Expected some buffer reuse"
+
+        # Verify that make_graphed_callables_kwargs contains expected keys
+        assert (
+            '_order' in make_graphed_callables_kwargs
+        ), "make_graphed_callables_kwargs should contain '_order'"
+        assert (
+            'num_warmup_iters' in make_graphed_callables_kwargs
+        ), "make_graphed_callables_kwargs should contain 'num_warmup_iters'"
+        assert (
+            'allow_unused_input' in make_graphed_callables_kwargs
+        ), "make_graphed_callables_kwargs should contain 'allow_unused_input'"
+
+        # Verify the order in kwargs matches expectations
+        order = make_graphed_callables_kwargs['_order']
+        num_model_chunks = cuda_graph_helper.num_model_chunks
+        expected_order_length = num_microbatches * num_model_chunks * 2
+        assert (
+            len(order) == expected_order_length
+        ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
+
+        # Verify that all forward passes in order have corresponding entries in sample_args
+        forward_count = sum(1 for chunk_id in order if chunk_id > 0)
+        assert forward_count == num_microbatches * num_model_chunks, (
+            f"Forward count mismatch: expected {num_microbatches * num_model_chunks}, "
+            f"got {forward_count}"
+        )
 
 
 if __name__ == "__main__":
