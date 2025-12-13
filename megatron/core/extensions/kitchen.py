@@ -396,6 +396,7 @@ class CompoundParamsConfigSchema:
 @dataclass
 class KitchenQuantizationParams:
     """Quantization parameters used for kitchen extensions"""
+
     # Could be extended with sparsity, etc.
     # match_input is what selected the config.
     qlinear_params: Optional[QLinearParams]
@@ -405,7 +406,6 @@ class KitchenQuantizationParams:
 
     qattention_params: Optional[QAttentionParams] = None
     qfa_params: Optional[QFlashAttentionParams] = None
-
 
     @staticmethod
     def parse_from_config(quant_config: QuantizationConfig) -> "KitchenQuantizationParams":
