@@ -46,7 +46,7 @@ def get_dtype(t):
         return "unknown"
 
 
-def new_general_gemm(A, B, workspace, out=None, accumulate=False, bias=None, **kwargs):
+def new_general_gemm(A, B, *args, out=None, accumulate=False, bias=None, **kwargs):
     """
     A wrapper for general_gemm that calls the original method twice
     and compares results for consistency.
@@ -65,7 +65,7 @@ def new_general_gemm(A, B, workspace, out=None, accumulate=False, bias=None, **k
             bias_arg = bias
 
         res = orig_general_gemm(
-            A, B, workspace, out=out_arg, accumulate=accumulate, bias=bias_arg, **kwargs
+            A, B, *args, out=out_arg, accumulate=accumulate, bias=bias_arg, **kwargs
         )
         out_res = res[0]
         if is_first_iter:
