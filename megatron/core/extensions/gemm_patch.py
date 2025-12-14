@@ -83,7 +83,7 @@ def new_general_gemm(A, B, *args, out=None, accumulate=False, bias=None, **kwarg
 
 
 def new_general_grouped_gemm(
-    A, B, out, out_dtype, *args, grad=False, accumulate=False, bias=None, **kwargs
+    A, B, out, *args, grad=False, accumulate=False, bias=None, **kwargs
 ):
     """
     A wrapper for general_grouped_gemm that calls the original method twice
@@ -106,7 +106,6 @@ def new_general_grouped_gemm(
             A,
             B,
             out_first_iter if is_first_iter else out,
-            out_dtype,
             *args,
             grad=grad if not is_first_iter else False,
             accumulate=accumulate,
