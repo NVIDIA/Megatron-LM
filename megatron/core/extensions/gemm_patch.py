@@ -108,7 +108,7 @@ def new_general_grouped_gemm(
             out_first_iter if is_first_iter else out,
             out_dtype,
             *args,
-            grad=grad if is_second_iter else False,
+            grad=grad if not is_first_iter else False,
             accumulate=accumulate,
             bias=bias_first_iter if is_first_iter else bias,
             **kwargs,
