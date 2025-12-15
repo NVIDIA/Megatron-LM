@@ -2479,7 +2479,7 @@ def train(
         if (
             getattr(args, "fsdp_manual_registration", False)
             and getattr(args, "use_megatron_fsdp", False)
-            and iteration ==  start_iteration + 2
+            and iteration ==  start_iteration + 1
         ):
             for model_chunk in model:
                 if isinstance(model_chunk, megatron_FSDP) and getattr(
