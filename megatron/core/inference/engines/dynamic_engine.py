@@ -480,14 +480,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
         torch.distributed.barrier(mp_group)
 
-        # initialize ep barrier 
-        self.ep_rank = get_pg_rank(self.pg_collection.ep)   
+        # initialize ep barrier
+        self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
         # todo: modify to use actual IP of ep-rank 0....
-        # todo: modify to find an empty port automatically... 
+        # todo: modify to find an empty port automatically...
         if self.ep_world_size > 1:
-            self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(self.zmq_context,
-                                                                     process_group=self.pg_collection.ep)
+            self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
+                self.zmq_context, process_group=self.pg_collection.ep
+            )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
@@ -1464,7 +1465,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """Determines if there are some pending requests in the expert parallel group this
         rank is a part of.
         Args:
-            local_work (int): The local work count for this rank. This is a sum of active 
+            local_work (int): The local work count for this rank. This is a sum of active
             and waiting requests.
         Returns:
             bool: True if there is some work in the EP group, False otherwise.
@@ -1526,7 +1527,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.controller.dummy_forward()
                     continue
 
-                
                 # 3. No work in EP group - Processing Control Signals
                 if not ep_group_has_work:
                     # Priority A: STOP
@@ -1542,7 +1542,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self.suspend()
                     else:
                         self.resume()
-                  
+
                     # Priority C: PAUSE or no work - nothing needs to be done
                     # todo [Siddharth]: Can this hardcoded sleep be avoided
                     # with asyncio zmq sockets?

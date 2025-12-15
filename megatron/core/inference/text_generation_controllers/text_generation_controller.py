@@ -753,7 +753,6 @@ class TextGenerationController:
         for the all-to-all communication."""
         return self.inference_wrapped_model.dummy_forward()
 
-   
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 

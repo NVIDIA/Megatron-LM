@@ -1733,6 +1733,7 @@ def get_expert_model_parallel_group(check_initialized=True):
         ), "expert model parallel group is not initialized"
     return _EXPERT_MODEL_PARALLEL_GROUP
 
+
 def get_expert_model_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
     in the expert model parallel group."""
