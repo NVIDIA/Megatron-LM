@@ -536,6 +536,37 @@ class _CudagraphReplayNode(torch.autograd.Function):
             )
         return None, None, *output_grads
 
+def _clone_nested_tensors(value: Any) -> Any:
+    """Recursively clone tensors inside nested containers."""
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, (tuple, list)):
+        return type(value)(_clone_nested_tensors(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _clone_nested_tensors(v) for k, v in value.items()}
+    return value
+
+def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Generator:
+    """Make generator state safe for CUDA graph capture/replay.
+
+    Generator state tensors can become inference tensors if created under `torch.inference_mode()`.
+    CUDA graph capture may later attempt in-place updates on that state; this fails for inference
+    tensors. Fix the generator *in-place* (preserving identity) by cloning its state outside
+    inference mode and setting it back.
+    """
+    with torch.inference_mode(mode=False):
+        if hasattr(gen, "graphsafe_get_state"):
+            state = gen.graphsafe_get_state()
+        else:
+            state = gen.get_state()
+
+        cloned_state = _clone_nested_tensors(state)
+        if hasattr(gen, "graphsafe_set_state"):
+            gen.graphsafe_set_state(cloned_state)
+        else:
+            gen.set_state(cloned_state)
+
+    return gen
 
 class _CudaGraphRunner(torch.nn.Module):
     """Represents the execution of a cudagraphed module for a single microbatch.
@@ -682,8 +713,11 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph = torch.cuda.CUDAGraph()
 
         # For cases with multiple active RNG states, e.g. TP.
-        for _, state in get_all_rng_states().items():
-            self.fwd_graph.register_generator_state(state)
+        rng_states = get_all_rng_states()
+        with torch.inference_mode(mode=False):
+            for gen in rng_states.values():
+                self.fwd_graph.register_generator_state(
+                    _ensure_generator_state_is_cudagraph_safe(gen))
 
         # warmup again as case graph capture mode may execute a different codepath
         for _ in range(self.num_warmup_steps):
@@ -705,6 +739,147 @@ class _CudaGraphRunner(torch.nn.Module):
 
         with self.get_quantization_context():
             torch.cuda.synchronize()
+            # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
+            # before capture begins, to avoid inference-tensor state issues during capture.
+            with torch.inference_mode(mode=False):
+                for device_idx in range(torch.cuda.device_count()):
+                    default_gen = torch.cuda.default_generators[device_idx]
+                    self.fwd_graph.register_generator_state(
+                        _ensure_generator_state_is_cudagraph_safe(default_gen)
+                    )
+
+            with torch.cuda.graph(
+                    self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
+            ):
+                outputs = self.base_module.forward(*args, **kwargs)
+
+        # save cudagraph output buffer
+        if isinstance(outputs, torch.Tensor):
+            outputs = (outputs,)
+        self.fwd_graph_outputs = outputs
+        self.fwd_graph_output_surface = self.get_tensors(outputs)
+
+        if self.training and torch.is_grad_enabled():
+            assert (
+                    len(self.fwd_graph_output_surface) > 0
+            ), """Tried graphing a moudule that returned no tensors in training mode,
+                however the graphed module must output at least one tensor,
+                so that a corresponding backward node may be registered in the autograd graph."""
+
+            # restore cached grads
+            for param in self.base_module.parameters():
+                if hasattr(param, 'main_grad'):
+                    saved_grad = save_main_grads.pop(0)
+                    assert (
+                            param.main_grad.shape == saved_grad.shape
+                    ), "Error restoring grads while cudagraphing!"
+                    param.main_grad.copy_(saved_grad)
+
+        if self.fp8_enabled or self.fp4_enabled:
+            restore_fp8_tensors([self.base_module], saved_fp8_tensors)
+
+        # Unfreeze GC.
+        if FREEZE_GC:
+            gc.unfreeze()
+
+            # gc.collect() drops references to unreachable tensors created during capture,
+            # returning their storage to the allocator to avoid a slowdown during replay. However,
+            # it forces expensive global garbage collection, so must be done only on the last layer
+            # per-device to avoid slowing down graph creation.
+            if self.is_last_layer:
+                gc.collect()
+
+    def create_fwd_graph_old(self, args, kwargs, clone_inputs=True):
+        """Create a fwd cudagraph for this runner. Should be called inside
+        'create_cudagraphs()'."""
+
+        # Freeze GC, to speed up capture time ~15-20x.
+        if FREEZE_GC:
+            gc.freeze()
+
+        # save grads and other variables that may be affected by graph warmup
+        if self.training and torch.is_grad_enabled():
+            save_main_grads = [
+                param.main_grad.clone()
+                for param in self.base_module.parameters()
+                if hasattr(param, 'main_grad')
+            ]
+
+        saved_fp8_tensors = None
+
+        if self.fp8_enabled:
+            if is_te_min_version("1.13.0"):
+                saved_fp8_tensors = save_fp8_tensors([self.base_module], self.fp8_recipe)
+            else:
+                saved_fp8_tensors = save_fp8_tensors(
+                    [self.base_module], self.fp8_recipe.amax_history_len
+                )
+        elif self.fp4_enabled:
+            if is_te_min_version("2.7.0.dev0"):
+                saved_fp8_tensors = save_fp8_tensors([self.base_module], self.fp4_recipe)
+            else:
+                raise ValueError("FP4 requires TE >= 2.7.0.dev0 for NVFP4BlockScaling support.")
+
+        if clone_inputs:
+            args, kwargs = self.zero_out_tensors(args, kwargs)
+
+        input_tensors = self.get_tensors(args, kwargs)
+        self.fwd_graph_input_surface = input_tensors + tuple(self.base_module.parameters())
+
+        self.fwd_graph = torch.cuda.CUDAGraph()
+
+        # For cases with multiple active RNG states, e.g. TP.
+        for _, state in get_all_rng_states().items():
+            rng_states = get_all_rng_states()
+            with torch.inference_mode(mode=False):
+                for gen in rng_states.values():
+                    self.fwd_graph.register_generator_state(
+                        _ensure_generator_state_is_cudagraph_safe(gen))
+            self.fwd_graph.register_generator_state(state)
+
+        # warmup again as case graph capture mode may execute a different codepath
+        for _ in range(self.num_warmup_steps):
+            with self.get_quantization_context():
+                torch.cuda.synchronize()
+                # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
+                # before capture begins, to avoid inference-tensor state issues during capture.
+                with torch.inference_mode(mode=False):
+                    for device_idx in range(torch.cuda.device_count()):
+                        default_gen = torch.cuda.default_generators[device_idx]
+                        self.fwd_graph.register_generator_state(
+                            _ensure_generator_state_is_cudagraph_safe(default_gen)
+                        )
+
+                with torch.cuda.graph(
+                        self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
+                ):
+                    outputs = self.base_module.forward(*args, **kwargs)
+                # outputs = self.base_module.forward(*args, **kwargs)
+            if self.training and torch.is_grad_enabled():
+                if isinstance(outputs, torch.Tensor):
+                    outputs = (outputs,)
+                outputs = self.get_tensors(outputs)
+                grad_inputs = torch.autograd.grad(
+                    outputs=tuple(o for o in outputs if o.requires_grad),
+                    inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
+                    grad_outputs=tuple(
+                        torch.zeros_like(o) if o.requires_grad else None for o in outputs
+                    ),
+                    only_inputs=True,
+                    allow_unused=True,
+                )
+
+        with self.get_quantization_context():
+            torch.cuda.synchronize()
+            # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
+            # before capture begins, to avoid inference-tensor state issues during capture.
+            with torch.inference_mode(mode=False):
+                for device_idx in range(torch.cuda.device_count()):
+                    default_gen = torch.cuda.default_generators[device_idx]
+                    self.fwd_graph.register_generator_state(
+                        _ensure_generator_state_is_cudagraph_safe(default_gen)
+                    )
+
             with torch.cuda.graph(
                 self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
             ):
@@ -746,6 +921,8 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.is_last_layer:
                 gc.collect()
 
+
+
     def create_bwd_graph(self, static_grad_outputs=None):
         """Create a bwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
@@ -758,7 +935,12 @@ class _CudaGraphRunner(torch.nn.Module):
 
         # For cases with multiple active RNG states, e.g. TP.
         for _, state in get_all_rng_states().items():
-            self.bwd_graph.register_generator_state(state)
+            rng_states = get_all_rng_states()
+            with torch.inference_mode(mode=False):
+                for gen in rng_states.values():
+                    self.bwd_graph.register_generator_state(
+                        _ensure_generator_state_is_cudagraph_safe(gen))
+            # self.bwd_graph.register_generator_state(state)
 
         if static_grad_outputs is None:
             static_grad_outputs = tuple(
