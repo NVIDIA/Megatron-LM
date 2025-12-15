@@ -1472,6 +1472,11 @@ class DynamicInferenceEngine(AbstractEngine):
             local_work = 0
 
         if self.ep_world_size > 1:
+            # Perform all-reduce to get max global work across EP group.
+            # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
+            # The user may have other tasks running in the event loop that need to be serviced.
+            # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
+            # We have tried that and it blocks the event loop is megatron-rl.
             max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
         else:
             max_global_work = local_work
@@ -1505,6 +1510,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
                 # 1. Check for work availability (Consensus Step)
                 ep_group_has_work = await self._ep_group_has_work(local_pending_requests)
+
                 # 2. Dummy Work Logic (Keep group alive if peers have work)
                 if ep_group_has_work and local_pending_requests == 0:
                     # run dummy forward pass if EP group as a whole has work,
@@ -1512,11 +1518,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.controller.dummy_forward()
                     continue
 
-                # 3. No work in EP group - Processing Control Signals
+                # 3. No work in EP group
+                # We handle control signals (PAUSE/STOP/SUSPEND) only when
+                # the entire EP group has received the signal. It is important to
+                # not process these signals immediately upon receipt, because
+                # other ranks in the EP group may not have received them yet.
+                # If we exit prematurely, other ranks will deadlock at the all-to-all.
+                # We use self._ep_group_has_work() to build consensus across the EP group
+                # as to when it is safe to process these signals. The function returns False
+                # when all ranks have received the signal.
                 if not ep_group_has_work:
                     # Priority A: STOP
-                    # If we have received a stop signal AND the group agrees (ep_group_has_work is False),
-                    # we must break the loop to exit.
                     if self.stopped.is_set():
                         if self.rank == 0:
                             logging.info("Stopping engine.")
@@ -1530,6 +1542,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         self.resume()
 
                     # Priority C: PAUSE or no work - nothing needs to be done
+                    # To avoid flooding the TP publisher socket with packets,
+                    # we sleep for 20 ms here.
                     # todo [Siddharth]: Can this hardcoded sleep be avoided
                     # with asyncio zmq sockets?
                     await asyncio.sleep(0.02)  # Yield to event loop
