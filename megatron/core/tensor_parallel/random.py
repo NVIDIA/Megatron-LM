@@ -196,6 +196,10 @@ class CudaRNGStatesTracker:
         # Seeds are just for book keeping and ensure no seed is set twice.
         self.seeds_ = set()
 
+        # Name of the rng state currently being used in the generator.
+        # The default one is "default-rng" and won't be pushed to the self.states_ dictionary.
+        self._current_state_name = "default-rng"
+
     def get_states(self):
         """Get rng states. Copy the dictionary so we have direct
         pointers to the states, not just a pointer to the dictionary."""
@@ -242,10 +246,14 @@ class CudaRNGStatesTracker:
         # Check if we have added the state
         if name not in self.states_:
             raise Exception('cuda rng state {} is not added'.format(name))
-        # Store current rng state.
+        # Store current rng state and name. Store in self.states_ if it's not the default state.
         orig_cuda_rng_state = _get_cuda_rng_state(graph_safe=self.use_cudagraphable_rng)
-        # Set rng state to the desired one
+        orig_state_name = self._current_state_name
+        if orig_state_name != "default-rng":
+            self.states_[orig_state_name] = orig_cuda_rng_state
+        # Set rng state and name to the desired one.
         _set_cuda_rng_state(self.states_[name], graph_safe=self.use_cudagraphable_rng)
+        self._current_state_name = name
         # Record cpu RNG state
         cpu_rng_state = torch.get_rng_state()
         # Do the stuff we wanted to do.
@@ -255,10 +263,19 @@ class CudaRNGStatesTracker:
             # Throw a warning if cpu RNG state changed
             if not torch.all(cpu_rng_state == torch.get_rng_state()).item():
                 logging.getLogger(__name__).warning('CPU RNG state changed within GPU RNG context')
+            # Check if the current state name is the same as the desired state name.
+            if self._current_state_name != name:
+                raise Exception(
+                    f'current state name {self._current_state_name} is not the same as the desired '
+                    f'state name {name}.'
+                )
             # Update the current rng state for later use.
             self.states_[name] = _get_cuda_rng_state(graph_safe=self.use_cudagraphable_rng)
-            # And set the state to the original state we started with.
+            # And set the state and name to the original state we started with.
+            if orig_state_name != "default-rng":
+                orig_cuda_rng_state = self.states_[orig_state_name]
             _set_cuda_rng_state(orig_cuda_rng_state, graph_safe=self.use_cudagraphable_rng)
+            self._current_state_name = orig_state_name
 
 
 # RNG tracker object.
