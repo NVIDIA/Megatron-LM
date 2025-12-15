@@ -639,7 +639,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
-                mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -700,7 +700,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return sharded_state_dict
 
     def configure_fused_tp_communication(
-        self, skip_qkv_norm: bool = False, fc2_next_layer_norm_weights: Optional[Tensor] = None
+        self, skip_qkv_norm_and_all_gather: bool = False, fc2_next_layer_norm_weights: Optional[Tensor] = None
     ):
         """
         Configure settings for fused TP communication in inference mode.
@@ -710,24 +710,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights
                 for current layer's MLP FC2.
         """
-        if skip_qkv_norm:
-            self.self_attention.linear_qkv.skip_norm_and_all_gather = True
+        self.self_attention.linear_qkv.skip_norm_and_all_gather = skip_qkv_norm_and_all_gather
 
         # Use current layer's own MLP FC1 norm weights for attention's out_proj
         mlp_fc1_weights = self.get_mlp_layer_norm_weights()
         self._set_proj_next_layer_norm_weights(mlp_fc1_weights)
 
         self.mlp.linear_fc1.skip_norm_and_all_gather = True
-
-        if fc2_next_layer_norm_weights is not None:
-            self._set_fc2_next_layer_norm_weights(fc2_next_layer_norm_weights)
+        # Use next layer's attention norm weights for current layer's MLP FC2
+        self._set_fc2_next_layer_norm_weights(fc2_next_layer_norm_weights)
 
     def _set_proj_next_layer_norm_weights(self, weights: Tensor):
         """Set next layer norm weights for linear_proj."""
         self.self_attention.linear_proj._set_next_layer_norm_weights(weights)
 
-    def _set_fc2_next_layer_norm_weights(self, weights: Tensor):
+    def _set_fc2_next_layer_norm_weights(self, weights: Optional[Tensor]):
         """Set next layer norm weights for MLP FC2."""
+        if weights is None:
+            # Create dummy tensor for last layer (same shape as fc1 norm weights)
+            weights = torch.empty_like(self.get_mlp_layer_norm_weights())
         self.mlp.linear_fc2._set_next_layer_norm_weights(weights)
 
     def _set_proj_residual(self, residual: Tensor):

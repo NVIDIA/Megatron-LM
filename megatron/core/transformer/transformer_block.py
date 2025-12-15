@@ -398,17 +398,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         for i in range(len(self.layers)):
             current_layer = self.layers[i]
 
-            # Get next layer's QKV norm weights (or create dummy for last layer)
+            # Get next layer's QKV norm weights (None for last layer)
             if i < len(self.layers) - 1:
-                next_qkv_weights = self.layers[i + 1].get_qkv_layer_norm_weights()
+                next_qkv_norm_weights = self.layers[i + 1].get_qkv_layer_norm_weights()
             else:
-                # Dummy layer norm weights for last layer's fc2 module
-                mlp_norm_weights = current_layer.get_mlp_layer_norm_weights()
-                next_qkv_weights = torch.empty_like(mlp_norm_weights)
+                next_qkv_norm_weights = None
 
             # Configure all fused TP communication settings in one call
             current_layer.configure_fused_tp_communication(
-                skip_qkv_norm=(i > 0), fc2_next_layer_norm_weights=next_qkv_weights
+                skip_qkv_norm_and_all_gather=(i > 0), 
+                fc2_next_layer_norm_weights=next_qkv_norm_weights
             )
 
     def _get_layer(self, layer_number: int):
