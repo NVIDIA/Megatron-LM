@@ -512,6 +512,10 @@ class TextGenerationController:
             else:
                 set_decode_expert_padding(unwrapped_model, False)
 
+        # initialize symmetric memory if needed
+        if model_config.transformer_impl == "inference_optimized":
+            context.maybe_initialize_symmetric_memory()
+
         if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
             if context.is_decode_only():
                 # Turn on symmetric all reduce when in decode mode
