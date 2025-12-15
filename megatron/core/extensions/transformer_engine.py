@@ -4,6 +4,7 @@ import dataclasses
 import enum
 import inspect
 import io
+import logging
 import os
 import pickle
 import warnings
@@ -58,6 +59,7 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
     is_torch_min_version,
+    log_single_rank,
 )
 
 try:
@@ -72,6 +74,8 @@ except ImportError:
     HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+
+logger = logging.getLogger(__name__)
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -286,6 +290,32 @@ def _get_should_context_be_quantized_params(
         return _get_should_context_be_quantized_recipe(
             qparams.training_recipe, is_context_quantized
         )
+
+
+def qtype_debug_log(prefix: str) -> None:
+    """Logs the precision of based on the autocast context"""
+    if os.getenv("QUANTIZATION_TYPE_DEBUG", "0") == "1":
+        if not HAVE_TE:
+            quantization_type = "none"
+            log_single_rank(
+                logger, logging.INFO, f"{prefix}, quantization_type: {quantization_type}"
+            )
+            return
+        if not FP8GlobalStateManager.is_fp8_enabled():
+            quantization_type = "none"
+        elif FP8GlobalStateManager.get_fp8_recipe().nvfp4():
+            quantization_type = "nvfp4"
+        elif FP8GlobalStateManager.get_fp8_recipe().mxfp8():
+            quantization_type = "mxfp8"
+        elif FP8GlobalStateManager.get_fp8_recipe().delayed():
+            quantization_type = "fp8_delayed_per_tensor_scaling"
+        elif FP8GlobalStateManager.get_fp8_recipe().float8_current_scaling():
+            quantization_type = "fp8_current_per_tensor_scaling"
+        elif FP8GlobalStateManager.get_fp8_recipe().float8_block_scaling():
+            quantization_type = "fp8_block_scaling"
+        else:
+            quantization_type = "unknown"
+        log_single_rank(logger, logging.INFO, f"{prefix}, quantization_type: {quantization_type}")
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -664,6 +694,8 @@ class TELinear(te.pytorch.Linear):
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         with quant_context:
+            if _is_first_microbatch:
+                qtype_debug_log(f"  {self.__class__.__name__}, weight shape {self.weight.shape}")
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
@@ -869,6 +901,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         with quant_context:
+            if _is_first_microbatch:
+                qtype_debug_log(f"  {self.__class__.__name__}, weight shape: {self.weight.shape}")
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
 
         self.is_first_microbatch = False
@@ -1577,6 +1611,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
+                if _is_first_microbatch:
+                    qtype_debug_log(f"  {self.__class__.__name__}")
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False
 
