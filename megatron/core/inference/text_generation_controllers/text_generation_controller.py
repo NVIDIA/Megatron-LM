@@ -506,7 +506,7 @@ class TextGenerationController:
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
-            if context.is_decode_only():
+            if context.using_cuda_graph_this_step():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
             else:
@@ -748,10 +748,23 @@ class TextGenerationController:
         return top_n_results if top_n_results else None
 
     def dummy_forward(self):
-        """Run a dummy forward pass through the model, with a single token.
-        Use-case: Used in EP on ranks which do not have any work, but are needed
-        for the all-to-all communication."""
-        return self.inference_wrapped_model.dummy_forward()
+        """Perform a dummy forward pass. This is used in expert model parallelism 
+        on ranks that do not have any real requests."""
+        context = self.inference_wrapped_model.inference_context
+        # if no cuda graphs, directly use dummy forward
+        if context.cuda_graph_batch_dimensions_list is None:
+            return self.inference_wrapped_model.dummy_forward()
+        
+        # attempt to use cuda-graph if possible 
+        input_ids, position_ids = self._dynamic_step_context_init(
+            # use the smallest cuda-graph config for dummy forward
+            construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list)
+        )
+        if context.using_cuda_graph_this_step():
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+        else:
+            self.inference_wrapped_model.dummy_forward()
+        context.reset()
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.

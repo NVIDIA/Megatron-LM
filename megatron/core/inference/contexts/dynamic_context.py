@@ -460,11 +460,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph config list
+        is_expert_parallel = parallel_state.get_expert_model_parallel_world_size() > 1
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=num_cuda_graphs,
-                cuda_graph_max_tokens=cuda_graph_max_tokens,
+                cuda_graph_max_tokens=self.max_active_requests if is_expert_parallel else cuda_graph_max_tokens,
                 cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
                 max_requests=self.max_active_requests,
                 max_tokens=self.max_tokens,
@@ -474,6 +475,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self._using_cuda_graph_this_step = False
+        self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
 
@@ -1217,14 +1219,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
-            batch_dimensions, self.cuda_graph_batch_dimensions_list
+            batch_dimensions, 
+            self.cuda_graph_batch_dimensions_list,
+            decode_only_cuda_graphs = (not self.use_cuda_graphs_for_non_decode_steps)
         )
         self._using_cuda_graph_this_step = best_graph is not None
-        if construct_graph_dimensions is not None:
-            assert (
-                batch_dimensions == construct_graph_dimensions == best_graph
-            ), f"batch_dimensions: {batch_dimensions}, construct_graph_dimensions: {construct_graph_dimensions}, best_graph: {best_graph}"
-
+        
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
         else:
