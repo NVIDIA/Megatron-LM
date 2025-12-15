@@ -242,7 +242,11 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 multimem_reduce_scatter(output, x, symm_mem_buffer["handle"])
                 return output
             else:
-                assert residual is not None
+                assert hasattr(self, "residual"), (
+                    "For fused reduce-scatter + add + rms-norm + all-gather, "
+                    "residual must be set via _set_residual()"
+                )
+                residual = self.residual
                 fused_multimem_rs_add_norm_ag(
                     residual,
                     symm_mem_buffer["tensor"],
@@ -269,6 +273,12 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         self.next_layer_norm_weights = weights
 
+    def _set_residual(self, residual: torch.Tensor):
+        """
+        Set residual for fused reduce-scatter + add + rms-norm + all-gather.
+        """
+        self.residual = residual
+
     @torch.no_grad()
     def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -278,5 +288,5 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             x = torch.matmul(x, self.weight.t())
             return x, None
         else:
-            x = self._matmul_reduce_scatter(x, residual=residual)
+            x = self._matmul_reduce_scatter(x)
             return x, None

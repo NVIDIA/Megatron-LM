@@ -711,7 +711,6 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-        residual: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Perform a forward pass through the attention module.
@@ -994,13 +993,7 @@ class Attention(MegatronModule, ABC):
         # =================
 
         nvtx_range_push(suffix="linear_proj")
-        using_inference_optimized_layer = (not self.training) and (
-            self.config.transformer_impl == "inference_optimized"
-        )
-        if using_inference_optimized_layer:
-            output, bias = self.linear_proj(core_attn_out, residual)
-        else:
-            output, bias = self.linear_proj(core_attn_out)
+        output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias

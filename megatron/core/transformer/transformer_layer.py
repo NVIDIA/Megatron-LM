@@ -494,6 +494,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
 
+        using_fused_tp_communication_kernel = (not self.training) and (
+            self.config.inference_fuse_tp_communication
+        )
+
+        if using_fused_tp_communication_kernel:
+            # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
+            # operation in attention's out_proj (linear_proj)
+            self._set_proj_residual(residual)
+
         # Self attention.
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
@@ -507,7 +516,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            residual=residual,
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -521,9 +529,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        using_fused_tp_communication_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
-        )
         if using_fused_tp_communication_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
@@ -595,6 +600,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and not self.config.transformer_impl == "inference_optimized"
         )
 
+        using_fused_tp_communication_kernel = (not self.training) and (
+            self.config.inference_fuse_tp_communication
+        )
+
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
                 # import here to avoid circular import
@@ -626,7 +635,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = (mlp_output, bias_output)
 
         else:
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, residual=residual)
+            if using_fused_tp_communication_kernel:
+                # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
+                # operation in MLP's fc2.
+                self._set_fc2_residual(residual)
+                mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -639,9 +652,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        using_fused_tp_communication_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
-        )
         if using_fused_tp_communication_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
@@ -690,16 +700,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return sharded_state_dict
 
     def configure_fused_tp_communication(
-        self,
-        skip_qkv_norm: bool = False,
-        fc2_next_layer_norm_weights: Optional[Tensor] = None,
+        self, skip_qkv_norm: bool = False, fc2_next_layer_norm_weights: Optional[Tensor] = None
     ):
         """
         Configure settings for fused TP communication in inference mode.
 
         Args:
             skip_qkv_norm (bool): Whether to skip norm and all-gather for linear_qkv.
-            fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights 
+            fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights
                 for current layer's MLP FC2.
         """
         if skip_qkv_norm:
@@ -721,6 +729,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     def _set_fc2_next_layer_norm_weights(self, weights: Tensor):
         """Set next layer norm weights for MLP FC2."""
         self.mlp.linear_fc2._set_next_layer_norm_weights(weights)
+
+    def _set_proj_residual(self, residual: Tensor):
+        """Set residual for attention's out_proj (linear_proj)."""
+        self.self_attention.linear_proj._set_residual(residual)
+
+    def _set_fc2_residual(self, residual: Tensor):
+        """Set residual for MLP FC2."""
+        self.mlp.linear_fc2._set_residual(residual)
 
     def get_mlp_layer_norm_weights(self) -> Tensor:
         """
@@ -928,4 +944,4 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             List[Tensor]: A list of layernorm weight tensors.
         """
-        return 
+        return

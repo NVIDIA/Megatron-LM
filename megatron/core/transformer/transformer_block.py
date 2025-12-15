@@ -388,11 +388,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     def _setup_fused_tp_communication(self):
         """Setup fused TP communication for all layers.
-            We have a fused reduce-scatter + add + layer-norm + all-gather operation. 
-            We call this kernel from within row parallel linear layers.
-            But layer-norm needs the layer norm weights from the 
-            successive column parallel linear layer. 
-            This function is used to pass those weights to the respective layers.
+        We have a fused reduce-scatter + add + layer-norm + all-gather operation.
+        We call this kernel from within row parallel linear layers.
+        But layer-norm needs the layer norm weights from the
+        successive column parallel linear layer.
+        This function is used to pass those weights to the respective layers.
         """
 
         for i in range(len(self.layers)):
@@ -408,8 +408,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
             # Configure all fused TP communication settings in one call
             current_layer.configure_fused_tp_communication(
-                skip_qkv_norm=(i > 0),
-                fc2_next_layer_norm_weights=next_qkv_weights,
+                skip_qkv_norm=(i > 0), fc2_next_layer_norm_weights=next_qkv_weights
             )
 
     def _get_layer(self, layer_number: int):
