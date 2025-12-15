@@ -5,16 +5,17 @@ A reference implementation of Megatron Core can be found in [NeMo](https://githu
 *intuitive* API.
 
 ```{toctree}
-:maxdepth: 2
+:maxdepth: 1
 :caption: User Guide
 
 user-guide/index
 ```
 
 ```{toctree}
-:maxdepth: 3
+:maxdepth: 1
 :caption: API Guide
 
 api-guide/index
+apidocs/index.rst
 ```
 
