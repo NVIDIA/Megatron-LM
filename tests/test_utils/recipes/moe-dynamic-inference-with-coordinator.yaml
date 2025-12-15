@@ -57,6 +57,6 @@ products:
   - test_case: [gpt_dynamic_inference_tp1_pp1_ep8_16B_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [flaky]
+        scope: [mr-github]
         platforms: [dgx_h100]
   
