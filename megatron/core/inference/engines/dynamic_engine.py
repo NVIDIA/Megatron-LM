@@ -482,7 +482,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # initialize ep barrier 
         self.ep_rank = get_pg_rank(self.pg_collection.ep)   
-        self.ep_world_size = get_pg_world_size(self.pg_collection.ep)
+        self.ep_world_size = get_pg_size(self.pg_collection.ep)
         # todo: modify to use actual IP of ep-rank 0....
         # todo: modify to find an empty port automatically... 
         if self.ep_world_size > 1:
@@ -1514,14 +1514,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 # needed to send one message on an IPC socket. However
                 # just to be safe, we use 20ms here.
 
-                pending_requests = self.context.get_active_request_count() + len(
+                local_pending_requests = self.context.get_active_request_count() + len(
                     self.waiting_request_ids
                 )
                 # 1. Check for work availability (Consensus Step)
-                ep_group_has_work = await self._ep_group_has_work(pending_requests)
-
+                ep_group_has_work = await self._ep_group_has_work(local_pending_requests)
                 # 2. Dummy Work Logic (Keep group alive if peers have work)
-                if ep_group_has_work and pending_requests == 0:
+                if ep_group_has_work and local_pending_requests == 0:
                     # run dummy forward pass if EP group as a whole has work,
                     # but this rank does not have any work.
                     self.controller.dummy_forward()
@@ -1534,8 +1533,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # If we have received a stop signal AND the group agrees (ep_group_has_work is False),
                     # we must break the loop to exit.
                     if self.stopped.is_set():
-                        # Optional: Log graceful shutdown
-                        if verbose and self.rank == 0:
+                        if self.rank == 0:
                             logging.info("Stopping engine.")
                         break
 
