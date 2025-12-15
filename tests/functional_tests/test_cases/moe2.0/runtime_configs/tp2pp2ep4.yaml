@@ -52,4 +52,4 @@ MODEL_ARGS:
   # MISC
   --manual-gc: true
   --manual-gc-interval: 100
-TEST_TYPE: regular
+TEST_TYPE: resume-ckpt
