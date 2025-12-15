@@ -100,11 +100,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self._fix_tensor_parallel_attributes(module)
 
-        if config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather:
-            self.use_separate_backward_weight = True
-        else:
-            self.use_separate_backward_weight = False
-
         super().__init__(
             config=config,
             module=MegatronFSDP(
@@ -116,7 +111,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
-                use_separate_backward_weight=self.use_separate_backward_weight,
+                enable_fine_grained_param_gather_hook=(
+                    config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
+                ),
             ),
         )
         self.param_and_grad_buffer = self.module.param_and_grad_buffer
