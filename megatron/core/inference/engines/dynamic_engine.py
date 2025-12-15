@@ -465,11 +465,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         torch.distributed.barrier(mp_group)
 
-        # initialize ep barrier
+        # initialize zmq-based EP communicator
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
-        # todo: modify to use actual IP of ep-rank 0....
-        # todo: modify to find an empty port automatically...
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep
