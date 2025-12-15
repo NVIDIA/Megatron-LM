@@ -484,6 +484,6 @@ def get_global_unique_param_name(model_chunks, param):
 
     # Get EP unique parameter name
     num_experts = model_chunks[0].config.num_moe_experts if model_chunks else None
-    param_name = list(handle_experts_in_state_dict({param_name: None}, num_experts).keys())[0]
+    param_name = next(iter(handle_experts_in_state_dict({param_name: None}, num_experts).keys()))
 
     return param_name
