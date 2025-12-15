@@ -285,6 +285,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                 block_size_tokens == 64
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
+        # give deprecated args warning for cuda_graph_max_tokens
+        if cuda_graph_max_tokens is not None:
+            warnings.warn(
+                "`cuda_graph_max_tokens` is deprecated and will be removed in a future release. "
+                "The context now automatically sets the max tokens for cuda graphs based on "
+                "`max_active_requests`.",
+                DeprecationWarning,
+            )
+
         self.metrics_writer = metrics_writer
 
         # Per partition num heads and hidden size.
@@ -465,9 +474,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=num_cuda_graphs,
-                cuda_graph_max_tokens=(
-                    self.max_active_requests if is_expert_parallel else cuda_graph_max_tokens
-                ),
+                cuda_graph_max_tokens=self.max_active_requests,
                 cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
                 max_requests=self.max_active_requests,
                 max_tokens=self.max_tokens,
