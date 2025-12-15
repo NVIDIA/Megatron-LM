@@ -465,7 +465,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=num_cuda_graphs,
-                cuda_graph_max_tokens=self.max_active_requests if is_expert_parallel else cuda_graph_max_tokens,
+                cuda_graph_max_tokens=(
+                    self.max_active_requests if is_expert_parallel else cuda_graph_max_tokens
+                ),
                 cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
                 max_requests=self.max_active_requests,
                 max_tokens=self.max_tokens,
@@ -1219,12 +1221,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
-            batch_dimensions, 
+            batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
-            decode_only_cuda_graphs = (not self.use_cuda_graphs_for_non_decode_steps)
+            decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
         )
         self._using_cuda_graph_this_step = best_graph is not None
-        
+
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
         else:

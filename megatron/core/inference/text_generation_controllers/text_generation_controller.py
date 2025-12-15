@@ -501,7 +501,7 @@ class TextGenerationController:
         # for prefill turn off symmetric kernels
         symmetric_ar_type = model_config.symmetric_ar_type
         nccl_all_reduce_for_prefill = inference_wrapper_config.nccl_all_reduce_for_prefill
-        # Turning on/off MoE padding for prefill
+        # Turning on/off MoE padding for cuda-graphs
         moe_pad_experts_for_cuda_graph_inference = (
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
@@ -748,14 +748,14 @@ class TextGenerationController:
         return top_n_results if top_n_results else None
 
     def dummy_forward(self):
-        """Perform a dummy forward pass. This is used in expert model parallelism 
+        """Perform a dummy forward pass. This is used in expert model parallelism
         on ranks that do not have any real requests."""
         context = self.inference_wrapped_model.inference_context
         # if no cuda graphs, directly use dummy forward
         if context.cuda_graph_batch_dimensions_list is None:
             return self.inference_wrapped_model.dummy_forward()
-        
-        # attempt to use cuda-graph if possible 
+
+        # attempt to use cuda-graph if possible
         input_ids, position_ids = self._dynamic_step_context_init(
             # use the smallest cuda-graph config for dummy forward
             construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list)

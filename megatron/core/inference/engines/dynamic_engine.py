@@ -273,7 +273,6 @@ class DynamicInferenceEngine(AbstractEngine):
         controller = self.controller
 
         config = controller.inference_wrapped_model.inference_wrapper_config
-        moe_pad_experts = config.moe_pad_experts_for_cuda_graph_inference
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
