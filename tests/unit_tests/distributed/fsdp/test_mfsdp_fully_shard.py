@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import shutil
 from copy import deepcopy
 from pathlib import Path
@@ -12,6 +13,8 @@ from torch.nn.functional import mse_loss
 from torch.optim import Adam
 
 from tests.unit_tests.test_utilities import Utils
+
+logger = logging.getLogger(__name__)
 
 HSDP = "hsdp"
 DP = "dp"
@@ -37,15 +40,22 @@ SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
 
 def destroy_device_mesh(device_mesh):
-    from torch.distributed.device_mesh import _mesh_resources
 
     # Teardown device mesh.
     del device_mesh
-    _mesh_resources.mesh_stack.clear()
-    _mesh_resources.child_to_root_mapping.clear()
-    _mesh_resources.root_to_flatten_mapping.clear()
-    _mesh_resources.flatten_name_to_root_dims.clear()
-    _mesh_resources.mesh_dim_group_options.clear()
+    try:
+        from torch.distributed.device_mesh import _mesh_resources
+
+        _mesh_resources.child_to_root_mapping.clear()
+        _mesh_resources.root_to_flatten_mapping.clear()
+        _mesh_resources.mesh_stack.clear()
+        _mesh_resources.mesh_dim_group_options.clear()
+        _mesh_resources.flatten_name_to_root_dims.clear()
+    except Exception as e:
+        # Global _MeshEnv is on a convoluted deprecation path.
+        # Attempt to clean the global state, otherwise skip.
+        logger.warning(f"Did not clean the deprecated DeviceMesh global state. Skipping...\n{e}")
+        pass
 
 
 class ToyCNN(torch.nn.Module):
