@@ -36,6 +36,56 @@ def test_cuda_rng_states_tracker():
     assert torch.equal(rng_tracker.get_states()['state2'], rng_state)
 
 
+@pytest.mark.parametrize("use_cudagraphable_rng", [True, False])
+def test_double_fork_cuda_rng_states_tracker(use_cudagraphable_rng):
+    rng_tracker = CudaRNGStatesTracker(use_cudagraphable_rng=use_cudagraphable_rng)
+    rng_tracker.add("state1", 1234)
+    rng_tracker.add("state2", 5678)
+    randn_double_fork_1 = []
+    randn_double_fork_2 = []
+    with rng_tracker.fork("state1"):
+        randn_double_fork_1.append(torch.randn(10, device="cuda"))
+        with rng_tracker.fork("state2"):
+            randn_double_fork_2.append(torch.randn(10, device="cuda"))
+            with rng_tracker.fork("state1"):
+                randn_double_fork_1.append(torch.randn(10, device="cuda"))
+            randn_double_fork_2.append(torch.randn(10, device="cuda"))
+        randn_double_fork_1.append(torch.randn(10, device="cuda"))
+    if use_cudagraphable_rng:
+        double_fork_state1 = rng_tracker.get_states()["state1"].get_state()
+        double_fork_state2 = rng_tracker.get_states()["state2"].get_state()
+    else:
+        double_fork_state1 = rng_tracker.get_states()["state1"]
+        double_fork_state2 = rng_tracker.get_states()["state2"]
+
+    rng_tracker.reset()
+    rng_tracker.add("state1", 1234)
+    rng_tracker.add("state2", 5678)
+    randn_single_fork_1 = []
+    randn_single_fork_2 = []
+    with rng_tracker.fork("state1"):
+        randn_single_fork_1.append(torch.randn(10, device="cuda"))
+        randn_single_fork_1.append(torch.randn(10, device="cuda"))
+        randn_single_fork_1.append(torch.randn(10, device="cuda"))
+    with rng_tracker.fork("state2"):
+        randn_single_fork_2.append(torch.randn(10, device="cuda"))
+        randn_single_fork_2.append(torch.randn(10, device="cuda"))
+    if use_cudagraphable_rng:
+        single_fork_state1 = rng_tracker.get_states()["state1"].get_state()
+        single_fork_state2 = rng_tracker.get_states()["state2"].get_state()
+    else:
+        single_fork_state1 = rng_tracker.get_states()["state1"]
+        single_fork_state2 = rng_tracker.get_states()["state2"]
+
+    assert torch.equal(randn_double_fork_1[0], randn_single_fork_1[0])
+    assert torch.equal(randn_double_fork_1[1], randn_single_fork_1[1])
+    assert torch.equal(randn_double_fork_1[2], randn_single_fork_1[2])
+    assert torch.equal(randn_double_fork_2[0], randn_single_fork_2[0])
+    assert torch.equal(randn_double_fork_2[1], randn_single_fork_2[1])
+    assert torch.equal(double_fork_state1, single_fork_state1)
+    assert torch.equal(double_fork_state2, single_fork_state2)
+
+
 def test_convert_cuda_rng_state():
     ## Get the default rng state
     torch.cuda.manual_seed(999)
