@@ -229,7 +229,8 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, Union[int, numpy.ndarray]]: The sample data including encoder input, decoder input/output, and masks.
+            Dict[str, Union[int, numpy.ndarray]]: The sample data including encoder input, decoder
+                input/output, and masks.
         """
         idx_beg, idx_end, target_sequence_length = self.sample_index[idx]
         sample = [self.dataset[i] for i in range(idx_beg, idx_end)]
