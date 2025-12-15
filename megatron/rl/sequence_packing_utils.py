@@ -444,6 +444,14 @@ def create_packed_seq_params_for_bin(
 
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
 
+    # Pad cu_seqlens to bin_size by repeating the last value (creates zero-length ghost sequences)
+    # This ensures a fixed tensor size for CUDA graph compatibility
+    if len(cu_seqlens) < bin_size:
+        padding_size = bin_size - len(cu_seqlens)
+        last_value = cu_seqlens[-1]
+        padding = torch.full((padding_size,), last_value, dtype=torch.int32, device=device)
+        cu_seqlens = torch.cat([cu_seqlens, padding])
+
     max_seqlen = bin_size
 
     return PackedSeqParams(
