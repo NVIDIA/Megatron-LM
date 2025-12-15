@@ -1602,6 +1602,9 @@ class ParamAndGradBuffer:
             if self.dist_index.get_outer_fsdp_group() is not None:
                 # Outer/Inter-FSDP group when using hybrid FSDP
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
+            if self.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True) is not None:
+                # All-gather group used when overlapping all-gather and gradient reduction.
+                self.ubr_groups.append(self.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True))
 
             if torch.distributed.get_rank() == 0:
                 logging.info(
@@ -1674,6 +1677,9 @@ class ParamAndGradBuffer:
             if groups is None:
                 # data parallel group is a default group for user buffer registration
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
+                if self.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True) is not None:
+                    # All-gather group used when overlapping all-gather and gradient reduction.
+                    groups.append(self.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True))
 
             if NCCL_ALLOCATOR == "MCORE":
                 if self.ddp_config.fsdp_manual_registration:
@@ -2830,6 +2836,11 @@ class ParamAndGradBuffer:
         ), "all_gather_parameters() should not be called when outer-DP sharding is enabled."
 
         all_gather_ops = []
+        if self.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True) is not None:
+            # All-gather group used when overlapping all-gather and gradient reduction.
+            group = self.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True)
+        else:
+            group = g.model_weight_buffer.data_parallel_group
         for g in self.parameter_groups:
             for buf in [g.model_weight_buffer, g.transpose_weight_buffer]:
                 if buf is None:
@@ -3547,6 +3558,9 @@ class AllGatherPipeline:
             # Coalesce the asynchronous NCCL operations in this context.
             all_gather_stream.wait_stream(torch.cuda.current_stream())
             dp_group = self.get_fsdp_buffer(buckets[0]).data_parallel_group
+            if self.buffer.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True) is not None:
+                # All-gather group used when overlapping all-gather and gradient reduction.
+                dp_group = self.buffer.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True)
             with torch.cuda.stream(all_gather_stream):
                 with _coalescing_manager(
                     dp_group, async_ops=async_param_gather
@@ -3650,10 +3664,15 @@ class AllGatherPipeline:
         bucket = wbuf.fetch_bucket(set_param_data=True)
         # All-gather the module weights in each buffer shard into the allocated bucket.
         # Now each rank will have a copy of this FSDP unit module's weights.
+        if self.buffer.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True) is not None:
+            # All-gather group when overlapping
+            group = self.buffer.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True)
+        else:
+            group = wbuf.data_parallel_group
         param_gather_event = torch.distributed.all_gather_into_tensor(
             output_tensor=bucket.data,
             input_tensor=wbuf.get_shard_from_local_buffer(),
-            group=wbuf.data_parallel_group,
+            group=group,
             async_op=True,
         )
 
