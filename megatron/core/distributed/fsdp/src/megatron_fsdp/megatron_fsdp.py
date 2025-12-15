@@ -565,13 +565,14 @@ class MegatronFSDP(torch.nn.Module):
                 if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
                     # Deallocate the module parameters after the backward pass,
                     # because we have our data-parallel gradients computed.
-                    release_module_parameters(module, bwd=False)
+                    release_module_parameters(module, bwd=True)
                     module._training_state = TrainingState.IDLE
                 param_list = list(module.parameters())
             else:
                 param_list = list(module.parameters(recurse=False))
 
-            param_list = list(module.parameters(recurse=False))
+            if self.enable_fine_grained_param_gather_hook:
+                param_list = list(module.parameters(recurse=False))
 
             # If the parameter is shared, we do not accumulate gradients
             # here, as the gradients will be accumulated in the
@@ -746,7 +747,9 @@ class MegatronFSDP(torch.nn.Module):
 
             # All-gather / unshard the module parameters before the backward pass.
             self.all_gather_and_wait_parameters_ready(
-                param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
+                param_list,
+                prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                bwd=True
             )
 
         self._root_pre_backward_hook_issued = False
