@@ -1112,7 +1112,7 @@ def get_microbatch_dataloader(packing_context: PackingContext) -> Tuple[DataLoad
 
     bin_indices = torch.arange(num_bins_this_rank)
     dataset = TensorDataset(bin_indices)
-    loader = DataLoader(dataset, batch_size=args.micro_batch_size, shuffle=False, collate_fn=lambda x: x[0])
+    loader = DataLoader(dataset, batch_size=args.micro_batch_size, shuffle=False, collate_fn=lambda x: x[0], drop_last=True)
     return loader, optimizer_steps
 
 def update_sequence_packing_metrics(args):
