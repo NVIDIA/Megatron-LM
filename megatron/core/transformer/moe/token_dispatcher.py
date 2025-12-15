@@ -66,6 +66,8 @@ class MoETokenDispatcher:
         """
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
+        # Whether to use NCCL stream for A2A communication, otherwise default stream is used.
+        self.use_nccl_stream = False # Will be set to True when shared_experts is set.
 
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
@@ -197,6 +199,8 @@ class MoETokenDispatcher:
         """Set shared expert to the dispatcher."""
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
+        self.use_nccl_stream = True
+
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -637,7 +641,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             permutated_local_input_tokens,
             self.output_splits,
             self.input_splits,
-            use_nccl_stream=True,
+            use_nccl_stream=self.use_nccl_stream,
         )
         # Move the shared experts fc1 right after the tokens A2A, to prevent the probs A2A
         # block the launch of fc1 GEMM when CUDA_DEVICE_MAX_CONNECTIONS=1.
@@ -650,7 +654,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             permuted_probs,
             self.output_splits,
             self.input_splits,
-            use_nccl_stream=True,
+            use_nccl_stream=self.use_nccl_stream,
         )
 
         return global_input_tokens, global_probs
@@ -796,7 +800,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             hidden_states,
             self.input_splits,
             self.output_splits,
-            use_nccl_stream=True,
+            use_nccl_stream=self.use_nccl_stream,
         )
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
@@ -1366,8 +1370,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 "--moe-flex-dispatcher-backend=hybridep"
             )
 
-    def set_shared_experts(self, shared_experts):
-        self.shared_experts = shared_experts
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
