@@ -245,7 +245,7 @@ class MaskedWordPieceDataset(MegatronDataset):
                 2. masked_positions -> The indices for the masked token ids
                 3. masked_labels    -> The original token ids for the masked token ids
                 4. boundaries       -> The sentence and word boundaries for the sequence
-                4. masked_spans     -> The masked positions and labels with N-gram info intact
+                5. masked_spans     -> The masked positions and labels with N-gram info intact
         """
         # Build the token sentence and word boundaries and the masking candidates
         # e.g. [cls, id, ##id, ##id, id, ##id, sep, id, ##id, sep]
