@@ -1401,7 +1401,7 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.RESUME:
                 self.suspend_signal = False
             elif header == Headers.STOP:
-                self.stopped = True
+                self.received_stop = True
             else:
                 raise UnknownHeaderError(header)
 
@@ -1417,7 +1417,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         if hasattr(self, "inference_coordinator_process"):
-            self.inference_coordinator_process.terminate()
+            self.inference_coordinator_process.join()
         for socket in self.zmq_sockets:
             socket.close()
         if hasattr(self, "expert_parallel_zmq_communicator"):
@@ -1520,6 +1520,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     if self.stopped.is_set():
                         if self.rank == 0:
                             logging.info("Stopping engine.")
+                        self.stop()
                         break
 
                     # Priority B: SUSPEND
