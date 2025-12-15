@@ -19,36 +19,37 @@ class MockTokenizer:
 
 def test_get_actual_sequence_lengths():
     pad_token = 42
-    
-    sequences = torch.tensor([
-        [1, 2, 3, pad_token, pad_token],
-        [4, 5, 6, 7, 8],
-        [9, pad_token, pad_token, pad_token, pad_token],
-        [pad_token, pad_token, pad_token, pad_token, pad_token],
-    ])
-    
+
+    sequences = torch.tensor(
+        [
+            [1, 2, 3, pad_token, pad_token],
+            [4, 5, 6, 7, 8],
+            [9, pad_token, pad_token, pad_token, pad_token],
+            [pad_token, pad_token, pad_token, pad_token, pad_token],
+        ]
+    )
+
     lengths = sequence_packing_utils.get_actual_sequence_lengths(sequences, pad_token)
-    
+
     assert lengths == [3, 5, 1, 0]
 
 
 def test_get_actual_sequence_lengths_with_interior_padding():
     pad_token = 42
-    
-    sequences = torch.tensor([
-        [1, pad_token, 3, pad_token, pad_token],
-        [pad_token, 2, 3, 4, pad_token],
-    ])
-    
+
+    sequences = torch.tensor(
+        [[1, pad_token, 3, pad_token, pad_token], [pad_token, 2, 3, 4, pad_token]]
+    )
+
     lengths = sequence_packing_utils.get_actual_sequence_lengths(sequences, pad_token)
-    
+
     assert lengths == [3, 4]
 
 
 def test_get_actual_sequence_lengths_invalid_shape():
     pad_token = 42
     sequences_1d = torch.tensor([1, 2, 3])
-    
+
     try:
         sequence_packing_utils.get_actual_sequence_lengths(sequences_1d, pad_token)
         assert False, "Should have raised ValueError"
@@ -67,27 +68,29 @@ def test_sequence_packing_basic():
 
     max_len = 5
     sequences = [
-        torch.cat([
-            torch.tensor([1, 2, 3, tokenizer.eod]),
-            torch.full((1,), tokenizer.pad, dtype=torch.long),
-        ]),
-        torch.cat([
-            torch.tensor([4, 5, tokenizer.eod]),
-            torch.full((2,), tokenizer.pad, dtype=torch.long)
-        ]),
+        torch.cat(
+            [
+                torch.tensor([1, 2, 3, tokenizer.eod]),
+                torch.full((1,), tokenizer.pad, dtype=torch.long),
+            ]
+        ),
+        torch.cat(
+            [torch.tensor([4, 5, tokenizer.eod]), torch.full((2,), tokenizer.pad, dtype=torch.long)]
+        ),
         torch.tensor([6, 7, 8, 9, tokenizer.eod]),
-        torch.cat([
-            torch.tensor([10, tokenizer.eod]),
-            torch.full((3,), tokenizer.pad, dtype=torch.long)
-        ]),
+        torch.cat(
+            [torch.tensor([10, tokenizer.eod]), torch.full((3,), tokenizer.pad, dtype=torch.long)]
+        ),
     ]
 
-    generation_masks = torch.tensor([
-        [False, True, True, True, False],
-        [False, True, True, False, False],
-        [False, True, True, True, True],
-        [False, True, False, False, False],
-    ])
+    generation_masks = torch.tensor(
+        [
+            [False, True, True, True, False],
+            [False, True, True, False, False],
+            [False, True, True, True, True],
+            [False, True, False, False, False],
+        ]
+    )
 
     rewards = torch.tensor([1.0, 2.0, 3.0, 4.0])
 
@@ -129,10 +132,9 @@ def test_sequence_packing_with_generation_masks():
         padded = torch.cat([seq, torch.full((max_len - len(seq),), tokenizer.pad, dtype=seq.dtype)])
         padded_sequences.append(padded)
 
-    generation_masks = torch.tensor([
-        [False, True, True, True, False],
-        [False, True, True, True, True],
-    ])
+    generation_masks = torch.tensor(
+        [[False, True, True, True, False], [False, True, True, True, True]]
+    )
 
     padded_sequences_tensor = torch.stack(padded_sequences)
     packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info = (
@@ -197,14 +199,15 @@ def test_sequence_packing_integration():
 
     max_len = 5
     sequences = [
-        torch.cat([
-            torch.tensor([1, 2, 3, tokenizer.eod]),
-            torch.full((1,), tokenizer.pad, dtype=torch.long),
-        ]),
-        torch.cat([
-            torch.tensor([4, 5, tokenizer.eod]),
-            torch.full((2,), tokenizer.pad, dtype=torch.long)
-        ]),
+        torch.cat(
+            [
+                torch.tensor([1, 2, 3, tokenizer.eod]),
+                torch.full((1,), tokenizer.pad, dtype=torch.long),
+            ]
+        ),
+        torch.cat(
+            [torch.tensor([4, 5, tokenizer.eod]), torch.full((2,), tokenizer.pad, dtype=torch.long)]
+        ),
         torch.tensor([6, 7, 8, 9, tokenizer.eod]),
     ]
     generation_masks = [
@@ -235,6 +238,7 @@ def test_sequence_packing_integration():
 
 class MockGroupStats:
     """Mock group stats object for testing."""
+
     def __init__(self):
         self.min_piold_to_inf_prob = None
         self.max_piold_to_inf_prob = None
@@ -316,23 +320,29 @@ def test_compute_packed_inference_logprobs_stats():
     """Test compute_packed_inference_logprobs_stats with packed data."""
     # Create packed data (simulating 2 bins)
     # old_logprobs shape: [num_bins, seq_len-1]
-    old_logprobs = torch.tensor([
-        [-0.5, -0.3, -0.2, 0.0, 0.0, 0.0, 0.0],  # bin 0
-        [-0.4, -0.6, -0.1, 0.0, 0.0, 0.0, 0.0],  # bin 1
-    ])
+    old_logprobs = torch.tensor(
+        [
+            [-0.5, -0.3, -0.2, 0.0, 0.0, 0.0, 0.0],  # bin 0
+            [-0.4, -0.6, -0.1, 0.0, 0.0, 0.0, 0.0],  # bin 1
+        ]
+    )
 
     # packed_inference_logprobs with same values (should give ratio ~1.0)
-    packed_inference_logprobs = torch.tensor([
-        [-0.5, -0.3, -0.2, 0.0, 0.0, 0.0, 0.0],  # bin 0
-        [-0.4, -0.6, -0.1, 0.0, 0.0, 0.0, 0.0],  # bin 1
-    ])
+    packed_inference_logprobs = torch.tensor(
+        [
+            [-0.5, -0.3, -0.2, 0.0, 0.0, 0.0, 0.0],  # bin 0
+            [-0.4, -0.6, -0.1, 0.0, 0.0, 0.0, 0.0],  # bin 1
+        ]
+    )
 
     # packed_loss_mask: [num_bins, seq_len] - indicates valid positions
     # Note: function shifts by 1, so packed_loss_mask[:, 1:] is used
-    packed_loss_mask = torch.tensor([
-        [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],  # bin 0: 3 valid tokens
-        [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],  # bin 1: 3 valid tokens
-    ])
+    packed_loss_mask = torch.tensor(
+        [
+            [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],  # bin 0: 3 valid tokens
+            [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],  # bin 1: 3 valid tokens
+        ]
+    )
 
     group_stats = MockGroupStats()
 
@@ -356,19 +366,13 @@ def test_compute_packed_inference_logprobs_stats():
 def test_compute_packed_inference_logprobs_stats_with_mismatch():
     """Test compute_packed_inference_logprobs_stats when values differ."""
     # old_logprobs
-    old_logprobs = torch.tensor([
-        [-0.5, -0.5, -0.5, 0.0, 0.0, 0.0, 0.0],
-    ])
+    old_logprobs = torch.tensor([[-0.5, -0.5, -0.5, 0.0, 0.0, 0.0, 0.0]])
 
     # Different inference logprobs
-    packed_inference_logprobs = torch.tensor([
-        [-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0],
-    ])
+    packed_inference_logprobs = torch.tensor([[-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0]])
 
     # packed_loss_mask
-    packed_loss_mask = torch.tensor([
-        [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-    ])
+    packed_loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
 
     group_stats = MockGroupStats()
 

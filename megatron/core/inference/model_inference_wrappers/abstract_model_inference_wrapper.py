@@ -21,7 +21,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_model_config, get_attr_wrapped_model
+from megatron.core.utils import get_attr_wrapped_model, get_model_config
 
 
 # pylint: disable=line-too-long
