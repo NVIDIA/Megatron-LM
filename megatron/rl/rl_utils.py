@@ -46,7 +46,8 @@ from megatron.rl.sequence_packing_utils import (
     load_packed_data_by_index,
     update_sequence_packing_metrics,
     get_sequence_packing_tensorboard_metrics,
-    get_sequence_packing_log_info
+    get_sequence_packing_log_info,
+    get_default_packed_seq_params,
 )
 from megatron.rl.agent.api import (
     EvaluationRequest,
@@ -430,7 +431,7 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, packed_seq_params=None):
+def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -449,6 +450,14 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, packed_seq_params=N
         Logprobs of input sequences.
 
     """
+
+    # Ensure packed_seq_params is always provided for CUDA graph signature consistency
+    if packed_seq_params is None and sequence_packing:
+        packed_seq_params = get_default_packed_seq_params(
+            seq_length=tokens.shape[1],
+            device=tokens.device,
+        )
+
     nvtx_range = get_nvtx_range()
 
     with nvtx_range("get-logprobs", time=False):
@@ -949,6 +958,7 @@ def prepare_data_for_update(
                         b_trajs,
                         b_posids,
                         no_grad=True,
+                        sequence_packing=args.rl_use_sequence_packing,                       
                         packed_seq_params=b_packed_seq_params,
                     ),
                     None,

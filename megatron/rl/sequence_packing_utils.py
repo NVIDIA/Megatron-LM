@@ -398,6 +398,33 @@ def create_empty_bins(
         empty_packing_info_entries,
     )
 
+def get_default_packed_seq_params(seq_length: int, device: torch.device) -> PackedSeqParams:
+    """Create a default PackedSeqParams that acts as no-op for a single sequence.
+
+    This ensures CUDA graph signature consistency when packed_seq_params
+    would otherwise be None. A single sequence spanning the full length
+    means no actual packing boundaries
+
+    Args:
+        seq_length: The sequence length 
+        device: Device to create tensors on.
+
+    Returns:
+        PackedSeqParams configured as a single unpacked sequence.
+    """
+    # Single sequence spanning the full length = no actual packing
+    cu_seqlens = torch.tensor([0, seq_length], dtype=torch.int32, device=device)
+
+    return PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=None,
+        cu_seqlens_kv_padded=None,
+        max_seqlen_q=seq_length,
+        max_seqlen_kv=seq_length,
+    )
+
 def create_packed_seq_params(packing_context: PackingContext):
     cached_packed_seq_params = []
     packing_info = packing_context.packing_info
