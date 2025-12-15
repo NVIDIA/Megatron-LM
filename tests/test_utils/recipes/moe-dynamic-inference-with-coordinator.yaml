@@ -54,9 +54,14 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [gpt_dynamic_inference_tp1_pp1_ep8_16B_logitsmatch_zmq]
+  - test_case: [gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [flaky]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_logitsmatch_cudagraph_zmq]
+    products:
+      - environment: [dev]
+        scope: [flaky]
         platforms: [dgx_h100]
   

@@ -415,8 +415,9 @@ class CUDAGraphBatchDimensionBuilder:
         Returns:
             The best matching CUDA graph batch dimension, or None if no applicable match is found
         """
-        # first filter out batch dimensions with smaller token count, prefill req count,
-        # or decode req count, as they are not applicable
+
+        if not cuda_graph_batch_dimensions_list:
+            return None
 
         adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
             real_batch_dim, decode_only_cuda_graphs
@@ -428,6 +429,8 @@ class CUDAGraphBatchDimensionBuilder:
             # in that case, all ranks have to run in eager mode
             return None
 
+        # first filter out batch dimensions with smaller token count, prefill req count,
+        # or decode req count, as they are not applicable
         graph_batch_dims_applicable = [
             graph_batch_dim
             for graph_batch_dim in cuda_graph_batch_dimensions_list

@@ -5,9 +5,18 @@ import socket
 import struct
 
 import torch.distributed as dist
-import zmq
 
 from megatron.core import parallel_state
+
+try:
+    import zmq
+
+    HAVE_ZMQ = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    zmq = MagicMock()
+    HAVE_ZMQ = False
 
 
 class AsyncZMQCommunicator:
