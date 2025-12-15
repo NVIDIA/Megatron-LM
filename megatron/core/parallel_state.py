@@ -1288,9 +1288,6 @@ def initialize_model_parallel(
     # we could stick it there
     _set_global_memory_buffer()
 
-    # initialize global symmetric memory buffer
-    _set_global_symmetric_memory_buffer()
-
 
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
