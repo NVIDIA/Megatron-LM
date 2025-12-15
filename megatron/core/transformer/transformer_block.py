@@ -384,22 +384,33 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.final_layernorm = None  # Either this or nn.Identity
 
         if self.config.inference_fuse_tp_communication:
-            for i in range(len(self.layers)):
-                if i > 0:
-                    self.layers[i].self_attention.linear_qkv.skip_norm_and_all_gather = True
-                self.layers[i].self_attention.linear_proj.next_layer_norm_weights = self.layers[
-                    i
-                ].mlp.linear_fc1.layer_norm_weight.data
-                self.layers[i].mlp.linear_fc1.skip_norm_and_all_gather = True
-                if i < len(self.layers) - 1:
-                    self.layers[i].mlp.linear_fc2.next_layer_norm_weights = self.layers[
-                        i + 1
-                    ].self_attention.linear_qkv.layer_norm_weight.data
-                else:
-                    # dummy layer norm weights for last layer's fc2 module
-                    self.layers[i].mlp.linear_fc2.next_layer_norm_weights = torch.empty_like(
-                        self.layers[i].mlp.linear_fc1.layer_norm_weight.data
-                    )
+            self._setup_fused_tp_communication()
+
+    def _setup_fused_tp_communication(self):
+        """Setup fused TP communication for all layers.
+            We have a fused reduce-scatter + add + layer-norm + all-gather operation. 
+            We call this kernel from within row parallel linear layers.
+            But layer-norm needs the layer norm weights from the 
+            successive column parallel linear layer. 
+            This function is used to pass those weights to the respective layers.
+        """
+
+        for i in range(len(self.layers)):
+            current_layer = self.layers[i]
+
+            # Get next layer's QKV norm weights (or create dummy for last layer)
+            if i < len(self.layers) - 1:
+                next_qkv_weights = self.layers[i + 1].get_qkv_layer_norm_weights()
+            else:
+                # Dummy layer norm weights for last layer's fc2 module
+                mlp_norm_weights = current_layer.get_mlp_layer_norm_weights()
+                next_qkv_weights = torch.empty_like(mlp_norm_weights)
+
+            # Configure all fused TP communication settings in one call
+            current_layer.configure_fused_tp_communication(
+                skip_qkv_norm=(i > 0),
+                fc2_next_layer_norm_weights=next_qkv_weights,
+            )
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]

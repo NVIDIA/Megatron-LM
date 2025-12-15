@@ -689,6 +689,57 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             apply_prefix_mapping(sharded_state_dict, prefixed_map)
         return sharded_state_dict
 
+    def configure_fused_tp_communication(
+        self,
+        skip_qkv_norm: bool = False,
+        fc2_next_layer_norm_weights: Optional[Tensor] = None,
+    ):
+        """
+        Configure settings for fused TP communication in inference mode.
+
+        Args:
+            skip_qkv_norm (bool): Whether to skip norm and all-gather for linear_qkv.
+            fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights 
+                for current layer's MLP FC2.
+        """
+        if skip_qkv_norm:
+            self.self_attention.linear_qkv.skip_norm_and_all_gather = True
+
+        # Use current layer's own MLP FC1 norm weights for attention's out_proj
+        mlp_fc1_weights = self.get_mlp_layer_norm_weights()
+        self._set_proj_next_layer_norm_weights(mlp_fc1_weights)
+
+        self.mlp.linear_fc1.skip_norm_and_all_gather = True
+
+        if fc2_next_layer_norm_weights is not None:
+            self._set_fc2_next_layer_norm_weights(fc2_next_layer_norm_weights)
+
+    def _set_proj_next_layer_norm_weights(self, weights: Tensor):
+        """Set next layer norm weights for linear_proj."""
+        self.self_attention.linear_proj._set_next_layer_norm_weights(weights)
+
+    def _set_fc2_next_layer_norm_weights(self, weights: Tensor):
+        """Set next layer norm weights for MLP FC2."""
+        self.mlp.linear_fc2._set_next_layer_norm_weights(weights)
+
+    def get_mlp_layer_norm_weights(self) -> Tensor:
+        """
+        Get the MLP FC1 layer norm weights.
+
+        Returns:
+            Tensor: The layer norm weight data.
+        """
+        return self.mlp.linear_fc1.layer_norm_weight.data
+
+    def get_qkv_layer_norm_weights(self) -> Tensor:
+        """
+        Get the QKV layer norm weights.
+
+        Returns:
+            Tensor: The layer norm weight data.
+        """
+        return self.self_attention.linear_qkv.layer_norm_weight.data
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
         Get the static inputs for the transformer layer. Besides the hidden_states that is
@@ -870,3 +921,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     'inference_context'
                 ].is_decode_only()
         return super().__call__(*args, **kwargs)
+
+    def get_layer_norm_weights(self):
+        """
+        Get the weights of all layernorms (attention and MLP) in the transformer layer.
+        Returns:
+            List[Tensor]: A list of layernorm weight tensors.
+        """
+        return 
