@@ -1,10 +1,13 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import asyncio
 import socket
 import struct
 
+import zmq
+
 import torch.distributed as dist
 
-import zmq
 from megatron.core import parallel_state
 
 
