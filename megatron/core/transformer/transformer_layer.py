@@ -700,7 +700,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return sharded_state_dict
 
     def configure_fused_tp_communication(
-        self, skip_qkv_norm_and_all_gather: bool = False, fc2_next_layer_norm_weights: Optional[Tensor] = None
+        self,
+        skip_qkv_norm_and_all_gather: bool = False,
+        fc2_next_layer_norm_weights: Optional[Tensor] = None,
     ):
         """
         Configure settings for fused TP communication in inference mode.

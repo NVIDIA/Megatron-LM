@@ -406,8 +406,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
             # Configure all fused TP communication settings in one call
             current_layer.configure_fused_tp_communication(
-                skip_qkv_norm_and_all_gather=(i > 0), 
-                fc2_next_layer_norm_weights=next_qkv_norm_weights
+                skip_qkv_norm_and_all_gather=(i > 0),
+                fc2_next_layer_norm_weights=next_qkv_norm_weights,
             )
 
     def _get_layer(self, layer_number: int):
