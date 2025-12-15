@@ -1802,7 +1802,9 @@ class ParamAndGradBuffer:
                 name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
             )
             self.transpose_weight_alloc = FixedPoolAllocator(
-                name="fsdp_fp8_transpose_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+                name="fsdp_fp8_transpose_params",
+                fsdp_param_groups=self.parameter_groups,
+                size=UB_BUFFER_NUM,
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM

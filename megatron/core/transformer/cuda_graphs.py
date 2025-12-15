@@ -3,6 +3,7 @@
 import gc
 import inspect
 import logging
+import math
 import os
 import time
 from collections import defaultdict
@@ -369,9 +370,26 @@ def create_cudagraphs():
 def delete_cuda_graphs():
     """Delete all CUDA graphs."""
 
+    # Reset runners.
+    for record in [
+        *_CudagraphGlobalRecord.cudagraph_record,
+        *_CudagraphGlobalRecord.cudagraph_inference_record,
+    ]:
+        runner = record[0]
+        assert isinstance(runner, _CudaGraphRunner)
+
+        runner.cudagraph_created = False
+        runner.fwd_graph_recorded = False
+        runner.bwd_graph_recorded = False
+        runner.fwd_graph = None
+        runner.bwd_graph = None
+        runner.fwd_mempool = None
+        runner.bwd_mempool = None
+
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
+    _CudagraphGlobalRecord.cudagraph_inference_record = []
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -1165,13 +1183,14 @@ class CudaGraphManager(torch.nn.Module):
         if self.reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
             if is_inference_mode:
-                batch_size = kwargs['hidden_states'].shape[0]
-                is_decode_only = kwargs["inference_context"].is_decode_only()
-                # Attempt to retrieve the corresponding runner from the lookup table.
-                # The table is keyed on (batch_size, is_decode_only).
-                # It returns None if no match is found, in which case a new runner is created
-                # and cached in the lookup table.
-                runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+                is_static_batching = kwargs['inference_context'].is_static_batching()
+                if is_static_batching:
+                    batch_size = kwargs['hidden_states'].shape[0]
+                    is_decode_only = kwargs["inference_context"].is_decode_only()
+                    runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+                else:
+                    padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
+                    runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 runner = next(
@@ -1203,9 +1222,12 @@ class CudaGraphManager(torch.nn.Module):
                     self.cudagraph_runners.append(runner)
                     if is_inference_mode:
                         # Cache the newly created runner in the inference lookup table.
-                        self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
-                            runner
-                        )
+                        if is_static_batching:
+                            self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
+                                runner
+                            )
+                        else:
+                            self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
@@ -1401,6 +1423,9 @@ class TECudaGraphHelper:
         self.optimizers = optimizers
         self.num_model_chunks = len(model)
 
+        # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
+        self.num_microbatches = None
+
         # Get callables with captureable layers.
         self.chunks_with_decoder = []
         self.num_layers_per_chunk = []
@@ -1536,12 +1561,12 @@ class TECudaGraphHelper:
             order
         ), "num_model_chunks must match the max chunk id in order."
         assert (
-            get_num_microbatches() == len(order) // self.num_model_chunks // 2
+            self.num_microbatches == len(order) // self.num_model_chunks // 2
         ), "num_microbatches must match the number of microbatches in order."
 
         # Generate sample arguments and keyword arguments for capturing.
-        sample_args = [None] * (len(self.flattened_callables) * get_num_microbatches())
-        sample_kwargs = [None] * (len(self.flattened_callables) * get_num_microbatches())
+        sample_args = [None] * (len(self.flattened_callables) * self.num_microbatches)
+        sample_kwargs = [None] * (len(self.flattened_callables) * self.num_microbatches)
 
         rotary_pos_emb_cache = {}
 
@@ -1623,7 +1648,7 @@ class TECudaGraphHelper:
             model_chunk_idx = abs(chunk_id) - 1
 
             if chunk_id > 0:
-                sample_start_idx = (prefix_num_layers[model_chunk_idx] * get_num_microbatches()) + (
+                sample_start_idx = (prefix_num_layers[model_chunk_idx] * self.num_microbatches) + (
                     fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
                 )
                 fwd_sample_idx = [
@@ -1691,14 +1716,23 @@ class TECudaGraphHelper:
             get_schedule_table,
         )
 
+        # If PP is not enabled, we only need to capture one microbatch.
+        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
+            assert (
+                self.num_model_chunks == 1
+            ), "If PP is not enabled, there should be only one model chunk."
+            self.num_microbatches = 1
+        else:
+            self.num_microbatches = get_num_microbatches()
+
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
-            get_num_microbatches(),
+            self.num_microbatches,
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
             False,
         )
         schedule_table = get_schedule_table(
-            get_num_microbatches(),
+            self.num_microbatches,
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
         )
@@ -1717,7 +1751,21 @@ class TECudaGraphHelper:
         sample_args, sample_kwargs = self._get_sample_arguments(order)
 
         def get_make_graphed_callables_kwargs():
-            kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
+            kwargs = {'allow_unused_input': True, '_order': order}
+
+            # Calculate the number of warmup iterations per layer per microbatch inside TE
+            # make_graphed_callables(). There are two rules:
+            # 1. There should be at least 1 warmup iteration per layer per microbatch inside TE
+            # make_graphed_callables().
+            # 2. There should be at least 10 warmup iterations per layer, counting the MCore warmup
+            # steps before going into this capture routine.
+            kwargs['num_warmup_iters'] = max(
+                1,
+                math.ceil(
+                    (10 - self.config.cuda_graph_warmup_steps * get_num_microbatches())
+                    / self.num_microbatches
+                ),
+            )
 
             if is_te_min_version("2.6.0"):
                 # Starting from TE 2.6.0, make_graphed_callables() accepts different number
@@ -1780,6 +1828,8 @@ class TECudaGraphHelper:
         torch.distributed.barrier()
         gc.collect()
         torch.cuda.empty_cache()
+        if FREEZE_GC:
+            gc.freeze()
 
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
@@ -1807,6 +1857,9 @@ class TECudaGraphHelper:
             optimizer.zero_grad()
         clear_aux_losses_tracker()
         reset_model_temporary_tensors(self.config, self.model)
+
+        if FREEZE_GC:
+            gc.unfreeze()
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1827,10 +1880,10 @@ class TECudaGraphHelper:
         for layers in self.callables_per_chunk:
             for layer_number, layer in enumerate(layers):
                 layer.cuda_graphs = []
-                for batch_number in range(get_num_microbatches()):
+                for batch_number in range(self.num_microbatches):
                     layer.cuda_graphs.append(
                         graphs[
-                            num_layers_accumulated * get_num_microbatches()
+                            num_layers_accumulated * self.num_microbatches
                             + batch_number * len(layers)
                             + layer_number
                         ]

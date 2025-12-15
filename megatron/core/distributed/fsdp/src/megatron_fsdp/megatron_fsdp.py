@@ -747,9 +747,7 @@ class MegatronFSDP(torch.nn.Module):
 
             # All-gather / unshard the module parameters before the backward pass.
             self.all_gather_and_wait_parameters_ready(
-                param_list,
-                prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
-                bwd=True
+                param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
             )
 
         self._root_pre_backward_hook_issued = False
@@ -801,9 +799,9 @@ class MegatronFSDP(torch.nn.Module):
                 # during activation recomputation / gradient checkpointing.
                 return output
 
-            assert isinstance(module, tuple(fsdp_unit_modules)), (
-                "_post_forward hook should only be registered on FSDP unit modules."
-            )
+            assert isinstance(
+                module, tuple(fsdp_unit_modules)
+            ), "_post_forward hook should only be registered on FSDP unit modules."
 
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False)
@@ -950,9 +948,10 @@ class MegatronFSDP(torch.nn.Module):
 
         # Register pre state_dict hook to ensure that the module parameters are
         # distributed before saving the state_dict.
-        self._state_dict_pre_hook = self.module.register_state_dict_pre_hook(
-            lambda *args, **kwargs: self._replace_param_with_distributed_if_needed()
-        )
+        for name, module in self.named_modules():
+            module.register_state_dict_pre_hook(
+                lambda *args, **kwargs: self._replace_param_with_distributed_if_needed()
+            )
 
     @contextmanager
     def no_sync(self):
