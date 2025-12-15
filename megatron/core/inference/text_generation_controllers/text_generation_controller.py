@@ -761,7 +761,7 @@ class TextGenerationController:
             return self.inference_wrapped_model.dummy_forward()
 
         # attempt to use cuda-graph if possible
-        # here we try to reuse the cuda-graph warmup code to run 
+        # here we try to reuse the cuda-graph warmup code to run
         # a dummy cuda graph.
         input_ids, position_ids = self._dynamic_step_context_init(
             # try to use the smallest cuda-graph config for dummy forward
@@ -769,7 +769,7 @@ class TextGenerationController:
         )
 
         # _dynamic_step_context_init tries to find a cuda-graph that is compatible
-        # with all EP ranks. It can also return no match, in which case 
+        # with all EP ranks. It can also return no match, in which case
         # we run in eager mode.
 
         if context.using_cuda_graph_this_step():
