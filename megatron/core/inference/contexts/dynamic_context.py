@@ -1402,6 +1402,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Check if the request can be added to the context.
         """
+
+        # Do not admit new requests while there are paused requests. This is a
+        # simple, conservative policy to avoid overcommitting KV cache capacity
+        # when the system is already under pressure and has requests waiting to
+        # be resumed.
+        if self.total_request_count >= 128:
+            return False, False, False
+        if self.paused_request_count > 0:
+            #print(f"[DynamicContext] Not admitting new requests while there are paused requests. paused_request_count={self.paused_request_count}")
+            return False, False, False
+
         request_can_be_added = (
             self.total_request_count - self.paused_request_count < self.max_active_requests
         )
