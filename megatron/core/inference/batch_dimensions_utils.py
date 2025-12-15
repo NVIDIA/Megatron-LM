@@ -417,6 +417,7 @@ class CUDAGraphBatchDimensionBuilder:
         """
 
         if not cuda_graph_batch_dimensions_list:
+            # no need to match if no cuda graph batch dimensions are provided
             return None
 
         adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
