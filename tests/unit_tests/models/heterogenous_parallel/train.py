@@ -245,7 +245,7 @@ if __name__ == "__main__":
 
     # Model parallelisms (CP and EP are hardcoded to 1 in model_specs.py)
     vision_tp, vision_pp, vision_dp = 1, 2, 1
-    language_tp, language_pp, language_dp = 1, 2, 2
+    language_tp, language_pp, language_dp = 1, 4, 1
     
     # Training parameters
     rank = dist.get_rank()
