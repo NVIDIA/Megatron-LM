@@ -653,6 +653,13 @@ def initialize_model_parallel(
             By default (None), it is enabled from dp group.
             Available options (choose one): [dp, dp_replica]
 
+        create_all_gather_group (bool, default = False):
+            Create a separate process group for all-gather operations to avoid
+            head-of-line blocking with reduce-scatter operations. When enabled,
+            creates an additional NCCL communicator with identical ranks as the
+            dp-cp group but with independent progress engines for better communication
+            overlap.
+
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
