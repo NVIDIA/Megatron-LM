@@ -73,9 +73,7 @@ def expert_dist_ckpt_decorator(func):
     replace the default TP parallel states with expert-TP parallel states.
     """
 
-    logger.warning(
-        "expert_dist_ckpt_decorator is deprecated and will be removed in version 0.17."
-    )
+    logger.warning("expert_dist_ckpt_decorator is deprecated and will be removed in version 0.17.")
 
     @wraps(func)
     def wrapper(*args, **kwargs):
