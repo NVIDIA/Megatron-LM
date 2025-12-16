@@ -1138,7 +1138,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dill" },
     { name = "filelock" },
-    { name = "fsspec", extra = ["http"], marker = "extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
+    { name = "fsspec", version = "2025.10.0", source = { registry = "https://pypi.org/simple" }, extra = ["http"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "multiprocess" },
@@ -1285,7 +1285,7 @@ wheels = [
 
 [[package]]
 name = "fastapi"
-version = "0.125.0"
+version = "0.124.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
@@ -1293,9 +1293,9 @@ dependencies = [
     { name = "starlette" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/17/71/2df15009fb4bdd522a069d2fbca6007c6c5487fce5cb965be00fc335f1d1/fastapi-0.125.0.tar.gz", hash = "sha256:16b532691a33e2c5dee1dac32feb31dc6eb41a3dd4ff29a95f9487cb21c054c0", size = 370550, upload-time = "2025-12-17T21:41:44.15Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cd/21/ade3ff6745a82ea8ad88552b4139d27941549e4f19125879f848ac8f3c3d/fastapi-0.124.4.tar.gz", hash = "sha256:0e9422e8d6b797515f33f500309f6e1c98ee4e85563ba0f2debb282df6343763", size = 378460, upload-time = "2025-12-12T15:00:43.891Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/34/2f/ff2fcc98f500713368d8b650e1bbc4a0b3ebcdd3e050dcdaad5f5a13fd7e/fastapi-0.125.0-py3-none-any.whl", hash = "sha256:2570ec4f3aecf5cca8f0428aed2398b774fcdfee6c2116f86e80513f2f86a7a1", size = 112888, upload-time = "2025-12-17T21:41:41.286Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/57/aa70121b5008f44031be645a61a7c4abc24e0e888ad3fc8fda916f4d188e/fastapi-0.124.4-py3-none-any.whl", hash = "sha256:6d1e703698443ccb89e50abe4893f3c84d9d6689c0cf1ca4fad6d3c15cf69f15", size = 113281, upload-time = "2025-12-12T15:00:42.44Z" },
 ]
 
 [[package]]
@@ -1560,6 +1560,18 @@ wheels = [
 name = "fsspec"
 version = "2025.10.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and sys_platform != 'linux'",
+    "python_full_version == '3.13.*' and sys_platform != 'linux'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and sys_platform != 'linux'",
+]
 sdist = { url = "https://files.pythonhosted.org/packages/24/7f/2747c0d332b9acfa75dc84447a066fdf812b5a6b8d30472b74d309bfe8cb/fsspec-2025.10.0.tar.gz", hash = "sha256:b6789427626f068f9a83ca4e8a3cc050850b6c0f71f99ddb4f542b8266a26a59", size = 309285, upload-time = "2025-10-30T14:58:44.036Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl", hash = "sha256:7c7712353ae7d875407f97715f0e1ffcc21e33d5b24556cb1e090ae9409ec61d", size = 200966, upload-time = "2025-10-30T14:58:42.53Z" },
@@ -1568,6 +1580,27 @@ wheels = [
 [package.optional-dependencies]
 http = [
     { name = "aiohttp" },
+]
+
+[[package]]
+name = "fsspec"
+version = "2025.12.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and sys_platform != 'linux'",
+    "python_full_version == '3.13.*' and sys_platform != 'linux'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and sys_platform != 'linux'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b6/27/954057b0d1f53f086f681755207dda6de6c660ce133c829158e8e8fe7895/fsspec-2025.12.0.tar.gz", hash = "sha256:c505de011584597b1060ff778bb664c1bc022e87921b0e4f10cc9c44f9635973", size = 309748, upload-time = "2025-12-03T15:23:42.687Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/51/c7/b64cae5dba3a1b138d7123ec36bb5ccd39d39939f18454407e5468f4763f/fsspec-2025.12.0-py3-none-any.whl", hash = "sha256:8bf1fe301b7d8acfa6e8571e3b1c3d158f909666642431cc78a1b7b4dbc5ec5b", size = 201422, upload-time = "2025-12-03T15:23:41.434Z" },
 ]
 
 [[package]]
@@ -1780,7 +1813,8 @@ version = "0.36.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
-    { name = "fsspec" },
+    { name = "fsspec", version = "2025.10.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "fsspec", version = "2025.12.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
     { name = "hf-xet", marker = "platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
     { name = "packaging" },
     { name = "pyyaml" },
@@ -2250,7 +2284,7 @@ dev = [
     { name = "tensorstore", version = "0.1.78", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "tensorstore", version = "0.1.80", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "tqdm" },
-    { name = "transformer-engine", extra = ["core-cu13", "pytorch"], marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "transformer-engine", marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "wget" },
 ]
 lts = [
@@ -2374,7 +2408,7 @@ requires-dist = [
     { name = "torch" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", specifier = ">=2.9.0a0,<2.11.0" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.11" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "wandb", marker = "extra == 'mlm'" },
     { name = "wget", marker = "extra == 'dev'" },
@@ -2444,7 +2478,8 @@ dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "pillow" },
     { name = "pyyaml" },
-    { name = "s3fs" },
+    { name = "s3fs", version = "2025.10.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "s3fs", version = "2025.12.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "tqdm" },
     { name = "webdataset" },
@@ -2582,7 +2617,7 @@ wheels = [
 
 [[package]]
 name = "multi-storage-client"
-version = "0.39.1"
+version = "0.38.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
@@ -2600,18 +2635,18 @@ dependencies = [
     { name = "xattr" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/03/d2/6cce7b432f58bcffb394bac96d9edad2d927ffec382a53300e41186da1a5/multi_storage_client-0.39.1-cp310-cp310-macosx_14_0_arm64.whl", hash = "sha256:46aa5c7446e079dac852e7db9077e80fe69f4c7e4690f526cc61cbd15d43b07e", size = 8429120, upload-time = "2025-12-19T03:18:25.375Z" },
-    { url = "https://files.pythonhosted.org/packages/18/00/423e6fcf218a52216ad86686f4fffa4f18b605594601d621aec68ad02d33/multi_storage_client-0.39.1-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:31249cee7f0fa4cc536136371eb41ad48c4b86c02fdf4e3186e7b464488d1e73", size = 4784439, upload-time = "2025-12-19T03:20:50.881Z" },
-    { url = "https://files.pythonhosted.org/packages/14/73/161ebe8bb71acee7bb7a42389756cd43d07e56e155d40f54b72370c5eb64/multi_storage_client-0.39.1-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:22eb940daae3149efe2e8e412fdd4e3d8d10c0077b336cf2ebc90236dfe58665", size = 5048336, upload-time = "2025-12-19T03:17:35.193Z" },
-    { url = "https://files.pythonhosted.org/packages/6d/77/c20249c7887c37c0868ec8bc9ca6313fca54a232c3a50b04cd56b0b514ea/multi_storage_client-0.39.1-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:4d71b05d5ea7d09c075edae731ee6b89ed2114b5eeaf96e46e2a15b37b91de07", size = 8427425, upload-time = "2025-12-19T03:20:26.171Z" },
-    { url = "https://files.pythonhosted.org/packages/8d/ab/350acee344fe32db07ae535021e339ec4edf5e40b78a323fc11fcd6dda97/multi_storage_client-0.39.1-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:1f0dd3bb536f8fc5992dccb1e53108a695fb4e703e9320d5292f63188269bfcd", size = 4783799, upload-time = "2025-12-19T03:19:14.054Z" },
-    { url = "https://files.pythonhosted.org/packages/83/c0/19b03d58f4d2713b3948e3bd72d5711d89f22250b966b70ccfbb914cb6fe/multi_storage_client-0.39.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:44602b32f7b708b82eab56d49ba00a05ed478193387cf4e22ca2c19da8c6877a", size = 5047335, upload-time = "2025-12-19T03:18:49.925Z" },
-    { url = "https://files.pythonhosted.org/packages/76/c5/204f3859f3cc7dde35fc74b52c5d61d7017434781c296c9640c1bbd849c7/multi_storage_client-0.39.1-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:15973fff7b351f2949d4cd3bf9f24bb8c73838f5ab29e67f018318ec3d3e3079", size = 8420253, upload-time = "2025-12-19T03:16:48.333Z" },
-    { url = "https://files.pythonhosted.org/packages/57/dd/9f2d20e83742c5dcf49719a2905157b372e6380779d8c2fdd90f3898f6b9/multi_storage_client-0.39.1-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:0fc12834fd3fada72016b4df54f908c769d1fd6d5b9dbbc573831665def8b46c", size = 4784064, upload-time = "2025-12-19T03:17:11.978Z" },
-    { url = "https://files.pythonhosted.org/packages/7f/c8/fbc5a69eb910246bf154030aec0d9df6c204481d8a1ec3352de042499300/multi_storage_client-0.39.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:881365a17bc3886bf8f54d33c9c5d0d5a393b6000cdd12eed756b6e5eb3b2bb0", size = 5048702, upload-time = "2025-12-19T03:15:27.792Z" },
-    { url = "https://files.pythonhosted.org/packages/8d/e6/7ca7a7fd03893d03b36c225702e2a644b38bfe1b5c0fa5b266fd8f72ba1d/multi_storage_client-0.39.1-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:e6f7a9710d1e61beb3f736cc2a1bbb9916c462022be544edf604cc8d8a9ac201", size = 8418852, upload-time = "2025-12-19T03:16:23.313Z" },
-    { url = "https://files.pythonhosted.org/packages/bb/6a/7b25d15446085a103ebdf21834705020693e76ea093ca23e5647872b4165/multi_storage_client-0.39.1-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:cfa87a3eecb09de64a77c68b622f2d2b0cb3aefb8a9d2306b1bf83c085f3bdd5", size = 4784229, upload-time = "2025-12-19T03:21:14.885Z" },
-    { url = "https://files.pythonhosted.org/packages/a1/bd/dbda0847ef2ffab6a11b60f4702edf60fc1287174009bb2e35dff205d5ba/multi_storage_client-0.39.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4f705d1d4d11b19ec9f6819674ef852d9b8fa2c95906c4c5cab2ecb7c22bc290", size = 5048266, upload-time = "2025-12-19T03:15:56.348Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/04/f4d1726c0fde589186fcf0f7834a8af37826a7303a3e58649fccf4ceca76/multi_storage_client-0.38.1-cp310-cp310-macosx_14_0_arm64.whl", hash = "sha256:2a3cd89cc040888fead655d2baba41c3fd8b5af77640f0bf457c863ffb1478b0", size = 8410297, upload-time = "2025-12-15T21:37:03.387Z" },
+    { url = "https://files.pythonhosted.org/packages/48/3f/ad8d9f060a04f68b49d18eb55998fa062912fbfbfdfc7093e523667a38ed/multi_storage_client-0.38.1-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ecc6936adcdd9160ccdb6b6ad592739b96112fd44b3e66d4bf737c70b2c77a94", size = 4769847, upload-time = "2025-12-15T21:42:20.839Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/ec/9bd9024cd2923144f7a47e41fe87d09323c3d5b74580bcbacc127c4c9814/multi_storage_client-0.38.1-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:eaa8195bbe270d668047ae9e94fb848d0479519b1a1bbc0b766ce9b8ffdbecdd", size = 5037970, upload-time = "2025-12-15T21:38:13.301Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/47/dab2aab29962ea9d0c43b8b68b86673f92845e2634a26249cddff43a7b13/multi_storage_client-0.38.1-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:a1e0ed42953d85fe7c818c37106a5d54acea1b21313caa6afe3bbfd55b19ca5a", size = 8413274, upload-time = "2025-12-15T21:39:20.424Z" },
+    { url = "https://files.pythonhosted.org/packages/63/c8/234df5446ed1c3e3a4a978a43c254f0f0a7427bd1159c4e2c6804fad878e/multi_storage_client-0.38.1-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:f4dd1f8d9020d4d5228ab30992887959309b9952ef5d651a757217b985b127f9", size = 4769722, upload-time = "2025-12-15T21:40:28.728Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/e4/3cb66d93afb9a9831d4781766e68783a46fc187e4be163f88f540e63f0bb/multi_storage_client-0.38.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4169da4c57dd1e22956350173c8f2b09e6bf08021ad60880df8562401c095ba5", size = 5039255, upload-time = "2025-12-15T21:39:43.036Z" },
+    { url = "https://files.pythonhosted.org/packages/69/78/d30a70b855549795ca14a8cfd75422973e34c0dedd52c9db12e0d914d1c4/multi_storage_client-0.38.1-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:542eff3be0f9bb02a36752711d8b3c46910e806d18a6bf400c3fe61647a98c19", size = 8405548, upload-time = "2025-12-15T21:41:58.842Z" },
+    { url = "https://files.pythonhosted.org/packages/33/48/eafaa64550cfd1bf9964c03786df695227feca9706a84f74c0f026d822f2/multi_storage_client-0.38.1-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:99c1783830fd2b59dd9f1cdcb8f8c05761097600575055fed8837fb83bc7b4da", size = 4765562, upload-time = "2025-12-15T21:38:35.933Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/28/7e6fe845a6b785f93cd8fd21fb06230057fc65965c76a11b9350dfee1e17/multi_storage_client-0.38.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c3c65fb277b53db9139c66ed9097681c9bec1259571dee5726e58129fdc9ed23", size = 5040197, upload-time = "2025-12-15T21:37:50.739Z" },
+    { url = "https://files.pythonhosted.org/packages/98/ce/fb1f345cf89afe16dc98bde97d5ce5671dd9a9fa45880e991174d21f143f/multi_storage_client-0.38.1-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:82f587e38f710e7eaa08cb165d5f95eeef5a93e42271830259aacd24679e48c4", size = 8404785, upload-time = "2025-12-15T21:41:12.697Z" },
+    { url = "https://files.pythonhosted.org/packages/83/b4/fe2548657f14a09b77c55aa5ed5cd4bddafe61acc7ab29771e9b4d53cae8/multi_storage_client-0.38.1-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:d29095167f0438345550231b4f564cccf81a2723dad12d6a19c1d66ad9260bc9", size = 4765386, upload-time = "2025-12-15T21:38:58.355Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/b9/b6a974a7468284fa9fe6bde0b535c8f86a3ea6f6c461fc770ceb0ffe723f/multi_storage_client-0.38.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:39e25d7dbc8e383147dcb3e5bd1ef42ff885b8de2e82d7e28dafc46f6a229882", size = 5040155, upload-time = "2025-12-15T21:40:05.489Z" },
 ]
 
 [[package]]
@@ -3056,7 +3091,7 @@ wheels = [
 
 [[package]]
 name = "nv-grouped-gemm"
-version = "1.1.4.post8"
+version = "1.1.4.post7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py" },
@@ -3064,7 +3099,7 @@ dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "torch", marker = "sys_platform == 'never'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/02/ad/046a097b63a96c1ba1d85f0031dbe7fcbdb33e6c445dfbaba2ffaefdd497/nv_grouped_gemm-1.1.4.post8.tar.gz", hash = "sha256:ab321693f0292cfd8a26dc7b6f14decd9eb00e209494de7218e4fad36191275d", size = 20821209, upload-time = "2025-12-17T02:22:38.432Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/63/36/13d0a1e1af31c3b2a297c15b6e7da532b13361730b32d11d9698854bdbe3/nv_grouped_gemm-1.1.4.post7.tar.gz", hash = "sha256:bc9f7906c9b0bd7fefea5a776acbc277577c65b103181340fd26ca2b8460c6a5", size = 26520, upload-time = "2025-12-16T19:42:33.176Z" }
 
 [[package]]
 name = "nv-one-logger-core"
@@ -3251,7 +3286,6 @@ dependencies = [
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ac/48/52907ac203c6de58b451511e251c8b1fc77c414dcb32aef3a0cd5194c7bd/nvidia_cutlass_dsl-4.3.3-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:dca550c8a7f7556a4c46bd4b85453342ae4e70600dc4aa3b5a6f1ebcd39a5ce5", size = 58734224, upload-time = "2025-12-10T09:45:22.008Z" },
     { url = "https://files.pythonhosted.org/packages/44/d7/f1936fdf697a8b76eea1f60d4bcfe41faa015e5bca925c4e767035e6857a/nvidia_cutlass_dsl-4.3.3-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:0d92144b9f161328be4a6734911c101d03c7d5335e307112ad579d826d7ac3b1", size = 58596215, upload-time = "2025-12-10T10:35:19.436Z" },
-    { url = "https://files.pythonhosted.org/packages/53/ff/41a855a356067cab074c77e79ddb308a8d3df0e74659bdc2195f5c19bb10/nvidia_cutlass_dsl-4.3.3-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:7d3914b3e865cf17334d3139c11d38aed1160b5855c29eaa4e3a470ea1fcfaba", size = 58731282, upload-time = "2025-12-17T09:17:36.918Z" },
     { url = "https://files.pythonhosted.org/packages/ef/75/79f494e08b85ea921eb376a5363a7a357db2352a6a1dfdfc659721fe94b2/nvidia_cutlass_dsl-4.3.3-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:046f3fc3fe3fa60f3207133e57512f2f5581ca36943f0763f3f7e8ab11180e16", size = 58596543, upload-time = "2025-12-10T10:09:13.657Z" },
     { url = "https://files.pythonhosted.org/packages/c6/d4/7c5ef53ccf75d7f99a9ea29cae9f9c0233229b75b3b22f85a4ef4f52e6ab/nvidia_cutlass_dsl-4.3.3-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:3278526f54bddd920d8e539771e5820c6166c549a1e67813375025f39417dec6", size = 58734009, upload-time = "2025-12-10T09:23:29.305Z" },
     { url = "https://files.pythonhosted.org/packages/88/a8/a27562194cc4182c67793cd21c5dbf9468cd5a49c775a487153c6f28364c/nvidia_cutlass_dsl-4.3.3-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:f2b25816b8bb8bc332bcbf6fc341347b5d728344cf185c65af0dd73e8503d5c7", size = 58596724, upload-time = "2025-12-10T11:01:07.228Z" },
@@ -4710,23 +4744,23 @@ wheels = [
 
 [[package]]
 name = "roman-numerals"
-version = "4.1.0"
+version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ae/f9/41dc953bbeb056c17d5f7a519f50fdf010bd0553be2d630bc69d1e022703/roman_numerals-4.1.0.tar.gz", hash = "sha256:1af8b147eb1405d5839e78aeb93131690495fe9da5c91856cb33ad55a7f1e5b2", size = 9077, upload-time = "2025-12-17T18:25:34.381Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/20/a6b20239f54814de5c34bf3f504e553b11780c2aad3677ad2daf989f1fb3/roman_numerals-4.0.0.tar.gz", hash = "sha256:231287018a8788bf8c0718482a08c15b90458523ea1d840a18a791a86d4583b3", size = 9027, upload-time = "2025-12-16T01:53:36.309Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/04/54/6f679c435d28e0a568d8e8a7c0a93a09010818634c3c3907fc98d8983770/roman_numerals-4.1.0-py3-none-any.whl", hash = "sha256:647ba99caddc2cc1e55a51e4360689115551bf4476d90e8162cf8c345fe233c7", size = 7676, upload-time = "2025-12-17T18:25:33.098Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/9d/ad950fd3b65cf0974c633862320829f3d461aef125b981504277c8409a93/roman_numerals-4.0.0-py3-none-any.whl", hash = "sha256:4131feb23ba1a542494873e4cee7844ec8d226a750134efc65ceb20939ed33c9", size = 7668, upload-time = "2025-12-16T01:53:34.922Z" },
 ]
 
 [[package]]
 name = "roman-numerals-py"
-version = "4.1.0"
+version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "roman-numerals", marker = "python_full_version >= '3.11' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/cb/b5/de96fca640f4f656eb79bbee0e79aeec52e3e0e359f8a3e6a0d366378b64/roman_numerals_py-4.1.0.tar.gz", hash = "sha256:f5d7b2b4ca52dd855ef7ab8eb3590f428c0b1ea480736ce32b01fef2a5f8daf9", size = 4274, upload-time = "2025-12-17T18:25:41.153Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7e/02/6cb667fc1872c5fe814971be2973317f0747d86f1c0aac37d0e1a1df1ecc/roman_numerals_py-4.0.0.tar.gz", hash = "sha256:f7fa8dff5b7b7251d3a7586b97c57a0698e2e28898fa42c23bcc0cf51b02aee9", size = 1119, upload-time = "2025-12-16T01:53:43.097Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/27/2c/daca29684cbe9fd4bc711f8246da3c10adca1ccc4d24436b17572eb2590e/roman_numerals_py-4.1.0-py3-none-any.whl", hash = "sha256:553114c1167141c1283a51743759723ecd05604a1b6b507225e91dc1a6df0780", size = 4547, upload-time = "2025-12-17T18:25:40.136Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/b7/c0aa3b0154e022faa8e8b4eadda0c49f53b09b6b8d55ed3b7cd311abfd92/roman_numerals_py-4.0.0-py3-none-any.whl", hash = "sha256:dfcecf6e0cddbf2ee1112e7e2ebf58ba771984f075cb57a30e1811cee4f06332", size = 1244, upload-time = "2025-12-16T01:53:42.369Z" },
 ]
 
 [[package]]
@@ -4880,14 +4914,52 @@ wheels = [
 name = "s3fs"
 version = "2025.10.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and sys_platform != 'linux'",
+    "python_full_version == '3.13.*' and sys_platform != 'linux'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and sys_platform != 'linux'",
+]
 dependencies = [
-    { name = "aiobotocore" },
-    { name = "aiohttp" },
-    { name = "fsspec" },
+    { name = "aiobotocore", marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "aiohttp", marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "fsspec", version = "2025.10.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bb/ee/7cf7de3b17ef6db10b027cc9f8a1108ceb6333e267943e666a35882b1474/s3fs-2025.10.0.tar.gz", hash = "sha256:e8be6cddc77aceea1681ece0f472c3a7f8ef71a0d2acddb1cc92bb6afa3e9e4f", size = 80383, upload-time = "2025-10-30T15:06:04.647Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2d/fc/56cba14af8ad8fd020c85b6e44328520ac55939bb1f9d01444ad470504cb/s3fs-2025.10.0-py3-none-any.whl", hash = "sha256:da7ef25efc1541f5fca8e1116361e49ea1081f83f4e8001fbd77347c625da28a", size = 30357, upload-time = "2025-10-30T15:06:03.48Z" },
+]
+
+[[package]]
+name = "s3fs"
+version = "2025.12.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and sys_platform != 'linux'",
+    "python_full_version == '3.13.*' and sys_platform != 'linux'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and sys_platform != 'linux'",
+]
+dependencies = [
+    { name = "aiobotocore", marker = "extra == 'extra-13-megatron-core-lts'" },
+    { name = "aiohttp", marker = "extra == 'extra-13-megatron-core-lts'" },
+    { name = "fsspec", version = "2025.12.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cf/26/fff848df6a76d6fec20208e61548244639c46a741e296244c3404d6e7df0/s3fs-2025.12.0.tar.gz", hash = "sha256:8612885105ce14d609c5b807553f9f9956b45541576a17ff337d9435ed3eb01f", size = 81217, upload-time = "2025-12-03T15:34:04.754Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/44/8c/04797ebb53748b4d594d4c334b2d9a99f2d2e06e19ad505f1313ca5d56eb/s3fs-2025.12.0-py3-none-any.whl", hash = "sha256:89d51e0744256baad7ae5410304a368ca195affd93a07795bc8ba9c00c9effbb", size = 30726, upload-time = "2025-12-03T15:34:03.576Z" },
 ]
 
 [[package]]
@@ -5749,7 +5821,8 @@ version = "2.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
-    { name = "fsspec" },
+    { name = "fsspec", version = "2025.10.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "fsspec", version = "2025.12.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
     { name = "jinja2" },
     { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
@@ -5868,7 +5941,8 @@ dependencies = [
     { name = "docker" },
     { name = "docstring-parser" },
     { name = "filelock" },
-    { name = "fsspec" },
+    { name = "fsspec", version = "2025.10.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "fsspec", version = "2025.12.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
     { name = "importlib-metadata" },
     { name = "pyre-extensions" },
     { name = "pyyaml" },
@@ -5894,60 +5968,17 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.10.0"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ea/45/b3402a4931c0850ac662b532888d7cb89d5d8f22324309ae8d24557340ee/transformer_engine-2.10.0-py3-none-any.whl", hash = "sha256:a14ccf4e887409be062c0bd8c4a341df55a77baad6aea6aabfe39c24e38252e5", size = 696221, upload-time = "2025-12-02T20:53:17.688Z" },
-]
-
-[package.optional-dependencies]
-core-cu13 = [
-    { name = "transformer-engine-cu13" },
-]
-pytorch = [
-    { name = "transformer-engine-torch" },
-]
-
-[[package]]
-name = "transformer-engine-cu12"
-version = "2.10.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "importlib-metadata" },
-    { name = "packaging" },
-    { name = "pydantic" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/24/3c/9f480a555c4707cd7b091c5341cc96db1af80b5bfb1a2eae834fb704283b/transformer_engine_cu12-2.10.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:ddd6f4f1f2a8f2c450ea0210d04a08a7b8ceff49a4d900f27b3858980502f21b", size = 286567840, upload-time = "2025-12-02T20:50:26.438Z" },
-    { url = "https://files.pythonhosted.org/packages/29/c7/b63b6989262fcf37402a910112aaee9f3273338d9d1d854478e022f5deb7/transformer_engine_cu12-2.10.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:6766d4ea1643a2606d498aa396d4e7da1046fe01580fdef2047c2c8aa37936b0", size = 287067223, upload-time = "2025-12-02T20:52:11.248Z" },
-]
-
-[[package]]
-name = "transformer-engine-cu13"
-version = "2.10.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "importlib-metadata" },
-    { name = "packaging" },
-    { name = "pydantic" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/31/bf/34a93b94ec3a8e707e9c5660c76533316357e3b84d08f5cc676787a196c5/transformer_engine_cu13-2.10.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:7409c48a5478acc15b7ac88231be3c45aa9e7c9d17f4875ad31d1bc1650595dd", size = 176560075, upload-time = "2025-12-02T20:48:52.307Z" },
-    { url = "https://files.pythonhosted.org/packages/48/80/1f08d928e7e0ce3f10c6cfa6871b17d13cec070dffb8b88ed9308653ac77/transformer_engine_cu13-2.10.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:b8ee7bd6cef455e07bad61d645af290940aa58856d70fda05e1f973353a85349", size = 177257305, upload-time = "2025-12-02T20:51:36.94Z" },
-]
-
-[[package]]
-name = "transformer-engine-torch"
-version = "2.10.0"
-source = { registry = "https://pypi.org/simple" }
+version = "2.11.0+cda10c4c"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.11#cda10c4cd3b52291bcc31a5c32ac0b4936324b65" }
 dependencies = [
     { name = "einops" },
+    { name = "importlib-metadata" },
     { name = "onnx" },
     { name = "onnxscript" },
+    { name = "packaging" },
+    { name = "pydantic" },
     { name = "torch", marker = "sys_platform == 'never'" },
-    { name = "transformer-engine-cu12" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/18/94/609a7772569d3acdba34261be7fd30b75f5ff4e5f704117c9e0da517b079/transformer_engine_torch-2.10.0.tar.gz", hash = "sha256:71faff8e3def742553ad74b4e32d2d12e91be9acfb13d1699c89e1e18dd4ecd6", size = 220302, upload-time = "2025-12-02T20:53:57.876Z" }
 
 [[package]]
 name = "transformers"
