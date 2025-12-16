@@ -41,16 +41,8 @@ extensions = [
 ]
 
 # Check if we should skip autodoc generation
-# usage: SKIP_AUTODOC=true or passing --skip-autodoc (if supported by builder arg parsing)
+# usage: SKIP_AUTODOC=true
 skip_autodoc = os.environ.get("SKIP_AUTODOC", "false").lower() == "true"
-if "--skip-autodoc" in sys.argv:
-    skip_autodoc = True
-    # Try to remove the flag so Sphinx doesn't complain if it hasn't parsed args yet,
-    # though standard sphinx-build usually parses before loading conf.py.
-    try:
-        sys.argv.remove("--skip-autodoc")
-    except ValueError:
-        pass
 
 if not skip_autodoc:
     extensions.append("autodoc2")  # Generates API docs
