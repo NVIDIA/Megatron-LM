@@ -11,6 +11,7 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.utils import experimental_api
 
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
@@ -31,6 +32,7 @@ except ImportError:
 
 
 @dataclass
+@experimental_api
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
 
@@ -241,6 +243,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant: gated_delta_net
     ####################
+    linear_attention_type: Optional[str] = None
+    """Type of linear attention to use.
+    Deprecated. Use experimental_attention_variant instead."""
+
     linear_attention_freq: Optional[Union[int, List[int]]] = None
     """Frequency between LA (linear attention) layers 
     and SDPA (scaled dot-product attention) layers.
@@ -771,6 +777,9 @@ class TransformerConfig(ModelParallelConfig):
     symmetric_ar_type: Optional[str] = None
     """Type of symmetric all reduce to use"""
 
+    use_inference_optimized_layers: bool = False
+    """If True, use inference optimized transformer layers during inference."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -876,6 +885,14 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        if self.linear_attention_type is not None:
+            warnings.warn(
+                "linear_attention_type is deprecated, "
+                "use experimental_attention_variant instead."
+            )
+            self.experimental_attention_variant = self.linear_attention_type
+            self.linear_attention_type = None
 
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
@@ -1829,6 +1846,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            if self.mtp_num_layers == 1:
+                assert self.pipeline_model_parallel_size > 1, (
+                    'Pipeline model parallel size must be larger than 1 '
+                    'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
+                )
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
@@ -1838,6 +1860,12 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_use_legacy_grouped_gemm
             ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+
+        if self.ep_overlap_early_attn_memory_release:
+            assert self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be enabled when enabling '
+                'ep_overlap_early_attn_memory_release'
+            )
 
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
@@ -1910,8 +1938,16 @@ class TransformerConfig(ModelParallelConfig):
                         f"for context parallelism, but got {self.cp_comm_type=} instead."
                     )
 
+        if self.transformer_impl == "inference_optimized":
+            assert self.normalization == "RMSNorm"
+            assert not self.layernorm_zero_centered_gamma
+            assert not self.add_bias_linear
+            assert not self.add_qkv_bias
+            assert not self.use_kitchen
+
 
 @dataclass
+@experimental_api
 class MLATransformerConfig(TransformerConfig):
     """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.
 
