@@ -99,6 +99,10 @@ _DATA_PARALLEL_GLOBAL_RANKS = None
 # the first local rank in the tensor model parallel group
 _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
 
+# A list of global ranks for each expert model parallel group to ease calculation of
+# the first local rank in the expert model parallel group
+_EXPERT_MODEL_PARALLEL_RANKS = None
+
 # A list of global ranks for each model parallel group to ease calculation of
 # the first local rank in the model parallel group
 _MODEL_PARALLEL_GLOBAL_RANKS = None
@@ -1120,7 +1124,7 @@ def initialize_model_parallel(
 
     ### Expert-related parallel groups initialization
     # Build the expert model parallel group
-    global _EXPERT_MODEL_PARALLEL_GROUP
+    global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
     for ranks in expert_decoder_rank_generator.get_ranks('ep'):
         group = create_group(
@@ -1131,6 +1135,7 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
+            _EXPERT_MODEL_PARALLEL_RANKS = ranks
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
@@ -1724,6 +1729,15 @@ def get_expert_model_parallel_group(check_initialized=True):
             _EXPERT_MODEL_PARALLEL_GROUP is not None
         ), "expert model parallel group is not initialized"
     return _EXPERT_MODEL_PARALLEL_GROUP
+
+
+def get_expert_model_parallel_src_rank():
+    """Calculate the global rank corresponding to the first local rank
+    in the expert model parallel group."""
+    assert (
+        _EXPERT_MODEL_PARALLEL_RANKS is not None
+    ), "Expert model parallel group is not initialized"
+    return _EXPERT_MODEL_PARALLEL_RANKS[0]
 
 
 def get_expert_model_parallel_world_size():
