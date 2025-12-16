@@ -414,19 +414,26 @@ class MegatronOptimizer(ABC):
         }
 
         final_groups = []
-        for key, params in zip(needed_groups, params_in_state_dict_order):
+        for i, (key, params) in enumerate(zip(needed_groups, params_in_state_dict_order)):
             if key not in loaded_groups_map:
                 available_keys = '\n'.join(str(k) for k in loaded_groups_map.keys())
-                raise ValueError(
+                logger.warning(
                     f"Could not find parameter group with key {key} in loaded checkpoint.\n"
                     f"Available keys:\n{available_keys}\n"
-                    f"Parameter group key definition: {param_group_identifier_keys}"
+                    f"Parameter group key definition: {param_group_identifier_keys}\n"
+                    f"This may occur when using different pipeline parallel layouts between "
+                    f"training and checkpoint loading. Using runtime parameter group configuration."
                 )
-
-            # Update group's parameters to preserve state dict ordering
-            group = loaded_groups_map[key]
-            group['params'] = params
-            final_groups.append(group)
+                # Use the current group configuration as fallback when checkpoint doesn't match
+                # This can happen with different pipeline-model-parallel-layout configurations
+                group = current_groups[i].copy()
+                group['params'] = params
+                final_groups.append(group)
+            else:
+                # Update group's parameters to preserve state dict ordering
+                group = loaded_groups_map[key]
+                group['params'] = params
+                final_groups.append(group)
 
         return final_groups
 
