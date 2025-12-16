@@ -78,6 +78,7 @@ def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext, log
     Args:
         bin_idx: Index of the bin to load.
     """
+    nvtx_range = get_nvtx_range()
     args = get_args()
     # Get packing context (should always be available in packed mode)
     idx = slice(bin_idx, bin_idx + 1)
@@ -510,56 +511,62 @@ def pack_inference_logprobs(
     Returns:
         Packed inference logprobs tensor of shape [num_bins, bin_size - 1]
     """
-    num_bins = len(packing_info.bin_seq_indices)
+    nvtx_range = get_nvtx_range()
+    
+    with nvtx_range("rl/pack-logprobs/pack-inference", log_level=2):
+        num_bins = len(packing_info.bin_seq_indices)
 
-    # Create packed inference logprobs tensor (logprobs are 1 token shorter than sequences)
-    packed_inference_logprobs = torch.zeros(
-        (num_bins, bin_size - 1), dtype=torch.float32, device='cpu'
-    )
+        # Create packed inference logprobs tensor (logprobs are 1 token shorter than sequences)
+        with nvtx_range("rl/pack-logprobs/pack-inference/alloc", log_level=3):
+            packed_inference_logprobs = torch.zeros(
+                (num_bins, bin_size - 1), dtype=torch.float32, device='cpu'
+            )
 
-    # Create mapping from global sequence index to local bin index
-    # This is needed because seq_to_bin_idx uses global bin indices,
-    # but after distribution each rank only has a subset of bins
-    seq_to_local_bin = {}
-    for local_bin_idx, seq_indices in enumerate(packing_info.bin_seq_indices):
-        for seq_idx in seq_indices:
-            seq_to_local_bin[seq_idx] = local_bin_idx
+        # Create mapping from global sequence index to local bin index
+        # This is needed because seq_to_bin_idx uses global bin indices,
+        # but after distribution each rank only has a subset of bins
+        with nvtx_range("rl/pack-logprobs/pack-inference/mapping", log_level=3):
+            seq_to_local_bin = {}
+            for local_bin_idx, seq_indices in enumerate(packing_info.bin_seq_indices):
+                for seq_idx in seq_indices:
+                    seq_to_local_bin[seq_idx] = local_bin_idx
 
-    # Align and pack inference logprobs based on generation masks
-    for seq_idx in range(len(inference_logprobs)):
-        if seq_idx not in seq_to_local_bin:
-            continue  # Skip sequences not on this rank
+        # Align and pack inference logprobs based on generation masks
+        with nvtx_range("rl/pack-logprobs/pack-inference/loop", log_level=3):
+            for seq_idx in range(len(inference_logprobs)):
+                if seq_idx not in seq_to_local_bin:
+                    continue  # Skip sequences not on this rank
 
-        local_bin_idx = seq_to_local_bin[seq_idx]
+                local_bin_idx = seq_to_local_bin[seq_idx]
 
-        # Get the position of this sequence within the bin
-        seq_positions = packing_info.bin_seq_indices[local_bin_idx]
-        seq_pos_in_bin = seq_positions.index(seq_idx)
-        seq_start = packing_info.seq_starts[local_bin_idx][seq_pos_in_bin]
+                # Get the position of this sequence within the bin
+                seq_positions = packing_info.bin_seq_indices[local_bin_idx]
+                seq_pos_in_bin = seq_positions.index(seq_idx)
+                seq_start = packing_info.seq_starts[local_bin_idx][seq_pos_in_bin]
 
-        # Get generation mask for this sequence to find where generation starts
-        gen_mask = generation_masks[seq_idx]
-        # Find first generation token (accounting for the shift in get_logprobs)
-        first_gen_idx = gen_mask.int().argmax().item() - 1
+                # Get generation mask for this sequence to find where generation starts
+                gen_mask = generation_masks[seq_idx]
+                # Find first generation token (accounting for the shift in get_logprobs)
+                first_gen_idx = gen_mask.int().argmax().item() - 1
 
-        # Get the inference logprobs for this sequence
-        if isinstance(inference_logprobs[seq_idx], torch.Tensor):
-            seq_inf_logprobs = inference_logprobs[seq_idx]
-        else:
-            continue  # Skip if no inference logprobs
+                # Get the inference logprobs for this sequence
+                if isinstance(inference_logprobs[seq_idx], torch.Tensor):
+                    seq_inf_logprobs = inference_logprobs[seq_idx]
+                else:
+                    continue  # Skip if no inference logprobs
 
-        # Calculate where to place inference logprobs in the packed tensor
-        # The inference logprobs start at the first generated token position
-        pack_start = seq_start + first_gen_idx
-        pack_end = min(
-            pack_start + len(seq_inf_logprobs), seq_start + packing_info.seq_lengths[seq_idx] - 1
-        )
-        actual_len = pack_end - pack_start
+                # Calculate where to place inference logprobs in the packed tensor
+                # The inference logprobs start at the first generated token position
+                pack_start = seq_start + first_gen_idx
+                pack_end = min(
+                    pack_start + len(seq_inf_logprobs), seq_start + packing_info.seq_lengths[seq_idx] - 1
+                )
+                actual_len = pack_end - pack_start
 
-        if actual_len > 0 and pack_end <= bin_size - 1:
-            packed_inference_logprobs[local_bin_idx, pack_start:pack_end] = seq_inf_logprobs[
-                :actual_len
-            ]
+                if actual_len > 0 and pack_end <= bin_size - 1:
+                    packed_inference_logprobs[local_bin_idx, pack_start:pack_end] = seq_inf_logprobs[
+                        :actual_len
+                    ]
 
     return packed_inference_logprobs
 
@@ -790,6 +797,7 @@ def distribute_packed_bins(
     packing_info: PackingInfo,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
     """Distribute packed bins across the data parallel ranks."""
+    nvtx_range = get_nvtx_range()
     rank = mpu.get_expert_data_parallel_rank()
     world_size = mpu.get_expert_data_parallel_world_size()
     tokenizer = get_tokenizer()
@@ -960,33 +968,36 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
     expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
     nvtx_range = get_nvtx_range()
 
-    with nvtx_range("regather_trajectories", time=True):
+    with nvtx_range("rl/sequence-packing/regather", log_level=1):
         # Regather trajectories from all ranks for packing
-        trajs = trajs.cuda()
-        trajs_list = [torch.empty_like(trajs) for _ in range(expert_data_parallel_world_size)]
-        torch.distributed.all_gather(
-            trajs_list, trajs, group=mpu.get_expert_data_parallel_group()
-        )
-        trajs = torch.cat(trajs_list, dim=0)
+        with nvtx_range("rl/sequence-packing/allgather/trajs", log_level=2):
+            trajs = trajs.cuda()
+            trajs_list = [torch.empty_like(trajs) for _ in range(expert_data_parallel_world_size)]
+            torch.distributed.all_gather(
+                trajs_list, trajs, group=mpu.get_expert_data_parallel_group()
+            )
+            trajs = torch.cat(trajs_list, dim=0)
 
         # Gather all generation masks
-        generation_masks = generation_masks.cuda()
-        masks_list = [torch.empty_like(generation_masks) for _ in range(expert_data_parallel_world_size)]
-        torch.distributed.all_gather(
-            masks_list, generation_masks, group=mpu.get_expert_data_parallel_group()
-        )
-        generation_masks = torch.cat(masks_list, dim=0)
+        with nvtx_range("rl/sequence-packing/allgather/masks", log_level=2):
+            generation_masks = generation_masks.cuda()
+            masks_list = [torch.empty_like(generation_masks) for _ in range(expert_data_parallel_world_size)]
+            torch.distributed.all_gather(
+                masks_list, generation_masks, group=mpu.get_expert_data_parallel_group()
+            )
+            generation_masks = torch.cat(masks_list, dim=0)
 
         # Gather inference logprobs if present
         if inference_logprobs is not None:
-            inference_logprobs = inference_logprobs.cuda()
-            logprobs_list = [torch.empty_like(inference_logprobs) for _ in range(expert_data_parallel_world_size)]
-            torch.distributed.all_gather(
-                logprobs_list, inference_logprobs, group=mpu.get_expert_data_parallel_group()
-            )
-            inference_logprobs = torch.cat(logprobs_list, dim=0)
+            with nvtx_range("rl/sequence-packing/allgather/logprobs", log_level=2):
+                inference_logprobs = inference_logprobs.cuda()
+                logprobs_list = [torch.empty_like(inference_logprobs) for _ in range(expert_data_parallel_world_size)]
+                torch.distributed.all_gather(
+                    logprobs_list, inference_logprobs, group=mpu.get_expert_data_parallel_group()
+                )
+                inference_logprobs = torch.cat(logprobs_list, dim=0)
 
-    with nvtx_range("pack_sequences", time=True):
+    with nvtx_range("rl/sequence-packing/pack-sequences", log_level=1):
         # Create packer with max sequences per bin limit to prevent extreme imbalance
         packer = SequencePacker(
             bin_size=bin_size,
@@ -995,51 +1006,55 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         )
 
         # Pack sequences with generation masks
-        (
-            packed_trajs,
-            packed_position_ids,
-            packed_attention_mask,
-            packed_loss_mask,
-            packing_info,
-        ) = packer.pack_sequences(trajs, generation_masks)
-        packing_info.packing_algo = packing_algo
+        with nvtx_range("rl/sequence-packing/binpack", log_level=2):
+            (
+                packed_trajs,
+                packed_position_ids,
+                packed_attention_mask,
+                packed_loss_mask,
+                packing_info,
+            ) = packer.pack_sequences(trajs, generation_masks)
+            packing_info.packing_algo = packing_algo
 
         # Distribute packed bins across the data parallel ranks
-        (
-            packed_trajs,
-            packed_position_ids,
-            packed_attention_mask,
-            packed_loss_mask,
-            packing_info,
-        ) = distribute_packed_bins(
-            packed_trajs,
-            packed_position_ids,
-            packed_attention_mask,
-            packed_loss_mask,
-            packing_info,
-        )
+        with nvtx_range("rl/sequence-packing/distribute", log_level=2):
+            (
+                packed_trajs,
+                packed_position_ids,
+                packed_attention_mask,
+                packed_loss_mask,
+                packing_info,
+            ) = distribute_packed_bins(
+                packed_trajs,
+                packed_position_ids,
+                packed_attention_mask,
+                packed_loss_mask,
+                packing_info,
+            )
 
     # Create bin_advantages list
-    bin_advantages = []
-    for seq_indices in packing_info.bin_seq_indices:
-        if seq_indices:
-            bin_advantages.append(global_advantages[seq_indices])
-        else:
-            bin_advantages.append(
-                torch.tensor([], dtype=global_advantages.dtype, device=global_advantages.device)
-            )
+    with nvtx_range("rl/sequence-packing/bin-advantages", log_level=2):
+        bin_advantages = []
+        for seq_indices in packing_info.bin_seq_indices:
+            if seq_indices:
+                bin_advantages.append(global_advantages[seq_indices])
+            else:
+                bin_advantages.append(
+                    torch.tensor([], dtype=global_advantages.dtype, device=global_advantages.device)
+                )
 
     # Pre-compute all PackedSeqParams for all bins ONCE to avoid repeated
     # tensor allocations that cause CUDA memory fragmentation and periodic spikes
     # Create a temporary packing context to pass to create_packed_seq_params
-    cached_packed_seq_params = [
-        create_packed_seq_params_for_bin(
-                packing_info=packing_info,
-                bin_idx=bin_idx,
-                bin_size=bin_size,
-                device=packed_trajs.device,
-            ) for bin_idx in range(len(packed_trajs))
-    ]
+    with nvtx_range("rl/sequence-packing/create-seq-params", log_level=2):
+        cached_packed_seq_params = [
+            create_packed_seq_params_for_bin(
+                    packing_info=packing_info,
+                    bin_idx=bin_idx,
+                    bin_size=bin_size,
+                    device=packed_trajs.device,
+                ) for bin_idx in range(len(packed_trajs))
+        ]
 
     # Create the final PackingContext
     packing_context = PackingContext(

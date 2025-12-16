@@ -225,7 +225,7 @@ class Timers:
         self._timers = {}
         self._log_levels = {}
         self._dummy_timer = DummyTimer()
-        self._max_log_level = 2
+        self._max_log_level = 3
 
     def __call__(self, name, log_level=None):
         """Call timer with name and log level."""

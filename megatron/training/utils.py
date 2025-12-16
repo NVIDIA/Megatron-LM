@@ -667,26 +667,44 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
 
 
 def get_nvtx_range():
-    """Create an NVTX range context manager."""
+    """Create an NVTX range context manager.
+    
+    Returns a context manager that can be used as:
+        nvtx_range = get_nvtx_range()
+        with nvtx_range("operation-name", log_level=1):
+            # code to profile
+    
+    Args:
+        msg: Name for the NVTX range and timer.
+        log_level: Timer log level (default=0 logs always, higher values are finer-grained).
+                   When log_level is not None, timing is automatically enabled.
+        time: Deprecated. Use log_level instead. If True and log_level is None, uses log_level=0.
+    """
     try:
         from torch.cuda import nvtx
 
         @contextmanager
-        def nvtx_range(msg, time=False):
-            if time:
+        def nvtx_range(msg, log_level=None, time=False):
+            # Determine if timing should be enabled
+            # log_level takes precedence; if specified, timing is enabled
+            # time=True is kept for backwards compatibility (uses log_level=0)
+            enable_timing = log_level is not None or time
+            effective_log_level = log_level if log_level is not None else 0
+            
+            if enable_timing:
                 timers = get_timers()
-                timers(msg, log_level=0).start()
+                timers(msg, log_level=effective_log_level).start()
             try:
                 nvtx.range_push(msg)
                 yield
             finally:
                 nvtx.range_pop()
-                if time:
-                    timers(msg, log_level=0).stop()
+                if enable_timing:
+                    timers(msg, log_level=effective_log_level).stop()
 
         return nvtx_range
     except:
         @contextmanager
-        def dummy_range(msg):
+        def dummy_range(msg, log_level=None, time=False):
             yield
         return dummy_range

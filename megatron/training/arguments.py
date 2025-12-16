@@ -1908,7 +1908,7 @@ def _add_logging_args(parser):
                        'number of floating-point operations) to progress.txt file in checkpoint '
                        'directory.')
     group.add_argument('--timing-log-level', type=int,
-                       default=0, choices=range(0,3),
+                       default=0, choices=range(0,4),
                        help='Granularity level to measure and report timing. '
                        '   0: report only iteration time and make sure timing '
                        '      does not introduce extra overhead.'
@@ -1917,6 +1917,8 @@ def _add_logging_args(parser):
                        '      each iteration (such as gradient all-reduce) '
                        '   2: report timing for operations that migh be '
                        '      executed numerous times during each iteration. '
+                       '   3: report timing for fine-grained operations '
+                       '      (e.g., individual kernel-level operations). '
                        'Note that setting the level to 1 or 2 might '
                        'cause increase in iteration time.')
     group.add_argument('--log-energy', action='store_true',

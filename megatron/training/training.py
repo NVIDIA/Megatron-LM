@@ -1563,14 +1563,112 @@ def training_log(
         ])
     # Add timers from RL loop if needed.
     if getattr(args, 'perform_rl_step', False):
-        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
-                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
-                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
-                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
-                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
-                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
-                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
-                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
+        # Level 1 RL timers - high-level phases
+        if args.timing_log_level >= 1:
+            timers_to_log.extend([
+                # Rollout collection phase
+                'rl/rollout-collection',
+                'rl/rollout-collection/generate',
+                'rl/rollout-collection/sync',
+                # Inference mode transitions
+                'rl/inference-mode/setup',
+                'rl/inference-mode/suspend',
+                'rl/inference-mode/resume',
+                'rl/inference-mode/offload-optimizer',
+                'rl/inference-mode/onload-optimizer',
+                'rl/inference-mode/offload-kv-cache',
+                'rl/inference-mode/onload-kv-cache',
+                'rl/inference-mode/cuda-graphs-on',
+                'rl/inference-mode/cuda-graphs-off',
+                'rl/inference-mode/build-cuda-graphs',
+                'rl/inference-mode/wait-decode-only',
+                'rl/inference-mode/get-interface',
+                # Data preparation phase
+                'rl/prepare-data',
+                'rl/prepare-data/group-stats',
+                'rl/prepare-data/advantages',
+                'rl/prepare-data/trajectories',
+                'rl/prepare-data/dataloader',
+                # Sequence packing
+                'rl/sequence-packing',
+                'rl/sequence-packing/pack-sequences',
+                'rl/sequence-packing/regather',
+                # Logprobs computation
+                'rl/compute-logprobs',
+                'rl/compute-logprobs/old',
+                'rl/compute-logprobs/old/from-inference',
+                'rl/compute-logprobs/ref',
+                # Post-logprobs processing
+                'rl/pack-logprobs',
+                'rl/align-logprobs',
+                'rl/log-metrics',
+            ])
+        # Level 2 RL timers - finer-grained operations
+        if args.timing_log_level >= 2:
+            timers_to_log.extend([
+                # Inference interface
+                'rl/inference-mode/get-interface/launch',
+                'rl/rollout-collection/create-agent',
+                'rl/rollout-collection/create-request',
+                # Data preparation
+                'rl/prepare-data/split-dp',
+                'rl/prepare-data/trajectories/loop',
+                'rl/prepare-data/trajectories/to-tensor',
+                # Logprobs computation details
+                'rl/compute-logprobs/get-logprobs',
+                'rl/compute-logprobs/get-logprobs/forward',
+                'rl/compute-logprobs/get-logprobs/log-softmax',
+                'rl/compute-logprobs/batch/loop',
+                'rl/compute-logprobs/batch/concat',
+                'rl/compute-logprobs/batch/broadcast',
+                'rl/compute-logprobs/batch/to-cpu',
+                # Reference logprobs
+                'rl/compute-logprobs/ref/save-state',
+                'rl/compute-logprobs/ref/load-ref-state',
+                'rl/compute-logprobs/ref/forward',
+                'rl/compute-logprobs/ref/restore-state',
+                'rl/compute-logprobs/ref/gc',
+                # Packing operations
+                'rl/sequence-packing/allgather/trajs',
+                'rl/sequence-packing/allgather/logprobs',
+                'rl/sequence-packing/allgather/masks',
+                'rl/sequence-packing/binpack',
+                'rl/sequence-packing/distribute',
+                'rl/sequence-packing/bin-advantages',
+                'rl/sequence-packing/create-seq-params',
+                'rl/pack-logprobs/to-cuda',
+                'rl/pack-logprobs/pack-inference',
+                'rl/pack-logprobs/compute-stats',
+                'rl/pack-logprobs/store-inference',
+                # Alignment
+                'rl/align-logprobs/total',
+                # GRPO loss
+                'rl/grpo-loss',
+            ])
+        # Level 3 RL timers - most detailed operations
+        if args.timing_log_level >= 3:
+            timers_to_log.extend([
+                # Logprobs batch details
+                'rl/compute-logprobs/batch/forward',
+                'rl/compute-logprobs/selective-log-softmax',
+                'rl/compute-logprobs/selective-log-softmax/fp32',
+                'rl/compute-logprobs/selective-log-softmax/bf16',
+                # Alignment details
+                'rl/align-logprobs/clone',
+                'rl/align-logprobs/loop',
+                'rl/align-logprobs/mask',
+                'rl/align-logprobs/stats',
+                # GRPO loss details
+                'rl/grpo-loss/ratios',
+                'rl/grpo-loss/advantages',
+                'rl/grpo-loss/kl-entropy',
+                'rl/grpo-loss/is-weights',
+                'rl/grpo-loss/final',
+                # Packing details
+                'rl/pack-logprobs/pack-inference/alloc',
+                'rl/pack-logprobs/pack-inference/mapping',
+                'rl/pack-logprobs/pack-inference/loop',
+            ])
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -1833,12 +1931,6 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
-def force_param_sync(model_chunks: list[DDP]) -> None:
-    for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
-        model_chunk.start_param_sync(force_sync=True)
-
-
 def save_checkpoint_and_time(
     iteration,
     model,
@@ -1864,7 +1956,7 @@ def save_checkpoint_and_time(
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
-        force_param_sync(model)
+        disable_forward_pre_hook(model)
     save_checkpoint(
         iteration,
         model,
@@ -1881,6 +1973,8 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
+    if should_disable_forward_pre_hook(args):
+        enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
 
@@ -2106,7 +2200,9 @@ def train(
                 and getattr(args, "use_torch_fsdp2", False)
                 and args.ckpt_format == "torch_dist",
             )
-        ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+        # Keep reference state dict on GPU for faster state swap during training
+        # This uses more GPU memory but avoids CPU<->GPU transfers (~1s savings per iteration)
+        ref_state_dict = {k: (v.clone() if v is not None else v) for k, v in model[0].state_dict().items()}
 
         # Reload RL training checkpoint weights
         args.load = load
