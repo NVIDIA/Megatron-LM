@@ -585,7 +585,8 @@ def main():
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric
-            json_results["throughput"] = throughputs
+            if args.record_throughput:
+                json_results["throughput"] = throughputs
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
