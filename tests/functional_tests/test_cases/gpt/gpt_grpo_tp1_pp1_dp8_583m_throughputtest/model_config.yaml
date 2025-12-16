@@ -47,7 +47,6 @@ MODEL_ARGS:
   --seed: 42
   --calculate-per-token-loss: true
   --rl-use-sequence-packing: true
-  --rl-sequence-packing-bin-size: 8192
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
   --timing-log-level: 1
