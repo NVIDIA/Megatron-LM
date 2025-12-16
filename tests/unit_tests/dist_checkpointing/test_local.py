@@ -82,6 +82,7 @@ class TestLocalCheckpointing:
         iteration = None
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
         metadata = {'distrib_optim_sharding_type': 'fully_reshardable', 'dp_cp_group': dp_cp_group}
+        model_sd_kwargs = dict(metadata={'dp_cp_group': dp_cp_group})
         optim_sd_kwargs = dict(metadata=metadata)
         mock_args = parse_args(ignore_unknown_args=True)
         mock_args.no_save_optim = False
