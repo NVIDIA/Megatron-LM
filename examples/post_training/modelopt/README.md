@@ -1,9 +1,9 @@
 <div align="center">
 
-# TensorRT Model Optimizer Integrated Examples
+# Model Optimizer Integrated Examples
 
 
-[TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) |
+[Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) |
 [Local Examples](#getting-started-in-a-local-environment) |
 [Configuration](./ADVANCED.md#advanced-configuration) |
 [Slurm Examples](./ADVANCED.md#slurm-examples) |
@@ -12,7 +12,7 @@
 
 </div>
 
-[TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) (**ModelOpt**, `nvidia-modelopt`)
+[Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) (**ModelOpt**, `nvidia-modelopt`)
 provides end-to-end model optimization for NVIDIA hardware including quantization (real or simulated),
 knowledge distillation, pruning, speculative decoding, and more.
 
@@ -42,7 +42,7 @@ Install `nvidia-modelopt` from [PyPI](https://pypi.org/project/nvidia-modelopt/)
 ```sh
 pip install -U nvidia-modelopt
 ```
-Alternatively, you can install from [source](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+Alternatively, you can install from [source](https://github.com/NVIDIA/Model-Optimizer)
 to try our latest features.
 
 > **❗ IMPORTANT:** The first positional argument (e.g. `meta-llama/Llama-3.2-1B-Instruct`) of each script
@@ -102,9 +102,52 @@ deployment.
 
 See [Adanvanced Topics](./ADVANCED.md) for a `moonshotai/Kimi-K2-Instruct` EAGLE3 training example using `slurm`.
 
+### ⭐ Offline BF16 EAGLE3 Training
+Unlike online EAGLE3 training, offline workflow precomputes target model `hidden_states` and dumps to disk.
+Then only the draft model is called during training. AL is no longer reported during training. After training,
+`export.sh` is used to export EAGLE3 checkpoint.
+
+```sh
+\
+    # Convert to online eagle3 model for base model feature extraction
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3 \
+    MLM_EXTRA_ARGS="--algorithm eagle3" \
+    ./convert.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    # Dump base model feature to disk
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3 \
+    MLM_EXTRA_ARGS="--output-dir /tmp/offline_data" \
+    ./offline_feature_extrach.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    # Convert to offline eagle3 model
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3-offline \
+    MLM_EXTRA_ARGS="--algorithm eagle3 --export-offline-model" \
+    ./convert.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    # Train the offline eagle3 model using extracted features
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3-offline \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3-offline \
+    MLM_EXTRA_ARGS="--export-offline-model --offline-distillation-data /tmp/offline_data" \
+    ./finetune.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    # Export the trained eagle3 checkpoint
+    PP=1 \
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3-offline \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Eagle3-Export \
+    MLM_EXTRA_ARGS="--export-offline-model" \
+    ./export.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
 ### ⭐ Pruning
 
-Checkout pruning getting started section and guidelines for configuring pruning parameters in the [ModelOpt pruning README](https://github.com/NVIDIA/TensorRT-Model-Optimizer/tree/main/examples/pruning).
+Checkout pruning getting started section and guidelines for configuring pruning parameters in the [ModelOpt pruning README](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning).
 
 Pruning is supported for GPT and Mamba models in Pipeline Parallel mode. Available pruning dimensions are:
 

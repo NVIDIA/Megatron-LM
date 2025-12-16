@@ -76,6 +76,7 @@ class BertModel(LanguageModule):
         return_embeddings=False,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super(BertModel, self).__init__(config=config, pg_collection=pg_collection)
 

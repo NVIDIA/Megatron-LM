@@ -28,7 +28,7 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_tensor_model_parallel_src_rank
+from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, get_tensor_model_parallel_world_size
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
@@ -55,6 +55,9 @@ from megatron.training.global_vars import (
 )
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -732,7 +735,8 @@ def selective_log_softmax(logits, index):
         `torch.Tensor`:
             Gathered log probabilities with the same shape as `index`.
     """
-    if logits.dtype in [torch.float32, torch.float64]:
+    use_bik_logsoftmax = is_batch_invariant_mode_enabled()
+    if logits.dtype in [torch.float32, torch.float64] and not use_bik_logsoftmax:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption
         logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
@@ -793,7 +797,30 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False, pac
                     # No real tokens, skip packed path
                     packed_seq_params = None
                 else:
-                    # Slice inputs to remove padding
+                    # When sequence parallelism is enabled, the sequence length must be 
+                    # divisible by the tensor parallel world size for reduce-scatter ops
+                    if model.config.sequence_parallel:
+                        tp_world_size = get_tensor_model_parallel_world_size()
+                        if actual_len % tp_world_size != 0:
+                            actual_len = ((actual_len + tp_world_size - 1) // tp_world_size) * tp_world_size
+                            # Update cu_seqlens to match the padded length.
+                            # The last entry of cu_seqlens must equal the tensor's sequence dimension.
+                            # Without this, TE attention/rotary ops see mismatched dimensions.
+                            if packed_seq_params.cu_seqlens_q[-1].item() != actual_len:
+                                # Clone to avoid modifying cached params
+                                new_cu_seqlens = packed_seq_params.cu_seqlens_q.clone()
+                                new_cu_seqlens[-1] = actual_len
+                                packed_seq_params = PackedSeqParams(
+                                    qkv_format=packed_seq_params.qkv_format,
+                                    cu_seqlens_q=new_cu_seqlens,
+                                    cu_seqlens_kv=new_cu_seqlens,
+                                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                                    cu_seqlens_kv_padded=packed_seq_params.cu_seqlens_kv_padded,
+                                    max_seqlen_q=packed_seq_params.max_seqlen_q,
+                                    max_seqlen_kv=packed_seq_params.max_seqlen_kv,
+                                )
+                    
+                    # Slice inputs to remove padding (or pad if needed for SP alignment)
                     # dimension 0 is batch, with seq packing BS=1
                     tokens = tokens[:, :actual_len]
                     position_ids = position_ids[:, :actual_len]
@@ -1817,8 +1844,6 @@ def prepare_data_for_update(
                 # Store packed inference logprobs in packing context
                 packing_context['packed_inference_logprobs'] = packed_inference_logprobs.cuda()
                 packing_context['has_inference_logprobs'] = True
-
-        # TODO(vitalyk): add a test for prepare_data_for_update.
 
         with torch.no_grad(), nvtx_range("compute_ref_logprobs"):
             # We need to load the ref model state dict and compute the logprobs for the ref model
