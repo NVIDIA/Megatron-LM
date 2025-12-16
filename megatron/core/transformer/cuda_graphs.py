@@ -1286,16 +1286,16 @@ class CudaGraphManager(torch.nn.Module):
                     runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
             else:
                 # Todo: For training, we could also cache runners based on input shape.
-                runner = None
-                for r in self.cudagraph_runners:
-                    if self.need_backward and torch.is_grad_enabled():
-                        if r.status == _GraphStatus.FWD_READY and r.grad_enabled == True and not r.get_mismatch_errors(args, kwargs):
-                            runner = r
-                    else:
-                        # if not training, we dont expect any backward passes to run, so doesnt matter if runner was created
-                        # with autograd or not
-                        if r.status == _GraphStatus.FWD_READY and not r.get_mismatch_errors(args, kwargs):
-                            runner = r
+                # If autograd is currently disabled, it doesnt matter if a runner was created 
+                # with or without autograd, so just get the first fwd ready runner.
+                require_grad = self.need_backward and torch.is_grad_enabled()
+                def is_valid(r):
+                    return (r.status == _GraphStatus.FWD_READY and 
+                            not r.get_mismatch_errors(args, kwargs) and 
+                            (not require_grad or r.grad_enabled))
+                # We must choose the first available runner, as the order of 
+                # self.cudagraph_runners corresponds to the capture order.
+                runner = next((r for r in self.cudagraph_runners if is_valid(r)), None)
 
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
