@@ -25,6 +25,7 @@ class InferenceBatchDimensions:
         token_count : number of total input tokens
         prefill_req_count : number of prefill requests
         decode_req_count : number of decode requests
+        has_explicit_chunked_prefill_req : whether the batch has an explicit chunked prefill request
 
     The batch dimensions are ordered by token_count, then by prefill_req_count,
     then by decode_req_count.
@@ -34,6 +35,7 @@ class InferenceBatchDimensions:
     token_count: int = 0
     prefill_req_count: int = 0
     decode_req_count: int = 0
+    has_explicit_chunked_prefill_req: bool = False
 
     def __str__(self):
         """
@@ -53,6 +55,9 @@ class InferenceBatchDimensions:
         for prefill or decode requests. Otherwise, prefill slots
         can only be used for prefill requests.
         """
+        if real_batch_dim.has_explicit_chunked_prefill_req != self.has_explicit_chunked_prefill_req:
+            return False
+
         if real_batch_dim.prefill_req_count == 0:
             return (
                 self.token_count >= real_batch_dim.token_count
@@ -99,6 +104,10 @@ class InferenceBatchDimensions:
         if self.token_count > self.prefill_req_count * max_sequence_length + self.decode_req_count:
             return False
 
+        # Check if there is an invalid chunked prefill request.
+        if self.prefill_req_count == 0 and self.has_explicit_chunked_prefill_req:
+            return False
+
         return True
 
     def __hash__(self):
@@ -106,7 +115,14 @@ class InferenceBatchDimensions:
         Returns a hash of the batch dimension.
         In cuda graph quick matching, the batch dimension is used as a key in a dictionary.
         """
-        return hash((self.token_count, self.prefill_req_count, self.decode_req_count))
+        return hash(
+            (
+                self.token_count,
+                self.prefill_req_count,
+                self.decode_req_count,
+                self.has_explicit_chunked_prefill_req,
+            )
+        )
 
     def __eq__(self, other: "InferenceBatchDimensions") -> bool:
         """
@@ -114,10 +130,16 @@ class InferenceBatchDimensions:
         """
         if other is None:
             return False
-        return (self.token_count, self.prefill_req_count, self.decode_req_count) == (
+        return (
+            self.token_count,
+            self.prefill_req_count,
+            self.decode_req_count,
+            self.has_explicit_chunked_prefill_req,
+        ) == (
             other.token_count,
             other.prefill_req_count,
             other.decode_req_count,
+            other.has_explicit_chunked_prefill_req,
         )
 
     @property
@@ -279,6 +301,8 @@ class CUDAGraphBatchDimensionBuilder:
             max_tokens: Maximum total tokens
             max_sequence_length: Maximum sequence length
             use_cuda_graphs_for_non_decode_steps: Whether to use CUDA graphs for non-decode steps
+            requires_explicit_chunked_prefill_req: Whether the model requires an explicit chunked
+                prefill request
 
         Returns:
             Tuple containing:

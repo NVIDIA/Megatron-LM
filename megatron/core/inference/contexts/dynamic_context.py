@@ -1221,10 +1221,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         if construct_graph_dimensions is not None:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
+        has_explicit_chunked_prefill_req = (
+            self.chunked_prefill_request_id != -1 and self.is_hybrid_model
+        )
+
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
             decode_req_count=self.num_decode_requests,
+            has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
@@ -1258,6 +1263,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
                 decode_req_count=padded_decode_req_count,
+                has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
             )
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
@@ -1296,6 +1302,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     token_count=batch_dimensions.token_count,
                     prefill_req_count=adjusted_prefill_req_count,
                     decode_req_count=adjusted_decode_req_count,
+                    has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
                 )
 
         self.active_attn_metadata["mha_metadata"].update(

@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
@@ -43,6 +45,7 @@ def _tensor_merge_kernel(
     ROW_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     OUTPUT_BATCH_SIZE: tl.constexpr,
+    IS_INPLACE: tl.constexpr,
 ):
     """
     Kernel to merge rows from tensor_a and tensor_b into output_tensor.
@@ -55,14 +58,15 @@ def _tensor_merge_kernel(
     pos_on_device = tl.load(POS_ON_DEVICE)
 
     if pid < pos_on_device:
-        row_offsets = tl.arange(0, BLOCK_SIZE)
-        row_mask = row_offsets < ROW_SIZE
+        if not IS_INPLACE:
+            row_offsets = tl.arange(0, BLOCK_SIZE)
+            row_mask = row_offsets < ROW_SIZE
 
-        tensor_a_ptr = TENSOR_A + pid * ROW_SIZE + row_offsets
-        output_ptr = OUTPUT_TENSOR + pid * ROW_SIZE + row_offsets
+            tensor_a_ptr = TENSOR_A + pid * ROW_SIZE + row_offsets
+            output_ptr = OUTPUT_TENSOR + pid * ROW_SIZE + row_offsets
 
-        tensor_a_data = tl.load(tensor_a_ptr, mask=row_mask, other=0.0)
-        tl.store(output_ptr, tensor_a_data, mask=row_mask)
+            tensor_a_data = tl.load(tensor_a_ptr, mask=row_mask, other=0.0)
+            tl.store(output_ptr, tensor_a_data, mask=row_mask)
 
     elif pid < pos_on_device + TENSOR_B_BATCH_SIZE and pid < OUTPUT_BATCH_SIZE:
         tensor_b_idx = pid - pos_on_device
@@ -291,15 +295,23 @@ def tensor_get_slice_after(input_tensor, output_tensor, pos_on_device, check_bou
         )
 
 
-def tensor_merge(tensor_a, tensor_b, output_tensor, pos_on_device, check_bounds: bool = False):
+def tensor_merge(
+    tensor_a: torch.Tensor,
+    tensor_b: torch.Tensor,
+    pos_on_device: torch.Tensor,
+    output_tensor: Optional[torch.Tensor] = None,
+    check_bounds: bool = False,
+):
     """
-    Merge tensor_a and tensor_b into output_tensor.
+    Merge tensor_a and tensor_b.
 
-    The operation performed is:
-        output[:pos_on_device] = tensor_a[:pos_on_device]
-        output[pos_on_device:pos_on_device + tensor_b_batch] = tensor_b[:tensor_b_batch]
-    Remaining rows in output_tensor are left unchanged.
+    If output_tensor is None, the operation is performed in-place on tensor_a.
     """
+
+    is_inplace = False
+    if output_tensor is None:
+        output_tensor = tensor_a
+        is_inplace = True
 
     assert (
         tensor_a.device == tensor_b.device == output_tensor.device
@@ -347,6 +359,7 @@ def tensor_merge(tensor_a, tensor_b, output_tensor, pos_on_device, check_bounds:
         ROW_SIZE=row_size,
         BLOCK_SIZE=block_size,
         OUTPUT_BATCH_SIZE=output_batch_size,
+        IS_INPLACE=is_inplace,
     )
 
 
