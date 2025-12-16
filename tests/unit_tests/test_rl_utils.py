@@ -320,7 +320,7 @@ def test_grpo_loss_truncation():
     torch.testing.assert_close(truncated_from_below, torch.tensor([[False, True], [False, False]]))
 
 
-@pytest.mark.skipif(True)
+@pytest.mark.skipif(True, reason="broken")
 def test_prepare_data_for_update():
     """Test that getting logprobs at least does not crash."""
     Utils.initialize_model_parallel()
