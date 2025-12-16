@@ -1,74 +1,74 @@
 {
   "deepseek_a2a_tp1ep8_bf16": {
-    "backward_ms": 10.452603197097778,
-    "forward_ms": 6.942623972892761,
+    "backward_ms": 10.473561668395996,
+    "forward_ms": 7.0397583723068236,
     "max_allocated_bytes": 3443356672,
     "max_regression_ratio": 1.02
   },
   "deepseek_a2a_tp1ep8_fp8": {
-    "backward_ms": 10.08771367073059,
-    "forward_ms": 7.413806390762329,
-    "max_allocated_bytes": 4413234688,
+    "backward_ms": 10.169206380844116,
+    "forward_ms": 7.509294438362121,
+    "max_allocated_bytes": 4414536806.4,
     "max_regression_ratio": 1.02
   },
   "deepseek_deepep_tp1ep8_bf16": {
-    "backward_ms": 9.059416055679321,
-    "forward_ms": 5.424827194213867,
+    "backward_ms": 9.087572860717774,
+    "forward_ms": 5.552492833137512,
     "max_allocated_bytes": 2445289472,
     "max_regression_ratio": 1.02
   },
   "deepseek_deepep_tp1ep8_fp8": {
-    "backward_ms": 8.589135932922364,
-    "forward_ms": 5.840974426269531,
-    "max_allocated_bytes": 3706644992,
+    "backward_ms": 8.65613431930542,
+    "forward_ms": 5.939857602119446,
+    "max_allocated_bytes": 3707643392,
     "max_regression_ratio": 1.02
   },
   "deepseek_hybridep_tp1ep8_bf16": {
-    "backward_ms": 8.845854425430298,
-    "forward_ms": 5.245569634437561,
-    "max_allocated_bytes": 2424111104,
+    "backward_ms": 8.81708312034607,
+    "forward_ms": 5.304497575759887,
+    "max_allocated_bytes": 2424370688,
     "max_regression_ratio": 1.02
   },
   "deepseek_hybridep_tp1ep8_fp8": {
-    "backward_ms": 7.715760040283203,
-    "forward_ms": 5.0010079622268675,
-    "max_allocated_bytes": 2651694080,
+    "backward_ms": 7.765577578544617,
+    "forward_ms": 5.046940803527832,
+    "max_allocated_bytes": 2651921408,
     "max_regression_ratio": 1.02
   },
   "mixtral_a2a_tp1ep8_bf16": {
-    "backward_ms": 7.825059199333191,
-    "forward_ms": 4.261713600158691,
+    "backward_ms": 7.71897599697113,
+    "forward_ms": 4.254391932487488,
     "max_allocated_bytes": 2890097664,
     "max_regression_ratio": 1.02
   },
   "mixtral_a2a_tp1ep8_fp8": {
-    "backward_ms": 6.719020819664001,
-    "forward_ms": 3.6756880044937135,
+    "backward_ms": 6.662894439697266,
+    "forward_ms": 3.7415760159492493,
     "max_allocated_bytes": 3096232960,
     "max_regression_ratio": 1.02
   },
   "mixtral_deepep_tp1ep8_bf16": {
-    "backward_ms": 8.030219149589538,
-    "forward_ms": 4.609353613853455,
-    "max_allocated_bytes": 2890296832,
+    "backward_ms": 7.892449617385864,
+    "forward_ms": 4.589172744750977,
+    "max_allocated_bytes": 2890526208,
     "max_regression_ratio": 1.02
   },
   "mixtral_deepep_tp1ep8_fp8": {
-    "backward_ms": 6.941707181930542,
-    "forward_ms": 4.02881760597229,
-    "max_allocated_bytes": 3095940608,
+    "backward_ms": 6.8890015363693236,
+    "forward_ms": 4.082740831375122,
+    "max_allocated_bytes": 3096104448,
     "max_regression_ratio": 1.02
   },
   "mixtral_hybridep_tp1ep8_bf16": {
-    "backward_ms": 7.8396320104598995,
-    "forward_ms": 4.41397442817688,
-    "max_allocated_bytes": 2890020864,
+    "backward_ms": 7.757384014129639,
+    "forward_ms": 4.282412815093994,
+    "max_allocated_bytes": 2890438758.4,
     "max_regression_ratio": 1.02
   },
   "mixtral_hybridep_tp1ep8_fp8": {
-    "backward_ms": 6.641488075256348,
-    "forward_ms": 3.7378703594207763,
-    "max_allocated_bytes": 3095500800,
+    "backward_ms": 6.5844896078109745,
+    "forward_ms": 3.63133282661438,
+    "max_allocated_bytes": 3096400896,
     "max_regression_ratio": 1.02
   }
 }
