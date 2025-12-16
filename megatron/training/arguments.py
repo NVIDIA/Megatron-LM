@@ -3115,6 +3115,8 @@ def _add_vision_args(parser):
                        help='Whether to layer normalize the q and k attention embeddings.')
     group.add_argument('--qk-l2-norm', action='store_true',
                        help='Use llama 4 qk l2 norm')
+    group.add_argument('--post-mlp-layernorm', action='store_true',
+                       help='Whether to layer normalize the output of the MLP.')
 
     return parser
 

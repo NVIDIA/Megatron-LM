@@ -130,6 +130,7 @@ def get_gpt_layer_with_inference_spec(
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=IdentityOp,
                 mlp=mlp,
+                post_mlp_layernorm=IdentityOp,
                 mlp_bda=get_bias_dropout_add,
             ),
         )
@@ -156,6 +157,7 @@ def get_gpt_layer_with_inference_spec(
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=IdentityOp,
                 mlp=mlp,
+                post_mlp_layernorm=IdentityOp,
                 mlp_bda=get_bias_dropout_add,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
@@ -180,7 +182,8 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
-) -> ModuleSpec:
+    post_mlp_layernorm: bool = False,
+    ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
 
@@ -194,7 +197,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
         use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
                                           enable certain operation fusions. Defaults to False.
-
+        post_mlp_layernorm (bool, optional): To use layernorm for the output of the MLP. Defaults to False.
     Returns:
         ModuleSpec: Module specification with TE modules
 
@@ -258,6 +261,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
+                post_mlp_layernorm=backend.layer_norm() if (num_experts and post_mlp_layernorm) else IdentityOp,
                 mlp_bda=get_bias_dropout_add,
             ),
         )
@@ -284,6 +288,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
+                post_mlp_layernorm=backend.layer_norm() if (num_experts and post_mlp_layernorm) else IdentityOp,
                 mlp_bda=get_bias_dropout_add,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
@@ -292,6 +297,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                     "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
                     "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
                     "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
+                    "post_mlp_layernorm.": "mlp.linear_fc2.layer_norm_",
                 },
             ),
         )
@@ -307,6 +313,7 @@ def get_gpt_layer_local_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -319,7 +326,7 @@ def get_gpt_layer_local_spec(
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
-
+        post_mlp_layernorm (bool, optional): To use layernorm for the output of the MLP. Defaults to False.
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
     """
@@ -374,6 +381,7 @@ def get_gpt_layer_local_spec(
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
+                post_mlp_layernorm=layer_norm if post_mlp_layernorm else IdentityOp,
                 mlp_bda=get_bias_dropout_add,
             ),
         )
@@ -400,10 +408,12 @@ def get_gpt_layer_local_spec(
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
+                post_mlp_layernorm=layer_norm if post_mlp_layernorm else IdentityOp,
                 mlp_bda=get_bias_dropout_add,
                 sharded_state_dict_keys_map={
                     "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
                     "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
+                    "post_mlp_layernorm.": "mlp.linear_fc2.layer_norm_",
                 },
             ),
         )
@@ -437,6 +447,7 @@ def get_mlp_module_spec(
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
     if fp8 is not None:
@@ -460,6 +471,7 @@ def get_mlp_module_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
+        post_mlp_layernorm=post_mlp_layernorm,
     )
 
 
@@ -470,6 +482,7 @@ def get_mlp_module_spec_for_backend(
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
 
@@ -498,6 +511,7 @@ def get_mlp_module_spec_for_backend(
             moe_grouped_gemm=moe_grouped_gemm,
             moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
             use_te_activation_func=use_te_activation_func,
+            post_mlp_layernorm=post_mlp_layernorm,
         )
 
 
@@ -508,6 +522,7 @@ def get_gpt_decoder_block_spec(
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
+    post_mlp_layernorm: bool = False,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -521,6 +536,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            post_mlp_layernorm=post_mlp_layernorm,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -531,6 +547,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            post_mlp_layernorm=post_mlp_layernorm,
         )
     else:
         layer_norm_impl = LNImpl
@@ -543,6 +560,7 @@ def get_gpt_decoder_block_spec(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            post_mlp_layernorm=post_mlp_layernorm,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -553,6 +571,7 @@ def get_gpt_decoder_block_spec(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            post_mlp_layernorm=post_mlp_layernorm,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
