@@ -501,12 +501,12 @@ class TextGenerationController:
         # for prefill turn off symmetric kernels
         symmetric_ar_type = model_config.symmetric_ar_type
         nccl_all_reduce_for_prefill = inference_wrapper_config.nccl_all_reduce_for_prefill
-        # Turning on/off MoE padding for prefill
+        # Turning on/off MoE padding for cuda-graphs
         moe_pad_experts_for_cuda_graph_inference = (
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
-            if context.is_decode_only():
+            if context.using_cuda_graph_this_step():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
             else:
@@ -750,6 +750,35 @@ class TextGenerationController:
                     top_n_results[req_idx] = top_n_per_token
 
         return top_n_results if top_n_results else None
+
+    def dummy_forward(self):
+        """Perform a dummy forward pass. This is used in expert model parallelism
+        on ranks that do not have any real requests."""
+
+        context = self.inference_wrapped_model.inference_context
+        # if no cuda graphs, directly use dummy forward
+        if not context.cuda_graph_batch_dimensions_list:
+            return self.inference_wrapped_model.dummy_forward()
+
+        # attempt to use cuda-graph if possible
+        # here we try to reuse the cuda-graph warmup code to run
+        # a dummy cuda graph.
+        input_ids, position_ids = self._dynamic_step_context_init(
+            # try to use the smallest cuda-graph config for dummy forward
+            construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list)
+        )
+
+        # _dynamic_step_context_init tries to find a cuda-graph that is compatible
+        # with all EP ranks. It can also return no match, in which case
+        # we run in eager mode.
+
+        if context.using_cuda_graph_this_step():
+            # we found a cuda-graph to run
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+        else:
+            # fallback to eager dummy forward
+            self.inference_wrapped_model.dummy_forward()
+        context.reset()
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
