@@ -25,7 +25,7 @@ jobs:
       should_skip: ${{ steps.check_files.outputs.should_skip }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
       
@@ -100,12 +100,12 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0  # Need full history to access baseline ref
       
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       
@@ -249,7 +249,7 @@ jobs:
     if: always() && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Validate workflow result
         shell: bash -x -e -u -o pipefail {0}
