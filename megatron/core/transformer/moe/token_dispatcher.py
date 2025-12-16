@@ -67,7 +67,7 @@ class MoETokenDispatcher:
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
         # Whether to use NCCL stream for A2A communication, otherwise default stream is used.
-        self.use_nccl_stream = False # Will be set to True when shared_experts is set.
+        self.use_nccl_stream = False  # Will be set to True when shared_experts is set.
 
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
@@ -200,7 +200,6 @@ class MoETokenDispatcher:
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
         self.use_nccl_stream = True
-
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -1369,7 +1368,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 "Please set --moe-flex-dispatcher-backend=deepep or "
                 "--moe-flex-dispatcher-backend=hybridep"
             )
-
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
