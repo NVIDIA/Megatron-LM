@@ -13,7 +13,6 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.activations import squared_relu
-from megatron.core.backwards_compatibility_decorators import deprecated
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     LocalNonpersistentObject,
@@ -45,6 +44,7 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import deprecated
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
