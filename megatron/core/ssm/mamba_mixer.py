@@ -449,27 +449,62 @@ class MambaMixer(MegatronModule):
         token_count = padded_dims.token_count
         decode_req_count = padded_dims.decode_req_count
         prefill_req_count = padded_dims.prefill_req_count
+        has_explicit_chunked_prefill_req = padded_dims.has_explicit_chunked_prefill_req
 
+        # Input projection
         zxBCdt, _ = self.in_proj(hidden_states)
 
         if decode_req_count > 0 and prefill_req_count == 0:
+            # Decode-only
             y = self.ssm_decode(
                 zxBCdt.transpose(0, 1),
                 conv_state,
                 ssm_state,
                 context.mamba_metadata.batch_indices_decode,
             ).transpose(0, 1)
-        elif decode_req_count == 0 and prefill_req_count > 0:
-            y = self.ssm_prefill(
-                zxBCdt,
-                conv_state=conv_state,
-                ssm_state=ssm_state,
-                seq_idx=context.mamba_metadata.seq_idx,
-                cu_seqlens=context.mamba_metadata.cu_seqlens,
-                return_varlen_states=True,
-                batch_indices=context.mamba_metadata.batch_indices_prefill,
-            )
+        elif decode_req_count == 0 and (prefill_req_count > 0 or has_explicit_chunked_prefill_req):
+            if prefill_req_count > 0:
+                # Prefill only (regular prefill requests)
+                y_prefill = self.ssm_prefill(
+                    zxBCdt,
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    seq_idx=context.mamba_metadata.seq_idx,
+                    cu_seqlens=context.mamba_metadata.cu_seqlens,
+                    return_varlen_states=True,
+                    batch_indices=context.mamba_metadata.batch_indices_prefill,
+                )
+            if has_explicit_chunked_prefill_req:
+                # Prefill only (chunked prefill request)
+                zxBCdt_chunked_prefill = torch.empty_like(zxBCdt)
+                tensor_get_slice_after(
+                    zxBCdt,
+                    zxBCdt_chunked_prefill,
+                    context.mamba_metadata.device_chunked_prefill,
+                    check_bounds=False,
+                )
+                y_chunked_prefill = self.ssm_prefill(
+                    zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[1]],
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    batch_indices=context.mamba_metadata.batch_indices_chunked_prefill,
+                    is_chunked_prefill=True,
+                )
+            if prefill_req_count > 0 and has_explicit_chunked_prefill_req:
+                # Merge regular prefill and chunked prefill parts
+                # TODO(ksanthanam): Make this copy in-place
+                y = torch.empty_like(y_prefill)
+                tensor_merge(
+                    y_prefill, y_chunked_prefill, y, context.mamba_metadata.device_chunked_prefill
+                )
+            elif prefill_req_count > 0:
+                # Prefill-only without chunked prefill
+                y = y_prefill
+            else:
+                # Prefill-only with only chunked prefill
+                y = y_chunked_prefill
         else:
+            # Mix of decode and prefill
             zxBCdt_prefill = torch.empty_like(zxBCdt)
             tensor_get_slice_after(
                 zxBCdt,
@@ -477,21 +512,58 @@ class MambaMixer(MegatronModule):
                 context.mamba_metadata.device_decode_prefill,
                 check_bounds=False,
             )
+            # Decode requests
             y_decode = self.ssm_decode(
                 zxBCdt[:decode_req_count].transpose(0, 1),
                 conv_state,
                 ssm_state,
                 context.mamba_metadata.batch_indices_decode,
             ).transpose(0, 1)
-            y_prefill = self.ssm_prefill(
-                zxBCdt_prefill,
-                conv_state=conv_state,
-                ssm_state=ssm_state,
-                seq_idx=context.mamba_metadata.seq_idx,
-                cu_seqlens=context.mamba_metadata.cu_seqlens,
-                return_varlen_states=True,
-                batch_indices=context.mamba_metadata.batch_indices_prefill,
-            )
+            if prefill_req_count > 0:
+                # Regular prefill requests
+                y_prefill = self.ssm_prefill(
+                    zxBCdt_prefill,
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    seq_idx=context.mamba_metadata.seq_idx,
+                    cu_seqlens=context.mamba_metadata.cu_seqlens,
+                    return_varlen_states=True,
+                    batch_indices=context.mamba_metadata.batch_indices_prefill,
+                )
+            if has_explicit_chunked_prefill_req:
+                # Chunked prefill request
+                zxBCdt_chunked_prefill = torch.empty_like(zxBCdt_prefill)
+                tensor_get_slice_after(
+                    zxBCdt_prefill,
+                    zxBCdt_chunked_prefill,
+                    context.mamba_metadata.device_chunked_prefill,
+                    check_bounds=False,
+                )
+                y_chunked_prefill = self.ssm_prefill(
+                    zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[:1]],
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    batch_indices=context.mamba_metadata.batch_indices_chunked_prefill,
+                    is_chunked_prefill=True,
+                )
+            if prefill_req_count > 0 and has_explicit_chunked_prefill_req:
+                # Merge regular prefill and chunked prefill parts
+                # TODO(ksanthanam): Make this copy in-place
+                y_prefill_merged = torch.empty_like(y_prefill)
+                tensor_merge(
+                    y_prefill,
+                    y_chunked_prefill,
+                    y_prefill_merged,
+                    context.mamba_metadata.device_chunked_prefill,
+                )
+                y_prefill = y_prefill_merged
+            elif has_explicit_chunked_prefill_req:
+                # Chunked prefill only
+                y_prefill = y_chunked_prefill
+            else:
+                # Regular prefill only; y_prefill is already set, nothing more to be done
+                pass
+            # Merge decode and prefill parts
             y = torch.empty(
                 [token_count, 1, y_prefill.shape[-1]],
                 dtype=y_prefill.dtype,
@@ -499,7 +571,9 @@ class MambaMixer(MegatronModule):
             )
             tensor_merge(y_decode, y_prefill, y, context.mamba_metadata.device_decode_prefill)
 
+        # Output projection
         out, out_bias = self.out_proj(y)
+
         return out, out_bias
 
     def decode(
@@ -632,6 +706,7 @@ class MambaMixer(MegatronModule):
         )
 
         # Compute short convolution
+        initial_conv_state = None
         if conv_state is not None and is_dynamic_batching:
             # xBC should have shape (b l d) for causal_conv1d_varlen_states
             assert batch_indices is not None
@@ -646,7 +721,14 @@ class MambaMixer(MegatronModule):
         elif is_chunked_prefill:
             # Maintain channels-last memory layout to use initial_states for causal_conv1d_fn
             # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L200 # pylint: disable=line-too-long
+            assert batch_indices is not None
+            initial_conv_state = (
+                conv_state[batch_indices, :, 1:].permute(0, 2, 1).contiguous().transpose(1, 2)
+            )
             xBC = xBC.transpose(1, 2)
+            tensor_masked_update(
+                conv_state, batch_indices, F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
+            )
         else:
             # transpose: b l pd --> b pd l
             xBC = rearrange(xBC, "b l d -> b d l").contiguous()
@@ -662,12 +744,6 @@ class MambaMixer(MegatronModule):
             xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
         else:
             assert self.activation in ["silu", "swish"]
-            if is_chunked_prefill:
-                initial_conv_state = (
-                    conv_state[:, :, 1:].permute(0, 2, 1).contiguous().transpose(1, 2)
-                )
-            else:
-                initial_conv_state = None
             xBC = causal_conv1d_fn(
                 x=xBC,
                 weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
@@ -706,7 +782,7 @@ class MambaMixer(MegatronModule):
         ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
 
         if is_chunked_prefill:
-            initial_ssm_state = ssm_state
+            initial_ssm_state = ssm_state[batch_indices]
         else:
             initial_ssm_state = None
 
@@ -745,6 +821,10 @@ class MambaMixer(MegatronModule):
                 # See reference implementation:
                 # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
                 tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
+            elif is_chunked_prefill:
+                assert batch_indices is not None
+                y, last_state = y
+                tensor_masked_update(ssm_state, batch_indices, last_state)
             else:
                 y, last_state = y
                 ssm_state.copy_(last_state)

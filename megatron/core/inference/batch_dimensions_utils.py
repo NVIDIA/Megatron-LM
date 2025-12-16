@@ -21,6 +21,7 @@ class InferenceBatchDimensions:
         token_count : number of total input tokens
         prefill_req_count : number of prefill requests
         decode_req_count : number of decode requests
+        has_explicit_chunked_prefill_req : whether the batch has an explicit chunked prefill request
 
     The batch dimensions are ordered by token_count, then by prefill_req_count,
     then by decode_req_count.
@@ -30,6 +31,7 @@ class InferenceBatchDimensions:
     token_count: int = 0
     prefill_req_count: int = 0
     decode_req_count: int = 0
+    has_explicit_chunked_prefill_req: bool = False
 
     def __str__(self):
         """
@@ -49,6 +51,9 @@ class InferenceBatchDimensions:
         for prefill or decode requests. Otherwise, prefill slots
         can only be used for prefill requests.
         """
+        if real_batch_dim.has_explicit_chunked_prefill_req != self.has_explicit_chunked_prefill_req:
+            return False
+
         if real_batch_dim.prefill_req_count == 0:
             return (
                 self.token_count >= real_batch_dim.token_count
@@ -95,6 +100,10 @@ class InferenceBatchDimensions:
         if self.token_count > self.prefill_req_count * max_sequence_length + self.decode_req_count:
             return False
 
+        # Check if there is an invalid chunked prefill request.
+        if self.prefill_req_count == 0 and self.has_explicit_chunked_prefill_req:
+            return False
+
         return True
 
     def __hash__(self):
@@ -102,7 +111,14 @@ class InferenceBatchDimensions:
         Returns a hash of the batch dimension.
         In cuda graph quick matching, the batch dimension is used as a key in a dictionary.
         """
-        return hash((self.token_count, self.prefill_req_count, self.decode_req_count))
+        return hash(
+            (
+                self.token_count,
+                self.prefill_req_count,
+                self.decode_req_count,
+                self.has_explicit_chunked_prefill_req,
+            )
+        )
 
     def __eq__(self, other: "InferenceBatchDimensions") -> bool:
         """
@@ -110,10 +126,16 @@ class InferenceBatchDimensions:
         """
         if other is None:
             return False
-        return (self.token_count, self.prefill_req_count, self.decode_req_count) == (
+        return (
+            self.token_count,
+            self.prefill_req_count,
+            self.decode_req_count,
+            self.has_explicit_chunked_prefill_req,
+        ) == (
             other.token_count,
             other.prefill_req_count,
             other.decode_req_count,
+            other.has_explicit_chunked_prefill_req,
         )
 
     @property
@@ -199,6 +221,7 @@ class CUDAGraphBatchDimensionBuilder:
         max_tokens: int,
         max_sequence_length: int,
         use_cuda_graphs_for_non_decode_steps: bool,
+        requires_explicit_chunked_prefill_req: bool = False,
     ) -> Tuple[List[InferenceBatchDimensions], Optional[List[int]]]:
         """
         Generate CUDA graph batch dimensions.
@@ -216,6 +239,8 @@ class CUDAGraphBatchDimensionBuilder:
            - Mixed prefill+decode: (token_count, prefill_req_count, token_count - prefill_req_count)
            - Prefill-only:
              (token_count, max(prefill_req_count, ceil(token_count/(max_seq_len-1))), 0)
+        If the model requires explicit chunked prefill then we create different sets of prefill CUDA
+        graphs for the case with chunked prefill and the case without chunked prefill.
 
         Filtering Rules:
         1. Request limit: prefill_req_count + decode_req_count <= max_requests
@@ -235,6 +260,8 @@ class CUDAGraphBatchDimensionBuilder:
             max_tokens: Maximum total tokens
             max_sequence_length: Maximum sequence length
             use_cuda_graphs_for_non_decode_steps: Whether to use CUDA graphs for non-decode steps
+            requires_explicit_chunked_prefill_req: Whether the model requires an explicit chunked
+                prefill request
 
         Returns:
             Tuple containing:
@@ -243,11 +270,23 @@ class CUDAGraphBatchDimensionBuilder:
             - Optional list of CUDA graph token counts
         """
 
-        def add_if_valid(token_count: int, prefill_req_count: int, decode_req_count: int) -> None:
+        def add_if_valid(
+            token_count: int,
+            prefill_req_count: int,
+            decode_req_count: int,
+            has_explicit_chunked_prefill_req: bool = False,
+        ) -> None:
             """Helper to create and append batch dimension to list only if it's valid."""
-            batch_dim = InferenceBatchDimensions(token_count, prefill_req_count, decode_req_count)
+            batch_dim = InferenceBatchDimensions(
+                token_count, prefill_req_count, decode_req_count, has_explicit_chunked_prefill_req
+            )
             if batch_dim.is_valid(max_requests, max_sequence_length):
                 cuda_graph_batch_dimensions_list.append(batch_dim)
+
+        # Chunked prefill configs
+        chunked_prefill_configs = [False]
+        if requires_explicit_chunked_prefill_req:
+            chunked_prefill_configs.append(True)
 
         # Cuda graph token-counts
         # (i.e., token counts used by cuda-graph steps, both decode and non-decode).
@@ -304,12 +343,14 @@ class CUDAGraphBatchDimensionBuilder:
             # Mixed prefill and decode mode
             # Create prefill and mixed dimensions with full token counts
             for size in cuda_graph_prefill_token_counts:
-                add_if_valid(
-                    token_count=size,
-                    prefill_req_count=min(cuda_graph_mixed_prefill_count, max_requests),
-                    decode_req_count=min(size, max_requests)
-                    - min(cuda_graph_mixed_prefill_count, max_requests),
-                )
+                for has_explicit_chunked_prefill_req in chunked_prefill_configs:
+                    add_if_valid(
+                        token_count=size,
+                        prefill_req_count=min(cuda_graph_mixed_prefill_count, max_requests),
+                        decode_req_count=min(size, max_requests)
+                        - min(cuda_graph_mixed_prefill_count, max_requests),
+                        has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
+                    )
                 # We need to ensure the prefill requests are shorter than the max sequence length,
                 # considering the one decode token is used for prefill request construction
                 prefill_only_minimal_num = max(
