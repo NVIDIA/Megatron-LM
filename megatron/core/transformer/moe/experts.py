@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import logging
 from copy import deepcopy
 from functools import partial, wraps
 from math import ceil
@@ -12,6 +13,7 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.activations import squared_relu
+from megatron.core.backwards_compatibility_decorators import deprecated
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     LocalNonpersistentObject,
@@ -39,6 +41,7 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
@@ -54,19 +57,23 @@ except ImportError:
 
     HAVE_TE = False
 
+logger = logging.getLogger(__name__)
 
-# TODO(Hepteract): delete the usage of the global parallel_state.
-# Currently we still have to use the global parallel_state in expert_dist_ckpt_decorator(),
-# in order to set sub-module's process group while getting sharded_state_dict.
-# After sub-module's refactoring is done, we can pass pg_collection to sub-module
-# and delete the function expert_dist_ckpt_decorator.
+
+@deprecated(
+    version="0.16",
+    removal_version="0.17",
+    alternative=None,
+    reason="pg_collection is being passed to sub-module",
+)
 def expert_dist_ckpt_decorator(func):
     """Decorator of shared_state_dict in expert layer for distributed checkpoint.
-
     Since !1940, the TP size for Expert layer can be different with Attention.
     To make distributed checkpoint work in such cases, we use a decorator to
     replace the default TP parallel states with expert-TP parallel states.
     """
+
+    logger.warning("expert_dist_ckpt_decorator is deprecated and will be removed in version 0.17.")
 
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -311,7 +318,6 @@ class GroupedMLP(MegatronModule):
 
         return fc2_output, None
 
-    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """
         Maps local expert to global experts.
@@ -565,6 +571,7 @@ class TEGroupedMLP(MegatronModule):
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
 
         self.ep_group = pg_collection.ep
+        self.tp_group = pg_collection.expt_tp
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.moe_ffn_hidden_size
@@ -767,7 +774,6 @@ class TEGroupedMLP(MegatronModule):
 
         return output, output_bias
 
-    @expert_dist_ckpt_decorator
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -775,10 +781,14 @@ class TEGroupedMLP(MegatronModule):
         Maps local expert to global experts.
         The sharded state dict is interchangable with SequentialMLP's.
         """
+        # Guard for cases metadata is not provided
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
-            sub_sd = sharded_state_dict_default(module, f'{name}.', sharded_offsets, metadata)
+            sub_sd = sharded_state_dict_default(
+                module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
+            )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
                 local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
@@ -842,6 +852,7 @@ class SequentialMLP(MegatronModule):
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
         self.ep_group = pg_collection.ep
+        self.tp_group = pg_collection.expt_tp
         # use pg_collection.expt_dp_group as data parallel group in this module.
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
         self.dp_group = pg_collection.expt_dp
@@ -929,9 +940,11 @@ class SequentialMLP(MegatronModule):
         for expert in self.local_experts:
             expert.backward_dw()
 
-    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
+        # Guard for cases metadata is not provided
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+
         sharded_state_dict = {}
         num_global_experts = self.ep_group.size() * self.num_local_experts
         local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
