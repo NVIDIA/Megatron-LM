@@ -11,31 +11,40 @@ MODEL_ARGS:
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
   --timing-log-level: 0
-  --load: ${CHECKPOINT_LOAD_PATH}/model/mamba_hybrid_2b/dcp/mcore-v1_bf16/checkpoint
-  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/mamba_hybrid_2b/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --load: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/checkpoints
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
   --tokenizer-type: TikTokenizer
   --tiktoken-pattern: v2
   --distributed-backend: nccl
   --log-interval: 1
   --transformer-impl: transformer_engine
-  --tensor-model-parallel-size: 1
+  --tensor-model-parallel-size: 4
   --pipeline-model-parallel-size: 1
-  --expert-model-parallel-size: 1
+  --expert-model-parallel-size: 8
+  --expert-tensor-parallel-size: 1
+  --sequence-parallel: true
   --use-mcore-models: true
-  --is-hybrid-model: true
-  --model-provider: mamba
-  --init-method-std: 0.0198
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+  --num-experts: 64
+  --moe-router-topk: 6
+  --moe-z-loss-coeff: 0
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-aux-loss-coeff: 1e-3
+  --moe-router-score-function: sigmoid
   --untie-embeddings-and-output-weights: true
   --disable-bias-linear: true
   --init-method-std: 0.014
-  --position-embedding-type: none
-  --num-layers: 50
+  --position-embedding-type: rope
+  --rotary-base: 1000000
+  --rotary-percent: 1.0
+  --num-layers: 27
   --hidden-size: 2048
-  --ffn-hidden-size: 11264
+  --moe-ffn-hidden-size: 1408
+  --moe-shared-expert-intermediate-size: 2816
+  --ffn-hidden-size: 10944
   --num-attention-heads: 16
   --kv-channels: 128
-  --hybrid-override-pattern: M-M-M-M*-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-
-  --spec: megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
   --normalization: RMSNorm
   --swiglu: true
   --attention-dropout: 0.0
@@ -55,7 +64,7 @@ MODEL_ARGS:
   --use-checkpoint-args: true
   --no-use-tokenizer-model-from-checkpoint-args: true
   --no-load-optim: true
-  --deterministic-mode: true
+  --deterministic-mode: true # moe will use different ops for determinism for inference
   --save-interval: 2000
   --temperature: 1.0
   --top_k: 1
@@ -65,9 +74,17 @@ MODEL_ARGS:
   --inference-max-seq-length: 4096
   --output-path: ${TENSORBOARD_PATH}
   --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
-  --incoming-requests-per-step: 32 
-  --inference-repeat-n: 3
-  --no-record-throughput: true
+  --incoming-requests-per-sec: -1 # all requests arrive up front.
+  --inference-repeat-n: 8
+  --inference-dynamic-batching-buffer-size-gb: 20
+  --cuda-graph-impl: local 
+  --moe-pad-experts-for-cuda-graph-inference: true
+  --inference-dynamic-batching-buffer-size-gb: 20
+  --inference-dynamic-batching-num-cuda-graphs: 1 
+  --inference-dynamic-batching-max-requests: 512
+  --inference-logging-step-interval: 1
+  --sequence-parallel: true
+
 METRICS:
   - "generated_tokens"
   - "logprobs"
