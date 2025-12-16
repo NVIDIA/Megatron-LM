@@ -66,6 +66,14 @@ try:
 except:
     HAVE_TE_MXFP8TENSOR = False
 
+# Detect the Blockwise FP8 tensor class
+try:
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+
+    HAVE_TE_BLOCKWISE_FP8TENSOR = True
+except:
+    HAVE_TE_BLOCKWISE_FP8TENSOR = False
+
 # Detect the "cast_master_weights_to_fp8" function of Transformer Engine
 try:
     from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_fp8
@@ -149,6 +157,11 @@ def is_te_min_version(vers, check_equality=True):
 def is_float8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a FP8 tensor."""
     return HAVE_TE and isinstance(tensor, FP8_TENSOR_CLASS)
+
+
+def is_blockwise_float8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Blockwise FP8 tensor."""
+    return HAVE_TE_BLOCKWISE_FP8TENSOR and isinstance(tensor, Float8BlockwiseQTensor)
 
 
 def fp8_need_transpose_data(tensor: torch.Tensor) -> bool:
