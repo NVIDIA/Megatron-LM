@@ -138,9 +138,9 @@ class ToyTETransformer(torch.nn.Module):
         return x
 
 
-def build_toy_model_and_optimizer(model_type: str, init_model_with_meta_device: bool, seed=None):
+def build_toy_model(model_type: str, init_model_with_meta_device: bool, seed=None):
     """
-    Helper function to build a toy model and optimizer for testing Megatron-FSDP.
+    Helper function to build a toy model for testing Megatron-FSDP.
     """
     # Set the seed to make sure the same model is initialized on all ranks.
     if seed is not None:
@@ -169,10 +169,9 @@ def build_toy_model_and_optimizer(model_type: str, init_model_with_meta_device: 
                 model_dim=DIM_SIZE, num_heads=2, num_layers=NUM_LAYERS, output_dim=DIM_SIZE
             )
             fsdp_unit_modules = [te.pytorch.TransformerLayer]
-        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
     # Return the toy model, optimizer, and FSDP unit modules.
-    return toy_model, toy_adam, fsdp_unit_modules
+    return toy_model, fsdp_unit_modules
 
 
 def build_distributed_environment(mesh_dim_config: tuple):
@@ -275,9 +274,8 @@ class TestMegatronFsdpFullyShard:
         device_mesh = build_distributed_environment(mesh_dim_config)
 
         # Construct toy model.
-        toy_model, toy_adam, fsdp_unit_modules = build_toy_model_and_optimizer(
-            model_type, init_model_with_meta_device
-        )
+        toy_model, fsdp_unit_modules = build_toy_model(model_type, init_model_with_meta_device)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -326,7 +324,7 @@ class TestMegatronFsdpFullyShard:
             # Validate gradients exist in the Torch Module, i.e. non-None and non-zero.
             grads_exist = any(
                 isinstance(p.grad, torch.Tensor) and p.grad.to_local().count_nonzero().item() > 0
-                for p in model.module.parameters()
+                for p in model.parameters()
             )
             sharding_group = (
                 device_mesh[HSDP].get_group()
@@ -406,9 +404,8 @@ class TestMegatronFsdpFullyShard:
         accuracy tests are non-trivial, i.e. don't just use the initialized weights.
         """
         # Test model.
-        toy_model, toy_adam, fsdp_unit_modules = build_toy_model_and_optimizer(
-            model_type, False, seed=0
-        )
+        toy_model, fsdp_unit_modules = build_toy_model(model_type, False, seed=0)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -487,9 +484,8 @@ class TestMegatronFsdpFullyShard:
         """
         # Initialize a new model for checkpoint loading. Set a different seed to force a different model init,
         # to ensure the checkpoint loading is accurate and non-trivial.
-        toy_model, toy_adam, fsdp_unit_modules = build_toy_model_and_optimizer(
-            model_type, False, seed=1
-        )
+        toy_model, fsdp_unit_modules = build_toy_model(model_type, False, seed=1)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -601,3 +597,44 @@ class TestMegatronFsdpFullyShard:
 
         # Destroy device mesh.
         destroy_device_mesh(device_mesh)
+
+    @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS_PARAMS, OPTIM_GRADS, OPTIM, NO_SHARD])
+    def test_fully_shard_ez(self, shard_strategy):
+        """
+        Test fully_shard(device_mesh=None). Represents the easiest entrypoint to Megatron-FSDP.
+        """
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+            fully_shard_model,
+            fully_shard_optimizer,
+        )
+
+        # Construct toy model.
+        toy_model, fsdp_unit_modules = build_toy_model(TRANSFORMER, False)
+
+        # Fully-shard the model.
+        mfsdp_model = fully_shard_model(
+            module=toy_model, fsdp_unit_modules=fsdp_unit_modules, zero_dp_strategy=shard_strategy
+        )
+
+        # Initialize the distributed optimizer on the MegatronFSDP model.
+        toy_adam = Adam(params=mfsdp_model.parameters(), lr=0.01)
+        optimizer = fully_shard_optimizer(optimizer=toy_adam)
+
+        # Mock input and target.
+        toy_input = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+        toy_target = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+
+        for step in range(NUM_STEPS):
+
+            # Forward pass.
+            output = mfsdp_model(toy_input, toy_input)
+
+            # Loss.
+            loss = mse_loss(output, toy_target)
+
+            # Backward pass.
+            loss.backward()
+
+            # Optimizer step.
+            optimizer.step()
+            optimizer.zero_grad()
