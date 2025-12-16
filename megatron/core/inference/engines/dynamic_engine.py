@@ -193,6 +193,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialize engine.
         self.reset()
 
+        # Set up stop word check callback for the controller
+        self.controller.set_stop_word_check_callback(self._check_stop_words_for_request)
+
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
             logging.info(
@@ -716,6 +719,11 @@ class DynamicInferenceEngine(AbstractEngine):
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
+        # Tokenize stop words if provided
+        if request.sampling_params.stop_words:
+            stop_word_ids = [self.controller.tokenize_prompt(stop_word, add_BOS=False) for stop_word in request.sampling_params.stop_words]
+            request.sampling_params.stop_word_ids = stop_word_ids
+
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
         else:
@@ -912,6 +920,41 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_top_n_logprobs.append(logit_dict)
 
         return active_request_ids, finished_request_records
+
+    def _check_stop_words_for_request(self, request_id: int, new_token: int) -> bool:
+        """Check if a request should stop due to stop words.
+
+        Args:
+            request_id (int): The request ID to check.
+            new_token (int): The newly generated token.
+
+        Returns:
+            bool: True if the generated sequence ends with a stop word, False otherwise.
+        """
+        if request_id not in self.requests:
+            return False
+
+        request = self.get_request(request_id)
+
+        # Check if request has stop words configured
+        if (
+            request.sampling_params.stop_word_ids is None
+            or len(request.sampling_params.stop_word_ids) == 0
+        ):
+            return False
+
+        # Build the current token sequence (existing generated tokens + new token)
+        generated_tokens = list(request.generated_tokens) + [new_token]
+
+        # Check if the sequence ends with any stop word
+        for stop_word_ids in request.sampling_params.stop_word_ids:
+            stop_len = len(stop_word_ids)
+            if len(generated_tokens) >= stop_len:
+                # Check if the last stop_len tokens match the stop word
+                if generated_tokens[-stop_len:] == stop_word_ids:
+                    return True
+
+        return False
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""

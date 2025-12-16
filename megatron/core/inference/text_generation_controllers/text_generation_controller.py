@@ -74,8 +74,22 @@ class TextGenerationController:
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.sampling_rng.manual_seed(model_config.inference_sampling_seed)
 
+        # Callback for checking stop words (set by engine)
+        self._stop_word_check_callback = None
+
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
+
+    def set_stop_word_check_callback(self, callback):
+        """Set a callback function for checking stop words.
+
+        The callback should have signature: callback(request_id: int, new_token: int) -> bool
+        Returns True if the request should stop due to a stop word match.
+
+        Args:
+            callback: Function to check stop words for a request.
+        """
+        self._stop_word_check_callback = callback
 
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
@@ -811,6 +825,21 @@ class TextGenerationController:
             self._sampled_tokens_cuda[:active_request_count]
             != self._request_metadata["termination_id"][active_request_slice]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+
+        # Check for stop words if callback is set
+        if self._stop_word_check_callback is not None:
+            sampled_tokens_list = self._sampled_tokens_cuda[:active_request_count].tolist()
+            request_ids_list = active_request_ids.tolist()
+
+            for idx, (request_id, new_token) in enumerate(
+                zip(request_ids_list, sampled_tokens_list)
+            ):
+                # Only check stop words for requests that aren't already terminated
+                if active_request_mask[idx] == 1:
+                    if self._stop_word_check_callback(request_id, new_token):
+                        # Mark request as finished due to stop word
+                        active_request_mask[idx] = 0
+
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
