@@ -80,18 +80,11 @@ def print_distributed_quant_summary(model, msg=""):
         mtq.print_quant_summary(unwrapped_model)
         return
 
-    def _print_rank_summary():
+    # Only print from unique TP ranks of [0, 1]
+    if parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0 and parallel_state.get_tensor_model_parallel_rank() in [0, 1]:
         TP_rank = parallel_state.get_tensor_model_parallel_rank()
         EP_rank = parallel_state.get_expert_model_parallel_rank()
         PP_rank = parallel_state.get_pipeline_model_parallel_rank()
         print(f"\nTP rank {TP_rank}, EP rank {EP_rank}, PP rank {PP_rank}")
         print("_" * 80)
         mtq.print_quant_summary(unwrapped_model)
-
-    # Only print from unique TP ranks of [0, 1]
-    should_print = (
-        parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
-        and parallel_state.get_tensor_model_parallel_rank() in [0, 1]
-    )
-    if should_print:
-        _print_rank_summary()
