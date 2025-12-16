@@ -1183,6 +1183,10 @@ def validate_args(args, defaults={}):
         assert args.inference_dynamic_batching_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
+    if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1:
+       assert args.moe_pad_experts_for_cuda_graph_inference, \
+        "--moe-pad-experts-for-cuda-graph-inference must be set when using CUDA graphs with expert parallelism"
+
     # MoE upcycling check
     if args.moe_use_upcycling:
         assert args.save is not None, "When using upcycling, the --save option must be specified."
@@ -1535,6 +1539,11 @@ def _add_inference_args(parser):
                        type=int, default=256,
                        help='KV cache block size. '
                        'It should be a multiple of 256')
+    group.add_argument('--inference-dynamic-batching-max-requests',
+                       type=int, default=None,
+                       help='Override the inference context\'s `max_requests`. '
+                       'By default, `max_requests` is set to the number of '
+                       'blocks in the context\'s memory buffer.')
     group.add_argument('--inference-dynamic-batching-max-tokens',
                        type=int, default=None,
                        help='Override the inference context\'s default `max_tokens`.')
@@ -1577,9 +1586,11 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
-    group.add_argument('--inference-wandb-logging-step-interval', type=int, default=0,
-                       help='Step interval for logging inference metrics to wandb. '
-                            'Default to 0 to disable inference wandb logging.')
+    group.add_argument('--inference-logging-step-interval', type=int, default=0,
+                       help='Step interval for logging inference metrics. '
+                            'Default to 0 to disable inference logging.')
+    group.add_argument('--inference-wandb-logging', action=argparse.BooleanOptionalAction,
+                       required=False, default=False, help='Enable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int, default=12346,
                        help="This port will be used to setup the inference coordinator on node-0")
     return parser
@@ -2301,6 +2312,13 @@ def _add_training_args(parser):
                        help='The communicator group names to use high priority streams.')
     group.add_argument('--use-te-activation-func', action='store_true',
                        help='Use activation function kernel from Transformer Engine in MLP module.')
+    group.add_argument('--batch-invariant-mode', action='store_true',
+                       help='Use batch-invariant kernels for deterministic forward execution regardless '
+                       'of batch size. Ensures bitwise identical results when the same inputs are '
+                       'processed in different batch configurations. This is more strict than deterministic-mode '
+                       'which only ensures bitwise identical results when the same inputs are processed in the same batch configuration. '
+                       'This will significantly affect speed of training and inference as the kernels are not full optimized.')
+
 
     return parser
 
@@ -2531,11 +2549,6 @@ def _add_checkpointing_args(parser):
                             ' Check StrictHandling docs for flags meaning.'
                             ' NOTE: This flag controls only distributed checkpoint'
                             ' load from storage, not loading state dict into the model.')
-    group.add_argument('--dist-ckpt-save-pre-mcore-014', action='store_true',
-                       help='Revert checkpointing simplifications introduced in Megatron-Core'
-                            ' v0.14. This option affects only checkpoint saving format and will'
-                            ' be removed soon (checkpoint load format is determined based on'
-                            ' checkpoint metadata).')
     group.add_argument('--dist-ckpt-optim-fully-reshardable', action='store_true',
                        help='Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP)'
                             ' as opposed to plain DP reshardability.')
