@@ -91,7 +91,8 @@ def common_test_parallel_reconfiguration_e2e(
         save(gpt_model_A.sharded_state_dict(metadata=metadata), ckpt_dir_A, save_strategy)
         regular_state_dict_A = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
-
+        if metadata is not None:
+            metadata.pop("dp_cp_group")
         # Load checkpoint A with different TP/PP and save as checkpoint B
         # No FPS this time, only FPL
         Utils.initialize_model_parallel(*dest_tp_pp, **(dst_tp_pp_kwargs or {}), order=store_order)
