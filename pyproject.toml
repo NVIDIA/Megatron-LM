@@ -92,6 +92,9 @@ moe = [
     "nv-grouped-gemm~=1.1",
 ]
 
+# Optional AMem NCCL plugin for memory offloading in RL scenarios
+amem = []
+
 lts = [
     "tqdm",
     "einops~=0.8",
