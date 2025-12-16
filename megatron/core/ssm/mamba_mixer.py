@@ -495,6 +495,7 @@ class MambaMixer(MegatronModule):
                 tensor_merge(
                     y_prefill, y_chunked_prefill, context.mamba_metadata.device_chunked_prefill
                 )
+                y = y_prefill
             elif prefill_req_count > 0:
                 # Prefill-only without chunked prefill
                 y = y_prefill
