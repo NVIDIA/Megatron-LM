@@ -2,15 +2,10 @@
 
 import os
 
-os.environ['WANDB_MODE'] = "disabled"
-os.environ['LOG_TO_WANDB'] = "false"
-os.environ['WORLD_SIZE'] = "1"
-os.environ['LOCAL_RANK'] = "0"
-
 from unittest.mock import patch
 
+import pytest
 import torch
-from pytest import fixture
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
@@ -70,7 +65,7 @@ class MockTokenizer:
         return [str(tok) for tok in tokens]
 
 
-@fixture(scope='module', autouse=True)
+@pytest.fixture(scope='module', autouse=True)
 def mock_pipeline_stuff():
     with patch('megatron.rl.rl_utils.is_pipeline_last_stage', return_value=True):
         yield
