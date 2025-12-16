@@ -232,13 +232,16 @@ class TestTextGenerationController:
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
 
     @pytest.mark.parametrize("backend", ["torch"])
-    def test_sample_from_dynamic_logits(self, backend):
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_sample_from_dynamic_logits(
+        self, backend: str, materialize_only_last_token_logits: bool
+    ):
         batch_size = 12
         self.setup_model(torch.float32, batch_size=batch_size, static=False)
         self.mock_tokenizer.eod = self.vocab_size
 
         context = self.text_generation_controller.inference_wrapped_model.inference_context
-        context.materialize_only_last_token_logits = True
+        context.materialize_only_last_token_logits = materialize_only_last_token_logits
 
         # Prepare sampling params in human-readable format, to aid with test maintenance.
         sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
@@ -258,29 +261,37 @@ class TestTextGenerationController:
                 rev_sampling_dict[idx] = sampling_params
 
         # Prepare metadata for sample bookkeeping.
-        request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
-        request_metadata = torch.empty(
-            (batch_size, len(request_metadata_labels)), dtype=torch.float32
-        ).cuda()
-        top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).cuda()
-        request_metadata[:, request_metadata_labels["top_k"]] = top_k_values
-        top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict]).cuda()
-        request_metadata[:, request_metadata_labels["top_p"]] = top_p_values
-        temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict]).cuda()
-        request_metadata[:, request_metadata_labels["temperature"]] = temp_values
+        temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict])
+        top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).to(torch.int32)
+        top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict])
+        request_metadata = {
+            "temperature": temp_values,
+            "top_k": top_k_values,
+            "top_p": top_p_values,
+        }
+        self.text_generation_controller._request_metadata = request_metadata
+        self.text_generation_controller._sampling_backend = backend
+
+        context.padded_active_token_count = batch_size
+        context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32)
+        context.paused_request_count = 0
+        context.total_request_count = batch_size
 
         # Bookkeeping.
-        self.text_generation_controller._dynamic_step_sample_bookkeeping(
-            request_metadata=request_metadata
-        )
+        self.text_generation_controller._dynamic_step_sample_bookkeeping()
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
-        sampled_logits = self.text_generation_controller._dynamic_step_sample_logits(
-            logits, backend=backend
-        )
+        self.text_generation_controller._dynamic_step_sample_logits(logits)
+        sampled_logits = self.text_generation_controller._sampled_tokens_cuda[:batch_size]
         vocab_indices = torch.arange(self.vocab_size).cuda()
 
+        # Move tensors to GPU for assertion checks.
+        temp_values = temp_values.cuda()
+        top_k_values = top_k_values.cuda()
+        top_p_values = top_p_values.cuda()
+
+        # Assert correct sampled values.
         top_k_values[top_k_values == 0] = self.vocab_size
         assert torch.all(
             sampled_logits >= self.vocab_size - top_k_values
@@ -442,10 +453,10 @@ class TestTextGenerationController:
             assert len(request.generated_log_probs) == request.generated_length
 
     @pytest.mark.parametrize("num_tokens_to_generate", [0, 4])
-    @pytest.mark.parametrize("return_prompt_top_n_logprobs", [True, False])
+    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_logprobs_and_topn_consistency(
-        self, num_tokens_to_generate, return_prompt_top_n_logprobs, dtype
+        self, num_tokens_to_generate, skip_prompt_log_probs, dtype
     ):
         """
         1.  Ensures that a batch request containing prompts of
@@ -489,7 +500,7 @@ class TestTextGenerationController:
                     temperature=0.0,
                     return_log_probs=True,
                     top_n_logprobs=5,
-                    return_prompt_top_n_logprobs=return_prompt_top_n_logprobs,
+                    skip_prompt_log_probs=skip_prompt_log_probs,
                 ),
                 arrival_time=time.time(),
                 status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
@@ -515,8 +526,8 @@ class TestTextGenerationController:
                 f"got {len(generated_log_probs)}"
             )
 
-            assert (not return_prompt_top_n_logprobs and prompt_top_n_logprobs is None) or (
-                return_prompt_top_n_logprobs
+            assert (skip_prompt_log_probs and prompt_top_n_logprobs is None) or (
+                not skip_prompt_log_probs
                 and prompt_top_n_logprobs is not None
                 and len(prompt_top_n_logprobs) == len(prompt_log_probs)
             )
@@ -671,7 +682,7 @@ class TestTextGenerationController:
                 top_k=1,
                 return_log_probs=True,
                 top_n_logprobs=5,
-                return_prompt_top_n_logprobs=True,
+                skip_prompt_log_probs=False,
             )
 
             inference_request = InferenceRequest(
@@ -732,16 +743,16 @@ class TestTextGenerationController:
                         == request_single.prompt_top_n_logprobs[i][token_str]
                     )
 
-    @pytest.mark.parametrize("return_prompt_top_n_logprobs", [True, False])
+    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_dynamic_top_n_logprobs_calculation(
-        self, return_prompt_top_n_logprobs: bool, materialize_only_last_token_logits: bool
+        self, skip_prompt_log_probs: bool, materialize_only_last_token_logits: bool
     ):
         """
         Test the _dynamic_step_calculate_top_n_logprobs function directly.
         Verifies:
         1. top_n_logprobs are computed for all requests
-        2. return_prompt_top_n_logprobs controls computation for prompt tokens
+        2. skip_prompt_log_probs controls computation for prompt tokens
         3. Correct number of tokens are returned for each request
         """
         batch_size = 4
@@ -753,21 +764,15 @@ class TestTextGenerationController:
 
         # Prepare sampling params
         top_n = 5
-        request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
-        request_metadata = torch.empty(
-            (batch_size, len(request_metadata_labels)), dtype=torch.float32
-        ).cuda()
-
-        # Set top_n_logprobs for all requests
-        request_metadata[:, request_metadata_labels["top_n_logprobs"]] = top_n
-        request_metadata[:, request_metadata_labels["return_prompt_top_n_logprobs"]] = float(
-            return_prompt_top_n_logprobs
-        )
-
-        # Bookkeeping
-        self.text_generation_controller._dynamic_step_sample_bookkeeping(
-            request_metadata=request_metadata
-        )
+        request_metadata = {
+            "top_n_logprobs": torch.full((batch_size,), top_n, dtype=torch.int32).cuda(),
+            "skip_prompt_log_probs": torch.full(
+                (batch_size,), float(skip_prompt_log_probs), dtype=torch.float32
+            ).cuda(),
+        }
+        self.text_generation_controller._request_metadata = request_metadata
+        self.text_generation_controller._active_request_count = batch_size
+        self.text_generation_controller._active_request_slice = slice(0, batch_size)
 
         if materialize_only_last_token_logits:
             # Decode mode: logits for last tokens only
@@ -841,7 +846,7 @@ class TestTextGenerationController:
                 assert req_idx in top_n_results, f"Request {req_idx} missing from results"
                 top_n_list = top_n_results[req_idx]
 
-                if return_prompt_top_n_logprobs:
+                if not skip_prompt_log_probs:
                     # Should have top-n for all tokens
                     expected_count = query_lengths[req_idx]
                     assert (
@@ -851,7 +856,7 @@ class TestTextGenerationController:
                     # Should have top-n for only the last token (first generated token)
                     assert (
                         len(top_n_list) == 1
-                    ), f"Request {req_idx}: expected 1 token when return_prompt_top_n_logprobs=False, got {len(top_n_list)}"
+                    ), f"Request {req_idx}: expected 1 token when skip_prompt_log_probs=True, got {len(top_n_list)}"
 
                 # Validate each token's top-n
                 for token_idx, (top_n_values, top_n_indices) in enumerate(top_n_list):
