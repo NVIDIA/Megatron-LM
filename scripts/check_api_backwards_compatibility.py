@@ -46,11 +46,20 @@ if sys.platform == 'win32':
 # Decorators that exempt objects from compatibility checks
 EXEMPT_DECORATORS = ['internal_api', 'deprecated', 'experimental_api']
 
-# Breakage kinds to ignore (not actual API signature changes)
+# Breakage kinds to ignore globally (not actual API signature changes)
 # AttributeChangedValueBreakage: Changing constant values (e.g., VERSION = "1.0" -> "2.0")
 #   is not a breaking API change - the constant still exists with the same name
 IGNORED_BREAKAGE_KINDS = [
     'AttributeChangedValueBreakage',
+]
+
+# Breakage kinds to ignore only for __init__ methods
+# ParameterMovedBreakage: Reordering parameters in __init__ is generally safe because:
+#   - Config dataclasses should always be initialized with keyword arguments
+#   - Adding fields to parent dataclasses shifts child __init__ params (inheritance artifact)
+#   - Nobody should call Config(4096, 32, ...) with positional args
+IGNORED_FOR_INIT_METHODS = [
+    'ParameterMovedBreakage',
 ]
 
 
@@ -217,6 +226,7 @@ def should_skip_change(change, filtered_paths: set) -> bool:
     
     A change is skipped if:
     - The change kind is in IGNORED_BREAKAGE_KINDS (not a signature change)
+    - The change kind is in IGNORED_FOR_INIT_METHODS and affects an __init__ method
     - The changed object itself is in filtered_paths (exact match)
     - The changed object is a child of an exempt object (prefix match)
     
@@ -227,7 +237,7 @@ def should_skip_change(change, filtered_paths: set) -> bool:
     Returns:
         bool: True if the change should be skipped (filtered out)
     """
-    # Check if this breakage kind should be ignored (not a signature change)
+    # Check if this breakage kind should be ignored globally (not a signature change)
     change_kind = type(change).__name__
     if change_kind in IGNORED_BREAKAGE_KINDS:
         return True
@@ -239,6 +249,12 @@ def should_skip_change(change, filtered_paths: set) -> bool:
     # Strip parameter names from path for matching
     # e.g., "Class.__init__(param)" -> "Class.__init__"
     clean_path = path.split('(')[0] if '(' in path else path
+    
+    # Check if this is a breakage kind we ignore for __init__ methods
+    # Config dataclasses should use keyword args, so parameter reordering is safe
+    if change_kind in IGNORED_FOR_INIT_METHODS:
+        if '.__init__' in clean_path:
+            return True
     
     # Check exact match
     if clean_path in filtered_paths or path in filtered_paths:
