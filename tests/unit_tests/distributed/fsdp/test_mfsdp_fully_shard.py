@@ -225,6 +225,7 @@ class TestMegatronFsdpFullyShard:
     )
     @pytest.mark.parametrize("preserve_fp32_weights", [True, False])
     @pytest.mark.parametrize("init_model_with_meta_device", [True, False])
+    @pytest.mark.parametrize("torch_compile", [True, False])
     def test_fully_shard(
         self,
         model_type,
@@ -233,6 +234,7 @@ class TestMegatronFsdpFullyShard:
         mesh_dim_config,
         preserve_fp32_weights,
         init_model_with_meta_device,
+        torch_compile,
     ):
         """
         Test the fully_shard API with different configurations.
@@ -289,6 +291,7 @@ class TestMegatronFsdpFullyShard:
             grad_reduce_in_fp32=False,
             init_model_with_meta_device=init_model_with_meta_device,
         )
+        model = torch.compile(model) if torch_compile else model
 
         # Mock input and target.
         toy_input = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
