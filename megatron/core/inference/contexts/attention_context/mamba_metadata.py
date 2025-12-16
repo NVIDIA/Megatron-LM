@@ -10,7 +10,13 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 
 @dataclass
 class MambaInferenceStateConfig:
-    """Config for initializing Mamba model inference state tensors."""
+    """
+    Config for initializing Mamba model inference state tensors.
+
+    Note that we maintain separate metadata for decode, regular prefill, and
+    chunked prefill requests because the Mamba kernels do not yet support mixing
+    these. Once the kernels have been updated we can simplify this code.
+    """
 
     layer_type_list: List[str]
     """
