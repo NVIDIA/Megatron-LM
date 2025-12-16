@@ -95,7 +95,6 @@ dev = [
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "flash-linear-attention~=0.4.0",
-    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -109,6 +108,11 @@ dev = [
     "openai",
 ]
 
+# Optional MoE dependencies that may require building from source with CUTLASS headers
+moe = [
+    "nv-grouped-gemm~=1.1",
+]
+
 lts = [
     "tqdm",
     "einops~=0.8",
@@ -118,7 +122,6 @@ lts = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
