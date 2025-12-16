@@ -13,7 +13,7 @@ MODEL_ARGS:
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/
   --auto-detect-ckpt-format: true
   --max-tokens-to-oom: 3600000
-  --inference-max-seq-length: 4096
+  --inference-max-seq-length: 1024
   --attention-backend: flash
   --mock-data: true
   --micro-batch-size: 1
@@ -47,7 +47,6 @@ MODEL_ARGS:
   --seed: 42
   --calculate-per-token-loss: true
   --rl-use-sequence-packing: true
-  --rl-sequence-packing-bin-size: 8192
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
   --timing-log-level: 1

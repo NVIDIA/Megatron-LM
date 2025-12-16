@@ -21,7 +21,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_attr_wrapped_model, get_model_config
 
 
 # pylint: disable=line-too-long
@@ -256,7 +256,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
             recv_buffer = self._allocate_recv_buffer(batch_size, seq_len)
             recv_from_prev_pipeline_rank_(recv_buffer, self.pp_group)
 
-        self.model.set_input_tensor(recv_buffer)
+        set_input_tensor = get_attr_wrapped_model(self.model, "set_input_tensor")
+        set_input_tensor(recv_buffer)
         output_tensor = self._forward(inference_input)
 
         if not is_pipeline_last_stage(self.pp_group):
