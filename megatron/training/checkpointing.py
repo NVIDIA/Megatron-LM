@@ -336,19 +336,18 @@ def get_rng_state(ckpt_format: str):
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         tp_rank = mpu.get_tensor_model_parallel_rank()
         tp_size = mpu.get_tensor_model_parallel_world_size()
-        ep_rank = mpu.get_expert_model_parallel_rank()
         ep_size = mpu.get_expert_model_parallel_world_size()
-        etp_rank = mpu.get_expert_tensor_parallel_rank()
-        etp_size = mpu.get_expert_tensor_parallel_world_size()
 
-        if ep_size > 1 or etp_size > 1:
-            # Shard RNG by EP ranks; use EDP rank as replica_id (not decoder DP).
+        if ep_size > 1:
+            # Shard RNG by PP, TP, DP when using expert parallelism.
+            dp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+            dp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
             rng_state_list = ShardedObject(
                 'rng_state',
                 rng_state_list,
-                (pp_size, tp_size, ep_size, etp_size),
-                (pp_rank, tp_rank, ep_rank, etp_rank),
-                replica_id=mpu.get_expert_data_parallel_rank(),
+                (pp_size, tp_size, dp_size),
+                (pp_rank, tp_rank, dp_rank),
+                replica_id=0,
             )
         else:
             rng_state_list = ShardedObject(
