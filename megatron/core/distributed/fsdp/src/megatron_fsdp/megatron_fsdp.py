@@ -1036,9 +1036,8 @@ class MegatronFSDP(torch.nn.Module):
         else:
             self.synchronize_param_gather()
             for bucket_id in range(self.all_gather_pipeline.num_buckets):
-                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
-
                 self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
+                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
                 if group.model_weight_buffer is None:
                     continue
 
@@ -1046,16 +1045,9 @@ class MegatronFSDP(torch.nn.Module):
                     # If model weight is sharded, we wait for the all-gather to complete and
                     # then release the bucket immediately to save memory usage.
                     self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
-                    # TODO(mxfp8): Is this correct?
-                    if group.transpose_weight_buffer is not None:
-                        self.all_gather_pipeline.wait_bucket_ready(bucket_id, True)
 
             for bucket_id in range(self.all_gather_pipeline.num_buckets):
-                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
                 self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
-                # TODO(mxfp8): Is this correct?
-                if group.transpose_weight_buffer is not None:
-                    self.all_gather_pipeline.wait_bucket_ready(bucket_id, True)
 
     def start_grad_sync(self, *unused):
         """

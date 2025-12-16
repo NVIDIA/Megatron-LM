@@ -2517,7 +2517,6 @@ class ParamAndGradBuffer:
                 # MCore.
                 mbuf = pg.model_weight_buffer
                 if mbuf:
-                    # TODO(mxfp8): Do we need to consider transpose buffer?
                     _start, _end = mbuf._get_item_slice_in_shard(item_id)
                     setattr(dist_param, "megatron_fsdp_slice", slice(_start, _end))
 
@@ -3502,7 +3501,7 @@ class AllGatherPipeline:
             if bwd and param_group.transpose_weight_buffer is not None:
                 raise RuntimeError("Transpose buffer is not supported for HSDP")
             else:
-                return param_group.model_weight_buffer
+                return param_group.hsdp_wbuf
         if bwd and param_group.transpose_weight_buffer is not None:
             return param_group.transpose_weight_buffer
         else:
