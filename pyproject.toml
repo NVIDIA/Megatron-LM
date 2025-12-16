@@ -78,7 +78,6 @@ dev = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -86,6 +85,11 @@ dev = [
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
+]
+
+# Optional MoE dependencies that may require building from source with CUTLASS headers
+moe = [
+    "nv-grouped-gemm~=1.1",
 ]
 
 lts = [
@@ -97,7 +101,6 @@ lts = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
