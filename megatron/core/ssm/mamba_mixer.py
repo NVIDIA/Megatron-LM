@@ -492,10 +492,8 @@ class MambaMixer(MegatronModule):
                 )
             if prefill_req_count > 0 and has_explicit_chunked_prefill_req:
                 # Merge regular prefill and chunked prefill parts
-                # TODO(ksanthanam): Make this copy in-place
-                y = torch.empty_like(y_prefill)
                 tensor_merge(
-                    y_prefill, y_chunked_prefill, y, context.mamba_metadata.device_chunked_prefill
+                    y_prefill, y_chunked_prefill, context.mamba_metadata.device_chunked_prefill
                 )
             elif prefill_req_count > 0:
                 # Prefill-only without chunked prefill
@@ -548,15 +546,9 @@ class MambaMixer(MegatronModule):
                 )
             if prefill_req_count > 0 and has_explicit_chunked_prefill_req:
                 # Merge regular prefill and chunked prefill parts
-                # TODO(ksanthanam): Make this copy in-place
-                y_prefill_merged = torch.empty_like(y_prefill)
                 tensor_merge(
-                    y_prefill,
-                    y_chunked_prefill,
-                    y_prefill_merged,
-                    context.mamba_metadata.device_chunked_prefill,
+                    y_prefill, y_chunked_prefill, context.mamba_metadata.device_chunked_prefill
                 )
-                y_prefill = y_prefill_merged
             elif has_explicit_chunked_prefill_req:
                 # Chunked prefill only
                 y_prefill = y_chunked_prefill
@@ -569,7 +561,9 @@ class MambaMixer(MegatronModule):
                 dtype=y_prefill.dtype,
                 device=y_prefill.device,
             )
-            tensor_merge(y_decode, y_prefill, y, context.mamba_metadata.device_decode_prefill)
+            tensor_merge(
+                y_decode, y_prefill, context.mamba_metadata.device_decode_prefill, output_tensor=y
+            )
 
         # Output projection
         out, out_bias = self.out_proj(y)

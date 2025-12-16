@@ -1010,7 +1010,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         lengths: List[int] = []
         num_tokens_to_generate: List[int] = []
-        finished_chunk_lens: List[int] = []
         request_ids: List[int] = []
         prompt_tokens: List[Tensor] = []
         metadata_cols: List[List] = [[] for _ in self.request_metadata_types]
@@ -1019,12 +1018,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert isinstance(
                 req, DynamicInferenceRequest
             ), "add_dummy_requests_parallel expects DynamicInferenceRequest objects"
+            assert (
+                req.finished_chunk_token_count == 0
+            ), "chunked requests are not supported in add_dummy_requests_parallel"
             assert req.remaining_prompt_tokens is not None, "request missing prompt tokens"
             assert req.sampling_params is not None, "request missing sampling params"
             chunk_length = req.remaining_prompt_length
             assert chunk_length > 0, "request without prompt tokens is not supported"
             lengths.append(chunk_length)
-            finished_chunk_lens.append(req.finished_chunk_token_count)
             num_tokens_to_generate.append(req.sampling_params.num_tokens_to_generate)
             request_ids.append(req.request_id)
             prompt_tokens.append(
@@ -1043,16 +1044,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         lengths_tensor = torch.tensor(
             lengths, dtype=self.request_query_lengths.dtype, device=device
         )
-        finished_chunk_lens_tensor = torch.tensor(
-            finished_chunk_lens, dtype=self.request_query_lengths.dtype, device=device
-        )
         tokens_to_generate_tensor = torch.tensor(
             num_tokens_to_generate, dtype=self.request_query_lengths.dtype, device=device
         )
         request_ids_tensor = torch.tensor(request_ids, dtype=self.request_ids.dtype, device=device)
 
         block_counts = torch.div(
-            finished_chunk_lens_tensor + lengths_tensor + (self.block_size_tokens - 1),
+            lengths_tensor + (self.block_size_tokens - 1),
             self.block_size_tokens,
             rounding_mode="floor",
         )
@@ -1063,10 +1061,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.request_ids[request_slice] = request_ids_tensor
         self.request_query_lengths[request_slice] = lengths_tensor
-        self.request_output_lengths[request_slice] = (
-            lengths_tensor + tokens_to_generate_tensor + finished_chunk_lens_tensor
-        )
-        self.request_kv_length_offsets[request_slice] = finished_chunk_lens_tensor
+        self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
+        self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
         for i, (label, dtype, _) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
@@ -1076,7 +1072,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         dummy_block_idx = self.block_allocator.dummy_block_idx
         self.request_last_kv_block_id[request_slice] = dummy_block_idx
         self.request_last_kv_block_offset[request_slice] = torch.remainder(
-            finished_chunk_lens_tensor + lengths_tensor - 1, self.block_size_tokens
+            lengths_tensor - 1, self.block_size_tokens
         )
 
         kv_block_view = self.request_to_kv_block_ids[request_slice]
@@ -1114,14 +1110,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         expanded_positions = position_template.unsqueeze(0).expand(num_new_requests, -1)
         mask = position_template.unsqueeze(0) < lengths_long.unsqueeze(1)
         positions = expanded_positions[mask]
-        finished_chunk_offsets = torch.repeat_interleave(
-            finished_chunk_lens_tensor.to(dtype=torch.long), lengths_long
-        )
         assert positions.numel() == total_new_tokens
-        self.token_to_position_in_request[token_slice] = positions + finished_chunk_offsets
-        self.token_to_pos_ids[token_slice] = positions + finished_chunk_offsets
+        self.token_to_position_in_request[token_slice] = positions
+        self.token_to_pos_ids[token_slice] = positions
         self.token_to_local_position_within_kv_block[token_slice] = torch.remainder(
-            positions + finished_chunk_offsets, self.block_size_tokens
+            positions, self.block_size_tokens
         )
         self.token_to_block_idx[token_slice] = dummy_block_idx
 
@@ -1185,22 +1178,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_prefill_tokens, dtype=torch.long, device=torch.cuda.current_device()
         )
 
-        prefill_requests = []
-        for i in range(graph_dimensions.prefill_req_count):
-            req = DynamicInferenceRequest(
+        prefill_requests = [
+            DynamicInferenceRequest(
                 request_id=i + graph_dimensions.decode_req_count,
                 prompt_tokens=shared_prefill_tokens[: prefill_token_counts[i]],
                 sampling_params=shared_sampling_params,
             )
-
-            if (
-                graph_dimensions.has_explicit_chunked_prefill_req
-                and i == graph_dimensions.prefill_req_count - 1
-            ):
-                req.finished_chunk_token_count = self.block_size_tokens
-
-            prefill_requests.append(req)
-
+            for i in range(graph_dimensions.prefill_req_count)
+        ]
         self.add_dummy_requests_parallel(prefill_requests)
         self.num_prefill_requests = graph_dimensions.prefill_req_count
 
@@ -1225,8 +1210,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if construct_graph_dimensions is not None:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
-        has_explicit_chunked_prefill_req = self.is_hybrid_model and (
-            self.chunked_prefill_request_id != -1
+        has_explicit_chunked_prefill_req = (
+            self.chunked_prefill_request_id != -1 and self.is_hybrid_model
         )
 
         batch_dimensions = InferenceBatchDimensions(
@@ -1307,6 +1292,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     token_count=batch_dimensions.token_count,
                     prefill_req_count=adjusted_prefill_req_count,
                     decode_req_count=adjusted_decode_req_count,
+                    has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
                 )
 
         self.active_attn_metadata["mha_metadata"].update(
