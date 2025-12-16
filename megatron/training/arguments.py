@@ -413,8 +413,8 @@ def validate_args(args, defaults={}):
             assert args.save_interval % num_training_iterations_per_inference_iteration == 0, \
                 f"save_interval should be divisible by number of global batches per inference iteration."
         if args.rl_use_sequence_packing:
-            assert args.seq_length <= args.rl_sequence_packing_bin_size, \
-                f"rl_sequence_packing_bin_size should be larger than or equal to seq_length"
+            assert args.micro_batch_size == 1, \
+                "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
 
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
@@ -2067,10 +2067,10 @@ def _add_rl_args(parser):
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
     group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, calculate the intra-group similarity of rollouts.')
-    group.add_argument('--rl-use-sequence-packing', action='store_true',
+    group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
-    group.add_argument('--rl-sequence-packing-bin-size', type=int, default=8192,
-                       help='Override bin size for sequence packing.')
+    group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,
+                       help='Maximum number of sequences that can be packed into a single bin. ')
     group.add_argument('--rl-sequence-packing-algo', type=str, default='fifo',
                        choices=['fifo', 'round-robin'],
                        help='Algorithm for distributing packed bins across ranks. '
