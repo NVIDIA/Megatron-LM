@@ -1434,6 +1434,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
+            and self.paused_request_count == 0
         )
         blocks = math.ceil(
             (req.remaining_prompt_length + req.finished_chunk_token_count) / self.block_size_tokens
