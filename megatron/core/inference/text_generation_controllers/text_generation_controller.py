@@ -74,6 +74,9 @@ class TextGenerationController:
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.sampling_rng.manual_seed(model_config.inference_sampling_seed)
 
+        # Callback for checking stop words (set by engine)
+        self._stop_word_check_callback = None
+
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
