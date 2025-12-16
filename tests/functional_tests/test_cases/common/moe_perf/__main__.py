@@ -38,7 +38,7 @@ WARMUP_ITERS = 5
 MEASURE_ITERS = 20
 
 
-BASELINES_PATH = Path(__file__).resolve().parent / "baseline.json"
+BASELINES_PATH = Path(__file__).resolve().parent / "baseline_dev.json"
 UPDATE_BASELINES_ENV = "MEGATRON_UPDATE_PERF_BASELINES"
 
 
