@@ -2648,10 +2648,10 @@ class ParamAndGradBuffer:
                 bufs["param"].copy_(bufs["bucket_param"])
             blockwise_fp8_param_buffers.clear()
 
-            # Memory clean-up
-            if check_gpu_memory(threshold=0.5):
-                gc.collect()
-                torch.cuda.empty_cache()
+            # Free bucket storage for blockwise FP8 weight buffers
+            for wbuf in blockwise_fp8_weight_buffers:
+                wbuf.free_bucket_storage()
+            blockwise_fp8_weight_buffers.clear()
 
         for pg in self.parameter_groups:
             mbuf = pg.main_weight_buffer
