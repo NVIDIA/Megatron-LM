@@ -206,7 +206,7 @@ class MoELayer(BaseMoELayer):
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
-        self.fwd_execution_map = None
+        self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
 
     @maybe_skip_or_early_return_by_cudagraph("route")
 
@@ -282,7 +282,7 @@ class MoELayer(BaseMoELayer):
             ), "Shared expert overlap not supported when MoE latent projections are used."
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
 
-        return probs, routing_map, shared_expert_output
+        return hidden_states, probs, routing_map
 
     def preprocess(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor

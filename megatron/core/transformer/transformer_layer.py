@@ -1250,10 +1250,11 @@ class MoETransformerLayer(TransformerLayer):
             self.cudagraph_manager = CudaGraphManager(config)
 
     def _forward_mlp_router(self, hidden_states):
+        residual = hidden_states
         self.mlp.fwd_execution_map = ("route")
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
         router_outputs = self.mlp(pre_mlp_layernorm_output)
-        return pre_mlp_layernorm_output, *router_outputs
+        return residual, hidden_states, *router_outputs
 
     def _forward_mlp_expert_compute(self, hidden_states, probs, routing_map):
         self.mlp.fwd_execution_map = ("dispatch_expert_compute_combine")
@@ -1267,9 +1268,9 @@ class MoETransformerLayer(TransformerLayer):
     def _forward_mlp(self, hidden_states, inference_context=None):
         # If using partial cudagraphs, decompose the forward pass into 3 subfunctions
         if self.use_partial_cudagraphs:        
-            residual = hidden_states
-            pre_mlp_layernorm_output, probs, routing_map, shared_expert_output = self._forward_mlp_router(hidden_states)
-            expert_output, mlp_bias = self._forward_mlp_expert_compute(pre_mlp_layernorm_output, probs, routing_map)
+            residual, hidden_states, probs, routing_map, shared_expert_output = \
+                self._forward_mlp_router(hidden_states)
+            expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs, routing_map)
             return self._forward_mlp_postprocess(residual, expert_output, shared_expert_output, mlp_bias)
         else:
             return super()._forward_mlp(hidden_states)
