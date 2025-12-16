@@ -135,6 +135,13 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         default=False,
         help='Use flashinfer fused rope implementation.',
     )
+    group.add_argument(
+        "--no-record-throughput",
+        action='store_false',
+        dest="record_throughput",
+        help="Disable throughput recording in --output-file"
+        
+    )
 
     return parser
 
