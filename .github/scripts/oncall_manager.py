@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 # Constants
 GITHUB_API_URL = "https://api.github.com"
 SCHEDULE_FILE = ".github/oncall_schedule.json"
-TEAM_SLUG = "mcore-oncalls"
+ROTATION_TEAM_SLUG = "mcore-oncall-rotation"
+ACTIVE_ONCALL_TEAM_SLUG = "megatron-oncall"
 TARGET_WEEKS = 12
 
 def get_headers():
@@ -81,6 +82,30 @@ def save_schedule(schedule):
         json.dump(schedule, f, indent=4)
         f.write('\n') # trailing newline
 
+def update_active_oncall_team(org, new_oncall):
+    """Updates the active oncall team to contain only the new oncall user."""
+    # 1. Get current members of the active team
+    current_members = get_team_members(org, ACTIVE_ONCALL_TEAM_SLUG)
+    
+    # 2. Add the new oncall if not present
+    if new_oncall not in current_members:
+        url = f"{GITHUB_API_URL}/orgs/{org}/teams/{ACTIVE_ONCALL_TEAM_SLUG}/memberships/{new_oncall}"
+        resp = requests.put(url, headers=get_headers())
+        if resp.status_code == 200:
+            print(f"Added {new_oncall} to {ACTIVE_ONCALL_TEAM_SLUG}")
+        else:
+            print(f"Failed to add {new_oncall} to {ACTIVE_ONCALL_TEAM_SLUG}: {resp.status_code} {resp.text}")
+
+    # 3. Remove everyone else
+    for member in current_members:
+        if member != new_oncall:
+            url = f"{GITHUB_API_URL}/orgs/{org}/teams/{ACTIVE_ONCALL_TEAM_SLUG}/memberships/{member}"
+            resp = requests.delete(url, headers=get_headers())
+            if resp.status_code == 204:
+                print(f"Removed {member} from {ACTIVE_ONCALL_TEAM_SLUG}")
+            else:
+                print(f"Failed to remove {member} from {ACTIVE_ONCALL_TEAM_SLUG}: {resp.status_code} {resp.text}")
+
 def rotate_schedule(repo_owner, dry_run=False):
     schedule = load_schedule()
     print(f"Current schedule length: {len(schedule)}")
@@ -95,6 +120,15 @@ def rotate_schedule(repo_owner, dry_run=False):
 
     # 2. Replenish
     ensure_schedule_filled(schedule, repo_owner)
+    
+    # 3. Update active oncall team
+    if schedule:
+        current_oncall = schedule[0]['user']
+        print(f"New active oncall: {current_oncall}")
+        if not dry_run:
+            update_active_oncall_team(repo_owner, current_oncall)
+        else:
+            print(f"Dry run: Would update {ACTIVE_ONCALL_TEAM_SLUG} to contain only {current_oncall}")
     
     if not dry_run:
         save_schedule(schedule)
@@ -111,9 +145,9 @@ def get_last_wednesday():
 
 def ensure_schedule_filled(schedule, repo_owner):
     """Appends users to schedule until it reaches TARGET_WEEKS."""
-    members = get_team_members(repo_owner, TEAM_SLUG)
+    members = get_team_members(repo_owner, ROTATION_TEAM_SLUG)
     if not members:
-        print("Warning: No team members found in mcore-oncalls.")
+        print(f"Warning: No team members found in {ROTATION_TEAM_SLUG}.")
         return
 
     members.sort() # Deterministic order
@@ -155,6 +189,7 @@ def ensure_schedule_filled(schedule, repo_owner):
         print(f"Appended: {new_entry}")
 
 def assign_reviewer(pr_number):
+    """Assigns the current oncall as the reviewer for the PR."""
     schedule = load_schedule()
     if not schedule:
         print("Error: Schedule is empty. Cannot assign reviewer.")
@@ -167,6 +202,7 @@ def assign_reviewer(pr_number):
     owner, repo = get_repo_info()
     url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{pr_number}/requested_reviewers"
     
+    # We can assign the user directly
     data = {"reviewers": [current_oncall]}
     resp = requests.post(url, headers=get_headers(), json=data)
     
