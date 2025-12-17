@@ -654,11 +654,11 @@ class TransformerConfig(ModelParallelConfig):
     determines the scope of graph capture."""
 
     cuda_graph_use_single_mempool: bool = False
-    """When set to true, cudagraphs will be captured inside a single mempool, in which all
-    cudagraphs may only be used once per step. If false, cudagraphs may be reused across
-    microbatches. Enabling may reduce cudagraph memory overheads due to memory fragmentation,
-    however may greatly increase the number of cudagraphs created when the number of microbatches
-    is high."""
+    """[For `local` implementation only] When set to true, cudagraphs will be captured inside a
+    single mempool, in which all cudagraphs may only be used once per step. If false, cudagraphs may
+    be reused across microbatches. Enabling may reduce cudagraph memory overheads due to memory
+    fragmentation, however may greatly increase the number of cudagraphs created when the number of
+    microbatches is high."""
 
     cuda_graph_retain_backward_graph: bool = False
     """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
@@ -1564,64 +1564,46 @@ class TransformerConfig(ModelParallelConfig):
                             )
 
             if self.recompute_granularity:
-                if self.recompute_granularity != "selective" or not self.cuda_graph_scope:
-                    raise ValueError(
-                        "Full-layer CUDA graphs not supported with activation recomputation."
-                    )
-                elif self.cuda_graph_scope != [CudaGraphScope.full_iteration]:
-                    # For scoped CUDA graphs, only the non-graphed parts of the layer can be
-                    # recomputed. So check if there are overlaps between the recomputed parts
-                    # and the graphed parts.
-                    if CudaGraphScope.attn in self.cuda_graph_scope:
-                        for module in self.recompute_modules:
-                            if module in ['core_attn', 'mla_up_proj']:
-                                raise ValueError(
-                                    f'attn cuda graph is not supported with {module} recompute.'
-                                )
+                if self.recompute_granularity != "selective":
+                    assert self.cuda_graph_scope == [
+                        CudaGraphScope.full_iteration
+                    ], "full recompute is only supported with full iteration CUDA graph."
+                else:
+                    # The recompute module should be inside or outside of the graph scope.
+                    # Recompute module coverring graph scope is not allowed.
+                    if "moe" in self.recompute_modules:
+                        assert (
+                            CudaGraphScope.moe_router not in self.cuda_graph_scope
+                        ), "moe recompute is not supported with moe_router CUDA graph."
+                    # Graphed recompute module doesn't accept random number.
                     if (
-                        CudaGraphScope.mlp in self.cuda_graph_scope
-                        and "mlp" in self.recompute_modules
+                        not self.cuda_graph_scope
+                        or CudaGraphScope.full_iteration in self.cuda_graph_scope
                     ):
-                        raise ValueError(f'mlp cuda graph is not supported with mlp recompute.')
-                    if CudaGraphScope.moe in self.cuda_graph_scope:
-                        for module in self.recompute_modules:
-                            if module in ['moe_act', 'moe', 'shared_experts']:
-                                raise ValueError(
-                                    f'moe cuda graph is not supported with {module} recompute.'
-                                )
-                    if CudaGraphScope.moe_router in self.cuda_graph_scope:
-                        for module in self.recompute_modules:
-                            if module in ['moe', 'shared_experts']:
-                                raise ValueError(
-                                    f'moe_router cuda graph is not supported with {module} '
-                                    'recompute.'
-                                )
-                    if "layernorm" in self.recompute_modules:
-                        if (
-                            CudaGraphScope.attn in self.cuda_graph_scope
-                            and CudaGraphScope.mlp in self.cuda_graph_scope
-                            and (
-                                CudaGraphScope.moe in self.cuda_graph_scope
-                                or CudaGraphScope.moe_router in self.cuda_graph_scope
-                            )
-                        ):
-                            raise ValueError(
-                                'cuda graph is not supported with layernorm recompute.'
-                            )
-                        if CudaGraphScope.attn in self.cuda_graph_scope:
-                            warnings.warn(
-                                "input_layernorm recompute is not supported with attention "
-                                "cudagraph. Will only recompute the pre_mlp_layernorm."
-                            )
-                        if (
-                            CudaGraphScope.mlp in self.cuda_graph_scope
-                            or CudaGraphScope.moe in self.cuda_graph_scope
-                            or CudaGraphScope.moe_router in self.cuda_graph_scope
-                        ):
-                            warnings.warn(
-                                "pre_mlp_layernorm recompute is not supported with mlp/moe "
-                                "cudagraph. Will only recompute the input_layernorm."
-                            )
+                        full_cudagraph = True
+                    else:
+                        full_cudagraph = False
+                    if self.attention_dropout != 0.0:
+                        assert (
+                            not full_cudagraph and CudaGraphScope.attn not in self.cuda_graph_scope
+                        ) or "core_attn" not in self.recompute_modules, (
+                            "attention dropout is not supported with graphed attention "
+                            "recomputation."
+                        )
+                    if self.hidden_dropout != 0.0:
+                        assert (
+                            (not full_cudagraph and CudaGraphScope.mlp not in self.cuda_graph_scope)
+                            or "mlp" not in self.recompute_modules
+                        ) and (
+                            (not full_cudagraph and CudaGraphScope.moe not in self.cuda_graph_scope)
+                            or "moe" not in self.recompute_modules
+                        ), "hidden dropout is not supported with graphed MLP/MoE recomputation."
+                    if self.moe_input_jitter_eps is not None:
+                        assert (
+                            not full_cudagraph and CudaGraphScope.moe not in self.cuda_graph_scope
+                        ) or "moe" not in self.recompute_modules, (
+                            "moe_input_jitter_eps is not supported with graphed moe recomputation."
+                        )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:

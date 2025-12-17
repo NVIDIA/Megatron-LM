@@ -1603,7 +1603,12 @@ class TECudaGraphHelper:
         )
 
         def get_make_graphed_callables_kwargs():
-            kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
+            kwargs = {
+                'num_warmup_iters': 11,
+                'allow_unused_input': True,
+                '_order': order,
+                'retain_graph_in_backward': self.config.cuda_graph_retain_backward_graph,
+            }
 
             if is_te_min_version("2.6.0"):
                 # Starting from TE 2.6.0, make_graphed_callables() accepts different number

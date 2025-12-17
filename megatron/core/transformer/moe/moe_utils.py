@@ -1083,17 +1083,24 @@ class MoECudaGraphPartialCaptureSignal(Exception):
         """
         Get the CUDA graph early return outputs for the MoE layer, including the intermediate
         tensors and the intermediate attributes of the token dispatcher.
+
+        The returned output tensors are in the order of:
+        - routed experts path outputs
+          - hidden states, probs, and routing map for capturing router
+          - hidden states and probs for capturing router and preprocess
+        - intermediate attributes of the token dispatcher (if capturing the preprocess step)
+        - shared expert path output (if exists)
         """
         if self.return_step == "route":
             # Capturing the router step returns three intermediate tensors:
             # hidden states, routing probabilities, and routing map.
             outputs = [hidden_states, self.kwargs['probs'], self.kwargs['routing_map']]
         elif self.return_step == "preprocess":
-            # Capturing the preprocess step returns three intermediate tensors:
-            # hidden states, routing probabilities, and residual connection.
+            # Capturing the preprocess step returns two intermediate tensors:
+            # hidden states and routing probabilities.
             # It also returns the intermediate attributes of the token dispatcher, recorded in
             # "token_dispatcher.cudagraph_attrs".
-            outputs = [self.kwargs['hidden_states'], self.kwargs['probs'], self.kwargs['residual']]
+            outputs = [self.kwargs['hidden_states'], self.kwargs['probs']]
             valid_cudagraph_attrs = []
             for attr_name in self.moe_layer.token_dispatcher.cudagraph_attrs:
                 hier_attr_name = attr_name.split('.')
@@ -1133,8 +1140,6 @@ class MoECudaGraphTensorStore:
         probs (Optional[torch.Tensor]): The routing probabilities for each token-expert pair.
         routing_map (Optional[torch.Tensor]): The sparse mapping indicating which experts
             were selected for each token. Used to skip the normal router step.
-        residual (Optional[torch.Tensor]): The residual connection tensor before routing.
-            Used to skip the normal preprocess step.
         shared_expert_output (Optional[torch.Tensor]): The output from shared experts
             computation. Used to skip the normal shared expert computation step.
     """
@@ -1142,7 +1147,6 @@ class MoECudaGraphTensorStore:
     hidden_states: Optional[torch.Tensor] = None
     probs: Optional[torch.Tensor] = None
     routing_map: Optional[torch.Tensor] = None
-    residual: Optional[torch.Tensor] = None
     shared_expert_output: Optional[torch.Tensor] = None
 
     def is_empty(self) -> bool:
@@ -1153,13 +1157,7 @@ class MoECudaGraphTensorStore:
         """
         return all(
             getattr(self, field_name) is None
-            for field_name in [
-                'hidden_states',
-                'probs',
-                'routing_map',
-                'residual',
-                'shared_expert_output',
-            ]
+            for field_name in ['hidden_states', 'probs', 'routing_map', 'shared_expert_output']
         )
 
     def set(self, **kwargs):
@@ -1169,7 +1167,6 @@ class MoECudaGraphTensorStore:
                 'hidden_states',
                 'probs',
                 'routing_map',
-                'residual',
                 'shared_expert_output',
             ], f"Invalid field name: {field_name}"
             if value is not None:
@@ -1180,13 +1177,7 @@ class MoECudaGraphTensorStore:
 
     def clear(self):
         """Reset all stored tensors to None."""
-        for field_name in [
-            'hidden_states',
-            'probs',
-            'routing_map',
-            'residual',
-            'shared_expert_output',
-        ]:
+        for field_name in ['hidden_states', 'probs', 'routing_map', 'shared_expert_output']:
             setattr(self, field_name, None)
 
 
@@ -1259,46 +1250,39 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
                     # Don't skip the router.
                     assert (
                         moe_layer.cudagraph_tensor_store.routing_map is None
-                        and moe_layer.cudagraph_tensor_store.residual is None
-                    ), "both routing_map and residual must be None if probs is None"
+                    ), "routing_map must be None if probs is None"
                     probs, routing_map = func(moe_layer, *args, **kwargs)
 
                     # Maybe early return after the router.
                     maybe_raise_signal(moe_layer, probs=probs, routing_map=routing_map)
                 else:
                     # Skip the router and get value from store.
-                    assert (
-                        moe_layer.cudagraph_tensor_store.routing_map is not None
-                        or moe_layer.cudagraph_tensor_store.residual is not None
-                    ), "either routing_map or residual must be given if probs is given"
                     probs, routing_map = (
                         moe_layer.cudagraph_tensor_store.probs,
                         moe_layer.cudagraph_tensor_store.routing_map,
                     )
                 return probs, routing_map
             elif step_condition == "preprocess":
-                if moe_layer.cudagraph_tensor_store.residual is None:
+                if (
+                    moe_layer.cudagraph_tensor_store.is_empty()
+                    or moe_layer.cudagraph_tensor_store.routing_map is not None
+                ):
                     # Don't skip the preprocess.
-                    hidden_states, probs, residual = func(moe_layer, *args, **kwargs)
+                    hidden_states, probs = func(moe_layer, *args, **kwargs)
 
                     # Maybe early return after the preprocess.
-                    maybe_raise_signal(
-                        moe_layer, hidden_states=hidden_states, probs=probs, residual=residual
-                    )
+                    maybe_raise_signal(moe_layer, hidden_states=hidden_states, probs=probs)
                 else:
                     # Skip the preprocess and get value from store.
                     assert (
-                        moe_layer.cudagraph_tensor_store.probs is not None
-                    ), "probs must not be None if residual is not None"
-                    assert (
-                        moe_layer.cudagraph_tensor_store.routing_map is None
-                    ), "routing_map must be None if residual is not None"
-                    hidden_states, probs, residual = (
+                        moe_layer.cudagraph_tensor_store.hidden_states is not None
+                        and moe_layer.cudagraph_tensor_store.probs is not None
+                    ), "hidden_states and probs must be given in moe_preprocess cudagraph replay"
+                    hidden_states, probs = (
                         moe_layer.cudagraph_tensor_store.hidden_states,
                         moe_layer.cudagraph_tensor_store.probs,
-                        moe_layer.cudagraph_tensor_store.residual,
                     )
-                return hidden_states, probs, residual
+                return hidden_states, probs
 
         return wrapped_func
 

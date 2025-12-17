@@ -1256,9 +1256,6 @@ def validate_args(args, defaults={}):
             "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
             "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
-        assert (
-            args.recompute_granularity != 'full'
-        ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
     if args.cuda_graph_scope == "full" or (
         isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
     ):
