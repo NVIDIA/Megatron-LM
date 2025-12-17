@@ -15,7 +15,7 @@
 name: Oncall Assign
 
 on:
-  pull_request:
+  pull_request_target:
     types: [labeled, ready_for_review]
 
 permissions:
@@ -40,9 +40,11 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Install dependencies
+        run: pip install requests
+
       - name: Assign Reviewer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          pip install --no-cache-dir uv
-          uv run python .github/scripts/oncall_manager.py assign --pr ${{ github.event.pull_request.number }}
+          python .github/scripts/oncall_manager.py assign --pr ${{ github.event.pull_request.number }}
