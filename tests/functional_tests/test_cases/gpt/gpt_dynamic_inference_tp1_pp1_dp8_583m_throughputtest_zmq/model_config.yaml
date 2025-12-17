@@ -44,7 +44,8 @@ MODEL_ARGS:
   --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-cuda-graph-max-tokens: 2048
   --cuda-graph-impl: local
-  --cuda-graph-scope: full
+  --cuda-graph-scope: full_iteration
+  --no-check-for-nan-in-loss-and-grad: true
   --disable-chunked-prefill: true
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors

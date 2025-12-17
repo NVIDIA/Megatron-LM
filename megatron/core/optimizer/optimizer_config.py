@@ -29,9 +29,6 @@ class OptimizerConfig:
     ##############
     # General
     ##############
-    optimizer: str = 'adam'
-    """Optimizer to use (one of Adam, SGD, or Muon)."""
-
     lr: Optional[float] = None
     """Initial learning rate. Depending on decay style and initial warmup, the learning rate at each
        iteration would be different.

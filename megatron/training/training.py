@@ -92,7 +92,7 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
@@ -648,30 +648,6 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def get_no_weight_decay_cond(no_weight_decay_cond_type, default_skip_embedding_weight_decay):
-    """Get the no weight decay condition function."""
-
-    # Default case: no_weight_decay_cond_type is None
-    no_weight_decay_cond_fn = None
-
-    if no_weight_decay_cond_type == 'apply_wd_to_qk_layernorm':
-        # Qwen3-Next applies weight decay to qk layernorm as a special case
-        def apply_wd_to_qk_layernorm_fn(name, param):
-            if "q_layernorm" in name or "k_layernorm" in name:
-                no_wd = False
-            else:
-                no_wd = (
-                    name.endswith(".bias")
-                    or len(param.shape) == 1
-                    or (default_skip_embedding_weight_decay and "embedding" in name)
-                )
-            return no_wd
-        no_weight_decay_cond_fn = apply_wd_to_qk_layernorm_fn
-    elif no_weight_decay_cond_type is not None:
-        raise ValueError(f"Invalid no_weight_decay_cond_type: {no_weight_decay_cond_type}")
-
-    return no_weight_decay_cond_fn
-
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -813,15 +789,8 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    no_weight_decay_cond = get_no_weight_decay_cond(
-        args.no_weight_decay_cond_type,
-        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
-    )
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider,
-        model_type,
-        checkpointing_context=checkpointing_context,
-        no_weight_decay_cond=no_weight_decay_cond,
+        model_provider, model_type, checkpointing_context=checkpointing_context
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1259,7 +1228,9 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
     config = None
-    if args.optimizer == 'adam':
+    if args.optimizer == 'adam' or 'muon' in args.optimizer:
+        # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
+        # So for now we keep using adam config that's back compat with old way
         kwargs = {}
         for f in dataclasses.fields(AdamOptimizerConfig):
             if hasattr(args, f.name):
@@ -1304,12 +1275,10 @@ def setup_model_and_optimizer(
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
-    if args.skip_train:
-        optimizer, opt_param_scheduler = None, None
-    elif 'muon' not in config.optimizer:
-        config, config_overrides = get_megatron_optimizer_config(args)
-        config.timers = timers
+    config, config_overrides = get_megatron_optimizer_config(args)
+    config.timers = timers
 
+    if 'muon' not in config.optimizer:
         # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
         # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
         # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
@@ -1324,9 +1293,7 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_muon_optimizer(
             config,
             model,
-            no_weight_decay_cond,
-            scale_lr_cond,
-            lr_mult,
+            config_overrides=config_overrides,
             use_gloo_process_groups=args.enable_gloo_process_groups,
             layer_wise_distributed_optimizer='dist' in config.optimizer,
         )

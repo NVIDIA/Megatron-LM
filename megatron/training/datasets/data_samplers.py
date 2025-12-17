@@ -54,8 +54,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 consumed_samples=consumed_samples,
                 micro_batch_size=args.micro_batch_size,
                 data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size(),
-        )
+                data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
