@@ -14,6 +14,7 @@ from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_paral
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import internal_api
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -914,6 +915,7 @@ def get_moe_layer_wise_logging_tracker():
     return _MOE_LAYER_WISE_LOGGING_TRACKER
 
 
+@internal_api
 class RandomSTE(torch.autograd.Function):
     """
     Straight-Through Estimator(STE) function that returns random values
