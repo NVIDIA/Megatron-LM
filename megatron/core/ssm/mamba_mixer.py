@@ -539,7 +539,7 @@ class MambaMixer(MegatronModule):
                     check_bounds=False,
                 )
                 y_chunked_prefill = self.ssm_prefill(
-                    zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[:1]],
+                    zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[1]],
                     conv_state=conv_state,
                     ssm_state=ssm_state,
                     batch_indices=context.mamba_metadata.batch_indices_chunked_prefill,
