@@ -495,11 +495,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
 
-        using_fused_tp_communication_kernel = (not self.training) and (
+        using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )
 
-        if using_fused_tp_communication_kernel:
+        if using_fused_tp_inference_kernel:
             # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
             # operation in attention's out_proj (linear_proj)
             self._set_proj_residual(residual)
@@ -530,7 +530,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        if using_fused_tp_communication_kernel:
+        if using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
             # self attention module.
@@ -601,7 +601,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and not self.config.transformer_impl == "inference_optimized"
         )
 
-        using_fused_tp_communication_kernel = (not self.training) and (
+        using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )
 
@@ -636,7 +636,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = (mlp_output, bias_output)
 
         else:
-            if using_fused_tp_communication_kernel:
+            if using_fused_tp_inference_kernel:
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
@@ -653,7 +653,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        if using_fused_tp_communication_kernel:
+        if using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
             # MLP module.
@@ -700,7 +700,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             apply_prefix_mapping(sharded_state_dict, prefixed_map)
         return sharded_state_dict
 
-    def configure_fused_tp_communication(
+    def configure_fused_tp_inference(
         self,
         skip_qkv_norm_and_all_gather: bool = False,
         fc2_next_layer_norm_weights: Optional[Tensor] = None,

@@ -406,7 +406,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 next_qkv_norm_weights = None
 
             # Configure all fused TP communication settings in one call
-            current_layer.configure_fused_tp_communication(
+            current_layer.configure_fused_tp_inference(
                 skip_qkv_norm_and_all_gather=(i > 0),
                 fc2_next_layer_norm_weights=next_qkv_norm_weights,
             )
