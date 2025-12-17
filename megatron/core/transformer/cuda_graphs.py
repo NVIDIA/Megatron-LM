@@ -370,9 +370,26 @@ def create_cudagraphs():
 def delete_cuda_graphs():
     """Delete all CUDA graphs."""
 
+    # Reset runners.
+    for record in [
+        *_CudagraphGlobalRecord.cudagraph_record,
+        *_CudagraphGlobalRecord.cudagraph_inference_record,
+    ]:
+        runner = record[0]
+        assert isinstance(runner, _CudaGraphRunner)
+
+        runner.cudagraph_created = False
+        runner.fwd_graph_recorded = False
+        runner.bwd_graph_recorded = False
+        runner.fwd_graph = None
+        runner.bwd_graph = None
+        runner.fwd_mempool = None
+        runner.bwd_mempool = None
+
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
+    _CudagraphGlobalRecord.cudagraph_inference_record = []
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -1166,13 +1183,14 @@ class CudaGraphManager(torch.nn.Module):
         if self.reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
             if is_inference_mode:
-                batch_size = kwargs['hidden_states'].shape[0]
-                is_decode_only = kwargs["inference_context"].is_decode_only()
-                # Attempt to retrieve the corresponding runner from the lookup table.
-                # The table is keyed on (batch_size, is_decode_only).
-                # It returns None if no match is found, in which case a new runner is created
-                # and cached in the lookup table.
-                runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+                is_static_batching = kwargs['inference_context'].is_static_batching()
+                if is_static_batching:
+                    batch_size = kwargs['hidden_states'].shape[0]
+                    is_decode_only = kwargs["inference_context"].is_decode_only()
+                    runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+                else:
+                    padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
+                    runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 runner = next(
@@ -1204,9 +1222,12 @@ class CudaGraphManager(torch.nn.Module):
                     self.cudagraph_runners.append(runner)
                     if is_inference_mode:
                         # Cache the newly created runner in the inference lookup table.
-                        self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
-                            runner
-                        )
+                        if is_static_batching:
+                            self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
+                                runner
+                            )
+                        else:
+                            self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
@@ -1622,48 +1643,82 @@ class TECudaGraphHelper:
         # with the same input signature.
         fwd_sample_queues = {}
         consumed_sample_queue = {}
+        layer_sample_keys_cache = {}
         fwd_idx = [0] * self.num_model_chunks
         for chunk_id in order:
             model_chunk_idx = abs(chunk_id) - 1
 
             if chunk_id > 0:
+                if model_chunk_idx not in fwd_sample_queues:
+                    fwd_sample_queues[model_chunk_idx] = []
+
                 sample_start_idx = (prefix_num_layers[model_chunk_idx] * self.num_microbatches) + (
                     fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
                 )
-                fwd_sample_idx = [
-                    sample_start_idx + i for i in range(self.num_layers_per_chunk[model_chunk_idx])
-                ]
-                if model_chunk_idx not in fwd_sample_queues:
-                    fwd_sample_queues[model_chunk_idx] = []
-                for per_callable_fwd_idx in fwd_sample_idx:
-                    if sample_args[per_callable_fwd_idx] is None:
+                for layer_idx, layer in enumerate(self.callables_per_chunk[model_chunk_idx]):
+                    per_callable_fwd_idx = sample_start_idx + layer_idx
+
+                    # Get sample_args and sample_kwargs for index per_callable_fwd_idx.
+                    assert (
+                        sample_args[per_callable_fwd_idx] is None
+                        and sample_kwargs[per_callable_fwd_idx] is None
+                    ), (
+                        f"sample_args and sample_kwargs must be None before assigning static data, "
+                        f"but got sample_args[{per_callable_fwd_idx}] = "
+                        f"{sample_args[per_callable_fwd_idx]} and "
+                        f"sample_kwargs[{per_callable_fwd_idx}] = "
+                        f"{sample_kwargs[per_callable_fwd_idx]}."
+                    )
+                    if id(layer) not in layer_sample_keys_cache:
+                        # Have not generated the static inputs for this layer yet. So we don't
+                        # know the input signature of this layer. Generate the static inputs, and
+                        # cache the signature.
                         sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
                             _get_layer_static_inputs(
-                                self.callables_per_chunk[model_chunk_idx][
-                                    per_callable_fwd_idx - sample_start_idx
-                                ],
-                                self.chunks_with_decoder[model_chunk_idx],
+                                layer, self.chunks_with_decoder[model_chunk_idx]
                             )
                         )
-
-                    sample_args_keys = tuple(
-                        (t.shape, t.dtype, t.layout) for t in sample_args[per_callable_fwd_idx]
-                    )
-                    sample_kwargs_keys = tuple(
-                        (k, v.shape, v.dtype, v.layout)
-                        for k, v in sorted(sample_kwargs[per_callable_fwd_idx].items())
-                    )
-                    sample_keys = sample_args_keys + sample_kwargs_keys
+                        sample_args_keys = tuple(
+                            (t.shape, t.dtype, t.layout) for t in sample_args[per_callable_fwd_idx]
+                        )
+                        sample_kwargs_keys = tuple(
+                            (k, v.shape, v.dtype, v.layout)
+                            for k, v in sorted(sample_kwargs[per_callable_fwd_idx].items())
+                        )
+                        sample_keys = sample_args_keys + sample_kwargs_keys
+                        layer_sample_keys_cache[id(layer)] = sample_keys
+                    else:
+                        # Get signature from cache. This signature will be used to see if we can
+                        # reuse the static inputs of a previous forward pass for this forward pass.
+                        # If not, we still need to generate the new static inputs.
+                        sample_keys = layer_sample_keys_cache[id(layer)]
 
                     fwd_sample_queues[model_chunk_idx].append((sample_keys, per_callable_fwd_idx))
                     if consumed_sample_queue.get(sample_keys, []):
+                        # We can reuse the static inputs of a previous forward pass for this
+                        # forward pass, because they are of the same input signature and the
+                        # backward pass of the previous forward pass has completed.
                         reuse_fwd_idx = consumed_sample_queue[sample_keys].pop(0)
                         assert (
                             sample_args[reuse_fwd_idx] is not None
                             and sample_kwargs[reuse_fwd_idx] is not None
-                        ), "sample_args and sample_kwargs must not be None when reusing."
+                        ), (
+                            f"sample_args and sample_kwargs must not be None when reusing, but got "
+                            f"sample_args[{reuse_fwd_idx}] = {sample_args[reuse_fwd_idx]} and "
+                            f"sample_kwargs[{reuse_fwd_idx}] = {sample_kwargs[reuse_fwd_idx]}.",
+                        )
                         sample_args[per_callable_fwd_idx] = sample_args[reuse_fwd_idx]
                         sample_kwargs[per_callable_fwd_idx] = sample_kwargs[reuse_fwd_idx]
+
+                    if sample_args[per_callable_fwd_idx] is None:
+                        # Unfortunately, no previous static inputs are available for reuse,
+                        # sample_args is still None. Last attempt: generate the new static inputs
+                        # for this forward pass.
+                        sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
+                            _get_layer_static_inputs(
+                                layer, self.chunks_with_decoder[model_chunk_idx]
+                            )
+                        )
                 fwd_idx[model_chunk_idx] += 1
             else:
                 num_consumed_samples = min(

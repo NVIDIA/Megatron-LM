@@ -777,6 +777,9 @@ class TransformerConfig(ModelParallelConfig):
     symmetric_ar_type: Optional[str] = None
     """Type of symmetric all reduce to use"""
 
+    use_inference_optimized_layers: bool = False
+    """If True, use inference optimized transformer layers during inference."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -1863,6 +1866,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            if self.mtp_num_layers == 1:
+                assert self.pipeline_model_parallel_size > 1, (
+                    'Pipeline model parallel size must be larger than 1 '
+                    'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
+                )
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
@@ -1872,6 +1880,12 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_use_legacy_grouped_gemm
             ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+
+        if self.ep_overlap_early_attn_memory_release:
+            assert self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be enabled when enabling '
+                'ep_overlap_early_attn_memory_release'
+            )
 
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
@@ -1943,6 +1957,13 @@ class TransformerConfig(ModelParallelConfig):
                         f"fallback_to_eager_attn only supports all_gather communication type "
                         f"for context parallelism, but got {self.cp_comm_type=} instead."
                     )
+
+        if self.transformer_impl == "inference_optimized":
+            assert self.normalization == "RMSNorm"
+            assert not self.layernorm_zero_centered_gamma
+            assert not self.add_bias_linear
+            assert not self.add_qkv_bias
+            assert not self.use_kitchen
 
 
 @dataclass
