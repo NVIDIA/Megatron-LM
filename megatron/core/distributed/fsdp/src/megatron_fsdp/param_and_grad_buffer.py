@@ -3344,9 +3344,14 @@ class AllGatherPipeline:
         mark_bucket_ready_to_use()
 
     @torch.no_grad()
-    def release_bucket(self, bucket_id: int):
+    def release_bucket(self, bucket_id: int, lazy: bool = False):
         """Release the bucket."""
         if self.bucket_status[bucket_id] == BucketStatus.EMPTY:
+            return
+
+        if lazy:
+            # Mark the bucket can be released later.
+            self.bucket_can_be_released[bucket_id] = True
             return
 
         self.wait_bucket_ready(bucket_id, empty_ok=True)

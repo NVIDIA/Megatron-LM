@@ -495,10 +495,10 @@ class MegatronFSDP(torch.nn.Module):
         """
         fsdp_unit_modules = self.fsdp_unit_modules
 
-        def release_module_parameters(module, *unused):
+        def release_module_parameters(module, lazy=False, *unused):
             for param in module.parameters():
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
-                self.all_gather_pipeline.release_bucket(bucket_id)
+                self.all_gather_pipeline.release_bucket(bucket_id, lazy=lazy)
 
             if not self.ddp_config.keep_fp8_transpose_cache:
                 release_params_fp8_transpose_cache(module.parameters())
@@ -780,11 +780,13 @@ class MegatronFSDP(torch.nn.Module):
             if module._training_state == TrainingState.PRE_BACKWARD:
                 # Skip weight deallocation until the backward pass is complete
                 # during activation recomputation / gradient checkpointing.
-                return output
+                lazy_release = True
+            else:
+                lazy_release = False
+                module._training_state = TrainingState.IDLE
 
             # Release the module parameters after the forward pass to save memory.
-            release_module_parameters(module)
-            module._training_state = TrainingState.IDLE
+            release_module_parameters(module, lazy=lazy_release)
 
             return output
 
