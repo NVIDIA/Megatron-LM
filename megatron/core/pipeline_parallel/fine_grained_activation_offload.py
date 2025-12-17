@@ -343,6 +343,7 @@ class PipelineOffloadManager:
 
         # Margin to avoid offloading too many groups so that
         self._offload_margin = 0
+        self._delayed_offload_groups = []
         self.reset()
 
     @property
@@ -360,6 +361,18 @@ class PipelineOffloadManager:
         """Get the shared CPU tensor pool."""
         return self._cpu_tensor_pool
 
+    def push_offload_groups(self, group_hook, forced_released_tensors):
+        """Push the offload groups to the delayed queue."""
+        debug_rank(f"pushing offload groups to the delayed queue")
+        self._delayed_offload_groups.append((group_hook, forced_released_tensors))
+    
+    def flush_delayed_groups(self):
+        """Flush the delayed groups."""
+        debug_rank("flushing delayed groups")
+        for group_hook, forced_released_tensors in self._delayed_offload_groups:
+            group_hook(forced_released_tensors)
+        self._delayed_offload_groups = []
+
     def reset(self):
         """Reset manager state for a new training iteration."""
         self._inside_context = False
@@ -376,6 +389,7 @@ class PipelineOffloadManager:
 
         for chunk in self._cached_chunks_forward:
             chunk.reset()
+        self._delayed_offload_groups = []
 
     def flush(self):
         """Flush all staged chunks to the backward queue in reverse order."""
@@ -941,15 +955,20 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         # pylint: disable=missing-function-docstring
         debug_rank("FineGrainedOffloadingGroupCommitFunction forward")
 
-        forced_released_tensors = args[-1]
-        name = args[-2]
-        cpu_offload_handler = args[-3]
-        tensor = args[:-3]
-        cpu_offload_handler.on_group_commit_forward(forced_released_tensors)
+        delay_offload = args[-1]
+        forced_released_tensors = args[-2]
+        name = args[-3]
+        cpu_offload_handler = args[-4]
+        tensor = args[:-4]
+        if delay_offload:
+            PipelineOffloadManager.get_instance().push_offload_groups(
+                cpu_offload_handler.on_group_commit_forward,
+                forced_released_tensors
+            )
+        else:
+            cpu_offload_handler.on_group_commit_forward(forced_released_tensors)
         ctx.cpu_offload_handler = cpu_offload_handler
         ctx.name = name
-
-        # return the identical tensor
         return tensor
 
     @staticmethod
@@ -959,10 +978,10 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
 
         cpu_offload_handler = ctx.cpu_offload_handler
         cpu_offload_handler.on_group_commit_backward(ctx.name)
-        return grad_output + (None, None, None)
+        return grad_output + (None, None, None, None)
 
 
-def fine_grained_offloading_group_commit(*tensor, name, forced_released_tensors=[]):
+def fine_grained_offloading_group_commit(*tensor, name, forced_released_tensors=[], delay_offload=False):
     """
     Specify the tensors to be released after offloading.
     forced_released_tensors is a list of tensors to be released after offloading.
@@ -973,9 +992,13 @@ def fine_grained_offloading_group_commit(*tensor, name, forced_released_tensors=
     if cur_forward_chunk is None:
         return tensor
     return FineGrainedOffloadingGroupCommitFunction.apply(
-        *tensor, cur_forward_chunk, name, forced_released_tensors
+        *tensor, cur_forward_chunk, name, forced_released_tensors, delay_offload
     )
 
+def fine_grained_offloading_group_flush_delayed_groups():
+    """Flush the delayed groups."""
+    debug_rank("fine_grained_offloading_group_flush_delayed_groups")
+    PipelineOffloadManager.get_instance().flush_delayed_groups()
 
 class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
     """

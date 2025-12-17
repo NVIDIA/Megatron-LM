@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from typing import Callable, Optional
 
 import torch
+import warnings
 from torch.autograd import Variable
 
 from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor

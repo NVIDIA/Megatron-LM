@@ -693,6 +693,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     mlp_output_with_bias = (mlp_output, mlp_output_with_bias[1])
             else:
                 mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+            if self.config.delay_offload_until_cuda_graph:
+                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                    fine_grained_offloading_group_flush_delayed_groups,
+                )
+                fine_grained_offloading_group_flush_delayed_groups()
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -883,6 +888,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
+
+        if self.config.delay_offload_until_cuda_graph:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                fine_grained_offloading_group_flush_delayed_groups,
+            )
+            fine_grained_offloading_group_flush_delayed_groups()
 
         if kwargs.get('context') is not None:
             context = cuda_graph_output.pop()
