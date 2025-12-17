@@ -1,9 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import os
 
 import pytest
 import torch
+
 
 EPSILON = 0.1
 
@@ -16,46 +18,40 @@ def _reset_cuda_memory():
     if cuda_available:
         torch.cuda.empty_cache()
 
-
 class ToyModel(torch.nn.Module):
     def __init__(self, hidden_size: int = 2048, num_layers: int = 4, dtype=torch.bfloat16):
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         super().__init__()
         layers = []
         for _ in range(num_layers):
-            layers.append(
-                torch.nn.Linear(hidden_size, hidden_size, bias=True, dtype=dtype, device="cuda")
-            )
+            linear = torch.nn.Linear(hidden_size, hidden_size, bias=True, dtype=dtype, device="cuda")
+            layers.append(linear)
         self.net = torch.nn.Sequential(*layers).to(device="cuda", dtype=dtype)
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dtype = dtype
-
-        # Prevent weights/bias from being considered activation tensors for offload;
-        # ensure we only count activation tensors (inputs x) in memory accounting.
-        for p in self.parameters():
-            try:
-                setattr(p, "offloading_activation", False)
-            except Exception:
-                pass
 
     def forward(self, x, use_offload: bool = False):
         from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
 
         if use_offload:
             # Initialize a new chunk (microbatch) and enable offload context.
-            with off.get_fine_grained_offloading_context(True):
-                off.fine_grained_offloading_init_chunk_handler(
-                    vp_size=1, vp_stage=None, min_offloaded_tensor_size=1
-                )
-                for i, layer in enumerate(self.net):
-                    # Group by module; with this linear-only model, each group corresponds to a layer.
-                    x = off.fine_grained_offloading_group_start(x, name=f"layer_{i}")
+            off.fine_grained_offloading_init_chunk_handler(
+                vp_size=1, vp_stage=None, min_offloaded_tensor_size=1
+            )
+            for layer in self.net:
+                # Group by module; with this linear-only model, each group corresponds to a layer.
+                x = off.fine_grained_offloading_group_start(x, name=f"linear_layer")
+                with off.get_fine_grained_offloading_context(True):
                     x = layer(x)
-                    # Commit the group; returns a tuple of tensors
-                    (x,) = off.fine_grained_offloading_group_commit(
-                        x, name=f"layer_{i}", forced_released_tensors=[]
-                    )
-                return x
+                # Commit the group; returns a tuple of tensors
+                (x,) = off.fine_grained_offloading_group_commit(
+                    x, name=f"linear_layer", forced_released_tensors=[]
+                )
+            return x
         # Baseline path (no offload hooks)
         with (
             torch.autocast(device_type="cuda", dtype=self.dtype)
@@ -65,19 +61,6 @@ class ToyModel(torch.nn.Module):
             for layer in self.net:
                 x = layer(x)
             return x
-
-
-@pytest.fixture(autouse=True)
-def _monkeypatch_offload_deps(monkeypatch):
-    # Avoid requiring torch.distributed initialization and NVML in tests
-    import megatron.core.pipeline_parallel.fine_grained_activation_offload as off
-
-    monkeypatch.setattr(off, "debug_rank", lambda *args, **kwargs: None, raising=False)
-    monkeypatch.setattr(off, "set_ideal_affinity_for_current_gpu", lambda: None, raising=False)
-    # Ensure a clean state each test
-    off.fine_grained_offloading_reset()
-    yield
-    off.fine_grained_offloading_reset()
 
 
 def test_fine_grained_activation_offload_memory_reduction():
@@ -111,7 +94,17 @@ def test_fine_grained_activation_offload_memory_reduction():
     from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
 
     off.fine_grained_offloading_reset()
+    # warmup
+    inp_off = inp.detach().clone().requires_grad_(True)
+    out_off = model(inp_off, use_offload=True)
+    (out_off.sum()).backward()
+    torch.cuda.synchronize()
+    off.fine_grained_offloading_reset()
+    del inp_off
+    del out_off
     _reset_cuda_memory()
+    torch.cuda.synchronize()
+
     inp_off = inp.detach().clone().requires_grad_(True)
     offload_mem_before = torch.cuda.memory_allocated() / (1024**2)
     out_off = model(inp_off, use_offload=True)

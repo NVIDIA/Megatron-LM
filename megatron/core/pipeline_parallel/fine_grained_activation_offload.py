@@ -824,6 +824,7 @@ class ChunkOffloadHandler:
 
     def tensor_need_offloading_checker(self, tensor):
         """Check if the tensor needs to be offloaded."""
+        debug_rank(f"tensor_need_offloading_checker {tensor.numel()} {getattr(tensor, 'offloading_activation', None)}")
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False
         # Respect tensor's offload preference if specified
@@ -889,9 +890,12 @@ class ChunkOffloadHandler:
     def should_bulk_offload(self):
         """Determine if the current group should be offloaded."""
         group = self._groups_to_offload[-1]
+        debug_rank(f"should_bulk_offload {self.is_warmup} {group.offload}")
         # Don't offload if the chunk is not in warmup stage
-        # and the group is marked as not offloadable
-        if not PipelineOffloadManager.get_instance()._is_warmup and not group.offload:
+        if self.is_warmup:
+            return True
+        # Don't offload if the group is marked as not offloadable
+        if not group.offload:
             return False
 
         # Check if next backward chunk is this chunk (for last pipeline stage)
