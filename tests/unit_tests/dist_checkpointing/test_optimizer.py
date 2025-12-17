@@ -1,4 +1,5 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import re
 from copy import deepcopy
 from functools import partial
@@ -706,12 +707,10 @@ class TestDistributedOptimizer:
             # Note: PP must be > 1 if TP <= 2 because of empty buckets otherwise
             ((2, 4), (2, 4), 'fully_reshardable', False),
             ((4, 2), (4, 2), 'dp_reshardable', None),
-            ((8, 1), (8, 1), 'fully_sharded_model_space', None),
             # DP resharding:
             ((4, 2), (4, 1), 'dp_reshardable', None),
             ((2, 4), (2, 2), 'fully_reshardable', False),
             ((2, 4), (2, 2), 'fully_reshardable', True),
-            ((1, 8), (1, 2), 'fully_sharded_model_space', None),
         ],
     )
     @pytest.mark.parametrize("initalize_fn", [initialize_pp_agnostic_model])
@@ -917,8 +916,12 @@ class TestFP32Optimizer:
                     bf16=False,
                 )
 
+                metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+
                 save(
-                    optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()),
+                    optimizer_A.sharded_state_dict(
+                        model_A[0].sharded_state_dict(), metadata=metadata
+                    ),
                     ckpt_dir_A,
                     preprocess_common_before_consistancy_check=preprocess_fn,
                 )
@@ -934,12 +937,17 @@ class TestFP32Optimizer:
                     bf16=False,
                 )
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(
-                    model_B[0].sharded_state_dict(), is_loading=True
+                    model_B[0].sharded_state_dict(), is_loading=True, metadata=metadata
                 )
                 state_dict = load(load_sharded_state_dict, ckpt_dir_A)
 
                 optimizer_B.load_state_dict(state_dict)
-                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                save(
+                    optimizer_B.sharded_state_dict(
+                        model_B[0].sharded_state_dict(), metadata=metadata
+                    ),
+                    ckpt_dir_B,
+                )
                 Utils.destroy_model_parallel()
 
                 # Test both checkpoints are equal
@@ -999,10 +1007,7 @@ class TestOptimizerResharding:
                     initialize_fn=initialize_fn,
                 )
 
-                if fully_parallel:
-                    metadata = {'distrib_optim_sharding_type': 'fully_sharded_model_space'}
-                else:
-                    metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+                metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
 
                 save(
                     optimizer_A.sharded_state_dict(
@@ -1086,10 +1091,7 @@ class TestOptimizerResharding:
                     use_glu=use_glu,
                 )
 
-                if fully_parallel:
-                    metadata = {'distrib_optim_sharding_type': 'fully_sharded_model_space'}
-                else:
-                    metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+                metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
 
                 save(
                     optimizer_A.sharded_state_dict(

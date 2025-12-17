@@ -21,7 +21,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_attr_wrapped_model, get_model_config
 
 
 # pylint: disable=line-too-long
@@ -166,6 +166,23 @@ class AbstractModelInferenceWrapper(abc.ABC):
             runtime_gather_output=True,  # Inference should always gather the logits
         )
 
+    @torch.no_grad()
+    def dummy_forward(self):
+        """Run a dummy forward pass through the model, with a single token.
+        Use-case: Used in EP on ranks which do not have any work, but are needed
+        for the all-to-all communication."""
+        # we use num_dummy_tokens equal to tensor model parallel size
+        # so that the dummy forward pass will work with sequence parallel
+        num_dummy_tokens = parallel_state.get_tensor_model_parallel_world_size()
+        tokens = torch.zeros(
+            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
+        )
+        position_ids = torch.zeros(
+            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
+        )
+        attention_mask = None
+        return self.model(tokens, position_ids, attention_mask)
+
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None
     ):
@@ -239,7 +256,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
             recv_buffer = self._allocate_recv_buffer(batch_size, seq_len)
             recv_from_prev_pipeline_rank_(recv_buffer, self.pp_group)
 
-        self.model.set_input_tensor(recv_buffer)
+        set_input_tensor = get_attr_wrapped_model(self.model, "set_input_tensor")
+        set_input_tensor(recv_buffer)
         output_tensor = self._forward(inference_input)
 
         if not is_pipeline_last_stage(self.pp_group):
