@@ -51,6 +51,8 @@ from megatron.core.utils import (
     trace_async_exceptions,
 )
 
+from .async_zmq_communicator import AsyncZMQCommunicator
+
 try:
     from tqdm import tqdm
 
@@ -271,21 +273,6 @@ class DynamicInferenceEngine(AbstractEngine):
         controller = self.controller
 
         config = controller.inference_wrapped_model.inference_wrapper_config
-        moe_pad_experts = config.moe_pad_experts_for_cuda_graph_inference
-
-        if moe_pad_experts:
-            filtered_cuda_graph_batch_dimensions_list = []
-            for config in context.cuda_graph_batch_dimensions_list:
-                if config.prefill_req_count == 0:
-                    filtered_cuda_graph_batch_dimensions_list.append(config)
-            if len(filtered_cuda_graph_batch_dimensions_list) != len(
-                context.cuda_graph_batch_dimensions_list
-            ):
-                warnings.warn(
-                    "MoE models do not support non-decode cuda graphs. "
-                    "Forcing non_decode_cuda_graphs to False."
-                )
-            context.cuda_graph_batch_dimensions_list = filtered_cuda_graph_batch_dimensions_list
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
@@ -477,6 +464,14 @@ class DynamicInferenceEngine(AbstractEngine):
         ]
 
         torch.distributed.barrier(mp_group)
+
+        # initialize zmq-based EP communicator
+        self.ep_rank = get_pg_rank(self.pg_collection.ep)
+        self.ep_world_size = get_pg_size(self.pg_collection.ep)
+        if self.ep_world_size > 1:
+            self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
+                self.zmq_context, process_group=self.pg_collection.ep
+            )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
@@ -1395,7 +1390,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.received_pause = False
             elif header == Headers.STOP_ACK:
                 self.stopped.set()
-                self.stop()
+                self.received_stop = False
             elif header == Headers.UNPAUSE:
                 self.paused.clear()
                 self.running.set()
@@ -1404,7 +1399,7 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.RESUME:
                 self.suspend_signal = False
             elif header == Headers.STOP:
-                self.stopped = True
+                self.received_stop = True
             else:
                 raise UnknownHeaderError(header)
 
@@ -1420,9 +1415,11 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         if hasattr(self, "inference_coordinator_process"):
-            self.inference_coordinator_process.terminate()
+            self.inference_coordinator_process.join()
         for socket in self.zmq_sockets:
             socket.close()
+        if hasattr(self, "expert_parallel_zmq_communicator"):
+            self.expert_parallel_zmq_communicator.close()
         self.zmq_context.term()
 
     @trace_async_exceptions
@@ -1447,6 +1444,44 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
+    async def _ep_group_has_work(self, local_work: int) -> bool:
+        """Determines if there are some pending requests in the expert parallel group this
+        rank is a part of.
+        Args:
+            local_work (int): The local work count for this rank. This is a sum of active
+            and waiting requests.
+        Returns:
+            bool: True if there is some work in the EP group, False otherwise.
+        """
+        range_push("_ep_group_has_work")
+
+        is_stopped = self.stopped.is_set() or self.received_stop
+        is_paused = self.paused.is_set() or self.received_pause
+        is_suspended = self.suspend_signal
+        if is_stopped or is_paused or is_suspended:
+            # Signals can be received asynchronously on EP ranks.
+            # We do not want a rank to pause/stop/suspend prematurely if one of it's peers
+            # is yet to receive the signal.
+            # So this is an *attempt* to process the signal. This rank has received the signal
+            # and passes 0 to the all-reduce. If any other rank in the EP group has not received the signal yet,
+            # it will pass a non-zero value to the all-reduce, and hence the global work will be non-zero,
+            # and we will defer processing the signal.
+            # When all ranks receive the signal, global work will be zero, and we can process the signal safely.
+            local_work = 0
+
+        if self.ep_world_size > 1:
+            # Perform all-reduce to get max global work across EP group.
+            # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
+            # The user may have other tasks running in the event loop that need to be serviced.
+            # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
+            # We have tried that and it blocks the event loop is megatron-rl.
+            max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
+        else:
+            max_global_work = local_work
+
+        range_pop()
+        return max_global_work > 0
+
     @trace_async_exceptions
     async def run_engine_with_coordinator(
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1457,8 +1492,6 @@ class DynamicInferenceEngine(AbstractEngine):
         try:
             while True:
                 self.schedule_requests()
-                if self.stopped.is_set():
-                    break
 
                 # for the cases below (no active requests, or undergoing a state-change)
                 # do not use asyncio.sleep(0)
@@ -1470,27 +1503,48 @@ class DynamicInferenceEngine(AbstractEngine):
                 # needed to send one message on an IPC socket. However
                 # just to be safe, we use 20ms here.
 
-                # todo [Siddharth]: Can this hardcoded sleep be avoided
-                # with asyncio zmq sockets?
-                if self.paused.is_set() or self.received_pause or self.received_stop:
-                    await asyncio.sleep(0.02)
+                local_pending_requests = self.context.get_active_request_count() + len(
+                    self.waiting_request_ids
+                )
+                # 1. Check for work availability (Consensus Step)
+                ep_group_has_work = await self._ep_group_has_work(local_pending_requests)
+
+                # 2. Dummy Work Logic (Keep group alive if peers have work)
+                if ep_group_has_work and local_pending_requests == 0:
+                    # run dummy forward pass if EP group as a whole has work,
+                    # but this rank does not have any work.
+                    self.controller.dummy_forward()
                     continue
 
-                # Suspend, resume.
-                if self.suspend_signal:
-                    self.suspend()
-                    await asyncio.sleep(0.02)
-                    continue
+                # 3. No work in EP group
+                # We handle control signals (PAUSE/STOP/SUSPEND) only when
+                # the entire EP group has received the signal. It is important to
+                # not process these signals immediately upon receipt, because
+                # other ranks in the EP group may not have received them yet.
+                # If we exit prematurely, other ranks will deadlock at the all-to-all.
+                # We use self._ep_group_has_work() to build consensus across the EP group
+                # as to when it is safe to process these signals. The function returns False
+                # when all ranks have received the signal.
+                if not ep_group_has_work:
+                    # Priority A: STOP
+                    if self.stopped.is_set():
+                        if self.rank == 0:
+                            logging.info("Stopping engine.")
+                        self.stop()
+                        break
 
-                else:
-                    self.resume()
+                    # Priority B: SUSPEND
+                    if self.suspend_signal:
+                        self.suspend()
+                    else:
+                        self.resume()
 
-                # No requests.
-                if (
-                    self.context.get_active_request_count() == 0
-                    and len(self.waiting_request_ids) == 0
-                ):
-                    await asyncio.sleep(0.02)
+                    # Priority C: PAUSE or no work - nothing needs to be done
+                    # To avoid flooding the TP publisher socket with packets,
+                    # we sleep for 20 ms here.
+                    # todo [Siddharth]: Can this hardcoded sleep be avoided
+                    # with asyncio zmq sockets?
+                    await asyncio.sleep(0.02)  # Yield to event loop
                     continue
 
                 await self.async_step()
