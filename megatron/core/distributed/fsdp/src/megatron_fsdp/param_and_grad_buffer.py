@@ -34,7 +34,6 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.device_mesh import _mesh_resources
 
 from .mixed_precision import (
-    fp8_dequantize,
     fp8_discard_transpose_cache,
     fp8_get_raw_data,
     fp8_need_transpose_data,
