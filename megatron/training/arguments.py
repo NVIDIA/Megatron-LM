@@ -658,8 +658,13 @@ def validate_args(args, defaults={}):
                 'all_gather instead, turning off fp8_param_gather',
                 args.rank,
             )
-        if args.fp4_param and not is_te_min_version("2.7.0.dev0"):
-            raise ValueError("--fp4-param requires Transformer Engine >= 2.7.0.dev0.")   
+        if args.fp4_param_gather and not is_te_min_version("2.7.0.dev0"):
+            args.fp4_param_gather = False
+            warn_rank_0(
+                'FSDP2 FP4 param gather is not supported yet in TE 2.0, will fallback to bf16'
+                'all_gather instead, turning off fp4_param_gather',
+                args.rank,
+            )
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
@@ -690,7 +695,7 @@ def validate_args(args, defaults={}):
         raise ValueError("--fp4-format and --fp8-format cannot be used simultaneously. Please choose one.")
 
     # FP4 param requires FP4 mode
-    if args.fp4_param and not args.fp4:
+    if args.fp4_param_gather and not args.fp4:
         raise ValueError("--fp4-param-gather must be used together with --fp4-format.")
     
     # FP4 requires TE >= 2.7.0.dev0
@@ -1327,6 +1332,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
+    kw_args['fp4_param'] = args.fp4_param_gather
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -1445,8 +1451,7 @@ def _add_transformer_engine_args(parser):
                        dest='fp4_quantizer_factory')
     group.add_argument('--fp4-param-gather', action='store_true',
                        help='Keep the compute param in fp4 (do not use any other intermediate '
-                            'dtype) and perform the param all-gather in fp4.',
-                       dest='fp4_param')
+                            'dtype) and perform the param all-gather in fp4.')
     group.add_argument('--te-rng-tracker', action='store_true', default=False,
                        help='Use the Transformer Engine version of the random number generator. '
                             'Required for CUDA graphs support.')
