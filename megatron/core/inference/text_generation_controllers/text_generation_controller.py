@@ -74,22 +74,22 @@ class TextGenerationController:
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.sampling_rng.manual_seed(model_config.inference_sampling_seed)
 
-        # Callback for checking stop words (set by engine)
-        self._stop_word_check_callback = None
+        # Callback to get request IDs that should be marked as finished due to stop words
+        self._get_stop_word_finished_ids_callback = None
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
-    def set_stop_word_check_callback(self, callback):
-        """Set a callback function for checking stop words.
+    def set_stop_word_finished_ids_callback(self, callback):
+        """Set a callback to get request IDs that should be marked as finished due to stop words.
 
-        The callback should have signature: callback(request_id: int, new_token: int) -> bool
-        Returns True if the request should stop due to a stop word match.
+        The callback should have signature: callback(active_request_ids: List[int]) -> Set[int]
+        Returns a set of request IDs from active_request_ids that should be marked as finished.
 
         Args:
-            callback: Function to check stop words for a request.
+            callback: Function that returns request IDs to mark as finished.
         """
-        self._stop_word_check_callback = callback
+        self._get_stop_word_finished_ids_callback = callback
 
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
@@ -826,18 +826,13 @@ class TextGenerationController:
             != self._request_metadata["termination_id"][active_request_slice]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
-        # Check for stop words if callback is set
-        if self._stop_word_check_callback is not None:
-            sampled_tokens_list = self._sampled_tokens_cuda[:active_request_count].tolist()
+        # Mark requests as finished if they hit stop words (detected in previous step's post_process_requests)
+        if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = active_request_ids.tolist()
-
-            for idx, (request_id, new_token) in enumerate(
-                zip(request_ids_list, sampled_tokens_list)
-            ):
-                # Only check stop words for requests that aren't already terminated
-                if active_request_mask[idx] == 1:
-                    if self._stop_word_check_callback(request_id, new_token):
-                        # Mark request as finished due to stop word
+            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+            if stop_word_finished_ids:
+                for idx, request_id in enumerate(request_ids_list):
+                    if request_id in stop_word_finished_ids:
                         active_request_mask[idx] = 0
 
         finished_idxs = (

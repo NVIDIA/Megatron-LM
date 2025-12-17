@@ -193,8 +193,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialize engine.
         self.reset()
 
-        # Set up stop word check callback for the controller
-        self.controller.set_stop_word_check_callback(self._check_stop_words_for_request)
+        # Set callback for getting stop word finished request IDs
+        self.controller.set_stop_word_finished_ids_callback(self._get_and_clear_stop_word_finished_ids)
 
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
@@ -236,6 +236,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        # Track requests that should stop due to stop words (detected in post_process_requests)
+        self.stop_word_finished_request_ids: set[int] = set()
+        # Track requests currently being finished due to stop words (to skip extra token)
+        self.stop_word_being_finished_ids: set[int] = set()
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
@@ -820,12 +824,19 @@ class DynamicInferenceEngine(AbstractEngine):
         ):
             request: DynamicInferenceRequest = self.get_request(request_id)
             if request_id != self.context.chunked_prefill_request_id:
-                request.generated_tokens.append(token)
-                if request.tpot is None:
-                    request.tpot = []
-                request.tpot.append(step_time)
+                # Skip appending token for requests being finished due to stop words
+                # (they already have their final token from the previous step)
+                if request_id not in self.stop_word_being_finished_ids:
+                    request.generated_tokens.append(token)
+                    if request.tpot is None:
+                        request.tpot = []
+                    request.tpot.append(step_time)
+
+                # Check for stop words (after token is appended)
+                stop_word_hit = self._check_stop_words_for_request_post_append(request)
 
                 if request_id in finished_request_ids:
+                    # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     finished_entry = self.requests.pop(request_id)
@@ -833,6 +844,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_request.generated_length = len(finished_request.generated_tokens)
                     finished_request_records.append(finished_entry.record)
                     finished_entry.future.set_result(finished_entry.record)
+                elif stop_word_hit:
+                    # Stop word detected - mark for removal in next step's bookkeeping
+                    # Don't pop yet; let the next step handle it properly via callback
+                    self.stop_word_finished_request_ids.add(request_id)
+                    active_request_ids.append(request_id)
                 else:
                     active_request_ids.append(request_id)
             else:
@@ -919,6 +935,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
+        # Clear the stop word being finished set after processing
+        self.stop_word_being_finished_ids.clear()
+
         return active_request_ids, finished_request_records
 
     def _check_stop_words_for_request(self, request_id: int, new_token: int) -> bool:
@@ -952,6 +971,60 @@ class DynamicInferenceEngine(AbstractEngine):
             if len(generated_tokens) >= stop_len:
                 # Check if the last stop_len tokens match the stop word
                 if generated_tokens[-stop_len:] == stop_word_ids:
+                    return True
+
+        return False
+
+    def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
+        """Get and clear the set of request IDs that should be finished due to stop words.
+
+        This callback is called from the controller during bookkeeping to get request IDs
+        that were detected as hitting stop words in the previous step's post_process_requests.
+
+        Args:
+            active_request_ids: List of currently active request IDs.
+
+        Returns:
+            Set of request IDs from active_request_ids that should be marked as finished.
+        """
+        if not self.stop_word_finished_request_ids:
+            return set()
+
+        # Find which stop word finished IDs are in the current active requests
+        result = self.stop_word_finished_request_ids & set(active_request_ids)
+        # Move to "being finished" set so post_process_requests can skip the extra token
+        self.stop_word_being_finished_ids = result
+        # Clear the IDs that we're returning (they'll be marked as finished)
+        self.stop_word_finished_request_ids -= result
+        return result
+
+    def _check_stop_words_for_request_post_append(self, request: DynamicInferenceRequest) -> bool:
+        """Check if a request should stop due to stop words (after token is appended).
+
+        This method is called from post_process_requests after the token has already
+        been appended to request.generated_tokens.
+
+        Args:
+            request: The request to check.
+
+        Returns:
+            bool: True if the generated sequence ends with a stop word, False otherwise.
+        """
+        # Check if request has stop words configured
+        if (
+            request.sampling_params.stop_word_ids is None
+            or len(request.sampling_params.stop_word_ids) == 0
+        ):
+            return False
+
+        generated_tokens = request.generated_tokens
+
+        # Check if the sequence ends with any stop word
+        for stop_word_ids in request.sampling_params.stop_word_ids:
+            stop_len = len(stop_word_ids)
+            if len(generated_tokens) >= stop_len:
+                # Check if the last stop_len tokens match the stop word
+                if list(generated_tokens[-stop_len:]) == stop_word_ids:
                     return True
 
         return False
