@@ -6,7 +6,6 @@ import os
 import pytest
 import torch
 
-
 EPSILON = 0.1
 
 # Skip all tests if CUDA is not available
@@ -18,6 +17,7 @@ def _reset_cuda_memory():
     if cuda_available:
         torch.cuda.empty_cache()
 
+
 class ToyModel(torch.nn.Module):
     def __init__(self, hidden_size: int = 2048, num_layers: int = 4, dtype=torch.bfloat16):
         if not torch.distributed.is_initialized():
@@ -27,7 +27,9 @@ class ToyModel(torch.nn.Module):
         super().__init__()
         layers = []
         for _ in range(num_layers):
-            linear = torch.nn.Linear(hidden_size, hidden_size, bias=True, dtype=dtype, device="cuda")
+            linear = torch.nn.Linear(
+                hidden_size, hidden_size, bias=True, dtype=dtype, device="cuda"
+            )
             layers.append(linear)
         self.net = torch.nn.Sequential(*layers).to(device="cuda", dtype=dtype)
         self.hidden_size = hidden_size
