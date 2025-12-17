@@ -633,16 +633,14 @@ class RouterReplay:
             self.record_indices(top_indices)
             return probs, top_indices
         elif self.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
-            # Use the provided indices for replay
-            top_indices = router_replay.target_topk_idx
+            top_indices = self.target_topk_idx
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
             # Gather the scores for the replayed indices to get the probabilities
             probs = scores.gather(1, top_indices)
             return probs, top_indices
         elif self.router_replay_action == RouterReplayAction.REPLAY_BACKWARD:
-            # Use the last recorded indices for backward replay
-            top_indices = router_replay.replay_backward_list.pop(0)
+            top_indices = self.replay_backward_list.pop(0)
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
             # Gather the scores for the replayed indices to get the probabilities
