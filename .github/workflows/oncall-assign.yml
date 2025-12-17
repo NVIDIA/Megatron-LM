@@ -34,8 +34,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.PAT }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -47,6 +45,6 @@ jobs:
 
       - name: Assign Reviewer
         env:
-          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python .github/scripts/oncall_manager.py assign --pr ${{ github.event.pull_request.number }}
