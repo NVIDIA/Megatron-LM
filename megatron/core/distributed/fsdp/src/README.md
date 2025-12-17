@@ -280,13 +280,16 @@ optimizer.load_state_dict(ckpt_state_dict["optimizer"])
     - **Only effective when using Megatron-LM.**
     - Defaults to `False`.
 - `nccl_ub` will allocate and register the NCCL userbuffer for param and grad buffers. This option enables an SM-efficient NCCL algorithm that could improve the performance of overlapped computations. This flag will be much more effective when used together with SHARP if the FSDP communication includes both NVL and IB domains. Enabling this option will cause additional memory overhead due to the requirement to enable the `fsdp_double_buffer` option.
-    - **Only effective when using Megatron-LM.**
+    - **Only effective when using with Megatron-Core.**
     - Defaults to `False`.
     - By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registraion.
+- `fsdp_manual_registration` will manually register the FSDP communication buffers with the NCCL user buffer. For symmetric registration with large models, the registration itself can take a significant amount of time. This option minimizes the number of registration calls to reduce the registration time. However, with this option enabled, you need to manually call the `ParamAndGradBuffer.manual_buffer_registration()` function after the first iteration. This is already implemented in the Megatron-LM training loop. In other use cases, users are expected to call this function themselves.
+    - **Only effective when using with Megatron-Core.**
+    - This option is only effective when `nccl_ub` is enabled.
+    - Defaults to `False`.
 - `disable_symmetric_registration` will disable NCCL window (i.e. symmetric) registraion when using `nccl_ub`. 
     - Dafaults to `False`.
 - `fsdp_double_buffer` will use persistently allocated double buffers for temporarily-defined memory needed in `MegatronFSDP` communications. Having persistent double buffers may increase peak VRAM utilization, but is required to register NCCL user buffers (`nccl_ub=True`) for `MegatronFSDP`. Currently, this is only supported for simple repetitive model structures such as GPT.
-    - **Only effective when using Megatron-LM.**
     - Defaults to `False`. Automatically overridden to `True` when `nccl_ub` is enabled.
 - `preproc_state_dict_for_dcp_ckpt` adds `model.state_dict()` and `optimizer.state_dict()` post-hooks that modify the model and optimizer state in preparation for `torch.distributed.checkpoint.{save,load}` ([Torch DCP](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)) checkpointing. Specifically, it adds `__create_write_items__` and `__create_chunk_list__` methods to Tensors utilized by Torch DCP to redistribute parameters when saving and loading model and optimizer checkpoints. Can be deactivated should the user need a custom distributed checkpointing strategy.
     - Defaults to `True`.
