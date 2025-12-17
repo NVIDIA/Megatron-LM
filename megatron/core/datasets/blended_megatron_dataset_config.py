@@ -31,7 +31,7 @@ class BlendedMegatronDatasetConfig:
 
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]] = None
     """A set of blends, as defined above, one for each split distribution. Not to be used with
-       'blend'. Defauls to None.
+       'blend'. Defaults to None.
     """
 
     multiple_validation_sets: Optional[bool] = None

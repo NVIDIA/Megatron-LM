@@ -11,6 +11,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
+logger = logging.getLogger(__name__)
+
 try:
     import transformer_engine as te
 
@@ -120,6 +122,7 @@ class Linear(torch.nn.Linear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.config = config
+        self.tp_group = tp_group
 
         self._return_bias = skip_bias_add and bias
 
@@ -157,7 +160,11 @@ class Linear(torch.nn.Linear):
                 if v.ndim == 0:
                     state_dict[k] = v.view(1)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_offsets=sharded_offsets
+            state_dict,
+            prefix,
+            sharded_offsets=sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
         return sharded_state_dict
 
