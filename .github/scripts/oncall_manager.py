@@ -17,7 +17,7 @@ import sys
 import json
 import requests
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Constants
 GITHUB_API_URL = "https://api.github.com"
@@ -127,8 +127,27 @@ def rotate_schedule(repo_owner, dry_run=False):
     # 1. Rotate (Remove past week)
     # Only if schedule is not empty.
     if schedule:
-        removed = schedule.pop(0)
-        print(f"Rotated out: {removed}")
+        # Check date of first entry
+        first_entry = schedule[0]
+        try:
+            # We assume the date is the *start* of the oncall shift (Wednesday).
+            # The shift ends 7 days later.
+            start_date = datetime.strptime(first_entry['date'], "%Y-%m-%d").date()
+            end_date = start_date + timedelta(days=7)
+            
+            today = datetime.now(timezone.utc).date()
+            
+            # If today is >= end_date, the shift is over.
+            # (e.g. Started last Wed, ends today Wed. If today is Wed, we rotate)
+            if today >= end_date:
+                removed = schedule.pop(0)
+                print(f"Rotated out: {removed} (Ended {end_date})")
+            else:
+                print(f"First entry {first_entry} has not ended yet (Ends {end_date}). Not removing.")
+        except ValueError:
+             # Fallback if date is invalid, rotate anyway
+             removed = schedule.pop(0)
+             print(f"Rotated out (invalid date): {removed}")
     else:
         print("Schedule empty, nothing to rotate.")
 
@@ -152,7 +171,7 @@ def rotate_schedule(repo_owner, dry_run=False):
         print(json.dumps(schedule, indent=4))
 
 def get_last_wednesday():
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     # Monday=0, Wednesday=2
     offset = (today.weekday() - 2) % 7
     return today - timedelta(days=offset)
