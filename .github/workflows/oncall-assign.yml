@@ -42,7 +42,7 @@ jobs:
 
       - name: Assign Reviewer
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           pip install --no-cache-dir uv
           uv run python .github/scripts/oncall_manager.py assign --pr ${{ github.event.pull_request.number }}
