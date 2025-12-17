@@ -862,6 +862,8 @@ def prepare_data_for_update(
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
+        # Note :- For EP, do not use the expert data parallel group here. Always 
+        # use the regular data parallel group. 
         if (data_parallel_world_size := mpu.get_data_parallel_world_size()) > 0:
             data_split_size = len(rollouts) // data_parallel_world_size
             data_split_range = (
