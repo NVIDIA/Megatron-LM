@@ -25,42 +25,11 @@ def execute_reshard_plan(
     A communication service must be provided to abstract transport.
     Expected service API: submit_send(tensor, dest_rank), submit_recv(tensor, src_rank), run().
     """
-    my_rank = dist.get_rank()
-    
+
     src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
     dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
     submit_send_with_id = getattr(service, "submit_send_with_id", None)
     submit_recv_with_id = getattr(service, "submit_recv_with_id", None)
-
-    # DEBUG: Print plan summary - focus on QKV weight for GQA debugging
-    if my_rank == 0:
-        print(f"\n[Rank {my_rank}] ========== RESHARD PLAN DEBUG ==========")
-        print(f"[Rank {my_rank}] Total send_ops: {len(plan.send_ops)}, recv_ops: {len(plan.recv_ops)}")
-        
-        # Show QKV weight ops specifically (these are critical for GQA)
-        print(f"[Rank {my_rank}] QKV WEIGHT RECV ops:")
-        for op in plan.recv_ops:
-            if "linear_qkv.weight" in op.param_name:
-                dst_param = dst_params.get(op.param_name)
-                dst_shape = list(dst_param.shape) if dst_param is not None else "NOT FOUND"
-                print(f"[Rank {my_rank}]   {op.param_name} slice={op.my_slice} <- rank {op.peer_rank}, dst_shape={dst_shape}")
-        
-        # Show QKV bias ops
-        print(f"[Rank {my_rank}] QKV BIAS RECV ops:")
-        for op in plan.recv_ops:
-            if "linear_qkv.bias" in op.param_name:
-                dst_param = dst_params.get(op.param_name)
-                dst_shape = list(dst_param.shape) if dst_param is not None else "NOT FOUND"
-                print(f"[Rank {my_rank}]   {op.param_name} slice={op.my_slice} <- rank {op.peer_rank}, dst_shape={dst_shape}")
-        
-        # Show linear_proj weight ops (row parallel - different sharding pattern)
-        print(f"[Rank {my_rank}] LINEAR_PROJ WEIGHT RECV ops:")
-        for op in plan.recv_ops:
-            if "linear_proj.weight" in op.param_name:
-                dst_param = dst_params.get(op.param_name)
-                dst_shape = list(dst_param.shape) if dst_param is not None else "NOT FOUND"
-                print(f"[Rank {my_rank}]   {op.param_name} slice={op.my_slice} <- rank {op.peer_rank}, dst_shape={dst_shape}")
-        print(f"[Rank {my_rank}] ========== END RESHARD PLAN DEBUG ==========\n")
 
     # Submit sends
     for op in plan.send_ops:
