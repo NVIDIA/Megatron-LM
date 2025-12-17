@@ -33,6 +33,7 @@ def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
     Args:
         total_offload_bytes: Dict mapping group names to offload bytes for this rank.
     """
+    # pylint: disable=bad-builtin
     assert torch.distributed.is_initialized()
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
@@ -1027,8 +1028,7 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         tensor = args[:-4]
         if delay_offload:
             PipelineOffloadManager.get_instance().push_offload_groups(
-                cpu_offload_handler.on_group_commit_forward,
-                forced_released_tensors
+                cpu_offload_handler.on_group_commit_forward, forced_released_tensors
             )
         else:
             cpu_offload_handler.on_group_commit_forward(forced_released_tensors)
@@ -1046,7 +1046,9 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         return grad_output + (None, None, None, None)
 
 
-def fine_grained_offloading_group_commit(*tensor, name, forced_released_tensors=[], delay_offload=False):
+def fine_grained_offloading_group_commit(
+    *tensor, name, forced_released_tensors=[], delay_offload=False
+):
     """
     Specify the tensors to be released after offloading.
     forced_released_tensors is a list of tensors to be released after offloading.
@@ -1060,10 +1062,12 @@ def fine_grained_offloading_group_commit(*tensor, name, forced_released_tensors=
         *tensor, cur_forward_chunk, name, forced_released_tensors, delay_offload
     )
 
+
 def fine_grained_offloading_group_flush_delayed_groups():
     """Flush the delayed groups."""
     debug_rank("fine_grained_offloading_group_flush_delayed_groups")
     PipelineOffloadManager.get_instance().flush_delayed_groups()
+
 
 class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
     """

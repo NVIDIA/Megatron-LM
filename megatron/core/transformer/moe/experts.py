@@ -975,8 +975,10 @@ class TEGroupedMLP(MegatronModule):
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         if self.offload_moe_act:
             (output,) = fine_grained_offloading_group_commit(
-                output, name="moe_act", forced_released_tensors=[fc1_output],
-                delay_offload=self.config.delay_offload_until_cuda_graph
+                output,
+                name="moe_act",
+                forced_released_tensors=[fc1_output],
+                delay_offload=self.config.delay_offload_until_cuda_graph,
             )
 
         # upad and concat the output

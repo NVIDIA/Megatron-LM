@@ -688,9 +688,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
                 if self.offload_dense_mlp:
                     (mlp_output,) = fine_grained_offloading_group_commit(
-                        mlp_output_with_bias[0], name="dense_mlp",
+                        mlp_output_with_bias[0],
+                        name="dense_mlp",
                         forced_released_tensors=[],
-                        delay_offload=self.config.delay_offload_until_cuda_graph
+                        delay_offload=self.config.delay_offload_until_cuda_graph,
                     )
                     mlp_output_with_bias = (mlp_output, mlp_output_with_bias[1])
             else:
@@ -749,6 +750,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 fine_grained_offloading_group_flush_delayed_groups,
             )
+
             fine_grained_offloading_group_flush_delayed_groups()
         return output
 
@@ -895,6 +897,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 fine_grained_offloading_group_flush_delayed_groups,
             )
+
             fine_grained_offloading_group_flush_delayed_groups()
 
         if kwargs.get('context') is not None:
@@ -954,7 +957,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
 
-            output = self._forward_post_mlp(mlp_output_with_bias, mlp_residual, flush_delayed_groups=False)
+            output = self._forward_post_mlp(
+                mlp_output_with_bias, mlp_residual, flush_delayed_groups=False
+            )
         else:
             # CUDA Graph does not capture the MLP/MoE part at all.
             output = self._forward_mlp(*cuda_graph_output, flush_delayed_groups=False)
