@@ -174,6 +174,7 @@ class Attention(MegatronModule, ABC):
                 pg_collection, 'cp'
             ), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
 
         # Per attention head and per partition values
         world_size = get_pg_size(self.pg_collection.tp)
