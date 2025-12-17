@@ -8,7 +8,6 @@ import torch.distributed as dist
 from pydantic import PrivateAttr
 
 from megatron.core import parallel_state
-from megatron.core.utils import get_attr_wrapped_model
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
@@ -25,13 +24,15 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
     SimpleTextGenerationController,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.pipeline_parallel.utils import (
-    is_pp_first_stage,
-    is_pp_last_stage,
+from megatron.core.utils import (
+    get_attr_wrapped_model,
+    get_mamba_inference_state_config_from_model,
+    get_pg_size,
+    log_single_rank,
 )
-from megatron.core.utils import get_mamba_inference_state_config_from_model, log_single_rank, get_pg_size
 from megatron.training import get_wandb_writer
 from megatron.training.global_vars import get_args, get_tokenizer
 
@@ -138,9 +139,7 @@ def get_dynamic_inference_engine(
         ),
         max_sequence_length=args.inference_max_seq_length,
         num_cuda_graphs=(
-            args.inference_dynamic_batching_num_cuda_graphs
-            if enable_cuda_graph
-            else None
+            args.inference_dynamic_batching_num_cuda_graphs if enable_cuda_graph else None
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
@@ -172,8 +171,9 @@ def get_dynamic_inference_engine(
     return DynamicInferenceEngine(
         controller=text_generation_controller,
         context=inference_context,
-        enable_cuda_graph=enable_cuda_graph,
         random_seed=args.seed,
+        track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+        enable_chunked_prefill=not args.disable_chunked_prefill,
         inference_logging_step_interval=inference_logging_step_interval,
         pg_collection=pg_collection,
     )
@@ -215,9 +215,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)
             for prompt in request.prompt
         ]
-        records = await asyncio.gather(
-            *requests
-        )
+        records = await asyncio.gather(*requests)
         responses = [record[-1] for record in records]
         return [
             InferenceResponse(
@@ -295,5 +293,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             self._client.unpause_engines()
         await self._inference_engine.running.wait()
+
 
 class MegatronChatLocal(ChatInferenceInterface, MegatronLocal): ...
