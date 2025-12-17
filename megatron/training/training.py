@@ -59,6 +59,7 @@ from megatron.core.utils import (
     StragglerDetector,
 )
 from megatron.core.fp8_utils import correct_amax_history_if_needed
+from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -69,6 +70,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
+from megatron.training.simulation import VppSimulator, SimulationArgsOverride
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.qk_clip import clip_qk
 
@@ -624,6 +626,25 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+def simulate_global_step(
+    train_valid_test_dataset_provider,
+    model_provider,
+    forward_step_func,
+):
+    
+    train_data_iterator, valid_data_iterator, test_data_iterator = (
+        build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+    )
+
+    vpp_simulator = VppSimulator(
+        train_data_iterator,
+        model_provider,
+        forward_step_func,
+    )
+
+    vpp_simulator.run_global_step()
+
+
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -674,19 +695,23 @@ def pretrain(
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
     """
+    parsed_args = parse_args(extra_args_provider, ignore_unknown_args=False)
 
-    if inprocess_call_wrapper is not None:
-        iteration = inprocess_call_wrapper.iteration
-        store = torch.distributed.PrefixStore(str(iteration), store)
+    # Temporarily override PP args for simulation initialization
+    with SimulationArgsOverride(parsed_args, enable=parsed_args.simulate_global_step):
+        if inprocess_call_wrapper is not None:
+            iteration = inprocess_call_wrapper.iteration
+            store = torch.distributed.PrefixStore(str(iteration), store)
 
-    # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(
-        extra_args_provider=extra_args_provider,
-        args_defaults=args_defaults,
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks,
-        store=store,
-    )
+        # Initialize Megatron with PP=1 to enable network setup with fewer GPUs
+        initialize_megatron(
+            extra_args_provider=extra_args_provider,
+            args_defaults=args_defaults,
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks,
+            store=store,
+            parsed_args=parsed_args
+        )
 
     args = get_args()
     timers = get_timers()
@@ -723,6 +748,14 @@ def pretrain(
 
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
+
+    if args.simulate_global_step:
+        simulate_global_step(
+            train_valid_test_dataset_provider,
+            model_provider,
+            forward_step_func,
+        )
+        return 
 
     # Context used for persisting some state between checkpoint saves.
     if args.non_persistent_ckpt_type == 'local':
