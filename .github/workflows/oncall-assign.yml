@@ -15,7 +15,7 @@
 name: Oncall Assign
 
 on:
-  pull_request:
+  pull_request_target:
     types: [labeled, ready_for_review]
 
 permissions:
