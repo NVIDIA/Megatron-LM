@@ -46,11 +46,11 @@ jobs:
           else
             # For push events, use merge-base to find common ancestor
             # This ensures we only detect changes actually made in this PR branch,
-            # not changes that happened in dev after the branch was created
-            BASE_SHA=$(git merge-base origin/dev HEAD 2>/dev/null || echo "")
+            # not changes that happened in main after the branch was created
+            BASE_SHA=$(git merge-base origin/main HEAD 2>/dev/null || echo "")
             if [ -z "$BASE_SHA" ]; then
-              # Fallback for branches targeting main
-              BASE_SHA=$(git merge-base origin/main HEAD 2>/dev/null || echo "")
+              # Fallback for pull-request/* branches targeting dev
+              BASE_SHA=$(git merge-base origin/dev HEAD 2>/dev/null || echo "")
             fi
             echo "Push event - comparing against merge-base: $BASE_SHA"
           fi
@@ -81,7 +81,7 @@ jobs:
   check-compatibility:
     needs: [pre-flight]
     if: needs.pre-flight.outputs.should_skip != 'true'
-    name: Check API Backward Compatibility
+    name: "OPTIONAL: Check API Backward Compatibility"
     runs-on: ubuntu-latest
     
     # ============================================================================
@@ -91,7 +91,7 @@ jobs:
       # Default baseline for automatic PR checks
       # Can be: branch name (e.g., 'main'), commit hash, or tag
       # Will be resolved to commit hash during execution
-      DEFAULT_BASELINE: '274e04d21fbcb7f53f63de992ee1217f275f1cf2'
+      DEFAULT_BASELINE: '5ab481cb45efc72add12f8ba0378e849b3d2bc50'
       # Tag pattern for auto-detection (e.g., 'core_r*', 'core_v*')
       TAG_PATTERN: 'core_v*'
       # Tag regex filter (e.g., '^core_v[0-9]+\.[0-9]+\.[0-9]+$' for stable versions only)
@@ -245,7 +245,7 @@ jobs:
   api-backward-compatibility-summary:
     needs: [pre-flight, check-compatibility]
     runs-on: ubuntu-latest
-    name: API Backward Compatibility Check Summary
+    name: "OPTIONAL: API Backward Compatibility Check Summary"
     if: always() && !cancelled()
     steps:
       - name: Checkout
@@ -257,7 +257,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.should_skip == 'true' }}
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and .name != "API Backward Compatibility Check Summary")] | length') || echo 0
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and .name != "OPTIONAL: API Backward Compatibility Check Summary")] | length') || echo 0
 
           if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
               if [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
@@ -268,7 +268,7 @@ jobs:
               exit 0
           else
               echo "❌ Found $FAILED_JOBS failed job(s)"
-              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success" and .name != "API Backward Compatibility Check Summary") | .name'
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success" and .name != "OPTIONAL: API Backward Compatibility Check Summary") | .name'
               exit 1
           fi
 

@@ -3,6 +3,7 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+from megatron.core.utils import internal_api
 
 try:
     from deep_ep import Buffer

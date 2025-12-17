@@ -375,7 +375,7 @@ class LanguageModule(MegatronModule):
         sharded_state_dict: ShardedStateDict,
         output_layer_weight_key: str,
         first_stage_word_emb_key: str,
-        metadata: Optional[dict] = None,
+        metadata: dict = {},
     ) -> None:
         """Ties the embedding and output weights in a given sharded state dict.
 

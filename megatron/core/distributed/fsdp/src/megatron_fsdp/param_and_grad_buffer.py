@@ -31,7 +31,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 import torch
 from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.distributed.tensor.device_mesh import _mesh_resources
 
 from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
 from .utils import (
@@ -3577,20 +3576,6 @@ def _get_fsdp_tensor_spec(
     if isinstance(param, DTensor) and cast(DTensor, param)._spec.num_shards > 1:
         # Retrieve original DTensorSpec (for TP).
         dtensor_spec = cast(DTensor, param)._spec
-        dtensor_mesh = getattr(dtensor_spec, "mesh", None)
-
-        # Validate that the DTensor root mesh is identical to the Megatron-FSDP device mesh.
-        megatron_fsdp_global_mesh = dist_index.get_root_mesh(is_expert_parallel=is_expert_param)
-        dtensor_global_mesh = _mesh_resources.get_root_mesh(dtensor_mesh)
-        # FIXME(boxiangw): add or megatron_fsdp_global_mesh != dtensor_global_mesh:
-        # _mesh_resources.get_root_mesh(dtensor_mesh) is not getting the correct root mesh
-        if dtensor_global_mesh is None:
-            raise ValueError(
-                f"When utilizing DTensor-based modules with Megatron-FSDP, the DTensor root "
-                f"device mesh must be identical to the Megatron-FSDP root device mesh.\n"
-                f"DTensor Root Mesh: {dtensor_global_mesh} / Megatron-FSDP "
-                f"Root Mesh: {megatron_fsdp_global_mesh}"
-            )
 
         # Get the placements for the parameter.
         assert len(dtensor_spec.placements) == 1, (
@@ -3778,7 +3763,7 @@ def make_fsdp_dtensor(
                 device_mesh=tp_mesh,
                 placements=placements,
                 run_check=run_check,
-                shape=global_shape,
+                shape=tuple(global_shape),
                 stride=torch.empty(global_shape).stride(),
             )
 

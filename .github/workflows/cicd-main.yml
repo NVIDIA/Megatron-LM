@@ -40,7 +40,6 @@ env:
 jobs:
   is-not-external-contributor:
     runs-on: ubuntu-latest
-    environment: nemo-ci
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
@@ -291,7 +290,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           file: ./docker/Dockerfile.ci.dev
           push: true
@@ -388,7 +387,6 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
-    environment: nemo-ci
     if: |
       (
         success()
@@ -568,7 +566,6 @@ jobs:
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
-    environment: nemo-ci
     steps:
       - name: Generate fake coverage report
         uses: actions/github-script@v6
@@ -636,3 +633,21 @@ jobs:
           path: |
             .coverage
           include-hidden-files: true
+
+  cleanup-taint-node:
+    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    needs:
+      - is-not-external-contributor
+      - cicd-container-build
+      - cicd-unit-tests-latest
+      - cicd-integration-tests-latest
+      - Coverage
+      - Coverage_Fake
+    if: |
+      always()
+      && !cancelled()
+      && contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
+    steps:
+      - name: Taint node for cleanup
+        shell: bash
+        run: taint-node.sh

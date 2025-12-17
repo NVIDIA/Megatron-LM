@@ -146,12 +146,7 @@ if __name__ == "__main__":
             with open(args.eagle_config)as f:
                 eagle_config = json.load(f)
             mtsp_config["config"]["eagle_architecture_config"].update(eagle_config)
-        # Update eagle hidden_size and vocab_size according to the base model
-        mtsp_config["config"]["eagle_architecture_config"]["hidden_size"] = unwrapped_model.config.hidden_size
-        mtsp_config["config"]["eagle_architecture_config"]["vocab_size"] = unwrapped_model.vocab_size
-        if not args.eagle_config or "draft_vocab_size" not in eagle_config:
-            # If draft_vocab_size is not provided, set it to vocab_size
-            mtsp_config["config"]["eagle_architecture_config"]["draft_vocab_size"] = unwrapped_model.vocab_size
+        
         if args.export_offline_model:
             mtsp_config["config"]["eagle_offline"] = True
 
@@ -162,17 +157,7 @@ if __name__ == "__main__":
             if eagle_module is not None:
                 mcore_eagle_state_dict = torch.load(args.extra_model_path)
                 eagle_module.load_state_dict(mcore_eagle_state_dict, strict=False)
-
-        # Add mask tokens for parallel draft
-        if unwrapped_model.eagle_config.parallel_draft_step > 1:
-            assert unwrapped_model.eagle_config.parallel_draft_step <= 4, "Parallel draft only supports steps less than or equal to 4."
-            tokenizer = get_tokenizer()
-            for i in range(unwrapped_model.eagle_config.parallel_draft_step - 1):
-                mask_token = "[MASK_{}]".format(i)
-                tokenizer._tokenizer.add_tokens([mask_token], special_tokens=True)
-                token_id = tokenizer._tokenizer.convert_tokens_to_ids(mask_token)
-                setattr(unwrapped_model, "mask_token_{}".format(i), torch.tensor(token_id))
-
+                
     elif args.algorithm == "medusa":
         config = {"medusa_num_heads": args.export_num_medusa_heads, "medusa_num_layers": 1}
         unwrapped_model = mtsp.convert(unwrapped_model, [("medusa", config)])

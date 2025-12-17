@@ -286,8 +286,14 @@ class MegatronFSDP(torch.nn.Module):
         self._register_fsdp_hooks(self.module)
         self.microbatch_count = 0
 
+        # Add a reference from the distributed parameters to self for API
+        # accessibility, e.g. when attaching MegatronFSDP scheduled ops
+        # to the distributed optimizer.step() and optimizer.zero_grad().
         self.is_param_fsdp_distributed = False
         self._replace_param_with_distributed_if_needed()
+        for param in self.module.parameters():
+            # Attach MegatronFSDP reference to the parameter.
+            setattr(param, "_megatron_fsdp_model", self)
 
     def _check_module_parameter_types(self):
         """
@@ -898,9 +904,10 @@ class MegatronFSDP(torch.nn.Module):
 
         # Register pre state_dict hook to ensure that the module parameters are
         # distributed before saving the state_dict.
-        self._state_dict_pre_hook = self.module.register_state_dict_pre_hook(
-            lambda *args, **kwargs: self._replace_param_with_distributed_if_needed()
-        )
+        for name, module in self.named_modules():
+            module.register_state_dict_pre_hook(
+                lambda *args, **kwargs: self._replace_param_with_distributed_if_needed()
+            )
 
     @contextmanager
     def no_sync(self):

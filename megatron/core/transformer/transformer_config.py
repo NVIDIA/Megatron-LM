@@ -484,6 +484,13 @@ class TransformerConfig(ModelParallelConfig):
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
+    use_kitchen_attention: bool = False
+    """Use the kitchen extension for attention (instead of TE's attention)."""
+
+    kitchen_attention_backend: Literal["sdpa", "fa"] = "sdpa"
+    """Which kitchen attention backend to use when use_kitchen_attention=True.
+    "sdpa" for KitchenDotProductAttention, "fa" for KitchenFlashAttention."""
+
     ####################
     # fp4 related
     ####################
@@ -585,7 +592,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of selected groups for group-limited routing."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax(pre-sigmoid) routing for MoE, which means softmax is before the 
+    """Enable pre-softmax(pre-sigmoid) routing for MoE, which means softmax is before the
     top-k selection.
     By default, softmax is done after top-k."""
 
@@ -684,6 +691,16 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    moe_latent_size: Optional[int] = None
+    """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
+
+    moe_deepep_num_sms: int = 20
+    """Number of SMs to use for DeepEP."""
+
+    moe_hybridep_num_sms: int = 16
+    """Number of SMs to use for HybridEP. In pure NVL scenarios,
+    16 SMs can generally achieve good bandwidth."""
+
     ##################
     # Context Parallel
     ##################
@@ -762,6 +779,13 @@ class TransformerConfig(ModelParallelConfig):
     flash_decode: bool = False
     """ Use the optimized flash decoding kernel during inference. """
 
+    batch_invariant_mode: bool = False
+    """If true, uses batch-invariant kernels that provide deterministic forward execution regardless
+       of batch size. This ensures bitwise identical results when the same inputs are processed
+       in different batch configurations. This will significantly affect speed of 
+       training and inference as the kernels are not full optimized.
+       Defaults to False."""
+
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
 
@@ -776,6 +800,9 @@ class TransformerConfig(ModelParallelConfig):
 
     symmetric_ar_type: Optional[str] = None
     """Type of symmetric all reduce to use"""
+
+    use_inference_optimized_layers: bool = False
+    """If True, use inference optimized transformer layers during inference."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -794,7 +821,7 @@ class TransformerConfig(ModelParallelConfig):
     """The number of groups used in Mamba layers."""
 
     mamba_num_heads: Optional[int] = None
-    """The number of heads used in Mamba layers. 
+    """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
     use_mamba_mem_eff_path: bool = True
@@ -814,7 +841,7 @@ class TransformerConfig(ModelParallelConfig):
     # Quantization
     ####################
     quant_recipe: Optional[RecipeConfig] = None
-    """Configuration of any quantization to be applied to the model"""
+    """Configuration of any per-module quantization settings to be applied to the model"""
 
     transformer_impl: str = "transformer_engine"
     """Transformer implementation to use.
@@ -877,9 +904,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
 
-        if self.num_query_groups % self.tensor_model_parallel_size != 0:
+        if (
+            self.num_query_groups % self.tensor_model_parallel_size != 0
+            and self.tensor_model_parallel_size % self.num_query_groups != 0
+        ):
             raise ValueError(
-                f"num_query_groups ({self.num_query_groups}) must be a multiple of "
+                f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
@@ -1904,6 +1934,19 @@ class TransformerConfig(ModelParallelConfig):
                     f"Length of no_rope list ({len(self.no_rope_freq)}) must match "
                     f"the number of layers ({self.num_layers})"
                 )
+
+        if self.transformer_impl == "inference_optimized":
+            assert self.normalization == "RMSNorm"
+            assert not self.layernorm_zero_centered_gamma
+            assert not self.add_bias_linear
+            assert not self.add_qkv_bias
+            assert not self.use_kitchen
+
+        if self.batch_invariant_mode:
+            assert (
+                self.attention_backend == AttnBackend.flash
+            ), "Batch invariant mode only supports FlashAttention"
+
 
         if self.fallback_to_eager_attn:
             assert self.transformer_impl == "transformer_engine", (

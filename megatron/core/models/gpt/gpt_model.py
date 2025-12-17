@@ -813,5 +813,19 @@ class GPTModel(LanguageModule):
                 tp_group=self.tp_group,
                 dp_cp_group=metadata['dp_cp_group'],
             )
+        if self.mtp_process and not self.post_process:
+            # We only need to tie the output layer weight if share_embeddings_and_output_weights
+            # is False. Because if share_embeddings_and_output_weights is True, the shared weight
+            # will be stored in embedding layer, and output layer will not have any weight.
+            if not self.share_embeddings_and_output_weights:
+                output_layer_weight_key = f'{prefix}output_layer.weight'
+                output_layer_weight = self.output_layer.weight
+                tie_output_layer_state_dict(
+                    sharded_state_dict,
+                    output_layer_weight,
+                    output_layer_weight_key,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
 
         return sharded_state_dict
