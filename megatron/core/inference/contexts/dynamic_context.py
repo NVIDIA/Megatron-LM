@@ -215,6 +215,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             utilized, resulting in a total buffer size of `2 * buffer_size_gb`.
             Regardless of total buffer size, the KV cache is conceptually divided
             into 50% active requests and 50% paused requests.
+        max_requests (int): Max number of active requests to use for
+            decode-only forward passes. This value is primarily limited by the
+            combination of `buffer_size_gb` and `max_sequence_length`.
         max_tokens (int): Max number of tokens to use for forward passes. This is
             primarily limited by prefill activation memory usage. (Defaults to
             16384).
@@ -256,6 +259,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_attention_heads: int,
         max_sequence_length: int,
         buffer_size_gb: float,
+        max_requests: int = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         block_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
@@ -280,6 +284,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert (
                 block_size_tokens == 64
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
+
+        # give deprecated args warning for cuda_graph_max_tokens
+        if cuda_graph_max_tokens is not None:
+            warnings.warn(
+                "`cuda_graph_max_tokens` is deprecated and will be removed in a future release. "
+                "The context now automatically sets the max tokens for cuda graphs based on "
+                "`max_active_requests`.",
+                DeprecationWarning,
+            )
 
         self.metrics_writer = metrics_writer
 
@@ -392,6 +405,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
 
+        # User-specified max_requests.
+        if max_requests is not None:
+            assert max_requests <= self.max_active_requests, (
+                f"User-specified `max_requests` {max_requests} > "
+                f"`max_active_requests` {self.max_active_requests}"
+            )
+            self.max_active_requests = max_requests
+
         assert self.max_tokens >= self.max_active_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
             f"max_active_requests ({self.max_active_requests}), "
@@ -448,11 +469,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph config list
+        is_expert_parallel = parallel_state.get_expert_model_parallel_world_size() > 1
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=num_cuda_graphs,
-                cuda_graph_max_tokens=cuda_graph_max_tokens,
+                cuda_graph_max_tokens=self.max_active_requests,
                 cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
                 max_requests=self.max_active_requests,
                 max_tokens=self.max_tokens,
@@ -462,6 +484,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self._using_cuda_graph_this_step = False
+        self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
 
@@ -474,6 +497,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
+        self.is_symmetric_memory_initialized = False
         self.allocate_all_tensors(is_init=True)
 
         # Print info.
@@ -1205,13 +1229,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
-            batch_dimensions, self.cuda_graph_batch_dimensions_list
+            batch_dimensions,
+            self.cuda_graph_batch_dimensions_list,
+            decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
         )
         self._using_cuda_graph_this_step = best_graph is not None
-        if construct_graph_dimensions is not None:
-            assert (
-                batch_dimensions == construct_graph_dimensions == best_graph
-            ), f"batch_dimensions: {batch_dimensions}, construct_graph_dimensions: {construct_graph_dimensions}, best_graph: {best_graph}"
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
@@ -1412,6 +1434,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
+            and self.paused_request_count == 0
         )
         blocks = math.ceil(
             (req.remaining_prompt_length + req.finished_chunk_token_count) / self.block_size_tokens
@@ -2053,3 +2076,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             'max_total_requests': int(self.max_total_requests),
             'max_active_requests': int(self.max_active_requests),
         }
+
+    def maybe_initialize_symmetric_memory(self):
+        """
+        Initializes symmetric memory for inference, if not already initialized
+        """
+        if not self.is_symmetric_memory_initialized:
+            parallel_state._set_global_symmetric_memory_buffer()
+            self.is_symmetric_memory_initialized = True
