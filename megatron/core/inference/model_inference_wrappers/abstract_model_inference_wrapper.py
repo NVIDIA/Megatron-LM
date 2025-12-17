@@ -73,10 +73,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.inference_context = inference_context
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection(
-                tp=parallel_state.get_tensor_model_parallel_group(),
-                pp=parallel_state.get_pipeline_model_parallel_group(),
-            )
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
@@ -365,7 +362,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         """
         # Check if we are in a PP model
         if not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+            is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         ):
             tokens = inference_input["tokens"]
             current_batch_size, seq_len = self._get_batch_size_and_seq_len(

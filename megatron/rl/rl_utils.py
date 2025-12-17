@@ -64,6 +64,98 @@ logger = logging.getLogger(__name__)
 # Global variable to store packing context for forward_step
 _GLOBAL_PACKING_CONTEXT = None
 
+
+def verify_model_weights_swap(
+    train_model: LanguageModule,
+    inference_model: LanguageModule,
+    seq_len: int = 8,
+    batch_size: int = 2,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+) -> None:
+    """Verify that the inference model produces the same forward pass outputs
+    as the training model after the weights have been swapped.
+
+    This function should be called after swap_model_weights to ensure the weight
+    transfer was successful. It runs a forward pass on both models and asserts
+    the outputs match.  This is meant for debugging purposes only.
+
+    Args:
+        train_model: The training model (source of weights).
+        inference_model: The inference model (target of weights).
+        seq_len: Sequence length for test input.
+        batch_size: Batch size for test input.
+        atol: Absolute tolerance for comparing outputs.
+        rtol: Relative tolerance for comparing outputs.
+
+    Raises:
+        AssertionError: If forward pass outputs do not match within tolerance.
+    """
+    args = get_args()
+
+    # Unwrap models to get the core module
+    train_lm = train_model[0] if isinstance(train_model, (list, tuple)) else train_model
+    inf_lm = inference_model[0] if isinstance(inference_model, (list, tuple)) else inference_model
+
+    train_core = unwrap_model(train_lm)
+    inf_core = unwrap_model(inf_lm)
+
+    actual_vocab_size = getattr(args, 'padded_vocab_size', 128256)
+    actual_seq_len = min(seq_len, getattr(args, 'seq_length', seq_len))
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    # Generate deterministic test input - same across ALL ranks
+    torch.manual_seed(1234)
+    test_tokens = torch.randint(
+        low=0, high=actual_vocab_size, size=(batch_size, actual_seq_len),
+        device=device, dtype=torch.long
+    )
+    test_position_ids = (
+        torch.arange(actual_seq_len, device=device, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+    test_attention_mask = torch.ones(
+        (batch_size, 1, actual_seq_len, actual_seq_len), device=device, dtype=torch.bool
+    )
+
+    # Save and restore training state
+    train_was_training = train_core.training
+    inf_was_training = inf_core.training
+
+    train_core.eval()
+    inf_core.eval()
+
+    try:
+        with torch.no_grad():
+            train_output = train_lm(
+                test_tokens, test_position_ids, test_attention_mask,
+                runtime_gather_output=True
+            )
+
+            inf_output = inf_lm(
+                test_tokens, test_position_ids, test_attention_mask,
+                runtime_gather_output=True
+            )
+
+        # Only check on ranks that have output (last PP stage)
+        if train_output is not None and inf_output is not None:
+            assert train_output.shape == inf_output.shape, (
+                f"Output shape mismatch: train={train_output.shape}, infer={inf_output.shape}"
+            )
+            
+            max_diff = (train_output - inf_output).abs().max().item()
+            assert torch.allclose(train_output, inf_output, atol=atol, rtol=rtol), (
+                f"Forward pass outputs do not match: max_diff={max_diff:.6e}, atol={atol}, rtol={rtol}"
+            )
+
+    finally:
+        # Restore training state
+        if train_was_training:
+            train_core.train()
+        if inf_was_training:
+            inf_core.train()
+
 GroupedRollouts = list[list[TokenRollout | Rollout]]
 
 
@@ -660,6 +752,13 @@ def get_environment_rollouts(
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
         swap_model_weights(model, inference_model, args.refit_method)
+        if args.rl_verify_model_weights_swap and args.curr_iteration == 0:
+            verify_model_weights_swap(
+                train_model=model,
+                inference_model=inference_model,
+                atol=.1,
+                rtol=5e-4,
+            )
     else:
         inference_model = model
 
@@ -1282,6 +1381,18 @@ def prepare_data_for_update(
     wandb_writer = get_wandb_writer()
     tb_writer = get_tensorboard_writer()
     nvtx_range = get_nvtx_range()
+
+    # RL policy updates + logprob computations should run eagerly; only rollout generation
+    # (inference engine) should use CUDA graphs until training cuda-graphs MR goes in. 
+    # In the single-model case this is naturally handled by `megatron_rl_inference_mode` 
+    # toggling graphs on/off around inference. In the refit case (separate inference_model),
+    # we must explicitly keep the training model (this `model`) with CUDA graphs disabled,
+    # otherwise training/logprobs can get cudagraphed.
+    if args.cuda_graph_impl != "none":
+        lang_module = (
+            model[0].module.module if hasattr(model[0].module, "module") else model[0].module
+        )
+        toggle_cuda_graphs(lang_module, "none", reset_cuda_graphs=False)
     model = model[0]
 
     with nvtx_range("prepare-data-for-update"):

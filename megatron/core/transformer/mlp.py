@@ -101,8 +101,13 @@ class MLP(MegatronModule):
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
+        # For GLU/SwiGLU, use stride=2 because each TP rank stores interleaved [gate, up] portions.
+        # This is critical for correct weight resharding across different TP sizes.
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
+            fc1_stride = 2
+        else:
+            fc1_stride = 1
 
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
@@ -116,6 +121,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
+            stride=fc1_stride,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):

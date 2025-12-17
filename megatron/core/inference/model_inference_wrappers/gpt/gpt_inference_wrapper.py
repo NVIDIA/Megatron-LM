@@ -12,6 +12,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 )
 from megatron.core.inference.utils import get_attention_mask
 from megatron.core.models.gpt import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import get_model_config
 
@@ -28,6 +29,8 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
             size, etc.
         inference_context (BaseInferenceContext): Manages KV cache, and tracks
             sequence/token/batch offsets.
+        pg_collection (ProcessGroupCollection): Process groups for model communication.
+            If not provided, defaults to global parallel state groups.
     """
 
     def __init__(
@@ -35,8 +38,9 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
         model: GPTModel,
         inference_wrapper_config: InferenceWrapperConfig,
         inference_context: Optional[BaseInferenceContext] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        super().__init__(model, inference_wrapper_config, inference_context)
+        super().__init__(model, inference_wrapper_config, inference_context, pg_collection)
 
     def prep_inference_input(self, prompts_tokens: torch.Tensor) -> Dict[str, Any]:
         """Prepares the inference input data.

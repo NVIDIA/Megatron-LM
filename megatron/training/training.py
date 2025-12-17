@@ -718,8 +718,14 @@ def pretrain(
             dp_size = args.world_size // (tp_size * cp_size * pp_size)
             assert dp_size >= 1 and (tp_size * cp_size * pp_size * dp_size) == args.world_size, \
                 "World size must be divisible by tp*cp*pp for inference PG layout"
-
-            grid = HyperCommGrid([tp_size, cp_size, ep_size, pp_size, dp_size], ["tp", "cp", "ep", "pp", "dp"])
+            # Default mpu order is 'tp-cp-ep-dp-pp', unless use_tp_pp_dp_mapping is set.
+            grid_order = 'tp-cp-ep-pp-dp' if args.use_tp_pp_dp_mapping else 'tp-cp-ep-dp-pp'
+            if args.use_tp_pp_dp_mapping:
+                # Order: tp-cp-ep-pp-dp (pp before dp)
+                grid = HyperCommGrid([tp_size, cp_size, ep_size, pp_size, dp_size], ["tp", "cp", "ep", "pp", "dp"])
+            else:
+                # Order: tp-cp-ep-dp-pp (dp before pp) - this is the default
+                grid = HyperCommGrid([tp_size, cp_size, ep_size, dp_size, pp_size], ["tp", "cp", "ep", "dp", "pp"])
             tp_group = grid.create_pg("tp")
             cp_group = grid.create_pg("cp")
             pp_group = grid.create_pg("pp")

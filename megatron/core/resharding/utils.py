@@ -162,6 +162,16 @@ def extract_param_metadata(
     is_tp = bool(getattr(param, 'tensor_model_parallel', False))
     partition_dim = int(getattr(param, 'partition_dim', 0))
     partition_stride = int(getattr(param, 'partition_stride', 1))
+    
+    # SwiGLU/GLU compatibility: For gated linear units, fc1 stores interleaved [gate, up] portions
+    # and requires partition_stride=2 for correct resharding. New models set this at construction
+    # time (MLP sets partition_stride=2 on weight when gated_linear_unit=True). For legacy models
+    # where stride=1 was left as default, we apply stride=2 as a fallback for fc1 parameters.
+    # This is safe because: (1) gated models need it, and (2) non-gated models have smaller fc1
+    # and stride doesn't affect single-block transfers.
+    # if 'mlp.linear_fc1' in param_name and is_tp and partition_stride == 1:
+    #     partition_stride = 2
+    
     # EP detection: Megatron convention - expert params are not allreduced
     is_ep = not bool(getattr(param, 'allreduce', True))
 
