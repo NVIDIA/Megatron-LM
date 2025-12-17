@@ -42,6 +42,7 @@ jobs:
           # Token to read org team members. Needs read:org scope.
           GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
         run: |
+          pip install --no-cache-dir uv
           uv run python .github/scripts/oncall_manager.py rotate
 
       - name: Commit and Push changes
@@ -50,5 +51,6 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add .github/oncall_schedule.json
           git commit -m "chore: rotate oncall schedule" || echo "No changes to commit"
+          git pull --rebase
           git push origin HEAD:main
 
