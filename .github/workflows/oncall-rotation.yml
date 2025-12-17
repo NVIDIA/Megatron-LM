@@ -30,7 +30,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -45,8 +45,6 @@ jobs:
           uv run python .github/scripts/oncall_manager.py rotate
 
       - name: Commit and Push changes
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
