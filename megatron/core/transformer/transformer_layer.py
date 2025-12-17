@@ -595,7 +595,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _forward_mlp(self, hidden_states, inference_context=None):
+    def _forward_mlp(self, hidden_states, inference_context=None, flush_delayed_groups=True):
         """
         Perform a forward pass through the feed-forward layer.
 
@@ -688,16 +688,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
                 if self.offload_dense_mlp:
                     (mlp_output,) = fine_grained_offloading_group_commit(
-                        mlp_output_with_bias[0], name="dense_mlp", forced_released_tensors=[]
+                        mlp_output_with_bias[0], name="dense_mlp",
+                        forced_released_tensors=[],
+                        delay_offload=self.config.delay_offload_until_cuda_graph
                     )
                     mlp_output_with_bias = (mlp_output, mlp_output_with_bias[1])
             else:
                 mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
-            if self.config.delay_offload_until_cuda_graph:
-                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                    fine_grained_offloading_group_flush_delayed_groups,
-                )
-                fine_grained_offloading_group_flush_delayed_groups()
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -707,9 +704,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="mlp")
 
-        return self._forward_post_mlp(mlp_output_with_bias, residual)
+        return self._forward_post_mlp(mlp_output_with_bias, residual, flush_delayed_groups)
 
-    def _forward_post_mlp(self, mlp_output_with_bias, residual):
+    def _forward_post_mlp(self, mlp_output_with_bias, residual, flush_delayed_groups=True):
         """
         Perform operations after the MLP computation.
 
@@ -748,6 +745,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
+        if self.config.delay_offload_until_cuda_graph and flush_delayed_groups:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                fine_grained_offloading_group_flush_delayed_groups,
+            )
+            fine_grained_offloading_group_flush_delayed_groups()
         return output
 
     def sharded_state_dict(
@@ -952,10 +954,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
 
-            output = self._forward_post_mlp(mlp_output_with_bias, mlp_residual)
+            output = self._forward_post_mlp(mlp_output_with_bias, mlp_residual, flush_delayed_groups=False)
         else:
             # CUDA Graph does not capture the MLP/MoE part at all.
-            output = self._forward_mlp(*cuda_graph_output)
+            output = self._forward_mlp(*cuda_graph_output, flush_delayed_groups=False)
         return output, context
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
