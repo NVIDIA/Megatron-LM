@@ -13,6 +13,7 @@ import struct
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from itertools import accumulate
@@ -451,17 +452,45 @@ class _FileBinReader(_BinReader):
             numpy.ndarray: An array with `count` items and data-type `dtype` constructed from
                 reading bytes from the data file starting at `offset`.
         """
-        sequence = numpy.empty(count, dtype=dtype)
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            with msc.open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
-                bin_buffer_file.seek(offset)
-                bin_buffer_file.readinto(sequence)
-        else:
-            with open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
-                bin_buffer_file.seek(offset)
-                bin_buffer_file.readinto(sequence)
-        return sequence
+
+        def _read():
+            """Helper method to read `count` bytes from self._bin_path at provided offset."""
+            sequence = numpy.empty(count, dtype=dtype)
+            if MultiStorageClientFeature.is_enabled():
+                msc = MultiStorageClientFeature.import_package()
+                with msc.open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
+                    bin_buffer_file.seek(offset)
+                    bin_buffer_file.readinto(sequence)
+            else:
+                with open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
+                    bin_buffer_file.seek(offset)
+                    bin_buffer_file.readinto(sequence)
+            return sequence
+
+        NUM_MAX_RETRIES = 3
+        SLEEP_DURATION_START = 10  # Sleep for 10, 20, 40 seconds between retries.
+        sleep_duration = SLEEP_DURATION_START
+        for i in range(NUM_MAX_RETRIES + 1):
+            try:
+                return _read()
+            except Exception as e:
+                time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+                if i == NUM_MAX_RETRIES:
+                    logger.warning(
+                        f"[{time_str}] {NUM_MAX_RETRIES+1} total tries to read data item failed; "
+                        f"going to abort and re-raise exception \"{e}\"..."
+                    )
+                    # Re-raise exception if in last iteration of for loop.
+                    raise e
+                logger.warning(
+                    f"[{time_str}] Attempt {i+1}/{NUM_MAX_RETRIES+1} to read data item failed "
+                    f"with exception \"{e}\"; going to sleep for {sleep_duration} seconds and "
+                    "then re-try..."
+                )
+                time.sleep(sleep_duration)
+                sleep_duration = sleep_duration * 2
+
+        raise RuntimeError("Should not reach here!")
 
 
 class _S3BinReader(_BinReader):
