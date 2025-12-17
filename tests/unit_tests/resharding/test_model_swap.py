@@ -2,7 +2,7 @@
 import copy
 import os
 import types
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import pytest
 import torch
@@ -21,7 +21,16 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from tests.unit_tests.test_utilities import Utils
+
+
+try:
+    import nvshmem.core
+    has_nvshmem = True
+except Exception:
+    has_nvshmem = False
+
 
 
 def _build_pg_collection(
@@ -114,17 +123,31 @@ def _set_pg_collection(module, tp_group, dp_group):
     module.pg_collection = types.SimpleNamespace(tp=tp_group, dp=dp_group, ep=None, pp=None)
     return module
 
-@pytest.mark.parametrize("refit_backend", ["nvshmem","nccl","gloo"])
+@pytest.mark.parametrize(
+    "refit_backend",
+    [
+        pytest.param(
+            "nvshmem",
+            marks=pytest.mark.skipif(
+                not has_nvshmem,
+                reason="nvshmem.core is not available (NVSHMEM Python bindings not installed)",
+            ),
+        ),
+        "nccl",
+        "gloo",
+    ],
+)
 @pytest.mark.parametrize(
     "src_tp,src_pp,src_ep,dst_tp,dst_pp,dst_ep,num_experts",
     [
         # TP only changes
         (2, 1, 1, 1, 1, 1, None),  # TP2 -> TP1
         (1, 1, 1, 2, 1, 1, None),  # TP1 -> TP2
-        # PP only changes
+        (2, 1, 1, 4, 1, 1, None),  # TP2 -> TP4
+        # # PP only changes
         (1, 2, 1, 1, 1, 1, None),  # PP2 -> PP1
         (1, 1, 1, 1, 2, 1, None),  # PP1 -> PP2
-        # Both TP and PP change
+        # # Both TP and PP change
         (2, 2, 1, 1, 1, 1, None),  # TP2,PP2 -> TP1,PP1
         (1, 1, 1, 2, 2, 1, None),  # TP1,PP1 -> TP2,PP2
         (2, 1, 1, 1, 2, 1, None),  # TP2,PP1 -> TP1,PP2
@@ -135,7 +158,7 @@ def _set_pg_collection(module, tp_group, dp_group):
         (1, 1, 2, 1, 2, 2, 4),
     ],
 )
-def test_nccl_swap_gpt_parametrized(
+def test_swap_gpt_parametrized(
     refit_backend: str,
     src_tp: int,
     src_pp: int,
@@ -164,16 +187,18 @@ def test_nccl_swap_gpt_parametrized(
     # Small GPT config
     seq_len = 8
     vocab_size = 128
+    # --group-query-attention   --num-query-groups 8 
     cfg = TransformerConfig(
         num_layers=4 if (src_pp > 1 or dst_pp > 1) else 2,
         hidden_size=32,
-        num_attention_heads=4,
+        num_attention_heads=8,
         use_cpu_initialization=True,
         pipeline_dtype=torch.float32,
         hidden_dropout=0.0,
         attention_dropout=0.0,
         moe_router_dtype="fp64",
         moe_token_dispatcher_type="alltoall",
+        num_query_groups=4,
     )
 
     # Build PGs and models (always use unified PG builder so we can set EP)
