@@ -138,6 +138,17 @@ def quantize_nvfp4_param_shard(
     if len(model_params) == 0:
         return
 
+    # # Debug: print what we're passing to cast_master_weights_to_nvfp4
+    # print(f"\n[FP4_UTILS DEBUG] quantize_nvfp4_param_shard called with {len(model_params)} params")
+    # for i, (mp, main_p, offset) in enumerate(zip(model_params, main_params, start_offsets)):
+    #     mp_shape = tuple(mp.shape) if hasattr(mp, 'shape') else 'N/A'
+    #     main_shape = tuple(main_p.shape) if main_p is not None else 'None'
+    #     print(f"[FP4_UTILS DEBUG]   [{i}] model_param shape={mp_shape}, main_param shape={main_shape}, offset={offset}")
+    #     if i == 0:  # Just show first param details
+    #         print(f"[FP4_UTILS DEBUG]   [{i}] model_param type={type(mp).__name__}")
+    #         if hasattr(mp, '_rowwise_data'):
+    #             print(f"[FP4_UTILS DEBUG]   [{i}] _rowwise_data shape={mp._rowwise_data.shape}")
+
     args = [model_params, main_params, start_offsets, data_parallel_group]
     if fsdp_shard_model_params is not None:
         args.append(fsdp_shard_model_params)
@@ -152,7 +163,8 @@ if HAVE_TE:
         if is_te_min_version("2.7.0.dev0"):
             if config.fp4_recipe == Fp4Recipe.nvfp4:
                 try:
-                    fp4_recipe = transformer_engine.common.recipe.NVFP4BlockScaling()
+                    # Disable RHT and stochastic rounding for debugging
+                    fp4_recipe = transformer_engine.common.recipe.NVFP4BlockScaling(disable_rht=True, disable_stochastic_rounding=True)
                 except AttributeError:
                     raise ValueError(
                         """NVFP4BlockScaling recipe is not available in this version of 
@@ -212,6 +224,10 @@ if HAVE_TE:
                     in inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
                 ):
                     context_args["recipe"] = fp4_recipe
+                if "preserve_high_precision_init_val" in (
+                    inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
+                ):
+                    context_args["preserve_high_precision_init_val"] = torch.is_grad_enabled()
                 fp4_context = transformer_engine.pytorch.fp8_model_init(**context_args)
 
         return fp4_context

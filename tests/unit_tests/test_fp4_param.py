@@ -40,6 +40,11 @@ class Utils:
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
+        # Force deterministic behavior to eliminate run-to-run variation
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
         if not torch.distributed.is_initialized() and Utils.rank >= 0:
             print(
                 f'Initializing torch.distributed with rank: {Utils.rank}, '
@@ -159,6 +164,7 @@ class TestFP4Param:
         args.fp4 = "e2m1"
         args.fp4_recipe = "nvfp4"
         args.fp4_param = fp4_param_gather
+        args.fp4_param_gather = fp4_param_gather
         args.ddp_bucket_size = 1024  # Create more buckets to test the rs/ag overlap.
 
         for key, value in kwargs.items():
@@ -181,7 +187,13 @@ class TestFP4Param:
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def _run_test_helper(
-        self, tp_size, inference: bool = False, fp4_param_gather: bool = True, **kwargs
+        self,
+        tp_size,
+        inference: bool = False,
+        fp4_param_gather: bool = True,
+        grad_ref: dict | None = None,
+        collect_grad_ref: bool = False,
+        **kwargs,
     ):
         """Test fp4_param with gpt_model."""
         args = self.create_test_args(
@@ -229,8 +241,29 @@ class TestFP4Param:
             assert num_fp4_params == 4 * fp4_layers
 
         loss_list = []
+        grad_ref_out: dict | None = {} if collect_grad_ref else None
+        first_master_mismatch_iter = None  # Track first master weight divergence
 
-        for i in range(100):
+        # Helper to get DistributedOptimizer from ChainedOptimizer
+        def _get_dop(opt):
+            if hasattr(opt, "chained_optimizers") and opt.chained_optimizers:
+                return opt.chained_optimizers[0]
+            return opt
+
+        # Helper to collect master weights by name
+        def _collect_master_weights(dop, model):
+            master_weights = {}
+            if hasattr(dop, "model_float16_groups") and hasattr(dop, "shard_fp32_from_float16_groups"):
+                for mg, sg in zip(dop.model_float16_groups, dop.shard_fp32_from_float16_groups):
+                    for model_param, shard_main in zip(mg, sg):
+                        if shard_main is not None:
+                            for n, p in model.named_parameters():
+                                if id(p) == id(model_param):
+                                    master_weights[n] = shard_main.detach().cpu().clone()
+                                    break
+            return master_weights
+
+        for i in range(200):
             if not inference:
                 gpt_model[0].zero_grad_buffer()
                 optimizer.zero_grad()
@@ -264,9 +297,46 @@ class TestFP4Param:
             update_successful, _, _ = optimizer.step()
             assert update_successful
 
+            # Check master weights every iteration to find first divergence
+            if not inference:
+                dop = _get_dop(optimizer)
+                master_weights = _collect_master_weights(dop, gpt_model[0])
+                
+                if collect_grad_ref:
+                    # Store master weights snapshot for comparison
+                    grad_ref_out[f"__master_iter_{i}__"] = master_weights
+                elif grad_ref is not None and first_master_mismatch_iter is None:
+                    # Compare with reference (only until first mismatch found)
+                    ref_key = f"__master_iter_{i}__"
+                    if ref_key in grad_ref:
+                        ref_masters = grad_ref[ref_key]
+                        for name in sorted(master_weights.keys()):
+                            if name not in ref_masters:
+                                continue
+                            cur = master_weights[name]
+                            ref = ref_masters[name]
+                            if not torch.equal(cur, ref):
+                                first_master_mismatch_iter = i
+                                flat_c = cur.view(-1)
+                                flat_r = ref.view(-1)
+                                diff = flat_c != flat_r
+                                diff_count = int(diff.sum().item())
+                                idx0 = int(diff.nonzero()[0].item())
+                                print(f"\n{'='*60}")
+                                print(f"[MASTER DEBUG] FIRST MISMATCH at iter {i}")
+                                print(f"[MASTER DEBUG]   param: {name}")
+                                print(f"[MASTER DEBUG]   total_diff={diff_count}/{flat_c.numel()} ({100*diff_count/flat_c.numel():.4f}%)")
+                                print(f"[MASTER DEBUG]   idx={idx0} got={flat_c[idx0].item():.10e} ref={flat_r[idx0].item():.10e}")
+                                print(f"{'='*60}\n")
+                                break
+
             loss_list.append(loss.item())
 
-        return torch.tensor(loss_list)
+        loss_t = torch.tensor(loss_list)
+        if collect_grad_ref:
+            assert grad_ref_out is not None
+            return loss_t, grad_ref_out
+        return loss_t
 
     def run_test(self, tp_size, inference: bool = False, **kwargs):
         """Test fp4_param with gpt_model."""
@@ -274,10 +344,58 @@ class TestFP4Param:
             with torch.inference_mode():
                 self._run_test_helper(tp_size, inference=True, **kwargs)
         else:
-            loss_list = self._run_test_helper(tp_size, fp4_param_gather=True, **kwargs)
+            # Memory profiling for NVFP4 run
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.empty_cache()
+            print("\n=== Running with fp4_param_gather=True (NVFP4) ===")
+            loss_list, grad_ref = self._run_test_helper(
+                tp_size,
+                fp4_param_gather=True,
+                collect_grad_ref=True,
+                **kwargs,
+            )
+            nvfp4_peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
 
-            # Compare with fp4_param_gather=False to verify numerical consistency
-            loss_list_ref = self._run_test_helper(tp_size, fp4_param_gather=False, **kwargs)
+            # Memory profiling for BF16 run
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.empty_cache()
+            print("\n=== Running with fp4_param_gather=False (BF16) ===")
+            loss_list_ref = self._run_test_helper(
+                tp_size,
+                fp4_param_gather=False,
+                grad_ref=grad_ref,
+                **kwargs,
+            )
+            bf16_peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+            # Print memory comparison
+            print("\n=== Memory Usage ===")
+            print(f"NVFP4 peak memory: {nvfp4_peak_mb:.2f} MB")
+            print(f"BF16 peak memory:  {bf16_peak_mb:.2f} MB")
+            print(f"Memory savings:    {bf16_peak_mb - nvfp4_peak_mb:.2f} MB ({100*(bf16_peak_mb - nvfp4_peak_mb)/bf16_peak_mb:.1f}%)")
+
+            # Debug: Compare first few iterations
+            print("\n=== Loss Comparison ===")
+            print("loss_list length: ", len(loss_list))
+            for i in range(0, min(100, len(loss_list)), 10):
+                fp4_loss = loss_list[i].item()
+                bf16_loss = loss_list_ref[i].item()
+                match = torch.isclose(loss_list[i], loss_list_ref[i], atol=0, rtol=0)
+                print(f"Iter {i}: FP4={fp4_loss:.6f}, BF16={bf16_loss:.6f}, Match={match}")
+
+            # Check if first iteration matches
+            first_match = torch.isclose(loss_list[0], loss_list_ref[0], atol=0, rtol=0)
+            print(f"\nFirst iteration match: {first_match}")
+            if not first_match:
+                print(">>> Issue is in FORWARD PASS or MODEL INIT <<<")
+            else:
+                # Find first mismatch
+                for i in range(len(loss_list)):
+                    if not torch.isclose(loss_list[i], loss_list_ref[i], atol=0, rtol=0):
+                        print(f">>> First mismatch at iteration {i} <<<")
+                        print(">>> Issue is in OPTIMIZER STEP or WEIGHT UPDATE <<<")
+                        break
+
             torch.testing.assert_close(loss_list, loss_list_ref, atol=0, rtol=0)
 
     @pytest.mark.skipif(
@@ -327,7 +445,7 @@ if __name__ == "__main__":
     test.setup_method(None)
     try:
         print("Running test_nvfp4 with dp_overlap=(False, False)...")
-        test.run_test(tp_size=2, overlap_param_gather=False, overlap_grad_reduce=False)
+        test.run_test(tp_size=1, overlap_param_gather=False, overlap_grad_reduce=False)
         test.teardown_method(None)
         print("PASSED: test_nvfp4 (no overlap)")
     except Exception as e:

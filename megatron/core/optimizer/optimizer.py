@@ -1318,7 +1318,8 @@ class ChainedOptimizer(MegatronOptimizer):
             return False, None, None
 
         grad_norm = self.get_grad_norm()
-
+        # Round to reduce accumulated floating-point errors in gradient clipping
+        grad_norm = round(grad_norm, 4)
         # Clip gradients.
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:

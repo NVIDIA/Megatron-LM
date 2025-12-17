@@ -356,7 +356,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 gbuf_index, dtype, bucket_index = param_gbuf_map[model_param]
                 gbuf_range = gbuf_ranges[gbuf_index][dtype][bucket_index]
                 param_range = gbuf_range["param_map"][model_param]["param"]
-
                 # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
 
@@ -381,6 +380,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # precision at the beginning of training (this problem will not occur if the
                         # training is long enough or if the main params are loaded from a
                         # checkpoint).
+                        # NVFP4 tensor will also go to this block.
                         if is_float8tensor(model_param):
                             if hasattr(model_param, 'get_high_precision_init_val'):
                                 shard_main_param = (
@@ -390,8 +390,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     .to(model_param.device)
                                     .float()
                                 )
+                                print("NVFP4 primary weights: initializing from high-precision init values.")
                                 model_param.clear_high_precision_init_val()
                             else:
+                                print("NVFP4 primary weights: initializing from quantized values.")
                                 shard_main_param = model_param.float().view(-1)[
                                     param_range.start : param_range.end
                                 ]
