@@ -45,6 +45,6 @@ jobs:
 
       - name: Assign Reviewer
         env:
-          GH_TOKEN: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
         run: |
           python .github/scripts/oncall_manager.py assign --pr ${{ github.event.pull_request.number }}
