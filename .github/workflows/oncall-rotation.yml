@@ -30,27 +30,25 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
-        run: pip install requests
-
       - name: Rotate Schedule
         env:
           # Token to read org team members. Needs read:org scope.
           GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
         run: |
-          python .github/scripts/oncall_manager.py rotate
+          uv run python .github/scripts/oncall_manager.py rotate
 
       - name: Commit and Push changes
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: rotate oncall schedule"
-          file_pattern: .github/oncall_schedule.json
-          branch: ${{ github.ref }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/oncall_schedule.json
+          git commit -m "chore: rotate oncall schedule" || echo "No changes to commit"
+          git push origin HEAD:main
 

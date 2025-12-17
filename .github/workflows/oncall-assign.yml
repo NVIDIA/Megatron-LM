@@ -40,11 +40,8 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
-        run: pip install requests
-
       - name: Assign Reviewer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python .github/scripts/oncall_manager.py assign --pr ${{ github.event.pull_request.number }}
+          uv run python .github/scripts/oncall_manager.py assign --pr ${{ github.event.pull_request.number }}
