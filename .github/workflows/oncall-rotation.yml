@@ -42,6 +42,7 @@ jobs:
           # Token to read org team members. Needs read:org scope.
           GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
         run: |
+          pip install --no-cache-dir uv
           uv run python .github/scripts/oncall_manager.py rotate
 
       - name: Commit and Push changes
