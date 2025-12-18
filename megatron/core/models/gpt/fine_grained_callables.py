@@ -384,7 +384,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
         probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
-        local_tokens, probs, _ = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
+        local_tokens, probs = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
@@ -426,7 +426,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
         shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
         expert_output, mlp_bias = layer.mlp.routed_experts_compute(
-            dispatched_tokens, dispatched_probs, pre_mlp_layernorm_output
+            dispatched_tokens, dispatched_probs
         )
 
         if layer.recompute_pre_mlp_layernorm:

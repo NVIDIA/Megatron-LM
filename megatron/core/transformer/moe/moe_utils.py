@@ -1116,6 +1116,7 @@ class MoECudaGraphPartialCaptureSignal(Exception):
         return outputs
 
 
+@internal_api
 @dataclass
 class MoECudaGraphTensorStore:
     """Storage for tensors used in CUDA graph replay for MoE layers.
