@@ -3345,7 +3345,13 @@ class AllGatherPipeline:
 
     @torch.no_grad()
     def release_bucket(self, bucket_id: int, lazy: bool = False):
-        """Release the bucket."""
+        """Release the bucket.
+
+        Args:
+            bucket_id (int): The bucket ID to be released.
+            lazy (bool, optional): Whether to release the bucket lazily.
+                Defaults to False.
+        """
         if self.bucket_status[bucket_id] == BucketStatus.EMPTY:
             return
 

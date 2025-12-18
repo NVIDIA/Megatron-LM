@@ -496,6 +496,13 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_unit_modules = self.fsdp_unit_modules
 
         def release_module_parameters(module, lazy=False, *unused):
+            """
+            Release the module parameters after the forward and backward pass.
+
+            Args:
+                module: The module whose parameters are to be released.
+                lazy: If True, release the parameters lazily.
+            """
             for param in module.parameters():
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
                 self.all_gather_pipeline.release_bucket(bucket_id, lazy=lazy)
