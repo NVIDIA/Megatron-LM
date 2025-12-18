@@ -38,6 +38,7 @@ from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMe
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
+from ..kv_cache import KVCacheBase, KVCacheLayout, MLACache, create_mhagqa_cache
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -585,34 +586,44 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
-        # Memory buffer.
+        # Determine cache layout based on attention backend.
+        if self.cache_mla_latent:
+            self._cache_layout = None  # MLA uses its own layout
+        elif self.attention_backend in [
+            AttnBackend.flashinfer_fa2,
+            AttnBackend.flashinfer_fa3,
+            AttnBackend.flashinfer_trt,
+        ]:
+            self._cache_layout = KVCacheLayout.M_N2HCD  # FlashInfer layout
+        else:
+            self._cache_layout = KVCacheLayout.M_2NCHD  # Flash backend (default)
+
+        # Memory buffer - list of cache objects, one per attention layer.
+        # Indexed via layer_map[global_layer_idx] to get attention layer index.
         def allocate_memory_buffer():
             """Allocate the memory buffer. This function is called below within
             `with ctx_manager:`."""
-            if self.cache_mla_latent:
-                self.memory_buffer = torch.empty(
-                    (
-                        self.num_attention_layers,
-                        self.block_allocator.total_count,
-                        self.block_size_tokens,
-                        self.kv_reduced_dim,
-                    ),
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-            else:
-                self.memory_buffer = torch.empty(
-                    (
-                        2,  # key and value
-                        self.num_attention_layers,
-                        self.block_allocator.total_count,
-                        self.block_size_tokens,
-                        self.num_attention_heads_per_partition,
-                        self.hidden_size_per_attention_head,
-                    ),
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
+            self.memory_buffer: List[KVCacheBase] = []
+            for _ in range(self.num_attention_layers):
+                if self.cache_mla_latent:
+                    cache = MLACache(
+                        num_chunks=self.block_allocator.total_count,
+                        chunk_size=self.block_size_tokens,
+                        kv_reduced_dim=self.kv_reduced_dim,
+                        dtype=self.params_dtype,
+                        device=torch.cuda.current_device(),
+                    )
+                else:
+                    cache = create_mhagqa_cache(
+                        layout=self._cache_layout,
+                        num_chunks=self.block_allocator.total_count,
+                        chunk_size=self.block_size_tokens,
+                        num_kv_heads=self.num_attention_heads_per_partition,
+                        head_dim=self.hidden_size_per_attention_head,
+                        dtype=self.params_dtype,
+                        device=torch.cuda.current_device(),
+                    )
+                self.memory_buffer.append(cache)
 
         # Optional state tensors for hybrid models
         def allocate_mamba_states():
@@ -810,75 +821,59 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Append to KV cache.
 
         Args:
-            layer_number (int): Layer number.
+            layer_number (int): Layer number (1-based).
             key (Tensor): Key tensor.
             value (Tensor): Value tensor.
         """
         attention_layer_number = self.layer_map[layer_number - 1]
+        cache = self.memory_buffer[attention_layer_number]
 
-        if triton_append_key_value_cache is not None and not self.cache_mla_latent:
-            # currently does not support MLA latent cache
+        # Use Triton kernel if cache supports it
+        if triton_append_key_value_cache is not None and cache.supports_triton():
             return triton_append_key_value_cache(
-                layer_number=attention_layer_number,
                 key=key,
                 value=value,
-                memory_buffer=self.memory_buffer,
+                cache=cache,
                 padded_active_token_count=self.padded_active_token_count,
                 token_to_block_idx=self.token_to_block_idx,
                 token_to_local_position_within_kv_block=self.token_to_local_position_within_kv_block,
             )
 
-        block_idx = self.token_to_block_idx[: self.padded_active_token_count]
-        local_kv_seq_idx = self.token_to_local_position_within_kv_block[
-            : self.padded_active_token_count
-        ]
+        # Fallback: use cache's append method
+        cache.append(
+            key=key,
+            value=value,
+            padded_active_token_count=self.padded_active_token_count,
+            token_to_block_idx=self.token_to_block_idx,
+            token_to_local_position_within_kv_block=self.token_to_local_position_within_kv_block,
+        )
 
-        if not self.cache_mla_latent:
-            assert key.size(1) == 1 and value.size(1) == 1
-
-        key = key.squeeze(1)
-        # There is no value cache in FlashMLA/absorption
-        if not self.cache_mla_latent:
-            value = value.squeeze(1)
-
-        if self.cache_mla_latent:
-            # We pass the kv_concat as the key in cache_mla_latent
-            kv_concat = key
-            self.memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = kv_concat[
-                : self.padded_active_token_count
-            ]
-        else:
-            self.memory_buffer[0, attention_layer_number, block_idx, local_kv_seq_idx] = key[
-                : self.padded_active_token_count
-            ]
-            self.memory_buffer[1, attention_layer_number, block_idx, local_kv_seq_idx] = value[
-                : self.padded_active_token_count
-            ]
-
-    def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+    def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Optional[Tensor], Tensor]:
         """Read from KV cache.
 
         Args:
-            layer_number (int): Layer number.
+            layer_number (int): Layer number (1-based).
 
         Return:
-            (Tuple[Tensor, Tensor]) The key and value pointer tensors that point
-            to blocks within the block-level memory buffer.
+            (Tuple[Tensor, Optional[Tensor], Tensor]) The key cache, value cache (or None for MLA),
+            and block table tensor.
         """
         attention_layer_number = self.layer_map[layer_number - 1]
+        cache = self.memory_buffer[attention_layer_number]
+        cache_content = cache.get_content()
+        block_table = self.active_attn_metadata["mha_metadata"].state_data["block_table"]
 
         if self.cache_mla_latent:
-            return (
-                self.memory_buffer[attention_layer_number],
-                None,
-                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
-            )
+            # MLA: cache_content is single tensor [N, C, D]
+            return (cache_content, None, block_table)
+        elif self._cache_layout == KVCacheLayout.M_2NCHD:
+            # M_2NCHD: [2, N, C, H, D] - slice on dim 0
+            return (cache_content[0], cache_content[1], block_table)
+        elif self._cache_layout == KVCacheLayout.M_N2HCD:
+            # M_N2HCD: [N, 2, H, C, D] - slice on dim 1
+            return (cache_content[:, 0], cache_content[:, 1], block_table)
         else:
-            return (
-                self.memory_buffer[0, attention_layer_number],
-                self.memory_buffer[1, attention_layer_number],
-                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
-            )
+            raise ValueError(f"Unknown cache layout: {self._cache_layout}")
 
     def mamba_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Returns the Mamba state tensors for the given layer."""
