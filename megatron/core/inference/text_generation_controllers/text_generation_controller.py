@@ -551,9 +551,6 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
         model_config = get_model_config(unwrapped_model)
 
-        # Build active slices of all relevant tensors.
-        context.build_active_slices()
-
         # Initialize attention state.
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
@@ -1066,9 +1063,7 @@ class TextGenerationController:
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
             context.paused_request_count : context.total_request_count
         ]
-        request_query_lengths = context.request_query_lengths[
-            context.paused_request_count : context.total_request_count
-        ]
+        request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
         num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
@@ -1220,9 +1215,9 @@ class TextGenerationController:
             return None
 
         # Get active request info from context
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
-        active_request_ids = context.request_ids[active_request_slice].tolist()
-        active_query_lengths = context.request_query_lengths[active_request_slice].tolist()
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_ids = context.active_request_ids[:active_request_count].tolist()
+        active_query_lengths = context.active_request_query_lengths[:active_request_count].tolist()
         active_token_count = context.active_token_count
 
         # Get TP group for all-gather if using sequence parallelism
@@ -1291,9 +1286,7 @@ class TextGenerationController:
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
             context.paused_request_count : context.total_request_count
         ]
-        request_query_lengths = context.request_query_lengths[
-            context.paused_request_count : context.total_request_count
-        ]
+        request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
         num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
@@ -1380,14 +1373,11 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
             context.paused_request_count : context.total_request_count
         ]
-        request_query_lengths = context.request_query_lengths[
-            context.paused_request_count : context.total_request_count
-        ]
+        request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
         num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
@@ -1480,7 +1470,6 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         # Handle decode-only mode (only last token)
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
@@ -1504,7 +1493,7 @@ class TextGenerationController:
         # Note: logits may be padded, so we only take the first active_token_count tokens
         log_probs = log_probs_tensor[: context.active_token_count]
 
-        active_query_lengths = context.request_query_lengths[active_request_slice]
+        active_query_lengths = context.active_request_query_lengths[:active_request_count]
 
         # Split log_probs across request boundaries
         # log_probs has shape [active_token_count, vocab_size]
@@ -1662,28 +1651,27 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
-
-        # Active sequence lengths.
-        active_request_ids = context.request_ids[active_request_slice].long()
-        active_sequence_lengths = context.get_active_sequence_lengths()
-
-        if self.num_speculative_tokens > 0:
-            active_sequence_lengths += (
-                self._accepted_token_counts_per_request[:active_request_count] + 1
-            )
-        else:
-            active_sequence_lengths += 1
-        max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
         # Note: termination_id tensor has per-request termination IDs from mixed sampling
+        if self.num_speculative_tokens > 0:
+            seq_len_increment = (
+                self._accepted_token_counts_per_request[:active_request_count] + 1
+            )
+        else:
+            seq_len_increment = 1
         active_request_mask = (
             self._sampled_tokens_cuda[:active_request_count]
             != context.active_request_metadata["termination_id"][:active_request_count]
-        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+        ).byte() & torch.less(
+            context.active_sequence_lengths[:active_request_count] + seq_len_increment,
+            context.active_request_output_lengths[:active_request_count],
+        ).byte()
 
-        # Mark requests as finished if they hit stop words (detected in previous step's post_process_requests)
+        active_request_ids = context.active_request_ids[:active_request_count]
+
+        # Mark requests as finished if they hit stop words
+        # (detected in previous step's post_process_requests)
         if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = active_request_ids.tolist()
             stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
