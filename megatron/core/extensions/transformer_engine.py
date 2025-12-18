@@ -1308,6 +1308,40 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+        # Gated attention support: per-head linear projection (applied post-TE-forward)
+        # gate = sigmoid(hidden_states @ gate_weight.T + gate_bias)
+        if self.config.gated_attention:
+            # gate_weight: [num_heads_per_partition, hidden_size]
+            self.register_parameter(
+                "attention_gate_weight",
+                torch.nn.Parameter(
+                    torch.empty(
+                        (self.config.num_attention_heads // self.config.tensor_model_parallel_size,
+                         self.config.hidden_size),
+                        device=torch.cuda.current_device(),
+                        dtype=self.config.params_dtype,
+                    )
+                ),
+            )
+            # gate_bias: [num_heads_per_partition]
+            self.register_parameter(
+                "attention_gate_bias",
+                torch.nn.Parameter(
+                    torch.full(
+                        (self.config.num_attention_heads // self.config.tensor_model_parallel_size,),
+                        self.config.gated_attention_init_value,
+                        device=torch.cuda.current_device(),
+                        dtype=self.config.params_dtype,
+                    )
+                ),
+            )
+            if self.config.perform_initialization:
+                # Initialize gate weights with small values
+                self.attention_gate_weight.data.normal_(mean=0.0, std=0.02)
+        else:
+            self.attention_gate_weight = None
+            self.attention_gate_bias = None
+
     def forward(
         self,
         query: Tensor,
@@ -1318,6 +1352,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_bias: Tensor = None,
         packed_seq_params: PackedSeqParams = None,
         num_splits: Optional[int] = None,
+        hidden_states: Optional[Tensor] = None,
     ):
         """Forward."""
         # Default to constructor-provided num_splits unless explicitly overridden
@@ -1389,6 +1424,70 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 _fa_kwargs["num_splits"] = num_splits
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
+        # Apply gated attention if enabled
+        if self.config.gated_attention:
+            assert hidden_states is not None, (
+                "hidden_states must be provided when gated_attention is enabled"
+            )
+            # core_attn_out from TE: shape depends on qkv_format
+            # For sbhd format: [sq, b, hp] where hp = num_heads * head_dim
+            # For bshd format: [b, sq, hp]
+            # For thd format: [total_tokens, hp]
+
+            # Get the shape
+            original_shape = core_attn_out.shape
+
+            # Reshape to expose head dimension for gating
+            np = self.config.num_attention_heads // self.config.tensor_model_parallel_size
+
+            if qkv_format == "sbhd":
+                # hidden_states: [sq, b, hidden_size]
+                # Compute gates: [sq, b, np]
+                gates = torch.sigmoid(
+                    torch.matmul(hidden_states, self.attention_gate_weight.T) + self.attention_gate_bias
+                )
+                # [sq, b, hp] -> [sq, b, np, hn]
+                sq, b, hp = original_shape
+                hn = hp // np
+                core_attn_out = core_attn_out.view(sq, b, np, hn)
+                # gates: [sq, b, np] -> [sq, b, np, 1]
+                gates = gates.unsqueeze(-1)
+                core_attn_out = core_attn_out * gates
+                # Reshape back
+                core_attn_out = core_attn_out.view(sq, b, hp)
+            elif qkv_format == "bshd":
+                # hidden_states needs to be [b, sq, hidden_size] for bshd format
+                # Assuming hidden_states is [sq, b, hidden_size], permute to [b, sq, hidden_size]
+                hidden_states_bshd = hidden_states.permute(1, 0, 2)
+                # Compute gates: [b, sq, np]
+                gates = torch.sigmoid(
+                    torch.matmul(hidden_states_bshd, self.attention_gate_weight.T) + self.attention_gate_bias
+                )
+                # [b, sq, hp] -> [b, sq, np, hn]
+                b, sq, hp = original_shape
+                hn = hp // np
+                core_attn_out = core_attn_out.view(b, sq, np, hn)
+                # gates: [b, sq, np] -> [b, sq, np, 1]
+                gates = gates.unsqueeze(-1)
+                core_attn_out = core_attn_out * gates
+                # Reshape back
+                core_attn_out = core_attn_out.view(b, sq, hp)
+            elif qkv_format == "thd":
+                # For THD format, hidden_states should be [total_tokens, hidden_size]
+                # Compute gates: [total_tokens, np]
+                gates = torch.sigmoid(
+                    torch.matmul(hidden_states, self.attention_gate_weight.T) + self.attention_gate_bias
+                )
+                # [total_tokens, hp] -> [total_tokens, np, hn]
+                total_tokens, hp = original_shape
+                hn = hp // np
+                core_attn_out = core_attn_out.view(total_tokens, np, hn)
+                # gates: [total_tokens, np] -> [total_tokens, np, 1]
+                gates = gates.unsqueeze(-1)
+                core_attn_out = core_attn_out * gates
+                # Reshape back
+                core_attn_out = core_attn_out.view(total_tokens, hp)
+
         return core_attn_out
 
     def sharded_state_dict(
@@ -1397,15 +1496,24 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
-        """Sharded state dict for the learnable softmax offset parameter"""
+        """Sharded state dict for learnable parameters (softmax_offset and attention_gate_bias)"""
+        state_dict = {}
+        sharding_spec = {}
+
         if self.config.softmax_type == "learnable":
-            state_dict = self.state_dict(prefix="", keep_vars=True)
-        else:
-            state_dict = {}
+            state_dict['softmax_offset'] = self.softmax_offset
+            sharding_spec['softmax_offset'] = 0
+
+        if self.config.gated_attention:
+            state_dict['attention_gate_weight'] = self.attention_gate_weight
+            state_dict['attention_gate_bias'] = self.attention_gate_bias
+            sharding_spec['attention_gate_weight'] = 0  # Shard along head dimension
+            sharding_spec['attention_gate_bias'] = 0  # Shard along head dimension
+
         return make_sharded_tensors_for_checkpoint(
             state_dict,
             prefix,
-            {'softmax_offset': 0},
+            sharding_spec,
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],

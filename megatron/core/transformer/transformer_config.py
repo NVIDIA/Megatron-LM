@@ -109,9 +109,16 @@ class TransformerConfig(ModelParallelConfig):
     """Softmax scale for attention scaling."""
 
     softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
-    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html.
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and
        and learnable offset."""
+
+    gated_attention: bool = False
+    """Enable gated attention: learnable sigmoid gate per head after SDPA output."""
+
+    gated_attention_init_value: float = 0.0
+    """Initial value for gate bias. Gate = sigmoid(init_value).
+       0.0 -> 0.5 (neutral), positive -> more signal, negative -> less signal."""
 
     num_query_groups: Optional[int] = None
     """Number of query groups for group query attention. If None, normal attention is used."""
@@ -1353,6 +1360,11 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
+
+        if self.gated_attention and self.multi_latent_attention:
+            warnings.warn(
+                "Gated attention with multi_latent_attention is experimental and not extensively tested."
+            )
 
         # Set the embedding init method
         if self.embedding_init_method_std is None:
