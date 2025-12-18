@@ -1250,11 +1250,6 @@ def validate_args(args, defaults={}):
                 "For fine-grained activation offloading with TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 should be set to 1 to avoid offloading weights."
         assert not args.moe_paged_stash, "Fine-grained activation offloading and paged stash cannot be enabled at the same time"
 
-    if args.moe_paged_stash:
-        assert args.transformer_impl == 'transformer_engine', \
-            "Paged stash is only supported with transformer_engine implementation"
-        assert not args.fine_grained_activation_offloading, "Paged stash and fine-grained activation offloading cannot be enabled at the same time"
-
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
         assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
