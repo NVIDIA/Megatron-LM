@@ -1132,6 +1132,9 @@ def _load_base_checkpoint(
     if getattr(args, "ckpt_step", None):
         iteration = args.ckpt_step
 
+    # Record the iteration loaded in args.
+    args.loaded_iteration = iteration
+
     if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
         if non_persistent_iteration >= iteration:
             return _load_non_persistent_base_checkpoint(
