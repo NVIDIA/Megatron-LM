@@ -483,9 +483,6 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
         model_config = get_model_config(unwrapped_model)
 
-        # Build active slices of all relevant tensors.
-        context.build_active_slices()
-
         # Initialize attention state.
         context.initialize_attention_state(construct_graph_dimensions=construct_graph_dimensions)
 
@@ -632,11 +629,12 @@ class TextGenerationController:
             return_log_probs (bool): Whether to return the sampled log_probs.
         """
         context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
 
-        return_log_probs = context.active_request_metadata["return_log_probs"]
-        top_n_log_probs = context.active_request_metadata["top_n_logprobs"] > 0
-
-        return return_log_probs.any(), top_n_log_probs.any()
+        return (
+            (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
+            (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
+        )
 
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
@@ -694,7 +692,7 @@ class TextGenerationController:
         # Note: logits may be padded, so we only take the first active_token_count tokens
         log_probs = log_probs_tensor[: context.active_token_count]
 
-        active_query_lengths = context.active_request_query_lengths
+        active_query_lengths = context.active_request_query_lengths[:active_request_count]
 
         # Split log_probs across request boundaries
         # log_probs has shape [active_token_count, vocab_size]
@@ -779,12 +777,12 @@ class TextGenerationController:
 
         # Request finished if termination_id or length >= max_sequence_length.
         # Note: termination_id tensor has per-request termination IDs from mixed sampling
-        active_request_mask = (
-            self._sampled_tokens_cuda[:active_request_count]
-            != context.active_request_metadata["termination_id"]
+        padded_active_request_mask = (
+            self._sampled_tokens_cuda != context.active_request_metadata["termination_id"]
         ).byte() & torch.less(
             context.active_sequence_lengths + 1, context.active_request_output_lengths
         ).byte()
+        active_request_mask = padded_active_request_mask[:active_request_count]
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -797,7 +795,7 @@ class TextGenerationController:
         newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
 
         return {
-            "active_request_ids": active_request_ids,
+            "active_request_ids": context.active_request_ids[:active_request_count],
             "newly_paused_request_ids": newly_paused_request_ids,
             "finished_request_ids": finished_request_ids,
         }
