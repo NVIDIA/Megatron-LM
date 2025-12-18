@@ -295,12 +295,11 @@ class MoELayer(BaseMoELayer):
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher. The original hidden states are returned as a residual connection.
         """
-        residual = hidden_states
-        probs, routing_map = self.router(hidden_states)
+
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
-        return hidden_states, probs, residual
+        return hidden_states, probs
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
@@ -391,6 +390,7 @@ class MoELayer(BaseMoELayer):
 
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
+<<<<<<< HEAD
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
@@ -400,6 +400,9 @@ class MoELayer(BaseMoELayer):
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
             if "expert_compute" in self.fwd_execution_map:
+=======
+                hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+>>>>>>> 529107a03f (fix rebase)
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
