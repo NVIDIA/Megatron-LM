@@ -830,6 +830,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of SMs to use for HybridEP. In pure NVL scenarios,
     16 SMs can generally achieve good bandwidth."""
 
+<<<<<<< HEAD
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
     block interleaved format. Instead of interpreting the input tensor
@@ -839,6 +840,11 @@ class TransformerConfig(ModelParallelConfig):
     This data format is experimental and primarily intended to enable
     advanced fused kernels."""
 
+=======
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert, None means no token
+    will be dropped. The default is None."""
+>>>>>>> f52bf7f51 (Update added arguments and add compatibility check)
     ##################
     # Context Parallel
     ##################
@@ -1103,6 +1109,14 @@ class TransformerConfig(ModelParallelConfig):
     """If True, enable packed moe expert offloading."""
     moe_paged_stash: bool = False
     """If True, enable paged stash for MoE expert activations."""
+
+    stash_modules: Optional[list[str]] = None
+    """The MoE submodules to stash activations for.
+    choices: "expert_fc1", "moe_act", "expert_fc2".
+    "expert_fc1": stash the input of the expert fc1 part.
+    "moe_act": stash the input of the moe activation part.
+    "expert_fc2": stash the input of the expert fc2 part.
+    """
 
 
     def __post_init__(self):
@@ -1412,6 +1426,18 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
                 )
 
+        if self.moe_expert_rank_capacity_factor is not None:
+            if not self.moe_use_device_initiated_grouped_gemm:
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires moe_use_device_initiated_grouped_gemm "
+                    "to be enabled."
+                )
+            if self.moe_flex_dispatcher_backend != "hybridep":
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
+                    "'hybridep'."
+                )
+
         if self.cpu_offloading and (
             self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
         ):
@@ -1670,12 +1696,25 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.cpu_offloading and not self.fine_grained_activation_offloading
             ), "paged_stash cannot be enabled with cpu_offloading."
-            assert self.offload_modules is not None and len(self.offload_modules) > 0
+            assert self.stash_modules is not None and len(self.stash_modules) > 0, (
+                "stash_modules must be specified when moe_paged_stash is enabled."
+            )
             allowed_modules = {"expert_fc1", "expert_fc2", "moe_act"}
-            invalid_modules = set(self.offload_modules) - allowed_modules
+            invalid_modules = set(self.stash_modules) - allowed_modules
             assert not invalid_modules, (
-                f'Invalid choices for offload_modules: {invalid_modules}. '
+                f'Invalid choices for stash_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
+            )
+            assert self.moe_expert_rank_capacity_factor is not None, (
+                "moe_expert_rank_capacity_factor must be set when moe_paged_stash is enabled."
+            )
+
+        # Check that no module is both stashed and offloaded
+        if self.stash_modules and self.offload_modules:
+            overlap = set(self.stash_modules) & set(self.offload_modules)
+            assert not overlap, (
+                f"A module cannot be stashed and offloaded at the same time. "
+                f"Found overlapping modules: {overlap}"
             )
 
         if (
