@@ -1661,7 +1661,12 @@ class TECudaGraphHelper:
                 sample_start_idx = (prefix_num_layers[model_chunk_idx] * self.num_microbatches) + (
                     fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
                 )
-                for layer_idx, layer in enumerate(self.callables_per_chunk[model_chunk_idx]):
+                if chunk_id_list:
+                    model_chunk_idx = chunk_id_list[idx][0]
+                    callables_curr_chunk = [self.callables_per_chunk[model_chunk_idx][chunk_id_list[idx][1]]]
+                else:
+                    callables_curr_chunk = self.callables_per_chunk[model_chunk_idx]
+                for layer_idx, layer in enumerate(callables_curr_chunk):
                     per_callable_fwd_idx = sample_start_idx + layer_idx
 
                     # Get sample_args and sample_kwargs for index per_callable_fwd_idx.
@@ -1681,7 +1686,7 @@ class TECudaGraphHelper:
                         # cache the signature.
                         sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
                             _get_layer_static_inputs(
-                                layer, self.chunks_with_decoder[chunk_id_list[idx][0]]
+                                layer, self.chunks_with_decoder[model_chunk_idx]
                             )
                         )
                         sample_args_keys = tuple(
@@ -1698,7 +1703,7 @@ class TECudaGraphHelper:
                         # reuse the static inputs of a previous forward pass for this forward pass.
                         # If not, we still need to generate the new static inputs.
                         sample_keys = layer_sample_keys_cache[id(layer)]
-
+                    model_chunk_idx = abs(chunk_id) - 1
                     fwd_sample_queues[model_chunk_idx].append((sample_keys, per_callable_fwd_idx))
                     if consumed_sample_queue.get(sample_keys, []):
                         # We can reuse the static inputs of a previous forward pass for this
@@ -1720,11 +1725,14 @@ class TECudaGraphHelper:
                         # Unfortunately, no previous static inputs are available for reuse,
                         # sample_args is still None. Last attempt: generate the new static inputs
                         # for this forward pass.
+                        if chunk_id_list:
+                            model_chunk_idx = chunk_id_list[idx][0]
                         sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
                             _get_layer_static_inputs(
                                 layer, self.chunks_with_decoder[model_chunk_idx]
                             )
                         )
+                        model_chunk_idx = abs(chunk_id) - 1
                 fwd_idx[model_chunk_idx] += 1
             elif ceil(chunk_id) == chunk_id:
                 num_consumed_samples = min(
