@@ -871,3 +871,11 @@ def paged_stash_reset(enabled=True):
         assert len(stash_manager.paged_tensors_to_stash) == 0, f"paged_tensors_to_stash is not empty {stash_manager.paged_tensors_to_stash}"
         assert len(stash_manager.paged_tensors_stash_in_progress) == 0, f"paged_tensors_stash_in_progress is not empty {stash_manager.paged_tensors_stash_in_progress}"
 
+def check_paged_stash_overflow():
+    """Check if paged stash overflow"""
+    stash_manager = PagedStashManager.get_instance()
+    if not stash_manager.enabled or stash_manager.overflow is None:
+        return
+    overflow = stash_manager.overflow.item()
+    if overflow != 0:
+        raise RuntimeError("PagedStashManager overflow!!!")
