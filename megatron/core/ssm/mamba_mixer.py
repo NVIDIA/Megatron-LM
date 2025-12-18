@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
@@ -24,6 +25,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
@@ -79,9 +81,16 @@ class ExtendedRMSNorm(RMSNormGated):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
+        if not hasattr(self, 'tp_group'):
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0},
+            sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
 
@@ -290,11 +299,11 @@ class MambaMixer(MegatronModule):
             )
             setattr(self.conv1d.weight, "tensor_model_parallel", True)
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
-
-            if self.conv_init is not None:
-                nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
-            else:
-                nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
+            if self.config.perform_initialization:
+                if self.conv_init is not None:
+                    nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+                else:
+                    nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
 
         self.activation = "silu"
         self.act = nn.SiLU()
@@ -319,7 +328,9 @@ class MambaMixer(MegatronModule):
             assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
             A = torch.empty(
                 self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
-            ).uniform_(*A_init_range)
+            )
+            if self.config.perform_initialization:
+                A = A.uniform_(*A_init_range)
             A_log = torch.log(A)  # Keep A_log in fp32
             self.A_log = nn.Parameter(A_log)
             setattr(self.A_log, "tensor_model_parallel", True)
@@ -378,6 +389,7 @@ class MambaMixer(MegatronModule):
             D_cp1=self.D,
             D_has_hdim=self.D_has_hdim,
         )
+        self.tp_group = pg_collection.tp
 
     def forward(
         self,
@@ -1037,6 +1049,9 @@ class MambaMixer(MegatronModule):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
+        # Guard for cases metadata is not provided
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+
         sharded_state_dict = {}
         # Parameters
         self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)
@@ -1056,12 +1071,17 @@ class MambaMixer(MegatronModule):
                 # Add TP sharding for Conv1d
                 module_sd = module.state_dict(prefix="", keep_vars=True)
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
-                    module_sd, f"{prefix}{name}.", {f"weight": 0, f"bias": 0}, sharded_offsets
+                    module_sd,
+                    f"{prefix}{name}.",
+                    {f"weight": 0, f"bias": 0},
+                    sharded_offsets,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
                 )
 
             else:
                 module_sharded_sd = sharded_state_dict_default(
-                    module, f"{prefix}{name}.", sharded_offsets, metadata
+                    module, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=self.tp_group
                 )
 
             sharded_state_dict.update(module_sharded_sd)

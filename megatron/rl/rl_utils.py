@@ -55,6 +55,9 @@ from megatron.training.global_vars import (
 )
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -732,7 +735,8 @@ def selective_log_softmax(logits, index):
         `torch.Tensor`:
             Gathered log probabilities with the same shape as `index`.
     """
-    if logits.dtype in [torch.float32, torch.float64]:
+    use_bik_logsoftmax = is_batch_invariant_mode_enabled()
+    if logits.dtype in [torch.float32, torch.float64] and not use_bik_logsoftmax:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption
         logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
@@ -1840,8 +1844,6 @@ def prepare_data_for_update(
                 # Store packed inference logprobs in packing context
                 packing_context['packed_inference_logprobs'] = packed_inference_logprobs.cuda()
                 packing_context['has_inference_logprobs'] = True
-
-        # TODO(vitalyk): add a test for prepare_data_for_update.
 
         with torch.no_grad(), nvtx_range("compute_ref_logprobs"):
             # We need to load the ref model state dict and compute the logprobs for the ref model
