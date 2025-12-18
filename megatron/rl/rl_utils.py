@@ -1417,7 +1417,7 @@ def megatron_rl_inference_mode(
                 optimizer.offload_to_cpu()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
-        if cuda_graph_impl != "none":
+        if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
 
         inference_interface = get_inference_interface(args, loop, model)
@@ -1466,7 +1466,7 @@ def megatron_rl_inference_mode(
                 inference_interface._inference_engine.context.memory_buffer = None
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
-        if cuda_graph_impl != "none":
+        if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
 
         if offload_optimizer_during_inference:
