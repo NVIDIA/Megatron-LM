@@ -2157,9 +2157,6 @@ def _add_training_args(parser):
                        help='Global step to stop profiling.')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
-    group.add_argument('--disable-gloo-process-groups', action='store_false',
-                       dest='enable_gloo_process_groups',
-                       help='Disables creation and usage of Gloo process groups.')
     group.add_argument('--use-pytorch-profiler', action='store_true',
                        help='Use the built-in pytorch profiler. '
                        'Useful if you wish to view profiles in tensorboard.',
@@ -2705,15 +2702,6 @@ def _add_distributed_args(parser):
     group.add_argument('--disable-symmetric-registration', action='store_true', dest='disable_symmetric_registration',
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.')
-    group.add_argument('--use-sharp', action='store_true',
-                       help='Required to enable SHARP communication.')
-    group.add_argument('--sharp-enabled-group', type=str, default=None,
-                       choices=['dp', 'dp_replica'],
-                       help='IB SHARP can be enabled from only one communication group. '
-                       'By default, it is enabled from dp group. '
-                       'Available options: [dp, dp_replica]')
-    group.add_argument('--use-megatron-fsdp', action='store_true',
-                       help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--init-model-with-meta-device', action='store_true')
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
