@@ -2445,6 +2445,7 @@ def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = F
 
     return _decorate if func is None else _decorate(func)
 
+
 def get_mamba_inference_state_config_from_model(model) -> Optional["MambaInferenceStateConfig"]:
     """Returns Mamba inference state config from the model if it is a hybrid model."""
     from megatron.core.inference.contexts.attention_context.mamba_metadata import (
@@ -2462,6 +2463,7 @@ def get_mamba_inference_state_config_from_model(model) -> Optional["MambaInferen
             mamba_ssm_states_shape=mamba_ssm_states_shape,
         )
     return None
+
 
 def get_mamba_inference_state_config_from_model(model) -> Optional["MambaInferenceStateConfig"]:
     """Returns Mamba inference state config from the model if it is a hybrid model."""

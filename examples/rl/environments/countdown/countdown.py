@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # This file is adapted from code in https://github.com/Jiayi-Pan/TinyZero
 
 import re

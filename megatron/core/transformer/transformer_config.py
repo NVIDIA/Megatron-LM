@@ -1958,7 +1958,6 @@ class TransformerConfig(ModelParallelConfig):
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
 
-
         if self.fallback_to_eager_attn:
             assert self.transformer_impl == "transformer_engine", (
                 f"fallback_to_eager_attn is only available with transformer_engine implementation,"

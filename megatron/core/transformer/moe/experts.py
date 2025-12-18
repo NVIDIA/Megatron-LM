@@ -65,6 +65,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
 

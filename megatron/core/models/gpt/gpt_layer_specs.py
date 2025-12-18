@@ -190,7 +190,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
     fallback_to_eager_attn: bool = False,
-        use_kitchen_attention: bool = False,
+    use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
