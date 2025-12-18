@@ -1492,11 +1492,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
             if self.recompute_granularity:
                 if (
-                    self.recompute_granularity != "selective"
-                    or self.cuda_graph_impl != "transformer_engine"
-                    or self.cuda_graph_scope != "attn"
+                    self.recompute_granularity == "selective"
+                    and self.cuda_graph_impl == ["local"]
+                    and self.recompute_modules != ["moe"]
                 ):
-                    raise ValueError("CUDA graphs not supported with activation recomputation.")
+                    raise ValueError("CUDA graphs currently only supports --recompute-modules moe")
                 else:
                     for module in self.recompute_modules:
                         if module in ['core_attn', 'mla_up_proj']:
