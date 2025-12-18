@@ -26,6 +26,7 @@ from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     get_all_rng_states,
     get_cuda_rng_tracker,
+    is_checkpointing
 )
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
@@ -41,6 +42,7 @@ from megatron.core.utils import (
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
+    from transformer_engine.pytorch.distributed import is_fp8_activation_recompute_enabled
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
     from transformer_engine.pytorch.graph import (
         make_graphed_callables,
@@ -316,6 +318,10 @@ class _CudagraphGlobalRecord:
                 has_te_modules = has_te_modules or any(
                     [isinstance(m, TransformerEngineBaseModule) for m in base_module.modules()]
                 )
+        else:
+            logging.warning("Transformer Engine was not detected while capturing training " \
+            "cudagraphs. As a result cudagraph memory overhead may significantly increase " \
+            "as Transformer Engine is needed to remove redundant cudagraph memory usage.")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1010,6 +1016,22 @@ class _CudaGraphRunner(torch.nn.Module):
         delattr(self, "kwargs")
         delattr(self, "outputs")
 
+    def apply_cudagraph_artifacts(self, args, kwargs, outputs):
+        for t in self.get_tensors(args, kwargs):
+            if not hasattr(t, "cg_artifacts"):
+                t.cg_artifacts = CudagraphArtifacts()
+
+            t.cg_artifacts.is_cudagraph_input = True
+            t.cg_artifacts.input_use_count += 1
+
+            if t.cg_artifacts.is_cudagraph_output:
+                t.cg_artifacts.cudagraph_reuse_ref_count += 1
+
+        # mark all outputs, so that the fwd graph we may reuse cudagraph output buffers as inputs
+        for o in self.get_tensors(outputs):
+            o.cg_artifacts = CudagraphArtifacts()
+            o.cg_artifacts.is_cudagraph_output = True
+
     def record_graph_capture(self, args, kwargs):
         """Records the data needed to create this runner's forward cudagraph.
         The first pass records a graph and appends the runner to _CudagraphGlobalRecord.
@@ -1037,20 +1059,7 @@ class _CudaGraphRunner(torch.nn.Module):
         if not self.fwd_graph_recorded:
             logger.debug(f"Recording forward graph creation...")
 
-            for t in self.get_tensors(args, kwargs):
-                if not hasattr(t, "cg_artifacts"):
-                    t.cg_artifacts = CudagraphArtifacts()
-
-                t.cg_artifacts.is_cudagraph_input = True
-                t.cg_artifacts.input_use_count += 1
-
-                if t.cg_artifacts.is_cudagraph_output:
-                    t.cg_artifacts.cudagraph_reuse_ref_count += 1
-
-            # mark all outputs, so that the fwd graph we may reuse cudagraph output buffers as inputs
-            for o in self.get_tensors(out):
-                o.cg_artifacts = CudagraphArtifacts()
-                o.cg_artifacts.is_cudagraph_output = True
+            self.apply_cudagraph_artifacts(args, kwargs, out)
 
             def _replace_with_meta(arg):
                 return ArgMetadata(arg) if torch.is_tensor(arg) else arg
@@ -1385,6 +1394,9 @@ class CudaGraphManager(torch.nn.Module):
             kwargs (dict):  The keyword args to be passed to the module.
         """
         is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+        is_in_checkpoint_fwd = is_checkpointing()
+        if HAVE_TE_GRAPHS:
+            is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
 
         if _CudagraphGlobalRecord.cudagraph_created:
             if self.training and torch.is_grad_enabled():
@@ -1437,16 +1449,18 @@ class CudaGraphManager(torch.nn.Module):
 
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
-
-            else:
-                # Training mode
+            elif self.training or is_in_checkpoint_fwd:
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
                 # check if a layer is frozen during training.
                 if not torch.is_grad_enabled():
                     # If the layer is frozen, we need to set the runner to eval mode.
                     runner.eval()
                 out = runner.record_graph_capture(args, kwargs)
-
+            else:
+                # No cudagraphs were found in training mode with grad disabled, so fallback to
+                # eager since autograd is needed to correctly trace the backward graph.
+                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
+        
         self.is_first_microbatch = False
         # If forward only, next replay should be a forward pass as well
         if is_inference_mode or not torch.is_grad_enabled():
