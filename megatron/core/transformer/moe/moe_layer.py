@@ -118,8 +118,11 @@ class MoELayer(BaseMoELayer):
         super(MoELayer, self).__init__(
             config=config, layer_number=layer_number, pg_collection=pg_collection
         )
+        # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
-            config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
+            config.recompute_granularity == 'selective' 
+            and "moe" in config.recompute_modules
+            and config.cuda_graph_impl != 'local'
         )
         self.shared_experts_recompute = (
             config.recompute_granularity == 'selective'
