@@ -74,9 +74,6 @@ class TextGenerationController:
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.sampling_rng.manual_seed(model_config.inference_sampling_seed)
 
-        # Callback to get request IDs that should be marked as finished due to stop words
-        self._get_stop_word_finished_ids_callback = None
-
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
@@ -95,6 +92,9 @@ class TextGenerationController:
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_total_requests
+
+        # Callback to get request IDs that should be marked as finished due to stop words
+        self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.inference_wrapper_config.params_dtype
