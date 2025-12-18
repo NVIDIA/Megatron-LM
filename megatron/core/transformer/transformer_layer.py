@@ -636,7 +636,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
         return pre_mlp_layernorm_output
 
-    def _forward_post_mlp(self, mlp_output_with_bias, residual, using_fused_tp_inference_kernel):
+    def _forward_post_mlp(self, mlp_output_with_bias, residual, using_fused_tp_inference_kernel=False):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
