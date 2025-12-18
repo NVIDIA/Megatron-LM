@@ -869,16 +869,6 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
             first_backward_idx = idx
         if c_id > 0:
             last_forward_idx = idx
-    assert (
-        first_backward_idx is not None
-        and last_forward_idx is not None
-        and first_backward_idx < last_forward_idx
-    ), "Invalid order"
-    for idx, c_id in enumerate(order[first_backward_idx + 1 : last_forward_idx]):
-        if idx % 2 == 0:
-            assert c_id > 0, "Invalid order"
-        else:
-            assert c_id < 0, "Invalid order"
 
     def get_layer_range(c_id):
         num_layers = num_layers_per_chunk[abs(c_id) - 1]
@@ -896,25 +886,26 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
         chunk_id_list.extend([abs(c_id) - 1, i] for i in range(len(layer_range)))
 
     # 1f1b overlap stage
-    for c_id_b, c_id_f in zip(
-        order[first_backward_idx : last_forward_idx + 1 : 2],
-        order[first_backward_idx + 1 : last_forward_idx + 1 : 2],
-    ):
-        layer_range_f = get_layer_range(c_id_f)
-        layer_range_b = get_layer_range(c_id_b)
-        index = 0
-        for l_b, l_f in zip_longest(layer_range_b, layer_range_f, fillvalue=0):
-            # always forward graph before backward graph
-            if l_f != 0:
-                add_order(c_id_f, l_f, index=index)
-            if l_b != 0:
-                add_order(c_id_b, l_b)
-                if capture_wgrad_graph and index < len(layer_range_b) - 1:
-                    add_order(c_id_b, l_b, is_wgrad=True)
-            index += 1
-        # last wgrad backward
-        if capture_wgrad_graph and layer_range_b:
-            add_order(c_id_b, layer_range_b[-1], is_wgrad=True)
+    if first_backward_idx < last_forward_idx:
+        for c_id_b, c_id_f in zip(
+            order[first_backward_idx : last_forward_idx + 1 : 2],
+            order[first_backward_idx + 1 : last_forward_idx + 1 : 2],
+        ):
+            layer_range_f = get_layer_range(c_id_f)
+            layer_range_b = get_layer_range(c_id_b)
+            index = 0
+            for l_b, l_f in zip_longest(layer_range_b, layer_range_f, fillvalue=0):
+                # always forward graph before backward graph
+                if l_f != 0:
+                    add_order(c_id_f, l_f, index=index)
+                if l_b != 0:
+                    add_order(c_id_b, l_b)
+                    if capture_wgrad_graph and index < len(layer_range_b) - 1:
+                        add_order(c_id_b, l_b, is_wgrad=True)
+                index += 1
+            # last wgrad backward
+            if capture_wgrad_graph and layer_range_b:
+                add_order(c_id_b, layer_range_b[-1], is_wgrad=True)
 
     # cool down stage, backward graphs only
     for c_id in order[last_forward_idx + 1 :]:
