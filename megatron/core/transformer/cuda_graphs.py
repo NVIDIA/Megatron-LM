@@ -18,7 +18,7 @@ from math import ceil
 from typing import Any, Dict, List, Optional
 
 import torch
-from torch.utils._pytree import tree_flatten
+from torch.utils._pytree import tree_map
 
 from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
@@ -667,6 +667,9 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()'."""
 
         def get_fwd_input_buffer(ten):
+            if not torch.is_tensor(ten):
+                return ten
+
             assert ten.is_cudagraph_input
             if hasattr(ten, "is_static"):
                 buf = ten
@@ -730,9 +733,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
         # Finalize the cudagraph input buffers
         if clone_inputs:
-            self.fwd_graph_input_args, self.fwd_graph_input_kwargs = self._apply_to_all_tensors(
-                get_fwd_input_buffer, args, kwargs
-            )
+            self.fwd_graph_input_args = tree_map(get_fwd_input_buffer, args)
+            self.fwd_graph_input_kwargs = tree_map(get_fwd_input_buffer, kwargs)
         else:
             self.fwd_graph_input_args, self.fwd_graph_input_kwargs = args, kwargs
 
@@ -751,8 +753,12 @@ class _CudaGraphRunner(torch.nn.Module):
             for _ in range(self.num_warmup_steps):
                 with self.get_quantization_context():
                     def clone_ten(ten):
+                        if not torch.is_tensor(ten):
+                            return ten
                         return torch.zeros_like(ten).requires_grad_(ten.requires_grad)
-                    warmup_args, warmup_kwargs = self._apply_to_all_tensors(clone_ten, args, kwargs)
+    
+                    warmup_args = tree_map(clone_ten, args)
+                    warmup_kwargs = tree_map(clone_ten, kwargs)
                     warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
 
                 if self.grad_enabled:
@@ -1096,39 +1102,13 @@ class _CudaGraphRunner(torch.nn.Module):
 
         return errors
 
-    def _apply_to_all_tensors(self, func, args, kwargs=None):
-        """Replace all tensors inside arg, kwargs with zeroed copies."""
-
-        def process_arg(arg):
-            if torch.is_tensor(arg):
-                return func(arg)
-            elif is_dataclass(arg):
-                for field in fields(arg):
-                    attr = getattr(arg, field.name)
-                    if torch.is_tensor(attr):
-                        setattr(arg, field.name, func(arg))
-            return arg
-
-        if torch.is_tensor(args):
-            return func(args)
-
-        args_replaced = []
-        if args is not None and len(args) > 0:
-            for arg in args:
-                args_replaced.append(process_arg(arg))
-        if kwargs is None:
-            return args_replaced
-
-        kwargs_replaced = {}
-        for k, v in kwargs.items():
-            kwargs_replaced[k] = process_arg(v)
-
-        return args_replaced, kwargs_replaced
-
     def replace_tensors_with_weak_refs(self, args, kwargs=None, cache_refs=False):
         """Replace all tensors inside arg, kwargs with zeroed copies."""
 
         def replace_with_weak_ref(arg):
+            if not torch.is_tensor(arg):
+                return arg
+
             if hasattr(arg, "is_static"):
                 return arg
 
@@ -1152,7 +1132,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 ref.bwd_cudagraph_buffer = arg.bwd_cudagraph_buffer
             return ref
 
-        return self._apply_to_all_tensors(replace_with_weak_ref, args, kwargs)
+
+        args_weakref = tree_map(replace_with_weak_ref, args)
+        if kwargs is None:
+            return args_weakref
+        
+        kwargs_weakref = tree_map(replace_with_weak_ref, kwargs)
+        return args_weakref, kwargs_weakref
+
 
     def get_tensors(self, args, kwargs=None, check_types=True):
         """
