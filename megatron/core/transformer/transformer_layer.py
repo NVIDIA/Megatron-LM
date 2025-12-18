@@ -1229,11 +1229,19 @@ class MoETransformerLayer(TransformerLayer):
     def __init__(self, *args, **kwargs):
         self.is_moe_layer = True
         self.use_partial_cudagraphs = False
+        self.moe_layer_recompute = False
 
         super().__init__(*args, **kwargs)
 
     def create_mcore_cudagraph_manager(self, config):
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+        self.moe_layer_recompute = (
+            self.config.recompute_granularity == 'selective' and \
+            "moe" in self.config.recompute_modules and 
+            self.config.cuda_graph_impl == "local"
+        )
+
         if "full" in self.config.cuda_graph_scope or "moe_router" in self.config.cuda_graph_scope:
             self.use_partial_cudagraphs = True        
             self.cudagraph_manager_router = CudaGraphManager(
@@ -1251,7 +1259,7 @@ class MoETransformerLayer(TransformerLayer):
         residual = hidden_states
         self.mlp.fwd_execution_map = ("route")
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-        router_outputs = self.mlp(pre_mlp_layernorm_output, intermediate_tensors=[])
+        router_outputs = self.mlp(pre_mlp_layernorm_output, intermediate_tensors=())
         return residual, *router_outputs
 
     def _forward_mlp_expert_compute(self, hidden_states, probs, routing_map):
@@ -1265,10 +1273,26 @@ class MoETransformerLayer(TransformerLayer):
 
     def _forward_mlp(self, hidden_states, inference_context=None):
         # If using partial cudagraphs, decompose the forward pass into 3 subfunctions
-        if self.use_partial_cudagraphs:        
+        def _forward_mlp_partial_cudagraphs(hidden_states, inference_context=None):
             residual, hidden_states, probs, routing_map, shared_expert_output = \
                 self._forward_mlp_router(hidden_states)
             expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs, routing_map)
             return self._forward_mlp_postprocess(residual, expert_output, shared_expert_output, mlp_bias)
+
+        if self.use_partial_cudagraphs:
+            if self.moe_layer_recompute:
+                if self.config.fp8 or self.config.fp4:
+                    from megatron.core.extensions.transformer_engine import te_checkpoint
+                    return te_checkpoint(
+                        _forward_mlp_partial_cudagraphs,
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        parallel_state.get_tensor_model_parallel_group(),
+                        hidden_states,
+                    )
+                else:
+                    return tensor_parallel.checkpoint(_forward_mlp_partial_cudagraphs, False, hidden_states)
+            else:
+                return _forward_mlp_partial_cudagraphs(hidden_states)
         else:
             return super()._forward_mlp(hidden_states)

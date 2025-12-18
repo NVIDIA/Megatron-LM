@@ -358,7 +358,8 @@ class _CudagraphGlobalRecord:
                 assert fwd_buffer_reuse_ref_count == 0
                 runner.create_bwd_graph()
 
-        assert bwd_buffer_reuse_ref_count == 0
+        # TODO: (jiemingz) see [interaction with recompute]
+        # assert bwd_buffer_reuse_ref_count == 0
 
         # Memory usage.
         time_end = time.time()
@@ -904,9 +905,14 @@ class _CudaGraphRunner(torch.nn.Module):
         for o in self.get_arg_metas(self.outputs):
             out_grad = None
             if o.requires_grad:
-                if o.cg_artifacts.is_cudagraph_input:
-                    assert o.cg_artifacts.bwd_cudagraph_buffer is not None and \
-                        o.cg_artifacts.bwd_cudagraph_buffer.shape == o.shape
+                # TODO: (jiemingz) [interaction with recompute]
+                # for activation recompute, the fwd pass is rerun in the backward pass and
+                # the metadata we attach in record_graph_capture is lost. As a result the next 
+                # cudagraph expects the buffer to be provided 'fwd_cudagraph_buffer' but is missing.
+                # So, we cannot always assume this metadata exists. Consequently, there are extra
+                # copies between the outputs of the fwd-bwd pass and the bwd pass.
+                if o.cg_artifacts.is_cudagraph_input and o.cg_artifacts.bwd_cudagraph_buffer is not None:
+                    o.cg_artifacts.bwd_cudagraph_buffer.shape == o.shape
                     
                     out_grad = o.cg_artifacts.bwd_cudagraph_buffer
                     o.cg_artifacts.bwd_cudagraph_buffer = None
@@ -1028,7 +1034,6 @@ class _CudaGraphRunner(torch.nn.Module):
             ]
         )
 
-
         if not self.fwd_graph_recorded:
             logger.debug(f"Recording forward graph creation...")
 
@@ -1072,7 +1077,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if len(out) == 1:
             return out[0]
-        return out
+        return tuple(out)
 
     def replay_graph_capture(self, is_first_microbatch, args, kwargs):
         """Replay the fwd cuda graph with autograd."""
@@ -1379,6 +1384,7 @@ class CudaGraphManager(torch.nn.Module):
 
             kwargs (dict):  The keyword args to be passed to the module.
         """
+        is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
 
         if _CudagraphGlobalRecord.cudagraph_created:
             if self.training and torch.is_grad_enabled():
@@ -1390,7 +1396,7 @@ class CudaGraphManager(torch.nn.Module):
             runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
-            if 'inference_context' in kwargs.keys() and kwargs['inference_context']:
+            if is_inference_mode:
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
                 runner.eval()
@@ -1432,7 +1438,7 @@ class CudaGraphManager(torch.nn.Module):
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
 
-            elif self.training:
+            else:
                 # Training mode
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
                 # check if a layer is frozen during training.
@@ -1443,12 +1449,13 @@ class CudaGraphManager(torch.nn.Module):
 
         self.is_first_microbatch = False
         # If forward only, next replay should be a forward pass as well
-        if self.training and torch.is_grad_enabled():
-            runner.status = _GraphStatus.BWD_READY
-        else:
+        if is_inference_mode or not torch.is_grad_enabled():
             runner.status = _GraphStatus.FWD_READY
+        else:
+            runner.status = _GraphStatus.BWD_READY
 
         return out
+
 
 
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
