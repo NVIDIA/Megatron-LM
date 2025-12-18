@@ -1213,8 +1213,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 kwargs["dynamic_inference_decode_only"] = kwargs[
                     'inference_context'
                 ].is_decode_only()
-            if 'rotary_pos_emb' in kwargs and torch.is_tensor(kwargs['rotary_pos_emb']):
-                kwargs['rotary_pos_emb'].is_static = True
     
         return super().__call__(*args, **kwargs)
 
