@@ -12,7 +12,9 @@ R_co = TypeVar('R_co', covariant=True)
 class _Module(Generic[P, R_co], Protocol):
     """Protocol allowing us to unwrap `forward`."""
 
-    def forward(self, *args: P.args, **kwargs: P.kwargs) -> R_co: ...
+    def forward(self, *args: P.args, **kwargs: P.kwargs) -> R_co:
+        """Forward method of the matching torch.nn.Module."""
+        ...
 
 
 def apply_module(m: _Module[P, R_co], *, check_subclass: bool = True) -> Callable[P, R_co]:
