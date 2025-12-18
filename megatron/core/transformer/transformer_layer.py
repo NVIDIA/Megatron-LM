@@ -715,7 +715,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         self.self_attention.linear_qkv.skip_norm_and_all_gather = skip_qkv_norm_and_all_gather
 
-        # Use current layer's own MLP FC1 norm weights for attention's out_proj
+        # Use current layer's own MLP FC1 norm weights for attention's/mixer's out_proj
         mlp_fc1_weights = self.get_mlp_layer_norm_weights()
         self._set_proj_next_layer_norm_weights(mlp_fc1_weights)
 
@@ -724,9 +724,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self._set_fc2_next_layer_norm_weights(fc2_next_layer_norm_weights)
 
     def _set_proj_next_layer_norm_weights(self, weights: Tensor):
-        """Set next layer norm weights for linear_proj."""
+        """Set next layer norm weights for attention/mixer's linear_proj."""
         self.self_attention.linear_proj._set_next_layer_norm_weights(weights)
-
+ 
     def _set_fc2_next_layer_norm_weights(self, weights: Optional[Tensor]):
         """Set next layer norm weights for MLP FC2."""
         if weights is None:
@@ -735,7 +735,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.mlp.linear_fc2._set_next_layer_norm_weights(weights)
 
     def _set_proj_residual(self, residual: Tensor):
-        """Set residual for attention's out_proj (linear_proj)."""
+        """Set residual for attention's/mixer's out_proj (linear_proj)."""
         self.self_attention.linear_proj._set_residual(residual)
 
     def _set_fc2_residual(self, residual: Tensor):
