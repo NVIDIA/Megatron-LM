@@ -533,7 +533,6 @@ class GPTModel(LanguageModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,
-                packed_seq_params=packed_seq_params,
                 **(extra_block_kwargs or {}),
             )
 
