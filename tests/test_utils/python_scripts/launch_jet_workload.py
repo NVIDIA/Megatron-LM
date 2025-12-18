@@ -115,11 +115,7 @@ def launch_and_wait_for_completion(
                                 }
                             }
                         }
-                    },
-                    "outputs": {
-                        "enabled": True,
-                        "artifacts_storages": [recipe_parser.resolve_artifact_config(cluster)],
-                    },
+                    }
                 },
                 wait_for_validation=True,
                 max_wait_time=(60 * 60),

@@ -23,6 +23,8 @@ class dotdict(dict):
 def resolve_cluster_config(cluster: str) -> str:
     if cluster == "dgxh100_eos":
         return "eos"
+    if cluster == "dgxgb200_oci-hsg":
+        return "oci-hsg"
     if cluster == "dgxa100_dracooci":
         return "draco-oci-iad"
     if cluster == "dgxa100_dracooci-ord":
@@ -31,18 +33,6 @@ def resolve_cluster_config(cluster: str) -> str:
         return "coreweave"
     if cluster == "ghci":
         return "ghci"
-    raise ValueError(f"Unknown cluster {cluster} provided.")
-
-
-def resolve_artifact_config(cluster: str) -> str:
-    if cluster == "dgxh100_eos":
-        return "eos_lustre"
-    if cluster == "dgxa100_dracooci":
-        return "draco-oci_lustre"
-    if cluster == "dgxa100_dracooci-ord":
-        return "draco-oci-ord_lustre"
-    if cluster == "dgxh100_coreweave":
-        return "coreweave_lustre"
     raise ValueError(f"Unknown cluster {cluster} provided.")
 
 
