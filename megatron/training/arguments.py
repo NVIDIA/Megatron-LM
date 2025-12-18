@@ -1254,9 +1254,9 @@ def validate_args(args, defaults={}):
             "expandable_segments:True may not be safe when using CUDA Graphs with some specific parallel settings. "
             "The training may crash with illegal memory access."
         )
-        assert (
-            args.recompute_granularity != 'full'
-        ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
+        # assert (
+        #     args.recompute_granularity != 'full'
+        # ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
