@@ -31,7 +31,7 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
-from megatron.core.utils import get_attr_wrapped_model, internal_api
+from megatron.core.utils import internal_api
 
 from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -271,7 +271,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
         use_cuda_graphs_for_non_decode_steps: bool = True,
         use_flashinfer_fused_rope: bool = False,
-        unified_memory_level: Optional[int] = 0,
+        unified_memory_level: Optional[int] = 1,
         cuda_graph_max_tokens: Optional[int] = None,
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
@@ -700,49 +700,28 @@ class DynamicInferenceContext(BaseInferenceContext):
         buffer_size_gb: float = 40,
         num_cuda_graphs: int = None,
         mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
-        unified_memory_level: int = 0,
     ):
         """
         Instantiate a `DynamicInferenceContext` from a `TransformerConfig` and an `InferenceWrapperConfig`.
         """
         # TODO: Add other necessary configs from inference_config
 
-        # Max sequence length.
-        position_embedding_type = get_attr_wrapped_model(model, "position_embedding_type")
-        model_max_seq_len = get_attr_wrapped_model(model, "max_sequence_length")
-        inf_max_seq_len = inference_config.inference_max_seq_length
-
-        if position_embedding_type == "learned_absolute":
-            # When using absolute position embeddings, it is critical that the
-            # context's `max_sequence_length` is less than or equal to the model's
-            # `max_sequence_length`. Otherwise, the context's `position_ids` will
-            # contain ids greater than the dimension of the position embedding
-            # tensor, which will result in an index error.
-            if inf_max_seq_len:
-                max_sequence_length = min(model_max_seq_len, inf_max_seq_len)
-            else:
-                max_sequence_length = model_max_seq_len
-            assert max_batch_size <= model_max_seq_len
-        else:
-            max_sequence_length = (
-                inference_config.inference_max_seq_length or model_config.max_sequence_length
-            )
-        max_sequence_length = max(max_sequence_length, max_batch_size)
-
-        # Context.
         model_config = model.config
+        max_sequence_length = (
+            inference_config.inference_max_seq_length or model_config.max_sequence_length
+        )
+        max_sequence_length = max(max_sequence_length, max_batch_size)
         return cls(
             params_dtype=inference_config.params_dtype,
             num_layers=model_config.num_layers // model_config.pipeline_model_parallel_size,
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
-            max_sequence_length=max_sequence_length,
+            max_sequence_length=inference_config.inference_max_seq_length,
             buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,
             num_cuda_graphs=num_cuda_graphs,
             use_flashinfer_fused_rope=None,
             mamba_inference_state_config=mamba_inference_state_config,
-            unified_memory_level=unified_memory_level,
         )
 
     @classmethod
