@@ -10,6 +10,10 @@ try:
     import triton
     import triton.language as tl
 except ImportError:
+    from unittest.mock import MagicMock
+
+    from megatron.core.utils import null_decorator
+
     triton = MagicMock()
     tl = MagicMock()
     triton.jit = null_decorator
