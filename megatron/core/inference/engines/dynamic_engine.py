@@ -1032,16 +1032,13 @@ class DynamicInferenceEngine(AbstractEngine):
             bool: True if the generated sequence ends with a stop word, False otherwise.
         """
         # Check if request has stop words configured
-        if (
-            request.sampling_params.stop_word_ids is None
-            or len(request.sampling_params.stop_word_ids) == 0
-        ):
+        if request.stop_word_ids is None or len(request.stop_word_ids) == 0:
             return False
 
         generated_tokens = request.generated_tokens
 
         # Check if the sequence ends with any stop word
-        for stop_word_ids in request.sampling_params.stop_word_ids:
+        for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
                 # Check if the last stop_len tokens match the stop word
