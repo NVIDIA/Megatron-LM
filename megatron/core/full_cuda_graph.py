@@ -7,8 +7,8 @@ import logging
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states
-from megatron.core.pipeline_parallel.moe_packed_offload import (
-    packed_moe_expert_offloading_reset,
+from megatron.core.transformer.moe.paged_stash import (
+    paged_stash_reset,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,11 +101,11 @@ class FullCudaGraphWrapper:
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
 
-    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, packed_moe_expert_offloading=False):
+    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, moe_paged_stash=False):
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
-        self.packed_moe_expert_offloading = packed_moe_expert_offloading
+        self.moe_paged_stash = moe_paged_stash
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -188,7 +188,7 @@ class FullCudaGraphWrapper:
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
-            packed_moe_expert_offloading_reset(enabled=self.packed_moe_expert_offloading and training)
+            paged_stash_reset(enabled=self.moe_paged_stash and training)
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
         self.speculative_cuda_graph_check(model)
         self.next_iter(training_str)
@@ -196,7 +196,7 @@ class FullCudaGraphWrapper:
 
     def speculative_cuda_graph_check(self, model):
         ''' check speculative execution modules '''
-        if self.packed_moe_expert_offloading:
+        if self.moe_paged_stash:
             # Check if there is any overflow in the receiving buffer
             over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
             for model_chunk in model:
