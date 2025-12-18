@@ -224,12 +224,11 @@ class MoELayer(BaseMoELayer):
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher. The original hidden states are returned as a residual connection.
         """
-        residual = hidden_states
-        probs, routing_map = self.router(hidden_states)
+
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
-        return hidden_states, probs, residual
+        return hidden_states, probs
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
@@ -340,9 +339,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs, routing_map = intermediate_tensors
 
-                hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-                    hidden_states, routing_map, probs
-                )
+                hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 output = self.combine(output)
