@@ -315,12 +315,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict])
         top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).to(torch.int32)
         top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict])
-        request_metadata = {
-            "temperature": temp_values,
-            "top_k": top_k_values,
-            "top_p": top_p_values,
-        }
-        self.text_generation_controller._request_metadata = request_metadata
+        context.active_request_metadata["temperature"][:batch_size].copy_(temp_values)
+        context.active_request_metadata["top_k"][:batch_size].copy_(top_k_values)
+        context.active_request_metadata["top_p"][:batch_size].copy_(top_p_values)
         self.text_generation_controller._sampling_backend = backend
 
         context.padded_active_token_count = batch_size
@@ -857,15 +854,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Prepare sampling params
         top_n = 5
-        request_metadata = {
-            "top_n_logprobs": torch.full((batch_size,), top_n, dtype=torch.int32).cuda(),
-            "skip_prompt_log_probs": torch.full(
-                (batch_size,), float(skip_prompt_log_probs), dtype=torch.float32
-            ).cuda(),
-        }
-        self.text_generation_controller._request_metadata = request_metadata
-        self.text_generation_controller._active_request_count = batch_size
-        self.text_generation_controller._active_request_slice = slice(0, batch_size)
+        context.active_request_metadata["top_n_logprobs"][:batch_size].fill_(top_n)
+        context.active_request_metadata["skip_prompt_log_probs"][:batch_size].fill_(
+            skip_prompt_log_probs
+        )
 
         if materialize_only_last_token_logits:
             # Decode mode: logits for last tokens only
