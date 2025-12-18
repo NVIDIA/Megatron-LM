@@ -534,13 +534,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 runner.fp8_param_cache_updated = is_first_microbatch
 
         runner.fwd_graph.replay()
-
-        #TODO remove these clones
-        out = tuple(
-            o.clone() if not hasattr(o, "is_cudagraph_input") else o
-            for o in runner.fwd_graph_output_surface
-        )
-        return out
+        return runner.fwd_graph_output_surface
 
     @staticmethod
     def backward(ctx, *grads):
@@ -578,16 +572,12 @@ class _CudagraphReplayNode(torch.autograd.Function):
         for param, grad_added in runner.groundtruth_grad_added_to_main_grad.items():
             param.grad_added_to_main_grad = grad_added
 
-        # Clone wgrads as autograd may launch the next graph before wgrads are accumulated.
-        input_grads = []
-        for inp_grad in runner.static_grad_inputs:
-            if not hasattr(inp_grad, "cg_artifacts") and torch.is_tensor(inp_grad):
-                inp_grad = torch.clone(inp_grad)
-            input_grads.append(inp_grad)
+        # Replaying the next bwd graph destroys the data held in input_grad buffers, so clone
+        # wgrads as autograd may launch the next graph before wgrads are accumulated
+        dgrads = runner.static_grad_inputs[:runner.num_dgrads]
+        wgrads = (g.clone() for g in runner.static_grad_inputs[runner.num_dgrads:])
 
-        input_grads = tuple(input_grads)
-        return None, None, *input_grads
-
+        return None, None, *dgrads, *wgrads
 
 class _CudaGraphRunner(torch.nn.Module):
     """Represents the execution of a cudagraphed module for a single microbatch.
@@ -838,14 +828,11 @@ class _CudaGraphRunner(torch.nn.Module):
 
 
         # save cudagraph output buffer
-        if isinstance(fwd_graph_outputs, torch.Tensor):
-            fwd_graph_outputs = (fwd_graph_outputs,)
         self.fwd_graph_outputs = fwd_graph_outputs
-        self.fwd_graph_output_surface = list(self.get_tensors(fwd_graph_outputs))
+        self.fwd_graph_output_surface = self.get_tensors(fwd_graph_outputs)
 
-        for idx, o in enumerate(self.get_arg_metas(self.outputs)):
+        for fwd_graph_out, o in zip(self.fwd_graph_output_surface, self.get_arg_metas(self.outputs)):
             assert hasattr(o, "cg_artifacts") and o.cg_artifacts.is_cudagraph_output
-            fwd_graph_out = self.fwd_graph_output_surface[idx]
             fwd_graph_out.cg_artifacts = deepcopy(o.cg_artifacts)
 
             if o.cg_artifacts.is_cudagraph_input and \
@@ -956,7 +943,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 if hasattr(param, "grad_added_to_main_grad"):
                     self.groundtruth_grad_added_to_main_grad[param] = param.grad_added_to_main_grad
 
-        # The rest of the function is solely for memory management
+        # After backward pass, input and output buffers can be freed
         # tensors outside the cudagraph mempool are returned to the pool for reuse
         for ten in self.fwd_graph_input_surface + self.static_grad_outputs:
             if torch.is_tensor(ten):
@@ -971,22 +958,22 @@ class _CudaGraphRunner(torch.nn.Module):
                     _CudagraphGlobalRecord.tensor_reuse_pool.insert(ten)
 
         # now weakref everything
-        self.fwd_graph_input_surface = self.replace_tensors_with_weak_refs(
-            self.fwd_graph_input_surface
-        )
-        self.fwd_graph_input_args, self.fwd_graph_input_kwargs = (
-            self.replace_tensors_with_weak_refs(
-                self.fwd_graph_input_args, self.fwd_graph_input_kwargs
-            )
-        )
-        self.fwd_graph_output_surface = self.replace_tensors_with_weak_refs(
-            self.fwd_graph_output_surface
-        )
-        self.fwd_graph_outputs = self.replace_tensors_with_weak_refs(self.fwd_graph_outputs)
-        # It is safe to weakref static_grad_inputs since any input grad that's reused as an output grad has a
-        # strong ref in the attribute 'bwd_cudagraph_buffer'
-        self.static_grad_inputs = self.replace_tensors_with_weak_refs(self.static_grad_inputs)
-        self.static_grad_outputs = self.replace_tensors_with_weak_refs(self.static_grad_outputs)
+        def replace_with_weak_ref(arg):
+            if not torch.is_tensor(arg):
+                return arg
+          
+            ref = make_weak_ref(arg)
+            ref.requires_grad = arg.requires_grad
+            return ref
+
+        self.fwd_graph_input_surface = tree_map(replace_with_weak_ref, self.fwd_graph_input_surface)
+        self.fwd_graph_input_args = tree_map(replace_with_weak_ref, self.fwd_graph_input_args)
+        self.fwd_graph_input_kwargs = tree_map(replace_with_weak_ref, self.fwd_graph_input_kwargs)
+        self.fwd_graph_output_surface = tree_map(replace_with_weak_ref, self.fwd_graph_output_surface)
+        # It is safe to weakref static_grad_inputs as any inuse input grads have a strong ref
+        # stored in 'bwd_cudagraph_buffer'
+        self.static_grad_inputs = tree_map(replace_with_weak_ref, self.static_grad_inputs)
+        self.static_grad_outputs = tree_map(replace_with_weak_ref, self.static_grad_outputs)
 
         delattr(self, "args")
         delattr(self, "kwargs")
@@ -1075,12 +1062,10 @@ class _CudaGraphRunner(torch.nn.Module):
             func_args = inp_tensors
 
         out = _CudagraphReplayNode.apply(self, is_first_microbatch, *func_args)
-        out = list(out)
 
-        if torch.is_tensor(self.fwd_graph_outputs):
-            self.fwd_graph_outputs = [self.fwd_graph_outputs]
-
-        return tuple(out.pop(0) if torch.is_tensor(o) else o for o in self.fwd_graph_outputs)
+        out_iter = iter(self.to_list(out))
+        fwd_outputs = self.to_list(self.fwd_graph_outputs)
+        return tuple(next(out_iter) if torch.is_tensor(o) else o for o in fwd_outputs)
 
     def get_mismatch_errors(self, args, kwargs):
         """Return list of detailed errors for mismatched cudagraph args."""
@@ -1145,45 +1130,6 @@ class _CudaGraphRunner(torch.nn.Module):
 
         return errors
 
-    def replace_tensors_with_weak_refs(self, args, kwargs=None, cache_refs=False):
-        """Replace all tensors inside arg, kwargs with zeroed copies."""
-
-        def replace_with_weak_ref(arg):
-            if not torch.is_tensor(arg):
-                return arg
-
-            if hasattr(arg, "is_static"):
-                return arg
-
-            if cache_refs and hasattr(arg, "weak_ref"):
-                ref = arg.weak_ref
-            else:
-                ref = make_weak_ref(arg)
-                if cache_refs:
-                    arg.weak_ref = ref
-
-            ref.requires_grad = arg.requires_grad
-            if hasattr(arg, "is_cudagraph_input"):
-                ref.is_cudagraph_input = True
-            if hasattr(arg, "is_cudagraph_output"):
-                ref.is_cudagraph_output = True
-            if hasattr(arg, "cudagraph_reuse_ref_count"):
-                ref.cudagraph_reuse_ref_count = arg.cudagraph_reuse_ref_count
-            if hasattr(arg, "fwd_cudagraph_buffer"):
-                ref.fwd_cudagraph_buffer = arg.fwd_cudagraph_buffer
-            if hasattr(arg, "bwd_cudagraph_buffer"):
-                ref.bwd_cudagraph_buffer = arg.bwd_cudagraph_buffer
-            return ref
-
-
-        args_weakref = tree_map(replace_with_weak_ref, args)
-        if kwargs is None:
-            return args_weakref
-        
-        kwargs_weakref = tree_map(replace_with_weak_ref, kwargs)
-        return args_weakref, kwargs_weakref
-
-
     def get_arg_metas(self, args, kwargs=None):
         arg_metas = []
         
@@ -1220,7 +1166,7 @@ class _CudaGraphRunner(torch.nn.Module):
             return []
 
         if torch.is_tensor(args):
-            return args
+            return (args,)
 
         args_tens = [tensor for arg in args for tensor in extract_tensors(arg)] if args else []
         kwargs_tens = (
@@ -1228,6 +1174,9 @@ class _CudaGraphRunner(torch.nn.Module):
         )
 
         return tuple(chain(args_tens, kwargs_tens))
+
+    def to_list(self, x):
+        return [x] if torch.is_tensor(x) else list(x)
 
 class CudaGraphManager(torch.nn.Module):
     """Creates and runs cudagraphs for a megatron module"""
