@@ -645,6 +645,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
             self.active_request_metadata[label] = tensor
 
+        self.active_request_ids = torch.empty_like(self.request_ids, dtype=torch.int64)
+        self.active_request_query_lengths = torch.empty_like(self.request_query_lengths)
+        self.active_request_output_lengths = torch.empty_like(self.request_output_lengths)
+        self.active_request_kv_length_offsets = torch.empty_like(self.request_kv_length_offsets)
+        self.active_request_to_kv_block_ids = torch.empty_like(self.request_to_kv_block_ids)
+
+        self.active_sequence_lengths = torch.empty_like(self.request_query_lengths)
+        self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
+
         # Memory buffer.
         def allocate_memory_buffer():
             """Allocate the memory buffer. This function is called below within
@@ -877,30 +886,40 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_attn_metadata["mha_metadata"].state_data["max_seqlen_k"],
         )
 
-    def get_active_sequence_lengths(self) -> Tensor:
-        """Total sequence length (query + key) for active requests."""
-        lengths = self.request_kv_length_offsets + self.request_query_lengths
-        lengths = lengths[self.paused_request_count : self.total_request_count]
-        return lengths
-
-    def get_max_sequence_lengths(self) -> Tensor:
-        """Maximum sequence length for active requests."""
-        return self.request_output_lengths[self.paused_request_count : self.total_request_count]
-
     def get_active_request_count(self):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
 
-    def build_active_slices(self):
+    def build_active_slices(self, batch_size: int):
         """Build the active slices of specific tensors. This is run on every forward step."""
         active_slice = slice(self.paused_request_count, self.total_request_count)
-        batch_size = self.total_request_count - self.paused_request_count
 
         # Request metadata all needs to be sliced.
         for label, _, _ in self.request_metadata_types:
             self.active_request_metadata[label][:batch_size].copy_(
                 self.request_metadata[label][active_slice], non_blocking=True
             )
+
+        # The following tensor slices are used in various kernels.
+        self.active_request_ids[:batch_size].copy_(self.request_ids[active_slice])
+        self.active_request_query_lengths[:batch_size].copy_(
+            self.request_query_lengths[active_slice]
+        )
+        self.active_request_output_lengths[:batch_size].copy_(
+            self.request_output_lengths[active_slice]
+        )
+        self.active_request_kv_length_offsets[:batch_size].copy_(
+            self.request_kv_length_offsets[active_slice]
+        )
+        self.active_request_to_kv_block_ids[:batch_size].copy_(
+            self.request_to_kv_block_ids[active_slice]
+        )
+
+        self.active_sequence_lengths[:batch_size].copy_(
+            (self.active_request_query_lengths + self.active_request_kv_length_offsets)[:batch_size]
+        )
+        graph_scratch_space = torch.cumsum(self.active_request_query_lengths[:batch_size], dim=0)
+        self.active_request_last_token_idxs[:batch_size].copy_(graph_scratch_space - 1)
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1387,11 +1406,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             else self.non_graph_attn_metadata
         )
 
-        # Update cu_query_seq_lengths, max_seqlen_q.
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        query_lengths_view = self.request_query_lengths[active_slice]
-        request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
-        request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
+        # Build active slices of all relevant tensors.
+        batch_size = self.total_request_count - self.paused_request_count
+        self.build_active_slices(batch_size)
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
@@ -1408,9 +1425,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
 
         self.active_attn_metadata["mha_metadata"].update(
-            request_query_lengths=query_lengths_view,
-            request_kv_length_offsets=request_kv_length_offsets_view,
-            request_to_kv_block_ids=request_to_kv_block_ids_view,
+            request_query_lengths=self.active_request_query_lengths[:batch_size],
+            request_kv_length_offsets=self.active_request_kv_length_offsets[:batch_size],
+            request_to_kv_block_ids=self.active_request_to_kv_block_ids[:batch_size],
             batch_dimensions=attn_dimensions,
             padded_batch_dimensions=self.padded_batch_dimensions,
         )
@@ -1525,18 +1542,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"padded_active_token_count ({self.padded_active_token_count})."
         )
 
-        # Last token logits.
-        logits = logits.squeeze(0)
-        last_token_idxs = (
-            torch.cumsum(
-                self.request_query_lengths[self.paused_request_count : self.total_request_count],
-                dim=0,
-            )
-            - 1
-        )
-        last_token_logits = logits[last_token_idxs, :]
-
-        return last_token_logits
+        active_request_count = self.total_request_count - self.paused_request_count
+        return logits.squeeze(0)[self.active_request_last_token_idxs[:active_request_count], :]
 
     def check_availability(self, req: DynamicInferenceRequest) -> (bool, bool, bool):
         """
