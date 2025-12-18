@@ -303,10 +303,13 @@ class GPTModel(LanguageModule):
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
             if padding_mask is not None and self.config.sequence_parallel:
-                # padding_mask: [bsz, seq] -> [seq, bsz] -> scatter -> [seq/tp, bsz] -> [bsz, seq/tp]
-                padding_mask = tensor_parallel.scatter_to_sequence_parallel_region(
-                    padding_mask.transpose(0, 1).contiguous()
-                ).transpose(0, 1).contiguous()
+                padding_mask = (
+                    tensor_parallel.scatter_to_sequence_parallel_region(
+                        padding_mask.transpose(0, 1).contiguous()
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -482,8 +485,14 @@ class GPTModel(LanguageModule):
             padding_mask=padding_mask,
         )
 
-        (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset,
-         padding_mask) = preproc_output[:6]
+        (
+            decoder_input,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+            padding_mask,
+        ) = preproc_output[:6]
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
