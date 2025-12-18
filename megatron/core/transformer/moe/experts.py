@@ -609,9 +609,10 @@ class TEGroupedMLP(MegatronModule):
             and "moe_act" in self.config.offload_modules
         )
 
-        self.moe_paged_stash_expert_fc1 = self.config.moe_paged_stash and "expert_fc1" in self.config.offload_modules
-        self.moe_paged_stash_moe_act = self.config.moe_paged_stash and "moe_act" in self.config.offload_modules
-        self.moe_paged_stash_expert_fc2 = self.config.moe_paged_stash and "expert_fc2" in self.config.offload_modules
+        stash_modules = self.config.stash_modules or []
+        self.moe_paged_stash_expert_fc1 = self.config.moe_paged_stash and "expert_fc1" in stash_modules
+        self.moe_paged_stash_moe_act = self.config.moe_paged_stash and "moe_act" in stash_modules
+        self.moe_paged_stash_expert_fc2 = self.config.moe_paged_stash and "expert_fc2" in stash_modules
 
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
@@ -738,7 +739,9 @@ class TEGroupedMLP(MegatronModule):
                         bias_parallel,
                         permuted_probs,
                         self.config.activation_func_fp8_input_store,
-                        tokens_per_expert.sum() if self.moe_paged_stash_moe_act else None,
+                        tokens_per_expert.sum()
+                        if (isinstance(tokens_per_expert, torch.Tensor) and tokens_per_expert.is_cuda)
+                        else None,
 
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:

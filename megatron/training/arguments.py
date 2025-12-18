@@ -1473,7 +1473,7 @@ def _add_inference_args(parser):
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')
-    group.add_argument('--moe-expert-capacity-factor-for-packed-offloading', type=float, default=None,
+    group.add_argument('--moe-expert-rank-capacity-factor', type=float, default=None,
                        help='The capacity factor for each EP rank when packed offloading is enabled.')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',

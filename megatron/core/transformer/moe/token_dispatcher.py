@@ -1002,7 +1002,7 @@ class _HybridEPManager(_DispatchManager):
                 "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
             )
 
-        self.packed_offloading_capacity_factor = self.config.moe_expert_capacity_factor_for_packed_offloading
+        self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
@@ -1010,9 +1010,9 @@ class _HybridEPManager(_DispatchManager):
         self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
 
-        if self.packed_offloading_capacity_factor is not None:
+        if self.moe_expert_rank_capacity_factor is not None:
             pad_multiple = get_align_size_for_quantization(self.config)
-            budget = int(routing_map.shape[0] * self.config.moe_router_topk  * self.packed_offloading_capacity_factor)
+            budget = int(routing_map.shape[0] * self.config.moe_router_topk  * self.moe_expert_rank_capacity_factor)
             budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
         # Compute the capacity for each expert at the drop_and_pad mode
@@ -1059,7 +1059,7 @@ class _HybridEPManager(_DispatchManager):
                 pad_multiple=self.pad_multiple,
             )
         )
-        if self.packed_offloading_capacity_factor is not None:
+        if self.moe_expert_rank_capacity_factor is not None:
             over_budget = self.handle[8] != 0 # this is overflow_flag
             self.over_budget |= over_budget
 
@@ -1067,7 +1067,7 @@ class _HybridEPManager(_DispatchManager):
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # self.num_permuted_tokens is necessary to allocate the output tensor for permute
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-        if self.config.moe_expert_capacity_factor_for_packed_offloading is not None:
+        if self.moe_expert_rank_capacity_factor is not None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
