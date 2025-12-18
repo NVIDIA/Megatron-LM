@@ -107,7 +107,6 @@ MODEL_OPTIONS="\
   --make-vocab-size-divisible-by 128 \
   --clip-grad 1.0 \
   --rl-use-sequence-packing \
-  --rl-sequence-packing-bin-size $MAX_SEQ_LENGTH \
   --rl-sequence-packing-algo fifo \
   $EXTRAS"
 
