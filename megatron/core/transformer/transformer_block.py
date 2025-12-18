@@ -16,8 +16,8 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.moe_packed_offload import (
-    packed_moe_expert_offloading_set_last_layer,
+from megatron.core.transformer.moe.paged_stash import (
+    paged_stash_set_last_layer,
 )
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -763,8 +763,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
-                    if self.config.packed_moe_expert_offloading:
-                        packed_moe_expert_offloading_set_last_layer(
+                    if self.config.moe_paged_stash:
+                        paged_stash_set_last_layer(
                             is_last_layer = (l_no == self.num_layers_per_pipeline_rank - 1)
                         )
 
