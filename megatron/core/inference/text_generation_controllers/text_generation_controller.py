@@ -778,13 +778,14 @@ class TextGenerationController:
 
         # Request finished if termination_id or length >= max_sequence_length.
         # Note: termination_id tensor has per-request termination IDs from mixed sampling
-        active_request_mask = (
+        padded_active_request_mask = (
             self._sampled_tokens_cuda[:active_request_count]
             != context.active_request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(
             context.active_sequence_lengths[:active_request_count] + 1,
             context.active_request_output_lengths[:active_request_count],
         ).byte()
+        active_request_mask = padded_active_request_mask[:active_request_count]
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )

@@ -813,28 +813,41 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.total_request_count - self.paused_request_count
 
     def build_active_slices(self, batch_size: int):
-        """Build the active slices of specific tensors. This is run on every forward step."""
-        active_slice = slice(self.paused_request_count, self.total_request_count)
+        """Build the active slices of specific tensors. This is run on every forward step.
+
+        If the context is reordered to active -> paused -> finished, this can be graphed.
+        """
+        padded_slice = slice(self.paused_request_count, self.paused_request_count + batch_size)
 
         # Request metadata all needs to be sliced.
         for label, _, _ in self.request_metadata_types:
             self.active_request_metadata[label][:batch_size].copy_(
-                self.request_metadata[label][active_slice], non_blocking=True
+                self.request_metadata[label][padded_slice], non_blocking=True
             )
 
         # The following tensor slices are used in various kernels.
-        self.active_request_ids[:batch_size].copy_(self.request_ids[active_slice])
+        self.active_request_ids[:batch_size].copy_(self.request_ids[padded_slice])
         self.active_request_query_lengths[:batch_size].copy_(
-            self.request_query_lengths[active_slice]
+            self.request_query_lengths[padded_slice]
         )
         self.active_request_output_lengths[:batch_size].copy_(
-            self.request_output_lengths[active_slice]
+            self.request_output_lengths[padded_slice]
         )
         self.active_request_kv_length_offsets[:batch_size].copy_(
-            self.request_kv_length_offsets[active_slice]
+            self.request_kv_length_offsets[padded_slice]
         )
         self.active_request_to_kv_block_ids[:batch_size].copy_(
-            self.request_to_kv_block_ids[active_slice]
+            self.request_to_kv_block_ids[padded_slice]
+        )
+
+        self.active_request_output_lengths[:batch_size].copy_(
+            self.request_output_lengths[padded_slice]
+        )
+        self.active_request_kv_length_offsets[:batch_size].copy_(
+            self.request_kv_length_offsets[padded_slice]
+        )
+        self.active_request_to_kv_block_ids[:batch_size].copy_(
+            self.request_to_kv_block_ids[padded_slice]
         )
 
         self.active_sequence_lengths[:batch_size].copy_(
@@ -1303,6 +1316,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
 
+        self.build_active_slices(self.padded_active_request_count)
+        batch_size = self.total_request_count - self.paused_request_count
+
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
             self.block_allocator.dummy_block_idx
@@ -1319,10 +1335,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.using_cuda_graph_this_step()
             else self.non_graph_attn_metadata
         )
-
-        # Build active slices of all relevant tensors.
-        batch_size = self.total_request_count - self.paused_request_count
-        self.build_active_slices(batch_size)
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
