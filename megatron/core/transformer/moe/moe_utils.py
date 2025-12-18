@@ -42,11 +42,6 @@ except ImportError:
     HAVE_TE = False
 
 
-import triton
-import triton.language as tl
-
-
-
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
@@ -1589,95 +1584,3 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         return wrapped_func
 
     return decorator
-
-@triton.jit
-def _drop_routing_map_kernel(
-    routing_map_ptr,
-    over_budget_ptr,
-    routing_map_dropped_ptr,
-    num_elements: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Triton kernel to drop routing map based on budget constraints.
-    
-    Args:
-        routing_map_ptr: Pointer to the input routing_map tensor
-        over_budget_ptr: Pointer to the boolean tensor indicating if any EP rank is over budget
-        routing_map_dropped_ptr: Pointer to the output routing_map tensor
-        num_elements: Total number of elements to process
-        BLOCK_SIZE: Block size for Triton kernel
-    """
-    # Get the program ID
-    pid = tl.program_id(axis=0)
-    
-    # Read the over_budget value (scalar tensor with single element)
-    over_budget_val = tl.load(over_budget_ptr)
-    
-    # Calculate the offset for this program
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    
-    # Load the routing_map values
-    mask = offset < num_elements
-    routing_map_val = tl.load(routing_map_ptr + offset, mask=mask, other=0.0)
-    
-    # If over_budget is 1 (True), output is 0 (drop); if over_budget is 0 (False), output is routing_map_val (keep)
-    output_val = routing_map_val * (1 - over_budget_val)
-    
-    # Store the result
-    tl.store(routing_map_dropped_ptr + offset, output_val, mask=mask)
-
-
-def drop_routing_map_triton(
-    routing_map: torch.Tensor, 
-    budget: torch.Tensor, 
-    num_tokens_per_ep_rank: torch.Tensor
-) -> torch.Tensor:
-    """Drop tokens from routing_map that exceed the budget per EP rank using Triton.
-    
-    Args:
-        routing_map: Tensor indicating which tokens are assigned to each expert.
-        budget: Integer tensor with the maximum number of tokens per EP rank.
-        num_tokens_per_ep_rank: Tensor with actual number of tokens per EP rank.
-    
-    Returns:
-        Modified routing_map with tokens exceeding budget zeroed out if any EP rank 
-        exceeds budget, otherwise returns the original routing_map.
-    """
-    
-    # Calculate boolean tensor: over_budget is True if ANY EP rank exceeds budget
-    over_budget = (num_tokens_per_ep_rank > budget).any()
-    
-    # Convert boolean to int8 
-    over_budget_int = over_budget.to(torch.int8)
-    
-    # Convert routing_map to numeric type if it's boolean
-    if routing_map.dtype == torch.bool:
-        routing_map_numeric = routing_map.to(torch.int8)
-    else:
-        routing_map_numeric = routing_map
-    
-    # Create output tensor with same dtype as input
-    routing_map_dropped = torch.empty_like(routing_map_numeric)
-    
-    # Flatten tensors for kernel processing
-    routing_map_flat = routing_map_numeric.flatten()
-    num_elements = routing_map_flat.numel()
-    
-    # Determine grid size
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
-    
-    # Launch kernel with over_budget tensor pointer (as int8)
-    _drop_routing_map_kernel[grid](
-        routing_map_flat,
-        over_budget_int,
-        routing_map_dropped.flatten(),
-        num_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    
-    # Convert back to boolean if original was boolean
-    if routing_map.dtype == torch.bool:
-        routing_map_dropped = routing_map_dropped.to(torch.bool)
-    
-    return routing_map_dropped, over_budget.to(torch.bool)
