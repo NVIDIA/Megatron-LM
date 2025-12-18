@@ -151,6 +151,16 @@ class SchedulerConfig:
     lr_warmup_init: float = 0.0
     """Initial value for learning rate warmup. The scheduler starts warmup from this value."""
 
+    lr_decay_steps: int | None = field(init=False, default=None)
+    """number of samples to decay learning rate over. Calculated at runtime from 
+    lr_decay_iters or lr_decay_samples.
+    """
+
+    lr_warmup_steps: int | None = field(init=False, default=None)
+    """number of samples to warmup learning rate over. Calculated at runtime from
+    lr_warmup_fraction, lr_warmup_iters, or lr_warmup_samples.
+    """
+    
     override_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--override-opt_param-scheduler", "--override-opt-param-scheduler"]}})
     """Reset the values of the scheduler (learning rate, warmup iterations, minimum learning rate,
     maximum number of iterations, and decay style) from input arguments and ignore values from
@@ -178,7 +188,8 @@ class SchedulerConfig:
     or it is embedding and embedding_init_method_std is not None.
     "qwen3_next": In addition to the default rules, apply weight decay to qk layernorm as a special case."""
 
-    lr_warmup_steps: int | None = field(init=False, default=None)
-    lr_decay_steps: int | None = field(init=False, default=None)
     wd_incr_steps: int | None = field(init=False, default=None)
+    """Number of samples to increment weight decay over. Calculated at runtime."""
+
     wsd_decay_steps: int | None = field(init=False, default=None)
+    """Number of samples to decay WSD weight decay. Calculated at runtime."""
