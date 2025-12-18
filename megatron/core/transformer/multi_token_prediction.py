@@ -617,7 +617,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                     vp_stage=self.vp_stage,
                     num_layers=self.config.mtp_num_layers_per_layer,
                     is_mtp_layer=True
-                    num_layers=self.config.mtp_num_layers_per_layer
                 )
             else:
                 # Uses the transformer block spec for MTP layer. This option is only implemented for the 
