@@ -600,6 +600,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
+        # Static tensor addresses of active slices to enable fast inference kernels.
+        self.active_request_metadata: Dict[str, Tensor] = {}
+        for label, _, on_gpu in self.request_metadata_types:
+            if on_gpu:
+                tensor = torch.empty_like(self.request_metadata[label])
+            else:
+                tensor = torch.empty_like(
+                    self.request_metadata[label], device="cpu", pin_memory=True
+                )
+            self.active_request_metadata[label] = tensor
+
         # Memory buffer.
         def allocate_memory_buffer():
             """Allocate the memory buffer. This function is called below within
@@ -845,6 +856,17 @@ class DynamicInferenceContext(BaseInferenceContext):
     def get_active_request_count(self):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
+
+    def build_active_slices(self):
+        """Build the active slices of specific tensors. This is run on every forward step."""
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        batch_size = self.total_request_count - self.paused_request_count
+
+        # Request metadata all needs to be sliced.
+        for label, _, _ in self.request_metadata_types:
+            self.active_request_metadata[label][:batch_size].copy_(
+                self.request_metadata[label][active_slice], non_blocking=True
+            )
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
