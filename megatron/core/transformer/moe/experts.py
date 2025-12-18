@@ -26,11 +26,11 @@ from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.moe_packed_offload import (
-    packed_moe_expert_offloading_group_start,
-    get_packed_moe_expert_offloading_context,
-    packed_moe_expert_offloading_reset,
-    packed_moe_expert_offloading_group_commit,
+from megatron.core.transformer.moe.paged_stash import (
+    paged_stash_group_start,
+    get_paged_stash_context,
+    paged_stash_reset,
+    paged_stash_group_commit,
 )
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -710,9 +710,9 @@ class TEGroupedMLP(MegatronModule):
             and "moe_act" in self.config.offload_modules
         )
 
-        self.packed_offload_expert_fc1 = self.config.packed_moe_expert_offloading and "expert_fc1" in self.config.offload_modules
-        self.packed_offload_moe_act = self.config.packed_moe_expert_offloading and "moe_act" in self.config.offload_modules
-        self.packed_offload_expert_fc2 = self.config.packed_moe_expert_offloading and "expert_fc2" in self.config.offload_modules
+        self.moe_paged_stash_expert_fc1 = self.config.moe_paged_stash and "expert_fc1" in self.config.offload_modules
+        self.moe_paged_stash_moe_act = self.config.moe_paged_stash and "moe_act" in self.config.offload_modules
+        self.moe_paged_stash_expert_fc2 = self.config.moe_paged_stash and "expert_fc2" in self.config.offload_modules
 
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
@@ -1152,7 +1152,7 @@ class TEGroupedMLP(MegatronModule):
                         bias_parallel,
                         permuted_probs,
                         self.config.activation_func_fp8_input_store,
-                        tokens_per_expert.sum() if self.packed_offload_moe_act else None,
+                        tokens_per_expert.sum() if self.moe_paged_stash_moe_act else None,
 
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
@@ -1208,14 +1208,14 @@ class TEGroupedMLP(MegatronModule):
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
-        if self.packed_offload_expert_fc2:
-            offload_context = get_packed_moe_expert_offloading_context(name="expert_fc2", max_num_tokens=bias_act_output.shape[0], num_tokens_tensor=tokens_per_expert.sum())
+        if self.moe_paged_stash_expert_fc2:
+            offload_context = get_paged_stash_context(name="expert_fc2", max_num_tokens=bias_act_output.shape[0], num_tokens_tensor=tokens_per_expert.sum())
         else:
             offload_context = nullcontext()
         with offload_context:
             output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
-        if self.config.packed_moe_expert_offloading:
-            output = packed_moe_expert_offloading_group_commit(output, name="expert_fc2")
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="expert_fc2")
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
