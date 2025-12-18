@@ -33,7 +33,6 @@ from megatron.core.transformer.moe.moe_utils import (
     permute,
     sort_chunks_by_idxs,
     unpermute,
-    drop_routing_map_triton,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
