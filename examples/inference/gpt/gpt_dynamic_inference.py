@@ -31,6 +31,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
 )
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.inference.contexts.attention_context.mamba_metadata import (
     MambaInferenceStateConfig,
 )
@@ -158,6 +159,13 @@ def get_inference_context(
     if args.inference_logging_step_interval > 0 and args.inference_wandb_logging:
         metrics_writer = get_wandb_writer()
 
+    # Use smaller block size for flashinfer backends
+    block_size = (
+        16
+        if hasattr(args, 'attention_backend') and args.attention_backend in [AttnBackend.flashinfer_fa2, AttnBackend.flashinfer_fa3, AttnBackend.flashinfer_trt]
+        else args.inference_dynamic_batching_block_size
+    )
+
     # Inference context.
     context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
@@ -172,7 +180,7 @@ def get_inference_context(
             if args.cuda_graph_impl == "local"
             else None
         ),
-        block_size_tokens=args.inference_dynamic_batching_block_size,
+        block_size_tokens=block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
@@ -184,6 +192,7 @@ def get_inference_context(
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
+        attention_backend=getattr(args, 'attention_backend', AttnBackend.flash),
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
         cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,

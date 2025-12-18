@@ -12,6 +12,7 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -240,6 +241,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             levels will be included to control other tensors within the context.
         use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
             If None, defaults to using flash-infer if available.
+        attention_backend (AttnBackend): Attention backend to use. Defaults to AttnBackend.flash.
         metrics_writer (Optional['WandbModule']): Wandb module for writing metrics.
         request_metadata_types (Optional[List[Tuple[str, torch.dtype, bool]]]): A list of the
             per-request metadata types to track. Each entry is a tuple consisting of the string
@@ -271,6 +273,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
         use_cuda_graphs_for_non_decode_steps: bool = True,
         use_flashinfer_fused_rope: bool = False,
+        attention_backend: AttnBackend = AttnBackend.flash,
         unified_memory_level: Optional[int] = 1,
         cuda_graph_max_tokens: Optional[int] = None,
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
@@ -279,6 +282,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
+        self.attention_backend = attention_backend
         self.cache_mla_latent = cache_mla_latent
         if self.cache_mla_latent:
             assert (
