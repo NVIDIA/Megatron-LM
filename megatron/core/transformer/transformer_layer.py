@@ -266,6 +266,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(config=config, vp_stage=vp_stage)
 
@@ -279,6 +280,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.config, vp_stage, get_pg_rank(pg_collection.pp)
         )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
+        self.is_mtp_layer = is_mtp_layer
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -349,6 +351,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if isinstance(submodules.mlp, ModuleSpec):
             if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
                 additional_mlp_kwargs["pg_collection"] = pg_collection
+                # Pass is_mtp_layer flag to MoELayer to distinguish MTP MoE layers.
+                if submodules.mlp.module == MoELayer:
+                    additional_mlp_kwargs["is_mtp_layer"] = self.is_mtp_layer
             elif submodules.mlp.module == MLP:
                 assert hasattr(
                     pg_collection, 'tp'

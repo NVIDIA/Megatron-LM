@@ -88,6 +88,7 @@ class MambaStack(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         vp_stage: Optional[int] = None,
         num_layers: int = None,
+        is_mtp_layer: bool = False,
     ) -> None:
         super().__init__(config=config)
         self.residual_in_fp32 = residual_in_fp32
@@ -95,6 +96,7 @@ class MambaStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self.is_mtp_layer = is_mtp_layer
 
         assert pg_collection is not None, "pg_collection must be provided for MambaStack"
 
@@ -141,6 +143,7 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         layer_number=i + 1,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                     )
                 elif layer_type == LayerSymbols.MLP:
                     # Transformer layers apply their own pp_layer_offset
@@ -153,7 +156,11 @@ class MambaStack(MegatronModule):
                 elif layer_type == LayerSymbols.MOE:
                     # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
-                        submodules.moe_layer, config=self.config, layer_number=i+1,
+                        submodules.moe_layer,
+                        config=self.config,
+                        layer_number=i+1,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                     )
                 else:
                     assert False, "unexpected layer_type"

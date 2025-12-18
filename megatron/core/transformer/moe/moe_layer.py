@@ -50,10 +50,12 @@ class BaseMoELayer(MegatronModule, ABC):
         config: TransformerConfig,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
         self.attn_tp_group = pg_collection.tp
@@ -103,6 +105,7 @@ class MoELayer(BaseMoELayer):
         submodules: Optional[MoESubmodules] = None,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         self.submodules = submodules
         # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -110,7 +113,8 @@ class MoELayer(BaseMoELayer):
         if pg_collection is None:
             pg_collection = get_default_pg_collection()
         super(MoELayer, self).__init__(
-            config=config, layer_number=layer_number, pg_collection=pg_collection
+            config=config, layer_number=layer_number, pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer
         )
         self.moe_layer_recompute = (
             config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
@@ -123,7 +127,7 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+        self.router = TopKRouter(config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
 
         # Initialize latent projections.
         if self.config.moe_latent_size:

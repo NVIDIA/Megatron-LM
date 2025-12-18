@@ -602,7 +602,6 @@ def validate_args(args, defaults={}):
 
                 assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
                     'Number of layers should be divisible by the pipeline-model-parallel size'
-
     # Validate MTP hybrid pattern segment count
     if args.mtp_hybrid_override_pattern is not None:
         mtp_segments = len(args.mtp_hybrid_override_pattern.split('|'))
@@ -1797,6 +1796,12 @@ def _add_network_size_args(parser):
                        'We compute the average of the MTP losses across all depths, '
                        'and multiply it the scaling factor to obtain the overall MTP loss, '
                        'which serves as an additional training objective.')
+    group.add_argument('--mtp-use-repeated-layer', action='store_true',
+                       help='Use a single MTP layer repeatedly instead of multiple separate layers. '
+                       'This is more parameter-efficient. When enabled, only 1 MTP layer is created '
+                       'and applied --mtp-num-layers times.')
+    group.add_argument('--mtp-num-layers-per-layer', type=int, default=None,
+                       help='Number of layers inside each MTP layer (e.g., for hybrid models).')
     group.add_argument('--moe-latent-size', type=int, default=None,
                        help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
     group.add_argument('--mtp-use-repeated-layer', action='store_true',

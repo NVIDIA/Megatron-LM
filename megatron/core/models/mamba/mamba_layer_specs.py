@@ -111,7 +111,7 @@ mamba_stack_spec = ModuleSpec(
     ),
 )
 
-<<<<<<< HEAD
+
 mamba_inference_stack_spec = ModuleSpec(
     module=MambaStack,
     submodules=MambaStackSubmodules(
@@ -171,7 +171,7 @@ mamba_inference_stack_spec = ModuleSpec(
         ),
     ),
 )
-=======
+
 
 def get_mamba_mtp_block_spec(
     config: TransformerConfig,
@@ -233,5 +233,3 @@ def get_mamba_mtp_block_spec_for_backend(
         mtp_block_spec = None
 
     return mtp_block_spec
-
->>>>>>> a05cbed31 (added mtp support)
