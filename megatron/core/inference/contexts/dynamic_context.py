@@ -2094,6 +2094,85 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Convert each log prob tensor into a list
         return [lp.tolist() for lp in selected_log_probs_list], log_probs
 
+        ### REWRITE THE ABOVE STEPS IN SERIES HERE FOR CLARITY ###
+        # Step zero, slice by active.
+        active_request_mask = request_mask[padded_active_slice] # graph by req cnt
+        active_query_lengths = self.request_query_lengths[padded_active_slice] # graph by req cnt
+        last_token_idxs = active_query_lengths.cumsum(dim=0) - 1 # graph by req cnt
+
+        # First, get the index count.
+        cnt = active_request_mask.sum() # non-graph
+        # Enqueue some other kernels in the meanwhile, and then come back to pad it.
+        if cnt.item() == 0: # CPU
+            return # skip logprob calculation based on cnt
+        padded_cnt = cnt.item() + 0 # CPU
+
+        # We can now get graphable indices.
+        active_request_indices = torch.nonzero_static(
+            active_request_mask, # req cnt
+            size=padded_cnt, # req* cnt
+        ).squeeze(1) # straddles graphs
+
+        # Now starts the meat of it.
+        if only_last_token_logits or self.is_decode_only():
+            logits_indices = last_token_idxs[ # req cnt
+                active_request_indices # req* cnt
+            ] # straddles graphs
+            selected_tokens = sampled_tokens[ # req cnt
+                :padded_cnt # req* cnt
+            ] # straddles graphs
+            selected_logits_squeezed = logits[:padded_active_request_count].squeeze(0)[ # req cnt
+                logits_indices, # req* cnt
+            ].float() # straddles graphs
+            log_probs[
+                logits_indices, # req* cnt
+                selected_tokens, # req* cnt
+            ] = F.log_softmax(
+                selected_logits_squeezed, # req* cnt
+                dim=-1,
+            ) # req* cnt
+        else:
+            masked_lengths = active_query_lengths[ # req cnt
+                active_request_indices # req* cnt
+            ]
+            cu_masked_lengths = masked_lengths.cumsum(0) # req* cnt
+
+            masked_ends = last_token_idxs[ # req cnt
+                active_request_indices # req* cnt
+            ]
+            # We need the number of selected tokens to put into output_size for repeat_interleave
+            selected_token_cnt = masked_lengths.sum() # non-graph
+            # We need to wait a while after this.
+
+            logit_indices_offset = torch.repeat_interleave(
+                masked_ends - cu_masked_lengths, # req* cnt
+                masked_lengths, # req* cnt
+                output_size=selected_token_cnt.item(), # tok* cnt
+            ) # straddles graphs; let's decide this is entirely CPU
+            logits_indices_range = torch.arange(
+                selected_token_cnt.item(), # tok* cnt
+                device=logits.device,
+            ) # tok* cnt
+            logit_indices = logit_indices_offset + logits_indices_range # tok* cnt
+
+            selected_tokens = self.token_to_input_ids[ # static
+                logit_indices # tok* cnt
+            ].roll(-1, 0) # tok* cnt
+
+            selected_tokens[ # tok* cnt
+                masked_ends # req* cnt
+            ] = new_tokens # req* cnt
+            selected_logits_squeezed = logits[:padded_active_token_count].squeeze(0)[ # tok cnt
+                logit_indices, # tok* cnt
+            ].float() # straddles graphs
+            log_probs[
+                logit_indices, # tok* cnt
+                selected_tokens, # tok* cnt
+            ] = F.log_softmax(
+                selected_logits_squeezed, # tok* cnt
+                dim=-1,
+            ) # tok* cnt
+
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.
 
