@@ -726,7 +726,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     def _set_proj_next_layer_norm_weights(self, weights: Tensor):
         """Set next layer norm weights for attention/mixer's linear_proj."""
         self.self_attention.linear_proj._set_next_layer_norm_weights(weights)
- 
+
     def _set_fc2_next_layer_norm_weights(self, weights: Optional[Tensor]):
         """Set next layer norm weights for MLP FC2."""
         if weights is None:
