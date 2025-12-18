@@ -1,6 +1,6 @@
-**NOTE: In M-Core 0.14, the custom FSDP refactored its checkpoint implementation to use DTensor-based torch distributed checkpointing. The custom FSDP was also renamed Megatron FSDP. The relevant sections of this document are no longer applicable.**
+# Megatron FSDP
 
-# MCore Custom Fully Sharded Data Parallel (FSDP)
+**NOTE: In M-Core 0.14, the custom FSDP refactored its checkpoint implementation to use DTensor-based torch distributed checkpointing. The custom FSDP was also renamed Megatron FSDP. The relevant sections of this document are no longer applicable.**
 
 ## How to use ?
 
