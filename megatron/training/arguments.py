@@ -745,6 +745,9 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron FSDP only supports fsdp_dtensor checkpoint format"
 
+        if args.use_megatron_fsdp:
+            args.reuse_grad_buf_for_mxfp8_param_ag = False
+
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
@@ -1302,7 +1305,10 @@ def validate_args(args, defaults={}):
 
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
-        if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
+        if (
+            "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
+            and not args.te_rng_tracker
+        ):
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
         assert (
