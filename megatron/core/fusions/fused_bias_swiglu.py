@@ -5,6 +5,8 @@
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
@@ -190,20 +192,51 @@ class SwiGLUFunction(torch.autograd.Function):
 
 class WeightedSwiGLUFunction(torch.autograd.Function):
     @staticmethod
-    # bias is an optional argument
-    def forward(ctx, input, weights, fp8_input_store):
+    def forward(ctx, input, weights, fp8_input_store, num_tokens_tensor=None):
+        """Forward pass for weighted SwiGLU.
+        
+        Args:
+            input: [total_tokens, hidden_size * 2]
+            weights: [total_tokens, 1]
+            fp8_input_store: Whether to store in FP8
+            num_tokens_tensor: Optional scalar tensor with actual token count
+                (uses Triton if provided)
+        """
+        # Convert input for backward pass
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
-        ctx.save_for_backward(input_for_backward, weights)
+        
+        # Use Triton implementation if num_tokens_tensor provided and available
+        if num_tokens_tensor is not None and input.dim() == 2:
+            output = weighted_swiglu_triton(input, weights, num_tokens_tensor)
+            ctx.save_for_backward(input_for_backward, weights, num_tokens_tensor)
+            ctx.use_triton = True
+        else:
+            # Fallback to JIT fused implementation
+            output = weighted_swiglu(input, weights)
+            ctx.save_for_backward(input_for_backward, weights)
+            ctx.use_triton = False
+        
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
-        return weighted_swiglu(input, weights)
+        return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        input, weights = ctx.saved_tensors
-        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
-        return tmp, wgrad, None
+        """Backward pass for weighted SwiGLU."""
+        if ctx.use_triton:
+            # Triton backward path
+            input, weights, num_tokens_tensor = ctx.saved_tensors
+            input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+            grad_input, grad_weights = weighted_swiglu_triton_back(
+                grad_output, input, weights, num_tokens_tensor
+            )
+            return grad_input, grad_weights, None, None
+        else:
+            # JIT fused backward path
+            input, weights = ctx.saved_tensors
+            input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+            tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
+            return tmp, wgrad, None, None
 
 
 def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
@@ -236,7 +269,7 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
-def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
+def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False, num_tokens_tensor=None):
     """
     Token-wise-weighted bias swiglu fusion.
     """
@@ -246,10 +279,241 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
     else:
-        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
+        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store, num_tokens_tensor)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
 # bias_swiglu_impl = BiasSwiGLUFunction.apply
 # swiglu_impl = SwiGLUFunction.apply
+
+@triton.jit
+def _weighted_swiglu_fwd_kernel(
+    input_ptr,
+    weights_ptr,
+    output_ptr,
+    num_tokens_ptr,
+    hidden_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel for weighted SwiGLU forward pass.
+    
+    Processes tokens in strided pattern, only operating on valid tokens.
+    Formula: output = SiLU(input[:, :H]) * input[:, H:] * weights
+    """
+    pid = tl.program_id(axis=0)
+    num_blocks = tl.num_programs(axis=0)
+    
+    # Load actual number of tokens
+    num_tokens = tl.load(num_tokens_ptr)
+    
+    # Strided access: each block handles tokens [pid, pid+num_blocks, ...]
+    token_idx = pid
+    while token_idx < num_tokens:
+        # Load weight for this token
+        weight = tl.load(weights_ptr + token_idx)
+        
+        # Process hidden dimension
+        for h_offset in range(0, hidden_size, BLOCK_SIZE):
+            h_mask = (h_offset + tl.arange(0, BLOCK_SIZE)) < hidden_size
+            
+            # Load input chunks (gate and value)
+            input_offset_1 = token_idx * (hidden_size * 2) + h_offset
+            input_offset_2 = token_idx * (hidden_size * 2) + hidden_size + h_offset
+
+            y1 = tl.load(
+                input_ptr + input_offset_1 + tl.arange(0, BLOCK_SIZE), mask=h_mask, other=0.0
+            )
+            y2 = tl.load(
+                input_ptr + input_offset_2 + tl.arange(0, BLOCK_SIZE), mask=h_mask, other=0.0
+            )
+
+            # SwiGLU: SiLU(y1) * y2 * weight
+            # SiLU(x) = x * sigmoid(x)
+            # Cast to fp32 for sigmoid computation (required by Triton)
+            y1_fp32 = y1.to(tl.float32)
+            y2_fp32 = y2.to(tl.float32)
+            weight_fp32 = weight.to(tl.float32)
+            
+            sigmoid_y1 = tl.sigmoid(y1_fp32)
+            silu_y1 = y1_fp32 * sigmoid_y1
+            result = silu_y1 * y2_fp32 * weight_fp32
+            
+            # Store output (cast back to original dtype)
+            output_offset = token_idx * hidden_size + h_offset
+            tl.store(
+                output_ptr + output_offset + tl.arange(0, BLOCK_SIZE),
+                result.to(y1.dtype),
+                mask=h_mask,
+            )
+        
+        # Stride to next token
+        token_idx += num_blocks
+
+@triton.jit
+def _weighted_swiglu_bwd_kernel(
+    grad_output_ptr,
+    input_ptr,
+    weights_ptr,
+    grad_input_ptr,
+    grad_weights_ptr,
+    num_tokens_ptr,
+    hidden_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel for weighted SwiGLU backward pass.
+    
+    Computes gradients with respect to input and weights for valid tokens only.
+    """
+    pid = tl.program_id(axis=0)
+    num_blocks = tl.num_programs(axis=0)
+    
+    # Load actual number of tokens
+    num_tokens = tl.load(num_tokens_ptr)
+    
+    # Strided access
+    token_idx = pid
+    while token_idx < num_tokens:
+        # Load weight for this token
+        weight = tl.load(weights_ptr + token_idx)
+        
+        # Accumulator for weight gradient (fp32 for precision)
+        weight_grad_acc = 0.0
+        
+        # Process hidden dimension
+        for h_offset in range(0, hidden_size, BLOCK_SIZE):
+            h_mask = (h_offset + tl.arange(0, BLOCK_SIZE)) < hidden_size
+            
+            # Load grad_output
+            grad_out_offset = token_idx * hidden_size + h_offset
+            grad_out = tl.load(
+                grad_output_ptr + grad_out_offset + tl.arange(0, BLOCK_SIZE),
+                mask=h_mask,
+                other=0.0,
+            )
+
+            # Load input chunks
+            input_offset_1 = token_idx * (hidden_size * 2) + h_offset
+            input_offset_2 = token_idx * (hidden_size * 2) + hidden_size + h_offset
+
+            y1 = tl.load(
+                input_ptr + input_offset_1 + tl.arange(0, BLOCK_SIZE), mask=h_mask, other=0.0
+            )
+            y2 = tl.load(
+                input_ptr + input_offset_2 + tl.arange(0, BLOCK_SIZE), mask=h_mask, other=0.0
+            )
+            
+            # Cast to fp32 for sigmoid computation (required by Triton)
+            y1_fp32 = y1.to(tl.float32)
+            y2_fp32 = y2.to(tl.float32)
+            grad_out_fp32 = grad_out.to(tl.float32)
+            weight_fp32 = weight.to(tl.float32)
+            
+            # Forward calculations
+            sigmoid_y1 = tl.sigmoid(y1_fp32)
+            silu_y1 = y1_fp32 * sigmoid_y1
+            
+            # Gradient for y1 (gate): d(SiLU(y1))/dy1 * y2 * weight * grad_out
+            # d(SiLU(y1))/dy1 = sigmoid(y1) * (1 + y1 * (1 - sigmoid(y1)))
+            dsilu_dy1 = sigmoid_y1 * (1.0 + y1_fp32 * (1.0 - sigmoid_y1))
+            grad_y1 = grad_out_fp32 * weight_fp32 * dsilu_dy1 * y2_fp32
+            
+            # Gradient for y2 (value): SiLU(y1) * weight * grad_out
+            grad_y2 = grad_out_fp32 * weight_fp32 * silu_y1
+            
+            # Store input gradients (cast back to original dtype)
+            tl.store(
+                grad_input_ptr + input_offset_1 + tl.arange(0, BLOCK_SIZE),
+                grad_y1.to(y1.dtype),
+                mask=h_mask,
+            )
+            tl.store(
+                grad_input_ptr + input_offset_2 + tl.arange(0, BLOCK_SIZE),
+                grad_y2.to(y2.dtype),
+                mask=h_mask,
+            )
+            
+            # Accumulate weight gradient: swiglu(y) * grad_out
+            # swiglu(y) = silu_y1 * y2
+            weight_grad_contribution = silu_y1 * y2_fp32 * grad_out_fp32
+            weight_grad_acc += tl.sum(weight_grad_contribution)
+        
+        # Store weight gradient after processing all chunks
+        tl.store(grad_weights_ptr + token_idx, weight_grad_acc)
+        
+        # Stride to next token
+        token_idx += num_blocks
+
+def weighted_swiglu_triton(input, weights, num_tokens_tensor):
+    """Triton implementation of weighted SwiGLU forward pass.
+    
+    Args:
+        input: [total_tokens, hidden_size * 2]
+        weights: [total_tokens, 1]
+        num_tokens_tensor: Scalar tensor with actual token count
+    
+    Returns:
+        output: [total_tokens, hidden_size]
+    """
+    assert input.dim() == 2, "Input must be 2D [total_tokens, hidden_size*2]"
+    assert weights.dim() == 2 and weights.size(1) == 1, "Weights must be [total_tokens, 1]"
+    
+    total_tokens, hidden_size_2 = input.shape
+    hidden_size = hidden_size_2 // 2
+    
+    # Allocate output
+    output = torch.empty((total_tokens, hidden_size), dtype=input.dtype, device=input.device)
+    
+    # Launch kernel
+    BLOCK_SIZE = 128
+    num_blocks = min(total_tokens, 4096)
+    grid = (num_blocks,)
+    
+    _weighted_swiglu_fwd_kernel[grid](
+        input,
+        weights,
+        output,
+        num_tokens_tensor,
+        hidden_size=hidden_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+def weighted_swiglu_triton_back(grad_output, input, weights, num_tokens_tensor):
+    """Triton implementation of weighted SwiGLU backward pass.
+    
+    Args:
+        grad_output: [total_tokens, hidden_size]
+        input: [total_tokens, hidden_size * 2]
+        weights: [total_tokens, 1]
+        num_tokens_tensor: Scalar tensor with actual token count
+    
+    Returns:
+        grad_input: [total_tokens, hidden_size * 2]
+        grad_weights: [total_tokens, 1]
+    """
+    total_tokens, hidden_size_2 = input.shape
+    hidden_size = hidden_size_2 // 2
+    
+    # Allocate gradients
+    grad_input = torch.empty_like(input)
+    grad_weights = torch.empty_like(weights)
+    
+    # Launch kernel
+    BLOCK_SIZE = 128
+    num_blocks = min(total_tokens, 4096)
+    grid = (num_blocks,)
+    
+    _weighted_swiglu_bwd_kernel[grid](
+        grad_output,
+        input,
+        weights,
+        grad_input,
+        grad_weights,
+        num_tokens_tensor,
+        hidden_size=hidden_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return grad_input, grad_weights
