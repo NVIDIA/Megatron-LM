@@ -14,6 +14,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import internal_api
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -1128,6 +1129,7 @@ class MoECudaGraphPartialCaptureSignal(Exception):
         return outputs
 
 
+@internal_api
 @dataclass
 class MoECudaGraphTensorStore:
     """Storage for tensors used in CUDA graph replay for MoE layers.
