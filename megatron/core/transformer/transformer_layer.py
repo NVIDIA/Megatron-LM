@@ -1253,8 +1253,8 @@ class MoETransformerLayer(TransformerLayer):
         residual = hidden_states
         self.mlp.fwd_execution_map = ("route")
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-        router_outputs = self.mlp(pre_mlp_layernorm_output)
-        return residual, hidden_states, *router_outputs
+        router_outputs = self.mlp(pre_mlp_layernorm_output, intermediate_tensors=[])
+        return residual, *router_outputs
 
     def _forward_mlp_expert_compute(self, hidden_states, probs, routing_map):
         self.mlp.fwd_execution_map = ("dispatch_expert_compute_combine")
@@ -1262,7 +1262,7 @@ class MoETransformerLayer(TransformerLayer):
 
     def _forward_mlp_postprocess(self, residual, output, shared_expert_output, mlp_bias):
         self.mlp.fwd_execution_map = ("postprocess")
-        output = self.mlp(None, intermediate_tensors=(output, shared_expert_output, mlp_bias))
+        output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
 
     def _forward_mlp(self, hidden_states, inference_context=None):

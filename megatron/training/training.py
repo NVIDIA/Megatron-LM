@@ -2701,7 +2701,7 @@ def train(
             timers('interval-time', log_level=0).start(barrier=True)
             if args.log_energy:
                 energy_monitor.resume()
-           if args.num_experts is not None:
+            if args.num_experts is not None:
                 clear_aux_losses_tracker()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).

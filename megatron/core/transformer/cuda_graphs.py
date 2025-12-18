@@ -500,7 +500,12 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 runner.fp8_param_cache_updated = is_first_microbatch
 
         runner.fwd_graph.replay()
-        return runner.fwd_graph_output_surface
+
+        out = tuple(
+            o.clone() if not hasattr(o, "is_cudagraph_input") else o
+            for o in runner.fwd_graph_output_surface
+        )
+        return out
 
     @staticmethod
     def backward(ctx, *grads):
