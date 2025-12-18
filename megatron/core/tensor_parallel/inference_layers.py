@@ -11,6 +11,7 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.inference.communication.torch_symm_triton import (
+    fused_multimem_rs_add_norm_ag,
     multimem_all_gather,
     multimem_reduce_scatter,
 )
@@ -90,7 +91,24 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
                 config.sequence_parallel
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
-    def _all_gather(self, x: torch.Tensor) -> None:
+        # Boolean to be toggled externally for skipping norm and all-gather.
+        # This is used when enabling fused reduce-scatter + add + rms-norm + all-gather
+        # in tensor parallelism. In this case, the preceeding RowParallelLinear layer
+        # has already applied the rms-norm and all-gather.
+        self.skip_norm_and_all_gather = False
+
+    def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
+        """
+        Attempt to allocate symmetric memory buffer for all-gather.
+        """
+        symm_mem_buffer_dims = list(x.size())
+        symm_mem_buffer_dims[0] *= self.tp_size
+        symm_mem_buffer = get_global_symmetric_memory_buffer().maybe_get_tensor(
+            symm_mem_buffer_dims, dtype=x.dtype
+        )
+        return symm_mem_buffer
+
+    def _all_gather(self, x: torch.Tensor, symm_mem_buffer: dict) -> None:
         """
         Attempt an NVLS all-gather into symmetric memory. If not possible,
         revert to torch dist (NCCL) all-gather.
@@ -102,17 +120,11 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         is_bf16 = x.dtype == torch.bfloat16
         # 2. check if hopper or newer
         is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
-        # 3. attempt to ask for symmetric memory
-        symm_mem_buffer_dims = list(x.size())
-        symm_mem_buffer_dims[0] *= self.tp_size
-        symm_mem_buffer = get_global_symmetric_memory_buffer().maybe_get_tensor(
-            symm_mem_buffer_dims, dtype=x.dtype
-        )
+        # 3. check if symmetric memory buffer is available
         has_enough_symmetric_memory = symm_mem_buffer["handle"] is not None
         can_use_custom_nvls_collectives = (
             is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
         )
-
         if can_use_custom_nvls_collectives:
             # do multimem all gather
             multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
@@ -127,9 +139,25 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         """
         Forward pass.
         """
-        x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
-        x = self._all_gather(x)
+        # Necessary conditions to ensure we are executing the fused rs-add-rmsnorm-ag
+        # in the preceeding RowParallelLinear layer.
+        # 1. skip_norm_and_all_gather is True
+        # 2. tp_size > 1
+        # 3. enough symmetric memory is available - if available it already has the output
+        symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
+        is_in_fused_mode = (
+            self.skip_norm_and_all_gather
+            and self.tp_size > 1
+            and symm_mem_buffer["handle"] is not None
+        )
+        if is_in_fused_mode:
+            x = symm_mem_buffer["tensor"]
+        else:
+            x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
+            x = self._all_gather(x, symm_mem_buffer)
+
         x = torch.matmul(x, self.weight.t())
+
         return x, None
 
 
@@ -176,7 +204,12 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 config.sequence_parallel
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
-    def _matmul_reduce_scatter(self, x):
+        # Placeholder for next layer norm weights for fused
+        # reduce-scatter + add + rms-norm + all-gather
+        self.next_layer_norm_weights = None
+        self.config = config
+
+    def _matmul_reduce_scatter(self, x, residual=None):
         """
         Multiplies x by the weight matrix and performs a reduce-scatter.
         It will first try to write the matmul output to symmetric memory
@@ -202,19 +235,52 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             torch.matmul(x, self.weight.t(), out=symm_mem_buffer["tensor"])
             x = symm_mem_buffer["tensor"]
             # perform nvls reduce-scatter
-            output_dims = list(x.size())
-            output_dims[0] = x.size(0) // self.tp_size
-            output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
-            multimem_reduce_scatter(output, x, symm_mem_buffer["handle"])
-            return output
+            if self.next_layer_norm_weights is None:
+                output_dims = list(x.size())
+                output_dims[0] = x.size(0) // self.tp_size
+                output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
+                multimem_reduce_scatter(output, x, symm_mem_buffer["handle"])
+                return output
+            else:
+                assert hasattr(self, "residual"), (
+                    "For fused reduce-scatter + add + rms-norm + all-gather, "
+                    "residual must be set via _set_residual()"
+                )
+                residual = self.residual
+                fused_multimem_rs_add_norm_ag(
+                    residual,
+                    symm_mem_buffer["tensor"],
+                    symm_mem_buffer["handle"],
+                    residual,
+                    self.next_layer_norm_weights,
+                    self.config.layernorm_epsilon,
+                )
+                # 1. Residual has the output of the reduce-scatter + residual add
+                #    Care must be taken in the model definition, so as to not apply the
+                #    residual again.
+                # 2. The output of the full reduce-scatter + add + rms-norm + all-gather is
+                #    written into symm_mem_buffer["tensor"] and will be accessible there.
+                return residual
         else:
             # revert to torch dist (NCCL) reduce-scatter
             x = torch.matmul(x, self.weight.t())
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
+    def _set_next_layer_norm_weights(self, weights: torch.Tensor):
+        """
+        Set next layer norm weights for fused reduce-scatter + add + rms-norm + all-gather.
+        """
+        self.next_layer_norm_weights = weights
+
+    def _set_residual(self, residual: torch.Tensor):
+        """
+        Set residual for fused reduce-scatter + add + rms-norm + all-gather.
+        """
+        self.residual = residual
+
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass.
         """
