@@ -811,7 +811,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 "2.3.0.dev0+39c0e70"
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
-        
+
         self.stride = stride
 
         super().__init__(
@@ -982,7 +982,6 @@ class TEColumnParallelLinear(TELinear):
         setattr(self.weight, 'partition_stride', stride)
         if bias and hasattr(self, 'bias') and self.bias is not None:
             setattr(self.bias, 'partition_stride', stride)
-
 
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, world_size)

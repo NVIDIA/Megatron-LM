@@ -378,9 +378,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]. The logits are returned only in the last pipeline stage for PP models.
         """
         # Check if we are in a PP model
-        if not (
-             is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
-        ):
+        if not (is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)):
             tokens = inference_input["tokens"]
             current_batch_size, seq_len = self._get_batch_size_and_seq_len(
                 tokens, recv_buffer_seq_len
