@@ -349,7 +349,7 @@ class MoELayer(BaseMoELayer):
 
             if "postprocess" in self.fwd_execution_map:
                 if intermediate_tensors is not None:
-                    output, shared_expert_output, mlp_bias = intermediate_tensors
+                    output, shared_expert_output = intermediate_tensors
 
                 output = self.postprocess(output, shared_expert_output) 
 
