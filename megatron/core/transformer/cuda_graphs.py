@@ -1643,48 +1643,82 @@ class TECudaGraphHelper:
         # with the same input signature.
         fwd_sample_queues = {}
         consumed_sample_queue = {}
+        layer_sample_keys_cache = {}
         fwd_idx = [0] * self.num_model_chunks
         for chunk_id in order:
             model_chunk_idx = abs(chunk_id) - 1
 
             if chunk_id > 0:
+                if model_chunk_idx not in fwd_sample_queues:
+                    fwd_sample_queues[model_chunk_idx] = []
+
                 sample_start_idx = (prefix_num_layers[model_chunk_idx] * self.num_microbatches) + (
                     fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
                 )
-                fwd_sample_idx = [
-                    sample_start_idx + i for i in range(self.num_layers_per_chunk[model_chunk_idx])
-                ]
-                if model_chunk_idx not in fwd_sample_queues:
-                    fwd_sample_queues[model_chunk_idx] = []
-                for per_callable_fwd_idx in fwd_sample_idx:
-                    if sample_args[per_callable_fwd_idx] is None:
+                for layer_idx, layer in enumerate(self.callables_per_chunk[model_chunk_idx]):
+                    per_callable_fwd_idx = sample_start_idx + layer_idx
+
+                    # Get sample_args and sample_kwargs for index per_callable_fwd_idx.
+                    assert (
+                        sample_args[per_callable_fwd_idx] is None
+                        and sample_kwargs[per_callable_fwd_idx] is None
+                    ), (
+                        f"sample_args and sample_kwargs must be None before assigning static data, "
+                        f"but got sample_args[{per_callable_fwd_idx}] = "
+                        f"{sample_args[per_callable_fwd_idx]} and "
+                        f"sample_kwargs[{per_callable_fwd_idx}] = "
+                        f"{sample_kwargs[per_callable_fwd_idx]}."
+                    )
+                    if id(layer) not in layer_sample_keys_cache:
+                        # Have not generated the static inputs for this layer yet. So we don't
+                        # know the input signature of this layer. Generate the static inputs, and
+                        # cache the signature.
                         sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
                             _get_layer_static_inputs(
-                                self.callables_per_chunk[model_chunk_idx][
-                                    per_callable_fwd_idx - sample_start_idx
-                                ],
-                                self.chunks_with_decoder[model_chunk_idx],
+                                layer, self.chunks_with_decoder[model_chunk_idx]
                             )
                         )
-
-                    sample_args_keys = tuple(
-                        (t.shape, t.dtype, t.layout) for t in sample_args[per_callable_fwd_idx]
-                    )
-                    sample_kwargs_keys = tuple(
-                        (k, v.shape, v.dtype, v.layout)
-                        for k, v in sorted(sample_kwargs[per_callable_fwd_idx].items())
-                    )
-                    sample_keys = sample_args_keys + sample_kwargs_keys
+                        sample_args_keys = tuple(
+                            (t.shape, t.dtype, t.layout) for t in sample_args[per_callable_fwd_idx]
+                        )
+                        sample_kwargs_keys = tuple(
+                            (k, v.shape, v.dtype, v.layout)
+                            for k, v in sorted(sample_kwargs[per_callable_fwd_idx].items())
+                        )
+                        sample_keys = sample_args_keys + sample_kwargs_keys
+                        layer_sample_keys_cache[id(layer)] = sample_keys
+                    else:
+                        # Get signature from cache. This signature will be used to see if we can
+                        # reuse the static inputs of a previous forward pass for this forward pass.
+                        # If not, we still need to generate the new static inputs.
+                        sample_keys = layer_sample_keys_cache[id(layer)]
 
                     fwd_sample_queues[model_chunk_idx].append((sample_keys, per_callable_fwd_idx))
                     if consumed_sample_queue.get(sample_keys, []):
+                        # We can reuse the static inputs of a previous forward pass for this
+                        # forward pass, because they are of the same input signature and the
+                        # backward pass of the previous forward pass has completed.
                         reuse_fwd_idx = consumed_sample_queue[sample_keys].pop(0)
                         assert (
                             sample_args[reuse_fwd_idx] is not None
                             and sample_kwargs[reuse_fwd_idx] is not None
-                        ), "sample_args and sample_kwargs must not be None when reusing."
+                        ), (
+                            f"sample_args and sample_kwargs must not be None when reusing, but got "
+                            f"sample_args[{reuse_fwd_idx}] = {sample_args[reuse_fwd_idx]} and "
+                            f"sample_kwargs[{reuse_fwd_idx}] = {sample_kwargs[reuse_fwd_idx]}.",
+                        )
                         sample_args[per_callable_fwd_idx] = sample_args[reuse_fwd_idx]
                         sample_kwargs[per_callable_fwd_idx] = sample_kwargs[reuse_fwd_idx]
+
+                    if sample_args[per_callable_fwd_idx] is None:
+                        # Unfortunately, no previous static inputs are available for reuse,
+                        # sample_args is still None. Last attempt: generate the new static inputs
+                        # for this forward pass.
+                        sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
+                            _get_layer_static_inputs(
+                                layer, self.chunks_with_decoder[model_chunk_idx]
+                            )
+                        )
                 fwd_idx[model_chunk_idx] += 1
             else:
                 num_consumed_samples = min(
@@ -1873,7 +1907,12 @@ class TECudaGraphHelper:
 
         # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
         sample_args, kwargs = self._get_cuda_graph_input_data()
-        graphs = make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
+        if self.config.sequence_parallel:
+            rng_context = get_cuda_rng_tracker().fork()
+        else:
+            rng_context = nullcontext()
+        with rng_context:
+            graphs = make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
 
         # Push the captured graphs to the corresponding TransformerBlock.
         num_layers_accumulated = 0

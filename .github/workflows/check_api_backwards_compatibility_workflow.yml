@@ -81,7 +81,7 @@ jobs:
   check-compatibility:
     needs: [pre-flight]
     if: needs.pre-flight.outputs.should_skip != 'true'
-    name: Check API Backward Compatibility
+    name: "OPTIONAL: Check API Backward Compatibility"
     runs-on: ubuntu-latest
 
     # ============================================================================
@@ -245,7 +245,7 @@ jobs:
   api-backward-compatibility-summary:
     needs: [pre-flight, check-compatibility]
     runs-on: ubuntu-latest
-    name: API Backward Compatibility Check Summary
+    name: "OPTIONAL: API Backward Compatibility Check Summary"
     if: always() && !cancelled()
     steps:
       - name: Checkout
@@ -257,7 +257,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.should_skip == 'true' }}
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and .name != "API Backward Compatibility Check Summary")] | length') || echo 0
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and .name != "OPTIONAL: API Backward Compatibility Check Summary")] | length') || echo 0
 
           if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
               if [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
@@ -268,6 +268,6 @@ jobs:
               exit 0
           else
               echo "❌ Found $FAILED_JOBS failed job(s)"
-              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success" and .name != "API Backward Compatibility Check Summary") | .name'
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success" and .name != "OPTIONAL: API Backward Compatibility Check Summary") | .name'
               exit 1
           fi
