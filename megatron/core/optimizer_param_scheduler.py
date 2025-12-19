@@ -3,10 +3,13 @@
 """Learning rate decay and weight decay incr functions."""
 import logging
 import math
-from typing import Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
-from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.utils import log_single_rank
+
+if TYPE_CHECKING:
+    # Avoid circular import.
+    from megatron.core.optimizer import MegatronOptimizer
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +97,7 @@ class OptimizerParamScheduler:
 
     def __init__(
         self,
-        optimizer: MegatronOptimizer,
+        optimizer: "MegatronOptimizer",
         init_lr: float,
         max_lr: float,
         min_lr: float,
