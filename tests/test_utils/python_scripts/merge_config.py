@@ -1,3 +1,26 @@
+"""
+Merges base_config, runtime_config and model_config into one final config that the CI can launch.
+
+Starting Dec 19th 2025 MCore CI supports a new format of defining tests. We are decoupling the test
+config into a modular system of base_config, model_config and runtime_config. This allows us to
+re-use and parametrize a given model easily with multiple runtime configs, like parallelism settings.
+
+With this DRY principle, we simplify test maintenance and reduce the amount of code duplication.
+
+This refactoring is fully compliant with the original CI system as we merge the three configs into one
+final config that the CI can launch.
+
+Precendence: Base config > Model config > Runtime config.
+
+Usage:
+
+python merge_config.py \
+    --model_config model_config.yaml \
+    --base_config base_config.yaml \
+    --runtime_config runtime_config.yaml \
+    --output_config output_config.yaml
+"""
+
 import logging
 
 import click
