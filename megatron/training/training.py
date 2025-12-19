@@ -1293,6 +1293,31 @@ def setup_model_and_optimizer(
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
 
+    print_rank_0('#########################################################################################################################')
+
+    with torch.no_grad():
+        for model_chunk in model:
+            for name, param in model_chunk.named_parameters():
+                if name == "module.module.embedding.word_embeddings.weight":
+
+                    local_rank = torch.distributed.get_rank()
+
+                    # mean_param = param.mean(dim=0)
+                    if local_rank % 2 == 0:
+                        print("resetting spl tokens", local_rank, param.shape)
+                        for idx in range(1000):
+                            if idx != 2:
+                                torch.nn.init.normal_(param[idx], mean=0, std=0.014)      
+                                # param[idx].data = mean_param
+                    else:
+                        print("no spl tokens to reset", local_rank)
+
+    if args.fp16 or args.bf16:
+        optimizer.reload_model_params()
+    
+    print_rank_0('#########################################################################################################################')
+
+
     # get model without FP16 and/or DDP wrappers
     if (
         args.iteration == 0
@@ -1831,12 +1856,10 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
-
 def force_param_sync(model_chunks: list[DDP]) -> None:
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
-
 
 def save_checkpoint_and_time(
     iteration,
@@ -2105,6 +2128,29 @@ def train(
                 and getattr(args, "use_torch_fsdp2", False)
                 and args.ckpt_format == "torch_dist",
             )
+        print_rank_0('#########################################################################################################################')
+
+        with torch.no_grad():
+            for model_chunk in model:
+                for name, param in model_chunk.named_parameters():
+                    if name == "module.module.embedding.word_embeddings.weight":
+
+                        local_rank = torch.distributed.get_rank()
+
+                        # mean_param = param.mean(dim=0)
+                        if local_rank % 2 == 0:
+                            print("resetting spl tokens", local_rank, param.shape)
+                            for idx in range(1000):
+                                if idx != 2:
+                                    torch.nn.init.normal_(param[idx], mean=0, std=0.014)      
+                                    # param[idx].data = mean_param
+                        else:
+                            print("no spl tokens to reset", local_rank)
+
+        if args.fp16 or args.bf16:
+            optimizer.reload_model_params()
+        
+        print_rank_0('#########################################################################################################################')
         ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
         # Reload RL training checkpoint weights
@@ -2120,6 +2166,29 @@ def train(
                 and getattr(args, "use_torch_fsdp2", False)
                 and args.ckpt_format == "torch_dist",
             )
+        print_rank_0('#########################################################################################################################')
+
+        with torch.no_grad():
+            for model_chunk in model:
+                for name, param in model_chunk.named_parameters():
+                    if name == "module.module.embedding.word_embeddings.weight":
+
+                        local_rank = torch.distributed.get_rank()
+
+                        # mean_param = param.mean(dim=0)
+                        if local_rank % 2 == 0:
+                            print("resetting spl tokens", local_rank, param.shape)
+                            for idx in range(1000):
+                                if idx != 2:
+                                    torch.nn.init.normal_(param[idx], mean=0, std=0.014)      
+                                    # param[idx].data = mean_param
+                        else:
+                            print("no spl tokens to reset", local_rank)
+
+        if args.fp16 or args.bf16:
+            optimizer.reload_model_params()
+        
+        print_rank_0('#########################################################################################################################')
 
         args.no_load_optim = no_load_optim
 
