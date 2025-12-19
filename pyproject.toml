@@ -68,7 +68,7 @@ mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
-    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.10.0",
+    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
     "nvidia-resiliency-ext",
     "tqdm",
     "einops~=0.8",
@@ -175,7 +175,7 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-# transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.9" } # on `release_v2.9`
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.11" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
 
