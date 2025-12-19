@@ -151,6 +151,8 @@ async def main(
         # While we wait for the requests to complete, the engine runs in the background.
         results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
 
+    peak_mem_stats = _get_global_peak_memory_stats_bytes()
+
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
@@ -175,7 +177,7 @@ async def main(
                 json_results = throughput_dict
             # Attach peak memory metrics; the functional test only validates these
             # if the fields exist in the golden values.
-            json_results.update(_get_global_peak_memory_stats_bytes())
+            json_results.update(peak_mem_stats)
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=4)
         else:

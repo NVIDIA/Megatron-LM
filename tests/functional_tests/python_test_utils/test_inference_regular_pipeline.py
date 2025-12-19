@@ -15,10 +15,6 @@ _NON_REQUEST_TOP_LEVEL_KEYS = {
     "mem-max-allocated-bytes",
 }
 
-_MEMORY_KEYS = (
-    "mem-max-allocated-bytes",
-)
-
 
 def _median_as_float(value):
     """Convert scalar or list metric to a single float (median).
@@ -92,35 +88,33 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
         output_groundtruth.pop('throughput')
 
     # Peak memory regression checks (optional: only if present in golden values).
-    for mem_key in _MEMORY_KEYS:
-        if mem_key in output_groundtruth:
-            assert mem_key in output_current, (
-                f"Golden values include `{mem_key}` but current output does not. "
-                "Ensure the inference script records memory metrics to the output JSON."
+    if "mem-max-allocated-bytes" in output_groundtruth:
+        assert "mem-max-allocated-bytes" in output_current, (
+            f"Golden values include mem-max-allocated-bytes but current output does not. "
+            "Ensure the inference script records memory metrics to the output JSON."
+        )
+        sampled = _median_as_float(output_current["mem-max-allocated-bytes"])
+        golden = _median_as_float(output_groundtruth["mem-max-allocated-bytes"])
+        assert golden > 0, f"Golden mem-max-allocated-bytes must be > 0, got {golden}."
+
+        low = 0.9 * golden
+        high = 1.1 * golden
+
+        if sampled < low:
+            raise AssertionError(
+                f"Memory is too low for mem-max-allocated-bytes: "
+                f"expected within ±10% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
+                f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
+                "This is >10% lower than expected; please update golden values in the functional tests."
             )
-            sampled = _median_as_float(output_current[mem_key])
-            golden = _median_as_float(output_groundtruth[mem_key])
-            assert golden > 0, f"Golden `{mem_key}` must be > 0, got {golden}."
-
-            low = 0.9 * golden
-            high = 1.1 * golden
-
-            if sampled < low:
-                raise AssertionError(
-                    f"Memory is too low for `{mem_key}`: "
-                    f"expected within ±10% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
-                    f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
-                    "This is >10% lower than expected; please update golden values in the functional tests."
-                )
-            if sampled > high:
-                raise AssertionError(
-                    f"Memory is too high for `{mem_key}`: "
-                    f"expected within ±10% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
-                    f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
-                    "This is >10% higher than expected; this is likely a regression."
-                )
-
-            output_groundtruth.pop(mem_key)
+        if sampled > high:
+            raise AssertionError(
+                f"Memory is too high for mem-max-allocated-bytes: "
+                f"expected within ±10% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
+                f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
+                "This is >10% higher than expected; this is likely a regression."
+            )
+        output_groundtruth.pop("mem-max-allocated-bytes")
 
     for request_id, groundtruth_results in output_groundtruth.items():
         current_results = output_current[request_id]

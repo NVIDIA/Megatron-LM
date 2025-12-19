@@ -533,8 +533,9 @@ def main():
             f"request.state == '{request.state}' != 'finished'."
         )
 
-    # Print unique prompts + outputs.
+    peak_mem_stats = _get_global_peak_memory_stats_bytes()
 
+    # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
         def escape_str(s):
             return s.replace("\n", "\\n")
@@ -608,7 +609,7 @@ def main():
                 json_results["throughput"] = throughputs
             # Attach peak memory metrics; the functional test only validates these
             # if the fields exist in the golden values.
-            json_results.update(_get_global_peak_memory_stats_bytes())
+            json_results.update(peak_mem_stats)
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
