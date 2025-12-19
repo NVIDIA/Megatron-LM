@@ -69,6 +69,11 @@ def _get_param_groups(
 
     Creates parameter groups from provided optimizer config object.
 
+    NOTE There can be more than one match between a ParamKey and a parameter.
+        What we do is merge all of the matching ParamKey overrides into a single ParamGroupOverride
+        for that parameter and use that as the key for that parameter. Any parameters that get
+        the same set of merged overrides will be mapped into the same parameter group.
+
     Args:
         model_chunks (List[MegatronModule]): model chunks to create parameter
             groups for.
@@ -79,7 +84,7 @@ def _get_param_groups(
         List of parameter groups.
     """
 
-    # Map (wd_mult, is_expert_parallel, param_group_hyperparameters_config) to params.
+    # Map (pg_overrides, is_expert_parallel) to params.
     params_map = {}
 
     for model_chunk in model_chunks:
