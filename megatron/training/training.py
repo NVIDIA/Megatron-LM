@@ -12,7 +12,7 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import torch.distributed
 
@@ -68,6 +68,9 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
+from megatron.core.optimizer.optimizer_config import ParamPredicate
+from megatron.core.optimizer.optimizer_config import ParamKey
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -1247,15 +1250,19 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 
     # Construct the appropriate config_overrides object.
     # TODO: add more logic here as needed down the road.
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
     if args.decoupled_lr is not None:
+        decoupled_lr_config: ParamGroupOverride = {"max_lr": args.decoupled_lr}
         decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        decoupled_optimizer_config = copy.deepcopy(config)
-        decoupled_optimizer_config.lr = args.decoupled_lr
         if args.decoupled_min_lr is not None:
-            decoupled_optimizer_config.min_lr = args.decoupled_min_lr
-        config_overrides = {decoupled_param_key: decoupled_optimizer_config}
-    else:
-        config_overrides = None
+            decoupled_lr_config["min_lr"] = args.decoupled_min_lr
+        config_overrides[decoupled_param_key] = decoupled_lr_config
+    
+    # Next construct the standard param group overrides for no weight decay on bias parameters 
+    #  as well as any length 1 parameters.
+    param_length_1_match = ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1)
+    param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
+    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
 
     return config, config_overrides
 

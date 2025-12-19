@@ -3,7 +3,7 @@ import copy
 import logging
 import warnings
 from dataclasses import astuple
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.optim import SGD as CPUSGD
@@ -35,6 +35,11 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+from megatron.core.optimizer_param_scheduler import (
+    ParamGroupOverride,
+    combine_param_group_overrides,
+    param_group_override_to_tuple,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
@@ -55,43 +60,10 @@ from .optimizer_config import AdamOptimizerConfig, OptimizerConfig, ParamKey, SG
 logger = logging.getLogger(__name__)
 
 
-def _matches(param: torch.nn.Parameter, param_name: str, param_key: ParamKey) -> bool:
-    """Returns true if passed-in parameter (with name) matches `param_key`.
-
-    Args:
-        param (torch.nn.Parameter): Handle to parameter object.
-        param_name (str): Name of parameter in underlying PyTorch module.
-        param_key (ParamKey): ParamKey object.
-
-    Returns:
-        bool: True if parameter matches passed-in param_key.
-    """
-
-    # Check if name matches.
-    if isinstance(param_key.name, str):
-        target_names = [param_key.name]
-    else:
-        target_names = list(param_key.name)
-    for target_name in target_names:
-        if param_name in target_name:
-            return True
-
-    # Check if attribute matches.
-    if isinstance(param_key.attr, str):
-        target_attrs = [param_key.attr]
-    else:
-        target_attrs = list(param_key.attr)
-    for target_attr in target_attrs:
-        if getattr(param, target_attr, False):
-            return True
-
-    return False
-
-
 def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
-    config_overrides: Optional[Dict[ParamKey, OptimizerConfig]],
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -101,7 +73,7 @@ def _get_param_groups(
         model_chunks (List[MegatronModule]): model chunks to create parameter
             groups for.
         config (OptimizerConfig): optimizer configuration object.
-        config_overrides (Optional[Dict[LayerKey, OptimizerConfig]): optimizer overrides,
+        config_overrides (Optional[Dict[ParamKey, ParamGroupOverride]): optimizer overrides,
             specified on a per-layer basis.
     Returns:
         List of parameter groups.
@@ -109,7 +81,6 @@ def _get_param_groups(
 
     # Map (wd_mult, is_expert_parallel, param_group_hyperparameters_config) to params.
     params_map = {}
-    configs_map = {}
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
@@ -117,46 +88,31 @@ def _get_param_groups(
                 continue
 
             uses_default_config = False
-            # Get optimizer config for this parameter.
-            if config_overrides is None:
-                config_for_param = config
-                uses_default_config = True
+            # Get optimizer config overrides for this parameter.
+            param_overrides_list: list[ParamGroupOverride] = []
+            if config_overrides is not None:
+                for param_key, param_override in config_overrides.items():
+                    if param_key.matches(param, name):
+                        param_overrides_list.append(param_override)
+
+            if param_overrides_list:
+                param_override: ParamGroupOverride | None = combine_param_group_overrides(
+                    param_overrides_list
+                )
             else:
-                config_for_param = None
-                for param_key in config_overrides:
-                    if _matches(param, name, param_key):
-                        config_for_param = config_overrides[param_key]
-                        break
-                # Fall back to default config.
-                if config_for_param is None:
-                    config_for_param = config
-                    uses_default_config = True
+                param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
-            # TODO: Make sure there is a way to support old no_weight_decay_func functionality
-            # and default_skip_embedding_weight_decay:
-            #     or (default_skip_embedding_weight_decay and "embedding" in name)
-            no_wd = name.endswith(".bias") or len(param.shape) == 1
-            if not no_wd:
-                wd_mult = 1.0
-            else:
-                wd_mult = 0.0
-
             # Create config_tuple that is hash-able. Remove timers object before
             # creating config_tuple.
-            config_for_param_copy = copy.deepcopy(config_for_param)
-            config_for_param_copy.timers = None
-            config_tuple = astuple(config_for_param_copy)
-            key = (wd_mult, is_expert_parallel, config_tuple)
+            param_override_tuple: tuple[tuple[str, Any], ...] | None = (
+                param_group_override_to_tuple(param_override)
+            )
+            key = (param_override_tuple, is_expert_parallel)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
-
-            if key in configs_map:
-                assert (config_for_param, uses_default_config) == configs_map[key]
-            else:
-                configs_map[key] = (config_for_param, uses_default_config)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
@@ -170,32 +126,34 @@ def _get_param_groups(
                 params_key.append(key)
 
     param_groups = []
-    for key in params_key:
-        wd_mult, is_expert_parallel, _ = key
+    for key in sorted(params_key):
+        param_override_tuple, is_expert_parallel = key
+        # False if param_group_override is None or empty tuple
+        uses_default_config = bool(param_override_tuple)
         params = params_map[key] if key in params_map else []
-        config, uses_default_config = None, True
-        if key not in configs_map:
-            assert params == []
-        else:
-            config, uses_default_config = configs_map[key]
-            assert config is not None
-
+        param_override: ParamGroupOverride = {
+            k: v for (k, v) in param_override_tuple if param_override_tuple is not None
+        }
         # TODO: Remove "backwards compatible" fields below eventually.
+        default_config: ParamGroupOverride = {
+            'wd_mult': 1.0,
+            'lr_mult': 1.0,
+            'is_decoupled_lr': False,
+            # The following two fields may be important to keep even when we remove the
+            #   above "backwards compatible" fields.
+            "max_lr": config.lr,  # user may override this in param_override
+            "min_lr": config.min_lr,  # user may override this in param_override
+        }
+        assert (
+            "params" not in param_override
+        ), "'params' should not be in param_override, this is a protected key"
         param_group = {
             'params': params,
-            'wd_mult': wd_mult,  # For backwards compatibility.
-            'lr_mult': 1.0,  # For backwards compatibility.
             'is_expert_parallel': is_expert_parallel,
-            'is_decoupled_lr': False,  # For backwards compatibility.
             'default_config': uses_default_config,
+            **default_config,
+            **param_override,  # keep **param_override last so that users can override other fields.
         }
-
-        # Stick relevant fields into param_group from config object.
-        if config is not None:
-            param_group['max_lr'] = config.lr
-            param_group['min_lr'] = config.min_lr
-            # TODO: Add other relevant arguments (e.g., weight decay, optimizer)
-            # here as well.
         param_groups.append(param_group)
 
     return param_groups
@@ -205,7 +163,7 @@ def _get_param_groups_and_buffers(
     model_chunks: List[MegatronModule],
     model_chunk_offset: int,
     config: OptimizerConfig,
-    config_overrides: Optional[Dict[ParamKey, OptimizerConfig]],
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
     filter_fn: Callable,
     buffer_name: str,
 ) -> Tuple[List[Dict], Dict[int, List[_ParamAndGradBuffer]]]:
@@ -216,8 +174,8 @@ def _get_param_groups_and_buffers(
             groups for.
         model_chunk_offset (int): offset of model_chunks in global model_chunks list.
         config (OptimizerConfig): optimizer configuration object.
-        config_overrides (Optional[Dict[LayerKey, OptimizerConfig]): optimizer overrides,
-            specified on a per-layer basis.
+        config_overrides (Optional[Dict[ParamKey, ParamGroupOverride]): optimizer/scheduler
+            overrides, specified on the basis of ParamKey matches with each parameter.
         lr (float): learning rate.
         min_lr (float): minimum learning rate.
         filter_fn (callable): filtering function for param_groups.
@@ -450,7 +408,7 @@ def _get_megatron_optimizer_based_on_param_groups(
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
-    config_overrides: Optional[Dict[ParamKey, OptimizerConfig]] = None,
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
     use_gloo_process_groups: bool = True,
     pg_collection: Optional[ProcessGroupCollection] = None,
     dump_param_to_param_group_map: Optional[str] = None,
