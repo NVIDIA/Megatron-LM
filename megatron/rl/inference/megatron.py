@@ -159,7 +159,7 @@ def get_dynamic_inference_engine(
         metrics_writer=metrics_writer,
     )
 
-    inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
+    inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context, pg_collection=pg_collection)
 
     inference_wrapped_model.model_is_pipeline_parallel = not (
         is_pp_first_stage(pg_collection.pp) and is_pp_last_stage(pg_collection.pp)
