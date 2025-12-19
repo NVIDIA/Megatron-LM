@@ -27,6 +27,7 @@ from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.moe.paged_stash import paged_stash_set_last_layer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -890,7 +891,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         )
                     if self.config.moe_paged_stash:
                         paged_stash_set_last_layer(
-                            is_last_layer = (l_no == self.num_layers_per_pipeline_rank - 1)
+                            is_last_layer=(l_no == self.num_layers_per_pipeline_rank - 1)
                         )
 
                     with self.offload_context, inner_quantization_context:

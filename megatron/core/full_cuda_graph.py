@@ -7,10 +7,7 @@ import logging
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states
-from megatron.core.transformer.moe.paged_stash import (
-    paged_stash_reset,
-    check_paged_stash_overflow,
-)
+from megatron.core.transformer.moe.paged_stash import check_paged_stash_overflow, paged_stash_reset
 
 logger = logging.getLogger(__name__)
 
@@ -203,14 +200,16 @@ class FullCudaGraphWrapper:
         return FullCudaGraphWrapper.result[training_str]
 
     def speculative_cuda_graph_check(self, model):
-        ''' check speculative execution modules '''
+        '''check speculative execution modules'''
         if self.moe_expert_rank_capacity_factor is not None:
             # Check if there is any overflow in the receiving buffer
             over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
             for model_chunk in model:
                 for layer in model_chunk.module.module.decoder.layers:
                     mlp = layer.mlp
-                    if hasattr(mlp, 'token_dispatcher') and hasattr(mlp.token_dispatcher, 'check_over_budget'):
+                    if hasattr(mlp, 'token_dispatcher') and hasattr(
+                        mlp.token_dispatcher, 'check_over_budget'
+                    ):
                         over_budget |= mlp.token_dispatcher.check_over_budget()
             if over_budget.item():
                 raise Exception(f"Rank {torch.distributed.get_rank()} overbudget")
