@@ -112,7 +112,7 @@ def update_active_oncall_team(org, new_oncall):
 
     # 3. Remove everyone else
     for member in current_members:
-        if member != new_oncall:
+        if member not in [new_oncall, 'svcnvidia-nemo-ci']:
             url = f"{GITHUB_API_URL}/orgs/{org}/teams/{ACTIVE_ONCALL_TEAM_SLUG}/memberships/{member}"
             resp = requests.delete(url, headers=get_headers())
             if resp.status_code == 204:

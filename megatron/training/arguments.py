@@ -1568,7 +1568,7 @@ def _add_inference_args(parser):
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
-                       type=int, default=1, choices=[0, 1],
+                       type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
                        'inference context. The levels are: 0) no unified memory, '
                        '1) allocate `memory_buffer` in unified memory. '
@@ -1598,6 +1598,9 @@ def _add_inference_args(parser):
                        required=False, default=False, help='Enable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int, default=12346,
                        help="This port will be used to setup the inference coordinator on node-0")
+    group.add_argument("--inference-fuse-tp-communication", action="store_true", default=False,
+                       help="Use the fused communication kernel for tensor parallelism during inference. This "
+                       "kernel fuses reduce-scatter + residual-add + rms-norm + all-gather into one operation.")
     return parser
 
 
@@ -2076,6 +2079,8 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
+                        help='Number of parallel generation tasks for RL inference.')
     return parser
 
 def _add_training_args(parser):
