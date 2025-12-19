@@ -80,7 +80,7 @@ class TextGenerationController:
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
-        max_requests = context.max_total_requests
+        max_requests = context.max_requests
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.inference_wrapper_config.params_dtype
@@ -820,12 +820,12 @@ class TextGenerationController:
         new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
 
         # Update requests.
-        newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
+        update_result = context.update_requests(active_request_mask, new_sample_copy)
 
         return {
             "active_request_ids": active_request_ids,
-            "newly_paused_request_ids": newly_paused_request_ids,
             "finished_request_ids": finished_request_ids,
+            **update_result,
         }
 
     @torch.inference_mode()

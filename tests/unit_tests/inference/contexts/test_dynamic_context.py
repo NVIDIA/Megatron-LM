@@ -108,17 +108,15 @@ class TestDynamicContext:
         if not is_hybrid_model:
             assert dynamic_context.block_allocator.total_count == 491
             assert dynamic_context.block_allocator.active_count == 245
-            assert dynamic_context.max_total_requests == 490
-            # We make max_active_requests divisible by the REQUEST_ROUNDER.
-            assert dynamic_context.max_active_requests == 192
+            # We make max_requests divisible by the REQUEST_ROUNDER.
+            assert dynamic_context.max_requests == 192
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_metadata is None
         else:
             assert dynamic_context.block_allocator.total_count == 555
             assert dynamic_context.block_allocator.active_count == 277
-            assert dynamic_context.max_total_requests == 554
-            assert dynamic_context.max_active_requests == 256
+            assert dynamic_context.max_requests == 256
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_metadata is not None
@@ -181,9 +179,9 @@ class TestDynamicContext:
             rounder=1,
             is_hybrid_model=is_hybrid_model,
         )
-        dynamic_context.max_active_requests //= 2
+        dynamic_context.max_requests //= 2
         with pytest.raises(RequestOverflowError):
-            for i in range(dynamic_context.max_active_requests + 1):
+            for i in range(dynamic_context.max_requests + 1):
                 dynamic_context.add_request(
                     DynamicInferenceRequest(
                         request_id=i,
@@ -207,7 +205,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=0.1,
             block_size_tokens=128,
-            max_tokens=200,  # setting low, but >= context.max_active_requests.
+            max_tokens=200,  # setting low, but >= context.max_requests.
             rounder=1,
             is_hybrid_model=is_hybrid_model,
         )
