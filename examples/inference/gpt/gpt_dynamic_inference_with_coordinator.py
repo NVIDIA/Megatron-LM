@@ -39,6 +39,19 @@ from megatron.training.arguments import parse_args
 
 logging.basicConfig(level=logging.INFO, force=True)
 
+def _get_global_peak_memory_stats_bytes() -> dict:
+    """Peak allocated CUDA memory aggregated across ranks (MAX), in bytes.
+
+    Uses `torch.cuda.max_memory_allocated()` and assumes peak stats were reset
+    before the benchmark run.
+    """
+    peak_alloc = int(torch.cuda.max_memory_allocated())
+    if dist.is_available() and dist.is_initialized():
+        t = torch.tensor([peak_alloc], device="cuda", dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        peak_alloc = int(t[0].item())
+    return {"mem-max-allocated-bytes": peak_alloc}
+
 async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],
@@ -160,6 +173,9 @@ async def main(
             throughput_dict = {"throughput": throughputs}
             if args.throughput_check_only:
                 json_results = throughput_dict
+            # Attach peak memory metrics; the functional test only validates these
+            # if the fields exist in the golden values.
+            json_results.update(_get_global_peak_memory_stats_bytes())
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=4)
         else:
@@ -211,6 +227,10 @@ if __name__ == "__main__":
                 args.termination_id if args.termination_id is not None else tokenizer.eod
             ),
         )
+
+        # Reset peak memory stats so functional tests measure this run and not
+        # whatever happened earlier during initialization.
+        torch.cuda.reset_peak_memory_stats()
 
         # Requests, context, conroller.
         model = get_model()

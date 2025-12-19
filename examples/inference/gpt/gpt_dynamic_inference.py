@@ -62,6 +62,19 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
+def _get_global_peak_memory_stats_bytes() -> dict:
+    """Peak allocated CUDA memory aggregated across ranks (MAX), in bytes.
+
+    Uses `torch.cuda.max_memory_allocated()` and assumes peak stats were reset
+    before the benchmark run.
+    """
+    peak_alloc = int(torch.cuda.max_memory_allocated())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        t = torch.tensor([peak_alloc], device="cuda", dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+        peak_alloc = int(t[0].item())
+    return {"mem-max-allocated-bytes": peak_alloc}
+
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -436,6 +449,10 @@ def main():
     else:
         tokenizer = build_tokenizer(args)
 
+    # Reset peak memory stats so functional tests measure this run and not
+    # whatever happened earlier during initialization.
+    torch.cuda.reset_peak_memory_stats()
+
     # Sampling params.
     sampling_params = SamplingParams(
         temperature=args.temperature,
@@ -494,6 +511,8 @@ def main():
 
         # Reset engine.
         engine.reset()
+
+        torch.cuda.reset_peak_memory_stats()
 
         # Trial.
         t = get_curr_time()
@@ -587,6 +606,9 @@ def main():
             # Track system-level throughput as a test / debug metric
             if args.record_throughput:
                 json_results["throughput"] = throughputs
+            # Attach peak memory metrics; the functional test only validates these
+            # if the fields exist in the golden values.
+            json_results.update(_get_global_peak_memory_stats_bytes())
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
