@@ -1855,8 +1855,8 @@ class TransformerConfig(ModelParallelConfig):
             if self.cuda_graph_impl != "none":
                 assert (
                     self.cuda_graph_impl == "transformer_engine"
-                    and "moe" not in self.cuda_graph_scope
-                    and "mlp" not in self.cuda_graph_scope
+                    and CudaGraphScope.moe not in self.cuda_graph_scope
+                    and CudaGraphScope.mlp not in self.cuda_graph_scope
                 ), (
                     'CUDA graph scope on moe and mlp is not '
                     'supported with overlap_moe_expert_parallel_comm'

@@ -38,7 +38,7 @@ class TransformerLayerSchedulePlan:
     mtp post process nodes.
 
     layer (TransformerLayerSchedulePlan)
-    ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
+    ├── attn (TransformerLayerNode): attention -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All

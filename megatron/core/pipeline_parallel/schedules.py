@@ -846,8 +846,39 @@ def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, s
 
 def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
     """
-    Get the order for overlap_moe_expert_parallel_comm schedule for the original
-    chunk-wise order list.
+    This functions gets the order for overlap_moe_expert_parallel_comm schedule for the original
+    chunk-wise order list. Each chunk is transformered to chunks with only 1 layer so that 
+    layers between 2 chunks can now overlap with each other while following the graph order.
+    If capture_wgrad_graph is True, the wgrad backward graph is also added to the order by 
+    decreasing the layer id by 0.5.
+
+    Args:
+        order (List[int]): The original chunk-wise order list. Positive values represent forward
+            passes for chunks, negative values represent backward passes. The absolute value
+            indicates the chunk ID (1-indexed).
+        num_layers_per_chunk (List[int]): Number of graphable layers in each chunk. The length 
+            of this list equals the number of chunks.
+        capture_wgrad_graph (bool): If True, weight gradient computation graphs are added to the
+            order by appending entries with layer_id - 0.5.
+
+    Returns:
+        Tuple[List[float], List[Optional[List[int]]]]: A tuple containing:
+            - new_order: The layer-wise order list where each chunk is expanded to individual
+              layers. Positive values are forward passes, negative values are backward passes.
+              Values with .5 suffix indicate weight gradient computations.
+            - chunk_id_list: A list parallel to new_order. For forward passes, contains
+              [chunk_id, layer_index_within_chunk]. For backward passes, contains None.
+
+    Example:
+        original_order: [1, 2, -2, 1, -1, -1]
+        num_layers_per_chunk: [1, 2]
+        capture_wgrad_graph=True:
+            new_order: [1, 2, 3, 1, -3, -3.5, -2, -2.5, -1, -1.5, -1, -1.5]
+            chunk_id_list: [[0, 0], [1, 0], [1, 1], [0, 0], None,
+                            None, None, None, None, None, None, None]
+        capture_wgrad_graph=False:
+            new_order: [1, 2, 3, 1, -3, -2, -1, -1]
+            chunk_id_list: [[0, 0], [1, 0], [1, 1], [0, 0], None, None, None, None]
     """
 
     def _add_order(new_order, chunk_id_list, c_id, layer_id, is_wgrad=False, index=None):
