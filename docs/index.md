@@ -56,6 +56,7 @@ user-guide/features/tokenizers
 :maxdepth: 1
 :caption: Developer Guide
 
+developer/contribute
 developer/submit
 developer/oncall
 ```
