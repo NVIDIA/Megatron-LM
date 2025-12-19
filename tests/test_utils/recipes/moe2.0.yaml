@@ -81,10 +81,10 @@ products:
         environment: [dev]
         scope: [broken]
         platforms: [dgx_h100]
-  - test_case: [qwen3_tp1pp1ep1]
+  - test_case: [qwen3_tp1pp1ep8]
     products:
       - model_config: qwen3_proxy
-        runtime_config: tp1pp1ep1
+        runtime_config: tp1pp1ep8
         environment: [dev]
         scope: [broken]
         platforms: [dgx_h100]
