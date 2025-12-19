@@ -55,7 +55,13 @@ from .optimizer import (
     MegatronOptimizer,
     param_group_identifier_keys,
 )
-from .optimizer_config import AdamOptimizerConfig, OptimizerConfig, ParamKey, SGDOptimizerConfig
+from .optimizer_config import (
+    AdamOptimizerConfig,
+    OptimizerConfig,
+    ParamKey,
+    ParamPredicate,
+    SGDOptimizerConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,16 +135,27 @@ def _get_param_groups(
         for key in keys:
             if key not in params_key:
                 params_key.append(key)
-
+    # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
-    for key in sorted(params_key):
+    # Sort keys, None first.
+    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
         param_override_tuple, is_expert_parallel = key
-        # False if param_group_override is None or empty tuple
-        uses_default_config = bool(param_override_tuple)
         params = params_map[key] if key in params_map else []
-        param_override: ParamGroupOverride = {
-            k: v for (k, v) in param_override_tuple if param_override_tuple is not None
-        }
+        if param_override_tuple is None:
+            param_override: ParamGroupOverride = {}
+        else:
+            param_override: ParamGroupOverride = {k: v for (k, v) in param_override_tuple}
+
+        # False if param_group_override is None or empty tuple or if we do not modify the
+        #  LR schedule.
+        #  NOTE: "default_config" is used for logging the learning rate in training.py.
+        #   so set to True if we do not modify the learning rate.
+        #  if param_group['default_config']:
+        #    learning_rate = param_group['lr']
+        uses_default_lr_schedule: bool = (not bool(param_override_tuple)) or not any(
+            ["lr" in k for k in param_override]
+        )
+
         # TODO: Remove "backwards compatible" fields below eventually.
         default_config: ParamGroupOverride = {
             'wd_mult': 1.0,
@@ -155,7 +172,7 @@ def _get_param_groups(
         param_group = {
             'params': params,
             'is_expert_parallel': is_expert_parallel,
-            'default_config': uses_default_config,
+            'default_config': uses_default_lr_schedule,
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
         }
