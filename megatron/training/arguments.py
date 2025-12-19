@@ -2043,6 +2043,8 @@ def _add_rl_args(parser):
                        help="Default temperature for model inference.")
     group.add_argument('--grpo-default-top-p', type=float, default=0,
                        help="Default top-p for model inference.")
+    group.add_argument('--grpo-default-top-k', type=int, default=-1,
+                       help="Default top-k for model inference.")
     group.add_argument('--langrl-inference-server-type', type=str,
                        choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
                        help="Type of inference server to use.")

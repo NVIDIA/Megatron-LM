@@ -21,7 +21,7 @@ assert (
     MATHVERIFY_AVAILABLE
 ), "math_verify is not installed but now required. Install it using `pip install math-verify` to continue."
 
-NEGATIVE_REWARD = 0.5
+NEGATIVE_REWARD = 0.0
 
 class MathAgent(RewardOnlyAgent):
     def __init__(self, format_reward: float = 0.0, answer_format: str = "tagged", **kwargs):
@@ -29,7 +29,6 @@ class MathAgent(RewardOnlyAgent):
         assert answer_format in ["tagged", "boxed"], "Invalid answer format"
         self.format_reward = format_reward
         self.answer_format = answer_format
-        print(f"MathAgent initialized with format reward: {format_reward} and answer format: {answer_format}")
 
     def compute_score(self, response: str, golden: dict, golden_key: str = "answer") -> float:
         """Take a response and a golden answer and return a score. Supports tagged or boxed answers.

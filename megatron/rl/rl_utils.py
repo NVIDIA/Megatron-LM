@@ -307,6 +307,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
                 'temperature': args.grpo_default_temperature,
                 'max_tokens': args.inference_max_seq_length,
                 'top_p': args.grpo_default_top_p,
+                'top_k': args.grpo_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
         )
@@ -1213,6 +1214,7 @@ def evaluate_and_print_results_rl(
                         'temperature': args.grpo_default_temperature,
                         'max_tokens': args.seq_length,
                         'top_p': args.grpo_default_top_p,
+                        'top_k': args.grpo_default_top_k,
                     },
                 )
                 evaluation_responses = loop.run_until_complete(agent.run_evaluation(request))
