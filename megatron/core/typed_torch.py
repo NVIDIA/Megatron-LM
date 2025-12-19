@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Utilities for improved type hinting with torch interfaces."""
 
 from collections.abc import Callable
