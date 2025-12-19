@@ -128,17 +128,17 @@ def test_get_param_groups_multiple_matches(mock_get_world_size):
         [net],
         OptimizerConfig(optimizer='adam', lr=0.01),
         {
-            ParamKey(name="*.bias"): ParamGroupOverride(wd_mult=0.0),
+            ParamKey(name="*.bias"): ParamGroupOverride(min_lr=1e-4, wd_mult=0.0),
             ParamKey(
                 predicate=ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1)
-            ): ParamGroupOverride(wd_mult=0.0),
+            ): ParamGroupOverride(wd_mult=0.0, min_lr=1e-4),
         },
     )
     config_overrides = {
         ParamKey(
             name="*.bias",
             predicate=ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1),
-        ): ParamGroupOverride(wd_mult=0.0)
+        ): ParamGroupOverride(min_lr=1e-4, wd_mult=0.0)
     }
     param_groups2 = _get_param_groups(
         [net], OptimizerConfig(optimizer='adam', lr=0.01), config_overrides
