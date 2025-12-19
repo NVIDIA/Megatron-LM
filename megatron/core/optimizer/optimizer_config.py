@@ -40,6 +40,9 @@ class OptimizerConfig:
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
 
+    wd_mult: Optional[float] = None
+    """Weight decay multiplier, can be used to adjust wd for sepcific layers."""
+
     ##############
     # Precision
     ##############
