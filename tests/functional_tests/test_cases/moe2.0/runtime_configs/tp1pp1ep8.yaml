@@ -19,12 +19,11 @@ MODEL_ARGS:
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
-  # Use unfused attention since MLA with fused attention and deterministic mode leads to NaN
-  --attention-backend: unfused # TODO: switch back to fused attention after fix
   --use-mcore-models: true
   --sequence-parallel: true
   --micro-batch-size: 4
   # MoE training related args
+  --moe-grouped-gemm: true
   --moe-token-dispatcher-type: alltoall
   --moe-permute-fusion: true
   --save-interval: 25
