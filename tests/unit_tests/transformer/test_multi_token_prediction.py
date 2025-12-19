@@ -779,6 +779,7 @@ class TestMultiTokenPredictionMamba:
         args.hybrid_mlp_ratio = 0.0  
         args.hybrid_override_pattern = "M*M*"  
         args.mtp_hybrid_override_pattern = "M*"  
+        args.mtp_num_layers_per_layer = 2 
         args.spec = "megatron.core.models.mamba.mamba_layer_specs.mamba_stack_spec"
         args.mtp_spec = "megatron.core.models.mamba.mamba_layer_specs.mamba_stack_spec"
         
