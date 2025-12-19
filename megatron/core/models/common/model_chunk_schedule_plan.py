@@ -358,11 +358,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 model, self._model_chunk_state, self._event, comp_stream
             )
 
-        # pre/postprocess may receive dgrad from attn, which is managed by cuda graph.
+        # preprocess may receive dgrad from attn, which is managed by cuda graph.
         if CudaGraphScope.attn in model.config.cuda_graph_scope:
             self.pre_process.manual_grads_release = False
-            if self.post_process:
-                self.post_process.manual_grads_release = False
 
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
         if module is None:
