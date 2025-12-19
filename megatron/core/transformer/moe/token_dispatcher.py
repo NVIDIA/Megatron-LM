@@ -10,7 +10,6 @@ from megatron.core import utils
 from megatron.core.config import is_experimental_enabled
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
-from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -1012,7 +1011,11 @@ class _HybridEPManager(_DispatchManager):
 
         if self.moe_expert_rank_capacity_factor is not None:
             pad_multiple = get_align_size_for_quantization(self.config)
-            budget = int(routing_map.shape[0] * self.config.moe_router_topk  * self.moe_expert_rank_capacity_factor)
+            budget = int(
+                routing_map.shape[0]
+                * self.config.moe_router_topk
+                * self.moe_expert_rank_capacity_factor
+            )
             budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
         # Compute the capacity for each expert at the drop_and_pad mode
@@ -1060,7 +1063,7 @@ class _HybridEPManager(_DispatchManager):
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
-            over_budget = self.handle[8] != 0 # this is overflow_flag
+            over_budget = self.handle[8] != 0  # this is overflow_flag
             self.over_budget |= over_budget
 
         if self.num_permuted_tokens is None:
@@ -1441,7 +1444,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
         self._comm_manager.setup_metadata(routing_map, probs)
-        
+
         return hidden_states, self._comm_manager.token_probs
 
     def token_dispatch(
@@ -1537,6 +1540,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         return hidden_states.view(self.hidden_shape)
 
     def check_over_budget(self):
+        """Check if the dispatcher has exceeded its budget."""
         if hasattr(self._comm_manager, 'over_budget'):
             return self._comm_manager.over_budget
         else:
