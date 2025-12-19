@@ -53,6 +53,14 @@ user-guide/features/tokenizers
 ```
 
 ```{toctree}
+:maxdepth: 1
+:caption: Developer Guide
+
+developer/submit
+developer/oncall
+```
+
+```{toctree}
 :maxdepth: 2
 :caption: Discussions
 
