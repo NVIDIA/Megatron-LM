@@ -13,9 +13,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
-from megatron.core.transformer.moe.paged_stash import (
-    paged_stash_reset,
-)
+from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -29,6 +27,7 @@ from megatron.core.process_groups_config import (
 )
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -1722,8 +1721,6 @@ def forward_backward_pipelining_with_interleaving(
         # Forward pass.
         forward_k = k + num_warmup_microbatches
 
-        
-
         # Decide to checkpoint all layers' activations of the current micro-batch.
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
@@ -1737,6 +1734,7 @@ def forward_backward_pipelining_with_interleaving(
         if config.overlap_p2p_comm:
 
             backward_k = k
+
             # Sync forward recv
             def pp_pre_forward(vp_stage=None):
                 if vp_stage is None:

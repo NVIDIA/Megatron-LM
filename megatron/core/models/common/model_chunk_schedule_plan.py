@@ -8,9 +8,6 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.transformer.moe.paged_stash import (
-    paged_stash_set_last_layer,
-)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -18,6 +15,7 @@ from megatron.core.pipeline_parallel.utils import (
     get_comp_stream,
 )
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.paged_stash import paged_stash_set_last_layer
 
 
 class ModelChunkState:
