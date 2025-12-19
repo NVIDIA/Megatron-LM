@@ -176,7 +176,9 @@ class PostProcessNode(ScheduleNode):
         layer_norm = self.gpt_model.decoder.final_layernorm
         if not self.gpt_model.config.mtp_num_layers and empty_decoder and layer_norm:
             hidden_states = layer_norm(hidden_states)
-            hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
 
         # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(
