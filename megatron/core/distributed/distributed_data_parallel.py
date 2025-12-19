@@ -461,6 +461,73 @@ class DistributedDataParallel(_BaseDataParallel):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
 
+                # Nonuniform TP: gather grads from spare GPUs and scatter to core GPUs
+                if (
+                    self.ddp_config.tp_spares > 0
+                    and hasattr(param, 'tensor_model_parallel')
+                    and param.tensor_model_parallel
+                    and parallel_state.get_tensor_model_parallel_world_size()
+                    == self.ddp_config.tp_base
+                ):
+                    empty_shape = list(param.shape)
+                    empty_shape[param.partition_dim] = 0
+                    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
+                    if tp_rank < self.ddp_config.tp_base - self.ddp_config.tp_spares:
+                        # Core GPU: receive grads from spare GPUs
+                        input = [
+                            torch.empty(
+                                empty_shape, device=param.device, dtype=param.side_grad.dtype
+                            ).contiguous()
+                            for _ in range(parallel_state.get_tensor_model_parallel_world_size())
+                        ]
+                        # Split side_grad and send to core GPUs
+                        output = [
+                            torch.empty(
+                                empty_shape, device=param.device, dtype=param.side_grad.dtype
+                            ).contiguous()
+                            for _ in range(self.ddp_config.tp_base - self.ddp_config.tp_spares)
+                        ] + [
+                            t.contiguous()
+                            for t in (print(f"[Rank {torch.distributed.get_rank()}] Core GPU accessing recv_splits: param id={id(param)}, has_recv={hasattr(param, 'recv_splits')}, has_send={hasattr(param, 'send_splits')}, tp_rank={tp_rank}") or torch.split(
+                                param.side_grad, param.recv_splits[tp_rank], dim=param.partition_dim
+                            ))
+                        ][-self.ddp_config.tp_spares :]
+                    else:
+                        # Spare GPU: send grads to core GPUs
+                        print(f"[Rank {torch.distributed.get_rank()}] Spare GPU accessing send_splits: param id={id(param)}, has_recv={hasattr(param, 'recv_splits')}, has_send={hasattr(param, 'send_splits')}, tp_rank={tp_rank}")
+                        input = [
+                            t.contiguous()
+                            for t in torch.split(
+                                param.main_grad, param.send_splits[tp_rank], dim=param.partition_dim
+                            )
+                        ]
+                        output = [
+                            torch.empty(
+                                empty_shape, device=param.device, dtype=param.main_grad.dtype
+                            ).contiguous()
+                            for _ in range(parallel_state.get_tensor_model_parallel_world_size())
+                        ]
+
+                    try:
+                        torch.distributed.all_to_all(
+                            output,
+                            input,
+                            group=parallel_state.get_tensor_model_parallel_group(),
+                            async_op=True,
+                        )
+                    except Exception as e:
+                        print('rank %d error: ' % tp_rank, e)
+                        print(
+                            'rank %d input element contiguity: ' % tp_rank,
+                            [i.is_contiguous() for i in input],
+                        )
+                        print(
+                            'rank %d output element contiguity: ' % tp_rank,
+                            [o.is_contiguous() for o in output],
+                        )
+                        raise e
+
                 if self.ddp_config.overlap_grad_reduce:
                     self.param_to_bucket_group[param].register_grad_ready(param)
 
