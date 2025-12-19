@@ -55,9 +55,7 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
     groundtruth_request_ids = set(output_groundtruth.keys()) - _NON_REQUEST_TOP_LEVEL_KEYS
     current_request_ids = set(output_current.keys()) - _NON_REQUEST_TOP_LEVEL_KEYS
 
-    assert groundtruth_request_ids.issuperset(
-        current_request_ids
-    ), (
+    assert groundtruth_request_ids.issuperset(current_request_ids), (
         "Some request IDs from groundtruth are missing in current or current has unexpected IDs: "
         f"{sorted(groundtruth_request_ids)} vs {sorted(current_request_ids)}"
     )
