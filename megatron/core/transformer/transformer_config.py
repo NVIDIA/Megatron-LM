@@ -665,8 +665,8 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     moe_use_device_initiated_grouped_gemm: bool = False
-    """Use the cutlass grouped gemm kernel, which allows for the token_per_expert tensor on GPU. This can prevent the GPU-CPU synchronization during the grouped gemm."""
-
+    """Use the cutlass grouped gemm kernel, which allows for the token_per_expert tensor on GPU.
+    This can prevent the GPU-CPU synchronization during the grouped gemm."""
 
     moe_use_legacy_grouped_gemm: bool = False
     """Use legacy GroupedMLP rather than TEGroupedMLP.
@@ -743,8 +743,8 @@ class TransformerConfig(ModelParallelConfig):
     16 SMs can generally achieve good bandwidth."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert, None means no token
-    will be dropped. The default is None."""
+    """The capacity factor for each expert, None means no token will be dropped.
+    The default is None."""
     ##################
     # Context Parallel
     ##################
@@ -1182,8 +1182,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_expert_rank_capacity_factor is not None:
             if not self.moe_use_device_initiated_grouped_gemm:
                 raise ValueError(
-                    "moe_expert_rank_capacity_factor requires moe_use_device_initiated_grouped_gemm "
-                    "to be enabled."
+                    "moe_expert_rank_capacity_factor requires "
+                    "moe_use_device_initiated_grouped_gemm to be enabled."
                 )
             if self.moe_flex_dispatcher_backend != "hybridep":
                 raise ValueError(
@@ -1351,18 +1351,18 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.cpu_offloading and not self.fine_grained_activation_offloading
             ), "paged_stash cannot be enabled with cpu_offloading."
-            assert self.stash_modules is not None and len(self.stash_modules) > 0, (
-                "stash_modules must be specified when moe_paged_stash is enabled."
-            )
+            assert (
+                self.stash_modules is not None and len(self.stash_modules) > 0
+            ), "stash_modules must be specified when moe_paged_stash is enabled."
             allowed_modules = {"expert_fc1", "expert_fc2", "moe_act"}
             invalid_modules = set(self.stash_modules) - allowed_modules
             assert not invalid_modules, (
                 f'Invalid choices for stash_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
-            assert self.moe_expert_rank_capacity_factor is not None, (
-                "moe_expert_rank_capacity_factor must be set when moe_paged_stash is enabled."
-            )
+            assert (
+                self.moe_expert_rank_capacity_factor is not None
+            ), "moe_expert_rank_capacity_factor must be set when moe_paged_stash is enabled."
 
         # Check that no module is both stashed and offloaded
         if self.stash_modules and self.offload_modules:
