@@ -72,26 +72,26 @@ products:
       - model_config: dsv3_proxy
         runtime_config: tp1pp1ep8
         environment: [dev]
-        scope: [mr, mr-github, mr-github-slim]
+        scope: [broken]
         platforms: [dgx_h100]
   - test_case: [dsv3_tp2pp2ep4]
     products:
       - model_config: dsv3_proxy
         runtime_config: tp2pp2ep4
         environment: [dev]
-        scope: [mr, mr-github, mr-github-slim]
+        scope: [broken]
         platforms: [dgx_h100]
   - test_case: [qwen3_tp1pp1ep1]
     products:
       - model_config: qwen3_proxy
         runtime_config: tp1pp1ep1
         environment: [dev]
-        scope: [mr, mr-github, mr-github-slim]
+        scope: [broken]
         platforms: [dgx_h100]
   - test_case: [qwen3_tp2pp2ep4]
     products:
       - model_config: qwen3_proxy
         runtime_config: tp2pp2ep4
         environment: [dev]
-        scope: [mr, mr-github, mr-github-slim]
+        scope: [broken]
         platforms: [dgx_h100]
