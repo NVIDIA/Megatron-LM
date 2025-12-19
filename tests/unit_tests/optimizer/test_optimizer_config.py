@@ -31,3 +31,8 @@ def test_paramkey_matches():
     setattr(p_with_attr, "is_embedding_or_output_parameter", True)
     assert has_attr.matches(p_with_attr, "interesting.bias")
     assert not has_attr.matches(torch.nn.Parameter(torch.empty(10, 10)), "interesting.bias")
+
+    # We expect that if the return of the attribute is False, it should not match even if
+    #  it has the attribute.
+    setattr(p_with_attr, "is_embedding_or_output_parameter", False)
+    assert not has_attr.matches(p_with_attr, "interesting.bias")
