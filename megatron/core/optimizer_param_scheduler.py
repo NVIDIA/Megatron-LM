@@ -37,7 +37,11 @@ class ParamGroupOverride(TypedDict):
 def param_group_override_to_tuple(
     param_group_override: ParamGroupOverride | None,
 ) -> tuple[tuple[str, Any], ...] | None:
-    """Convert a param group override to a tuple for use as a key in a dictionary."""
+    """Convert a param group override to a tuple for use as a key in a dictionary.
+
+    The tuple is sorted by the keys of the param group override to handle different orderings of
+     the keys in different override dictionaries which still mean the same thing.
+    """
     if param_group_override is None:
         return None
     return tuple(sorted(param_group_override.items()))
