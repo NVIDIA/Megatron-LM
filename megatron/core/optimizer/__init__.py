@@ -115,8 +115,7 @@ def _get_param_groups(
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
-            # Create config_tuple that is hash-able. Remove timers object before
-            # creating config_tuple.
+            # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
