@@ -418,6 +418,13 @@ class TransformerConfig(ModelParallelConfig):
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
+    use_kitchen_attention: bool = False
+    """Use the kitchen extension for attention (instead of TE's attention)."""
+
+    kitchen_attention_backend: Literal["sdpa", "fa"] = "sdpa"
+    """Which kitchen attention backend to use when use_kitchen_attention=True.
+    "sdpa" for KitchenDotProductAttention, "fa" for KitchenFlashAttention."""
+
     ####################
     # fp4 related
     ####################
@@ -516,7 +523,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of selected groups for group-limited routing."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax(pre-sigmoid) routing for MoE, which means softmax is before the 
+    """Enable pre-softmax(pre-sigmoid) routing for MoE, which means softmax is before the
     top-k selection.
     By default, softmax is done after top-k."""
 
@@ -729,6 +736,9 @@ class TransformerConfig(ModelParallelConfig):
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
 
+    inference_fuse_tp_communication: bool = False
+    """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference. """
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -746,7 +756,7 @@ class TransformerConfig(ModelParallelConfig):
     """The number of groups used in Mamba layers."""
 
     mamba_num_heads: Optional[int] = None
-    """The number of heads used in Mamba layers. 
+    """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
     use_mamba_mem_eff_path: bool = True
@@ -1633,6 +1643,11 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_qkv_bias
             assert not self.use_kitchen
 
+        if self.inference_fuse_tp_communication:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_fuse_tp_communication is only supported "
+                "for inference_optimized transformer implementation."
+            )
         if self.batch_invariant_mode:
             assert (
                 self.attention_backend == AttnBackend.flash
