@@ -155,9 +155,7 @@ class DistributedInitConfig:
     `min_ctas`, `max_ctas`, and `cga_cluster_size`."""
 
     use_tp_pp_dp_mapping: bool = False
-    """If set, distributed ranks initialize order is changed from tp-dp-pp to tp-pp-dp.
-    Make sure EP and CP aren't used with this option enabled.
-    """
+    """If set, distributed ranks initialize order is changed from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp"""
 
     enable_gloo_process_groups: bool = True
     """If set, create Gloo process groups for communications."""
