@@ -35,6 +35,8 @@ megatron/core/post_training/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/post-tr
 
 megatron/post_training/ @NVIDIA/post-training
 
+megatron/core/transformer/cuda_graphs.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/cuda-graphs
+
 .gitlab/ @NVIDIA/ci
 .github/ @NVIDIA/ci
 .gitlab-ci.yml @NVIDIA/ci
