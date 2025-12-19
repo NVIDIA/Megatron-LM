@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from ast import Not
 from unittest.mock import patch
 
 import pytest
@@ -21,11 +22,7 @@ from megatron.core.optimizer import (
     _get_param_groups,
     get_megatron_optimizer,
 )
-from megatron.core.optimizer_param_scheduler import (
-    ParamGroupOverride,
-    combine_param_group_overrides,
-    param_group_override_to_tuple,
-)
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
