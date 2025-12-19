@@ -20,28 +20,14 @@ MODEL_ARGS:
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
-  # Use unfused attention since MLA with fused attention and deterministic mode leads to NaN
-  --attention-backend: unfused # TODO: switch back to fused attention after fix
   --use-mcore-models: true
   --sequence-parallel: true
   --micro-batch-size: 4
   # MoE training related args
+  --moe-grouped-gemm: true
   --moe-token-dispatcher-type: alltoall
   --moe-permute-fusion: true
-  # Add checkpointing args
-  --save: ${CHECKPOINT_SAVE_PATH}
-  --load: ${CHECKPOINT_LOAD_PATH}
   --save-interval: 25
-  # Add logging args
-  --log-timers-to-tensorboard: true
-  --log-memory-to-tensorboard: true
-  --log-num-zeros-in-grad: true
-  --log-params-norm: true
-  --log-validation-ppl-to-tensorboard: true
-  --log-throughput: true
-  --log-interval: 1
-  --logging-level: 40
-  --tensorboard-dir: ${TENSORBOARD_PATH}
   # Add mixed precision args
   --bf16: true
   --exit-interval: 50
