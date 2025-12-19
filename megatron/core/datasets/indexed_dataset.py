@@ -706,7 +706,15 @@ class IndexedDataset(torch.utils.data.Dataset):
         Returns:
             Tuple[str, bool, bool, Optional[ObjectStorageConfig]]: The state tuple
         """
-        return self.path_prefix, self.multimodal, self.mmap, self.object_storage_config, self.fast_cache_load, self.sequences_per_dataset, self.dtype_code
+        return (
+            self.path_prefix,
+            self.multimodal,
+            self.mmap,
+            self.object_storage_config,
+            self.fast_cache_load,
+            self.sequences_per_dataset,
+            self.dtype_code,
+        )
 
     def __setstate__(self, state: Tuple[str, bool, bool, Optional[ObjectStorageConfig]]) -> None:
         """Set the state during un-pickling
@@ -714,8 +722,24 @@ class IndexedDataset(torch.utils.data.Dataset):
         Args:
             state (Tuple[str, bool, bool, Optional[ObjectStorageConfig]]): The state tuple
         """
-        path_prefix, multimodal, mmap, object_storage_config, fast_cache_load, sequences_per_dataset, dtype_code = state
-        self.initialize(path_prefix, multimodal, mmap, object_storage_config, fast_cache_load, sequences_per_dataset, dtype_code)
+        (
+            path_prefix,
+            multimodal,
+            mmap,
+            object_storage_config,
+            fast_cache_load,
+            sequences_per_dataset,
+            dtype_code,
+        ) = state
+        self.initialize(
+            path_prefix,
+            multimodal,
+            mmap,
+            object_storage_config,
+            fast_cache_load,
+            sequences_per_dataset,
+            dtype_code,
+        )
 
     def __del__(self) -> None:
         """Clean up the object"""
