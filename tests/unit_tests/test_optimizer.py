@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-from ast import Not
 from unittest.mock import patch
 
 import pytest
