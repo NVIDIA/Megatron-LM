@@ -26,7 +26,7 @@ Below is the checklist that the oncall needs to go through for each PR.
   - File structure
 - [ ] Do all tests pass?
   - Oncall will need to kick off testing suite for external reviewers
-  - Comment “/ok to test commid_id” to kick off testing suite
+  - Comment "/ok to test commit_id" to kick off testing suite
 - [ ] Add the “Expert Review” label
   - Expert reviewers should review within 1 business day. Message the assigned reviewer if it is taking longer.
   - After 2 business days, the expert reviewer waives the right to review.
