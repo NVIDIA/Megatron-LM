@@ -175,7 +175,6 @@ class MambaMetadata:
 
             # The length of tokens belonging to regular prefill requests (excluding decode tokens)
             seq_len = end_regular_prefill_token_idx - real_decode_count
-            padded_seq_len = padded_token_count - padded_decode_count
 
             if seq_len > 0:
                 self._seq_idx_buffer[:, :seq_len].copy_(
@@ -183,8 +182,8 @@ class MambaMetadata:
                     - real_decode_count
                 )
 
-            if padded_seq_len > seq_len:
-                self._seq_idx_buffer[:, seq_len:padded_seq_len].fill_(-1)
+            if padded_token_count > seq_len:
+                self._seq_idx_buffer[:, seq_len:padded_token_count].fill_(-1)
             self.seq_idx = self._seq_idx_buffer[:, :padded_token_count]
 
             # Update cu_seqlens
@@ -217,6 +216,7 @@ class MambaMetadata:
                 cu_seqlens[real_decode_count + real_prefill_count]
                 - cu_seqlens[real_decode_count + real_prefill_count - 1]
             )
+            assert self.cu_seqlens is not None
             self._device_chunked_prefill_buffer[0] = self.cu_seqlens[regular_prefill_count]
             self._device_chunked_prefill_buffer[1] = chunked_prefill_token_count
             self.device_chunked_prefill = self._device_chunked_prefill_buffer

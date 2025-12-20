@@ -528,6 +528,7 @@ class MambaMixer(MegatronModule):
                 ssm_state,
                 context.mamba_metadata.batch_indices_decode,
             ).transpose(0, 1)
+            y_prefill, y_chunked_prefill = None, None
             if prefill_req_count > 0:
                 # Regular prefill requests
                 y_prefill = self.ssm_prefill(
@@ -557,15 +558,19 @@ class MambaMixer(MegatronModule):
                 )
             if prefill_req_count > 0 and has_explicit_chunked_prefill_req:
                 # Merge regular prefill and chunked prefill parts
+                assert y_prefill is not None
+                assert y_chunked_prefill is not None
                 tensor_merge(
                     y_prefill, y_chunked_prefill, context.mamba_metadata.device_chunked_prefill
                 )
             elif has_explicit_chunked_prefill_req:
                 # Chunked prefill only
+                assert y_prefill is None
+                assert y_chunked_prefill is not None
                 y_prefill = y_chunked_prefill
             else:
                 # Regular prefill only; y_prefill is already set, nothing more to be done
-                pass
+                assert y_prefill is not None
             # Merge decode and prefill parts
             y = torch.empty(
                 [token_count, 1, y_prefill.shape[-1]],

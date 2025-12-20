@@ -95,8 +95,8 @@ def _tensor_masked_update_kernel_2d(
     BLOCK_SIZE: tl.constexpr,
 ):
     """Kernel to update values in a 2D states tensor using a mask."""
-    pid_batch = tl.program_id(0)
-    pid_row_chunk = tl.program_id(1)
+    pid_batch = tl.program_id(0).to(tl.int64)
+    pid_row_chunk = tl.program_id(1).to(tl.int64)
 
     target_idx = tl.load(IDX_PTR + pid_batch)
     if target_idx == -1:
@@ -107,8 +107,16 @@ def _tensor_masked_update_kernel_2d(
     mask = row_offsets < ROW_SIZE
 
     # 2D Calculation: base + batch * stride0 + col * stride1
-    dst_ptr = STATES_PTR + (target_idx * stride_state_b) + (row_offsets * stride_state_d0)
-    src_ptr = NEW_STATES_PTR + (pid_batch * stride_new_b) + (row_offsets * stride_new_d0)
+    dst_ptr = (
+        STATES_PTR
+        + (target_idx.to(tl.int64) * stride_state_b.to(tl.int64))
+        + (row_offsets.to(tl.int64) * stride_state_d0.to(tl.int64))
+    )
+    src_ptr = (
+        NEW_STATES_PTR
+        + (pid_batch * stride_new_b.to(tl.int64))
+        + (row_offsets.to(tl.int64) * stride_new_d0.to(tl.int64))
+    )
 
     val = tl.load(src_ptr, mask=mask)
     tl.store(dst_ptr, val, mask=mask)
@@ -131,8 +139,8 @@ def _tensor_masked_update_kernel_3d(
     BLOCK_SIZE: tl.constexpr,
 ):
     """Kernel to update values in a 3D states tensor using a mask."""
-    pid_batch = tl.program_id(0)
-    pid_row_chunk = tl.program_id(1)
+    pid_batch = tl.program_id(0).to(tl.int64)
+    pid_row_chunk = tl.program_id(1).to(tl.int64)
 
     target_idx = tl.load(IDX_PTR + pid_batch)
     if target_idx == -1:
@@ -147,15 +155,21 @@ def _tensor_masked_update_kernel_3d(
     # Given shape (batch, D0, D1)
     # idx_d1 = flat_idx % D1
     # idx_d0 = flat_idx // D1
-    idx_d1 = flat_offsets % SIZE_D1
-    idx_d0 = flat_offsets // SIZE_D1
+    idx_d1 = flat_offsets % SIZE_D1.to(tl.int64)
+    idx_d0 = flat_offsets // SIZE_D1.to(tl.int64)
 
     # Calculate pointers using specific strides
     dst_offset = (
-        (target_idx * stride_state_b) + (idx_d0 * stride_state_d0) + (idx_d1 * stride_state_d1)
+        (target_idx.to(tl.int64) * stride_state_b.to(tl.int64))
+        + (idx_d0 * stride_state_d0.to(tl.int64))
+        + (idx_d1 * stride_state_d1.to(tl.int64))
     )
 
-    src_offset = (pid_batch * stride_new_b) + (idx_d0 * stride_new_d0) + (idx_d1 * stride_new_d1)
+    src_offset = (
+        (pid_batch * stride_new_b.to(tl.int64))
+        + (idx_d0 * stride_new_d0.to(tl.int64))
+        + (idx_d1 * stride_new_d1.to(tl.int64))
+    )
 
     dst_ptr = STATES_PTR + dst_offset
     src_ptr = NEW_STATES_PTR + src_offset
@@ -184,8 +198,8 @@ def _tensor_masked_update_kernel_4d(
     BLOCK_SIZE: tl.constexpr,
 ):
     """Kernel to update values in a 4D states tensor using a mask."""
-    pid_batch = tl.program_id(0)
-    pid_row_chunk = tl.program_id(1)
+    pid_batch = tl.program_id(0).to(tl.int64)
+    pid_row_chunk = tl.program_id(1).to(tl.int64)
 
     target_idx = tl.load(IDX_PTR + pid_batch)
     if target_idx == -1:
@@ -203,24 +217,24 @@ def _tensor_masked_update_kernel_4d(
     # idx_d1 = temp % D1
     # idx_d0 = temp // D1
 
-    idx_d2 = flat_offsets % SIZE_D2
-    temp = flat_offsets // SIZE_D2
-    idx_d1 = temp % SIZE_D1
-    idx_d0 = temp // SIZE_D1
+    idx_d2 = flat_offsets % SIZE_D2.to(tl.int64)
+    temp = flat_offsets // SIZE_D2.to(tl.int64)
+    idx_d1 = temp % SIZE_D1.to(tl.int64)
+    idx_d0 = temp // SIZE_D1.to(tl.int64)
 
     # Calculate pointers using specific strides
     dst_offset = (
-        (target_idx * stride_state_b)
-        + (idx_d0 * stride_state_d0)
-        + (idx_d1 * stride_state_d1)
-        + (idx_d2 * stride_state_d2)
+        (target_idx.to(tl.int64) * stride_state_b.to(tl.int64))
+        + (idx_d0 * stride_state_d0.to(tl.int64))
+        + (idx_d1 * stride_state_d1.to(tl.int64))
+        + (idx_d2 * stride_state_d2.to(tl.int64))
     )
 
     src_offset = (
-        (pid_batch * stride_new_b)
-        + (idx_d0 * stride_new_d0)
-        + (idx_d1 * stride_new_d1)
-        + (idx_d2 * stride_new_d2)
+        (pid_batch * stride_new_b.to(tl.int64))
+        + (idx_d0 * stride_new_d0.to(tl.int64))
+        + (idx_d1 * stride_new_d1.to(tl.int64))
+        + (idx_d2 * stride_new_d2.to(tl.int64))
     )
 
     dst_ptr = STATES_PTR + dst_offset
@@ -240,7 +254,9 @@ def _compute_row_size(tensor):
     return row_size
 
 
-def tensor_get_slice_after(input_tensor, output_tensor, pos_on_device, check_bounds: bool = False):
+def tensor_get_slice_after(
+    input_tensor, output_tensor, pos_on_device, check_bounds: bool = False
+):
     """
     Copy from input_tensor[pos_on_device:] to output_tensor[:copy_size].
     """
@@ -320,7 +336,9 @@ def tensor_merge(
         tensor_a.dtype == tensor_b.dtype == output_tensor.dtype
     ), "All tensors must have the same dtype"
     assert (
-        tensor_a.is_contiguous() and tensor_b.is_contiguous() and output_tensor.is_contiguous()
+        tensor_a.is_contiguous()
+        and tensor_b.is_contiguous()
+        and output_tensor.is_contiguous()
     ), "All tensors must be contiguous"
 
     if check_bounds:
@@ -363,7 +381,9 @@ def tensor_merge(
     )
 
 
-def tensor_masked_update(states: torch.Tensor, idx: torch.Tensor, new_states: torch.Tensor):
+def tensor_masked_update(
+    states: torch.Tensor, idx: torch.Tensor, new_states: torch.Tensor
+):
     """
     Update `states` to `new_states` at `idx`, but ignore any -1 values in `idx`.
     Works for 2D, 3D, or 4D tensors.
@@ -387,7 +407,7 @@ def tensor_masked_update(states: torch.Tensor, idx: torch.Tensor, new_states: to
         row_size *= dim
 
     BLOCK_SIZE = 1024
-    grid = lambda meta: (n_updates, triton.cdiv(row_size, meta['BLOCK_SIZE']))
+    grid = lambda meta: (n_updates, triton.cdiv(row_size, meta["BLOCK_SIZE"]))
 
     if ndim == 2:
         _tensor_masked_update_kernel_2d[grid](
