@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import time
-import uuid
 
 from flask import Blueprint, current_app, jsonify, request
 
@@ -64,16 +63,33 @@ async def completions():
         temperature = float(req.get("temperature", 1.0))
         top_p = float(req.get("top_p", 1.0))
         top_k = int(req.get("top_k", 0))
+        echo = bool(req.get("echo", False))
 
         if temperature == 0.0:
             top_k = 1
             top_p = 0.0
 
+        # Parse logprobs - can be an integer (number of top logprobs to return) or None
+        logprobs_param = req.get("logprobs", None)
+
+        if logprobs_param is not None:
+            top_n_logprobs = int(logprobs_param)
+            return_log_probs = True
+        else:
+            top_n_logprobs = 0
+            return_log_probs = False
+
+        # When echo=True and logprobs are requested, we need prompt logprobs
+        # skip_prompt_log_probs=False ensures the engine computes logprobs for prompt tokens
+        skip_prompt_log_probs = not (echo and return_log_probs)
+
         sampling_params = SamplingParams(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-            return_log_probs=bool(req.get("logprobs", None) is not None),
+            return_log_probs=return_log_probs,
+            top_n_logprobs=top_n_logprobs,
+            skip_prompt_log_probs=skip_prompt_log_probs,
             num_tokens_to_generate=int(req.get("max_tokens", 16)),
         )
     except ValueError as e:
@@ -87,6 +103,8 @@ async def completions():
             top_k=sampling_params.top_k,
             top_p=sampling_params.top_p,
             return_log_probs=sampling_params.return_log_probs,
+            top_n_logprobs=sampling_params.top_n_logprobs,
+            skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
             num_tokens_to_generate=sampling_params.num_tokens_to_generate,
         )
         tasks.append(client.add_request(prompt_tokens, per_req_params))
@@ -101,48 +119,86 @@ async def completions():
         f"Batch of {len(tasks)} requests processed in {time.perf_counter() - start_time:.2f}s"
     )
 
-    # --- 4. Format OpenAI Response ---
-    echo = bool(req.get("echo", False))
+    # --- 4. Format Response (matching old_completions.py) ---
     choices = []
-    total_completion_tokens = 0
 
     request_idx = 0
     for record in batch_results:
         for result in record.requests:
-            full_text = result.generated_text
+            full_text = result.generated_text or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
             logprobs_data = None
             if sampling_params.return_log_probs:
-                token_logprobs = getattr(result, 'log_probs', [])
-                tokens = [tokenizer.detokenize([tok]) for tok in result.generated_tokens]
+                # Get prompt tokens and logprobs
+                prompt_tokens_list = []
+                if result.prompt_tokens is not None:
+                    if hasattr(result.prompt_tokens, 'tolist'):
+                        prompt_tokens_list = result.prompt_tokens.tolist()
+                    else:
+                        prompt_tokens_list = list(result.prompt_tokens)
+
+                prompt_log_probs = getattr(result, 'prompt_log_probs', None) or []
+                prompt_top_n_logprobs = getattr(result, 'prompt_top_n_logprobs', None) or []
+
+                # Get generated tokens and logprobs
+                generated_tokens_list = list(result.generated_tokens) if result.generated_tokens else []
+                generated_log_probs = getattr(result, 'generated_log_probs', None) or []
+                generated_top_n_logprobs = getattr(result, 'generated_top_n_logprobs', None) or []
+
+                if echo:
+                    # When echo=True, include prompt tokens and their logprobs
+                    # Prompt logprobs are for tokens [1:] (first token has no logprob)
+                    all_token_ids = prompt_tokens_list + generated_tokens_list
+                    tokens = [tokenizer.detokenize([tok]) for tok in all_token_ids]
+
+                    # Build token_logprobs: [None] for first token, then prompt logprobs, then generated logprobs
+                    token_logprobs = [None] + list(prompt_log_probs) + list(generated_log_probs)
+
+                    # Build top_logprobs: [None] for first token, then prompt top_n, then generated top_n
+                    top_logprobs = None
+                    if prompt_top_n_logprobs or generated_top_n_logprobs:
+                        top_logprobs = [None] + list(prompt_top_n_logprobs) + list(generated_top_n_logprobs)
+
+                    # Calculate text_offset: cumulative character positions starting from 0
+                    text_offset = []
+                    current_offset = 0
+                    for tok_str in tokens:
+                        text_offset.append(current_offset)
+                        current_offset += len(tok_str)
+                else:
+                    # When echo=False, only return generated tokens and their logprobs
+                    tokens = [tokenizer.detokenize([tok]) for tok in generated_tokens_list]
+
+                    # Prepend [None] to match OpenAI format
+                    token_logprobs = [None] + list(generated_log_probs)
+
+                    # Build top_logprobs
+                    top_logprobs = None
+                    if generated_top_n_logprobs:
+                        top_logprobs = [None] + list(generated_top_n_logprobs)
+
+                    # Calculate text_offset for generated tokens only
+                    text_offset = []
+                    current_offset = 0
+                    for tok_str in tokens:
+                        text_offset.append(current_offset)
+                        current_offset += len(tok_str)
+
                 logprobs_data = {
                     "token_logprobs": token_logprobs,
                     "tokens": tokens,
-                    "text_offset": [],
-                    "top_logprobs": [],
+                    "text_offset": text_offset,
+                    "top_logprobs": top_logprobs,
                 }
 
             choices.append(
                 {
-                    "index": 0,
+                    "index": request_idx,
                     "text": text_output,
                     "logprobs": logprobs_data,
-                    "finish_reason": "length",
                 }
             )
-            total_completion_tokens += len(result.generated_tokens)
             request_idx += 1
 
-    response = {
-        "id": f"cmpl-{uuid.uuid4()}",
-        "object": "text_completion",
-        "created": int(time.time()),
-        "choices": choices,
-        "usage": {
-            "prompt_tokens": sum(len(p) for p in prompts_as_tokens),
-            "completion_tokens": total_completion_tokens,
-            "total_tokens": sum(len(p) for p in prompts_as_tokens) + total_completion_tokens,
-        },
-    }
-    return jsonify(response)
+    return jsonify({"choices": choices})
