@@ -15,6 +15,8 @@ from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDat
 from megatron.core.datasets.utils import Split, normalize
 from megatron.core.utils import log_single_rank
 
+import time
+
 logger = logging.getLogger(__name__)
 
 MidLevelDataset = MegatronDataset
@@ -395,10 +397,11 @@ class BlendedMegatronDatasetBuilder(object):
                     megatron_datasets, num_workers, prefixes, split, sizes_per_dataset
                 )
 
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
 
             # Then, build on other ranks; guaranteed to be data_cache hit
             if rank != 0:
+                time.sleep(10)
                 _threading_helper(
                     megatron_datasets,
                     num_dataset_builder_threads,

@@ -351,10 +351,13 @@ def test_fast_builder(
     if use_split and fast_cache_load:
         pytest.skip("Skipping test case when both use_split and fast_cache_load are True")
 
-    Utils.initialize_distributed()
-    if torch.distributed.get_rank() == 0:
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
         compile_helpers()
-    torch.distributed.barrier()
 
     tokenizer = build_tokenizer(
         Namespace(
