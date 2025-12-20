@@ -7,6 +7,6 @@ Multi-Latent Attention ("MLA") is an innovative attention mechanism introduced b
 ## Enabling Multi-Latent Attention
 
 To enable MLA in Megatron-LM, set the following flags in command line:
-- `--multi-latent-attention` to enable MLA in MLP.
+- `--multi-latent-attention` to enable MLA.
 - Set `MLATransformerConfig` to configure MLA.
 
