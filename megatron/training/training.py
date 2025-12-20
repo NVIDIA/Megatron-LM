@@ -2026,7 +2026,7 @@ def training_log(
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
-        log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+        log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
         if has_rl_utils and args.rl_use_sequence_packing:
@@ -3006,7 +3006,7 @@ def train(
     if args.log_energy:
         energy_monitor.lap()
         total_energy = energy_monitor.get_total()
-        print_rank_0(f"Total training energy (GPU): {total_energy / 1e6} MJ")
+        print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
