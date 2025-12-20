@@ -8,7 +8,7 @@ import os
 import tempfile
 from argparse import Namespace
 from collections import defaultdict
-from random import randint
+import random
 from typing import Dict, Optional
 
 import numpy
@@ -51,11 +51,11 @@ def create_file_prefixes(tokenizer, number_of_files, maximum_number_of_documents
         builder = IndexedDatasetBuilder(
             file_prefix_path + ".bin", dtype=DType.optimal_dtype(tokenizer.vocab_size)
         )
-        number_of_documents = randint(10, maximum_number_of_documents)
+        number_of_documents = random.randint(10, maximum_number_of_documents)
         for j in range(number_of_documents):
-            number_of_tokens = randint(5000, 10000)
+            number_of_tokens = random.randint(5000, 10000)
             tokenized_doc = [
-                str(randint(0, tokenizer.vocab_size - 1)) for _ in range(number_of_tokens)
+                str(random.randint(0, tokenizer.vocab_size - 1)) for _ in range(number_of_tokens)
             ]
             builder.add_document(tokenized_doc, [len(tokenized_doc)])
         builder.finalize(file_prefix_path + ".idx")
@@ -358,6 +358,8 @@ def test_fast_builder(
         torch.distributed.barrier()
     else:
         compile_helpers()
+    
+    random.seed(1234)
 
     tokenizer = build_tokenizer(
         Namespace(
@@ -408,14 +410,14 @@ def test_fast_builder(
                 # For train_file_prefixes, alternately append a random int (10-100) and the file prefix.
                 train_file_prefixes = []
                 for fp in train_file_prefixes_original:
-                    train_file_prefixes.extend([randint(10, 100), fp])
+                    train_file_prefixes.extend([random.randint(10, 100), fp])
                 # For valid/test, also add random weights (10-100).
                 valid_file_prefixes = []
                 for fp in valid_file_prefixes_original:
-                    valid_file_prefixes.extend([randint(10, 100), fp])
+                    valid_file_prefixes.extend([random.randint(10, 100), fp])
                 test_file_prefixes = []
                 for fp in test_file_prefixes_original:
-                    test_file_prefixes.extend([randint(10, 100), fp])
+                    test_file_prefixes.extend([random.randint(10, 100), fp])
 
             args.train_data_path = train_file_prefixes
             args.valid_data_path = valid_file_prefixes
