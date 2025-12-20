@@ -404,11 +404,11 @@ If loading for either inference or finetuning, use the following arguments:
 --normalization RMSNorm \
 --position-embedding-type rope \
 --no-masked-softmax-fusion \
---attention-softmax-in-fp32
+--attention-softmax-in-fp32 \
 --apply-layernorm-1p \
 --transformer-impl transformer_engine \
 --group-query-attention 8 \
---disable-bia-linear \
+--disable-bias-linear \
 --rotary-base 1000000 \
 --rotary-percent 1.0 \
 --swiglu \
