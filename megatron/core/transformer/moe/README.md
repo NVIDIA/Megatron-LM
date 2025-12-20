@@ -84,7 +84,7 @@ To enable the token drop mechanism, such as GShard and SwitchTransformer, includ
 --moe-pad-expert-input-to-capacity # Optional
 ```
 
-The following figure illustrates differenting dropping strategies in MCore:
+The following figure illustrates different dropping strategies in MCore:
 <!-- This image is uncommented for now as Sphinx cannot resolve this path. Sphinx imports this markdown file, and from the imported location this relative path does not exist anymore. Ideally, this markdown should not live here but rather in the `docs/` directory that Sphinx uses. -->
 <!-- ![Token Droppling Strategies](../../../../docs/source/images/moe/token_drop.png) -->
 
@@ -148,7 +148,7 @@ The parallelism patterns of the shared experts follow the settings of the dense 
 
 We also have an experimental feature that tries to overlap the communications and computations in the shared experts and the dispatcher.
 We can set `--moe-shared-expert-overlap` and use `alltoall` dispatcher to enable it.
-The overlapping relies on the envirionment setting `CUDA_DEVICE_MAX_CONNECTIONS=1`.
+The overlapping relies on the environment setting `CUDA_DEVICE_MAX_CONNECTIONS=1`.
 The `AllGather` and `ReduceScatter` communications in the shared experts are overlapped with `permute`/`unpermute` in the dispatcher.
 The `MLP` computation part in the shared experts are overlapped with the `AlltoAll` communications in the dispatcher.
 Both the forward and the backward pass can overlap. But to get the overlapping in the backward pass, the PyTorch version should `>= 2.2.0`.
@@ -210,14 +210,14 @@ To use `--cuda-graph-impl=transformer_engine`, the user should call related meth
 For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-scope=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-scope`.
 
 
-### Batch-Level EP-A2A hidding
+### Batch-Level EP-A2A Hiding
 Enable A2A overlap across different batches inspired by the DSv3 DualPipe implmentation. \
 **Features** 
 - Hide ep a2a communication by batch-level overlapping
 - Split weight gradient and activation gradient computations for better overlap with communications
 - Support interleaved pipelined parallelism
 - Support FP8 training
-- Support MTP (`-mtp-num-layers 1` only, multiple MTP layers are not supported yet.)
+- Support MTP (`--mtp-num-layers 1` only, multiple MTP layers are not supported yet.)
 
 
 **Usage** 
@@ -479,11 +479,11 @@ By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 MoE suffers from a severe load imbalance issue when the router is under-trained, leading to the model easily running out of memory (OOM), which typically occurs in the first 100~300 steps when training from scratch. 
 Therefore, there are two recommended ways during the first 200 steps to avoid the OOM problem, which can be removed after the token distribution is more stable:
 1. Increase the `expert-tensor-parallel-size` and decrease `expert-model-parallel-size` to replace EP with TP in MoELayer, this can prevent the load imbalancing between EP ranks. Since current ETP implementation has some memeory overhead, you can further enable activation recomputation only for MoE Layer by adding `--moe-layer-recompute`.
-2. Setting capacity factor to a relatively small number like 1.0 by adding `--moe-token-capacity-factor 1.0`.
+2. Setting capacity factor to a relatively small number like 1.0 by adding `--moe-expert-capacity-factor 1.0`.
 
 **Leverage DeepSeek's DeepEP for High-Performance Cross-Node Token Dispatching**
 - The primary advantage of DeepEP is its cross-node token communication efficiency, which delivers substantial performance improvements when deploying expert parallelism across multiple nodes with large TopK values.
-- To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-enable-deepep` in your command line arguments.
+- To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-flex-dispatcher-backend=deepep` in your command line arguments.
 
 **FP8 Training Best Practice**
 - Using latest version of [TransformerEngine](https://github.com/NVIDIA/TransformerEngine).
