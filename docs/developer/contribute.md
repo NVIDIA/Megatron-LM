@@ -56,6 +56,6 @@ After 2 business days, use `@megatron-oncall`.
 
 Yes, we have a bot that will mark untouched PRs as "stale" after 60 days.
 
-We have a long backlog of issues and PRs dating back years. We are trying to triage these now by working backwards. Older issues we believe may still be relevant may recieve a request to re-test them with the latest code. If there's no response they may be closed. Again, if you they should be re-opened then just respond with a comment to that effect.
+We have a long backlog of issues and PRs dating back years. We are trying to triage these now by working backwards. Older issues we believe may still be relevant may receive a request to re-test them with the latest code. If there's no response they may be closed. Again, if they should be re-opened then just respond with a comment to that effect.
 
 Thank you!
