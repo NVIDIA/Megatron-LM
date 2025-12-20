@@ -15,7 +15,6 @@ from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDat
 from megatron.core.datasets.utils import Split, normalize
 from megatron.core.utils import log_single_rank
 
-
 logger = logging.getLogger(__name__)
 
 MidLevelDataset = MegatronDataset

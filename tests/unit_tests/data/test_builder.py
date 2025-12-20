@@ -5,10 +5,10 @@
 ##
 
 import os
+import random
 import tempfile
 from argparse import Namespace
 from collections import defaultdict
-import random
 from typing import Dict, Optional
 
 import numpy
@@ -358,9 +358,8 @@ def test_fast_builder(
         torch.distributed.barrier()
     else:
         compile_helpers()
-    
-    random.seed(1234)
 
+    random.seed(1234)
     tokenizer = build_tokenizer(
         Namespace(
             vocab_size=vocab_size,
