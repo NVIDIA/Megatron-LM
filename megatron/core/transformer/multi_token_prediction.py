@@ -689,7 +689,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: torch.Tensor,
         embedding: Callable,
         hidden_states: torch.Tensor,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -704,23 +704,19 @@ class MultiTokenPredictionLayer(MegatronModule):
                 from gpt model to compute the decoder input.
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
-            packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
         """
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
-        input_ids, _ = roll_tensor(
+        input_ids, _ = cp_handler.roll_tensor(
             input_ids,
             shifts=-1,
             dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
         )
-        position_ids, _ = roll_tensor(
+        position_ids, _ = cp_handler.roll_tensor(
             position_ids,
             shifts=-1,
             dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
         )
+
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -763,7 +759,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_sin: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
         inference_params: Optional[InferenceParams] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler=None,
         sequence_len_offset: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -803,7 +799,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     rotary_pos_sin=rotary_pos_sin,
                     attention_bias=attention_bias,
                     inference_params=inference_params,
-                    packed_seq_params=packed_seq_params,
+                    cp_handler=cp_handler,
                     sequence_len_offset=sequence_len_offset,
                 )
 
@@ -876,7 +872,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_sin: Tensor = None,
         attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
+        cp_handler=None,
         sequence_len_offset: Tensor = None,
         embedding=None,
     ):
@@ -909,7 +905,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             position_ids=position_ids,
             embedding=embedding,
             hidden_states=hidden_states,
-            packed_seq_params=packed_seq_params,
+            cp_handler=cp_handler,
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
@@ -925,7 +921,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 rotary_pos_sin=rotary_pos_sin,
                 attention_bias=attention_bias,
                 inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
                 sequence_len_offset=sequence_len_offset,
             )
         else:
@@ -940,7 +936,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 rotary_pos_sin=rotary_pos_sin,
                 attention_bias=attention_bias,
                 inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
                 sequence_len_offset=sequence_len_offset,
             )
 
@@ -1092,7 +1088,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         rotary_pos_sin: Tensor = None,
         attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
+        cp_handler=None,
         sequence_len_offset: Tensor = None,
         extra_block_kwargs: dict = None,
         embedding=None,
@@ -1125,7 +1121,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
                 **(extra_block_kwargs or {}),

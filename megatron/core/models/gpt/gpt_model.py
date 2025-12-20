@@ -21,6 +21,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_init_chunk_handler,
 )
+from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
@@ -281,9 +282,9 @@ class GPTModel(LanguageModule):
         self,
         input_ids: Tensor,
         position_ids: Tensor,
+        cp_handler: ContextParallelHandler,
         decoder_input: Tensor = None,
         inference_context: BaseInferenceContext = None,
-        packed_seq_params: PackedSeqParams = None,
     ):
         """Preprocesses inputs for the transformer decoder.
 
@@ -341,18 +342,18 @@ class GPTModel(LanguageModule):
                     )
             else:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                    inference_context, self.decoder, decoder_input, self.config, cp_handler=cp_handler
                 )
                 rotary_pos_emb = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
+                    rotary_seq_len, cp_handler=cp_handler
                 )
         elif self.position_embedding_type == 'yarn':
             if self.training or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                    inference_context, self.decoder, decoder_input, self.config, cp_handler=cp_handler
                 )
                 rotary_pos_emb, _ = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
+                    rotary_seq_len, cp_handler=cp_handler
                 )
             else:
                 raise NotImplementedError(
@@ -362,7 +363,7 @@ class GPTModel(LanguageModule):
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
                 rotary_pos_emb = self.rotary_pos_emb(
-                    position_ids, self.mrope_section, packed_seq_params=packed_seq_params
+                    position_ids, self.mrope_section, cp_handler=cp_handler
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -437,10 +438,10 @@ class GPTModel(LanguageModule):
         input_ids: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor,
+        cp_handler: ContextParallelHandler,
         decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
-        packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
         runtime_gather_output: Optional[bool] = None,
         *,
@@ -465,9 +466,9 @@ class GPTModel(LanguageModule):
         preproc_output = self._preprocess(
             input_ids=input_ids,
             position_ids=position_ids,
+            cp_handler=cp_handler,
             decoder_input=decoder_input,
             inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
         )
 
         (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = (
@@ -485,7 +486,7 @@ class GPTModel(LanguageModule):
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
             rotary_pos_cos_sin=rotary_pos_cos_sin,
-            packed_seq_params=packed_seq_params,
+            cp_handler=cp_handler,
             sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
         )
@@ -503,7 +504,7 @@ class GPTModel(LanguageModule):
             decoder_input=decoder_input,
             attention_mask=attention_mask,
             inference_params=inference_params,
-            packed_seq_params=packed_seq_params,
+            cp_handler=cp_handler,
             sequence_len_offset=sequence_len_offset,
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
@@ -524,7 +525,7 @@ class GPTModel(LanguageModule):
         decoder_input=None,
         attention_mask=None,
         inference_params=None,
-        packed_seq_params=None,
+        cp_handler=None,
         sequence_len_offset=None,
         runtime_gather_output=None,
         extra_block_kwargs=None,
@@ -553,7 +554,7 @@ class GPTModel(LanguageModule):
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
                 sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,
                 **(extra_block_kwargs or {}),
@@ -572,19 +573,16 @@ class GPTModel(LanguageModule):
                 loss_mask = torch.ones_like(mtp_labels)
             for mtp_layer_number in range(self.config.mtp_num_layers):
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
-                mtp_labels, _ = roll_tensor(
+                mtp_labels, _ = cp_handler.roll_tensor(
                     mtp_labels,
                     shifts=-1,
                     dims=-1,
-                    cp_group=self.cp_group,
-                    packed_seq_params=packed_seq_params,
                 )
-                loss_mask, num_tokens = roll_tensor(
+
+                loss_mask, num_tokens = cp_handler.roll_tensor(
                     loss_mask,
                     shifts=-1,
                     dims=-1,
-                    cp_group=self.cp_group,
-                    packed_seq_params=packed_seq_params,
                 )
 
                 # Compute mtp loss without storing logits to save memory.

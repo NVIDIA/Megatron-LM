@@ -202,6 +202,7 @@ class MultiLatentAttention(Attention):
     def forward(
         self,
         hidden_states,
+        cp_handler,
         attention_mask,
         key_value_states=None,
         inference_context=None,
@@ -210,7 +211,6 @@ class MultiLatentAttention(Attention):
         rotary_pos_sin=None,
         rotary_pos_cos_sin=None,
         attention_bias=None,
-        packed_seq_params=None,
         position_ids=None,
         sequence_len_offset=None,
         *,
@@ -249,7 +249,7 @@ class MultiLatentAttention(Attention):
                 hidden_states,
                 key_value_states,
                 position_ids,
-                packed_seq_params,
+                cp_handler,
                 inference_context=inference_context,
             )
         elif self.config.experimental_attention_variant == "dsa":
@@ -257,7 +257,7 @@ class MultiLatentAttention(Attention):
                 hidden_states,
                 key_value_states,
                 position_ids,
-                packed_seq_params,
+                cp_handler,
                 inference_context=inference_context,
                 return_compressed_tensors=True,
             )
@@ -289,7 +289,7 @@ class MultiLatentAttention(Attention):
         # Need corresponding TE change
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, packed_seq_params=packed_seq_params
+                query, key, value, attention_mask, cp_handler=cp_handler
             )
         else:
             if self.offload_core_attention and self.training:
@@ -303,7 +303,7 @@ class MultiLatentAttention(Attention):
                             key,
                             value,
                             attention_mask,
-                            packed_seq_params=packed_seq_params,
+                            cp_handler=cp_handler,
                             attn_mask_type=attn_mask_type,
                         )
                     elif self.config.experimental_attention_variant == "dsa":
@@ -318,7 +318,7 @@ class MultiLatentAttention(Attention):
                             attention_mask=attention_mask,
                             attn_mask_type=attn_mask_type,
                             attention_bias=None,
-                            packed_seq_params=packed_seq_params,
+                            cp_handler=cp_handler,
                         )
                     else:
                         raise ValueError(
@@ -359,7 +359,7 @@ class MultiLatentAttention(Attention):
             # Flatten back: [seq, batch, num_heads * v_head_dim]
             core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if cp_handler is not None and cp_handler.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
@@ -541,7 +541,7 @@ class MLASelfAttention(MultiLatentAttention):
         hidden_states,
         key_value_states=None,
         position_ids=None,
-        packed_seq_params=None,
+        cp_handler=None,
         inference_context=None,
         *,
         inference_params=None,
@@ -555,9 +555,9 @@ class MLASelfAttention(MultiLatentAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
+        if cp_handler is not None:
             assert (
-                packed_seq_params.local_cp_size is None
+                cp_handler.local_cp_size is None
             ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
             Please disable hybrid_context_parallel."
 
@@ -567,22 +567,22 @@ class MLASelfAttention(MultiLatentAttention):
         # Prepare RoPE and seqlen related params
         # =========================================
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            inference_context, None, hidden_states, self.config, packed_seq_params
+            inference_context, None, hidden_states, self.config, cp_handler
         )
 
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        packed_seq = cp_handler is not None and cp_handler.qkv_format == 'thd'
         if self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len, packed_seq_params=packed_seq_params
+                rotary_seq_len, cp_handler=cp_handler
             )
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq_params=packed_seq_params
+                    rotary_seq_len, dtype=hidden_states.dtype, cp_handler=cp_handler
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -592,18 +592,12 @@ class MLASelfAttention(MultiLatentAttention):
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
                 rotary_pos_emb, mscale = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
+                    rotary_seq_len, cp_handler=cp_handler
                 )
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            if packed_seq_params.cu_seqlens_q_padded is not None:
-                cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
-            else:
-                cu_seqlens_q = packed_seq_params.cu_seqlens_q
-            if packed_seq_params.cu_seqlens_kv_padded is not None:
-                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
-            else:
-                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+        if cp_handler is not None and cp_handler.qkv_format == 'thd':
+            cu_seqlens_q = cp_handler.cu_seqlens_q_padded if cp_handler.cu_seqlens_q_padded is not None else cp_handler.cu_seqlens_q
+            cu_seqlens_kv = cp_handler.cu_seqlens_kv_padded if cp_handler.cu_seqlens_kv_padded is not None else cp_handler.cu_seqlens_kv
         else:
             cu_seqlens_q = cu_seqlens_kv = None
 
@@ -653,7 +647,7 @@ class MLASelfAttention(MultiLatentAttention):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
-        if packed_seq_params is not None:
+        if cp_handler is not None and cp_handler.qkv_format == 'thd':
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
             # In Megatron-Core, the qkv shape is [t, 1, h, d].
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
@@ -808,7 +802,7 @@ class MLASelfAttention(MultiLatentAttention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or self.config.context_parallel_size == 1:
+                elif cp_handler is None or self.config.context_parallel_size == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -832,22 +826,16 @@ class MLASelfAttention(MultiLatentAttention):
                 )
 
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_pos_emb = apply_rotary_pos_emb(
+                q_pos_emb = cp_handler.apply_rotary_pos_emb(
                     q_pos_emb,
                     rotary_pos_emb,
                     config=self.config,
-                    cu_seqlens=cu_seqlens_q,
-                    mscale=mscale,
-                    cp_group=self.pg_collection.cp,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-                k_pos_emb = apply_rotary_pos_emb(
+                k_pos_emb = cp_handler.apply_rotary_pos_emb(
                     k_pos_emb,
                     rotary_pos_emb,
                     config=self.config,
-                    cu_seqlens=cu_seqlens_kv,
-                    mscale=mscale,
-                    cp_group=self.pg_collection.cp,
                 )
 
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]

@@ -159,40 +159,34 @@ class YarnRotaryEmbedding(RotaryEmbedding):
 
     @internal_api
     def forward(
-        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+        self, max_seq_len: int, offset: int = 0, cp_handler: Optional[PackedSeqParams] = None
     ) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
-            packed_seq_params (PackedSeqParams, optional): Packed sequence params. Defaults to None.
+            cp_handler (PackedSeqParams, optional): Packed sequence params. Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying Yarn RoPE.
         """
         emb, _mscale = self.get_emb(max_seq_len, offset)
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            # Set CP group to dynamic CP group for CP slicing
-            cp_group = packed_seq_params.cp_group
-        else:
-            cp_group = self.cp_group
-        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension
-            # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+
+        if cp_handler is not None:
+            emb = cp_handler.get_emb_on_this_cp_rank(emb)
+
         return emb, _mscale
 
-    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq_params=None):
+    def _set_cos_sin_cache(self, seq_len, offset, dtype, cp_handler=None):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
         self.packed_seq_cached = (
-            packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+            cp_handler is not None and cp_handler.qkv_format == 'thd'
         )
 
-        emb, _mscale = self.forward(seq_len, offset, packed_seq_params)
+        emb, _mscale = self.forward(seq_len, offset, cp_handler)
         self.register_buffer(
             "cos_cached", (emb.cos() * _mscale).to(dtype).contiguous(), persistent=False
         )
@@ -201,17 +195,17 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         )
 
     def get_cached_cos_sin(
-        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq_params=None
+        self, seq_len, offset=0, dtype=torch.get_default_dtype(), cp_handler=None
     ):
         """Get cached cos and sin values."""
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        packed_seq = cp_handler is not None and cp_handler.qkv_format == 'thd'
         if (
             seq_len > self.max_seq_len_cached
             or offset != self.offset_cached
             or dtype != self.dtype_cached
             or packed_seq != self.packed_seq_cached
         ):
-            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq_params)
+            self._set_cos_sin_cache(seq_len, offset, dtype, cp_handler)
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
 

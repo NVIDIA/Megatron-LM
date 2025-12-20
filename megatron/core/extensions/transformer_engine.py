@@ -1053,33 +1053,39 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType,
         attention_bias: Tensor = None,
-        packed_seq_params: PackedSeqParams = None,
+        cp_handler = None,
     ):
+        from megatron.core.context_parallel import ContextParallelHandler, TEDynamicContextParallelHandler, TEContextParallelHandler
         """Forward."""
-        if packed_seq_params is not None:
-            # If Dynamic CP group is provided, update TE DPA CP group
-            if packed_seq_params.cp_group is not None:
-                self.cp_group = packed_seq_params.cp_group
-                super().set_context_parallel_group(
-                    self.cp_group,
-                    torch.distributed.get_process_group_ranks(self.cp_group),
-                    TEDotProductAttention.cp_stream,
-                    self.cp_comm_type,
-                )
-            # If cp_group is None but local_cp_size is provided,
-            # Indicates to turn off CP dynamically
-            elif packed_seq_params.local_cp_size is not None:
-                assert (
-                    packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+        if cp_handler is not None:
+            assert isinstance(cp_handler, TEContextParallelHandler), (
+                "cp_handler must be an instance of TEContextParallelHandler."
+            )
+
+        if isinstance(cp_handler, TEDynamicContextParallelHandler):
+            assert hasattr(cp_handler, "cp_group") and cp_handler.cp_group is not None, (
+                "For TEDynamicContextParallelHandler, cp_group must be provided."
+            )
+            assert hasattr(cp_handler, "local_cp_size") and cp_handler.local_cp_size is not None, (
+                "For TEDynamicContextParallelHandler, local_cp_size must be provided."
+            )
+
+            super().set_context_parallel_group(
+                cp_handler.cp_group,
+                torch.distributed.get_process_group_ranks(cp_handler.cp_group),
+                TEDotProductAttention.cp_stream,
+                self.cp_comm_type,
+            )
+
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
+
         packed_seq_kwargs = (
-            {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
-            if packed_seq_params is not None
+            {key: getattr(cp_handler.packed_seq_params(), key) for key in self.kept_packed_seq_params}
+            if isinstance(cp_handler, TEContextParallelHandler) and cp_handler.qkv_format == "thd"
             else {}
         )
+
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}

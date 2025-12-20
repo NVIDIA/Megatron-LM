@@ -36,6 +36,7 @@ from megatron.core.utils import (
     get_pg_rank,
     make_viewless_tensor,
 )
+from megatron.core.context_parallel import ContextParallelHandler
 
 try:
     import transformer_engine.pytorch as te  # pylint: disable=unused-import
@@ -423,11 +424,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,
+        cp_handler: ContextParallelHandler,
         context: Tensor,
         context_mask: Tensor,
         rotary_pos_emb: Tensor,
         attention_bias: Tensor,
-        packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
     ):
         """Forward method with activation checkpointing."""
@@ -459,12 +460,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
+                            cp_handler=cp_handler,
                             context=context,
                             context_mask=context_mask,
                             rotary_pos_emb=rotary_pos_emb,
                             attention_bias=attention_bias,
                             inference_context=None,
-                            packed_seq_params=packed_seq_params,
                         )
                 return hidden_states, context
 
@@ -589,6 +590,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self,
         hidden_states: Union[Tensor, WrappedTensor],
         attention_mask: Optional[Tensor],
+        cp_handler: ContextParallelHandler,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -597,7 +599,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -616,6 +617,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 reference in the calling function.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
+            cp_handler (ContextParallelHandler): A backend-agnostic handler that manages context parallel operations. 
+                It handles communication primitives (e.g., dispatch, combine) and exposes high-level hooks, 
+                ensuring a non-intrusive integration that keeps the model architecture clean.
             context (Tensor, optional): Context tensor for cross-attention.
             context_mask (Tensor, optional): Mask for cross-attention context
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
@@ -628,8 +632,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 Used as an alternative to apply attention mask for TE cuDNN attention.
             inference_context (BaseInferenceContext, optional): Parameters for inference-time
                 optimizations.
-            packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
-                processing.
             dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
                 inference context is for decode-only. This args is only used to uniquely
                 identify decode and non-decode cuda graph runners in the cuda graph manager.
@@ -702,11 +704,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_states = self._checkpointed_forward(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
+                    cp_handler=cp_handler,
                     context=context,
                     context_mask=context_mask,
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
                 )
             else:
@@ -735,6 +737,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
+                            cp_handler=cp_handler,
                             context=context,
                             context_mask=context_mask,
                             rotary_pos_emb=rotary_pos_emb,
@@ -743,7 +746,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             rotary_pos_cos_sin=rotary_pos_cos_sin,
                             attention_bias=attention_bias,
                             inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
 

@@ -28,6 +28,7 @@ from megatron.training.utils import (
     is_first_or_last_pipeline_stage,
 )
 from model_provider import model_provider
+from megatron.core.context_parallel import ContextParallelHandler, get_cp_handler_cls
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
@@ -44,6 +45,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
     args = get_args()
     config = core_transformer_config_from_args(args)
+
+    backend = args.transformer_impl
+    cp_comm_type = args.cp_comm_type
+    cp_handler_cls = get_cp_handler_cls(backend=backend, cp_comm_type=cp_comm_type)
+
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
@@ -53,7 +59,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     batch = get_batch_on_this_tp_rank(
         data_iterator,
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
-        )
+    )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
@@ -62,17 +68,22 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if local_cp_size is not None:
         local_cp_size = int(local_cp_size.item())
 
-    if cu_seqlens is None and local_cp_size is None:
-        # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
-        packed_seq_params = None
-    elif local_cp_size is None:  # Packed THD format
-        assert max_seqlen.dim() == 1
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
-    else: # Hybrid CP format
-        batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-    
-    return (*batch.values(), packed_seq_params)
+    qkv_format = "sbhd" if cu_seqlens is None and local_cp_size is None else "thd"
+
+    cp_handler = cp_handler_cls(
+        qkv_format=qkv_format,
+        backend=backend,
+        cp_comm_type=cp_comm_type,
+        cp_group=parallel_state.get_context_parallel_group(),
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=None if cu_seqlens else batch['tokens'].size(1),
+        max_seqlen_kv=None if cu_seqlens else batch['tokens'].size(1),
+    )
+
+    batch = get_batch_on_this_cp_rank(batch, cp_handler=cp_handler) 
+
+    return (*batch.values(), cp_handler)
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -157,7 +168,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
+        tokens, labels, loss_mask, attention_mask, position_ids, cp_handler = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:
@@ -173,7 +184,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, cp_handler=cp_handler
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

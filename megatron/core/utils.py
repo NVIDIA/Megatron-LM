@@ -1954,18 +1954,17 @@ def is_submodule(module, parent_module, strict=True):
 ### context parallel ###
 ########################
 
-
 def get_batch_on_this_cp_rank(
-    batch: Dict[str, Any], cp_group: Optional[torch.distributed.ProcessGroup] = None
+    batch: Dict[str, Any], cp_handler
 ):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors.
-        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel process group.
-            If provided, uses this group's size and rank. Otherwise, falls back to
-            the current context-parallel settings from parallel_state.
+        cp_handler (ContextParallelHandler): Context parallel handler, 屏蔽了context parallel的具体细节，主要做两个事:
+            1. 实现context parallel的相关parallel方法（dispatch, combine等）
+            2. 当context parallel需要对源代码做修改时，直接提供接口给用户调用，避免将context parallel的逻辑散落在代码各处。
     """
 
     # With causal masking, each token only attends to its prior tokens. Simply split
@@ -1975,29 +1974,11 @@ def get_batch_on_this_cp_rank(
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
     # Determine CP topology either from provided group or from current context parallel state
-    if cp_group is not None:
-        cp_size = get_pg_size(cp_group)
-        cp_rank = get_pg_rank(cp_group)
-    else:
-        cp_size = parallel_state.get_context_parallel_world_size()
-        cp_rank = parallel_state.get_context_parallel_rank()
-
-    if cp_size > 1:
-        for key, val in batch.items():
-            if val is not None:
-                seq_dim = 1 if key != 'attention_mask' else 2
-                val = val.view(
-                    *val.shape[0:seq_dim],
-                    2 * cp_size,
-                    val.shape[seq_dim] // (2 * cp_size),
-                    *val.shape[(seq_dim + 1) :],
-                )
-                index = torch.zeros(2, dtype=torch.int64, device=val.device)
-                index[0].fill_(cp_rank)
-                index[1].fill_(2 * cp_size - cp_rank - 1)
-                val = val.index_select(seq_dim, index)
-                val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
-                batch[key] = val
+    for key, val in batch.items():
+        if val is not None:
+            assert isinstance(val, torch.Tensor)
+            seq_dim = 1 if key != 'attention_mask' else 2
+            batch[key] = cp_handler.dispatch(seq_dim=seq_dim, tensor=val)
 
     return batch
 

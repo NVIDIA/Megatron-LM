@@ -31,6 +31,7 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+from megatron.core.context_parallel import ContextParallelHandler
 
 logger = logging.getLogger(__name__)
 
@@ -463,7 +464,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     def _forward_attention(
         self,
         hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,
+        attention_mask: Tensor,
+        cp_handler: Optional[ContextParallelHandler] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -472,7 +474,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         inference_context: Optional[Any] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
@@ -485,6 +486,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
                 b is batch size, and h is hidden size.
             attention_mask (Tensor): Mask tensor for self-attention.
+            cp_handler (ContextParallelHandler): A backend-agnostic handler that manages context parallel operations. 
+                It handles communication primitives (e.g., dispatch, combine) and exposes high-level hooks, 
+                ensuring a non-intrusive integration that keeps the model architecture clean.
             context (Tensor, optional): Context tensor for cross-attention.
             context_mask (Tensor, optional): Mask tensor for cross-attention.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
@@ -494,7 +498,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             attention_bias (Tensor, optional): Bias tensor for Q * K.T.
             inference_context (object, optional): Parameters for inference-time optimizations.
-            packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
 
@@ -533,13 +536,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
+            cp_handler=cp_handler,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")

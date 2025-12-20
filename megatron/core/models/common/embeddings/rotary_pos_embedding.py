@@ -177,7 +177,7 @@ class RotaryEmbedding(nn.Module):
 
     @internal_api
     def forward(
-        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+        self, max_seq_len: int, offset: int = 0, cp_handler = None
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
@@ -190,17 +190,8 @@ class RotaryEmbedding(nn.Module):
             Tensor: Embeddings after applying RoPE.
         """
         emb = self.get_emb(max_seq_len, offset)
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            # Set CP group to dynamic CP group for CP slicing
-            cp_group = packed_seq_params.cp_group
-        else:
-            cp_group = self.cp_group
-
-        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension
-            # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+        if cp_handler is not None:
+            emb = cp_handler.get_emb_on_this_cp_rank(emb)
 
         return emb
 
@@ -214,7 +205,7 @@ class RotaryEmbedding(nn.Module):
         transformer: TransformerBlock,
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> int:
@@ -234,10 +225,10 @@ class RotaryEmbedding(nn.Module):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        if packed_seq_params is not None:
+        if cp_handler is not None:
             # max_seqlen are the max sequence length in the packed sequence before being divived
             # by the tp and cp size.
-            return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
+            return max(cp_handler.max_seqlen_q, cp_handler.max_seqlen_kv)
         elif inference_context is not None:
             rotary_seq_len = inference_context.max_sequence_length
         else:
