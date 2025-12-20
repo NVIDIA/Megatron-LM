@@ -2,17 +2,18 @@
 
 """Unit tests for stop word functionality in dynamic inference."""
 
-import pytest
 from dataclasses import dataclass, field
 from typing import List, Optional
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from megatron.core.inference.sampling_params import SamplingParams
 
 
 class MockDynamicInferenceRequest:
     """Mock class for DynamicInferenceRequest to test stop word detection."""
-    
+
     def __init__(
         self,
         request_id: int,
@@ -34,7 +35,7 @@ class TestStopWordDetection:
     ) -> bool:
         """
         Check if a request should stop due to stop words (after token is appended).
-        
+
         This mirrors the logic in DynamicInferenceEngine._check_stop_words_for_request_post_append
         """
         # Check if request has stop words configured
@@ -56,18 +57,14 @@ class TestStopWordDetection:
     def test_no_stop_words_configured(self):
         """Test that requests without stop words configured don't trigger stop."""
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 300],
-            stop_word_ids=None,
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=None
         )
         assert self._check_stop_words_for_request_post_append(request) is False
 
     def test_empty_stop_words_list(self):
         """Test that empty stop words list doesn't trigger stop."""
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 300],
-            stop_word_ids=[],
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[]
         )
         assert self._check_stop_words_for_request_post_append(request) is False
 
@@ -75,18 +72,14 @@ class TestStopWordDetection:
         """Test detection of single-token stop word."""
         # Stop word is token 300
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 300],
-            stop_word_ids=[[300]],
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[300]]
         )
         assert self._check_stop_words_for_request_post_append(request) is True
 
     def test_single_token_stop_word_no_match(self):
         """Test no detection when single-token stop word doesn't match."""
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 300],
-            stop_word_ids=[[400]],
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[400]]
         )
         assert self._check_stop_words_for_request_post_append(request) is False
 
@@ -94,9 +87,7 @@ class TestStopWordDetection:
         """Test detection of multi-token stop word."""
         # Stop word is tokens [200, 300]
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 300],
-            stop_word_ids=[[200, 300]],
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[200, 300]]
         )
         assert self._check_stop_words_for_request_post_append(request) is True
 
@@ -104,9 +95,7 @@ class TestStopWordDetection:
         """Test no detection when only partial stop word matches."""
         # Stop word is [200, 300], but generated ends with [100, 200]
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200],
-            stop_word_ids=[[200, 300]],
+            request_id=1, generated_tokens=[100, 200], stop_word_ids=[[200, 300]]
         )
         assert self._check_stop_words_for_request_post_append(request) is False
 
@@ -114,36 +103,28 @@ class TestStopWordDetection:
         """Test no detection when tokens are present but in wrong order."""
         # Stop word is [200, 300], but generated ends with [300, 200]
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 300, 200],
-            stop_word_ids=[[200, 300]],
+            request_id=1, generated_tokens=[100, 300, 200], stop_word_ids=[[200, 300]]
         )
         assert self._check_stop_words_for_request_post_append(request) is False
 
     def test_multiple_stop_words_first_matches(self):
         """Test with multiple stop words where first one matches."""
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 300],
-            stop_word_ids=[[300], [400], [500]],
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[300], [400], [500]]
         )
         assert self._check_stop_words_for_request_post_append(request) is True
 
     def test_multiple_stop_words_second_matches(self):
         """Test with multiple stop words where second one matches."""
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 400],
-            stop_word_ids=[[300], [400], [500]],
+            request_id=1, generated_tokens=[100, 200, 400], stop_word_ids=[[300], [400], [500]]
         )
         assert self._check_stop_words_for_request_post_append(request) is True
 
     def test_multiple_stop_words_none_match(self):
         """Test with multiple stop words where none match."""
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 600],
-            stop_word_ids=[[300], [400], [500]],
+            request_id=1, generated_tokens=[100, 200, 600], stop_word_ids=[[300], [400], [500]]
         )
         assert self._check_stop_words_for_request_post_append(request) is False
 
@@ -151,27 +132,21 @@ class TestStopWordDetection:
         """Test that stop word longer than generated tokens doesn't crash."""
         # Stop word is 5 tokens, but only 3 tokens generated
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 300],
-            stop_word_ids=[[1, 2, 3, 4, 5]],
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[1, 2, 3, 4, 5]]
         )
         assert self._check_stop_words_for_request_post_append(request) is False
 
     def test_stop_word_exact_length_match(self):
         """Test stop word that matches entire generated sequence."""
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 300],
-            stop_word_ids=[[100, 200, 300]],
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[100, 200, 300]]
         )
         assert self._check_stop_words_for_request_post_append(request) is True
 
     def test_empty_generated_tokens(self):
         """Test with no generated tokens."""
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[],
-            stop_word_ids=[[300]],
+            request_id=1, generated_tokens=[], stop_word_ids=[[300]]
         )
         assert self._check_stop_words_for_request_post_append(request) is False
 
@@ -179,9 +154,7 @@ class TestStopWordDetection:
         """Test that stop word in middle of sequence doesn't trigger (only end matters)."""
         # Stop word is [200], which is in middle but not at end
         request = MockDynamicInferenceRequest(
-            request_id=1,
-            generated_tokens=[100, 200, 300],
-            stop_word_ids=[[200]],
+            request_id=1, generated_tokens=[100, 200, 300], stop_word_ids=[[200]]
         )
         assert self._check_stop_words_for_request_post_append(request) is False
 
@@ -193,23 +166,23 @@ class TestStopWordTrackingFlow:
         """Test that stop_word_finished_request_ids correctly tracks requests."""
         stop_word_finished_request_ids = set()
         stop_word_being_finished_ids = set()
-        
+
         # Simulate detecting stop word in post_process_requests
         request_id = 42
         stop_word_finished_request_ids.add(request_id)
-        
+
         assert request_id in stop_word_finished_request_ids
         assert len(stop_word_finished_request_ids) == 1
-        
+
         # Simulate callback being called
         active_request_ids = [42, 43, 44]
         result = stop_word_finished_request_ids & set(active_request_ids)
         stop_word_being_finished_ids = result
         stop_word_finished_request_ids -= result
-        
+
         assert request_id in stop_word_being_finished_ids
         assert request_id not in stop_word_finished_request_ids
-        
+
     def test_skip_extra_token_for_stop_word_requests(self):
         """Test that extra token is skipped for stop word finished requests."""
         stop_word_being_finished_ids = {42}
@@ -217,13 +190,13 @@ class TestStopWordTrackingFlow:
             42: [100, 200, 300],  # Already has tokens from previous step
             43: [100, 200],
         }
-        
+
         new_tokens = {42: 999, 43: 301}  # New tokens to potentially append
-        
+
         for request_id, token in new_tokens.items():
             if request_id not in stop_word_being_finished_ids:
                 generated_tokens[request_id].append(token)
-        
+
         # Request 42 should NOT have the extra token
         assert generated_tokens[42] == [100, 200, 300]
         # Request 43 should have the new token
@@ -251,4 +224,3 @@ class TestSamplingParamsStopWords:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
