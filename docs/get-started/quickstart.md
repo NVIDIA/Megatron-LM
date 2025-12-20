@@ -2,13 +2,15 @@
 
 ## Installation
 
-Install Megatron Core with pip:
+### Option 1: Install from PyPI (library only)
 
 ```bash
-# 1. Install Megatron Core with required dependencies
 pip install --no-build-isolation megatron-core[mlm,dev]
+```
 
-# 2. Clone repository for examples
+### Option 2: Install from source (includes examples)
+
+```bash
 git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
 pip install --no-build-isolation .[mlm,dev]
@@ -28,8 +30,8 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 ### LLaMA-3 Training Example
 
 ```bash
-# 8 GPUs, FP8 precision, mock data
-./examples/llama/train_llama3_8b_fp8.sh
+# 8 GPUs, FP8 precision, mock data (H100 GPUs)
+./examples/llama/train_llama3_8b_h100_fp8.sh
 ```
 
 ## Data Preparation
