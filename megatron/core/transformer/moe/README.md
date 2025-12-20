@@ -181,6 +181,24 @@ Note: The MoE model structure is defined through script arguments. All MoE-relat
 - To enable HybridEP, set `--moe-token-dispatcher-type=flex` and
   `--moe-flex-dispatcher-backend=hybridep` in your command line arguments.
 
+#### Building HybridEP from Source
+
+**Example Dockerfile for multi-node RDMA:**
+```dockerfile
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libnvidia-ml-dev
+
+RUN git clone -b hybrid_ep https://github.com/deepseek-ai/DeepEP.git
+ENV HYBRID_EP_MULTINODE=1
+RUN cd DeepEP && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0" MAX_JOBS=8 pip install --no-build-isolation . && \
+    apt-get purge -y libnvidia-ml-dev && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+```
+
+For complete installation instructions (intra-node, MNNVL, multi-node RDMA, and runtime configuration), see the [HybridEP Installation Guide](https://github.com/deepseek-ai/DeepEP/blob/hybrid-ep/Hybrid-EP_Implementation.md#installation).
+
 ### CUDA Graph Support
 CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are two implementations:
 
