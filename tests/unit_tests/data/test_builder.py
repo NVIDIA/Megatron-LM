@@ -351,13 +351,10 @@ def test_fast_builder(
     if use_split and fast_cache_load:
         pytest.skip("Skipping test case when both use_split and fast_cache_load are True")
 
-    if torch.distributed.is_available():
-        Utils.initialize_distributed()
-        if torch.distributed.get_rank() == 0:
-            compile_helpers()
-        torch.distributed.barrier()
-    else:
+    Utils.initialize_distributed()
+    if torch.distributed.get_rank() == 0:
         compile_helpers()
+    torch.distributed.barrier()
 
     tokenizer = build_tokenizer(
         Namespace(
@@ -369,7 +366,7 @@ def test_fast_builder(
         )
     )
 
-    with tempfile.TemporaryDirectory(dir="/opt/data/datasets") as temp_dir:
+    with tempfile.TemporaryDirectory() as temp_dir:
         # Created file_prefixes (tokenizer, Number of files, number of documents, path) --> returns file prefixes (list of strings)
         file_prefixes = create_file_prefixes(
             tokenizer, number_of_files, number_of_documents, os.path.join(temp_dir, "dataset")
