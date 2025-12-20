@@ -88,7 +88,7 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
-        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         if ffn_hidden_size is None:
             if is_expert:
                 raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")
@@ -102,8 +102,13 @@ class MLP(MegatronModule):
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
+        # For GLU/SwiGLU, use stride=2 because each TP rank stores interleaved [gate, up] portions.
+        # This is critical for correct weight resharding across different TP sizes.
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
+            fc1_stride = 2
+        else:
+            fc1_stride = 1
 
         # Use moe_latent_size only for routed experts. 'is_expert' is false for
         # shared_experts.
@@ -121,6 +126,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
+            stride=fc1_stride,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -227,6 +233,7 @@ class MLP(MegatronModule):
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
+
         output, output_bias = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
 
