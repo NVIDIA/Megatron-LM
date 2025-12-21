@@ -1,20 +1,27 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
+import math
 import warnings
 from dataclasses import dataclass, fields
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
+from torch import Tensor
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_expert_data_parallel_rank,
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import MatchContext, QuantizationConfig
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
@@ -22,17 +29,41 @@ from megatron.core.tensor_parallel.random import (
     get_expert_parallel_rng_tracker_name,
 )
 from megatron.core.tensor_parallel.utils import divide
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.transformer.utils import attention_mask_func, make_sharded_tensors_for_checkpoint
+from megatron.core.utils import get_tensor_model_parallel_group_if_none, log_single_rank
+
+logger = logging.getLogger(__name__)
+
 
 # Parsing constant
 _KITCHEN_CONFIG_TYPE_KEY = "kitchen_config_type"
 try:
-    import nvidia_kitchen
-    from nvidia_kitchen.config import QLinearParams, get_qlinear_params_from_qat_params
+    import nvidia_kitchen  # type: ignore[import-not-found]
+
+    # Kitchen imports for SDPA
+    from nvidia_kitchen.attention import (  # type: ignore[import-not-found]
+        QAttentionParams,
+        QuantizedBMM,
+    )
+    from nvidia_kitchen.config import (  # type: ignore[import-not-found]
+        QLinearParams,
+        get_qlinear_params_from_qat_params,
+    )
+    from nvidia_kitchen.config_attention_recipe import (  # type: ignore[import-not-found]
+        get_qattention_params_from_qat_params,
+    )
+    from nvidia_kitchen.config_fa_recipe import (  # type: ignore[import-not-found]
+        get_qfa_params_from_recipe_name,
+    )
+
+    # Kitchen imports for FA
+    from nvidia_kitchen.fa import KitchenFlashAttentionModule  # type: ignore[import-not-found]
+    from nvidia_kitchen.fa_params import QFlashAttentionParams  # type: ignore[import-not-found]
 
     HAVE_KITCHEN = True
 except ImportError:
@@ -40,15 +71,155 @@ except ImportError:
 
     HAVE_KITCHEN = False
     nvidia_kitchen = MagicMock()
+    QuantizedBMM = MagicMock()
+    QAttentionParams = MagicMock()
     QLinearParams = MagicMock()
     get_qlinear_params_from_qat_params = MagicMock()
+    get_qattention_params_from_qat_params = MagicMock()
+    KitchenFlashAttentionModule = MagicMock()
+    QFlashAttentionParams = MagicMock()
+    get_qfa_params_from_recipe_name = MagicMock()
 
 
 class KitchenConfigType(Enum):
     """Configuration object types in config dictionary"""
 
     QLINEAR_PARAMS = "QLinearParams"
-    # Could be extended with attention params e.g. QAttentionParams
+    QATTENTION_PARAMS = "QAttentionParams"
+    QFLASHATTENTION_PARAMS = "QFlashAttentionParams"
+
+    COMPOUND_PARAMS = "CompoundParams"
+
+
+@dataclass
+class QFlashAttentionParamsConfigSchema:
+    """Dataclass to parse values from config dict of 'QFlashAttentionParams' type"""
+
+    kitchen_config_type: KitchenConfigType
+    recipe_name: str
+
+    @classmethod
+    def parse_config_dict(cls, config_dict: Dict[Any, Any]) -> 'QFlashAttentionParamsConfigSchema':
+        """
+        Parse config dictionary and return a schema instance.
+
+
+        Expected config format:
+            {"kitchen_config_type": "QFlashAttentionParams", "recipe_name": <str>}
+        """
+        expected_keys = cls.get_expected_keys()
+        actual_keys = set(config_dict.keys())
+
+        # Check for missing keys
+        missing = expected_keys - actual_keys
+        if missing:
+            raise KeyError(f"Missing required keys: {missing}")
+
+        # Check for unexpected keys
+        unexpected = actual_keys - expected_keys
+        if unexpected:
+            raise KeyError(f"Unexpected keys in config: {unexpected}")
+
+        try:
+            config_type = KitchenConfigType(config_dict[_KITCHEN_CONFIG_TYPE_KEY])
+        except ValueError:
+            raise ValueError(f"Unsupported config type '{config_dict['kitchen_config_type']}'.")
+
+        if config_type != KitchenConfigType.QFLASHATTENTION_PARAMS:
+            raise ValueError(f"Parsing config dict of incorrect type '{config_type}'")
+
+        # Create instance with converted enum
+        return cls(kitchen_config_type=config_type, recipe_name=config_dict["recipe_name"])
+
+    @classmethod
+    def get_expected_keys(cls) -> Set[str]:
+        """Get expected keys from the dataclass fields."""
+        return {field.name for field in fields(cls)}
+
+    def __post_init__(self):
+        # config type check
+        if not isinstance(self.kitchen_config_type, KitchenConfigType):
+            raise TypeError(
+                "kitchen_config_type must be KitchenConfigType, "
+                f"got {type(self.kitchen_config_type)}"
+            )
+
+        if self.kitchen_config_type != KitchenConfigType.QFLASHATTENTION_PARAMS:
+            raise TypeError(
+                f"kitchen_config_type must be QFlashAttentionParams got {self.kitchen_config_type}"
+            )
+        # recipe_name check
+        if not isinstance(self.recipe_name, str):
+            raise ValueError(f"recipe_name must be a string, got {self.recipe_name}")
+
+    def to_kitchen_qfa(self) -> QFlashAttentionParams:
+        """Converts to kitchen library's QFlashAttentionParams object."""
+        return get_qfa_params_from_recipe_name(self.recipe_name)
+
+
+@dataclass
+class QAttentionParamsConfigSchema:
+    """Dataclass to parse values from config dict of 'QAttentionParams' type"""
+
+    kitchen_config_type: KitchenConfigType
+    recipe_idx: int
+
+    @classmethod
+    def parse_config_dict(cls, config_dict: Dict[Any, Any]) -> 'QAttentionParamsConfigSchema':
+        """
+        Parse config dictionary and return a schema instance.
+
+
+        Expected config format: {"kitchen_config_type": "QLinearParams", "recipe_idx": <int>}
+        """
+        expected_keys = cls.get_expected_keys()
+        actual_keys = set(config_dict.keys())
+
+        # Check for missing keys
+        missing = expected_keys - actual_keys
+        if missing:
+            raise KeyError(f"Missing required keys: {missing}")
+
+        # Check for unexpected keys
+        unexpected = actual_keys - expected_keys
+        if unexpected:
+            raise KeyError(f"Unexpected keys in config: {unexpected}")
+
+        try:
+            config_type = KitchenConfigType(config_dict[_KITCHEN_CONFIG_TYPE_KEY])
+        except ValueError:
+            raise ValueError(f"Unsupported config type '{config_dict['kitchen_config_type']}'.")
+
+        if config_type != KitchenConfigType.QATTENTION_PARAMS:
+            raise ValueError(f"Parsing config dict of incorrect type '{config_type}'")
+
+        # Create instance with converted enum
+        return cls(kitchen_config_type=config_type, recipe_idx=config_dict["recipe_idx"])
+
+    @classmethod
+    def get_expected_keys(cls) -> Set[str]:
+        """Get expected keys from the dataclass fields."""
+        return {field.name for field in fields(cls)}
+
+    def __post_init__(self):
+        # config type check
+        if not isinstance(self.kitchen_config_type, KitchenConfigType):
+            raise TypeError(
+                "kitchen_config_type must be KitchenConfigType, "
+                f"got {type(self.kitchen_config_type)}"
+            )
+
+        if self.kitchen_config_type != KitchenConfigType.QATTENTION_PARAMS:
+            raise TypeError(
+                f"kitchen_config_type must be QAttentionParams got {self.kitchen_config_type}"
+            )
+        # recipe_idx check
+        if not isinstance(self.recipe_idx, int) or self.recipe_idx <= 0:
+            raise ValueError(f"recipe_idx must be a positive integer, got {self.recipe_idx}")
+
+    def to_kitchen_qattention(self) -> QAttentionParams:
+        """Converts to kitchen library's QAttentionParams object."""
+        return get_qattention_params_from_qat_params(self.recipe_idx)
 
 
 @dataclass
@@ -117,15 +288,124 @@ class QLinearParamsConfigSchema:
 
 
 @dataclass
+class CompoundParamsConfigSchema:
+    """Dataclass to parse values from config dict of 'CompoundParams' type"""
+
+    kitchen_config_type: KitchenConfigType
+    configs: Dict[Any, Any]
+
+    q_linear_params: Optional[QLinearParamsConfigSchema] = None
+    q_attention_params: Optional[QAttentionParamsConfigSchema] = None
+    q_fa_params: Optional[QFlashAttentionParamsConfigSchema] = None
+
+    @classmethod
+    def parse_config_dict(cls, config_dict: Dict[Any, Any]) -> 'CompoundParamsConfigSchema':
+        """
+        Parse config dictionary and return a schema instance.
+
+        Expected config format: {
+            "kitchen_config_type": "CompoundParams",
+            "configs": [
+                {"kitchen_config_type": "QLinearParams", "recipe_idx": <int>},
+                {"kitchen_config_type": "QAttentionParams", "recipe_idx": <int>},
+            ]
+        }
+
+        or {
+            "kitchen_config_type": "CompoundParams",
+            "configs": [
+                {"kitchen_config_type": "QLinearParams", "recipe_idx": <int>},
+                {"kitchen_config_type": "QFlashAttentionParams", "recipe_name": <str>},
+            ]
+        }
+        """
+        expected_keys = cls.get_expected_keys()
+        actual_keys = set(config_dict.keys())
+
+        # Check for missing keys
+        missing = expected_keys - actual_keys
+        if missing:
+            raise KeyError(f"Missing required keys: {missing}")
+
+        # Check for unexpected keys
+        unexpected = actual_keys - expected_keys
+        if unexpected:
+            raise KeyError(f"Unexpected keys in config: {unexpected}")
+
+        try:
+            config_type = KitchenConfigType(config_dict[_KITCHEN_CONFIG_TYPE_KEY])
+        except ValueError:
+            raise ValueError(f"Unsupported config type '{config_dict['kitchen_config_type']}'.")
+
+        if config_type != KitchenConfigType.COMPOUND_PARAMS:
+            raise ValueError(f"Parsing config dict of incorrect type '{config_type}'")
+
+        # Create instance with converted enum
+        return cls(kitchen_config_type=config_type, configs=config_dict["configs"])
+
+    @classmethod
+    def get_expected_keys(cls) -> Set[str]:
+        """Get expected keys from the dataclass fields."""
+        return {
+            field.name
+            for field in fields(cls)
+            if field.name not in ["q_linear_params", "q_attention_params", "q_fa_params"]
+        }
+
+    def __post_init__(self):
+        if not isinstance(self.kitchen_config_type, KitchenConfigType):
+            raise TypeError(
+                "kitchen_config_type must be KitchenConfigType, "
+                f"got {type(self.kitchen_config_type)}"
+            )
+
+        if self.kitchen_config_type != KitchenConfigType.COMPOUND_PARAMS:
+            raise TypeError(
+                f"kitchen_config_type must be CompoundParams got {self.kitchen_config_type}"
+            )
+
+        for config in self.configs:
+            if config["kitchen_config_type"] == KitchenConfigType.QLINEAR_PARAMS.value:
+                self.q_linear_params = QLinearParamsConfigSchema.parse_config_dict(config)
+            elif config["kitchen_config_type"] == KitchenConfigType.QATTENTION_PARAMS.value:
+                self.q_attention_params = QAttentionParamsConfigSchema.parse_config_dict(config)
+            elif config["kitchen_config_type"] == KitchenConfigType.QFLASHATTENTION_PARAMS.value:
+                self.q_fa_params = QFlashAttentionParamsConfigSchema.parse_config_dict(config)
+            else:
+                raise ValueError(f"Unsupported config type '{config['kitchen_config_type']}'.")
+
+    def get_qlinear_params(self) -> Optional[QLinearParams]:
+        """
+        Returns the QLinearParams object for the compound params.
+        """
+        return self.q_linear_params.to_kitchen_qlinear() if self.q_linear_params else None
+
+    def get_qattention_params(self) -> Optional[QAttentionParams]:
+        """
+        Returns the QAttentionParams object for the compound params.
+        """
+        return self.q_attention_params.to_kitchen_qattention() if self.q_attention_params else None
+
+    def get_qfa_params(self) -> Optional[QFlashAttentionParams]:
+        """
+        Returns the QFlashAttentionParams object for the compound params.
+        """
+        return self.q_fa_params.to_kitchen_qfa() if self.q_fa_params else None
+
+
+@dataclass
 class KitchenQuantizationParams:
     """Quantization parameters used for kitchen extensions"""
 
-    qlinear_params: Optional[QLinearParams]
-    # Could be extended with attention params,
-    # sparsity, etc.
+    # Could be extended with sparsity, etc.
     # match_input is what selected the config.
+    qlinear_params: Optional[QLinearParams]
+
     match_input: MatchContext
     params_config_key: str
+
+    qattention_params: Optional[QAttentionParams] = None
+    qfa_params: Optional[QFlashAttentionParams] = None
 
     @staticmethod
     def parse_from_config(quant_config: QuantizationConfig) -> "KitchenQuantizationParams":
@@ -151,6 +431,37 @@ class KitchenQuantizationParams:
                 qlinear_params=QLinearParamsConfigSchema.parse_config_dict(
                     config
                 ).to_kitchen_qlinear(),
+                qattention_params=None,
+                qfa_params=None,
+                match_input=quant_config.match_input,
+                params_config_key=quant_config.config_key,
+            )
+        elif config_type == KitchenConfigType.QATTENTION_PARAMS:
+            return KitchenQuantizationParams(
+                qlinear_params=None,
+                qattention_params=QAttentionParamsConfigSchema.parse_config_dict(
+                    config
+                ).to_kitchen_qattention(),
+                qfa_params=None,
+                match_input=quant_config.match_input,
+                params_config_key=quant_config.config_key,
+            )
+        elif config_type == KitchenConfigType.QFLASHATTENTION_PARAMS:
+            return KitchenQuantizationParams(
+                qlinear_params=None,
+                qattention_params=None,
+                qfa_params=QFlashAttentionParamsConfigSchema.parse_config_dict(
+                    config
+                ).to_kitchen_qfa(),
+                match_input=quant_config.match_input,
+                params_config_key=quant_config.config_key,
+            )
+        elif config_type == KitchenConfigType.COMPOUND_PARAMS:
+            compound_params = CompoundParamsConfigSchema.parse_config_dict(config)
+            return KitchenQuantizationParams(
+                qlinear_params=compound_params.get_qlinear_params(),
+                qattention_params=compound_params.get_qattention_params(),
+                qfa_params=compound_params.get_qfa_params(),
                 match_input=quant_config.match_input,
                 params_config_key=quant_config.config_key,
             )
@@ -1018,17 +1329,401 @@ class KitchenLayerNormColumnParallelLinear(nvidia_kitchen.LayerNormLinear):
         )
 
 
+class KitchenFlashAttention(MegatronModule):
+    """
+    Flash Attention implementation for Kitchen.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        attention_dropout: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        super().__init__(config=config)
+
+        self.config = config
+
+        self.is_first_microbatch = True
+
+        assert (
+            self.config.context_parallel_size == 1
+        ), "Context parallelism is not supported by KitchenDotProductAttention!"
+
+        assert (
+            self.config.window_size is None
+        ), "Sliding Window Attention is not supported by KitchenDotProductAttention!"
+
+        self.layer_number = max(1, layer_number)
+        self.attn_mask_type = attn_mask_type
+        self.attention_type = attention_type  # unused for now
+
+        kv_channels = self.config.kv_channels
+        assert kv_channels is not None, "kv_channels must be set for KitchenFlashAttention"
+        projection_size = kv_channels * self.config.num_attention_heads
+
+        # Per attention head and per partition values.
+        if pg_collection is None:
+            raise ValueError("DotProductAttention was called without ProcessGroupCollection")
+        else:
+            assert hasattr(
+                pg_collection, 'tp'
+            ), "DotProductAttention pg_collection must have tp process group"
+
+        world_size = pg_collection.tp.size()
+        self.hidden_size_per_partition = divide(projection_size, world_size)
+        self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads)
+        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
+        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+
+        coeff = None
+        if softmax_scale is None:
+            self.softmax_scale = 1.0 / math.sqrt(self.hidden_size_per_attention_head)
+        else:
+            self.softmax_scale = softmax_scale
+
+        if self.config.apply_query_key_layer_scaling:
+            coeff = self.layer_number
+            self.softmax_scale /= coeff
+
+        self.attention_dropout = (
+            self.config.attention_dropout if attention_dropout is None else attention_dropout
+        )
+
+        self.init_finished = False
+
+    def finish_init(self, quantization_config: QuantizationConfig):
+        """
+        Finishes the initialization of the KitchenFlashAttention module.
+        """
+        extra_kwargs = _get_extra_kitchen_kwargs(self.config)
+        self.kitchen_quant_params = KitchenQuantizationParams.parse_from_config(quantization_config)
+        extra_kwargs["qfa_params"] = self.kitchen_quant_params.qfa_params
+
+        self.flash_attention_module = KitchenFlashAttentionModule(
+            num_attention_heads=self.config.num_attention_heads,
+            kv_channels=self.config.kv_channels,
+            num_gqa_groups=self.config.num_query_groups,
+            attention_dropout=self.attention_dropout,
+            qkv_format='sbhd',
+            attn_mask_type=self.attn_mask_type.name,
+            window_size=self.config.window_size,
+            sequence_parallel=self.config.sequence_parallel,
+            # tp_size=self.config.tensor_model_parallel_size,
+            get_rng_state_tracker=(
+                None  # TODO(Frank): Support cuda rng tracker for dropout.
+                # get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+            ),
+            layer_number=self.layer_number,
+            attention_type=self.attention_type,
+            softmax_scale=self.softmax_scale,
+            qfa_params=self.kitchen_quant_params.qfa_params,
+        )
+        self.init_finished = True
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        attn_mask_type: AttnMaskType = None,
+        attention_bias: Tensor = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Forward."""
+        assert self.init_finished, "Must call finish_init before forward."
+        assert packed_seq_params is None, (
+            "Packed sequence is not supported by KitchenDotProductAttention."
+            "Please use TEDotProductAttention instead."
+        )
+        assert (
+            attention_bias is None
+        ), "Attention bias is not supported for KitchenDotProductAttention."
+        _is_first_microbatch = self.is_first_microbatch
+
+        # TODO(Frank): Handles group query attention internally to kitchen backend.
+        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
+            key = key.repeat_interleave(
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
+            )
+            value = value.repeat_interleave(
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
+            )
+
+        if attn_mask_type is not None:
+            assert (
+                attn_mask_type == AttnMaskType.causal
+            ), "Only causal mask is supported for KitchenFlashAttention."
+        attn_mask_type_str = "causal"
+
+        # TODO(Frank): Figure out the story for qkv_layout
+        core_attn_out = self.flash_attention_module(
+            query,
+            key,
+            value,
+            attn_mask_type=attn_mask_type_str,
+            window_size=self.config.window_size,
+            is_first_microbatch=_is_first_microbatch,
+        )
+        self.is_first_microbatch = False
+
+        return core_attn_out
+
+
+class KitchenDotProductAttention(MegatronModule):
+    """
+    Region where selective activation recomputation is applied.
+    This region is memory intensive but less compute intensive which
+    makes activation checkpointing more efficient for LLMs (20B+).
+    See Reducing Activation Recomputation in Large Transformer Models:
+    https://arxiv.org/abs/2205.05198 for more details.
+
+    We use the following notation:
+     h: hidden size
+     n: number of attention heads
+     p: number of tensor model parallel partitions
+     b: batch size
+     s: sequence length
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        attention_dropout: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        super().__init__(config=config)
+
+        self.config: TransformerConfig = config
+
+        assert (
+            self.config.context_parallel_size == 1
+        ), "Context parallelism is not supported by KitchenDotProductAttention!"
+
+        assert (
+            self.config.window_size is None
+        ), "Sliding Window Attention is not supported by KitchenDotProductAttention!"
+
+        self.layer_number = max(1, layer_number)
+        self.attn_mask_type = attn_mask_type
+        self.attention_type = attention_type  # unused for now
+
+        kv_channels = self.config.kv_channels
+        assert kv_channels is not None, "kv_channels must be set for KitchenFlashAttention"
+        projection_size = kv_channels * self.config.num_attention_heads
+
+        # Per attention head and per partition values.
+        if pg_collection is None:
+            raise ValueError("DotProductAttention was called without ProcessGroupCollection")
+        else:
+            assert hasattr(
+                pg_collection, 'tp'
+            ), "DotProductAttention pg_collection must have tp process group"
+
+        world_size = pg_collection.tp.size()
+        self.hidden_size_per_partition = divide(projection_size, world_size)
+        self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads)
+        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
+        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+
+        coeff = None
+        if softmax_scale is None:
+            self.softmax_scale = 1.0 / math.sqrt(self.hidden_size_per_attention_head)
+        else:
+            self.softmax_scale = softmax_scale
+
+        if self.config.apply_query_key_layer_scaling:
+            coeff = self.layer_number
+            self.softmax_scale /= coeff
+
+        self.scale_mask_softmax = FusedScaleMaskSoftmax(
+            input_in_fp16=self.config.fp16,
+            input_in_bf16=self.config.bf16,
+            attn_mask_type=self.attn_mask_type,
+            scaled_masked_softmax_fusion=self.config.masked_softmax_fusion,
+            mask_func=attention_mask_func,
+            softmax_in_fp32=self.config.attention_softmax_in_fp32,
+            scale=coeff,
+        )
+
+        # Dropout. Note that for a single iteration, this layer will generate
+        # different outputs on different number of parallel partitions but
+        # on average it should not be partition dependent.
+        self.attention_dropout = torch.nn.Dropout(
+            self.config.attention_dropout if attention_dropout is None else attention_dropout
+        )
+        self.auto_grad_qbmm = QuantizedBMM
+        self.init_finished = False
+
+    def finish_init(self, quantization_config: QuantizationConfig):
+        """
+        Finishes the initialization of the KitchenDotProductAttention module.
+        """
+        extra_kwargs = _get_extra_kitchen_kwargs(self.config)
+        self.kitchen_quant_params = KitchenQuantizationParams.parse_from_config(quantization_config)
+        extra_kwargs["qattention_params"] = self.kitchen_quant_params.qattention_params
+        self.qattention_params = self.kitchen_quant_params.qattention_params
+        self.init_finished = True
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        attn_mask_type: AttnMaskType = None,
+        attention_bias: Tensor = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Forward."""
+        assert self.init_finished, "Must call finish_init before forward."
+        assert packed_seq_params is None, (
+            "Packed sequence is not supported by KitchenDotProductAttention."
+            "Please use TEDotProductAttention instead."
+        )
+        assert (
+            attention_bias is None
+        ), "Attention bias is not supported for KitchenDotProductAttention."
+
+        # ===================================
+        # Raw attention scores. [b, n/p, s, s]
+        # ===================================
+
+        # expand the key and value [sk, b, ng, hn] -> [sk, b, np, hn]
+        # This is a noop for normal attention where ng == np. When using group query attention this
+        # creates a view that has the keys and values virtually repeated along their dimension to
+        # match the number of queries.
+
+        # attn_mask_type is not used.
+        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
+            key = key.repeat_interleave(
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
+            )
+            value = value.repeat_interleave(
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
+            )
+
+        # [b, np, sq, sk]
+        output_size = (query.size(1), query.size(2), query.size(0), key.size(0))
+
+        # [sq, b, np, hn] -> [sq, b * np, hn]
+        # This owill be a simple view when doing normal attention, but in group query attention
+        # the key and value tensors are repeated to match the queries so you can't use
+        # simple strides to extract the queries.
+        query = query.reshape(output_size[2], output_size[0] * output_size[1], -1)
+        # [sk, b, np, hn] -> [sk, b * np, hn]
+        key = key.view(output_size[3], output_size[0] * output_size[1], -1)
+
+        bmm_args: List[Any] = []
+        if torch.is_grad_enabled():
+            bmm_fn = self.auto_grad_qbmm.apply
+        else:
+            bmm_fn = self.auto_grad_qbmm.forward
+            bmm_args.append(None)
+        bmm_args.extend(
+            [
+                query,
+                key,
+                self.softmax_scale,
+                False,
+                torch.is_grad_enabled(),
+                self.layer_number,
+                self.qattention_params,
+            ]
+        )
+        # Raw attention scores. [b * np, sq, sk]
+        matmul_result = bmm_fn(*bmm_args)
+
+        # change view to [b, np, sq, sk]
+        attention_scores = matmul_result.view(*output_size)
+
+        # ===========================
+        # Attention probs and dropout
+        # ===========================
+
+        # attention scores and attention mask [b, np, sq, sk]
+        attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+
+        if not self.config.sequence_parallel:
+            with tensor_parallel.get_cuda_rng_tracker().fork():
+                attention_probs = self.attention_dropout(attention_probs)
+        else:
+            attention_probs = self.attention_dropout(attention_probs)
+
+        # =========================
+        # Context layer. [sq, b, hp]
+        # =========================
+
+        # value -> context layer.
+        # [sk, b, np, hn] --> [b, np, sq, hn]
+
+        # context layer shape: [b, np, sq, hn]
+        output_size = (value.size(1), value.size(2), query.size(0), value.size(3))
+
+        # change view [sk, b * np, hn]
+        value = value.view(value.size(0), output_size[0] * output_size[1], -1)
+
+        # change view [b * np, sq, sk]
+        attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
+
+        # matmul: [b * np, sq, hn]
+        bmm_args = []
+        if torch.is_grad_enabled():
+            bmm_fn = self.auto_grad_qbmm.apply
+        else:
+            bmm_fn = self.auto_grad_qbmm.forward
+            bmm_args.append(None)
+        bmm_args.extend(
+            [
+                attention_probs,
+                value,
+                1.0,
+                True,
+                torch.is_grad_enabled(),
+                self.layer_number,
+                self.qattention_params,
+            ]
+        )
+        context = bmm_fn(*bmm_args)
+        # change view [b, np, sq, hn]
+        context = context.view(*output_size)
+
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context = context.permute(2, 0, 1, 3).contiguous()
+
+        # [sq, b, np, hn] --> [sq, b, hp]
+        new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
+        context = context.view(*new_context_shape)
+
+        return context
+
+
 class KitchenSpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
-    def __init__(self, fallback: BackendSpecProvider):
-        if not HAVE_KITCHEN:
-            raise ImportError(
-                "Kitchen extension requires the nvidia_kitchen package. "
-                "Please install it with `pip install nvidia-kitchen`."
-            )
-
+    def __init__(
+        self,
+        fallback: BackendSpecProvider,
+        use_kitchen_attention: bool = False,
+        kitchen_attention_backend: str = "sdpa",
+    ):
         self.fallback = fallback
+        self.use_kitchen_attention = use_kitchen_attention
+        self.kitchen_attention_backend = kitchen_attention_backend
 
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module kitchen backend uses"""
@@ -1059,7 +1754,31 @@ class KitchenSpecProvider(BackendSpecProvider):
 
     def core_attention(self) -> type:
         """Which module to use for attention"""
-        return self.fallback.core_attention()
+        if not self.use_kitchen_attention:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "KitchenSpecProvider: Using fallback (likely TE) as core attention.",
+            )
+            return self.fallback.core_attention()
+
+        if self.kitchen_attention_backend == "sdpa":
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "KitchenSpecProvider: Using Kitchen SDPA as core attention.",
+            )
+            return KitchenDotProductAttention
+        elif self.kitchen_attention_backend == "fa":
+            log_single_rank(
+                logger, logging.WARNING, "KitchenSpecProvider: Using Kitchen FA as core attention."
+            )
+            return KitchenFlashAttention
+        else:
+            raise ValueError(
+                f"Invalid kitchen_attention_backend: {self.kitchen_attention_backend}. "
+                "Must be 'sdpa' or 'fa'."
+            )
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
@@ -1086,4 +1805,4 @@ class KitchenSpecProvider(BackendSpecProvider):
 
     def activation_func(self) -> type:
         """Which module to use for activation function"""
-        return None
+        return self.fallback.activation_func()
