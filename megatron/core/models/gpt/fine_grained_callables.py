@@ -410,7 +410,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
 
-    def submodule_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
+    def submodule_moe_forward(
+        node: ScheduleNode, dispatched_tokens: torch.Tensor
+    ):
         """
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
@@ -436,27 +438,33 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # release tensor reference after use
         node.layer_state.dispatched_probs = None
         node.layer_state.pre_mlp_layernorm_output = None
-        if shared_expert_output is None:
-            # Return only expert_output, since shared_expert_output causes backward on None
-            return expert_output
-        return expert_output, shared_expert_output
+        if shared_expert_output is not None:
+        # Save shared_expert_output to layer state for later use in post_combine
+            node.layer_state.shared_expert_output = node.detach(shared_expert_output)
+        return expert_output
 
     def submodule_combine_forward(
-        node: ScheduleNode,
-        output: torch.Tensor,
-        shared_expert_output: Optional[torch.Tensor] = None,
+        node: ScheduleNode, output: torch.Tensor
     ):
         """
-        # Triggers token combine and the remaining computation in the transformer layer.
-        # The `mlp_bda` computation is placed after `mlp.combine` due to data dependency.
-        # This ordering is also critical for pipeline performance. Starting the `mlp.combine`
-        # communication at first allows it to be overlapped with computation from another
-        # microbatch. If `mlp_bda` were to run first, it would compete for SM resources
-        # with another microbatch's computation and expose the communication.
+        Triggers token combine communication.
+        This communication can be overlapped with computation from another microbatch.
+        """
+        output = layer.mlp.combine(output)
+        return output
+
+    def submodule_post_combine_forward(
+        node: ScheduleNode, output: torch.Tensor
+    ):
+        """
+        Post-processes combined output and completes the transformer layer computation.
+        Adds shared expert output and performs bias-dropout-add operation.
         """
         residual = node.layer_state.residual
-
-        output = layer.mlp.combine(output, shared_expert_output)
+        shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
+        
+        # Post-process combine and add shared expert output
+        output = layer.mlp.post_combine(output, shared_expert_output)
         mlp_output_with_bias = (output, None)
 
         with layer.bias_dropout_add_exec_handler():
@@ -474,8 +482,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # Need to record residual to comm stream, since it's created on comp stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
 
-        # release tensor reference after use
+        # release tensor references after use
+        if shared_expert_output is not None:
+            shared_expert_output.untyped_storage().resize_(0)
         node.layer_state.residual = None
+        node.layer_state.shared_expert_output = None
+        
 
         # final layer norm from decoder
         final_layernorm = node.chunk_state.model.decoder.final_layernorm
@@ -498,8 +510,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     dispatch_func = submodule_dispatch_forward if is_moe else raise_not_implemented
     mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented
+    post_combine_func = submodule_post_combine_forward if is_moe else raise_not_implemented
 
-    forward_funcs = [attn_func, post_attn_func, dispatch_func, mlp_func, combine_func, None]
+    forward_funcs = [attn_func, post_attn_func, dispatch_func, mlp_func, combine_func, post_combine_func, None]
     backward_dw = {"attn": layer.self_attention, "mlp": layer.mlp}
     return forward_funcs, backward_dw
 
@@ -512,7 +525,7 @@ def build_mtp_layer_callables(layer):
     """
 
     forward_funcs, backward_dw = build_transformer_layer_callables(layer.transformer_layer)
-    attn_forward, post_attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = (
+    attn_forward, post_attn_forward, dispatch_forward, mlp_forward, combine_forward, post_combine_forward, _ = (
         forward_funcs
     )
     is_moe = isinstance(layer.transformer_layer.mlp, MoELayer)
@@ -579,6 +592,7 @@ def build_mtp_layer_callables(layer):
     dispatch_func = partial(rng_context_wrapper, dispatch_forward)
     mlp_func = partial(rng_context_wrapper, mlp_forward)
     combine_func = partial(rng_context_wrapper, combine_forward)
+    post_combine_func = partial(rng_context_wrapper, post_combine_forward)
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
     forward_funcs = [
@@ -587,6 +601,7 @@ def build_mtp_layer_callables(layer):
         dispatch_func,
         mlp_func,
         combine_func,
+        post_combine_func,
         mtp_post_process_func,
     ]
     backward_dw = {
