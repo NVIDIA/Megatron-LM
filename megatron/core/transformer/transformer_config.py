@@ -564,6 +564,10 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
+    moe_alltoall_comm_backend: str = "nccl"
+    """The communication backend to use for AlltoAll dispatcher. The default is 'nccl'.
+    Options are 'nccl' and 'ucc'. Only applicable when moe_token_dispatcher_type is 'alltoall'."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
@@ -875,6 +879,17 @@ class TransformerConfig(ModelParallelConfig):
             warnings.warn(
                 "moe_enable_deepep is deprecated."
                 "Please use --moe-flex-dispatcher-backend=deepep instead."
+            )
+
+        if self.moe_alltoall_comm_backend not in ["nccl", "ucc"]:
+            raise ValueError(
+                f"moe_alltoall_comm_backend must be 'nccl' or 'ucc', got {self.moe_alltoall_comm_backend}"
+            )
+        
+        if self.moe_alltoall_comm_backend == "ucc" and self.moe_token_dispatcher_type != "alltoall":
+            raise ValueError(
+                "moe_alltoall_comm_backend='ucc' is only applicable when "
+                "moe_token_dispatcher_type='alltoall'"
             )
 
         if self.moe_token_dispatcher_type == "flex":

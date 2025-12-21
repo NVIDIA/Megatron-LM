@@ -3271,6 +3271,10 @@ def _add_moe_args(parser):
                        choices=['allgather', 'alltoall', 'flex'],
                        default='allgather',
                        help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
+    group.add_argument('--moe-alltoall-comm-backend', type=str,
+                       choices=['nccl', 'ucc'],
+                       default='nccl',
+                       help='The communication backend to use for AlltoAll dispatcher. The default is "nccl". Options are "nccl" and "ucc". Only applicable when --moe-token-dispatcher-type is "alltoall".')
     group.add_argument('--moe-enable-deepep', action='store_true',
                        help='DEPRECATED: Please use --moe-flex-dispatcher-backend=deepep instead.')
     group.add_argument('--moe-flex-dispatcher-backend', type=str,

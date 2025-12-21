@@ -533,6 +533,7 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
+    moe_alltoall_comm_backend: str = "nccl",
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -1125,8 +1126,9 @@ def initialize_model_parallel(
     for ranks in expert_decoder_rank_generator.get_ranks('ep'):
         group = create_group(
             ranks,
+            backend=moe_alltoall_comm_backend,
             timeout=timeout,
-            pg_options=get_nccl_options("ep", nccl_comm_cfgs),
+            pg_options=get_nccl_options("ep", nccl_comm_cfgs) if moe_alltoall_comm_backend == "nccl" else None,
             group_desc="EXPERT_MODEL_PARALLEL_GROUP",
         )
         if rank in ranks:
