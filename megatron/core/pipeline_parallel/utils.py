@@ -182,6 +182,7 @@ class ScheduleNode:
         self.free_input = free_input
         self.inputs = None
         self.outputs = None
+        self.delay_grads_release = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -263,6 +264,12 @@ class ScheduleNode:
             for g in output_grad:
                 if g is not None:
                     g.record_stream(self.stream)
+                    # Manually trigger the memory release of dgrad tensor
+                    # to avoid delayed garbage collection. If
+                    # delay_grads_release is True, dgrad is last used in
+                    # wgrad compute and skip the release here.
+                    if not self.delay_grads_release:
+                        g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
         self._release_state()
