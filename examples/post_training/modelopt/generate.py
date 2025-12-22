@@ -20,6 +20,8 @@ from megatron.training import get_args, get_model, get_tokenizer, initialize_meg
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
 
+import modelopt.torch.quantization as mtq
+
 warnings.filterwarnings('once')
 
 
@@ -128,6 +130,8 @@ if __name__ == "__main__":
 
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.eval()
+
+    mtq.fold_weight(unwrapped_model)
 
     for idx, example in enumerate(dataset):
         if idx > args.fraction * len(dataset):

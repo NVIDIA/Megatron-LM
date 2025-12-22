@@ -28,12 +28,12 @@ def add_modelopt_args(parser):
         action="store_true",
         help="Forcing local DotProductAttention; otherwise TEDotProductAttention is used.",
     )
-
     # Quantization
     group.add_argument(
         "--export-kv-cache-quant",
-        action="store_true",
-        help="Whether or not to perform KV-cache quantization.",
+        help="Type of KV cache quantization to perform.",
+        choices=["none", "fp8", "fp8_affine", "nvfp4", "nvfp4_affine", "nvfp4_rotate"],
+        default="none",
     )
     group.add_argument(
         "--export-real-quant-cfg",
@@ -46,21 +46,9 @@ def add_modelopt_args(parser):
         "--export-quant-cfg",
         type=str,
         default=None,
-        choices=[
-            "int8_sq",
-            "fp8",
-            "fp8_real_quant",
-            "fp8_blockwise",
-            "fp8_blockwise_real_quant",
-            "fp8_blockwise_32",
-            "int4_awq",
-            "w4a8_awq",
-            "nvfp4",
-            "None",
-        ],
-        help="Specify a quantization config from the supported choices.",
+        # TODO replace choices with mtq.config.choices after deprecating the shorter aliases
+        help="Specify a quantization config from mtq.config.choices.",
     )
-
     # Knowledge Distillation
     group.add_argument(
         '--export-kd-cfg',

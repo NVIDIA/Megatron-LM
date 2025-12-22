@@ -2,8 +2,10 @@
 
 import os
 import torch
-from datasets import load_dataset
-
+import modelopt.torch.quantization as mtq
+from megatron.core import parallel_state
+from megatron.training.utils import unwrap_model
+from modelopt.torch.quantization.utils import is_quantized
 
 def get_current_memory_info():
     """Get current memory usage."""
@@ -26,6 +28,7 @@ def report_current_memory_info():
 
 def get_mtbench_chat_data():
     """Return a MTBench dataset."""
+    from datasets import load_dataset
 
     def mtbench_to_oai_chat(example):
         """Convert MTBench data to OpenAI chat completion format."""
@@ -58,3 +61,30 @@ def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=T
     module._apply(
         lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
     )
+
+def print_distributed_quant_summary(model, msg=""):
+    from megatron.core import parallel_state
+    from megatron.training import print_rank_0
+    from megatron.training.utils import unwrap_model
+
+    unwrapped_model = unwrap_model(model)
+    if isinstance(unwrapped_model, list):
+        unwrapped_model = unwrapped_model[0]
+
+    if not is_quantized(unwrapped_model):
+        return
+
+    print_rank_0(f"{msg}\nQuantization summary of unwrapped model: {unwrapped_model}\n{'_'*80}")
+
+    if not torch.distributed.is_initialized():
+        mtq.print_quant_summary(unwrapped_model)
+        return
+
+    # Only print from unique TP ranks of [0, 1]
+    if parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0 and parallel_state.get_tensor_model_parallel_rank() in [0, 1]:
+        TP_rank = parallel_state.get_tensor_model_parallel_rank()
+        EP_rank = parallel_state.get_expert_model_parallel_rank()
+        PP_rank = parallel_state.get_pipeline_model_parallel_rank()
+        print(f"\nTP rank {TP_rank}, EP rank {EP_rank}, PP rank {PP_rank}")
+        print("_" * 80)
+        mtq.print_quant_summary(unwrapped_model)

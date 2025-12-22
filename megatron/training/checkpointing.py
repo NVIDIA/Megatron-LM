@@ -58,6 +58,7 @@ except ImportError:
 # [ModelOpt]: Import
 try:
     from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
+    from megatron.post_training.utils import print_distributed_quant_summary
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
@@ -1817,7 +1818,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
                  f'p {mpu.get_pipeline_model_parallel_rank() + 1}/{mpu.get_pipeline_model_parallel_world_size()} ] '
                  f'at iteration {iteration}')
-
+                 
+    if has_nvidia_modelopt:
+        print_distributed_quant_summary(model, msg="After loading checkpoint")
+        
     # Additional callback for wandb (last rank)
     if not torch.distributed.is_initialized() \
        or is_last_rank():

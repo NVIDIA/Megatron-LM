@@ -921,7 +921,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # For distillation ckpts without ModelOpt state
             args.modelopt_enabled = True
 
-
     # Build model.
     def build_model():
         if (
