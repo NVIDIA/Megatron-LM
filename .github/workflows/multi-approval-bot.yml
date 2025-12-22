@@ -27,7 +27,7 @@ jobs:
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Checkout action
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
         with:
           repository: noamelf/codeowner-multi-approval-action
           ref: v0.1
@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Result
         env:
