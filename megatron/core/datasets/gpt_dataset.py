@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from math import ceil
 from typing import Dict, Optional, Tuple
 
 import numpy
@@ -49,6 +50,11 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
+    sequences_per_dataset: Optional[Dict[str, int]] = None
+    """If provided, the sequence and document counts for each dataset. 
+       Check --per-dataset-sequences-path
+    """
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -58,6 +64,17 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
+
+        self.token_dtype_code = (
+            None
+            if self.tokenizer.vocab_size is None
+            else (4 if self.tokenizer.vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8)
+        )
+        if self.sequences_per_dataset is not None:
+            assert (
+                self.token_dtype_code is not None
+            ), "Tokenizer vocab size is not set, deactivate --per-dataset-sequences-path or \
+            fix the tokenizer."
 
 
 class GPTDataset(MegatronDataset):
@@ -143,7 +160,17 @@ class GPTDataset(MegatronDataset):
                     path_to_idx_cache=config.object_storage_cache_path
                 ),
             )
-        return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
+        sequences_per_dataset = None
+        if config.sequences_per_dataset:
+            sequences_per_dataset = config.sequences_per_dataset[dataset_path]
+        return IndexedDataset(
+            dataset_path,
+            multimodal=False,
+            mmap=config.mmap_bin_files,
+            fast_cache_load=config.fast_cache_load,
+            sequences_per_dataset=sequences_per_dataset,
+            dtype_code=config.token_dtype_code,
+        )
 
     def __len__(self) -> int:
         """Abstract method implementation
@@ -151,6 +178,27 @@ class GPTDataset(MegatronDataset):
         Returns:
             int: The length of the dataset
         """
+        if self.config.defer_npy_index_mmap:
+            # NOTE(asolergi-nv): We need the number of samples of every GPTDataset to build/hit the BlendedDataset cache # pylint: disable=C0301
+            # NOTE(asolergi-nv): Uses logic from megatron/core/datasets/helpers.cpp::build_sample_idx to compute the number of samples # pylint: disable=C0301
+            num_tokens_per_epoch = self._get_num_tokens_per_epoch()
+            num_epochs = self._get_num_epochs(num_tokens_per_epoch)
+
+            drop_last_partial_sequence = True
+            if self.index_split == Split.valid:
+                drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
+
+            if drop_last_partial_sequence:
+                return (
+                    num_epochs * num_tokens_per_epoch - self.config.add_extra_token_to_sequence
+                ) // self.config.sequence_length
+            else:
+                return ceil(
+                    float(
+                        num_epochs * num_tokens_per_epoch - self.config.add_extra_token_to_sequence
+                    )
+                    / self.config.sequence_length
+                )
         return self.sample_index.shape[0] - 1
 
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
@@ -237,6 +285,18 @@ class GPTDataset(MegatronDataset):
         Returns:
             Tuple[numpy.ndarray, numpy.ndarray]: The text ids and document ids
         """
+        if self.shuffle_index is None:
+            # NOTE(asolergi-nv): Lazy memmap the indexes
+            self.shuffle_index = numpy.load(
+                self.path_to_shuffle_index, allow_pickle=True, mmap_mode='r'
+            )
+            self.sample_index = numpy.load(
+                self.path_to_sample_index, allow_pickle=True, mmap_mode='r'
+            )
+            self.document_index = numpy.load(
+                self.path_to_document_index, allow_pickle=True, mmap_mode='r'
+            )
+
         # Do the shuffle mapping
         idx = self.shuffle_index[idx]
 
@@ -318,6 +378,15 @@ class GPTDataset(MegatronDataset):
             Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: The document index, the sample
             index, and the shuffle index
         """
+        if self.config.defer_npy_index_mmap:
+            # NOTE(asolergi-nv): Direct path to lazy memmap the indexes
+            base = f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}"
+            get_path_to = lambda affix: os.path.join(self.config.path_to_cache, f"{base}-{affix}")
+            self.path_to_document_index = get_path_to("document_index.npy")
+            self.path_to_sample_index = get_path_to("sample_index.npy")
+            self.path_to_shuffle_index = get_path_to("shuffle_index.npy")
+            return None, None, None
+
         path_to_cache = self.config.path_to_cache
         if path_to_cache is None and not self.config.mock:
             path_to_cache = os.path.join(
@@ -331,15 +400,19 @@ class GPTDataset(MegatronDataset):
             path_to_document_index = get_path_to("document_index.npy")
             path_to_sample_index = get_path_to("sample_index.npy")
             path_to_shuffle_index = get_path_to("shuffle_index.npy")
-            cache_hit = all(
-                map(
-                    os.path.isfile,
-                    [
-                        path_to_description,
-                        path_to_document_index,
-                        path_to_sample_index,
-                        path_to_shuffle_index,
-                    ],
+            cache_hit = (
+                True
+                if self.config.fast_cache_load
+                else all(
+                    map(
+                        os.path.isfile,
+                        [
+                            path_to_description,
+                            path_to_document_index,
+                            path_to_sample_index,
+                            path_to_shuffle_index,
+                        ],
+                    )
                 )
             )
         else:
