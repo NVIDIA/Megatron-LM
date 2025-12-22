@@ -22,6 +22,7 @@ assert (
 ), "math_verify is not installed but now required. Install it using `pip install math-verify` to continue."
 
 NEGATIVE_REWARD = 0.0
+PARTIAL_END_REWARD = 0.75
 
 class MathAgent(RewardOnlyAgent):
     def __init__(self, format_reward: float = 0.0, answer_format: str = "tagged", **kwargs):
@@ -61,6 +62,10 @@ class MathAgent(RewardOnlyAgent):
                 for token in end_tokens:
                     if after.startswith(token):
                         return 1.0
+                # If the end token is present later (extra text before it), give partial credit.
+                for token in end_tokens:
+                    if token in after:
+                        return PARTIAL_END_REWARD
                 # If a correct answer but missing immediate end, give format reward (not NEGATIVE_REWARD).
                 return self.format_reward
             else:
@@ -86,6 +91,9 @@ class MathAgent(RewardOnlyAgent):
                     for token in end_tokens:
                         if after.startswith(token):
                             return 1.0
+                    for token in end_tokens:
+                        if token in after:
+                            return PARTIAL_END_REWARD
                     return self.format_reward
                 else:
                     # Formatting is correct but the answer is incorrect
@@ -110,6 +118,7 @@ class MathAgent(RewardOnlyAgent):
     The question will be a word math problem. Show your work in <think> </think> tags. 
     {answer_format}
     User: {kwargs[problem_key]}
-    Assistant: Let me solve this step by step.
-    <think>"""
+    Assistant: """
+    # Assistant: Let me solve this step by step.
+    # <think>"""
         return prefix

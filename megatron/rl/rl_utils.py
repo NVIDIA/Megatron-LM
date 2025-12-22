@@ -4,6 +4,7 @@ import gc
 
 # Keep this to make the env registered.
 import itertools
+import json
 import logging
 import math
 import pickle
@@ -796,9 +797,9 @@ def prepare_trajectories(
         inference_logprobs = None
 
     # Some sanity checks regarding the tokenization
-    assert (
-        tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
-    ), "First token should be bos"
+    # assert (
+    #     tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
+    # ), "First token should be bos"
     assert (
         tokenizer.bos is None or (trajs[:, 1] != tokenizer.bos).all()
     ), "Second token should not be bos"
@@ -1212,7 +1213,7 @@ def evaluate_and_print_results_rl(
                     rank_info=None,
                     generation_args={
                         'temperature': args.grpo_default_temperature,
-                        'max_tokens': args.seq_length,
+                        'max_tokens': args.seq_length, # why is this not args.inference_max_seq_length?
                         'top_p': args.grpo_default_top_p,
                         'top_k': args.grpo_default_top_k,
                     },
@@ -1503,3 +1504,29 @@ def get_iteration_sequence_count(args):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(sequences_tensor, group=mpu.get_data_parallel_group())
     return int(sequences_tensor.item())
+
+def snapshot_ctx(ctx):
+    # USAGE:
+    # # write snapshots for later diffing
+    # with open("inference_context.json", "w") as f:
+    #     json.dump(snapshot_ctx(inference_context), f, indent=2)
+    def snap(x):
+        if torch.is_tensor(x):
+            return {
+                "type": "tensor",
+                "shape": list(x.shape),
+                "dtype": str(x.dtype),
+                "device": str(x.device),
+            }
+        if isinstance(x, dict):
+            return {k: snap(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [snap(v) for v in x]
+        # fall back to string if not JSON-serializable
+        try:
+            json.dumps(x)
+            return x
+        except TypeError:
+            return str(x)
+
+    return {k: snap(v) for k, v in vars(ctx).items()}

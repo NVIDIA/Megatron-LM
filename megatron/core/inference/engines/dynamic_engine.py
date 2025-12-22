@@ -745,7 +745,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Tokenize prompt if text. Support legacy single-arg mocks.
             prompt_str = prompt
             try:
-                prompt_token_ids = self.controller.tokenize_prompt(prompt, sampling_params.add_BOS)
+                prompt_token_ids = self.controller.tokenize_prompt(prompt, False)
             except TypeError:
                 prompt_token_ids = self.controller.tokenize_prompt(prompt)
             tokens = torch.tensor(
