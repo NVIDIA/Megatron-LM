@@ -184,7 +184,6 @@ class InferenceBatchDimensions:
         )
 
         sync_tensor = sync_tensor.cpu()
-        adjusted_token_count = int(sync_tensor[0].item())
         is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
         any_ep_rank_has_explicit_chunked_prefill_req = sync_tensor[2].item() == 1
 
@@ -203,7 +202,7 @@ class InferenceBatchDimensions:
 
         assert not has_explicit_chunked_prefill_req
         adjusted_batch_dim = InferenceBatchDimensions(
-            token_count=adjusted_token_count,
+            token_count=int(sync_tensor[0].item()),
             prefill_req_count=local_batch_dims.prefill_req_count,
             decode_req_count=local_batch_dims.decode_req_count,
             has_explicit_chunked_prefill_req=False,

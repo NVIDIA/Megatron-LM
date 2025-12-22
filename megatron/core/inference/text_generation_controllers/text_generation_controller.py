@@ -483,7 +483,7 @@ class TextGenerationController:
         Args:
             construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use
                 for constructing the cuda graphs.
-            is_dummy_forward (bool)
+            is_dummy_forward (bool): Whether we are running an expert parallel dummy forward pass
 
         Return:
             input_ids (Tensor): The active input IDs.
