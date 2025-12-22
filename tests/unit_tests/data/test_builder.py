@@ -384,6 +384,8 @@ def test_fast_builder(
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
+        random.seed(1234)  # NOTE(asolergi-nv): re-sync random state across all ranks
+
         data_cache_path = os.path.join(temp_dir, "cache")
 
         args = Namespace(
@@ -409,7 +411,6 @@ def test_fast_builder(
             test_file_prefixes = file_prefixes[9:10]
 
             if add_weights:
-                random.seed(1234)
                 # Save original lists before modifying
                 train_file_prefixes_original = train_file_prefixes[:]
                 valid_file_prefixes_original = valid_file_prefixes[:]
