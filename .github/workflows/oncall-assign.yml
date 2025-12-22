@@ -16,7 +16,7 @@ name: Oncall Assign
 
 on:
   pull_request_target:
-    types: [labeled, ready_for_review]
+    types: [opened, ready_for_review]
 
 permissions:
   pull-requests: write
@@ -25,12 +25,7 @@ permissions:
 jobs:
   assign-reviewer:
     runs-on: ubuntu-latest
-    if: >
-      !github.event.pull_request.draft &&
-      (
-        (github.event.action == 'labeled' && github.event.label.name == 'Oncall Review') ||
-        (github.event.action == 'ready_for_review' && contains(github.event.pull_request.labels.*.name, 'Oncall Review'))
-      )
+    if: !github.event.pull_request.draft
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
