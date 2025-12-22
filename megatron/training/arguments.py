@@ -2902,6 +2902,12 @@ def _add_data_args(parser):
                        'we pass in a file path from which we read those arguments. '
                        'This is useful when the list of data is too big. Format is a '
                        'json file with `train`, `valid, `test` keys')
+    group.add_argument('--per-dataset-sequences-path', default=None,
+                       help='Path to a json file with the sequences per dataset. Check the tools/build_sequences_per_dataset.py script to build this file.')
+    group.add_argument('--dataloader-fast-cache-load', action='store_true',
+                       help='Option to use the fast cache loading path when building the datasets. Requires all the dataset caches to be built and stored in --data-cache-path.')
+    group.add_argument('--dataloader-defer-npy-index-mmap', action='store_true',
+                       help='Defer the mmap of the dataset indexes (.npy files) until the first access. Requires all the dataset caches to be built and stored in --data-cache-path.')
     group.add_argument('--data-cache-path', default=None,
                        help='Path to a directory to hold cached index files.')
     group.add_argument('--no-mmap-bin-files', action='store_false',
