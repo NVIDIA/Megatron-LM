@@ -53,7 +53,7 @@ def create_file_prefixes(tokenizer, number_of_files, maximum_number_of_documents
         )
         number_of_documents = random.randint(10, maximum_number_of_documents)
         for j in range(number_of_documents):
-            number_of_tokens = random.randint(5000, 10000)
+            number_of_tokens = random.randint(50, 100)
             tokenized_doc = [
                 str(random.randint(0, tokenizer.vocab_size - 1)) for _ in range(number_of_tokens)
             ]
@@ -344,7 +344,7 @@ def test_fast_builder(
     defer_npy_index_mmap,
     vocab_size,
     mid_level_dataset_surplus,
-    sequence_length: int = 100,
+    sequence_length: int = 5,
     number_of_files: int = 10,
     number_of_documents: int = 10,
 ):
@@ -359,7 +359,6 @@ def test_fast_builder(
     else:
         compile_helpers()
 
-    random.seed(1234)
     tokenizer = build_tokenizer(
         Namespace(
             vocab_size=vocab_size,
@@ -372,9 +371,18 @@ def test_fast_builder(
 
     with tempfile.TemporaryDirectory() as temp_dir:
         # Created file_prefixes (tokenizer, Number of files, number of documents, path) --> returns file prefixes (list of strings)
-        file_prefixes = create_file_prefixes(
-            tokenizer, number_of_files, number_of_documents, os.path.join(temp_dir, "dataset")
-        )
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            file_prefixes = create_file_prefixes(
+                tokenizer, number_of_files, number_of_documents, os.path.join(temp_dir, "dataset")
+            )
+        else:
+            file_prefixes = []
+            for i in range(number_of_files):
+                file_prefix_path = os.path.join(temp_dir, "dataset", f"file_{i}")
+                file_prefixes.append(file_prefix_path)
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
         data_cache_path = os.path.join(temp_dir, "cache")
 
@@ -401,6 +409,7 @@ def test_fast_builder(
             test_file_prefixes = file_prefixes[9:10]
 
             if add_weights:
+                random.seed(1234)
                 # Save original lists before modifying
                 train_file_prefixes_original = train_file_prefixes[:]
                 valid_file_prefixes_original = valid_file_prefixes[:]
@@ -447,7 +456,7 @@ def test_fast_builder(
         config = GPTDatasetConfig(**data_args)
 
         train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-            GPTDataset, [10000, 1000, 1000], lambda: True, config
+            GPTDataset, [100, 10, 10], lambda: True, config
         ).build()
 
         fast_config = GPTDatasetConfig(
@@ -458,7 +467,7 @@ def test_fast_builder(
         )
 
         train_ds_fast, valid_ds_fast, test_ds_fast = BlendedMegatronDatasetBuilder(
-            GPTDataset, [10000, 1000, 1000], lambda: True, fast_config
+            GPTDataset, [100, 10, 10], lambda: True, fast_config
         ).build()
 
         for ds_slow, ds_fast, split_name in zip(
@@ -515,7 +524,10 @@ def test_fast_builder(
                         ds_slow_i.dataset.index.sequence_pointers,
                         ds_fast_i.dataset.index.sequence_pointers,
                     )
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
 
 if __name__ == "__main__":
-    test_builder()
+    # test_builder()
+    test_fast_builder(False, True, True, True, False, 131072, 0.005)
