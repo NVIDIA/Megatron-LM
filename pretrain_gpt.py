@@ -198,9 +198,9 @@ def core_gpt_dataset_config_from_args(args):
         "object_storage_cache_path": args.object_storage_cache_path,
         "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
         "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
-        fast_cache_load=args.dataloader_fast_cache_load,
-        sequences_per_dataset=sequences_per_dataset,
-        defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
+        "fast_cache_load": args.dataloader_fast_cache_load,
+        "sequences_per_dataset": sequences_per_dataset,
+        "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
     }
 
     # add FIM args to the config
