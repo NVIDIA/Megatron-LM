@@ -249,6 +249,15 @@ class GPTModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
+            # The Linear-Cross-Entropy fusion bypasses the output layer during the forward pass.
+            # The output_layer submodule shares its weights with the gpt_model to prevent
+            # issues arising from pre-forward hooks attached to the output layer.
+            if (
+                self.config.cross_entropy_loss_fusion
+                and self.config.cross_entropy_fusion_impl == 'linear'
+            ):
+                self.shared_output_layer_weight = self.output_layer.weight
+
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
@@ -591,7 +600,11 @@ class GPTModel(LanguageModule):
                 mtp_loss = self.compute_output_layer_and_language_model_loss(
                     hidden_states_list[mtp_layer_number + 1],
                     labels=mtp_labels,
-                    weight=self.shared_embedding_or_output_weight(),
+                    weight=(
+                        output_weight
+                        if output_weight is not None
+                        else self.shared_output_layer_weight
+                    ),
                     sequence_parallel_enabled=self.output_layer.sequence_parallel,
                     column_parallel_linear=self.output_layer,
                     col_linear_kwargs={
@@ -679,7 +692,7 @@ class GPTModel(LanguageModule):
         loss = self.compute_output_layer_and_language_model_loss(
             hidden_states,
             labels=labels,
-            weight=self.shared_embedding_or_output_weight(),
+            weight=output_weight if output_weight is not None else self.shared_output_layer_weight,
             sequence_parallel_enabled=self.output_layer.sequence_parallel,
             column_parallel_linear=self.output_layer,
             col_linear_kwargs={
