@@ -24,7 +24,7 @@ import sys
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = "Megatron-LM"
+project = "Megatron Core"
 copyright = "2025, NVIDIA Corporation"
 author = "NVIDIA Corporation"
 release = "latest"
