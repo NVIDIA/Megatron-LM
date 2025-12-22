@@ -60,12 +60,12 @@ def forward_step(data_iterator, model):
 
 
 def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
-    vision_num_layers, vision_hidden_size, 
-    language_num_layers, language_hidden_size, 
+    vision_num_layers, vision_num_moe_experts, vision_hidden_size, 
+    language_num_layers, language_num_moe_experts, language_hidden_size, 
     vocab_size, image_seq_length, seq_length, 
     special_token_ids,
-    vision_tp, vision_pp, vision_dp,
-    language_tp, language_pp, language_dp,
+    vision_tp, vision_pp, vision_dp, vision_cp, vision_ep,
+    language_tp, language_pp, language_dp, language_cp, language_ep,
     batch_size, num_microbatches,
     num_iterations=1, profile_start_step=None, profile_end_step=None, enable_profiling=False
 ):
@@ -80,16 +80,18 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         image_seq_length: Sequence length for images
         seq_length: Total sequence length (text tokens = seq_length - image_seq_length)
         special_token_ids: Dictionary of special token IDs
-        vision_tp, vision_pp, vision_dp: Vision model parallelism configs (TP, PP, DP)
-        language_tp, language_pp, language_dp: Language model parallelism configs (TP, PP, DP)
+        vision_tp, vision_pp, vision_dp, vision_cp, vision_ep: Vision model parallelism configs (TP, PP, DP, CP, EP)
+        language_tp, language_pp, language_dp, language_cp, language_ep: Language model parallelism configs (TP, PP, DP, CP, EP)
         batch_size: Batch size for training
         num_microbatches: Number of microbatches for pipeline parallelism
     """
     logging.info("Creating VLM MIMO model...")
-    mimo_model, module_to_grid_map, topology = get_vlm_mimo_model(
+    mimo_model, module_to_grid_map, topology, vision_pg_collection, language_pg_collection = get_vlm_mimo_model(
         vision_num_layers=vision_num_layers,
+        vision_num_moe_experts=vision_num_moe_experts,
         vision_hidden_size=vision_hidden_size,
         language_num_layers=language_num_layers,
+        language_num_moe_experts=language_num_moe_experts,
         language_hidden_size=language_hidden_size,
         vocab_size=vocab_size,
         seq_len=seq_length,
@@ -97,9 +99,13 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         vision_tp=vision_tp,
         vision_pp=vision_pp,
         vision_dp=vision_dp,
+        vision_cp=vision_cp,
+        vision_ep=vision_ep,
         language_tp=language_tp,
         language_pp=language_pp,
         language_dp=language_dp,
+        language_cp=language_cp,
+        language_ep=language_ep,
     )
     
     logging.info(f"Rank {dist.get_rank()}: Model created successfully")
@@ -149,7 +155,11 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     }
     
     # Get pg collections for modules that should be initialized on this rank
-    pg_collection = get_pg_collections_for_rank(module_to_grid_map)
+    current_rank = dist.get_rank()
+    if current_rank < vision_tp*vision_pp*vision_dp:
+        pg_collection = vision_pg_collection
+    else:
+        pg_collection = language_pg_collection
     print(f"for debug: Rank {dist.get_rank()}: pg_collection: {pg_collection}")
     all_losses = []
     
@@ -180,7 +190,7 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         config=optimizer_config,
         model_chunks=model_chunks,
         use_gloo_process_groups=False,  # Required when using custom process groups
-        pg_collection=pg_collection[0], # [TODO by shifangx] check if the pg_collection is correct
+        pg_collection=pg_collection,
     )
 
     for iteration in range(num_iterations):
@@ -233,8 +243,10 @@ if __name__ == "__main__":
     
     # Model parameters
     vision_num_layers = 16
+    vision_num_moe_experts = 8
     vision_hidden_size = 1024
     language_num_layers = 16
+    language_num_moe_experts = 8
     language_hidden_size = 2048
 
     # Data parameters
@@ -244,8 +256,12 @@ if __name__ == "__main__":
     special_token_ids = {"images": 32000}
 
     # Model parallelisms (CP and EP are hardcoded to 1 in model_specs.py)
-    vision_tp, vision_pp, vision_dp = 1, 2, 1
-    language_tp, language_pp, language_dp = 1, 4, 1
+    vision_tp, vision_pp, vision_dp, vision_cp, vision_ep = 1, 1, 1, 1, 1
+    language_tp, language_pp, language_dp, language_cp, language_ep = 1, 1, 2, 1, 2
+    assert vision_cp == 1, \
+        f"Do not support vision module with CP > 1 currently"
+    assert language_cp == 1, \
+        f"Do not support language module with CP > 1 currently"
     
     # Training parameters
     rank = dist.get_rank()
@@ -265,8 +281,10 @@ if __name__ == "__main__":
  
     losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         vision_num_layers=vision_num_layers,
+        vision_num_moe_experts=vision_num_moe_experts,
         vision_hidden_size=vision_hidden_size,
         language_num_layers=language_num_layers,
+        language_num_moe_experts=language_num_moe_experts,
         language_hidden_size=language_hidden_size,
         vocab_size=vocab_size,
         image_seq_length=image_seq_length,
@@ -275,9 +293,13 @@ if __name__ == "__main__":
         vision_tp=vision_tp,
         vision_pp=vision_pp,
         vision_dp=vision_dp,
+        vision_cp=vision_cp,
+        vision_ep=vision_ep,
         language_tp=language_tp,
         language_pp=language_pp,
         language_dp=language_dp,
+        language_cp=language_cp,
+        language_ep=language_ep,
         batch_size=batch_size,
         num_microbatches=num_microbatches,
         num_iterations=num_iterations,

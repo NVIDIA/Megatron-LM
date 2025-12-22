@@ -12,8 +12,9 @@ from examples.mimo.configs.llava_vlm import get_llava_projection_layer_spec, get
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from tests.unit_tests.pipeline_parallel.test_multimodule_schedules import create_hypercomm_grid, _get_pg_collection_with_embedding_groups
+from parallel_utils import _create_pg_collection
 
-def get_language_model_spec(num_layers, hidden_size, vocab_size, seq_len, pg_collection):
+def get_language_model_spec(num_layers, num_moe_experts, hidden_size, vocab_size, seq_len, pg_collection):
     """Get the language model spec."""
     # Determine pre_process and post_process based on PP rank
     pp_rank = dist.get_rank(pg_collection.pp)
@@ -28,7 +29,7 @@ def get_language_model_spec(num_layers, hidden_size, vocab_size, seq_len, pg_col
     pp_size = pg_collection.pp.size() if pg_collection.pp is not None else 1
     
     lm_config = TransformerConfig(
-        num_layers=num_layers, hidden_size=hidden_size, num_attention_heads=4, use_cpu_initialization=True, variable_seq_lengths=True, moe_token_dispatcher_type= 'alltoall', tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size, pipeline_dtype=torch.bfloat16, bf16=True,
+        num_layers=num_layers, num_moe_experts=num_moe_experts, hidden_size=hidden_size, num_attention_heads=4, use_cpu_initialization=True, variable_seq_lengths=True, moe_token_dispatcher_type= 'alltoall', tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size, pipeline_dtype=torch.bfloat16, bf16=True,
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='native',
     )
@@ -48,7 +49,7 @@ def get_language_model_spec(num_layers, hidden_size, vocab_size, seq_len, pg_col
     return language_model_spec
 
 
-def get_vision_submodules_spec(num_layers, hidden_size, language_hidden_size, pg_collection):
+def get_vision_submodules_spec(num_layers, num_moe_experts, hidden_size, language_hidden_size, pg_collection):
     """Get the submodule spec for the vision modality.
     
     Args:
@@ -63,7 +64,7 @@ def get_vision_submodules_spec(num_layers, hidden_size, language_hidden_size, pg
     pp_size = pg_collection.pp.size() if pg_collection.pp is not None else 1
 
     vision_config = TransformerConfig(
-        num_layers=num_layers, hidden_size=hidden_size, num_attention_heads=4, use_cpu_initialization=True, variable_seq_lengths=True, moe_token_dispatcher_type= 'alltoall', tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size, pipeline_dtype=torch.bfloat16, bf16=True,
+        num_layers=num_layers, num_moe_experts=num_moe_experts, hidden_size=hidden_size, num_attention_heads=4, use_cpu_initialization=True, variable_seq_lengths=True, moe_token_dispatcher_type= 'alltoall', tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size, pipeline_dtype=torch.bfloat16, bf16=True,
     )
     vision_encoder_spec = ModuleSpec(
         module=TransformerBlock,
@@ -103,21 +104,29 @@ def get_vision_submodules_spec(num_layers, hidden_size, language_hidden_size, pg
 
 
 def get_vlm_mimo_model(
-    vision_num_layers, vision_hidden_size, language_num_layers, language_hidden_size, 
+    vision_num_layers, vision_num_moe_experts, vision_hidden_size, language_num_layers, language_num_moe_experts, language_hidden_size, 
     vocab_size, seq_len, special_token_ids, 
-    vision_tp, vision_pp, vision_dp,
-    language_tp, language_pp, language_dp
+    vision_tp, vision_pp, vision_dp, vision_cp, vision_ep,
+    language_tp, language_pp, language_dp, language_cp, language_ep,
 ):
-    # Calculate offsets for grids to avoid overlap (CP and EP are hardcoded to 1)
-    vision_grid_size = vision_tp * vision_pp * vision_dp
-    language_module_grid = create_hypercomm_grid(offset=vision_grid_size, tp=language_tp, cp=1, pp=language_pp, dp=language_dp)
-    language_pg_collection = _get_pg_collection_with_embedding_groups(language_module_grid)
+    global_world_size = dist.get_world_size()
+    vision_grid_size = vision_tp * vision_pp * vision_dp * vision_cp
+    language_grid_size = language_tp * language_pp * language_dp * language_cp
+    assert global_world_size == vision_grid_size + language_grid_size, \
+        f"global_world_size ({global_world_size}) should be equal to vision_grid_size ({vision_grid_size}) + language_grid_size ({language_grid_size})"
 
-    vision_module_grid = create_hypercomm_grid(offset=0, tp=vision_tp, cp=1, pp=vision_pp, dp=vision_dp)
-    vision_pg_collection = _get_pg_collection_with_embedding_groups(vision_module_grid)
+    num_distributed_optimizer_instances=1
+    rank_offset=0
+    world_size=vision_grid_size
+    vision_pg_collection, vision_grid, vision_expert_grid = _create_pg_collection(vision_tp, vision_pp, vision_cp, vision_ep, num_distributed_optimizer_instances, rank_offset, world_size)
+    
+    num_distributed_optimizer_instances=1
+    rank_offset=vision_grid_size
+    world_size=language_grid_size
+    language_pg_collection, language_grid, language_expert_grid = _create_pg_collection(language_tp, language_pp, language_cp, language_ep, num_distributed_optimizer_instances, rank_offset, world_size)
 
-    language_model_spec = get_language_model_spec(language_num_layers, language_hidden_size, vocab_size, seq_len, language_pg_collection)
-    vision_submodule_spec = get_vision_submodules_spec(vision_num_layers, vision_hidden_size, language_hidden_size, vision_pg_collection)
+    vision_submodule_spec = get_vision_submodules_spec(vision_num_layers, vision_num_moe_experts, vision_hidden_size, language_hidden_size, vision_pg_collection)
+    language_model_spec = get_language_model_spec(language_num_layers, language_num_moe_experts, language_hidden_size, vocab_size, seq_len, language_pg_collection)
 
     mimo_config = MimoModelConfig(
         language_model_spec=language_model_spec,
@@ -126,7 +135,8 @@ def get_vlm_mimo_model(
     )
     # Create MIMO model
     mimo_model = MimoModel(mimo_config)
-    module_to_grid_map = {'images': vision_module_grid, 'language_module': language_module_grid}
+    # TODO(shifangx): need map from model name to more than one grid, or to one ProcessGroupCollection
+    module_to_grid_map = {'images': vision_grid, 'language_module': language_grid}
     topology = {
         'images': ['language_module'],  # images sends forward results to language_module
         'language_module': [],  # language_module is the last stage here
@@ -154,4 +164,4 @@ def get_vlm_mimo_model(
         )
     mimo_model.modality_submodules['images'] = submodule
 
-    return mimo_model, module_to_grid_map, topology
+    return mimo_model, module_to_grid_map, topology, vision_pg_collection, language_pg_collection
