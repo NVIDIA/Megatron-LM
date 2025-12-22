@@ -1092,9 +1092,7 @@ class TEGroupedMLP(MegatronModule):
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
-        num_local_experts = self.num_local_experts
-        if self.config.moe_enable_echo:
-            num_local_experts = self.config.moe_num_echo_experts // self.ep_group.size()
+        num_local_experts = self.config.num_moe_experts // self.ep_group.size()
         for name, module in self._modules.items():
             sub_sd = sharded_state_dict_default(
                 module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
@@ -1259,12 +1257,13 @@ class SequentialMLP(MegatronModule):
         metadata = ensure_metadata_has_dp_cp_group(metadata)
 
         sharded_state_dict = {}
-        num_global_experts = self.ep_group.size() * self.num_local_experts
-        local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+        num_global_experts = self.config.num_moe_experts
+        num_local_experts = num_global_experts // self.ep_group.size()
+        local_expert_indices_offset = self.ep_group.rank() * num_local_experts
 
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
 
-        for expert_local_idx, expert in enumerate(self.local_experts):
+        for expert_local_idx, expert in enumerate(num_local_experts):
             expert_global_idx = local_expert_indices_offset + expert_local_idx
             expert_state_dict_prefix = f'{prefix}local_experts.{expert_local_idx}.'
             if singleton_local_shards:
