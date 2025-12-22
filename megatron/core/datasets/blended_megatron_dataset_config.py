@@ -88,8 +88,29 @@ class BlendedMegatronDatasetConfig:
        incorrect tokenizer - this option may be set to True. This is typically not recommended.
     """
 
+    fast_cache_load: bool = False
+    """Option to use the fast cache loading path. Requires all the dataset caches to be built."""
+
+    defer_npy_index_mmap: bool = False
+    """Option to defer the mmap of the dataset indexes until the first access.
+       Requires all the dataset caches to be built.
+    """
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
+        if self.fast_cache_load:
+            assert (
+                self.path_to_cache is not None
+            ), "--data-cache-path must be provided when using --dataloader-fast-cache-load."
+            assert (
+                self.blend is None
+            ), f"--dataloader-fast-cache-load and --data-path cannot be used together. \
+            Use --per-split-data-args-path or --train-data-path, --valid-data-path and \
+            --test-data-path instead."
+        if self.defer_npy_index_mmap:
+            assert (
+                self.path_to_cache is not None
+            ), "--data-cache-path must be provided when using --dataloader-defer-npy-index-mmap."
         if self.blend_per_split is not None and any(self.blend_per_split):
             assert self.blend is None, "blend and blend_per_split are incompatible"
             assert self.split is None, "split and blend_per_split are incompatible"
