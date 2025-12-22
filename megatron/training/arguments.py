@@ -3298,6 +3298,8 @@ def _add_moe_args(parser):
                        help='[Experimental] Enable Elastic Cloning for Hot Experts (ECHO). '
                        'This feature dynamically clones frequently used experts to spare/echo experts '
                        'for better load balancing and reduced communication overhead.')
+    group.add_argument('--moe-echo-dump-dir', type=str, default=None,
+                       help='The directory to dump the echo routing data.')
     group.add_argument('--moe-echo-recompute-expert-dispatch', action='store_true', 
                        help='[Experimental] Recompute the expert dispatch for echo experts in the backward pass to reduce the memory overhead. '
                        'It is only effective when --moe-enable-echo is enabled.')

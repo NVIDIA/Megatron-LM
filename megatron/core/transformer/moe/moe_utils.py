@@ -1050,6 +1050,40 @@ def get_default_pg_collection():
     )
     return pg_collection
 
+from collections import defaultdict
+import os
+class MoERoutingTracker:
+    def __init__(self):
+        self.data_dict = {}
+
+    def set_rank_info(self, ep_group):
+        self.ep_group = ep_group
+        self.rank = torch.distributed.get_rank()
+        self.ep_rank = torch.distributed.get_rank(self.ep_group)
+
+    def add_data(self, moe_layer_number: int, key_name: str, data: torch.Tensor):
+        if key_name not in self.data_dict:
+            self.data_dict[key_name] = {}
+        if moe_layer_number not in self.data_dict[key_name]:
+            self.data_dict[key_name][moe_layer_number] = []
+        self.data_dict[key_name][moe_layer_number].append(data.detach())
+
+    def dump_data(self, dir_path: str):
+        for key_name in self.data_dict.keys():
+            for moe_layer_number in self.data_dict[key_name].keys():
+                data_list = self.data_dict[key_name][moe_layer_number]
+                data_tensor = torch.stack(data_list)
+                self.data_dict[key_name][moe_layer_number] = data_tensor
+        if self.ep_rank == 0:
+            file_name = f"data_rank_{self.rank}_ep_rank_{self.ep_rank}.pth"
+            file_path = os.path.join(dir_path, file_name)
+            os.makedirs(dir_path, exist_ok=True)
+            torch.save(self.data_dict, file_path)
+
+    def clear_data(self):
+        self.data_dict = {}
+
+GLOBAL_MOE_ROUTING_TRACKER = MoERoutingTracker()
 
 class MoECudaGraphPartialCaptureSignal(Exception):
     """

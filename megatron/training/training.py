@@ -1693,6 +1693,10 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
         )
+        from megatron.core.transformer.moe.moe_utils import GLOBAL_MOE_ROUTING_TRACKER
+        if args.moe_echo_dump_dir is not None:
+            GLOBAL_MOE_ROUTING_TRACKER.dump_data(os.path.join(args.moe_echo_dump_dir, f"iter_{iteration}"))
+            GLOBAL_MOE_ROUTING_TRACKER.clear_data()
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(

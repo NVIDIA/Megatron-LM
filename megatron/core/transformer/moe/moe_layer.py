@@ -9,6 +9,8 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.transformer.moe.moe_utils import GLOBAL_MOE_ROUTING_TRACKER
+
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -368,6 +370,16 @@ class MoELayer(BaseMoELayer):
                     num_ep_ranks=self.ep_group.size(),
                     num_spare_experts_per_ep_rank=self.config.moe_num_echo_experts // self.ep_group.size(),
                 )
+            if self.config.moe_echo_dump_dir is not None:
+                GLOBAL_MOE_ROUTING_TRACKER.set_rank_info(self.ep_group)
+                num_offloaded_experts_per_rank = expert_offloading_map.reshape(self.ep_group.size(), -1).sum(dim=-1)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "num_offloaded_experts_per_rank", num_offloaded_experts_per_rank)
+                rerouted_tokens_per_rank = rerouting_map.sum(dim=0).reshape(self.ep_group.size(), -1).sum(dim=-1)
+                torch.distributed.all_reduce(rerouted_tokens_per_rank, group=self.ep_group, op=torch.distributed.ReduceOp.SUM)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "rerouted_tokens_per_rank", rerouted_tokens_per_rank)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "tokens_per_expert_per_ep_rank", tokens_per_expert_per_ep_rank)
+                GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "tokens_per_rank", 
+                    tokens_per_expert_per_ep_rank.reshape(self.ep_group.size(), self.ep_group.size(), -1).sum(dim=[0, 2]))
         # Step 2: Expert weight dispatch for echo experts
         # Create checkpoints for gradient computation
         with torch.cuda.nvtx.range("expert_dispatch"):

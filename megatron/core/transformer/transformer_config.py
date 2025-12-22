@@ -625,6 +625,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_echo: bool = False
     """[Experimental] Enable Elastic Cloning for Hot Experts."""
 
+    moe_echo_dump_dir: Optional[str] = None
+    """The directory to dump the echo routing data."""
+
     moe_num_echo_experts: Optional[int] = None
     """[Experimental] Number of echo experts to use. If None, the number of echo experts is set to
     the number of experts."""
