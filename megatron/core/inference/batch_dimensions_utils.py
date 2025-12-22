@@ -321,8 +321,6 @@ class CUDAGraphBatchDimensionBuilder:
             max_tokens: Maximum total tokens
             max_sequence_length: Maximum sequence length
             use_cuda_graphs_for_non_decode_steps: Whether to use CUDA graphs for non-decode steps
-            requires_explicit_chunked_prefill_req: Whether the model requires an explicit chunked
-                prefill request
 
         Returns:
             Tuple containing:

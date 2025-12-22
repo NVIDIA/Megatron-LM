@@ -45,29 +45,45 @@ class MambaMetadata:
         self.max_tokens = max_tokens
         self.device = torch.cuda.current_device()
 
-        # Metadata for mapping requests to slots in the static Mamba state buffer
+        # Map from requests to slots in the static Mamba state buffer
         self.request_to_mamba_state_idx = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
+        # Map from requests to slots in the static Mamba state buffer for active decode requests
         self._batch_indices_decode_buffer = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=self.device
         )
+
+        # Map from requests to slots in the static Mamba state buffer for active prefill requests
         self._batch_indices_prefill_buffer = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=self.device
         )
+
+        # Map from the active chunked prefill request to its slot in the static Mamba state buffer
         self._batch_indices_chunked_prefill_buffer = torch.full(
             (1,), -1, dtype=torch.int32, device=self.device
         )
+
+        # Map from token id to request id for active prefill requests
         self._seq_idx_buffer = torch.full(
             (1, self.max_tokens), -1, dtype=torch.int32, device=self.device
         )
+
+        # Cumulative sequence lengths for active prefill requests
         self._cu_seqlens_buffer = torch.zeros(
             (self.max_requests + 1,), dtype=torch.int32, device=self.device
         )
+
+        # Tuple of (active decode request count, active prefill request count)
         self._device_decode_prefill_buffer = torch.zeros(
-            (3,), dtype=torch.int32, device=self.device
+            (2,), dtype=torch.int32, device=self.device
         )
+
+        # Tuple of (
+        #   total prefill sequence length excluding chunked prefill,
+        #   chunked prefill sequence length
+        # )
         self._device_chunked_prefill_buffer = torch.zeros(
             (2,), dtype=torch.int32, device=self.device
         )
@@ -206,7 +222,6 @@ class MambaMetadata:
         if padded_decode_count > 0 and padded_prefill_count > 0:
             self._device_decode_prefill_buffer[0] = real_decode_count
             self._device_decode_prefill_buffer[1] = regular_prefill_count
-            self._device_decode_prefill_buffer[2] = has_explicit_chunked_prefill_req
             self.device_decode_prefill = self._device_decode_prefill_buffer
 
         # If using chunked prefill for this batch, store the number of regular prefill tokens
