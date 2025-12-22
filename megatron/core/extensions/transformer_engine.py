@@ -844,11 +844,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         if bias and hasattr(self, 'bias') and self.bias is not None:
             setattr(self.bias, 'partition_stride', stride)
 
-        # Set proper partition_stride
-        setattr(self.weight, 'partition_stride', stride)
-        if bias and hasattr(self, 'bias') and self.bias is not None:
-            setattr(self.bias, 'partition_stride', stride)
-
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, self.tp_size)
             _ = _initialize_affine_weight_cpu(

@@ -1054,7 +1054,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # are set for all params so the optimizer can use them.
     for model_module in model:
         for param in model_module.parameters():
-            #TODO(Peter) We need to use the proper models MPU here.
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     # Print number of parameters.
