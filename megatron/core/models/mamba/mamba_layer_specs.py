@@ -198,6 +198,7 @@ def get_mamba_mtp_block_spec(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage
     )
 
+
 def get_mamba_mtp_block_spec_for_backend(
     config: TransformerConfig,
     spec: ModuleSpec,

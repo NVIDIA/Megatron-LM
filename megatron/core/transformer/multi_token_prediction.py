@@ -629,7 +629,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     vp_stage=self.vp_stage,
                     is_mtp_layer=True
                 )
-                
+
         self.final_layernorm = build_module(
             self.submodules.layer_norm,
             config=self.config,
@@ -992,7 +992,7 @@ class MultiTokenPredictionBlock(MegatronModule):
     the k-th depth to produce the output representation.
 
     When `mtp_use_repeated_layer=True` in config, instead of creating N separate MTP layers,
-    only 1 layer is created and applied mtp_num_layers times. 
+    only 1 layer is created and applied mtp_num_layers times.
 
     for more information, please refer to DeepSeek-V3 Technical Report
     https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
@@ -1011,7 +1011,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
-        
+
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
 
         vp_size = config.virtual_pipeline_model_parallel_size
@@ -1139,11 +1139,11 @@ class MultiTokenPredictionBlock(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tensor:
         """Process Multi-Token Prediction (MTP) loss computation.
-        
+
         This method handles the MTP loss computation for multiple prediction layers.
         It chunks the hidden states, computes logits and losses for each MTP layer,
         and applies loss scaling.
-        
+
         Args:
             hidden_states (Tensor): Hidden states tensor from the model.
             labels (Tensor): Ground truth labels.
@@ -1153,18 +1153,18 @@ class MultiTokenPredictionBlock(MegatronModule):
             runtime_gather_output (Optional[bool]): Whether to gather output at runtime.
             is_training (bool): Whether the model is in training mode.
             compute_language_model_loss (Callable): Method to compute language model loss.
-        
+
         Returns:
             Tensor: Updated hidden states after MTP loss processing.
         """
         mtp_labels = labels.clone()
         hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
         hidden_states = hidden_states_list[0]
-        
+
         if loss_mask is None:
             # if loss_mask is not provided, use all ones as loss_mask
             loss_mask = torch.ones_like(mtp_labels)
-        
+
         for mtp_layer_number in range(self.config.mtp_num_layers):
             # output
             mtp_logits, _ = output_layer(
@@ -1175,7 +1175,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             # Calc loss for the current Multi-Token Prediction (MTP) layers.
             mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params)
             loss_mask, num_tokens = roll_tensor(
-                loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group,  packed_seq_params=packed_seq_params
+                loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params
             )
             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
             mtp_loss = loss_mask * mtp_loss
@@ -1199,7 +1199,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 hidden_states = MTPLossAutoScaler.apply(
                     hidden_states, mtp_loss_scale * mtp_loss / num_tokens
                 )
-        
+
         return hidden_states
 
     def sharded_state_dict(
@@ -1221,7 +1221,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
             offset = get_mtp_layer_offset(self.config)
-            sharded_prefix = f'{layer_prefix}{layer.layer_number - 1 }.'
+            sharded_prefix = f'{layer_prefix}{layer.layer_number - 1}.'
 
             state_dict_prefix = f'{layer_prefix}{layer.layer_number - 1 - offset}.'
             sharded_pp_offset = []
