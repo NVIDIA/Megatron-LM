@@ -176,12 +176,12 @@ mamba_inference_stack_spec = ModuleSpec(
 def get_mamba_mtp_block_spec(
     config: TransformerConfig,
     spec: ModuleSpec,
-    use_transformer_engine: bool, 
+    use_transformer_engine: bool,
     vp_stage: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """Mamba Multi-Token Prediction (MTP) block spec."""
     assert HAVE_KITCHEN, "Kitchen needs to be installed."
-    
+
     if use_transformer_engine:
         assert HAVE_TE, "TransformerEngine needs to be installed."
         backend: BackendSpecProvider = (
@@ -198,10 +198,11 @@ def get_mamba_mtp_block_spec(
     return get_mamba_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage
     )
-    
+
+
 def get_mamba_mtp_block_spec_for_backend(
     config: TransformerConfig,
-    spec: ModuleSpec, 
+    spec: ModuleSpec,
     backend: BackendSpecProvider,
     vp_stage: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
@@ -214,7 +215,7 @@ def get_mamba_mtp_block_spec_for_backend(
         mtp_model_layer_spec=spec, backend=backend
     )
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
-    
+
     if config.mtp_use_repeated_layer:
         mtp_layer_specs = [mtp_layer_spec]
     else:

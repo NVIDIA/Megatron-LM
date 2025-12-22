@@ -158,7 +158,7 @@ class MambaStack(MegatronModule):
                     layer = build_module(
                         submodules.moe_layer,
                         config=self.config,
-                        layer_number=i+1,
+                        layer_number=i + 1,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
                     )
@@ -328,7 +328,7 @@ class MambaStack(MegatronModule):
 
         # Ensure that the tensor passed between pipeline parallel stages is
         # viewless. See related notes in TransformerBlock and TransformerLayer
-        output = make_viewless_tensor(
+        hidden_states = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 

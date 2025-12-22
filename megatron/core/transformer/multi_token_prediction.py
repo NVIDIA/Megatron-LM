@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
@@ -368,7 +369,7 @@ class MTPLossLoggingHelper:
         mtp_losses = tracker["values"] * loss_scale
         mtp_num_layers = mtp_losses.shape[0]
         for i in range(mtp_num_layers):
-            name = f"mtp_{i+1} loss"
+            name = f"mtp_{i + 1} loss"
             loss = mtp_losses[i]
             if total_loss_dict is not None:
                 if name in total_loss_dict:
@@ -421,7 +422,7 @@ def get_mtp_layer_spec(
 
 
 def get_mtp_layer_spec_for_backend(
-   mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider
+    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -550,21 +551,21 @@ class MultiTokenPredictionLayer(MegatronModule):
         if hasattr(self.submodules.mtp_model_layer.submodules, 'attention_layer'):
             self_attention_spec = self.submodules.mtp_model_layer.submodules.attention_layer
             if self_attention_spec.submodules.self_attention is not None:
-                    self_attention_spec = self_attention_spec.submodules.self_attention
-                    attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
-                    assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-                        f"Multi-Token Prediction (MTP) is not yet supported with "
-                        + f"{attn_mask_type} attention mask type."
-                        + f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
-                    )
+                self_attention_spec = self_attention_spec.submodules.self_attention
+                attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
+                assert attn_mask_type in SUPPORTED_ATTN_MASK, (
+                    f"Multi-Token Prediction (MTP) is not yet supported with "
+                    f"{attn_mask_type} attention mask type. "
+                    f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
+                )
         elif hasattr(self.submodules.mtp_model_layer.submodules, 'self_attention'):
             self_attention_spec = self.submodules.mtp_model_layer.submodules.self_attention
             if self_attention_spec is not None:
                 attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
                 assert attn_mask_type in SUPPORTED_ATTN_MASK, (
                     f"Multi-Token Prediction (MTP) is not yet supported with "
-                    + f"{attn_mask_type} attention mask type."
-                    + f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
+                    f"{attn_mask_type} attention mask type. "
+                    f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
                 )
 
         self.enorm = build_module(
@@ -602,14 +603,14 @@ class MultiTokenPredictionLayer(MegatronModule):
             if self.mtp_hybrid_override_pattern is not None:
                 pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-                # We do not need pre and post process stage for MTP layer, given they are handled in the 
-                # MultiTokenPredictionLayer itself.
+                # We do not need pre and post process stage for MTP layer, given they are
+                # handled in the MultiTokenPredictionLayer itself.
                 assert self.config.mtp_num_layers_per_layer is not None, \
                     "mtp_num_layers_per_layer must be set when using mtp_hybrid_override_pattern"
                 self.mtp_model_layer = build_module(
                     self.submodules.mtp_model_layer,
                     self.config,
-                    pre_process=False, 
+                    pre_process=False,
                     post_process=False,
                     hybrid_override_pattern=self.mtp_hybrid_override_pattern,
                     dtype=self.config.params_dtype,
@@ -619,11 +620,16 @@ class MultiTokenPredictionLayer(MegatronModule):
                     is_mtp_layer=True
                 )
             else:
-                # Uses the transformer block spec for MTP layer. This option is only implemented for the 
-                # GPT model. In hybrid model, we model transformer block spec for MTP layers with the hybrid
-                # override pattern.
-                self.mtp_model_layer = build_module(self.submodules.mtp_model_layer, config=self.config, vp_stage=self.vp_stage, is_mtp_layer=True)
-                
+                # Uses the transformer block spec for MTP layer. This option is only
+                # implemented for the GPT model. In hybrid model, we model transformer
+                # block spec for MTP layers with the hybrid override pattern.
+                self.mtp_model_layer = build_module(
+                    self.submodules.mtp_model_layer,
+                    config=self.config,
+                    vp_stage=self.vp_stage,
+                    is_mtp_layer=True
+                )
+
         self.final_layernorm = build_module(
             self.submodules.layer_norm,
             config=self.config,
@@ -861,7 +867,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
-        assert context is None, f"multi token prediction + cross attention is not yet supported."
+        assert context is None, "multi token prediction + cross attention is not yet supported."
         input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,

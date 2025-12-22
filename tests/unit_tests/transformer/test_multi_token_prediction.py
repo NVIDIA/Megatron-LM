@@ -682,8 +682,8 @@ class TestMTPLossLoggingHelper:
 
         # Verify total_loss_dict is populated
         for i in range(num_layers):
-            assert f"mtp_{i+1} loss" in total_loss_dict
-            assert total_loss_dict[f"mtp_{i+1} loss"] == loss * loss_scale
+            assert f"mtp_{i + 1} loss" in total_loss_dict
+            assert total_loss_dict[f"mtp_{i + 1} loss"] == loss * loss_scale
 
         # Verify tracker is cleaned
         assert torch.all(MTPLossLoggingHelper.tracker["values"] == 0)
@@ -715,11 +715,11 @@ class TestMultiTokenPredictionMamba:
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
         config = core_transformer_config_from_args(args)
-        
+
         mtp_block_spec = get_mamba_mtp_block_spec(
             config=config, spec=mamba_stack_spec, use_transformer_engine=True
         )
-        
+
         model = MambaModel(
             config=config,
             mamba_stack_spec=mamba_stack_spec,
@@ -755,7 +755,7 @@ class TestMultiTokenPredictionMamba:
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.num_query_groups = 8
-        args.mamba_num_groups = 4  
+        args.mamba_num_groups = 4
         args.max_position_embeddings = 256
         args.micro_batch_size = micro_batch_size
         args.create_attention_mask_in_dataloader = True
@@ -774,15 +774,15 @@ class TestMultiTokenPredictionMamba:
         args.no_load_optim = True
         args.no_load_rng = True
         args.bf16 = True
-        
-        args.hybrid_attention_ratio = 0.5  
-        args.hybrid_mlp_ratio = 0.0  
-        args.hybrid_override_pattern = "M*M*"  
-        args.mtp_hybrid_override_pattern = "M*"  
-        args.mtp_num_layers_per_layer = 2 
+
+        args.hybrid_attention_ratio = 0.5
+        args.hybrid_mlp_ratio = 0.0
+        args.hybrid_override_pattern = "M*M*"
+        args.mtp_hybrid_override_pattern = "M*"
+        args.mtp_num_layers_per_layer = 2
         args.spec = "megatron.core.models.mamba.mamba_layer_specs.mamba_stack_spec"
         args.mtp_spec = "megatron.core.models.mamba.mamba_layer_specs.mamba_stack_spec"
-        
+
         if fp8 is not None:
             args.fp8 = 'e4m3'
         if full_recompute:
@@ -827,7 +827,7 @@ class TestMultiTokenPredictionMamba:
         mamba_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
         mamba_model = unwrap_model(mamba_model)
         sharded_state_dict = mamba_model[0].sharded_state_dict()
-        
+
         # Verify MTP layers are in the state dict
         for i in range(args.mtp_num_layers):
             assert f"mtp.layers.{i}.enorm.weight" in sharded_state_dict.keys()
@@ -848,11 +848,11 @@ class TestMultiTokenPredictionMamba:
         )
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
-        
+
         mamba_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             self.model_provider, ModelType.encoder_or_decoder
         )
-        
+
         output_ref = mamba_model_ref[0].forward(
             input_ids=tokens,
             position_ids=position_ids,
@@ -860,7 +860,7 @@ class TestMultiTokenPredictionMamba:
             labels=labels,
             loss_mask=loss_mask,
         )
-        
+
         tracker = MTPLossLoggingHelper.tracker
         mtp_loss_ref = None
         assert "values" in tracker
@@ -899,11 +899,11 @@ class TestMultiTokenPredictionMamba:
                 self.model_provider, ModelType.encoder_or_decoder
             )
             load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)
-            
+
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(batch)
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
-            
+
             output = mamba_model[0].forward(
                 input_ids=tokens,
                 position_ids=position_ids,
@@ -911,7 +911,7 @@ class TestMultiTokenPredictionMamba:
                 labels=labels,
                 loss_mask=loss_mask,
             )
-            
+
             tracker = MTPLossLoggingHelper.tracker
             assert "values" in tracker
             mtp_loss = tracker['values'].clone()
@@ -920,7 +920,7 @@ class TestMultiTokenPredictionMamba:
                 mtp_loss, group=pg_collection.cp, op=torch.distributed.ReduceOp.AVG
             )
             MTPLossLoggingHelper.clean_loss_in_tracker()
-            
+
             assert torch.allclose(output_ref, output, rtol=1e-03, atol=1e-03)
             assert torch.allclose(mtp_loss, mtp_loss_ref, rtol=1e-02, atol=1e-02)
 
@@ -942,7 +942,7 @@ class TestMultiTokenPredictionMamba:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
-        
+
         try:
             mamba_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
             mamba_model = unwrap_model(mamba_model)

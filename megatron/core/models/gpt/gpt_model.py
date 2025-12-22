@@ -620,7 +620,7 @@ class GPTModel(LanguageModule):
             # will be stored in embedding layer, and output layer will not have any weight.
             assert hasattr(
                 self, 'embedding'
-            ), f"embedding is needed in this pipeline stage, but it is not initialized."
+            ), "embedding is needed in this pipeline stage, but it is not initialized."
             return self.embedding.word_embeddings.weight
         elif self.post_process:
             return self.output_layer.weight
