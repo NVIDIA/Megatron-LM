@@ -258,7 +258,9 @@ def get_modelopt_torch_quantization_config():
 
 def get_calib_dataloader(calib_size=512, max_sequence_length=512):
     """Return a dataloader for calibration."""
-    dataset = load_dataset("cnn_dailymail", name="3.0.0", split="train")
+    args = get_args()
+    dataset_path = args.hf_local_dir + "cnn_dailymail"
+    dataset = load_dataset(dataset_path, name="3.0.0", split="train")
     text_column = "article"
 
     calib_size = min(len(dataset), calib_size)

@@ -179,9 +179,11 @@ if __name__ == "__main__":
 
     all_correct = {}
 
+    mmlu_dataset_path = args.hf_local_dir + "cais/mmlu"
+
     for subject in all_subjects:
-        test_data = datasets.load_dataset("cais/mmlu", subject, split="test")
-        dev_data = datasets.load_dataset("cais/mmlu", subject, split="dev")
+        test_data = datasets.load_dataset(mmlu_dataset_path, subject, split="test")
+        dev_data = datasets.load_dataset(mmlu_dataset_path, subject, split="dev")
 
         correct = []
         for idx, test_example in enumerate(test_data):
