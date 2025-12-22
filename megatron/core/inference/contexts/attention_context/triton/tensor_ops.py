@@ -254,9 +254,7 @@ def _compute_row_size(tensor):
     return row_size
 
 
-def tensor_get_slice_after(
-    input_tensor, output_tensor, pos_on_device, check_bounds: bool = False
-):
+def tensor_get_slice_after(input_tensor, output_tensor, pos_on_device, check_bounds: bool = False):
     """
     Copy from input_tensor[pos_on_device:] to output_tensor[:copy_size].
     """
@@ -336,9 +334,7 @@ def tensor_merge(
         tensor_a.dtype == tensor_b.dtype == output_tensor.dtype
     ), "All tensors must have the same dtype"
     assert (
-        tensor_a.is_contiguous()
-        and tensor_b.is_contiguous()
-        and output_tensor.is_contiguous()
+        tensor_a.is_contiguous() and tensor_b.is_contiguous() and output_tensor.is_contiguous()
     ), "All tensors must be contiguous"
 
     if check_bounds:
@@ -381,9 +377,7 @@ def tensor_merge(
     )
 
 
-def tensor_masked_update(
-    states: torch.Tensor, idx: torch.Tensor, new_states: torch.Tensor
-):
+def tensor_masked_update(states: torch.Tensor, idx: torch.Tensor, new_states: torch.Tensor):
     """
     Update `states` to `new_states` at `idx`, but ignore any -1 values in `idx`.
     Works for 2D, 3D, or 4D tensors.

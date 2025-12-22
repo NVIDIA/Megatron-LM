@@ -168,49 +168,25 @@ class InferenceBatchDimensions:
         # all reduce local work across expert model parallel group
 
         has_explicit_chunked_prefill_req = local_batch_dims.has_explicit_chunked_prefill_req
-
-        if strict:
-            # For strict matching we take the max over the total token count, decode req count, and
-            # prefill req count to guarantee that every rank selects the same graph
-            # TODO(sidsingh, ksanthanam): Investigate whether we need this extra synchronization
-            sync_tensor = torch.tensor(
-                [
-                    local_batch_dims.token_count,
-                    local_batch_dims.decode_req_count,
-                    local_batch_dims.prefill_req_count,
-                    int(has_explicit_chunked_prefill_req),
-                ],
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
-        else:
-            is_non_decode = local_batch_dims.prefill_req_count > 0
-            sync_tensor = torch.tensor(
-                [
-                    local_batch_dims.token_count,
-                    int(is_non_decode),
-                    int(has_explicit_chunked_prefill_req),
-                ],
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
+        is_non_decode = local_batch_dims.prefill_req_count > 0
+        sync_tensor = torch.tensor(
+            [
+                local_batch_dims.token_count,
+                int(is_non_decode),
+                int(has_explicit_chunked_prefill_req),
+            ],
+            dtype=torch.int32,
+            device=torch.cuda.current_device(),
+        )
 
         torch.distributed.all_reduce(
             sync_tensor, op=torch.distributed.ReduceOp.MAX, group=expert_model_parallel_group
         )
+
         sync_tensor = sync_tensor.cpu()
         adjusted_token_count = int(sync_tensor[0].item())
-
-        if strict:
-            adjusted_decode_req_count = int(sync_tensor[1].item())
-            adjusted_prefill_req_count = int(sync_tensor[2].item())
-            is_any_ep_rank_in_non_decode = adjusted_prefill_req_count > 0
-            any_ep_rank_has_explicit_chunked_prefill_req = sync_tensor[3].item() == 1
-        else:
-            is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
-            any_ep_rank_has_explicit_chunked_prefill_req = sync_tensor[2].item() == 1
-            adjusted_decode_req_count = local_batch_dims.decode_req_count
-            adjusted_prefill_req_count = local_batch_dims.prefill_req_count
+        is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
+        any_ep_rank_has_explicit_chunked_prefill_req = sync_tensor[2].item() == 1
 
         # We force eager mode for scenarios where some ranks will run with CUDA graphs
         # while others will not. Without this check, the all-to-all communication in the
@@ -228,8 +204,8 @@ class InferenceBatchDimensions:
         assert not has_explicit_chunked_prefill_req
         adjusted_batch_dim = InferenceBatchDimensions(
             token_count=adjusted_token_count,
-            prefill_req_count=adjusted_prefill_req_count,
-            decode_req_count=adjusted_decode_req_count,
+            prefill_req_count=local_batch_dims.prefill_req_count,
+            decode_req_count=local_batch_dims.decode_req_count,
             has_explicit_chunked_prefill_req=False,
         )
         return adjusted_batch_dim
