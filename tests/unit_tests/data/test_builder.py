@@ -24,6 +24,7 @@ from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDat
 from megatron.core.datasets.utils import Split, compile_helpers, get_blend_from_list
 from megatron.training.tokenizer import build_tokenizer
 from megatron.training.utils import get_blend_and_blend_per_split
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from tools.build_sequences_per_dataset import build_sequences_per_dataset
 
@@ -344,6 +345,7 @@ def test_fast_builder(
     defer_npy_index_mmap,
     vocab_size,
     mid_level_dataset_surplus,
+    tmp_path_dist_ckpt,
     sequence_length: int = 5,
     number_of_files: int = 10,
     number_of_documents: int = 10,
@@ -369,7 +371,7 @@ def test_fast_builder(
         )
     )
 
-    with tempfile.TemporaryDirectory() as temp_dir:
+    with TempNamedDir(tmp_path_dist_ckpt / "test_fast_builder", sync=True) as temp_dir:
         # Created file_prefixes (tokenizer, Number of files, number of documents, path) --> returns file prefixes (list of strings)
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             file_prefixes = create_file_prefixes(
@@ -530,5 +532,4 @@ def test_fast_builder(
 
 
 if __name__ == "__main__":
-    # test_builder()
-    test_fast_builder(False, True, True, True, False, 131072, 0.005)
+    test_builder()
