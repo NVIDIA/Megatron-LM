@@ -1368,6 +1368,7 @@ def core_transformer_config_from_args(args, config_class=None):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['vocab_size'] = args.vocab_size
+    kw_args['min_hybrid_context_parallel_size'] = args.min_hybrid_context_parallel_size
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
     kw_args['layernorm_epsilon'] = args.norm_epsilon
@@ -2269,7 +2270,7 @@ def _add_training_args(parser):
                        help='Use the built-in pytorch profiler. '
                        'Useful if you wish to view profiles in tensorboard.',
                        dest='use_pytorch_profiler')
-    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 24],
+    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 15, 16, 24, 32],
                        help='Global ranks to profile.')
     group.add_argument('--record-memory-history', action="store_true", default=False,
                        help='Record memory history in last rank.')

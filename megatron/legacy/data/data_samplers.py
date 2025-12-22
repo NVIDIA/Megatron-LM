@@ -36,7 +36,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'single':
         if args.sft_sequence_packing:
-            if True:    # TODO: add flag.
+            if False:    # TODO: add flag.
                 batch_sampler = MegatronSFTPrefetchDPBalancedSampler(
                     dataset=dataset,
                     total_samples=len(dataset),
@@ -268,7 +268,7 @@ class MegatronSFTPrefetchDPBalancedSampler(MegatronPretrainingSampler):
         batch_numel = [self.get_numel(idx) for idx in batch]
         # TODO: use distributed `get_numel` to reduce io pressure.
         
-        groups, sample_id_groups, cp_sizes = self.data_scheduler.get_groups_and_subsamples(batch_numel, self.config)
+        groups, sample_id_groups, cp_sizes = self.data_scheduler.get_groups_and_subsamples(batch_numel, self.config, return_cp_sizes=True)
         return groups, sample_id_groups, cp_sizes
 
     def __iter__(self):
@@ -296,7 +296,7 @@ class MegatronSFTPrefetchDPBalancedSampler(MegatronPretrainingSampler):
                 microbatch = sample_id_groups[microbatch_idx][self.data_parallel_rank]
                 microbatch_cp_sizes = cp_sizes[microbatch_idx][self.data_parallel_rank]
                 num_microbatch_left = [len(sample_id_groups)-microbatch_idx-1] * len(microbatch)
-                print(f"{groups=}\n{sample_id_groups=}")
+                # print(f"{groups=}\n{sample_id_groups=}")
                 yield list(zip(microbatch, num_microbatch_left, microbatch_cp_sizes))
                 # global_batch_idx.extend(microbatch)
 
