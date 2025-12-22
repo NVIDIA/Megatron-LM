@@ -2,7 +2,7 @@
 
 ## Context parallelism overview
 
-```{figure} ../images/context_parallel/CP_overview.png
+```{figure} ../../images/context_parallel/CP_overview.png
 :alt: cp_overview
 :align: center
 
@@ -15,7 +15,7 @@ For example, in Figure 1, assuming sequence length is 8K, each GPU processes 4K 
 
 ## Context parallelism benefits
 
-```{figure} ../images/context_parallel/CP_results.png
+```{figure} ../../images/context_parallel/CP_results.png
 :alt: cp_results
 :align: center
 

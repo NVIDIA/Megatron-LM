@@ -413,8 +413,8 @@ def validate_args(args, defaults={}):
             assert args.save_interval % num_training_iterations_per_inference_iteration == 0, \
                 f"save_interval should be divisible by number of global batches per inference iteration."
         if args.rl_use_sequence_packing:
-            assert args.seq_length <= args.rl_sequence_packing_bin_size, \
-                f"rl_sequence_packing_bin_size should be larger than or equal to seq_length"
+            assert args.micro_batch_size == 1, \
+                "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
 
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
@@ -875,7 +875,6 @@ def validate_args(args, defaults={}):
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
     if args.moe_grouped_gemm:
-        assert args.bf16, 'Currently GroupedGEMM for MoE only supports bf16 dtype.'
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
@@ -1051,8 +1050,6 @@ def validate_args(args, defaults={}):
         assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
         assert args.num_experts % args.expert_model_parallel_size == 0, \
             "Number of experts should be a multiple of expert model parallel_size."
-        assert not args.fp16, \
-            "Expert parallelism is not supported with fp16 training."
 
     # MoE router check
     if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
@@ -1568,7 +1565,7 @@ def _add_inference_args(parser):
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
-                       type=int, default=1, choices=[0, 1],
+                       type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
                        'inference context. The levels are: 0) no unified memory, '
                        '1) allocate `memory_buffer` in unified memory. '
@@ -1598,6 +1595,9 @@ def _add_inference_args(parser):
                        required=False, default=False, help='Enable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int, default=12346,
                        help="This port will be used to setup the inference coordinator on node-0")
+    group.add_argument("--inference-fuse-tp-communication", action="store_true", default=False,
+                       help="Use the fused communication kernel for tensor parallelism during inference. This "
+                       "kernel fuses reduce-scatter + residual-add + rms-norm + all-gather into one operation.")
     return parser
 
 
@@ -2067,15 +2067,17 @@ def _add_rl_args(parser):
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
     group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, calculate the intra-group similarity of rollouts.')
-    group.add_argument('--rl-use-sequence-packing', action='store_true',
+    group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
-    group.add_argument('--rl-sequence-packing-bin-size', type=int, default=8192,
-                       help='Override bin size for sequence packing.')
+    group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,
+                       help='Maximum number of sequences that can be packed into a single bin. ')
     group.add_argument('--rl-sequence-packing-algo', type=str, default='fifo',
                        choices=['fifo', 'round-robin'],
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
+                        help='Number of parallel generation tasks for RL inference.')
     return parser
 
 def _add_training_args(parser):
