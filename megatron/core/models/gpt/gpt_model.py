@@ -553,9 +553,19 @@ class GPTModel(LanguageModule):
                     runtime_gather_output=runtime_gather_output,
                 )
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
-                mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group)
+                mtp_labels, _ = roll_tensor(
+                    mtp_labels,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
                 loss_mask, num_tokens = roll_tensor(
-                    loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
+                    loss_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
                 )
                 mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
                 mtp_loss = loss_mask * mtp_loss
@@ -750,7 +760,13 @@ class GPTModel(LanguageModule):
         if self.mtp_process and not self.pre_process:
             emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
             emb_weight = self.embedding.word_embeddings.weight
-            tie_word_embeddings_state_dict(sharded_state_dict, emb_weight, emb_weight_key)
+            tie_word_embeddings_state_dict(
+                sharded_state_dict,
+                emb_weight,
+                emb_weight_key,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
+            )
         if self.mtp_process and not self.post_process:
             # We only need to tie the output layer weight if share_embeddings_and_output_weights
             # is False. Because if share_embeddings_and_output_weights is True, the shared weight
@@ -759,7 +775,11 @@ class GPTModel(LanguageModule):
                 output_layer_weight_key = f'{prefix}output_layer.weight'
                 output_layer_weight = self.output_layer.weight
                 tie_output_layer_state_dict(
-                    sharded_state_dict, output_layer_weight, output_layer_weight_key
+                    sharded_state_dict,
+                    output_layer_weight,
+                    output_layer_weight_key,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
                 )
 
         return sharded_state_dict

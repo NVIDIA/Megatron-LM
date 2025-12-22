@@ -42,6 +42,7 @@ from megatron.core.inference.utils import Counter, await_process_event
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import (
+    experimental_api,
     get_asyncio_loop,
     get_pg_rank,
     get_pg_size,
@@ -49,6 +50,8 @@ from megatron.core.utils import (
     internal_api,
     trace_async_exceptions,
 )
+
+from .async_zmq_communicator import AsyncZMQCommunicator
 
 try:
     from tqdm import tqdm
@@ -111,6 +114,7 @@ class RequestEntry:
 
 
 # pylint: disable=line-too-long
+@experimental_api
 class DynamicInferenceEngine(AbstractEngine):
     """The dynamic inference engine.
 
@@ -269,21 +273,6 @@ class DynamicInferenceEngine(AbstractEngine):
         controller = self.controller
 
         config = controller.inference_wrapped_model.inference_wrapper_config
-        moe_pad_experts = config.moe_pad_experts_for_cuda_graph_inference
-
-        if moe_pad_experts:
-            filtered_cuda_graph_batch_dimensions_list = []
-            for config in context.cuda_graph_batch_dimensions_list:
-                if config.prefill_req_count == 0:
-                    filtered_cuda_graph_batch_dimensions_list.append(config)
-            if len(filtered_cuda_graph_batch_dimensions_list) != len(
-                context.cuda_graph_batch_dimensions_list
-            ):
-                warnings.warn(
-                    "MoE models do not support non-decode cuda graphs. "
-                    "Forcing non_decode_cuda_graphs to False."
-                )
-            context.cuda_graph_batch_dimensions_list = filtered_cuda_graph_batch_dimensions_list
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
@@ -342,7 +331,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self,
         inference_coordinator_port: int,
         launch_inference_coordinator: bool = True,
-        verbose: bool = False,
         *,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
@@ -376,7 +364,6 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
-            verbose (bool): Whether to run in verbose mode.
         """
 
         assert HAVE_ZMQ, (
@@ -478,15 +465,21 @@ class DynamicInferenceEngine(AbstractEngine):
 
         torch.distributed.barrier(mp_group)
 
+        # initialize zmq-based EP communicator
+        self.ep_rank = get_pg_rank(self.pg_collection.ep)
+        self.ep_world_size = get_pg_size(self.pg_collection.ep)
+        if self.ep_world_size > 1:
+            self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
+                self.zmq_context, process_group=self.pg_collection.ep
+            )
+
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
             logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
-        self.engine_loop_task = loop.create_task(
-            self.run_engine_with_coordinator(loop=loop, verbose=verbose)
-        )
+        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
     @contextmanager
     @staticmethod
@@ -678,14 +671,20 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate is None
             or request.sampling_params.num_tokens_total is None
         )
-        if request.sampling_params.return_prompt_top_n_logprobs:
-            assert (
-                request.sampling_params.return_log_probs
-            ), "return_prompt_top_n_logprobs requires sampling_params.return_log_probs to be True"
         if request.sampling_params.top_n_logprobs > 0:
             assert (
                 request.sampling_params.return_log_probs
             ), "top_n_logprobs requires sampling_params.return_log_probs to be True"
+        if (
+            request.sampling_params.return_log_probs
+            and not request.sampling_params.skip_prompt_log_probs
+        ):
+            assert not self.context.materialize_only_last_token_logits, (
+                "Prompt log probs cannot be calculated if only last token logits are materialized. "
+                "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
+                "or skip_prompt_log_probs to True in SamplingParams."
+            )
+
         if request.sampling_params.num_tokens_total is not None:
             request.sampling_params.num_tokens_to_generate = (
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)
@@ -1023,6 +1022,7 @@ class DynamicInferenceEngine(AbstractEngine):
         is_decode_only = self.context.is_decode_only()
         pre_step_context_state = {
             "is_decode_only": is_decode_only,
+            "max_active_requests": self.context.max_active_requests,
             "total_request_count": self.context.total_request_count,
             "paused_request_count": self.context.paused_request_count,
             "active_token_count": self.context.active_token_count,
@@ -1044,8 +1044,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if (
             self.inference_logging_step_interval > 0
-            and step_count > 0
-            and step_count % self.inference_logging_step_interval == 0
+            and self.step_count > 0
+            and self.step_count % self.inference_logging_step_interval == 0
             and self.context.metrics_writer is not None
         ):
             kvcache_util_stats = self.context.get_kvcache_utilization_stats()
@@ -1069,13 +1069,7 @@ class DynamicInferenceEngine(AbstractEngine):
         return result, context_state, step_time, self.step_count
 
     async def async_bookkeep(
-        self,
-        step_result: Optional[Dict],
-        context_state: Dict,
-        step_time: float,
-        step_count: int,
-        *,
-        verbose: bool = False,
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float, step_count: int
     ):
         """Uses `asyncio` for continuous bookkeeping.
 
@@ -1084,7 +1078,6 @@ class DynamicInferenceEngine(AbstractEngine):
             context_state (Dict): is_decode_only, total/paused request count, active token count.
             step_time (float): How long this step took.
             step_count (int): The count of the step.
-            verbose (bool): Whether to run in verbose mode.
 
         Returns:
             A dictionary containing:
@@ -1183,12 +1176,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
         # Print context state.
-        if verbose:
+        if (
+            self.inference_logging_step_interval > 0
+            and step_count % self.inference_logging_step_interval == 0
+        ):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f%s ... "
-                "reqs: a %d/%d, p %d/%d, w %d, f %d ... "
+                "reqs: a %d/%d, p %d, w %d, f %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
@@ -1209,9 +1205,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     ),
                     context_state["total_request_count"] - context_state["paused_request_count"],
-                    context_state["total_active_block_count"],
+                    context_state["max_active_requests"],
                     context_state["paused_request_count"],
-                    context_state["total_paused_block_count"],
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
                     context_state["total_active_used_blocks"],
@@ -1235,15 +1230,12 @@ class DynamicInferenceEngine(AbstractEngine):
         }
 
     async def async_step(
-        self, *, verbose: bool = False
+        self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
         match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
-
-        Args:
-            verbose (bool): Whether to run in verbose mode.
 
         Returns:
             A tuple comprised of:
@@ -1252,18 +1244,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 3. The step time in seconds.
         """
         last_step_data = await self.async_forward()
-        ret = await self.async_bookkeep(*last_step_data, verbose=verbose)
+        ret = await self.async_bookkeep(*last_step_data)
         # Keep for compatibility with current test suite.
         return ret
 
     def step_modern(
-        self, *, verbose: bool = False
+        self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
-        return self._loop.run_until_complete(self.async_step(verbose=verbose))
+        return self._loop.run_until_complete(self.async_step())
 
     def step_legacy(
-        self, sampling_params: SamplingParams, *, verbose: bool = False
+        self, sampling_params: SamplingParams
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
         warnings.warn(
@@ -1271,7 +1263,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "0.16. Please use `step_modern()` going forward, which will eventually "
             "be renamed to `step()`."
         )
-        result = self._loop.run_until_complete(self.async_step(verbose=verbose))
+        result = self._loop.run_until_complete(self.async_step())
         active_requests = [self.get_request(i) for i in result["active_request_ids"]]
         finished_requests = [r.merge() for r in result["finished_request_records"]]
         return active_requests, finished_requests, result["step_time"]
@@ -1398,7 +1390,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.received_pause = False
             elif header == Headers.STOP_ACK:
                 self.stopped.set()
-                self.stop()
+                self.received_stop = False
             elif header == Headers.UNPAUSE:
                 self.paused.clear()
                 self.running.set()
@@ -1407,7 +1399,7 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.RESUME:
                 self.suspend_signal = False
             elif header == Headers.STOP:
-                self.stopped = True
+                self.received_stop = True
             else:
                 raise UnknownHeaderError(header)
 
@@ -1423,15 +1415,15 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         if hasattr(self, "inference_coordinator_process"):
-            self.inference_coordinator_process.terminate()
+            self.inference_coordinator_process.join()
         for socket in self.zmq_sockets:
             socket.close()
+        if hasattr(self, "expert_parallel_zmq_communicator"):
+            self.expert_parallel_zmq_communicator.close()
         self.zmq_context.term()
 
     @trace_async_exceptions
-    async def run_engine(
-        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
-    ):
+    async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = False
@@ -1448,13 +1440,51 @@ class DynamicInferenceEngine(AbstractEngine):
                             )
                         )
                     )
-                await self.async_step(verbose=verbose)
+                await self.async_step()
         except asyncio.CancelledError:
             pass
 
+    async def _ep_group_has_work(self, local_work: int) -> bool:
+        """Determines if there are some pending requests in the expert parallel group this
+        rank is a part of.
+        Args:
+            local_work (int): The local work count for this rank. This is a sum of active
+            and waiting requests.
+        Returns:
+            bool: True if there is some work in the EP group, False otherwise.
+        """
+        range_push("_ep_group_has_work")
+
+        is_stopped = self.stopped.is_set() or self.received_stop
+        is_paused = self.paused.is_set() or self.received_pause
+        is_suspended = self.suspend_signal
+        if is_stopped or is_paused or is_suspended:
+            # Signals can be received asynchronously on EP ranks.
+            # We do not want a rank to pause/stop/suspend prematurely if one of it's peers
+            # is yet to receive the signal.
+            # So this is an *attempt* to process the signal. This rank has received the signal
+            # and passes 0 to the all-reduce. If any other rank in the EP group has not received the signal yet,
+            # it will pass a non-zero value to the all-reduce, and hence the global work will be non-zero,
+            # and we will defer processing the signal.
+            # When all ranks receive the signal, global work will be zero, and we can process the signal safely.
+            local_work = 0
+
+        if self.ep_world_size > 1:
+            # Perform all-reduce to get max global work across EP group.
+            # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
+            # The user may have other tasks running in the event loop that need to be serviced.
+            # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
+            # We have tried that and it blocks the event loop is megatron-rl.
+            max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
+        else:
+            max_global_work = local_work
+
+        range_pop()
+        return max_global_work > 0
+
     @trace_async_exceptions
     async def run_engine_with_coordinator(
-        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None
     ):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
@@ -1462,8 +1492,6 @@ class DynamicInferenceEngine(AbstractEngine):
         try:
             while True:
                 self.schedule_requests()
-                if self.stopped.is_set():
-                    break
 
                 # for the cases below (no active requests, or undergoing a state-change)
                 # do not use asyncio.sleep(0)
@@ -1475,30 +1503,51 @@ class DynamicInferenceEngine(AbstractEngine):
                 # needed to send one message on an IPC socket. However
                 # just to be safe, we use 20ms here.
 
-                # todo [Siddharth]: Can this hardcoded sleep be avoided
-                # with asyncio zmq sockets?
-                if self.paused.is_set() or self.received_pause or self.received_stop:
-                    await asyncio.sleep(0.02)
+                local_pending_requests = self.context.get_active_request_count() + len(
+                    self.waiting_request_ids
+                )
+                # 1. Check for work availability (Consensus Step)
+                ep_group_has_work = await self._ep_group_has_work(local_pending_requests)
+
+                # 2. Dummy Work Logic (Keep group alive if peers have work)
+                if ep_group_has_work and local_pending_requests == 0:
+                    # run dummy forward pass if EP group as a whole has work,
+                    # but this rank does not have any work.
+                    self.controller.dummy_forward()
                     continue
 
-                # Suspend, resume.
-                if self.suspend_signal:
-                    self.suspend()
-                    await asyncio.sleep(0.02)
+                # 3. No work in EP group
+                # We handle control signals (PAUSE/STOP/SUSPEND) only when
+                # the entire EP group has received the signal. It is important to
+                # not process these signals immediately upon receipt, because
+                # other ranks in the EP group may not have received them yet.
+                # If we exit prematurely, other ranks will deadlock at the all-to-all.
+                # We use self._ep_group_has_work() to build consensus across the EP group
+                # as to when it is safe to process these signals. The function returns False
+                # when all ranks have received the signal.
+                if not ep_group_has_work:
+                    # Priority A: STOP
+                    if self.stopped.is_set():
+                        if self.rank == 0:
+                            logging.info("Stopping engine.")
+                        self.stop()
+                        break
+
+                    # Priority B: SUSPEND
+                    if self.suspend_signal:
+                        self.suspend()
+                    else:
+                        self.resume()
+
+                    # Priority C: PAUSE or no work - nothing needs to be done
+                    # To avoid flooding the TP publisher socket with packets,
+                    # we sleep for 20 ms here.
+                    # todo [Siddharth]: Can this hardcoded sleep be avoided
+                    # with asyncio zmq sockets?
+                    await asyncio.sleep(0.02)  # Yield to event loop
                     continue
 
-                else:
-                    self.resume()
-
-                # No requests.
-                if (
-                    self.context.get_active_request_count() == 0
-                    and len(self.waiting_request_ids) == 0
-                ):
-                    await asyncio.sleep(0.02)
-                    continue
-
-                await self.async_step(verbose=verbose)
+                await self.async_step()
 
         except asyncio.CancelledError:
             pass

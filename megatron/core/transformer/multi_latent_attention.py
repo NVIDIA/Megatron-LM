@@ -923,3 +923,123 @@ class MLASelfAttention(MultiLatentAttention):
         if self.config.q_lora_rank is not None:
             set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_down_proj)
+
+    def clip_qk(self):
+        """
+        QK Clipping is a technique to clip the query and key attention logits to prevent the
+        attention logits from exploding. Per MuonClip usage, we update the weight by calling this
+        function after Muon optimizer step.
+        """
+
+        if not self.config.qk_clip:
+            raise ValueError("qk_clip option needs to be enabled")
+
+        if self.core_attention.current_max_attn_logits is None:
+            raise ValueError("current_max_attn_logits is None")
+
+        # Check if we're in absorption mode
+        if self.cache_mla_latents and not hasattr(self, 'linear_kv_up_proj'):
+            raise ValueError(
+                "qk_clip is not supported when cache_mla_latents is enabled and absorption is "
+                "active. The linear_kv_up_proj layer has been deleted during absorption "
+                "preparation."
+            )
+
+        assert self.core_attention.current_max_attn_logits.shape == (
+            self.num_attention_heads_per_partition,
+        ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
+                    but {self.core_attention.current_max_attn_logits.shape}"
+
+        # only update the weight if any head has
+        # current_max_attn_logits > qk_clip_threshold
+        if torch.any(self.core_attention.current_max_attn_logits > self.config.qk_clip_threshold):
+            # Use num_attention_heads_per_partition for tensor parallel scenarios
+
+            # qk_clip_balancing_eta (n, 1, 1)
+            assert self.core_attention.current_max_attn_logits.shape == (
+                self.num_attention_heads_per_partition,
+            ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition},) \
+                but {self.core_attention.current_max_attn_logits.shape}"
+            self.qk_clip_balancing_eta = torch.clamp(
+                self.config.qk_clip_threshold / self.core_attention.current_max_attn_logits, max=1.0
+            ).view(self.num_attention_heads_per_partition, 1, 1)
+            assert torch.all(self.qk_clip_balancing_eta <= 1.0)
+
+            # Update q side weight, keep qk_pos_emb_head_dim side weight unchanged
+            if self.config.q_lora_rank is None:
+                q_proj_weight = self.linear_q_proj.weight
+            else:
+                q_proj_weight = self.linear_q_up_proj.weight
+
+            # Handle different weight access patterns (main_param vs direct access)
+            if hasattr(q_proj_weight, 'main_param'):
+                q_proj_weight.main_param.data.copy_(
+                    self._clip_q_proj_weight(q_proj_weight.main_param.data)
+                )
+            q_proj_weight.data.copy_(self._clip_q_proj_weight(q_proj_weight.data))
+
+            # Update k side weight, keep v side weight unchanged
+            kv_proj_weight = self.linear_kv_up_proj.weight
+
+            # Handle different weight access patterns
+            if hasattr(kv_proj_weight, 'main_param'):
+                kv_proj_weight.main_param.data.copy_(
+                    self._clip_kv_proj_weight(kv_proj_weight.main_param.data)
+                )
+            kv_proj_weight.data.copy_(self._clip_kv_proj_weight(kv_proj_weight.data))
+
+        # reset current_max_attn_logits
+        self.core_attention.current_max_attn_logits = None
+
+    def _clip_q_proj_weight(self, weight):
+        """Clip q_proj_weight"""
+        # Reshape to (n, a + b, -1)
+        weight_reshaped = weight.view(
+            self.num_attention_heads_per_partition,
+            self.config.qk_head_dim + self.config.qk_pos_emb_head_dim,
+            -1,
+        )
+
+        # Split into qk_head_dim and qk_pos_emb_head_dim parts: (n, a, -1) and (n, b, -1)
+        weight_q_nope = weight_reshaped[:, : self.config.qk_head_dim, :]
+        weight_q_pe = weight_reshaped[:, self.config.qk_head_dim :, :]
+
+        # Clipping
+        weight_q_nope.mul_(torch.pow(self.qk_clip_balancing_eta, self.config.qk_clip_alpha))
+        weight_q_pe.mul_(self.qk_clip_balancing_eta)
+
+        # Concatenate back and reshape to original shape
+        weight_q_updated = torch.cat([weight_q_nope, weight_q_pe], dim=1)
+        weight_q_updated = weight_q_updated.view(
+            self.num_attention_heads_per_partition
+            * (self.config.qk_head_dim + self.config.qk_pos_emb_head_dim),
+            -1,
+        )
+
+        return weight_q_updated
+
+    def _clip_kv_proj_weight(self, weight):
+        """Clip kv_proj_weight"""
+        # shape: (n, qk_head_dim + v_head_dim, kv_lora_rank)
+        weight_reshaped = weight.view(
+            self.num_attention_heads_per_partition,
+            self.config.qk_head_dim + self.config.v_head_dim,
+            -1,
+        )
+
+        # Split into qk_head_dim and v_head_dim parts: (n, a, -1) and (n, b, -1)
+        weight_k = weight_reshaped[:, : self.config.qk_head_dim, :]
+        weight_v = weight_reshaped[:, self.config.qk_head_dim :, :]
+
+        # Clipping
+        weight_k.mul_(torch.pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha))
+
+        # Concatenate back and reshape to original shape
+        weight_kv_updated = torch.cat([weight_k, weight_v], dim=1)
+        weight_kv_updated = weight_kv_updated.view(
+            self.num_attention_heads_per_partition
+            * (self.config.qk_head_dim + self.config.v_head_dim),
+            -1,
+        )
+
+        return weight_kv_updated
