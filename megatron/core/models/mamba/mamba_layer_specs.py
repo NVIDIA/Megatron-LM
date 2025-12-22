@@ -181,7 +181,6 @@ def get_mamba_mtp_block_spec(
 ) -> MultiTokenPredictionBlockSubmodules:
     """Mamba Multi-Token Prediction (MTP) block spec."""
     assert HAVE_KITCHEN, "Kitchen needs to be installed."
-
     if use_transformer_engine:
         assert HAVE_TE, "TransformerEngine needs to be installed."
         backend: BackendSpecProvider = (
@@ -198,7 +197,6 @@ def get_mamba_mtp_block_spec(
     return get_mamba_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage
     )
-
 
 def get_mamba_mtp_block_spec_for_backend(
     config: TransformerConfig,

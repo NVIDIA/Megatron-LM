@@ -774,7 +774,6 @@ class TestMultiTokenPredictionMamba:
         args.no_load_optim = True
         args.no_load_rng = True
         args.bf16 = True
-
         args.hybrid_attention_ratio = 0.5
         args.hybrid_mlp_ratio = 0.0
         args.hybrid_override_pattern = "M*M*"
@@ -860,7 +859,6 @@ class TestMultiTokenPredictionMamba:
             labels=labels,
             loss_mask=loss_mask,
         )
-
         tracker = MTPLossLoggingHelper.tracker
         mtp_loss_ref = None
         assert "values" in tracker
@@ -903,7 +901,6 @@ class TestMultiTokenPredictionMamba:
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(batch)
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
-
             output = mamba_model[0].forward(
                 input_ids=tokens,
                 position_ids=position_ids,
@@ -911,7 +908,6 @@ class TestMultiTokenPredictionMamba:
                 labels=labels,
                 loss_mask=loss_mask,
             )
-
             tracker = MTPLossLoggingHelper.tracker
             assert "values" in tracker
             mtp_loss = tracker['values'].clone()
@@ -920,7 +916,6 @@ class TestMultiTokenPredictionMamba:
                 mtp_loss, group=pg_collection.cp, op=torch.distributed.ReduceOp.AVG
             )
             MTPLossLoggingHelper.clean_loss_in_tracker()
-
             assert torch.allclose(output_ref, output, rtol=1e-03, atol=1e-03)
             assert torch.allclose(mtp_loss, mtp_loss_ref, rtol=1e-02, atol=1e-02)
 
@@ -942,7 +937,6 @@ class TestMultiTokenPredictionMamba:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
-
         try:
             mamba_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
             mamba_model = unwrap_model(mamba_model)

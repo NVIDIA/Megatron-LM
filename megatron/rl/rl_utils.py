@@ -237,7 +237,7 @@ def align_unpacked_inference_logprobs(
     return padded_inference_logprobs
 
 
-def get_agent(args):
+def get_agent(args, parallel_generation_tasks: int | None = None):
     """Get an agent based on environment configuration.
 
     If args.langrl_env_config is provided, uses weighted environment selection.
@@ -246,7 +246,10 @@ def get_agent(args):
     with open(args.langrl_env_config, 'r') as f:
         config = yaml.safe_load(f)
 
-    return WeightedMultiTask.from_config(config)
+    return WeightedMultiTask.from_config(
+        config,
+        parallel_generation_tasks=parallel_generation_tasks,
+    )
 
 
 _INFERENCE_INTERFACE = None
@@ -294,7 +297,7 @@ _ROLLOUT_GENERATOR = None
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
     if not args.rl_partial_rollouts or _ROLLOUT_GENERATOR is None:
-        agent = get_agent(args)
+        agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
         # Collect Rollouts
         request = GroupedRolloutRequest(
             num_groups=-1 if args.rl_partial_rollouts else n_prompts,

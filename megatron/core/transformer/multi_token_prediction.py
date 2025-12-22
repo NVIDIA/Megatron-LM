@@ -629,7 +629,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     vp_stage=self.vp_stage,
                     is_mtp_layer=True
                 )
-
+                
         self.final_layernorm = build_module(
             self.submodules.layer_norm,
             config=self.config,
