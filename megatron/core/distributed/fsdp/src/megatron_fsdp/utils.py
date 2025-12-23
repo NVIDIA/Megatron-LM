@@ -789,6 +789,8 @@ class FSDPDistributedIndex:
 
         # Register EP submeshes
         if self.expt_device_mesh is not None:
+            register_submesh(self.device_mesh, hsdp_submesh, True)
+            register_submesh(self.device_mesh, hsdp_tp_submesh, True)
             register_submesh(self.expt_device_mesh, tp_submesh, True)
             register_submesh(self.expt_device_mesh, fsdp_tp_submesh, True)
             register_submesh(self.expt_device_mesh, fsdp_submesh, True)
