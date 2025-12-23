@@ -3,7 +3,6 @@
 import asyncio
 import multiprocessing
 import sys
-
 import torch
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -138,6 +137,28 @@ def tensor_swap(x, src_idxs, dst_idxs):
     """
     x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
 
+def use_cuda_graph(graph_cache: dict, graph_key, fn):
+    """Record-or-replay a CUDA graph for fn().
+
+    On first call for a given graph_key, captures fn() into a CUDA graph.
+    On subsequent calls with the same key, replays the cached graph.
+    fn must be a zero-argument callable operating on static-address tensors.
+    """
+    if graph_key in graph_cache:
+        graph_cache[graph_key].replay()
+    else:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fn()
+        graph_cache[graph_key] = g
+
+async def torch_awaitable(stream: torch.cuda.Stream | None = None):
+    """Syntactic sugar for returning an awaitable handle for non-distributed torch."""
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    event = stream.record_event()
+    while not event.query():
+        await asyncio.sleep(0)
 
 async def await_process_call(call, process: multiprocessing.Process, timeout: float = 1.0):
     """Repeatedly wait for a multiprocessing callable to resolve, aborting upon process failure.
