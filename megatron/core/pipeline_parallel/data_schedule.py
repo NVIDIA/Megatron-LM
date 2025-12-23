@@ -54,7 +54,7 @@ def wrap_dataloader(
         config: The config object containing the max_seqlen_per_dp_cp_rank
         dp_cp_group: Data parallel context parallel group.
     """
-    # if torch.distributed.get_rank() == 0: print(f"{scheduler_type=}")
+    if torch.distributed.get_rank() == 0: print(f"{scheduler_type=}")
 
     scheduler_map = {
         "hybrid_cp": BalancedHybridCPscheduler,
@@ -434,6 +434,7 @@ def wrap_dataloader(
 
         elif (
             scheduler_type is PackingScheduler.HYBRID_CP
+            or scheduler_type is PackingScheduler.HYBRID_CP_WITH_PP
             or scheduler_type is PackingScheduler.NAIVE_SEQUENCE_PACKING
         ):
             batch = next(data_iterator)
@@ -452,6 +453,7 @@ def wrap_dataloader(
             groups, sample_id_groups = scheduler.get_groups_and_subsamples(
                 global_id_seqlens, config
             )
+            # if torch.distributed.get_rank() == 0: print(f"\n{groups=}\n{sample_id_groups=}\n{global_id_seqlens=}")
 
             # TODO(tailaim): remove this after testing
             set_gbs = set()
@@ -486,6 +488,7 @@ def wrap_dataloader(
             # TODO(tailaim): modify this to support different ranks
             # have different num_microbatches within the HDP group
             new_samples = []
+            cp_sizes = []
             for i in range(num_micro_batches):
                 # pack sequences in the same group and create a new data iterator
                 sample_ids_this_group = sample_id_groups[i][hdp_rank]
@@ -501,11 +504,14 @@ def wrap_dataloader(
                     if config.hybrid_context_parallel
                     else None
                 )
+                cp_sizes.append(partner_cp_size)
                 new_sample = _pack_sequences(samples, partner_cp_size)
                 new_samples.append(new_sample)
+            
+            # if parallel_state.get_pipeline_model_parallel_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}\n{sample_id_groups[0][hdp_rank]=}\n{sample_id_groups[1][hdp_rank]=}\n{sample_id_groups[2][hdp_rank]=}")
 
         # TODO(tailaim): do we need to move this to collate function?
-        print(f"{scheduler_type=}")
+        # print(f"{scheduler_type=}")
         if scheduler_type is PackingScheduler.ONLY_PACKING_NO_SCHEDULING:
             # allreduce to get the total number of microbatches
             mfu_info_to_broadcast_this_hdp_group = torch.tensor(
@@ -1220,6 +1226,7 @@ class BalancedHybridCPscheduler(BaseScheduler):
         #     breakpoint()
         # torch.distributed.barrier()
         # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {groups=}")
+        # print(f"rank={torch.distributed.get_rank()}, {sample_id_groups=}")
         return groups, sample_id_groups
 
 
@@ -1580,11 +1587,13 @@ def assign_samples_to_buckets(
 
     for index in sorted_indices:
         if index in preassigned_samples:
+            print(f"{index=}, {preassigned_samples=}")
             continue
 
         min_score = float('inf')
         target_bucket = None
 
+        score = None
         for bucket in buckets:
             score = update_rule(bucket, index, all_density, all_lengths, all_flops)
             if score is not None and score < min_score:
@@ -1597,7 +1606,12 @@ def assign_samples_to_buckets(
             target_bucket.seq_len_sum += all_lengths[index]
             target_bucket.samples.append(index)
             remaining_sample_indices.remove(index)
+            # if torch.distributed.get_rank() == 0: print(f"pop {index=}, {len(remaining_sample_indices)=}, length_rule={update_rule == length_update_rule}, flops_rule={update_rule == fwd_flops_update_rule} {remaining_sample_indices=}")
+        else:
+            if update_rule == length_update_rule:
+                if torch.distributed.get_rank() == 0: print(f"skip {index=}, {score=}, {min_score=} {len(buckets)=}, {len(remaining_sample_indices)=}, length_rule={update_rule == length_update_rule}, flops_rule={update_rule == fwd_flops_update_rule} ")
 
+    return remaining_sample_indices
 
 
 def nearest_pow2(n: int) -> int:
@@ -1686,6 +1700,7 @@ def fill_bucket_with_samples(
     remaining_sample_indices=None,
     total_num=0,
     consumed_num_buckets=0,
+    assign_all_sample_to_except_bucket_flag=False,
 ):
     # assume sorted_indices is sorted by fwd flops in reversed order.
     selected_indices = []
@@ -1700,8 +1715,14 @@ def fill_bucket_with_samples(
         sample_fwd_flops = all_flops[1][index]
         # sample_bwd_flops = all_flops[2][index]
         sample_bwd_flops = all_flops[2][index]  # TODO(wuguohao): more precisely bwd_flops
-        if sample_fwd_flops < remained_flops * 1.05 and total_num < len(remaining_sample_indices) and length_sum < (max_seq_len * consumed_num_buckets): # TODO: consume num buckets * max seq len
-            # print_rank0(f"{target_flops=}, {index=}, {sample_fwd_flops=}, {sample_bwd_flops=}")
+        extra_limit = total_num < len(remaining_sample_indices) and length_sum < (max_seq_len * consumed_num_buckets)
+        extra_limit = (assign_all_sample_to_except_bucket_flag) or extra_limit  # skip extra_limit if `assign_all_sample_to_except_bucket_flag` is True
+
+        exceed_ratio = 1.05
+        # if assign_all_sample_to_except_bucket_flag:
+        #     exceed_ratio = 1.5
+        if sample_fwd_flops < remained_flops * exceed_ratio and extra_limit: # TODO: consume num buckets * max seq len
+            # if torch.distributed.get_rank() == 0: print(f"{target_flops=}, {index=}, {sample_fwd_flops=}, {sample_bwd_flops=}")
             remained_flops -= sample_fwd_flops
             selected_indices.append(index)
             selected_fwd_flops.append(sample_fwd_flops)
@@ -1744,7 +1765,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
             cp_size = self.gpus_needed(seq_length)
         return (seq_length * seq_length) / cp_size
 
-    def get_groups_and_subsamples(self, sample_id_seqlens, config):
+    def get_groups_and_subsamples(self, sample_id_seqlens, config, return_cp_sizes=False):
         """
         This function recursively forms groups of sub-samples such that all DPxCP ranks
         have a roughly balanced workload in the group.
@@ -1790,25 +1811,49 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         local_sample_id_groups = transpose_2d_list(best_sample_ids)
         local_best_indices_buckets = transpose_2d_list(best_indices_buckets)
         # groups = 
+        min_hybrid_context_parallel_size = config.min_hybrid_context_parallel_size
         for microbatch_idx in range(len(local_sample_id_groups)):
             sample_id_groups.append([])
             groups.append([])
             cp_sizes.append([])
-            for dp_rank in range(len(local_sample_id_groups[microbatch_idx])):
+            dpxcp = len(local_sample_id_groups[microbatch_idx]) * min_hybrid_context_parallel_size
+            for dp_rank in range(dpxcp):
+                # for min_hybrid_context_parallel_rank in range(min_hybrid_context_parallel_size):
                 sample_id_groups[microbatch_idx].append([])
                 groups[microbatch_idx].append([])
                 cp_sizes[microbatch_idx].append([])
-                for local_sample_idx in local_sample_id_groups[microbatch_idx][dp_rank]:
+                origin_dp_rank = dp_rank // min_hybrid_context_parallel_size
+                # if torch.distributed.get_rank() == 0: print(f"{microbatch_idx=}, {dp_rank=}, {origin_dp_rank=}, {local_sample_id_groups[microbatch_idx][origin_dp_rank]=}")
+                for local_sample_idx in local_sample_id_groups[microbatch_idx][origin_dp_rank]:
                     sample_id_groups[microbatch_idx][dp_rank].append(sample_id_seqlens[local_sample_idx][0])
                     groups[microbatch_idx][dp_rank].append(sample_id_seqlens[local_sample_idx][1])
-                    cp_sizes[microbatch_idx][dp_rank].append(local_best_indices_buckets[microbatch_idx][dp_rank].cp_size)
+                    final_cp_size = local_best_indices_buckets[microbatch_idx][origin_dp_rank].cp_size * min_hybrid_context_parallel_size
+                    cp_sizes[microbatch_idx][dp_rank].append(final_cp_size)
 
-
+        # if torch.distributed.get_rank() == 0: print(f"{sample_id_groups=}")
+        # if torch.distributed.get_rank() == 0: print(f"{cp_sizes=}")
         # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {groups=}")
-        if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}")
+        # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}")
+        def flatten(lst):
+            result = []
+            for item in lst:
+                if isinstance(item, list):
+                    result.extend(flatten(item))
+                else:
+                    result.append(item)
+            return result
+
+        # 示例
+        # nested_list = [1, [2, 3], [4, [5, 6]], 7]
+        # print(flatten(nested_list))  # [1, 2, 3, 4, 5, 6, 7]
+
+        # print(f"rank={torch.distributed.get_rank()}, {flatten(sample_id_groups)=}")
         # breakpoint()
 
-        return groups, sample_id_groups, cp_sizes
+        if return_cp_sizes:
+            return groups, sample_id_groups, cp_sizes
+
+        return groups, sample_id_groups
 
     def split_sample(
         self,
@@ -1880,14 +1925,41 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         first_non_zero_m = 1 + non_zero_combination.index(True)
         threshold = 2 * sum_fwd_flops / (first_non_zero_m * (DP-len(single_sample_indexes)) * PP)
 
-        for index in except_indexes:
+        consumed_num_buckets_backup = {}
+        consumed_num_buckets_raw_backup = {}
+        for idx, index in enumerate(except_indexes):
             find_bucket = False
             for i in range(len(num_buckets)):
                 # 只考虑有剩余桶的m值
                 if combination[i] > 0:
                     # 计算当前序列需要的桶数量(向上取整)
                     consumed_num_buckets_raw = math.ceil(all_flops[1][index] / avg_fwd_flops_with_m[i])
-                    consumed_num_buckets = min(min(nearest_pow2(consumed_num_buckets_raw), max_split_size), DP)
+                    remain_num_split_sample = len(except_indexes) - 1 - idx
+                    consumed_num_buckets = min(nearest_pow2(consumed_num_buckets_raw), max_split_size, DP//config.min_hybrid_context_parallel_size, num_buckets[i]-remain_num_split_sample)
+                    consumed_num_buckets_raw_backup[index] = consumed_num_buckets_raw
+                    consumed_num_buckets_backup[index] = consumed_num_buckets
+                    # 更新剩余桶数量
+                    num_buckets[i] -= consumed_num_buckets
+                    find_bucket = True
+                    break
+
+
+        assign_all_sample_to_except_bucket_flag = False
+        assert sum(num_buckets) >= 0
+        if sum(num_buckets) == 0:
+            assign_all_sample_to_except_bucket_flag = True
+        # if torch.distributed.get_rank() == 0: print(f"{num_buckets=}\n{consumed_num_buckets_raw_backup.keys()=}\n{consumed_num_buckets_raw_backup.values()=}\n{consumed_num_buckets_backup.keys()=}\n{consumed_num_buckets_backup.values()=}\n{except_indexes=}")
+        
+        for index in except_indexes:
+            find_bucket = False
+            for i in range(len(num_buckets)):
+                # 只考虑有剩余桶的m值
+                if combination[i] > 0:
+                    # 计算当前序列需要的桶数量(向上取整)
+                    # consumed_num_buckets_raw = math.ceil(all_flops[1][index] / avg_fwd_flops_with_m[i])
+                    # consumed_num_buckets = min(min(nearest_pow2(consumed_num_buckets_raw), max_split_size), DP)
+                    consumed_num_buckets = consumed_num_buckets_backup[index]
+                    # print(f"{index=}, {i=}, {consumed_num_buckets_raw=}, {consumed_num_buckets=}")
                     remained_flops = consumed_num_buckets * avg_fwd_flops_with_m[i] - all_flops[1][index]
 
                     # choose the CP interval
@@ -1895,7 +1967,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                     max_left = max_right = -1
                     max_indexes = [-1] * consumed_num_buckets
                     for j in range(combination[i]):
-                        left = j // consumed_num_buckets * consumed_num_buckets
+                        left = (j // consumed_num_buckets) * consumed_num_buckets
                         right = (j // consumed_num_buckets + 1) * consumed_num_buckets
                         min_value_this_interval = 10000000
                         # for dp size not divisible by consumed_num_buckets, continue to skip this search space
@@ -1903,11 +1975,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                             continue
 
                         for k in range(left, right): #left close right close
-                            try:
-                                min_value_this_interval = min(min_value_this_interval, remain_buckets_num_per_dp_per_m[i][k])
-                            except:
-                                import pdb;pdb.set_trace()
-                                assert False
+                            min_value_this_interval = min(min_value_this_interval, remain_buckets_num_per_dp_per_m[i][k])
                         if max_value < min_value_this_interval:
                             max_value = min_value_this_interval
                             max_left = left
@@ -1915,7 +1983,8 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                             max_indexes = list(range(left, right))
                     
                     normal_indexes_copy = copy.deepcopy(normal_indexes)
-                    selected_indices, selected_flops, selected_lengths, remained_flops, remaining_sample_indices = fill_bucket_with_samples(index, normal_indexes, remained_flops, all_flops, all_lengths, max_seq_len, normal_indexes_copy, total_num, consumed_num_buckets)
+                    selected_indices, selected_flops, selected_lengths, remained_flops, remaining_sample_indices = fill_bucket_with_samples(index, normal_indexes, remained_flops, all_flops, all_lengths, max_seq_len, normal_indexes_copy, total_num, consumed_num_buckets, assign_all_sample_to_except_bucket_flag)
+                    # print(f"\n{len(selected_indices)=}, {selected_indices=}\n{len(remaining_sample_indices)=}, {remaining_sample_indices=}\n{sum(selected_lengths)=}, {sum(selected_flops[0])=}, {remained_flops=}, {all_lengths[index]=}, {max_seq_len*consumed_num_buckets=}")
                     normal_indexes = remaining_sample_indices
                     for j in range(consumed_num_buckets):
                         remain_buckets_num_per_dp_per_m[i][max_indexes[j]] -= 1
@@ -1943,7 +2012,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                         except_bucket_num += 1  # 递增桶计数器
 
                     # 更新剩余桶数量
-                    num_buckets[i] -= consumed_num_buckets
+                    # num_buckets[i] -= consumed_num_buckets
                     # 记录分配信息
                     except_bucket_num_per_sample.append(consumed_num_buckets)
                     except_bucket_m_per_sample.append(i)
@@ -2012,10 +2081,13 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
             best_sample_ids = []
             best_dp_combination = []
 
+            assert DP % config.min_hybrid_context_parallel_size == 0
+            limit_item = DP // config.min_hybrid_context_parallel_size
+
             for idx, limit in enumerate(limits):
                 combination = [0] * len(limits)
                 combination[idx] = limit
-                if sum(combination) != DP:
+                if sum(combination) != limit_item:
                     continue
 
                 num_buckets = [PP * i * combination[i - 1] for i in range(1, len(combination)+1)]
@@ -2047,7 +2119,9 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
             return min_max_flops_sum_per_iter, best_indices_buckets, best_sample_ids, best_dp_combination
 
         search_space = 6
-        limits = [DP] * search_space
+        assert DP % config.min_hybrid_context_parallel_size == 0
+        limit_item = DP // config.min_hybrid_context_parallel_size
+        limits = [limit_item] * search_space
 
         min_max_flops_sum_per_iter, best_indices_buckets, best_sample_ids, best_dp_combination = dynamic_loops_product(limits)
         if torch.distributed.get_rank() == 0: print(f"{best_dp_combination=}")
@@ -2092,6 +2166,12 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                 except_indexes.append(idx)
             else:
                 normal_indexes.append(idx)
+        # if torch.distributed.get_rank() == 0:
+        #     print(f"\n{except_indexes=}")
+        #     except_flops = []
+        #     for idx in except_indexes:
+        #         except_flops.append(all_flops[1][idx])
+        #     print(f"{except_indexes=}\n{except_flops=}")
         except_indexes = sorted(except_indexes, key=lambda x: all_flops[1][x], reverse=True)
         normal_indexes = sorted(normal_indexes, key=lambda x: all_flops[1][x], reverse=True)
 
@@ -2108,239 +2188,165 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         
 
         if max_seq_len_for_fuse == 0:
-            select_except_buckets = [item for subexcept_buckets in except_buckets for item in subexcept_buckets]
-            sorted_indices_fwdflops = sorted(normal_indexes, key=lambda x: all_flops[1][x], reverse=True)
-            all_sample_index_copy = copy.deepcopy(sorted_indices_fwdflops)
+            assert len(normal_indexes) == 0
+        total_bucket_num, all_buckets = create_buckets(num_buckets, avg_fwd_flops_with_m, max_seq_len_for_fuse)
+        sorted_indices_fwdflops = sorted(normal_indexes, key=lambda x: all_flops[1][x], reverse=True)
+        sorted_all_buckets_fwd_flops = sorted(all_buckets, key=lambda bucket: bucket.fwd_flops)
+        all_sample_index_copy = copy.deepcopy(sorted_indices_fwdflops)
 
-            sorted_indices_length = sorted(all_sample_index_copy, key=lambda x: all_lengths[x], reverse=True)
-            sorted_all_buckets_length = sorted(all_buckets, key=lambda bucket: bucket.seq_len_sum)
+        all_sample_index_copy_bef_flops = copy.deepcopy(all_sample_index_copy)
+        all_sample_index_copy = assign_samples_to_buckets(sorted_indices_fwdflops,
+                                    sorted_all_buckets_fwd_flops,
+                                    all_density,
+                                    all_lengths,
+                                    all_flops,
+                                    update_rule=UpdateRule.FW_FLOPS,
+                                    remaining_sample_indices=all_sample_index_copy)
+    
+        # If there are some leftover of the samples 
+        # (e.g. if put the sample in any of the bucket will cause the bucket exceed the memory limit),
+        # we will use the length update rule to assign those samples to the bucket.
+        # The all_sample_index_copy should contain only a few samples. Sorting might be unnecessary.
+        sorted_indices_length = sorted(all_sample_index_copy, key=lambda x: all_lengths[x], reverse=True)
+        sorted_all_buckets_length = sorted(all_buckets, key=lambda bucket: bucket.seq_len_sum)
 
-            if len(all_sample_index_copy) > 0:
-                assign_samples_to_buckets(sorted_indices_length,
-                                            sorted_all_buckets_length,
-                                            all_density,
-                                            all_lengths,
-                                            all_flops,
-                                            update_rule=UpdateRule.LENGTH,
-                                            remaining_sample_indices=all_sample_index_copy,
-                                            print_score=True)
-            assert len(all_sample_index_copy) == 0
-            indices_buckets_2d = [[] for _ in range(len(num_buckets))]
-            for i in range(len(num_buckets)):
-                total_buckets_for_current_m = len(except_buckets[i])
-                num_m = i + 1
-                bucket_num_per_dp_curr_m = num_m * PP
-                assert total_buckets_for_current_m % bucket_num_per_dp_curr_m == 0
-                dp_size_for_current_m = total_buckets_for_current_m // bucket_num_per_dp_curr_m
-                max_sum_per_iter = 0
+        if len(all_sample_index_copy) > 0:
+            all_sample_index_copy_bef_len = copy.deepcopy(all_sample_index_copy)
+            all_sample_index_copy = assign_samples_to_buckets(sorted_indices_length, sorted_all_buckets_length, all_density, all_lengths, all_flops, update_rule=UpdateRule.LENGTH, remaining_sample_indices=all_sample_index_copy, print_score=True)
 
-                (
-                    fwd_flops_for_dp_per_m,
-                    bwd_flops_for_dp_per_m,
-                    seq_len_for_dp_per_m,
-                    buckets_for_dp,
-                    fwd_flops_sum_per_dp_this_m,
-                    bucket_used_num_per_dp_this_m,
-                    num_split_for_dp,
-                    prefix_sum_per_dp_this_m,
-                ) = assign_except_buckets(
-                    curr_m=i,
-                    except_bucket_m_per_sample=except_bucket_m_per_sample,
-                    except_bucket_num_per_sample=except_bucket_num_per_sample,
-                    except_buckets=except_buckets,
-                    dp_size=dp_size_for_current_m,
-                )
-                for j in range(len(buckets_for_dp)):
-                    indices_buckets_2d[i].extend(buckets_for_dp[j])
-                max_sum, max_iters, bubbles = evaluate_dp_schedule_metrics(
-                    fwd_flops_for_dp_per_m,
-                    bwd_flops_for_dp_per_m,
-                    seq_len_for_dp_per_m,
-                    buckets_for_dp,
-                    PP,
-                    VPP,
-                    simulate_time,
-                    compute_pp_bubble_ratio,
-                    print_rank0,
-                    None,
-                    i,
-                )
-            return indices_buckets_2d, max_sum, 0, 0
-        else:
-            total_bucket_num, all_buckets = create_buckets(num_buckets, avg_fwd_flops_with_m, max_seq_len_for_fuse)
-            sorted_indices_fwdflops = sorted(normal_indexes, key=lambda x: all_flops[1][x], reverse=True)
-            sorted_all_buckets_fwd_flops = sorted(all_buckets, key=lambda bucket: bucket.fwd_flops)
-            all_sample_index_copy = copy.deepcopy(sorted_indices_fwdflops)
+        assert len(all_sample_index_copy) == 0, f"sample {all_sample_index_copy} is not assigned to any bucket."
 
-            assign_samples_to_buckets(sorted_indices_fwdflops,
-                                        sorted_all_buckets_fwd_flops,
-                                        all_density,
-                                        all_lengths,
-                                        all_flops,
-                                        update_rule=UpdateRule.FW_FLOPS,
-                                        remaining_sample_indices=all_sample_index_copy)
+        indices_buckets = [[] for _ in range(total_bucket_num)]
+        used_flops = [0.0] * total_bucket_num
+        used_fwd_flops = [0.0] * total_bucket_num
+        used_bwd_flops = [0.0] * total_bucket_num
+        max_seq_per_m = 0
+        seq_per_m = []
         
-            # If there are some leftover of the samples 
-            # (e.g. if put the sample in any of the bucket will cause the bucket exceed the memory limit),
-            # we will use the length update rule to assign those samples to the bucket.
-            # The all_sample_index_copy should contain only a few samples. Sorting might be unnecessary.
-            sorted_indices_length = sorted(all_sample_index_copy, key=lambda x: all_lengths[x], reverse=True)
-            sorted_all_buckets_length = sorted(all_buckets, key=lambda bucket: bucket.seq_len_sum)
+        for bucket in sorted_all_buckets_fwd_flops:
+            bucket_id = bucket.bucket_id 
+            indices_buckets[bucket_id] = bucket
+            used_flops[bucket_id] = bucket.fwd_flops + bucket.bwd_flops
+            used_fwd_flops[bucket_id] = bucket.fwd_flops
+            used_bwd_flops[bucket_id] = bucket.bwd_flops
+            max_seq_per_m = max(bucket.seq_len_sum, max_seq_per_m)
+            seq_per_m.append(bucket.seq_len_sum)
 
-            if len(all_sample_index_copy) > 0:
-                assign_samples_to_buckets(sorted_indices_length,
-                                            sorted_all_buckets_length,
-                                            all_density,
-                                            all_lengths,
-                                            all_flops,
-                                            update_rule=UpdateRule.LENGTH,
-                                            remaining_sample_indices=all_sample_index_copy,
-                                            print_score=True)
-            assert len(all_sample_index_copy) == 0, f"sample {all_sample_index_copy} is not assigned to any bucket."
+        indices_buckets_2d = [[] for _ in range(len(num_buckets))]
+        sample_ids_2d = [[] for _ in range(len(num_buckets))]
+        new_cnt = 0
+        max_sum_per_iter = 0.0
+        rets = [0.0] * DP
+        thread_cnt = 0
 
-            indices_buckets = [[] for _ in range(total_bucket_num)]
-            used_flops = [0.0] * total_bucket_num
-            used_fwd_flops = [0.0] * total_bucket_num
-            used_bwd_flops = [0.0] * total_bucket_num
-            max_seq_per_m = 0
-            seq_per_m = []
+        max_iter_sum_among_dp_list = []
+        for i in range(len(num_buckets)):
+            if len(except_buckets[i]) + num_buckets[i] == 0:
+                assert combination[i] == 0, f"{combination=}, {num_buckets=}, {len(except_buckets[i])=}"
+                continue
+
+            total_buckets_for_current_m = num_buckets[i] + len(except_buckets[i])
+            num_m = i + 1
+            bucket_num_per_dp_curr_m = num_m * PP
+            assert total_buckets_for_current_m % bucket_num_per_dp_curr_m == 0, f"{total_buckets_for_current_m=}, {bucket_num_per_dp_curr_m=}"
+            dp_size_for_current_m = total_buckets_for_current_m // bucket_num_per_dp_curr_m
+
+            buckets_for_current_m = []
+            for j in range(num_buckets[i]):
+                buckets_for_current_m.append([used_flops[new_cnt], new_cnt, used_fwd_flops[new_cnt]])
+                new_cnt += 1
+
+            buckets_for_current_m.sort(key=lambda x: x[2])
+
+            fwd_flops_for_dp_per_m, bwd_flops_for_dp_per_m, buckets_for_dp, sample_ids_for_dp, seq_len_for_dp_per_m, empty_bucket_flag = greedy_assign_bucket_to_dp(i, indices_buckets, normal_indexes, except_buckets, except_bucket_num_per_sample, except_bucket_m_per_sample, except_bucket_dp_per_sample, buckets_for_current_m, dp_size_for_current_m, used_flops, used_fwd_flops, used_bwd_flops, bucket_num_per_dp_curr_m, all_flops, all_lengths, combination, config)
+
+            for j in range(len(buckets_for_dp)):
+                indices_buckets_2d[i].append(buckets_for_dp[j])
+                sample_ids_2d[i].append(sample_ids_for_dp[j])
             
-            for bucket in sorted_all_buckets_fwd_flops:
-                bucket_id = bucket.bucket_id 
-                indices_buckets[bucket_id] = bucket
-                used_flops[bucket_id] = bucket.fwd_flops + bucket.bwd_flops
-                used_fwd_flops[bucket_id] = bucket.fwd_flops
-                used_bwd_flops[bucket_id] = bucket.bwd_flops
-                max_seq_per_m = max(bucket.seq_len_sum, max_seq_per_m)
-                seq_per_m.append(bucket.seq_len_sum)
+            assert len(indices_buckets_2d) == len(sample_ids_2d), f"{len(indices_buckets_2d)=}, {len(sample_ids_2d)=}"
 
-            indices_buckets_2d = [[] for _ in range(len(num_buckets))]
-            sample_ids_2d = [[] for _ in range(len(num_buckets))]
-            new_cnt = 0
-            max_sum_per_iter = 0.0
-            rets = [0.0] * DP
-            thread_cnt = 0
+            bubble_time_list = []
+            if empty_bucket_flag:
+                print(f"error, found empty bucket, skip")
+                max_sum_per_iter = sys.float_info.max / 10.0
+            else:
+                for m in range(len(fwd_flops_for_dp_per_m)):
+                    total_bucket_num_for_current_dp = len(fwd_flops_for_dp_per_m[m])
+                    forward_cost = [fwd_flops_for_dp_per_m[m][k][0] for k in range(len(fwd_flops_for_dp_per_m[m]))]
+                    backward_cost = [bwd_flops_for_dp_per_m[m][k][0] for k in range(len(fwd_flops_for_dp_per_m[m]))]
+                    seq_len_for_dp = seq_len_for_dp_per_m[m]
+                    communication_cost = [0.0] * len(fwd_flops_for_dp_per_m[m])
 
-            max_iter_sum_among_dp_list = []
-            for i in range(len(num_buckets)):
-                if len(except_buckets[i]) + num_buckets[i] == 0:
-                    assert combination[i] == 0, f"{combination=}, {num_buckets=}, {len(except_buckets[i])=}"
-                    continue
+                    forward_cost_cmp = []
+                    backward_cost_cmp = []
+                    assert len(fwd_flops_for_dp_per_m[m]) == len(bwd_flops_for_dp_per_m[m])
+                    for k in range(len(fwd_flops_for_dp_per_m[m])):
+                        split_num = fwd_flops_for_dp_per_m[m][k][2]
+                        split_idx = fwd_flops_for_dp_per_m[m][k][3]
+                        fwd_cost = fwd_flops_for_dp_per_m[m][k][0]
+                        bwd_cost = bwd_flops_for_dp_per_m[m][k][0]
 
-                total_buckets_for_current_m = num_buckets[i] + len(except_buckets[i])
-                num_m = i + 1
-                bucket_num_per_dp_curr_m = num_m * PP
-                assert total_buckets_for_current_m % bucket_num_per_dp_curr_m == 0
-                dp_size_for_current_m = total_buckets_for_current_m // bucket_num_per_dp_curr_m
+                        forward_cost_cmp.append([fwd_cost])
+                        backward_cost_cmp.append([bwd_cost])
 
-                buckets_for_current_m = []
-                for j in range(num_buckets[i]):
-                    buckets_for_current_m.append([used_flops[new_cnt], new_cnt, used_fwd_flops[new_cnt]])
-                    new_cnt += 1
+                    max_iter_sum_among_dp = simulate_time(forward_cost_cmp, backward_cost_cmp, PP, VPP)
+                    
+                    max_iter_sum_among_dp_list.append(max_iter_sum_among_dp)
+                    max_sum_per_iter = max(max_sum_per_iter, max_iter_sum_among_dp)
 
-                buckets_for_current_m.sort(key=lambda x: x[2])
+                    peak_memory = simulate_memory(seq_len_for_dp, config)
 
-                fwd_flops_for_dp_per_m, bwd_flops_for_dp_per_m, buckets_for_dp, sample_ids_for_dp, seq_len_for_dp_per_m, empty_bucket_flag = greedy_assign_bucket_to_dp(i, indices_buckets, normal_indexes, except_buckets, except_bucket_num_per_sample, except_bucket_m_per_sample, except_bucket_dp_per_sample, buckets_for_current_m, dp_size_for_current_m, used_flops, used_fwd_flops, used_bwd_flops, bucket_num_per_dp_curr_m, all_flops, all_lengths, combination, config)
+                    forward_cost_cmp = torch.tensor(forward_cost_cmp).flatten().tolist()
+                    backward_cost_cmp = torch.tensor(backward_cost_cmp).flatten().tolist()
 
-                # for j in range(len(buckets_for_dp)):
-                #     if torch.distributed.get_rank() == 0:
-                #         cp_sizes = []
-                #         for k in range(len(buckets_for_dp[j])):
-                #             cp_sizes.append(buckets_for_dp[j][k].cp_size)
-                #         print(f"{cp_sizes=}")
-                # for j in range(len(buckets_for_dp)):
-                #     if torch.distributed.get_rank() == 0:
-                #         fwd_flops = []
-                #         for k in range(len(buckets_for_dp[j])):
-                #             fwd_flops.append(buckets_for_dp[j][k].fwd_flops)
-                #         print(f"{fwd_flops=}")
-                for j in range(len(buckets_for_dp)):
-                    indices_buckets_2d[i].append(buckets_for_dp[j])
-                    sample_ids_2d[i].append(sample_ids_for_dp[j])
-                
-                assert len(indices_buckets_2d) == len(sample_ids_2d), f"{len(indices_buckets_2d)=}, {len(sample_ids_2d)=}"
+                    fwd_cost_total = sum(forward_cost_cmp)
+                    bwd_cost_total = sum(backward_cost_cmp)
 
-                bubble_time_list = []
-                if empty_bucket_flag:
-                    print(f"error, found empty bucket, skip")
-                    max_sum_per_iter = sys.float_info.max / 10.0
-                else:
-                    for m in range(len(fwd_flops_for_dp_per_m)):
-                        total_bucket_num_for_current_dp = len(fwd_flops_for_dp_per_m[m])
-                        forward_cost = [fwd_flops_for_dp_per_m[m][k][0] for k in range(len(fwd_flops_for_dp_per_m[m]))]
-                        backward_cost = [bwd_flops_for_dp_per_m[m][k][0] for k in range(len(fwd_flops_for_dp_per_m[m]))]
-                        seq_len_for_dp = seq_len_for_dp_per_m[m]
-                        communication_cost = [0.0] * len(fwd_flops_for_dp_per_m[m])
+                    fwd_bwd_cost_total = fwd_cost_total + bwd_cost_total
+                    num_microbatch = (i+1) * PP
+                    pp_bubble_ratio = compute_pp_bubble_ratio(PP, num_microbatch, VPP)
 
-                        forward_cost_cmp = []
-                        backward_cost_cmp = []
-                        assert len(fwd_flops_for_dp_per_m[m]) == len(bwd_flops_for_dp_per_m[m])
-                        for k in range(len(fwd_flops_for_dp_per_m[m])):
-                            split_num = fwd_flops_for_dp_per_m[m][k][2]
-                            split_idx = fwd_flops_for_dp_per_m[m][k][3]
-                            fwd_cost = fwd_flops_for_dp_per_m[m][k][0]
-                            bwd_cost = bwd_flops_for_dp_per_m[m][k][0]
+                    pp_bubble_time = fwd_bwd_cost_total / (1 - pp_bubble_ratio) - fwd_bwd_cost_total
+                    bubble_idle_time = max_iter_sum_among_dp - fwd_bwd_cost_total
+                    imbalanced_bubble_time = bubble_idle_time - pp_bubble_time
 
-                            forward_cost_cmp.append([fwd_cost])
-                            backward_cost_cmp.append([bwd_cost])
+                    bubble_over_iter_time = bubble_idle_time / max_iter_sum_among_dp
+                    bubble_over_compute_time = bubble_idle_time / fwd_bwd_cost_total
 
-                        max_iter_sum_among_dp = simulate_time(forward_cost_cmp, backward_cost_cmp, PP, VPP)
-                        
-                        max_iter_sum_among_dp_list.append(max_iter_sum_among_dp)
-                        max_sum_per_iter = max(max_sum_per_iter, max_iter_sum_among_dp)
+                    pp_bubble_over_iter_time = pp_bubble_time / max_iter_sum_among_dp
+                    pp_bubble_over_compute_time = pp_bubble_time / fwd_bwd_cost_total
 
-                        peak_memory = simulate_memory(seq_len_for_dp, config)
+                    imbalanced_bubble_over_iter_time = imbalanced_bubble_time / max_iter_sum_among_dp
+                    imbalanced_bubble_over_compute_time = imbalanced_bubble_time / fwd_bwd_cost_total
 
-                        forward_cost_cmp = torch.tensor(forward_cost_cmp).flatten().tolist()
-                        backward_cost_cmp = torch.tensor(backward_cost_cmp).flatten().tolist()
+                    bubble_time_list.append({
+                        "pp_bubble_ratio": pp_bubble_ratio,
+                        "bubble_over_compute_time":bubble_over_compute_time,
+                        "pp_bubble_over_compute_time":pp_bubble_over_compute_time,
+                        "imbalanced_bubble_over_compute_time":imbalanced_bubble_over_compute_time,
+                    })
 
-                        fwd_cost_total = sum(forward_cost_cmp)
-                        bwd_cost_total = sum(backward_cost_cmp)
+                    # if peak_memory >= 70 * 1024**3:
+                    #     max_sum_per_iter = sys.float_info.max / 10.0    # skip this m
+                    #     print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
 
-                        fwd_bwd_cost_total = fwd_cost_total + bwd_cost_total
-                        num_microbatch = (i+1) * PP
-                        pp_bubble_ratio = compute_pp_bubble_ratio(PP, num_microbatch, VPP)
+                # if torch.distributed.get_rank() == 0:
+                #     for k in range(len(bubble_time_list)):
+                #         for key in bubble_time_list[k].keys():
+                #             bubble_time_list[k][key] = round(bubble_time_list[k][key], 3)
+                #         print(f"{k=}, {bubble_time_list[k]}")
 
-                        pp_bubble_time = fwd_bwd_cost_total / (1 - pp_bubble_ratio) - fwd_bwd_cost_total
-                        bubble_idle_time = max_iter_sum_among_dp - fwd_bwd_cost_total
-                        imbalanced_bubble_time = bubble_idle_time - pp_bubble_time
+        max_max_iter_sum = max(max_iter_sum_among_dp_list)
+        min_max_iter_sum = min(max_iter_sum_among_dp_list)
+        sum_max_iter_sum = sum(max_iter_sum_among_dp_list)
+        len_max_iter_sum = len(max_iter_sum_among_dp_list)
+        mean_max_iter_sum = sum_max_iter_sum/len_max_iter_sum
 
-                        bubble_over_iter_time = bubble_idle_time / max_iter_sum_among_dp
-                        bubble_over_compute_time = bubble_idle_time / fwd_bwd_cost_total
+        # print(f"{sample_ids_2d=}")
 
-                        pp_bubble_over_iter_time = pp_bubble_time / max_iter_sum_among_dp
-                        pp_bubble_over_compute_time = pp_bubble_time / fwd_bwd_cost_total
-
-                        imbalanced_bubble_over_iter_time = imbalanced_bubble_time / max_iter_sum_among_dp
-                        imbalanced_bubble_over_compute_time = imbalanced_bubble_time / fwd_bwd_cost_total
-
-                        bubble_time_list.append({
-                            "pp_bubble_ratio": pp_bubble_ratio,
-                            "bubble_over_compute_time":bubble_over_compute_time,
-                            "pp_bubble_over_compute_time":pp_bubble_over_compute_time,
-                            "imbalanced_bubble_over_compute_time":imbalanced_bubble_over_compute_time,
-                        })
-
-                        # print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
-                        if peak_memory >= 70 * 1024**3:
-                            max_sum_per_iter = sys.float_info.max / 10.0    # skip this m
-
-                    # if torch.distributed.get_rank() == 0:
-                    #     for k in range(len(bubble_time_list)):
-                    #         for key in bubble_time_list[k].keys():
-                    #             bubble_time_list[k][key] = round(bubble_time_list[k][key], 3)
-                    #         print(f"{k=}, {bubble_time_list[k]}")
-
-            max_max_iter_sum = max(max_iter_sum_among_dp_list)
-            min_max_iter_sum = min(max_iter_sum_among_dp_list)
-            sum_max_iter_sum = sum(max_iter_sum_among_dp_list)
-            len_max_iter_sum = len(max_iter_sum_among_dp_list)
-            mean_max_iter_sum = sum_max_iter_sum/len_max_iter_sum
-
-            # print(f"{sample_ids_2d=}")
-
-            return indices_buckets_2d, sample_ids_2d, max_sum_per_iter, max_seq_per_m, used_flops
-
+        return indices_buckets_2d, sample_ids_2d, max_sum_per_iter, max_seq_per_m, used_flops
+            
 class OnlyPackingNoSchedulingScheduler(BaseScheduler):
     """
     This scheduler only packs sequences in their original order
