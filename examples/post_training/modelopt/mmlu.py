@@ -177,7 +177,7 @@ if __name__ == "__main__":
     # Fold the scalars into weight for speedup.
     # [TODO]: fold_weight current assumes all weight_quantizer has weight allocated;
     # however, this is not the case when share_embeddings_and_output_weights is False.
-    if getattr(unwrapped_model, "share_embeddings_and_output_weights", False):
+    if not getattr(unwrapped_model, "share_embeddings_and_output_weights", False):
         mtq.fold_weight(unwrapped_model)
 
     all_subjects = get_all_subjects()
