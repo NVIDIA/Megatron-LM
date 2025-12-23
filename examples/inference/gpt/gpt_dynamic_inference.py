@@ -62,12 +62,6 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
-# >>>
-from lutil import pax as _pax
-import builtins
-builtins.pax = _pax
-# <<<
-
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -526,27 +520,6 @@ def main():
     if torch.distributed.get_rank() == 0:
         def escape_str(s):
             return s.replace("\n", "\\n")
-
-        # >>>
-        from megatron.core.inference.inference_request import DynamicInferenceEventType
-        evicted_requests = []
-        for request in requests:
-            for event in request.events:
-                if event.type == DynamicInferenceEventType.EVICT:
-                    evicted_requests.append(request)
-                    break
-        pax("requests", {
-            "events" : [ r.events for r in requests ],
-        }, "evicted_requests", {
-            "evicted_requests / 0" : evicted_requests[0],
-            "evicted seqs" : [
-                "%s ...... %s ..." % (
-                    escape_str(r.prompt_text),
-                    escape_str(r.output_text)[:75],
-                ) for r in evicted_requests
-            ],
-        })
-        # <<<
 
         print("~~~~ Unique prompts + outputs. ~~~~")
 
