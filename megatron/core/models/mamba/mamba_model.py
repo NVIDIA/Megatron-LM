@@ -188,7 +188,8 @@ class MambaModel(LanguageModule):
 
         It either returns the Loss values if labels are given or the final hidden units
 
-        # packed_seq_params is unused but included to maintain compatibility with GPTModel's forward signature.
+        packed_seq_params is unused but included to maintain compatibility with 
+        GPTModel's forward signature.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
