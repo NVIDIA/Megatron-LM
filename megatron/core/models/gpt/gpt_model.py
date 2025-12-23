@@ -257,6 +257,8 @@ class GPTModel(LanguageModule):
                 and self.config.cross_entropy_fusion_impl == 'linear'
             ):
                 self.shared_output_layer_weight = self.output_layer.weight
+            else:
+                self.shared_output_layer_weight = None
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
