@@ -79,9 +79,6 @@ def add_modelopt_args(parser):
 
     # Finetuning
     group.add_argument(
-        "--hf_local_dir", type=str, default="", help="A path prefix for HuggingFace Hub to find the asset locally."
-    )
-    group.add_argument(
         "--finetune-hf-dataset", type=str, default=None, help="HF dataset used for finetuning."
     )
     group.add_argument(

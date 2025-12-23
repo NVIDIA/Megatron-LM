@@ -36,6 +36,7 @@ def add_mmlu_args(parser):
     group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
     group.add_argument("--lower-bound", type=float, default=None)
     group.add_argument("--no-subject-prompt", action="store_true", help="Use empty prompt instead of subject-based prompt.")
+    group.add_argument("--mmlu-dataset", type=str, default="cais/mmlu", help="The default dataset to use is cais/mmlu from the HG hub.")
     group.add_argument("--cache-dir", type=str, default=None)
     add_modelopt_args(parser)
     return parser
@@ -179,11 +180,9 @@ if __name__ == "__main__":
 
     all_correct = {}
 
-    mmlu_dataset_path = args.hf_local_dir + "cais/mmlu"
-
     for subject in all_subjects:
-        test_data = datasets.load_dataset(mmlu_dataset_path, subject, split="test")
-        dev_data = datasets.load_dataset(mmlu_dataset_path, subject, split="dev")
+        test_data = datasets.load_dataset(args.mmlu_dataset, subject, split="test")
+        dev_data = datasets.load_dataset(args.mmlu_dataset, subject, split="dev")
 
         correct = []
         for idx, test_example in enumerate(test_data):
