@@ -221,7 +221,7 @@ class TestDynamicInferenceEngine:
             num_attention_heads=transformer_config.num_query_groups,
             max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
-            use_cuda_graphs_for_non_decode_steps=not test_config.model_provider == "mamba",
+            use_cuda_graphs_for_non_decode_steps=True,
             buffer_size_gb=test_config.context_buffer_size_gb,
             block_size_tokens=test_config.context_block_size_tokens,
             max_requests=test_config.context_max_requests,
