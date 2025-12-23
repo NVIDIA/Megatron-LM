@@ -927,9 +927,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Checkpoint requests (i.e., prompt += generations) + add eviction event.
             for request_id in evict_request_ids:
-                request = self.requests[request_id]
-                request.record.checkpoint()
-                request.add_event_evict()
+                self.requests[request_id].record.checkpoint()
+                self.get_request(request_id).add_event_evict()
 
         return active_request_ids, finished_request_records
 

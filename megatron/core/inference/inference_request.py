@@ -140,6 +140,7 @@ class DynamicInferenceEventType(Enum):
 
     ADD = auto()
     PAUSE = auto()
+    EVICT = auto()
     FINISH = auto()
     FAIL = auto()
     ERROR_TRANSIENT = auto()
@@ -154,6 +155,7 @@ class DynamicInferenceEvent:
 
     - request added
     - request paused
+    - request evicted
     - request finished
     - request failed
     - request error (transient)
@@ -348,6 +350,10 @@ class DynamicInferenceRequest(InferenceRequest):
     def add_event_pause(self):
         """Add 'pause' event."""
         return self.add_event(DynamicInferenceEventType.PAUSE)
+
+    def add_event_evict(self):
+        """Add 'evict' event."""
+        return self.add_event(DynamicInferenceEventType.EVICT)
 
     def add_event_finish(self):
         """Add 'finish' event."""

@@ -375,6 +375,7 @@ def run_inference(
                 request.time_end = get_curr_time()
                 request.state = "finished"
                 request.request_id = finished_request.request_id
+                request.events = finished_request.events
 
                 # Update prompt, in case engine has been suspended and resumed.
                 request.prompt_tokens = finished_request.prompt_tokens.tolist()
@@ -522,10 +523,30 @@ def main():
         )
 
     # Print unique prompts + outputs.
-
     if torch.distributed.get_rank() == 0:
         def escape_str(s):
             return s.replace("\n", "\\n")
+
+        # >>>
+        from megatron.core.inference.inference_request import DynamicInferenceEventType
+        evicted_requests = []
+        for request in requests:
+            for event in request.events:
+                if event.type == DynamicInferenceEventType.EVICT:
+                    evicted_requests.append(request)
+                    break
+        pax("requests", {
+            "events" : [ r.events for r in requests ],
+        }, "evicted_requests", {
+            "evicted_requests / 0" : evicted_requests[0],
+            "evicted seqs" : [
+                "%s ...... %s ..." % (
+                    escape_str(r.prompt_text),
+                    escape_str(r.output_text)[:75],
+                ) for r in evicted_requests
+            ],
+        })
+        # <<<
 
         print("~~~~ Unique prompts + outputs. ~~~~")
 
