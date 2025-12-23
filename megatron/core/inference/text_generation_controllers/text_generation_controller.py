@@ -488,13 +488,16 @@ class TextGenerationController:
         return padded_batch_prompt_tokens[:original_batch_size]
 
     def _dynamic_step_context_init(
-        self, construct_graph_dimensions: Optional[InferenceBatchDimensions] = None
+        self,
+        construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
+        is_dummy_forward: bool = False,
     ):
         """Initializes the inference context for dynamic batching.
 
         Args:
             construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use
                 for constructing the cuda graphs.
+            is_dummy_forward (bool): Whether we are running an expert parallel dummy forward pass
 
         Return:
             input_ids (Tensor): The active input IDs.
@@ -547,7 +550,9 @@ class TextGenerationController:
                 )
 
         # Get flat tokens, position ids.
-        if construct_graph_dimensions is not None:
+        # If we are running a dummy forward step we want to use the token count agreed upon
+        # by all EP ranks rather than the minimum number of tokens.
+        if construct_graph_dimensions is not None and not is_dummy_forward:
             return context.current_input_and_position_ids(
                 num_warmup_tokens=construct_graph_dimensions.token_count
             )
@@ -779,7 +784,8 @@ class TextGenerationController:
         # a dummy cuda graph.
         input_ids, position_ids = self._dynamic_step_context_init(
             # try to use the smallest cuda-graph config for dummy forward
-            construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list)
+            construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list),
+            is_dummy_forward=True,
         )
 
         # _dynamic_step_context_init tries to find a cuda-graph that is compatible
