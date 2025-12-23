@@ -21,11 +21,7 @@ def test_record_mode_with_topk_routing_softmax_post():
     rr.set_router_replay_action(RouterReplayAction.RECORD)
     logits = torch.randn(4, 6)
     probs, routing_map = topk_routing_with_score_function(
-        logits=logits,
-        topk=2,
-        use_pre_softmax=False,
-        router_replay=rr,
-        score_function="softmax",
+        logits=logits, topk=2, use_pre_softmax=False, router_replay=rr, score_function="softmax"
     )
     recorded = rr.get_recorded_indices()
     expected_idx = torch.topk(logits, k=2, dim=1).indices
@@ -43,11 +39,7 @@ def test_replay_forward_with_topk_routing_softmax_pre():
     target = torch.tensor([[1, 2], [0, 3], [2, 4]], dtype=torch.long)
     rr.set_target_indices(target)
     probs, routing_map = topk_routing_with_score_function(
-        logits=logits,
-        topk=2,
-        use_pre_softmax=True,
-        router_replay=rr,
-        score_function="softmax",
+        logits=logits, topk=2, use_pre_softmax=True, router_replay=rr, score_function="softmax"
     )
     assert routing_map.sum(dim=1).eq(2).all()
     scores = torch.softmax(logits, dim=-1)
@@ -61,11 +53,7 @@ def test_replay_forward_with_topk_routing_softmax_post():
     target = torch.tensor([[1, 2], [0, 5], [3, 4]], dtype=torch.long)
     rr.set_target_indices(target)
     probs, routing_map = topk_routing_with_score_function(
-        logits=logits,
-        topk=2,
-        use_pre_softmax=False,
-        router_replay=rr,
-        score_function="softmax",
+        logits=logits, topk=2, use_pre_softmax=False, router_replay=rr, score_function="softmax"
     )
     selected = torch.softmax(logits.gather(1, target), dim=-1)
     assert torch.equal(probs.gather(1, target), selected)
@@ -104,7 +92,6 @@ def test_global_action_set_and_clear():
 def test_set_replay_data_length_mismatch():
     _ = RouterReplay()
     with pytest.raises(ValueError):
-        RouterReplay.set_replay_data([
-            torch.tensor([[0, 1]], dtype=torch.long),
-            torch.tensor([[1, 0]], dtype=torch.long),
-        ])
+        RouterReplay.set_replay_data(
+            [torch.tensor([[0, 1]], dtype=torch.long), torch.tensor([[1, 0]], dtype=torch.long)]
+        )
