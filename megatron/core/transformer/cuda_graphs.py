@@ -330,7 +330,8 @@ class _CudagraphGlobalRecord:
             return
 
         # Otherwise, create all the recorded cudagraphs.
-        logging.getLogger(__name__).info(f"Creating {len(cls.cudagraph_record)} CUDA graphs")
+        if torch.distributed.get_rank() == 0:
+            logging.getLogger(__name__).info(f"Creating {len(cls.cudagraph_record)} CUDA graphs")
 
         has_te_modules = False
         if HAVE_TE_GRAPHS:
@@ -340,15 +341,16 @@ class _CudagraphGlobalRecord:
                     [isinstance(m, TransformerEngineBaseModule) for m in base_module.modules()]
                 )
         else:
-            logging.warning(
-                "Transformer Engine was not detected while capturing training "
-                "cudagraphs. As a result cudagraph memory overhead may significantly increase "
-                "as Transformer Engine's weak reference feature is used on cudagraph "
-                "input and output buffers. This allows the memory of input and output buffers to "
-                "to be reclaimed across graphs while remaining valid buffers for when the graph is "
-                "replayed. For more information see: "
-                "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # pylint: disable=line-too-long
-            )
+            if torch.distributed.get_rank() == 0:
+                logging.warning(
+                    "Transformer Engine was not detected while capturing training cudagraphs."
+                    "As a result cudagraph memory overhead may significantly increase as "
+                    "Transformer Engine's weak reference feature is used on cudagraph input and "
+                    "output buffers. This allows the memory of input and output buffers to be "
+                    " reclaimed across graphs while remaining valid buffers for when the graph "
+                    "is replayed. For more information see: "
+                    "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # pylint: disable=line-too-long
+                )
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -366,12 +368,18 @@ class _CudagraphGlobalRecord:
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
-        progress_bar = enumerate(cls.cudagraph_record)
 
         global bwd_buffer_reuse_ref_count, fwd_buffer_reuse_ref_count
 
+        progress_bar = enumerate(cls.cudagraph_record)
         if HAVE_TQDM:
-            progress_bar = tqdm(progress_bar, "create cuda graphs", total=len(cls.cudagraph_record))
+            progress_bar = tqdm(
+                progress_bar,
+                "create cuda graphs",
+                total=len(cls.cudagraph_record),
+                disable=torch.distributed.get_rank() != 0,
+            )
+
         for g_idx, g in progress_bar:
             mem_stats = torch.cuda.memory_stats()
             progress_str = "create cuda graphs | mem: alloc %s, res %s" % (
@@ -405,6 +413,7 @@ class _CudagraphGlobalRecord:
                 - mem_stats_start["reserved_bytes.all.current"]
             ),
         }
+
         logger.info(
             "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
             "allocated %s, reserved %s."
