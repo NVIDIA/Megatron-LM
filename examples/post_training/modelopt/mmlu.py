@@ -174,7 +174,11 @@ if __name__ == "__main__":
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
-    mtq.fold_weight(unwrapped_model) # speed up quantization
+    # Fold the scalars into weight for speedup.
+    # [TODO]: fold_weight current assumes all weight_quantizer has weight allocated;
+    # however, this is not the case when share_embeddings_and_output_weights is False.
+    if getattr(unwrapped_model, "share_embeddings_and_output_weights", False):
+        mtq.fold_weight(unwrapped_model)
 
     all_subjects = get_all_subjects()
 
