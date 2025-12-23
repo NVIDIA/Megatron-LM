@@ -170,11 +170,16 @@ class PostProcessNode(ScheduleNode):
 
         Returns:
             The logits or loss depending on whether labels are provided.
-
-        Note:
-            Final layernorm now has been moved from the post-process stage to the
-            last decoder layer, so we don't need to run the final layer norm here.
         """
+
+        empty_decoder = len(self.gpt_model.decoder.layers) == 0
+        layer_norm = self.gpt_model.decoder.final_layernorm
+        if not self.gpt_model.config.mtp_num_layers and empty_decoder and layer_norm:
+            hidden_states = layer_norm(hidden_states)
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
+
         # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(
             hidden_states=hidden_states,
