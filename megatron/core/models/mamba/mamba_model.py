@@ -177,8 +177,8 @@ class MambaModel(LanguageModule):
         decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
-        packed_seq_params: PackedSeqParams = None,
         runtime_gather_output: Optional[bool] = None,
+        packed_seq_params: PackedSeqParams = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
