@@ -197,6 +197,9 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
+        # Used to execute only a part of the forward pass and return intermediate outputs.
+        # This is used to separate the forward pass into cudagraphable and noncudagraphable parts.
+        # See 'tranformer_layer.MoETransformerLayer' for details.
         self.fwd_execution_map = ["route", "dispatch_expert_compute_combine", "postprocess"]
 
     def route(self, hidden_states: torch.Tensor):
