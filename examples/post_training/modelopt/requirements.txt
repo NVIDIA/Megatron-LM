@@ -1,6 +1,5 @@
 diskcache
 datasets
-jsonlines
 nvidia-modelopt
 omegaconf
 pulp
