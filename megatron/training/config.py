@@ -157,7 +157,7 @@ class DistributedInitConfig:
     use_tp_pp_dp_mapping: bool = False
     """If set, distributed ranks initialize order is changed from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp"""
 
-    enable_gloo_process_groups: bool = True
+    enable_gloo_process_groups: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--disable-gloo-process-groups"]}})
     """If set, create Gloo process groups for communications."""
 
     use_sharp: bool = False
