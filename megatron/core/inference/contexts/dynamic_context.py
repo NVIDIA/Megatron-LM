@@ -1682,6 +1682,113 @@ class DynamicInferenceContext(BaseInferenceContext):
         # and updates it instead of the original tensor.
         self.request_to_kv_block_ids[request_indexes] = -1
 
+    def resume_paused_requests(
+        self,
+        active_request_count: int,
+        newly_paused_request_ids: torch.Tensor,
+    ) -> tuple[int, int, torch.Tensor]:
+        """Resume as many paused requests as we have space for in the active buffer.
+
+        Args:
+            active_request_count (int): Number of active requests.
+            newly_paused_request_ids (torch.Tensor): List of newly paused request ids.
+
+        Returns:
+            (tuple[int, int, torch.Tensor]) active_request_count, resume_request_count,
+            newly_paused_request_ids.
+        """
+
+        # Assign released blocks to paused requests.
+        # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
+        resume_request_count = 0
+        if self.paused_request_count > 0:
+            active_block_count_avail = self.block_allocator.get_active_avail()
+            paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
+            paused_block_counts = paused_block_counts.flip(dims=[0])
+            paused_block_counts += 1  # +1 for newly added block
+            paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
+            resume_request_count = min(
+                torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
+                self.block_allocator.total_avail,
+            )
+
+        self.paused_request_count -= resume_request_count
+        active_request_count += resume_request_count
+        assert active_request_count > 0, "active_request_count == %d." % active_request_count
+
+        # finally, swap the chunked prefill to the end of the active requests to obey the invariance
+        if self.chunked_prefill_request_id != -1:
+            self._swap_book_keeping_tensors(
+                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
+                dst_idxs=torch.tensor([active_request_count + self.paused_request_count - 1]),
+                next_tokens=next_tokens,
+            )
+        # Remove resumed requests from newly_paused_request_ids. We do this by
+        # truncating the end of newly_paused_request_ids, which works because we
+        # resume requests in LIFO order. If resume_request_count >
+        # len(newly_paused_request_ids), this means that none of the paused
+        # requests are newly paused during this update.
+        if newly_paused_request_ids is not None and resume_request_count > 0:
+            newly_paused_request_ids = newly_paused_request_ids[:-resume_request_count]
+
+        return active_request_count, resume_request_count, newly_paused_request_ids
+
+    def evict_overflow_requests(self, next_tokens) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evict requests that overflow the paused buffer.
+
+        Args:
+            next_tokens (torch.Tensor): Sampled tokens.
+
+        Returns:
+            (torch.Tensor) Evicted request ids.
+        """
+
+        # Evict overflowing requests in the paused buffer.
+        evict_request_count = (
+            self.block_allocator.get_paused_used()
+            - self.block_allocator.paused_count
+        )
+        evict_request_ids = None
+        if evict_request_count > 0:
+
+            # Eviction index range.
+            evict_start_idx = self.paused_request_count - evict_request_count
+            evict_end_idx = self.paused_request_count
+            evict_request_idxs = torch.arange(
+                evict_start_idx,
+                evict_end_idx,
+                device=torch.cuda.current_device(),
+            )
+            evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
+
+            # Release memory.
+            self.release_memory_blocks_from_request_indexes(evict_request_idxs)
+
+            # Move active requests to replace evicted paused requests.
+            src_idxs = torch.arange(
+                self.paused_request_count,
+                self.total_request_count,
+                device=torch.cuda.current_device(),
+            )
+            dst_idxs = torch.arange(
+                self.paused_request_count - evict_request_count,
+                self.total_request_count - evict_request_count,
+                device=torch.cuda.current_device(),
+            )
+
+            self._move_book_keeping_tensors(
+                src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
+            )
+
+            # Update tracking vars.
+            self.paused_request_count -= evict_request_count
+            self.total_request_count -= evict_request_count
+
+            # Reset unused block ids.
+            self.request_to_kv_block_ids[self.total_request_count:(self.total_request_count + evict_request_count)] = -1
+
+        return evict_request_ids
+
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
         """Update context state after calling engine.step().
@@ -1711,11 +1818,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         3. Concatenate the paused tokens to the active tokens
         4. For the finished requests we release memory blocks and move them to the right
         5. We identify requests that require a new block and add them to the paused requests (i.e move them left)
-        6. Evict overflowing requests in the paused buffer.
-        7. We determine how many requests we can resume and resume them
-        8. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        9. We resume those requests by assigning blocks and updating bookkeeping tensors
-        10. We make relevant changes to the token bookkeeping tensors
+        6. Resume paused requests & evict overflowing paused requests.
+        7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
+        8. We resume those requests by assigning blocks and updating bookkeeping tensors
+        9. We make relevant changes to the token bookkeeping tensors
 
         Args:
             active_requests_mask (Tensor): 1D Mask tensor marking active requests.
@@ -1879,86 +1985,29 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count += active_requests_requiring_new_block_count
             active_request_count -= active_requests_requiring_new_block_count
 
-        # 6. Evict overflowing requests in the paused buffer.
-        evict_request_count = (
-            self.block_allocator.get_paused_used()
-            - self.block_allocator.paused_count
-        )
-        evict_request_ids = None
-        if evict_request_count > 0:
-
-            # Eviction index range.
-            evict_start_idx = self.paused_request_count - evict_request_count
-            evict_end_idx = self.paused_request_count
-            evict_request_idxs = torch.arange(
-                evict_start_idx,
-                evict_end_idx,
-                device=torch.cuda.current_device(),
-            )
-            evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
-
-            # Release memory.
-            self.release_memory_blocks_from_request_indexes(evict_request_idxs)
-
-            # Move active requests to replace evicted paused requests.
-            src_idxs = torch.arange(
-                self.paused_request_count,
-                self.total_request_count,
-                device=torch.cuda.current_device(),
-            )
-            dst_idxs = torch.arange(
-                self.paused_request_count - evict_request_count,
-                self.total_request_count - evict_request_count,
-                device=torch.cuda.current_device(),
-            )
-
-            self._move_book_keeping_tensors(
-                src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
-            )
-
-            # Update tracking vars.
-            self.paused_request_count -= evict_request_count
-            self.total_request_count -= evict_request_count
-
-            # Reset unused block ids.
-            self.request_to_kv_block_ids[self.total_request_count:(self.total_request_count + evict_request_count)] = -1
-
-        # 7. Now that we have the requests in following order [Paused, Active, Finished]
+        # 6. Now that we have the requests in following order [Paused, Active, Finished]
         # We determine how many requests we can resume and resume them
-        # Assign released blocks to paused requests.
-        # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
-        resume_request_count = 0
-        if self.paused_request_count > 0:
-            active_block_count_avail = self.block_allocator.get_active_avail()
-            paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
-            paused_block_counts = paused_block_counts.flip(dims=[0])
-            paused_block_counts += 1  # +1 for newly added block
-            paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-            resume_request_count = min(
-                torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
-                self.block_allocator.total_avail,
+
+        # 6.a. First, resume temporarily paused requests.
+        active_request_count, resume_request_count, newly_paused_request_ids = (
+            self.resume_paused_requests(
+                active_request_count,
+                newly_paused_request_ids,
             )
+        )
 
-        self.paused_request_count -= resume_request_count
-        active_request_count += resume_request_count
-        assert active_request_count > 0, "active_request_count == %d." % active_request_count
+        # 6.b. Evict requests that overflow the paused buffer.
+        evict_request_ids = self.evict_overflow_requests(next_tokens)
 
-        # finally, swap the chunked prefill to the end of the active requests to obey the invariance
-        if self.chunked_prefill_request_id != -1:
-            self._swap_book_keeping_tensors(
-                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
-                dst_idxs=torch.tensor([active_request_count + self.paused_request_count - 1]),
-                next_tokens=next_tokens,
+        # 6.c. Resume any additional requests.
+        active_request_count, resume_request_count, newly_paused_request_ids = (
+            self.resume_paused_requests(
+                active_request_count,
+                newly_paused_request_ids,
             )
-        # Remove resumed requests from newly_paused_request_ids. We do this by
-        # truncating the end of newly_paused_request_ids, which works because we
-        # resume requests in LIFO order. If resume_request_count >
-        # len(newly_paused_request_ids), this means that none of the paused
-        # requests are newly paused during this update.
-        if newly_paused_request_ids is not None and resume_request_count > 0:
-            newly_paused_request_ids = newly_paused_request_ids[:-resume_request_count]
+        )
 
-        # 8. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
+        # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count
 
         # All these active requests are in decode phase, so they need only 1 token per request
@@ -1986,7 +2035,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             + 1
         ) % self.block_size_tokens
 
-        # 9. We resume those requests by assigning blocks and updating bookkeeping tensors
+        # 8. We resume those requests by assigning blocks and updating bookkeeping tensors
         if resume_request_count > 0:
             assert torch.all(
                 self.request_last_kv_block_offset[
@@ -2013,7 +2062,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.paused_request_count : (self.paused_request_count + resume_request_count)
             ] = block_ids
 
-        # 10. We make relevant changes to the token bookkeeping tensors
+        # 9. We make relevant changes to the token bookkeeping tensors
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
             self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
         )

@@ -521,6 +521,33 @@ def main():
         def escape_str(s):
             return s.replace("\n", "\\n")
 
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        from megatron.core.inference.inference_request import DynamicInferenceEventType
+        evicted_requests = []
+        for request in requests:
+            for event in request.events:
+                if event.type == DynamicInferenceEventType.EVICT:
+                    evicted_requests.append(request)
+                    break
+
+        # from lutil import pax
+        # pax("evicted_requests")
+
+        print("~~~~ evicted requests [%d] ~~~~" % len(evicted_requests))
+        for request_idx, request in enumerate(evicted_requests):
+            input_text = escape_str(request.prompt_text)
+            gen_text = escape_str(request.output_text)
+            if len(gen_text) > 100:
+                gen_text = gen_text[:100] + " ..."
+            print("%d [%d]) %s .... %s" % (
+                request_idx,
+                request.request_id,
+                input_text,
+                gen_text,
+            ))
+        exit()
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
         print("~~~~ Unique prompts + outputs. ~~~~")
 
         # Map requests by their prompt.
