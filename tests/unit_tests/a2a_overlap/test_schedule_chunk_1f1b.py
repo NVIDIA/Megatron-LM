@@ -195,7 +195,7 @@ class TestA2AOverlap:
         # Re-initialize model parallel with the specified configuration
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=parallel_config["tp"],
+            tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=4,
             expert_tensor_parallel_size=1,
@@ -212,8 +212,8 @@ class TestA2AOverlap:
         # create TransformerConfig
         extra_kwargs = {
             "moe_token_dispatcher_type": dispatcher_type,
-            "tensor_model_parallel_size": parallel_config["tp"],
-            "sequence_parallel": parallel_config["tp"] > 1,
+            "tensor_model_parallel_size": tp_size,
+            "sequence_parallel": tp_size > 1,
         }
         if dispatcher_type == "flex":
             extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
