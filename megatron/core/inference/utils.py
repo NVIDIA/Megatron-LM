@@ -1,10 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import functools
 import multiprocessing
 import sys
-
 import torch
+
+from contextlib import contextmanager
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
@@ -138,6 +140,34 @@ def tensor_swap(x, src_idxs, dst_idxs):
     """
     x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
 
+
+@contextmanager
+def use_cuda_graph(graph_cache: dict, graph_key):
+    """Syntactic sugar decorator to simplify CUDA graph capture and replay."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapped(*args, graph_mode: str = "replay", **kwargs):
+            assert graph_mode in ("record", "replay")
+            if graph_mode == "record":
+                # Do not allow for overwriting of existing graphs.
+                assert graph_key not in graph_cache
+
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    fn(*args, **kwargs)
+                graph_cache[graph_key] = g
+            elif graph_mode == "replay":
+                graph_cache[graph_key].replay()
+        return wrapped
+    return deco
+
+async def torch_awaitable(stream: torch.cuda.Stream | None = None):
+    """Syntactic sugar for returning an awaitable handle for non-distributed torch."""
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    event = stream.record_event()
+    while not event.query():
+        await asyncio.sleep(0)
 
 async def await_process_event(
     event: multiprocessing.Event, process: multiprocessing.Process, timeout: float = 1.0
