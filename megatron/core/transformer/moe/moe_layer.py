@@ -114,7 +114,7 @@ class MoELayer(BaseMoELayer):
         )
         # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
-            config.recompute_granularity == 'selective' 
+            config.recompute_granularity == 'selective'
             and "moe" in config.recompute_modules
             and config.cuda_graph_impl != 'local'
         )
@@ -268,9 +268,7 @@ class MoELayer(BaseMoELayer):
 
         return shared_expert_output
 
-    def routed_experts_compute(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor
-    ):
+    def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Computes the output of the routed experts on the dispatched tokens.
 
         This method first post-processes the dispatched input to get permuted tokens
@@ -297,9 +295,9 @@ class MoELayer(BaseMoELayer):
         return output
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
-        
-        # Project the output back from latent dimension to hidden dimension after combine
-        # in latent dimension.
+        """Project the output back from latent dimension to hidden dimension after combine
+        in latent dimension if needed. Combine expert output with shared_experts if needed."""
+
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 
@@ -354,7 +352,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     output, shared_expert_output = intermediate_tensors
 
-                output = self.postprocess(output, shared_expert_output) 
+                output = self.postprocess(output, shared_expert_output)
 
                 if intermediate_tensors is not None:
                     return output
@@ -363,7 +361,7 @@ class MoELayer(BaseMoELayer):
 
         if self.moe_layer_recompute:
             if self.config.fp8 or self.config.fp4:
-                output, mlp_bias = te_checkpoint(
+                outputs = te_checkpoint(
                     custom_forward,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
@@ -372,7 +370,9 @@ class MoELayer(BaseMoELayer):
                     intermediate_tensors,
                 )
             else:
-                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states, intermediate_tensors)
+                outputs = tensor_parallel.checkpoint(
+                    custom_forward, False, hidden_states, intermediate_tensors
+                )
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors)
 
