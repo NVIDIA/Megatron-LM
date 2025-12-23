@@ -112,7 +112,7 @@ class SFTDataset(torch.utils.data.Dataset):
     def _wildcard_get(cls, directory: Dict[str, Any], name: str, default_value=None):
         ret = default_value
         for key, val in directory.items():
-            if name in key:
+            if key in name:
                 ret = val
                 break
         return ret
