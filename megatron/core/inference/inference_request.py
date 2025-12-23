@@ -246,6 +246,7 @@ class DynamicInferenceRequest(InferenceRequest):
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     latency: Optional[float] = None
     finished_chunk_token_count = 0
+    stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
