@@ -7,8 +7,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union
 
 import torch
-import torch.distributed
-from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -1226,6 +1224,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
 
 class MoETransformerLayer(TransformerLayer):
+    """
+    A Transformer layer specialized for Mixture-of-Experts (MoE) architectures.
+
+    This is a child class of `TransformerLayer` that implements specific functionality
+    to support CUDA graph capture for MoE layers. Due to the dynamic nature of MoE
+    (routing and expert dispatch), capturing the entire layer in a single CUDA graph
+    can be challenging. This class supports "partial" CUDA graphs by decomposing the
+    MLP forward pass into router, expert-compute, and post-process stages.
+    """
+
     def __init__(self, *args, **kwargs):
         self.is_moe_layer = True
         self.use_partial_cudagraphs = False
@@ -1234,6 +1242,15 @@ class MoETransformerLayer(TransformerLayer):
         super().__init__(*args, **kwargs)
 
     def create_mcore_cudagraph_manager(self, config):
+        """
+        Initializes the CUDA graph manager(s) for the MoE layer.
+
+        Unlike the standard layer which typically uses a single manager, this method
+        can configure multiple graph managers if partial CUDA graphs are enabled via
+        `cuda_graph_scope`. This allows capturing the static parts of the MoE pass
+        while leaving the expert computation to execute eagerly.
+        """
+
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
         self.moe_layer_recompute = (
@@ -1242,7 +1259,10 @@ class MoETransformerLayer(TransformerLayer):
             self.config.cuda_graph_impl == "local"
         )
 
-        if "full" in self.config.cuda_graph_scope or "moe_router" in self.config.cuda_graph_scope:
+        if "full" in self.config.cuda_graph_scope or \
+            "moe_router" in self.config.cuda_graph_scope or \
+            self.config.cuda_graph_scope == []:
+
             self.use_partial_cudagraphs = True        
             self.cudagraph_manager_router = CudaGraphManager(
                 self.config, self,
@@ -1256,6 +1276,13 @@ class MoETransformerLayer(TransformerLayer):
             self.cudagraph_manager = CudaGraphManager(config)
 
     def _forward_mlp_router(self, hidden_states):
+        """
+        Executes the router phase of the MoE block.
+
+        This includes the pre-MLP layernorm and the routing logic.
+        This method is isolated so it can be captured by `cudagraph_manager_router`.
+        """
+
         residual = hidden_states
         self.mlp.fwd_execution_map = ("route")
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
@@ -1263,16 +1290,39 @@ class MoETransformerLayer(TransformerLayer):
         return residual, *router_outputs
 
     def _forward_mlp_expert_compute(self, hidden_states, probs, routing_map):
-        self.mlp.fwd_execution_map = ("dispatch_expert_compute_combine")
+        """
+        Executes the actual computation of the experts.
+        
+        This phase takes the routing information and inputs, dispatches them to the
+        appropriate experts, and computes the results. In partial graph modes, this
+        step runs eagerly between the router and postprocess graph replays.
+        """
+
+        self.mlp.fwd_execution_map = ("expert_compute")
         return self.mlp(None, intermediate_tensors=(hidden_states, probs, routing_map)) 
 
     def _forward_mlp_postprocess(self, residual, output, shared_expert_output, mlp_bias):
+        """
+        Executes the post-processing phase of the MoE block.
+
+        Handles combining the expert outputs, applying biases, re-registering
+        activation recomputation hooks if necessary, and performing the final
+        Bias-Dropout-Add. This method is isolated so it can be captured by cudagraphs.
+
+        """
+
         self.mlp.fwd_execution_map = ("postprocess")
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
 
     def _forward_mlp(self, hidden_states, inference_context=None):
-        # If using partial cudagraphs, decompose the forward pass into 3 subfunctions
+        """
+        Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
+
+        If `use_partial_cudagraphs` is True, this method stitches together the
+        router, expert_compute, and postprocess calls.
+        """
+
         def _forward_mlp_partial_cudagraphs(hidden_states, inference_context=None):
             residual, hidden_states, probs, routing_map, shared_expert_output = \
                 self._forward_mlp_router(hidden_states)

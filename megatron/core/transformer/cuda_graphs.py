@@ -100,10 +100,13 @@ def _set_capture_end():
     _IS_GRAPH_CAPTURING = False
 
 
-artifact_count = 0
-
 @dataclass
-class CudagraphArtifacts:
+class CudagraphBufferMetadata:
+    """
+    Metadata thats save to tensors during cudagraph capture. This data will be used to determine
+    when a cudagraph can reuse a buffer or directly write its output into a subsequent's graph's
+    input.
+    """
     is_cudagraph_input: bool = False
     is_cudagraph_output: bool = False
     input_use_count: int = 0
@@ -111,13 +114,6 @@ class CudagraphArtifacts:
     capture_reuse_count: int = 0
     fwd_cudagraph_buffer: torch.Tensor = None
     bwd_cudagraph_buffer: torch.Tensor = None
-    
-    g_id = -1
-
-    def __init__(self):
-        global artifact_count
-        self.g_id = artifact_count
-        artifact_count += 1
 
 
 class ArgMetadata:
@@ -131,9 +127,9 @@ class ArgMetadata:
             self.device = arg.device
             self.value = arg.data_ptr()
             self.requires_grad = arg.requires_grad
-            if hasattr(arg, "cg_artifacts"):
+            if hasattr(arg, "cg_buffer_metadata"):
                 # Its important this is a reference copy
-                self.cg_artifacts = arg.cg_artifacts
+                self.cg_buffer_metadata = arg.cg_buffer_metadata
         else:
             self.value = arg
 
@@ -145,6 +141,11 @@ class ArgMetadata:
             requires_grad=self.requires_grad)
 
 class TensorReusePool:
+    """
+    A pool-like list of tensors that can be reused as input and output buffers during graph capture.
+    Also maintains strong references to all tensors created by this pool, so that they will never be
+    freed by the memory allocator.
+    """
 
     tensor_strong_refs = []
     tensor_strong_refs_dataptrs = set()
@@ -157,6 +158,9 @@ class TensorReusePool:
         return tensor.data_ptr() in self.tensor_strong_refs_dataptrs
 
     def get(self, meta: ArgMetadata):
+        """Try to get a buffer from the pool. If a matching tensor is already in the pool, its 
+        assumed to be available and returned. Otherwise, allocate a new buffer. """
+
         assert isinstance(meta, ArgMetadata)
         # Find first matching buffer in pool
         for i, buf in enumerate(self.pool):
@@ -279,6 +283,7 @@ class _CudagraphGlobalRecord:
     cudagraph_record = []
     cudagraph_inference_record = []
 
+    """A pool-like data structure to reuse input and output buffers across cudagraph."""
     tensor_reuse_pool = TensorReusePool()
 
     @classmethod
@@ -321,7 +326,11 @@ class _CudagraphGlobalRecord:
         else:
             logging.warning("Transformer Engine was not detected while capturing training " \
             "cudagraphs. As a result cudagraph memory overhead may significantly increase " \
-            "as Transformer Engine is needed to remove redundant cudagraph memory usage.")
+            "as Transformer Engine's weak reference feature is used on cudagraph " \
+            "input and output buffers. This allows the memory of input and output buffers to " \
+            "to be reclaimed across graphs while remaining valid buffers for when the graph is " \
+            "replayed. For more information see:" \
+            "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -363,9 +372,6 @@ class _CudagraphGlobalRecord:
             else:
                 assert fwd_buffer_reuse_ref_count == 0
                 runner.create_bwd_graph()
-
-        # TODO: (jiemingz) see [interaction with recompute]
-        # assert bwd_buffer_reuse_ref_count == 0
 
         # Memory usage.
         time_end = time.time()
@@ -678,6 +684,9 @@ class _CudaGraphRunner(torch.nn.Module):
             return nullcontext()
 
     def get_connected_params(self, outputs):
+        """Iterate through the autograd graph of 'outputs' and returns all parameters connected. 
+        In theory this should return all parameters that return a nonzero wgrad when computing
+        the backward pass of 'outputs'. """
         # Flatten outputs and start traversal from roots that require gradients
         args = (outputs,) if torch.is_tensor(outputs) else outputs
         stack = [t.grad_fn for t in self.get_tensors(args, check_types=False) if t.requires_grad and t.grad_fn]
@@ -697,38 +706,37 @@ class _CudaGraphRunner(torch.nn.Module):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
 
-
         def _resolve_input_buffer(ten):
             if not isinstance(ten, ArgMetadata):
                 return ten
 
-            assert hasattr(ten, "cg_artifacts") and ten.cg_artifacts.is_cudagraph_input
+            assert hasattr(ten, "cg_buffer_metadata") and ten.cg_buffer_metadata.is_cudagraph_input
 
             global fwd_buffer_reuse_ref_count
             can_skip_copy = False
 
             # case 1: the buffer is reused form the output of a preceding cudagraph
-            if ten.cg_artifacts.is_cudagraph_output:
-                buf = ten.cg_artifacts.fwd_cudagraph_buffer
-                buf.cg_artifacts.capture_reuse_count -= 1
-                if buf.cg_artifacts.capture_reuse_count == 0:
-                    ten.cg_artifacts.fwd_cudagraph_buffer = None
+            if ten.cg_buffer_metadata.is_cudagraph_output:
+                buf = ten.cg_buffer_metadata.fwd_cudagraph_buffer
+                buf.cg_buffer_metadata.capture_reuse_count -= 1
+                if buf.cg_buffer_metadata.capture_reuse_count == 0:
+                    ten.cg_buffer_metadata.fwd_cudagraph_buffer = None
                     fwd_buffer_reuse_ref_count -= 1
             # case 2: the buffer is reused over multiple cudagraph inputs
-            elif ten.cg_artifacts.input_use_count > 1:
-                if ten.cg_artifacts.fwd_cudagraph_buffer is None:
+            elif ten.cg_buffer_metadata.input_use_count > 1:
+                if ten.cg_buffer_metadata.fwd_cudagraph_buffer is None:
                     buf = _CudagraphGlobalRecord.tensor_reuse_pool.get(ten)
-                    buf.cg_artifacts = deepcopy(ten.cg_artifacts)
-                    buf.cg_artifacts.capture_reuse_count = ten.cg_artifacts.input_use_count
-                    ten.cg_artifacts.fwd_cudagraph_buffer = buf
+                    buf.cg_buffer_metadata = deepcopy(ten.cg_buffer_metadata)
+                    buf.cg_buffer_metadata.capture_reuse_count = ten.cg_buffer_metadata.input_use_count
+                    ten.cg_buffer_metadata.fwd_cudagraph_buffer = buf
                     fwd_buffer_reuse_ref_count += 1
                 else:
                     can_skip_copy = True
 
-                buf = ten.cg_artifacts.fwd_cudagraph_buffer
-                buf.cg_artifacts.capture_reuse_count -= 1
-                if buf.cg_artifacts.capture_reuse_count == 0:
-                    ten.cg_artifacts.fwd_cudagraph_buffer = None
+                buf = ten.cg_buffer_metadata.fwd_cudagraph_buffer
+                buf.cg_buffer_metadata.capture_reuse_count -= 1
+                if buf.cg_buffer_metadata.capture_reuse_count == 0:
+                    ten.cg_buffer_metadata.fwd_cudagraph_buffer = None
                     fwd_buffer_reuse_ref_count -= 1
             # case 3: need to provide a fresh buffer from the reuse pool
             else:
@@ -861,14 +869,14 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph_output_surface = self.get_tensors(fwd_graph_outputs)
 
         for fwd_graph_out, o in zip(self.fwd_graph_output_surface, self.get_arg_metas(self.outputs)):
-            assert hasattr(o, "cg_artifacts") and o.cg_artifacts.is_cudagraph_output
-            fwd_graph_out.cg_artifacts = deepcopy(o.cg_artifacts)
+            assert hasattr(o, "cg_buffer_metadata") and o.cg_buffer_metadata.is_cudagraph_output
+            fwd_graph_out.cg_buffer_metadata = deepcopy(o.cg_buffer_metadata)
 
-            if o.cg_artifacts.is_cudagraph_input and \
-                o.cg_artifacts.fwd_cudagraph_buffer is None:     
-                fwd_graph_out.cg_artifacts.capture_reuse_count = \
-                    o.cg_artifacts.cudagraph_reuse_ref_count
-                o.cg_artifacts.fwd_cudagraph_buffer = fwd_graph_out
+            if o.cg_buffer_metadata.is_cudagraph_input and \
+                o.cg_buffer_metadata.fwd_cudagraph_buffer is None:     
+                fwd_graph_out.cg_buffer_metadata.capture_reuse_count = \
+                    o.cg_buffer_metadata.cudagraph_reuse_ref_count
+                o.cg_buffer_metadata.fwd_cudagraph_buffer = fwd_graph_out
                 global fwd_buffer_reuse_ref_count
                 fwd_buffer_reuse_ref_count += 1
 
@@ -898,6 +906,9 @@ class _CudaGraphRunner(torch.nn.Module):
     def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
+
+        # unlike 'fwd_buffer_reuse_ref_count', 'bwd_buffer_reuse_ref_count' may not decrement
+        # to 0 when activation checkpointing is used. See [interaction with recompute].
         global bwd_buffer_reuse_ref_count
 
         assert self.grad_enabled
@@ -917,12 +928,12 @@ class _CudaGraphRunner(torch.nn.Module):
                 # cudagraph expects the buffer to be provided 'fwd_cudagraph_buffer' but is missing.
                 # So, we cannot always assume this metadata exists. Consequently, there are extra
                 # copies between the outputs of the fwd-bwd pass and the bwd pass.
-                if o.cg_artifacts.is_cudagraph_input and o.cg_artifacts.bwd_cudagraph_buffer is not None:
-                    o.cg_artifacts.bwd_cudagraph_buffer.shape == o.shape
+                if o.cg_buffer_metadata.is_cudagraph_input and o.cg_buffer_metadata.bwd_cudagraph_buffer is not None:
+                    o.cg_buffer_metadata.bwd_cudagraph_buffer.shape == o.shape
                     
-                    out_grad = o.cg_artifacts.bwd_cudagraph_buffer
-                    o.cg_artifacts.bwd_cudagraph_buffer = None
-                    out_grad.cg_artifacts.capture_reuse_count -= 1
+                    out_grad = o.cg_buffer_metadata.bwd_cudagraph_buffer
+                    o.cg_buffer_metadata.bwd_cudagraph_buffer = None
+                    out_grad.cg_buffer_metadata.capture_reuse_count -= 1
                     bwd_buffer_reuse_ref_count -= 1
                 else:
                     out_grad = _CudagraphGlobalRecord.tensor_reuse_pool.get(o)
@@ -955,11 +966,11 @@ class _CudaGraphRunner(torch.nn.Module):
         for input_tensor in self.get_arg_metas(self.args, self.kwargs):
             if input_tensor.requires_grad:
                 input_grad = grad_inputs.pop(0)
-                input_grad.cg_artifacts = deepcopy(input_tensor.cg_artifacts)
-                if input_tensor.cg_artifacts.is_cudagraph_output:
-                    if input_tensor.cg_artifacts.bwd_cudagraph_buffer is None:
-                        input_tensor.cg_artifacts.bwd_cudagraph_buffer = input_grad
-                        input_grad.cg_artifacts.capture_reuse_count += 1
+                input_grad.cg_buffer_metadata = deepcopy(input_tensor.cg_buffer_metadata)
+                if input_tensor.cg_buffer_metadata.is_cudagraph_output:
+                    if input_tensor.cg_buffer_metadata.bwd_cudagraph_buffer is None:
+                        input_tensor.cg_buffer_metadata.bwd_cudagraph_buffer = input_grad
+                        input_grad.cg_buffer_metadata.capture_reuse_count += 1
                         bwd_buffer_reuse_ref_count += 1
                 self.static_grad_inputs.append(input_grad)
             else:
@@ -985,8 +996,8 @@ class _CudaGraphRunner(torch.nn.Module):
                 # passes its input directly as an output, and places this output as the
                 # input of a subsequent cudgraph, leading to a grad output buffer to be still in use
                 # even after the backward pass.
-                reuse_count = ten.cg_artifacts.capture_reuse_count \
-                    if hasattr(ten, "cg_artifacts") else 0
+                reuse_count = ten.cg_buffer_metadata.capture_reuse_count \
+                    if hasattr(ten, "cg_buffer_metadata") else 0
 
                 if _CudagraphGlobalRecord.tensor_reuse_pool.owns(ten) and reuse_count == 0:
                     _CudagraphGlobalRecord.tensor_reuse_pool.insert(ten)
@@ -1016,21 +1027,23 @@ class _CudaGraphRunner(torch.nn.Module):
         delattr(self, "kwargs")
         delattr(self, "outputs")
 
-    def apply_cudagraph_artifacts(self, args, kwargs, outputs):
+    def apply_cudagraph_record_metadata(self, args, kwargs, outputs):
+        """Attaches capture metadata and converts all passed in tensors. """
+
         for t in self.get_tensors(args, kwargs):
-            if not hasattr(t, "cg_artifacts"):
-                t.cg_artifacts = CudagraphArtifacts()
+            if not hasattr(t, "cg_buffer_metadata"):
+                t.cg_buffer_metadata = CudagraphBufferMetadata()
 
-            t.cg_artifacts.is_cudagraph_input = True
-            t.cg_artifacts.input_use_count += 1
+            t.cg_buffer_metadata.is_cudagraph_input = True
+            t.cg_buffer_metadata.input_use_count += 1
 
-            if t.cg_artifacts.is_cudagraph_output:
-                t.cg_artifacts.cudagraph_reuse_ref_count += 1
+            if t.cg_buffer_metadata.is_cudagraph_output:
+                t.cg_buffer_metadata.cudagraph_reuse_ref_count += 1
 
         # mark all outputs, so that the fwd graph we may reuse cudagraph output buffers as inputs
         for o in self.get_tensors(outputs):
-            o.cg_artifacts = CudagraphArtifacts()
-            o.cg_artifacts.is_cudagraph_output = True
+            o.cg_buffer_metadata = CudagraphBufferMetadata()
+            o.cg_buffer_metadata.is_cudagraph_output = True
 
     def record_graph_capture(self, args, kwargs):
         """Records the data needed to create this runner's forward cudagraph.
@@ -1059,7 +1072,7 @@ class _CudaGraphRunner(torch.nn.Module):
         if not self.fwd_graph_recorded:
             logger.debug(f"Recording forward graph creation...")
 
-            self.apply_cudagraph_artifacts(args, kwargs, out)
+            self.apply_cudagraph_record_metadata(args, kwargs, out)
 
             def _replace_with_meta(arg):
                 return ArgMetadata(arg) if torch.is_tensor(arg) else arg
@@ -1175,6 +1188,7 @@ class _CudaGraphRunner(torch.nn.Module):
         return errors
 
     def get_arg_metas(self, args, kwargs=None):
+        """Replaces all passed in tensors with 'ArgMetadata' and returns them as a list. """
         arg_metas = []
         
         def collect(item):
