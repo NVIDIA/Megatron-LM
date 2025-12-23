@@ -60,12 +60,13 @@ ENV_DEPENDENT="\
   --grpo-kl-beta $GRPO_KL_BETA \
   --langrl-env-config $ENV_CONFIG "
 
+  # --cuda-graph-scope full_iteration \
+  # --inference-dynamic-batching \
 MODEL_OPTIONS="\
   --no-rl-use-sequence-packing \
   --rl-partial-rollouts \
   --rl-offload-optimizer-during-inference \
   --moe-pad-experts-for-cuda-graph-inference \
-  --inference-dynamic-batching \
   --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
   --inference-dynamic-batching-num-cuda-graphs 2 \

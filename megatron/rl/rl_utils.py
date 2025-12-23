@@ -482,7 +482,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                     tokens,
                     position_ids,
                     attention_mask_for_forward,
-                    # packed_seq_params=packed_seq_params,
+                    packed_seq_params=packed_seq_params,
                     runtime_gather_output=True,
                     fp32_output=fp32_output,
                 )
@@ -966,7 +966,7 @@ def prepare_data_for_update(
                         b_posids,
                         no_grad=True,
                         sequence_packing=args.rl_use_sequence_packing,                       
-                        # packed_seq_params=b_packed_seq_params,
+                        packed_seq_params=b_packed_seq_params,
                     ),
                     None,
                 )
