@@ -636,10 +636,14 @@ class TestPaddingMaskAuxLoss:
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
-    def test_padding_mask_removes_padding_tokens(self, aux_loss_type, tp_size, ep_size, cp_size, sequence_parallel):
+    def test_padding_mask_removes_padding_tokens(
+        self, aux_loss_type, tp_size, ep_size, cp_size, sequence_parallel
+    ):
         """Test that padding tokens are correctly excluded from aux loss calculation."""
         # Initialize model parallel with given configuration
-        self.setup_model_parallel(tp_size=tp_size, ep_size=ep_size, cp_size=cp_size, sequence_parallel=sequence_parallel)
+        self.setup_model_parallel(
+            tp_size=tp_size, ep_size=ep_size, cp_size=cp_size, sequence_parallel=sequence_parallel
+        )
 
         try:
             clear_aux_losses_tracker()
