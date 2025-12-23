@@ -1173,9 +1173,8 @@ class MoETransformerLayer(TransformerLayer):
     """
     A Transformer layer specialized for Mixture-of-Experts (MoE) architectures.
 
-    This is a child class of `TransformerLayer` that implements specific functionality
-    to support CUDA graph capture for MoE layers. Due to the dynamic nature of MoE
-    (routing and expert dispatch), capturing the entire layer in a single CUDA graph
+    Implements specific functionality to support CUDA graph capture for MoE layers. 
+    Due to the dynamic nature of MoE, capturing the entire layer in a single CUDA graph
     can be challenging. This class supports "partial" CUDA graphs by decomposing the
     MLP forward pass into router, expert-compute, and post-process stages.
     """
