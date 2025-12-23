@@ -11,6 +11,7 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.utils import experimental_api
 
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
@@ -31,6 +32,7 @@ except ImportError:
 
 
 @dataclass
+@experimental_api
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
 
@@ -241,6 +243,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant: gated_delta_net
     ####################
+    linear_attention_type: Optional[str] = None
+    """Type of linear attention to use.
+    Deprecated. Use experimental_attention_variant instead."""
+
     linear_attention_freq: Optional[Union[int, List[int]]] = None
     """Frequency between LA (linear attention) layers 
     and SDPA (scaled dot-product attention) layers.
@@ -876,6 +882,14 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        if self.linear_attention_type is not None:
+            warnings.warn(
+                "linear_attention_type is deprecated, "
+                "use experimental_attention_variant instead."
+            )
+            self.experimental_attention_variant = self.linear_attention_type
+            self.linear_attention_type = None
 
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
@@ -1912,6 +1926,7 @@ class TransformerConfig(ModelParallelConfig):
 
 
 @dataclass
+@experimental_api
 class MLATransformerConfig(TransformerConfig):
     """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.
 

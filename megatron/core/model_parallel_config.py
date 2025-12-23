@@ -6,8 +6,11 @@ from typing import Callable, ContextManager, Optional
 
 import torch
 
+from megatron.core.utils import experimental_api
+
 
 @dataclass
+@experimental_api
 class ModelParallelConfig:
     """Base configuration for Megatron Core
 
@@ -66,13 +69,14 @@ class ModelParallelConfig:
     """
     If true, enables hybrid context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
+    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
     When enabling hybrid_context_parallel, sft_sequence_packing must be true.
     """
 
     hybrid_context_parallel_scheduler: str = 'balanced'
     """
     Scheduler for hybrid context parallel.
-    balanced: balanced scheduler for hybrid context parallel.
+    balanced: balanced scheduler for hybrid context parallel which provided by MCore.
     only_packing_no_scheduling: scheduling is already handled by the data sampler,
     this scheduler only performs packing.
     """
@@ -80,11 +84,6 @@ class ModelParallelConfig:
     sft_sequence_packing: bool = False
     """
     If true, enables sft sequence packing.
-    This is used to pack samples with variable sequence lengths
-    into a single sample. This is useful when we use hybrid_context_parallel.
-    If enable hybrid_context_parallel,
-    the max sequence length after packing would be controlled by max_seqlen_per_dp_cp_rank.
-    Else, it would be controlled by the maximum sequence length / context parallel size.
     """
 
     balanced_sequence_packing: bool = False

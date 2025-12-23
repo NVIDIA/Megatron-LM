@@ -124,8 +124,6 @@ class SFTDataset(MegatronDataset):
         num_tokens = len(tokens) + force_eod_length
         if sft_sequence_packing:
             padding_len = self.get_padding_size(num_tokens) - num_tokens
-            # TODO(tailaim): remove this after testing
-            # padding_len = max_seq_len - num_tokens
         else:
             padding_len = max_seq_len - num_tokens
         assert padding_len >= 0

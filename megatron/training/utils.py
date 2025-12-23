@@ -531,7 +531,7 @@ def get_batch_on_this_tp_rank(
                 mpu.get_tensor_model_parallel_src_rank(),
                 group=mpu.get_tensor_model_parallel_group(),
             )
-
+   
     if mpu.get_tensor_model_parallel_rank() == 0:
 
         assert data_iterator is not None
@@ -614,7 +614,7 @@ def get_batch_on_this_tp_rank(
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
 
-        elif mpu.is_pipeline_first_stage():
+        elif mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage):
             _broadcast(batch['tokens'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
@@ -624,7 +624,7 @@ def get_batch_on_this_tp_rank(
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
 
-        elif mpu.is_pipeline_last_stage():
+        elif mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
@@ -640,7 +640,7 @@ def get_batch_on_this_tp_rank(
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
             
-        elif args.sft_sequence_packing:
+        elif (not is_first_or_last_pipeline_stage(vp_stage)) and args.sft_sequence_packing:
             # Except for PP rank 0 and the last PP rank, broadcast 
             # cu_seqlens, cu_seqlens_padded and max_seqlen for the THD format.
             _broadcast_cu_seqlens(batch['cu_seqlens'])
@@ -649,42 +649,69 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['local_cp_size'])
 
     else:
-        if args.sft_sequence_packing:
-            seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
-            _broadcast(seq_len)
-            shape = (seq_len.item())
-        else:
-            shape = (args.micro_batch_size, args.seq_length)
-            
-        tokens = torch.empty(
-            shape,
-            dtype=torch.int64,
-            device=torch.cuda.current_device(),
-        )
-        labels = torch.empty(
-            shape,
-            dtype=torch.int64,
-            device=torch.cuda.current_device(),
-        )
-        loss_mask = torch.empty(
-            shape,
-            dtype=torch.float32,
-            device=torch.cuda.current_device(),
-        )
-        if args.create_attention_mask_in_dataloader:
-            shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.hybrid_context_parallel else (1, 1, shape[0], shape[0])
-            attention_mask = torch.empty(
-                shape_attention_mask,
-                dtype=torch.bool,
+        if is_first_or_last_pipeline_stage(vp_stage):
+            if args.sft_sequence_packing:
+                seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
+                _broadcast(seq_len)
+                shape = (seq_len.item())
+            else:
+                shape = (args.micro_batch_size, args.seq_length)       
+            tokens = torch.empty(
+                shape,
+                dtype=torch.int64,
                 device=torch.cuda.current_device(),
             )
-        else:
-            attention_mask = None
-        position_ids = torch.empty(
-            shape,
-            dtype=torch.int64,
+            labels = torch.empty(
+                shape,
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            loss_mask = torch.empty(
+                shape,
+                dtype=torch.float32,
+                device=torch.cuda.current_device(),
+            )
+            if args.create_attention_mask_in_dataloader:
+                shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.hybrid_context_parallel else (1, 1, shape[0], shape[0])
+                attention_mask = torch.empty(
+                    shape_attention_mask,
+                    dtype=torch.bool,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                attention_mask = None
+            position_ids = torch.empty(
+                shape,
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+
+        cu_seqlens = None
+        cu_seqlens_padded = None
+        max_seqlen = torch.empty(
+            1,
+            dtype=torch.int32,
             device=torch.cuda.current_device(),
-        )
+        ) if args.sft_sequence_packing else None
+        local_cp_size = torch.empty(
+            1,
+            dtype=torch.int32,
+            device=torch.cuda.current_device(),
+        ) if args.hybrid_context_parallel else None
+
+        def _broadcast_cu_seqlens():
+            dev = torch.cuda.current_device()
+
+            n = torch.empty((), dtype=torch.int32, device=dev)
+            _broadcast(n)
+            n = int(n.item())
+            if n == 0:
+                cu_seqlens = torch.empty(0, dtype=torch.int32, device=dev)
+            else:
+                cu_seqlens = torch.empty(n, dtype=torch.int32, device=dev)
+            _broadcast(cu_seqlens)
+
+            return cu_seqlens if n > 0 else None
 
         cu_seqlens = None
         cu_seqlens_padded = None
@@ -725,7 +752,7 @@ def get_batch_on_this_tp_rank(
                 cu_seqlens = _broadcast_cu_seqlens()
                 cu_seqlens_padded = _broadcast_cu_seqlens()
 
-        elif mpu.is_pipeline_first_stage():
+        elif mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage):
             labels = None
             loss_mask = None
             _broadcast(tokens)
@@ -737,16 +764,12 @@ def get_batch_on_this_tp_rank(
                 cu_seqlens = _broadcast_cu_seqlens()
                 cu_seqlens_padded = _broadcast_cu_seqlens()
 
-        elif mpu.is_pipeline_last_stage():
+        elif mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
             tokens = None
             position_ids = None
-            cu_seqlens = None
-            cu_seqlens_padded = None
-            max_seqlen = None
-
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
@@ -756,9 +779,10 @@ def get_batch_on_this_tp_rank(
                 cu_seqlens = _broadcast_cu_seqlens()
                 cu_seqlens_padded = _broadcast_cu_seqlens()
 
-        elif args.sft_sequence_packing:
+        elif (not is_first_or_last_pipeline_stage(vp_stage)) and args.sft_sequence_packing:
             # Except for PP rank 0 and the last PP rank, broadcast 
             # cu_seqlens, cu_seqlens_padded and max_seqlen for the THD format.
+            tokens, labels, loss_mask, attention_mask, position_ids = None, None, None, None, None
             cu_seqlens = _broadcast_cu_seqlens()
             cu_seqlens_padded = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
