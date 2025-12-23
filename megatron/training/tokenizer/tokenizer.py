@@ -81,7 +81,7 @@ def build_tokenizer(args, **kwargs):
             kwargs = {
                 "from_slow": True,
                 "legacy": False,
-                "add_bos_token": False,
+                "add_bos_token": True,
             }
 
         # Currently, only HuggingFace tokenizers are supported.
