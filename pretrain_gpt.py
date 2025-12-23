@@ -71,7 +71,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-    
+
     return (*batch.values(), packed_seq_params)
 
 

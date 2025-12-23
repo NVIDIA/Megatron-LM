@@ -255,7 +255,7 @@ def should_skip_change(change, filtered_paths: set) -> bool:
     if change_kind in IGNORED_FOR_INIT_METHODS:
         if '.__init__' in clean_path:
             return True
-    
+
     # Check exact match
     if clean_path in filtered_paths or path in filtered_paths:
         return True

@@ -132,7 +132,7 @@ jobs:
           name: lock-file-${{ env.SOURCE_BRANCH }}
 
       - name: Create Bump PR
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         id: create-pull-request
         env:
           title: "chore(beep boop 🤖): Bump `uv.lock` (${{ inputs.target-branch}}) (${{ needs.pre-flight.outputs.date }})"

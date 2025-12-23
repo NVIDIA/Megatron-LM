@@ -6,15 +6,17 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.core.models.mamba.mamba_layer_specs import mamba_inference_stack_spec
 
-
-def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None):
+def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building MAMBA model ...')
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
     assert args.use_legacy_models is False, "Mamba only supported in Mcore!"
 
-    if args.spec is not None:
+    if config.transformer_impl == "inference_optimized":
+        mamba_stack_spec = mamba_inference_stack_spec 
+    elif args.spec is not None:
         mamba_stack_spec = import_module(args.spec)
     else:
         raise ValueError("You must provide a valid Mamba layer spec via --spec")
@@ -35,6 +37,7 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None):
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
+        pg_collection=pg_collection,
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):

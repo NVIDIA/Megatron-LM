@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from typing import Any, Dict
 
 import pytest
@@ -5,17 +7,28 @@ import pytest
 from megatron.core.quantization.quant_config import GlobMatcher, MatchContext, RecipeConfig
 
 try:
-    import nvidia_kitchen
-    from nvidia_kitchen.config import (
+    import nvidia_kitchen  # type: ignore[import-not-found]
+    from nvidia_kitchen.config import (  # type: ignore[import-not-found]
         AutogradFunctionImplementation,
         QuantizeRecipe,
         get_qlinear_params_from_predefined,
     )
+    from nvidia_kitchen.config_attention_recipe import (  # type: ignore[import-not-found]
+        QuantizeRecipeAttnBMM,
+        get_qattention_params_from_predefined,
+    )
+    from nvidia_kitchen.config_fa_recipe import (  # type: ignore[import-not-found]
+        get_qfa_params_from_recipe_name,
+    )
 
-    from megatron.core.extensions.kitchen import QLinearParamsConfigSchema
+    from megatron.core.extensions.kitchen import (  # type: ignore[import-not-found]
+        QAttentionParamsConfigSchema,
+        QFlashAttentionParamsConfigSchema,
+        QLinearParamsConfigSchema,
+    )
 
     HAVE_KITCHEN = True
-except ImportError:
+except ImportError as e:
     HAVE_KITCHEN = False
 
 
@@ -61,6 +74,27 @@ def test_parse_qlinear_params_example() -> None:
         == AutogradFunctionImplementation.QUANTIZED
     )
 
+    qat_params = 6001
+    config = {"kitchen_config_type": "QAttentionParams", "recipe_idx": qat_params}
+    qattention_params_actual = QAttentionParamsConfigSchema.parse_config_dict(
+        config
+    ).to_kitchen_qattention()
+    qattention_params_expected = get_qattention_params_from_predefined(
+        QuantizeRecipeAttnBMM.MXFP8_EMULATION
+    )
+    assert type(qattention_params_actual.quantizer_bmm1) == type(
+        qattention_params_expected.quantizer_bmm1
+    )
+    assert type(qattention_params_actual.quantizer_bmm2) == type(
+        qattention_params_expected.quantizer_bmm2
+    )
+    assert type(qattention_params_actual.get_quantizer(True)) == type(
+        qattention_params_expected.get_quantizer(True)
+    )
+    assert type(qattention_params_actual.get_quantizer(False)) == type(
+        qattention_params_expected.get_quantizer(False)
+    )
+
 
 @pytest.mark.skipif(not HAVE_KITCHEN, reason="Kitchen required for using kitchen backend.")
 def test_error_from_malformed() -> None:
@@ -84,3 +118,71 @@ def test_error_from_malformed() -> None:
     }
     with pytest.raises(KeyError, match="Unexpected keys in config"):
         qlinear_params_actual = QLinearParamsConfigSchema.parse_config_dict(config)
+
+
+@pytest.mark.skipif(not HAVE_KITCHEN, reason="Kitchen required for using kitchen backend.")
+def test_parse_qflash_attention_params_example() -> None:
+    recipe_name = "triton_fa_bf16_for_all_base_2"
+    config = {"kitchen_config_type": "QFlashAttentionParams", "recipe_name": recipe_name}
+    qfa_params_actual = QFlashAttentionParamsConfigSchema.parse_config_dict(config).to_kitchen_qfa()
+    qfa_params_expected = get_qfa_params_from_recipe_name(recipe_name)
+
+    # Verify they are the same object (since recipes are cached)
+    assert qfa_params_actual is qfa_params_expected
+    assert qfa_params_actual.backend == "triton"
+    assert qfa_params_actual.qk_dot_precisions == "bf16@bf16"
+    assert qfa_params_actual.pv_dot_precisions == "bf16@bf16"
+    assert qfa_params_actual.use_natural_transcendental_func is False
+
+    # Test with natural recipe
+    recipe_name = "triton_fa_bf16_for_all_natural"
+    config = {"kitchen_config_type": "QFlashAttentionParams", "recipe_name": recipe_name}
+    qfa_params_actual = QFlashAttentionParamsConfigSchema.parse_config_dict(config).to_kitchen_qfa()
+    qfa_params_expected = get_qfa_params_from_recipe_name(recipe_name)
+
+    assert qfa_params_actual is qfa_params_expected
+    assert qfa_params_actual.backend == "triton"
+    assert qfa_params_actual.use_natural_transcendental_func is True
+
+
+@pytest.mark.skipif(not HAVE_KITCHEN, reason="Kitchen required for using kitchen backend.")
+def test_error_from_malformed_qflash_attention_params() -> None:
+    # Missing recipe_name
+    config: Dict[Any, Any] = {"kitchen_config_type": "QFlashAttentionParams"}
+    with pytest.raises(KeyError, match="Missing required keys"):
+        qfa_params_actual = QFlashAttentionParamsConfigSchema.parse_config_dict(config)
+
+    # Missing kitchen_config_type
+    config = {"recipe_name": "triton_fa_bf16_for_all_base_2"}
+    with pytest.raises(KeyError, match="Missing required keys"):
+        qfa_params_actual = QFlashAttentionParamsConfigSchema.parse_config_dict(config)
+
+    # Wrong config type
+    config = {
+        "kitchen_config_type": "QLinearParams",
+        "recipe_name": "triton_fa_bf16_for_all_base_2",
+    }
+    with pytest.raises(ValueError, match="Parsing config dict of incorrect type"):
+        qfa_params_actual = QFlashAttentionParamsConfigSchema.parse_config_dict(config)
+
+    # Unsupported config type
+    config = {
+        "kitchen_config_type": "QUnknownParams",
+        "recipe_name": "triton_fa_bf16_for_all_base_2",
+    }
+    with pytest.raises(ValueError, match="Unsupported config type"):
+        qfa_params_actual = QFlashAttentionParamsConfigSchema.parse_config_dict(config)
+
+    # Extra keys
+    config = {
+        "kitchen_config_type": "QFlashAttentionParams",
+        "recipe_name": "triton_fa_bf16_for_all_base_2",
+        "extra_key": "extra_value",
+    }
+    with pytest.raises(KeyError, match="Unexpected keys in config"):
+        qfa_params_actual = QFlashAttentionParamsConfigSchema.parse_config_dict(config)
+
+    # Invalid recipe_name (not a string)
+    config = {"kitchen_config_type": "QFlashAttentionParams", "recipe_name": 123}
+    with pytest.raises(ValueError, match="recipe_name must be a string"):
+        qfa_params_actual = QFlashAttentionParamsConfigSchema.parse_config_dict(config)

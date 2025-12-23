@@ -12,6 +12,7 @@ from typing import Callable, Coroutine, Type
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Self, Type
 
+
 def import_class(class_path: str) -> Type:
     """Import a class from a string path.
 
