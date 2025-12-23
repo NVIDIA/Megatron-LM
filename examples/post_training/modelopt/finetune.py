@@ -108,6 +108,7 @@ class SFTDataset(torch.utils.data.Dataset):
         "Open-Orca/OpenOrca": "{{ messages['question'] + ' ' + messages['response'] + ' ' }}",
     }
 
+    @classmethod
     def _wildcard_get(cls, directory: Dict[str, Any], name: str, default_value=None):
         ret = default_value
         for key, val in directory.items():
