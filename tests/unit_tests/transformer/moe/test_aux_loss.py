@@ -581,7 +581,7 @@ class TestRouterAuxLoss:
 class TestPaddingMaskAuxLoss:
     """Test padding mask support in various aux loss types."""
 
-    def setup_model_parallel(self, tp_size=1, ep_size=1, cp_size=1):
+    def setup_model_parallel(self, tp_size=1, ep_size=1, cp_size=1, sequence_parallel=False):
         """Initialize model parallel with given configuration.
 
         Args:
@@ -615,6 +615,10 @@ class TestPaddingMaskAuxLoss:
             bf16=True,
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+            sequence_parallel=sequence_parallel and tp_size > 1,
         )
 
     def new_router(self, **kwargs):
@@ -627,14 +631,15 @@ class TestPaddingMaskAuxLoss:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("sequence_parallel", [True, False])
     @pytest.mark.parametrize("aux_loss_type", ["aux_loss", "seq_aux_loss", "global_aux_loss"])
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
-    def test_padding_mask_removes_padding_tokens(self, aux_loss_type, tp_size, ep_size, cp_size):
+    def test_padding_mask_removes_padding_tokens(self, aux_loss_type, tp_size, ep_size, cp_size, sequence_parallel):
         """Test that padding tokens are correctly excluded from aux loss calculation."""
         # Initialize model parallel with given configuration
-        self.setup_model_parallel(tp_size=tp_size, ep_size=ep_size, cp_size=cp_size)
+        self.setup_model_parallel(tp_size=tp_size, ep_size=ep_size, cp_size=cp_size, sequence_parallel=sequence_parallel)
 
         try:
             clear_aux_losses_tracker()
