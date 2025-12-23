@@ -162,6 +162,7 @@ class SFTDataset(MegatronDataset):
         if sft_sequence_packing:
             # sequence packing need both original sequence length and padded length
             ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
+            ret['padded_seq_len'] = torch.tensor(seq_len, dtype=torch.int32, device=tokens.device)
 
         return ret
 
@@ -237,7 +238,7 @@ class MockSFTLowLevelDataset:
         length = self.sequence_lengths[idx % self.size]
         # the length of sample is 'length', but only length-1 elements are generated here, 
         # because an eod token will be appended at the end later in SFTDataset
-        sample = np.arange(2, length + 1 , dtype=np.int64)
+        sample = np.arange(1, length, dtype=np.int64)
         return sample
 class MockSFTDataset(SFTDataset):
     """The mock dataset used during SFT"""
@@ -320,5 +321,6 @@ class MockSFTDataset(SFTDataset):
         if sft_sequence_packing:
             # sequence packing need both original sequence length and padded length
             ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
+            ret['padded_seq_len'] = torch.tensor(seq_len, dtype=torch.int32, device=tokens.device)
 
         return ret
