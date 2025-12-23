@@ -173,6 +173,7 @@ class GraphableMegatronModule(MegatronModule):
                 self.create_mcore_cudagraph_manager(config)
             else:
                 from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
                 self.cudagraph_manager = CudaGraphManager(config)
         elif config.cuda_graph_impl == "transformer_engine":
             # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is

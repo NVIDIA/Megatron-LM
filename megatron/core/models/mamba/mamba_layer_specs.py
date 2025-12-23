@@ -20,7 +20,11 @@ from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules, MoETransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    MoETransformerLayer,
+    TransformerLayer,
+    TransformerLayerSubmodules,
+)
 
 moe = get_moe_module_spec(
     use_te=True,
