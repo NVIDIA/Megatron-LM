@@ -9,7 +9,6 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
@@ -22,7 +21,6 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, StragglerDetector
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
-from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
 from megatron.training.datasets.sft_dataset import SFTDataset
@@ -62,10 +60,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
     
     if args.sft_sequence_packing:
-        
-        #TODO(tailaim): sequence packing doesn't consider the MTP rank,
-        # we need to handle this.
-        
+                
         # get batches based on the TP rank you are on
         batch = get_batch_on_this_tp_rank(
             data_iterator,
@@ -73,15 +68,12 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             vp_stage=vp_stage,
         )
         
-        # print(f"rank={torch.distributed.get_rank()}, {batch=}")
-        
         cu_seqlens = batch.pop('cu_seqlens')
         cu_seqlens_padded = batch.pop('cu_seqlens_padded')
         max_seqlen = int(batch.pop('max_seqlen').item())
         # local_cp_size is None if we disable hybrid-cp
         local_cp_size = int(batch.pop('local_cp_size').item()) if ('local_cp_size' in batch) else None
-
-        
+   
         if is_first_or_last_pipeline_stage(vp_stage):
             batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, 
                     cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size, vp_stage=vp_stage)
@@ -98,7 +90,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             return None, None, None, None, None, None
         batch = get_batch_on_this_tp_rank(
         data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+        vp_stage=vp_stage
         )
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
@@ -194,8 +187,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
-            if return_schedule_plan:
-                
+            if return_schedule_plan:                
                 assert args.overlap_moe_expert_parallel_comm, \
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
                 schedule_plan = model.build_schedule_plan(
@@ -255,6 +247,10 @@ def core_gpt_dataset_config_from_args(args):
         sequence_parallel_size=args.tensor_model_parallel_size*args.sequence_parallel,
         hybrid_context_parallel=args.hybrid_context_parallel,
         allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
+        context_parallel_size=args.context_parallel_size,
+        data_parallel_size=args.data_parallel_size,
+        sequence_parallel_size=args.tensor_model_parallel_size*args.sequence_parallel,
+        hybrid_context_parallel=args.hybrid_context_parallel,
         sft_mock_dataset_config_json=args.sft_mock_dataset_config_json,
         sft_sequence_packing=args.sft_sequence_packing,
         hybrid_context_parallel_scheduler=args.hybrid_context_parallel_scheduler,

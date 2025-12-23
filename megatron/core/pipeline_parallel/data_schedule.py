@@ -455,7 +455,6 @@ def wrap_dataloader(
             )
             # if torch.distributed.get_rank() == 0: print(f"\n{groups=}\n{sample_id_groups=}\n{global_id_seqlens=}")
 
-            # TODO(tailaim): remove this after testing
             set_gbs = set()
             for group in sample_id_groups:
                 for sub in group:
@@ -485,8 +484,6 @@ def wrap_dataloader(
             num_total_tokens_this_GB = np.int64(sum(seqlens_gathered))
             sequence_square_sum_this_GB = np.int64(sum(seqlen**2 for seqlen in seqlens_gathered))
 
-            # TODO(tailaim): modify this to support different ranks
-            # have different num_microbatches within the HDP group
             new_samples = []
             cp_sizes = []
             for i in range(num_micro_batches):
@@ -510,8 +507,6 @@ def wrap_dataloader(
             
             # if parallel_state.get_pipeline_model_parallel_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}\n{sample_id_groups[0][hdp_rank]=}\n{sample_id_groups[1][hdp_rank]=}\n{sample_id_groups[2][hdp_rank]=}")
 
-        # TODO(tailaim): do we need to move this to collate function?
-        # print(f"{scheduler_type=}")
         if scheduler_type is PackingScheduler.ONLY_PACKING_NO_SCHEDULING:
             # allreduce to get the total number of microbatches
             mfu_info_to_broadcast_this_hdp_group = torch.tensor(
@@ -614,31 +609,33 @@ def wrap_dataloader(
     if (
         config.virtual_pipeline_model_parallel_size is not None
         and config.virtual_pipeline_model_parallel_size > 1
-        and tp_group.rank() == 0
     ):
         vpp_size = config.virtual_pipeline_model_parallel_size
-        if pp_group.rank() == 0 or pp_group.rank() == pp_group.size() - 1:
-            new_samples_for_other_ppstage = []
-            for sample in new_samples:
-                new_sample_for_other_ppstage = []
-                new_sample_for_other_ppstage.append(sample["max_seqlen"])
-                new_sample_for_other_ppstage.append(sample["cu_seqlens"])
-                new_sample_for_other_ppstage.append(sample["cu_seqlens_padded"])
-                if config.hybrid_context_parallel:
-                    new_sample_for_other_ppstage.append(sample["local_cp_size"])
-                new_samples_for_other_ppstage.append(new_sample_for_other_ppstage)
-            if pp_group.rank() == 0:
-                new_data_iterator = [RerunDataIterator(iter(new_samples))] + [
-                    RerunDataIterator(iter(new_samples_for_other_ppstage))
-                    for _ in range(vpp_size - 1)
-                ]
+        if tp_group.rank() == 0:
+            if pp_group.rank() == 0 or pp_group.rank() == pp_group.size() - 1:
+                new_samples_for_other_ppstage = []
+                for sample in new_samples:
+                    new_sample_for_other_ppstage = {}
+                    new_sample_for_other_ppstage["max_seqlen"] = sample["max_seqlen"]
+                    new_sample_for_other_ppstage["cu_seqlens"] = sample["cu_seqlens"]
+                    new_sample_for_other_ppstage["cu_seqlens_padded"] = sample["cu_seqlens_padded"]
+                    if config.hybrid_context_parallel:
+                        new_sample_for_other_ppstage["local_cp_size"] = sample["local_cp_size"]
+                    new_samples_for_other_ppstage.append(new_sample_for_other_ppstage)
+                if pp_group.rank() == 0:
+                    new_data_iterator = [RerunDataIterator(iter(new_samples))] + [
+                        RerunDataIterator(iter(new_samples_for_other_ppstage))
+                        for _ in range(vpp_size - 1)
+                    ]
+                else:
+                    new_data_iterator = [
+                        RerunDataIterator(iter(new_samples_for_other_ppstage))
+                        for _ in range(vpp_size - 1)
+                    ] + [RerunDataIterator(iter(new_samples))]
             else:
-                new_data_iterator = [
-                    RerunDataIterator(iter(new_samples_for_other_ppstage))
-                    for _ in range(vpp_size - 1)
-                ] + [RerunDataIterator(iter(new_samples))]
+                new_data_iterator = [RerunDataIterator(iter(new_samples)) for _ in range(vpp_size)]
         else:
-            new_data_iterator = [RerunDataIterator(iter(new_samples)) for _ in range(vpp_size)]
+            new_data_iterator = [None for _ in range(vpp_size)]
     else:
         new_data_iterator = RerunDataIterator(iter(new_samples)) if tp_group.rank() == 0 else None
 
@@ -684,13 +681,6 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         sum_seqlen = 0
         single_microbatch = []
 
-        # TODO(tailaim): remove this after testing
-        # # debugmtl use 1 seq per microbatch
-        # num_micro_batches = len(sample_id_seqlens)//self.dp_size
-        # for i in range(num_micro_batches):
-        #     for j in range(self.dp_size):
-        #         packed_id_groups.append([i+j*num_micro_batches])
-
         for i in range(len(sample_id_seqlens)):
             if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
             # if flag and sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
@@ -704,7 +694,6 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         if len(single_microbatch) > 0:
             packed_id_groups.append(single_microbatch)
 
-        # TODO(tailaim): remove this after testing
         gbs_sum = 0
         for i in packed_id_groups:
             gbs_sum += len(i)
@@ -981,8 +970,6 @@ class BalancedHybridCPscheduler(BaseScheduler):
             # ---- Step 3 – assign the sequence to every member of that group ------
             per_gpu_cost = compute_estimator(seq_len)
 
-            # TODO(tailaim): remove this after to support different ranks have
-            # different num_microbatches within the HDP group
             packing_sequence_len[best_gid] = (
                 packing_sequence_len.get(best_gid, 0) + seq_len / needed
             )
