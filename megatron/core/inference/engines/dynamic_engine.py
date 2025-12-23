@@ -149,9 +149,6 @@ class DynamicInferenceEngine(AbstractEngine):
         inference_logging_step_interval: int = 0,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        # >>>
-        # pax("inference_logging_step_interval")
-        # <<<
 
         assert isinstance(
             controller, TextGenerationController
@@ -916,40 +913,23 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # Handle evicted requests.
         if evict_request_ids is not None:
 
             evict_request_ids = evict_request_ids.tolist()
             
-            # >>>
-            # pax({
-            #     "wait req" : self.get_request(self.waiting_request_ids[0]),
-            #     "evict req" : self.get_request(evict_request_ids[0]),
-            # })
-            # <<<
-
-            # >>>
+            # Insert into waiting_request_ids after any chunk prefill request.
             if self.context.chunked_prefill_request_id != -1:
-                raise Exception("Insert into waiting_request_ids after chunked prefill request.")
-            # <<<
-
+                raise Exception(
+                    "TODO: Insert into waiting_request_ids after chunked prefill request."
+                )
             self.waiting_request_ids.extendleft(evict_request_ids)
 
-            # >>>
+            # Checkpoint requests (i.e., prompt += generations) + add eviction event.
             for request_id in evict_request_ids:
-                # pax({"req / before": self.get_request(request_id), "generated_tokens": "%d | %s" % (len(self.get_request(request_id).generated_tokens), self.get_request(request_id).generated_tokens)})
-                self.requests[request_id].record.checkpoint()
-                # pax({"req / after": self.get_request(request_id)})
-            # <<<
-
-            # evict_requests = {i:self.requests[i] for i in evict_request_ids}
-            # pax({
-            #     "requests" : self.requests,
-            # }, "evict_request_ids, evict_requests", {
-            #     "merged_requests" : {i:e.record.merge() for i, e in evict_requests.items()},
-            #     "waiting_request_ids" : self.waiting_request_ids,
-            # })
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+                request = self.requests[request_id]
+                request.record.checkpoint()
+                request.add_event_evict()
 
         return active_request_ids, finished_request_records
 
@@ -1016,15 +996,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
                     self.context.chunked_prefill_request_id = -1
-                    # >>>
-                    # self.context.add_request(req)
-                    # +++
-                    try:
-                        self.context.add_request(req)
-                    except Exception as e:
-                        raise e
-                        pax("req, e")
-                    # <<<
+                    self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -1076,11 +1048,6 @@ class DynamicInferenceEngine(AbstractEngine):
             "active_token_count": self.context.active_token_count,
         }
 
-        # >>>
-        # if self.step_count == 796:
-        #     pax("pre_step_context_state")
-        # <<<
-
         # Generate tokens.
         range_push("Prefill" if not is_decode_only else "Decode")
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
@@ -1088,27 +1055,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
-        # >>>
-        # if self.step_count == 795:
-        #     pax("pre_step_context_state")
-        # if "evict_request_ids" not in result:
-        #     pax({
-        #         "request statuses" : [
-        #             self.get_request(i).status
-        #             for i in self.requests.keys()
-        #         ],
-        #         "waiting_request_ids" : self.waiting_request_ids,
-        #     }, "pre_step_context_state, result")
-        # <<<
-        # >>>
-        # evict_request_ids = result["evict_request_ids"]
-        # if evict_request_ids is not None:
-        #     evict_request_ids = evict_request_ids.tolist()
-        #     pax({
-        #         "waiting_request_ids" : self.waiting_request_ids,
-        #         "chunked_prefill_request_id" : self.context.chunked_prefill_request_id,
-        #     }, "evict_request_ids")
-        # <<<
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
@@ -1168,11 +1114,6 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_ids = step_result["finished_request_ids"]
             newly_paused_request_ids = step_result.get("newly_paused_request_ids")
             evict_request_ids = step_result.get("evict_request_ids")
-            # >>>
-            # if newly_paused_request_ids is None:
-            # if active_request_ids.numel() == 7 and finished_request_ids.numel() == 7:
-            #     pax("step_result")
-            # <<<
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)

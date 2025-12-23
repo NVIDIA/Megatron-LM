@@ -113,16 +113,7 @@ class BlockAllocator:
             None
         """
         num_blocks = blocks.size(dim=0)
-        # >>>
-        # self.block_bag[self.total_avail : (self.total_avail + num_blocks)] = blocks
-        # +++
-        try:
-            self.block_bag[self.total_avail : (self.total_avail + num_blocks)] = blocks
-        except Exception as e:
-            pax("blocks, num_blocks", {
-                "total_avail" : "%d / %d" % (self.total_avail, self.total_count),
-            })
-        # <<<
+        self.block_bag[self.total_avail : (self.total_avail + num_blocks)] = blocks
         self.total_avail += num_blocks
 
     def reset(self) -> None:

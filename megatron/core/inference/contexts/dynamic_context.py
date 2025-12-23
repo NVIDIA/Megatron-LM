@@ -413,14 +413,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             ),
             paused_count=paused_block_count,
         )
-        # >>>
-        # pax("buffer_size_gb, paused_buffer_size_gb",
-        #     "buffer_size_bytes, paused_buffer_size_bytes",
-        #     "block_count, paused_block_count",
-        #     {
-        #         "block_allocator" : self.block_allocator,
-        #     })
-        # <<<
 
         # Track request metadata.
         if request_metadata_types is None:
@@ -459,15 +451,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.max_requests = max_requests
 
         self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
-
-        # >>>
-        # pax({
-        #     "block_allocator / active_count" : self.block_allocator.active_count,
-        #     "max_kv_block_count" : self.max_kv_block_count,
-        #     "max_requests" : self.max_requests,
-        #     "max_tokens" : self.max_tokens,
-        # })
-        # <<<
 
         assert self.max_tokens >= self.max_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
@@ -1661,16 +1644,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         return torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    def validate_memory_block_usage(self):
-        ctx_used = (self.request_to_kv_block_ids != -1).sum().item()
-        alc_used = self.block_allocator.get_total_used()
-        if ctx_used != alc_used:
-            pax({
-                "block_allocator" : self.block_allocator,
-            }, "ctx_used, alc_used")
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
     def release_memory_blocks_from_request_indexes(self, request_indexes) -> None:
         """Release memory blocks used by the given request idxs.
 
@@ -1680,14 +1653,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         kv_blocks_assigned = self.request_to_kv_block_ids[request_indexes]
         non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
-        # >>>
-        # self.block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
-        # +++
-        try:
-            self.block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
-        except Exception as e:
-            pax("request_indexes, kv_blocks_assigned, non_zero_values_in_kv_memory, e")
-        # <<<
+        self.block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
 
         # Reset the KV blocks for finished requests.
         # Note: do not use fill_() (or add_() and similar inplace ops) here.
@@ -1724,10 +1690,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         3. Concatenate the paused tokens to the active tokens
         4. For the finished requests we release memory blocks and move them to the right
         5. We identify requests that require a new block and add them to the paused requests (i.e move them left)
-        6. We determine how many requests we can resume and resume them
-        7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        8. We resume those requests by assigning blocks and updating bookkeeping tensors
-        9. We make relevant changes to the token bookkeeping tensors
+        6. Evict overflowing requests in the paused buffer.
+        7. We determine how many requests we can resume and resume them
+        8. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
+        9. We resume those requests by assigning blocks and updating bookkeeping tensors
+        10. We make relevant changes to the token bookkeeping tensors
 
         Args:
             active_requests_mask (Tensor): 1D Mask tensor marking active requests.
@@ -1780,12 +1747,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Reset Mamba state.
             self.reset_mamba_state()
 
-            # >>>
-            # pax("active_requests_mask", {
-            #     "total_request_count" : self.total_request_count,
-            #     "paused_request_count" : self.paused_request_count,
-            # }, "active_request_count, finished_request_count")
-            # <<<
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -1897,17 +1858,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count += active_requests_requiring_new_block_count
             active_request_count -= active_requests_requiring_new_block_count
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # ??? 5.5 ???. Evict overflowing requests in the paused buffer.
+        # 6. Evict overflowing requests in the paused buffer.
         evict_request_count = (
             self.block_allocator.get_paused_used()
             - self.block_allocator.paused_count
         )
         evict_request_ids = None
         if evict_request_count > 0:
-            # >>>
-            # self.evict_requests(evict_request_count)
-            # <<<
 
             # Eviction index range.
             evict_start_idx = self.paused_request_count - evict_request_count
@@ -1919,10 +1876,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
 
-            # pax("evict_start_idx, evict_end_idx, evict_request_idxs, evict_request_ids")
-
             # Release memory.
-            # pax({"alloc / before": self.block_allocator})
             self.release_memory_blocks_from_request_indexes(evict_request_idxs)
 
             # Move active requests to replace evicted paused requests.
@@ -1937,10 +1891,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 device=torch.cuda.current_device(),
             )
 
-            # >>>
-            # pax("evict_request_ids, src_idxs, dst_idxs")
-            # <<<
-
             self._move_book_keeping_tensors(
                 src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
             )
@@ -1949,21 +1899,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count -= evict_request_count
             self.total_request_count -= evict_request_count
 
-            # >>>
-            # For debugging only?
+            # Reset unused block ids.
             self.request_to_kv_block_ids[self.total_request_count:(self.total_request_count + evict_request_count)] = -1
-            # <<<
 
-            # >>>
-            # pax({"alloc / after": self.block_allocator})
-            # pax({"block_allocator": self.block_allocator}, "evict_request_count")
-            # <<<
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-        # >>>
-        self.validate_memory_block_usage()
-        # <<<
-
-        # 6. Now that we have the requests in following order [Paused, Active, Finished]
+        # 7. Now that we have the requests in following order [Paused, Active, Finished]
         # We determine how many requests we can resume and resume them
         # Assign released blocks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
@@ -1981,15 +1920,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
-        # >>>
-        if active_request_count == 0:
-            pax({
-                "block_allocator" : self.block_allocator,
-                "max_requests" : self.max_requests,
-            }, "active_request_count", {
-                "paused_request_count" : self.paused_request_count,
-            }, "active_block_count_avail, paused_block_counts, paused_block_counts_cumsum, resume_request_count")
-        # <<<
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
         # finally, swap the chunked prefill to the end of the active requests to obey the invariance
@@ -2007,7 +1937,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if newly_paused_request_ids is not None and resume_request_count > 0:
             newly_paused_request_ids = newly_paused_request_ids[:-resume_request_count]
 
-        # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
+        # 8. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count
 
         # All these active requests are in decode phase, so they need only 1 token per request
@@ -2035,7 +1965,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             + 1
         ) % self.block_size_tokens
 
-        # 8. We resume those requests by assigning blocks and updating bookkeeping tensors
+        # 9. We resume those requests by assigning blocks and updating bookkeeping tensors
         if resume_request_count > 0:
             assert torch.all(
                 self.request_last_kv_block_offset[
@@ -2062,7 +1992,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.paused_request_count : (self.paused_request_count + resume_request_count)
             ] = block_ids
 
-        # 9. We make relevant changes to the token bookkeeping tensors
+        # 10. We make relevant changes to the token bookkeeping tensors
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
             self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
         )
@@ -2076,10 +2006,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_block[: self.active_token_count] = (
             self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count]
         )
-
-        # >>>
-        self.validate_memory_block_usage()
-        # <<<
 
         return {
             "newly_paused_request_ids" : newly_paused_request_ids,

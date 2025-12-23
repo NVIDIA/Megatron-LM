@@ -811,12 +811,6 @@ class TextGenerationController:
             self._sampled_tokens_cuda[:active_request_count]
             != self._request_metadata["termination_id"][active_request_slice]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
-        # >>>
-        # sampled_tokens = self._sampled_tokens_cuda[:active_request_count]
-        # termination_ids = self._request_metadata["termination_id"][active_request_slice]
-        # if sampled_tokens.numel() != termination_ids.numel():
-        #     raise Exception("hi.")
-        # <<<
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -826,37 +820,7 @@ class TextGenerationController:
         new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
 
         # Update requests.
-        # >>>
-        # _active_request_count = (active_request_mask == 1).sum().item()
-        # if _active_request_count == 0:
-        #     # pax("active_request_mask, _active_request_count",
-        #     #     "finished_idxs, finished_request_ids",
-        #     #     "new_sample_copy", {
-        #     #         "total_request_count" : context.total_request_count,
-        #     #         "paused_request_count" : context.paused_request_count,
-        #     #         "sample_tokens_cuda" : self._sampled_tokens_cuda[:active_request_count],
-        #     #         "termination_ids" : self._request_metadata["termination_id"][active_request_slice],
-        #     # })
-        #     pax({
-        #         "_sampled_tokens_cuda" : self._sampled_tokens_cuda[:active_request_count],
-        #         "termination ids" : self._request_metadata["termination_id"][active_request_slice],
-        #     }, "active_sequence_lengths, max_sequence_lengths")
-        # <<<
-        # >>>
-        # total_request_count_0 = context.total_request_count
-        # <<<
         update_result = context.update_requests(active_request_mask, new_sample_copy)
-        # >>>
-        # total_request_count_1 = context.total_request_count
-        # # if total_request_count_0 == 11 and total_request_count_1 == 7:
-        # _active_request_count = (active_request_mask == 1).sum().item()
-        # if _active_request_count == 0:
-        #     pax("update_result, total_request_count_0, total_request_count_1")
-        # <<<
-        # >>>
-        # if update_result is None:
-        #     pax("active_request_ids, finished_request_ids, update_result")
-        # <<<
 
         return {
             "active_request_ids": active_request_ids,
@@ -931,10 +895,6 @@ class TextGenerationController:
             "cuda_graph_request_count": cuda_graph_request_count,
         }
         ret.update(request_bookkeeping)
-        # >>>
-        if request_bookkeeping is None:
-            pax("request_bookkeeping, ret")
-        # <<<
         return ret
 
     @torch.inference_mode()
