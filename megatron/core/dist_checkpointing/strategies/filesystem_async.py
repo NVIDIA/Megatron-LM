@@ -8,6 +8,7 @@ import logging
 import os
 import pickle
 import queue
+import time as time_module
 from functools import partial
 from heapq import heappop, heappush
 from itertools import chain
@@ -366,45 +367,74 @@ class FileSystemWriterAsync(FileSystemWriter):
         mem_before = _process_memory()
         use_msc = kwargs.get("use_msc", False)
 
+        # Retry configuration
+        max_retries = kwargs.get("max_ckpt_save_retries", 3)
+        retry_delay = kwargs.get("ckpt_save_retry_delay", 10.0)  # seconds
+
         local_results = []
-        try:
-            file_name, storage_key, (bytes_data, tensor_data) = write_bucket
-            extra_kwargs = {}
-            if "serialization_format" in inspect.signature(_write_item).parameters:
-                from torch.distributed.checkpoint.filesystem import SerializationFormat
+        local_output = None
 
-                extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
-            if use_msc:
-                import multistorageclient as msc
+        for attempt in range(max_retries):
+            try:
+                file_name, storage_key, (bytes_data, tensor_data) = write_bucket
+                extra_kwargs = {}
+                if "serialization_format" in inspect.signature(_write_item).parameters:
+                    from torch.distributed.checkpoint.filesystem import SerializationFormat
 
-                open_file = msc.open
-            else:
-                open_file = open
-            with open_file(file_name, "wb") as stream:
-                for write_item, data in bytes_data:
-                    local_results.append(
-                        _write_item(
-                            *transform_list, stream, data, write_item, storage_key, **extra_kwargs
+                    extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
+                if use_msc:
+                    import multistorageclient as msc
+
+                    open_file = msc.open
+                else:
+                    open_file = open
+
+                # Reset results for each retry attempt
+                local_results = []
+
+                with open_file(file_name, "wb") as stream:
+                    for write_item, data in bytes_data:
+                        local_results.append(
+                            _write_item(
+                                *transform_list, stream, data, write_item, storage_key, **extra_kwargs
+                            )
                         )
-                    )
 
-                for write_item, tensor in tensor_data:
-                    assert tensor.is_cpu
-                    local_results.append(
-                        _write_item(
-                            *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
+                    for write_item, tensor in tensor_data:
+                        assert tensor.is_cpu
+                        local_results.append(
+                            _write_item(
+                                *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
+                            )
                         )
-                    )
 
-                if use_fsync:
-                    if use_msc:
-                        stream.fsync()
-                    else:
-                        os.fsync(stream.fileno())
-            local_output = (local_proc_idx, local_results)
-        except Exception as e:
-            logger.debug(f"{local_proc_idx} failed")
-            local_output = (local_proc_idx, e)  # type: ignore[assignment]
+                    if use_fsync:
+                        if use_msc:
+                            stream.fsync()
+                        else:
+                            os.fsync(stream.fileno())
+
+                local_output = (local_proc_idx, local_results)
+                logger.debug(f"{local_proc_idx} completed successfully on attempt {attempt + 1}")
+                break  # Success, exit retry loop
+
+            except Exception as e:
+                is_last_attempt = (attempt == max_retries - 1)
+
+                if is_last_attempt:
+                    logger.error(
+                        f"{local_proc_idx} failed after {max_retries} attempts. "
+                        f"Last error: {type(e).__name__}: {str(e)}"
+                    )
+                    local_output = (local_proc_idx, e)  # type: ignore[assignment]
+                else:
+                    logger.warning(
+                        f"{local_proc_idx} failed on attempt {attempt + 1}/{max_retries} "
+                        f"with error: {type(e).__name__}: {str(e)}. "
+                        f"Retrying in {retry_delay:.2f} seconds..."
+                    )
+                    # TODO: Use exponential backoff for retry delay
+                    time_module.sleep(retry_delay)
 
         results_queue.put(local_output)
         # Signal this process is done.
