@@ -2,7 +2,7 @@
 
 import math
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 
@@ -525,9 +525,9 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
 
 
 class RouterReplayAction(Enum):
-    RECORD = "record" # Record the topk indices for replay
-    REPLAY_FORWARD = "replay_forward" # Replay the recorded topk indices for forward pass
-    REPLAY_BACKWARD = "replay_backward" # Replay topk indices for re-compute during backward pass
+    RECORD = "record"  # Record the topk indices for replay
+    REPLAY_FORWARD = "replay_forward"  # Replay the recorded topk indices for forward pass
+    REPLAY_BACKWARD = "replay_backward"  # Replay topk indices for re-compute during backward pass
 
 
 class RouterReplay:
@@ -562,7 +562,9 @@ class RouterReplay:
         Collects the recorded topk indices from all RouterReplay instances.
         :return: A list of tensors, each containing the recorded topk indices for a layer.
         """
-        return [router.get_recorded_indices() for router in RouterReplay.global_router_replay_instances]
+        return [
+            router.get_recorded_indices() for router in RouterReplay.global_router_replay_instances
+        ]
 
     @staticmethod
     def clear_global_indices():
@@ -586,8 +588,12 @@ class RouterReplay:
         """Initializes a RouterReplay instance for a specific layer."""
         self.target_topk_idx: Optional[torch.Tensor] = None  # Target topk indices for replay
         self.recorded_topk_idx: Optional[torch.Tensor] = None  # Recorded topk indices for replay
-        self.router_replay_action: Optional[RouterReplayAction] = None  # Router replay action for this layer
-        self.replay_backward_list: List[torch.Tensor] = []  # List of tensors for backward pass replay
+        self.router_replay_action: Optional[RouterReplayAction] = (
+            None  # Router replay action for this layer
+        )
+        self.replay_backward_list: List[torch.Tensor] = (
+            []
+        )  # List of tensors for backward pass replay
         RouterReplay.global_router_replay_instances.append(self)
 
     def set_target_indices(self, topk_indices: torch.Tensor):
@@ -623,7 +629,9 @@ class RouterReplay:
         topk: int,
         num_groups: Optional[int] = None,
         group_topk: Optional[int] = None,
-        default_compute_topk: Callable[[torch.Tensor, int, Optional[int], Optional[int]], torch.Tensor] = None,
+        default_compute_topk: Callable[
+            [torch.Tensor, int, Optional[int], Optional[int]], torch.Tensor
+        ] = None,
     ) -> torch.Tensor:
         """Returns the target topk indices for replay."""
         if self.router_replay_action == RouterReplayAction.RECORD:
@@ -648,6 +656,7 @@ class RouterReplay:
             return probs, top_indices
         else:
             return default_compute_topk(scores, topk, num_groups, group_topk)
+
 
 def topk_routing_with_score_function(
     logits: torch.Tensor,
