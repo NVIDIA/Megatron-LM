@@ -33,7 +33,7 @@ def tokenize_prompts(
         assert tokens_to_generate is not None
         # Tensor of tokens padded and their unpadded length.
         prompts_tokens_cuda_long_tensor, prompts_length_cuda_long_tensor = (
-            _tokenize_prompts_and_batch(tokenizer, prompts, tokens_to_generate, add_BOS=False)
+            _tokenize_prompts_and_batch(tokenizer, prompts, tokens_to_generate, add_BOS)
         )
         # We need the sizes of these tensors for the boradcast
         sizes_list = [
