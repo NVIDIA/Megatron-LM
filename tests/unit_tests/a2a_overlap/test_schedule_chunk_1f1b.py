@@ -186,7 +186,7 @@ class TestA2AOverlap:
     @pytest.mark.parametrize("layers", [[2, 1], [1, 1]])
     @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
     def test_1f1b_schedule_model_chunk_with_padding_mask(
-        self, dispatcher_type, layers, parallel_config
+        self, dispatcher_type, layers, tp_size
     ):
         """
         Verifies all-to-all overlap optimization with padding_mask produces
