@@ -77,10 +77,24 @@ class TextGenerationController:
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
+    def set_stop_word_finished_ids_callback(self, callback):
+        """Set a callback to get request IDs that should be marked as finished due to stop words.
+
+        The callback should have signature: callback(active_request_ids: List[int]) -> Set[int]
+        Returns a set of request IDs from active_request_ids that should be marked as finished.
+
+        Args:
+            callback: Function that returns request IDs to mark as finished.
+        """
+        self._get_stop_word_finished_ids_callback = callback
+
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_total_requests
+
+        # Callback to get request IDs that should be marked as finished due to stop words
+        self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.inference_wrapper_config.params_dtype
@@ -811,6 +825,16 @@ class TextGenerationController:
             self._sampled_tokens_cuda[:active_request_count]
             != self._request_metadata["termination_id"][active_request_slice]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+
+        # Mark requests as finished if they hit stop words (detected in previous step's post_process_requests)
+        if self._get_stop_word_finished_ids_callback is not None:
+            request_ids_list = active_request_ids.tolist()
+            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+            if stop_word_finished_ids:
+                for idx, request_id in enumerate(request_ids_list):
+                    if request_id in stop_word_finished_ids:
+                        active_request_mask[idx] = 0
+
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
