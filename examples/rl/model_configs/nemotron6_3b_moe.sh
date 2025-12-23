@@ -30,8 +30,8 @@ if [ "$(basename "$ENV_CONFIG")" = "dapo.yaml" ]; then
   TRAINING_BATCH_SIZE=${TRAINING_BATCH_SIZE:-1024}
   MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
   MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-11999}
-  EXIT_INTERVAL=${EXIT_INTERVAL:-16}
-  CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-16}
+  EXIT_INTERVAL=${EXIT_INTERVAL:-20}
+  CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-20}
 else
   # Some default values if config is unsupported.
   echo "Undected environment config, using default values"
@@ -45,8 +45,8 @@ else
   TRAINING_BATCH_SIZE=${TRAINING_BATCH_SIZE:-32}
   MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
   MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-1024}
-  EXIT_INTERVAL=${EXIT_INTERVAL:-16}
-  CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-16}
+  EXIT_INTERVAL=${EXIT_INTERVAL:-20}
+  CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-20}
 fi
 
 ENV_DEPENDENT="\
@@ -61,15 +61,14 @@ ENV_DEPENDENT="\
   --langrl-env-config $ENV_CONFIG "
 
 MODEL_OPTIONS="\
+  --no-rl-use-sequence-packing \
   --rl-partial-rollouts \
   --rl-offload-optimizer-during-inference \
-  --recompute-granularity full \
-  --recompute-method uniform \
-  --recompute-num-layers 1 \
   --moe-pad-experts-for-cuda-graph-inference \
+  --inference-dynamic-batching \
   --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
-  --inference-dynamic-batching-num-cuda-graphs 1 \
+  --inference-dynamic-batching-num-cuda-graphs 2 \
   --decode-only-cuda-graphs \
   --cuda-graph-impl local \
   --cuda-graph-scope full \
@@ -125,4 +124,5 @@ MODEL_OPTIONS="\
   --lr-warmup-samples 640 \
   --lr-warmup-init 0.3e-7 \
   --no-load-optim \
+  --no-load-rng \
   "
