@@ -110,7 +110,6 @@ def test_prepare_trajectories(mock_rank):
     args = type('Args', (), {})()
     args.rl_use_sequence_packing = False
     args.rl_inference_logprobs_is_correction = True
-    args.rl_add_bos_token = True
     global_vars.set_args(args)
 
     tokenizer = MockTokenizer()

@@ -211,7 +211,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             termination_id=self._inference_engine.controller.tokenizer.eod,
             return_log_probs=True,
             skip_prompt_log_probs=True,
-            add_BOS=(args.rl_add_bos_token and tokenizer.bos is not None),
+            add_BOS=(not args.rl_skip_bos_token and tokenizer.bos is not None),
         )
         requests = [
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)

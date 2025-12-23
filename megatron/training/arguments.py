@@ -2080,8 +2080,8 @@ def _add_rl_args(parser):
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
     group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
                         help='Number of parallel generation tasks for RL inference.')
-    group.add_argument('--rl-add-bos-token', type=bool, default=True,
-                        help='Add BOS token to the beginning of the sequences. Default is True.')
+    group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                        help='Skip BOS token at the beginning of the sequences. Default is False.')
     return parser
 
 def _add_training_args(parser):

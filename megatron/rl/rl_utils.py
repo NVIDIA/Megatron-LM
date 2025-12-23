@@ -797,7 +797,7 @@ def prepare_trajectories(
         inference_logprobs = None
 
     # Some sanity checks regarding the tokenization
-    if args.rl_add_bos_token:
+    if not args.rl_skip_bos_token:
         assert (
             tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
         ), "First token should be bos"
