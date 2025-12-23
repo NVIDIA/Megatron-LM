@@ -105,7 +105,6 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
@@ -2664,7 +2663,7 @@ def train(
             num_zeros_in_grad,
             max_attention_logit,
             num_total_tokens_this_GB, 
-            sequence_square_sum_this_GB
+            sequence_square_sum_this_GB,
             pg_collection=model_pg_collection,
         )
 

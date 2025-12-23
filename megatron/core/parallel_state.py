@@ -429,7 +429,7 @@ def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
     hybrid_dp_cp_groups = {}
     # Generate group for every power of 2 up to the number of CP ranks
     # We limit the allowed group sizes in order to avoid excessive overhead.
-    group_sizes = [2**i for i in range(int(log2(len(ranks))))]
+    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(

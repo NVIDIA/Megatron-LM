@@ -6,7 +6,14 @@ from typing import Callable, ContextManager, Optional
 
 import torch
 
-from megatron.core.utils import experimental_api
+from megatron.core.utils import experimental_api, get_te_version, is_te_min_version
+
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except ImportError:
+    HAVE_PACKAGING = False
 
 
 @dataclass
@@ -459,4 +466,13 @@ class ModelParallelConfig:
                 raise ValueError(
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
+                )
+        if self.sft_sequence_packing:
+            # TODO: remove this after we fix the convergence issue with TE < 2.9.
+            if not (
+                is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")
+            ):
+                raise ValueError(
+                    "SFT sequence packing requires Transformer Engine >= 2.9.0 "
+                    f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
                 )
