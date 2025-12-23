@@ -797,9 +797,14 @@ def prepare_trajectories(
         inference_logprobs = None
 
     # Some sanity checks regarding the tokenization
-    # assert (
-    #     tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
-    # ), "First token should be bos"
+    if args.rl_add_bos_token:
+        assert (
+            tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
+        ), "First token should be bos"
+    else:
+        assert (
+            tokenizer.bos is None or (trajs[:, 0] != tokenizer.bos).all()
+        ), "First token should not be bos"  
     assert (
         tokenizer.bos is None or (trajs[:, 1] != tokenizer.bos).all()
     ), "Second token should not be bos"
@@ -1213,7 +1218,7 @@ def evaluate_and_print_results_rl(
                     rank_info=None,
                     generation_args={
                         'temperature': args.grpo_default_temperature,
-                        'max_tokens': args.seq_length, # why is this not args.inference_max_seq_length?
+                        'max_tokens': args.seq_length,
                         'top_p': args.grpo_default_top_p,
                         'top_k': args.grpo_default_top_k,
                     },

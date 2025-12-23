@@ -1254,9 +1254,9 @@ def validate_args(args, defaults={}):
             "expandable_segments:True may not be safe when using CUDA Graphs with some specific parallel settings. "
             "The training may crash with illegal memory access."
         )
-        # assert (
-        #     args.recompute_granularity != 'full'
-        # ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
+        assert (
+            args.recompute_granularity != 'full'
+        ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
@@ -2080,6 +2080,8 @@ def _add_rl_args(parser):
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
     group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
                         help='Number of parallel generation tasks for RL inference.')
+    group.add_argument('--rl-add-bos-token', type=bool, default=True,
+                        help='Add BOS token to the beginning of the sequences. Default is True.')
     return parser
 
 def _add_training_args(parser):
