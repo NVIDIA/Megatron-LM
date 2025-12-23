@@ -1831,10 +1831,12 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
+
 def force_param_sync(model_chunks: list[DDP]) -> None:
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
+
 
 def save_checkpoint_and_time(
     iteration,
