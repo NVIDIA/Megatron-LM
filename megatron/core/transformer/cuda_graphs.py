@@ -106,9 +106,9 @@ def _set_capture_end():
 @dataclass
 class CudagraphBufferMetadata:
     """
-    Metadata thats save to tensors during cudagraph capture. This data will be used to determine
-    when a cudagraph can reuse a buffer or directly write its output into a subsequent's graph's
-    input.
+    Metadata saved to tensors during cudagraph capture. This data will be used to determine
+    during graph captue when a cudagraph can reuse a buffer or directly write its output into
+    a subsequent's graph's input.
     """
 
     is_cudagraph_input: bool = False
@@ -1087,7 +1087,7 @@ class _CudaGraphRunner(torch.nn.Module):
         delattr(self, "outputs")
 
     def apply_cudagraph_record_metadata(self, args, kwargs, outputs):
-        """Attaches capture metadata and converts all passed in tensors."""
+        """Attaches graph capture metadata to all passed in tensors."""
 
         for t in self.get_tensors(args, kwargs):
             if not hasattr(t, "cg_buffer_metadata"):
