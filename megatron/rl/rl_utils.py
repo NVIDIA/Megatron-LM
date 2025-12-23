@@ -1504,29 +1504,3 @@ def get_iteration_sequence_count(args):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(sequences_tensor, group=mpu.get_data_parallel_group())
     return int(sequences_tensor.item())
-
-def snapshot_ctx(ctx):
-    # USAGE:
-    # # write snapshots for later diffing
-    # with open("inference_context.json", "w") as f:
-    #     json.dump(snapshot_ctx(inference_context), f, indent=2)
-    def snap(x):
-        if torch.is_tensor(x):
-            return {
-                "type": "tensor",
-                "shape": list(x.shape),
-                "dtype": str(x.dtype),
-                "device": str(x.device),
-            }
-        if isinstance(x, dict):
-            return {k: snap(v) for k, v in x.items()}
-        if isinstance(x, (list, tuple)):
-            return [snap(v) for v in x]
-        # fall back to string if not JSON-serializable
-        try:
-            json.dumps(x)
-            return x
-        except TypeError:
-            return str(x)
-
-    return {k: snap(v) for k, v in vars(ctx).items()}
