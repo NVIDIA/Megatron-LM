@@ -126,7 +126,6 @@ class MegatronGenerate(Resource):
             add_BOS = request.get_json()["add_BOS"]
             if not isinstance(add_BOS, bool):
                 return "add_BOS must be a boolean value"
-        add_BOS = False
 
         if any([len(prompt) == 0 for prompt in prompts]) and not add_BOS:
             return "Empty prompts require add_BOS=true"
