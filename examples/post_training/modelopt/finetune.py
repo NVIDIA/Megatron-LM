@@ -346,23 +346,17 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
         print_rank_0("> finished creating offline SFT datasets ...")
     else:
         kwargs = {
+            "hf_dataset": args.finetune_hf_dataset,
             "tokenizer": tokenizer._tokenizer,
             "seq_length": args.seq_length,
             # Optional kwargs
-            "hf_dataset": args.finetune_hf_dataset,
             "num_shards": mpu.get_expert_data_parallel_world_size(),
             "shard_index": mpu.get_expert_data_parallel_rank(),
         }
 
-        data_path = [
-            args.train_data_path[0] if args.train_data_path else None,
-            args.valid_data_path[0] if args.valid_data_path else None,
-            args.test_data_path[0] if args.test_data_path else None,
-        ]
-
-        train_ds = SFTDataset(train_val_test_num_samples[0], data_path[0], **kwargs)
-        valid_ds = SFTDataset(train_val_test_num_samples[1], data_path[1], **kwargs)
-        test_ds = SFTDataset(train_val_test_num_samples[2], data_path[2], **kwargs)
+        train_ds = SFTDataset(train_val_test_num_samples[0], **kwargs)
+        valid_ds = SFTDataset(train_val_test_num_samples[1], **kwargs)
+        test_ds = SFTDataset(train_val_test_num_samples[2], **kwargs)
 
         print_rank_0("> finished creating SFT datasets ...")
 
