@@ -108,6 +108,14 @@ class SFTDataset(torch.utils.data.Dataset):
         "Open-Orca/OpenOrca": "{{ messages['question'] + ' ' + messages['response'] + ' ' }}",
     }
 
+    def _wildcard_get(cls, directory: Dict[str, Any], name: str, default_value=None):
+        ret = default_value
+        for key, val in directory.items():
+            if name in key:
+                ret = val
+                break
+        return ret
+
     def __init__(
         self,
         num_packed_samples: int,
@@ -174,8 +182,10 @@ class SFTDataset(torch.utils.data.Dataset):
         if self.tokenizer.chat_template is None:
             self.tokenizer.chat_template = SFTDataset.hf_dataset_to_prompt_template
         elif self.hf_dataset is not None:
-            self.data_transformation = SFTDataset.hf_dataset_to_conversation.get(
-                self.hf_dataset, lambda data: data
+            self.data_transformation = SFTDataset._wildcard_get(
+                SFTDataset.hf_dataset_to_conversation,
+                self.hf_dataset,
+                default_value=lambda data: data,
             )
 
         if self.tokenizer.chat_template is None:
