@@ -61,6 +61,11 @@ ENV_DEPENDENT="\
   --langrl-env-config $ENV_CONFIG "
 
 MODEL_OPTIONS="\
+  --rl-partial-rollouts \
+  --rl-offload-optimizer-during-inference \
+  --recompute-granularity full \
+  --recompute-method uniform \
+  --recompute-num-layers 1 \
   --moe-pad-experts-for-cuda-graph-inference \
   --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
@@ -84,7 +89,7 @@ MODEL_OPTIONS="\
   --grpo-default-temperature 1.0 \
   --grpo-default-top-p 1.0 \
   --rl-inference-logprobs-is-correction \
-  --rl-importance-sampling-truncation-coef 5.0 \
+  --rl-importance-sampling-truncation-coef 10.0 \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
   --inference-max-batch-size $MAX_INFERENCE_BS \
