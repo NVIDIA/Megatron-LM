@@ -571,7 +571,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.requests[request_id].record.suspend()
+            self.requests[request_id].record.checkpoint()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
