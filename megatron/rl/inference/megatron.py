@@ -143,6 +143,7 @@ def get_dynamic_inference_engine(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=inference_tp_size,
         materialize_only_last_token_logits=True,
@@ -158,7 +159,7 @@ def get_dynamic_inference_engine(
         metrics_writer=metrics_writer,
     )
 
-    inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
+    inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context, pg_collection=pg_collection)
 
     inference_wrapped_model.model_is_pipeline_parallel = not (
         is_pp_first_stage(pg_collection.pp) and is_pp_last_stage(pg_collection.pp)
