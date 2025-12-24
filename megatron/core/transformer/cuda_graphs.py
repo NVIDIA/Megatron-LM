@@ -1785,7 +1785,11 @@ class TECudaGraphHelper:
         sample_args, sample_kwargs = self._get_sample_arguments(order)
 
         def get_make_graphed_callables_kwargs():
-            kwargs = {'allow_unused_input': True, '_order': order}
+            kwargs = {
+                'allow_unused_input': True,
+                '_order': order,
+                'retain_graph_in_backward': self.config.cuda_graph_retain_backward_graph,
+            }
 
             # Calculate the number of warmup iterations per layer per microbatch inside TE
             # make_graphed_callables(). There are two rules:
