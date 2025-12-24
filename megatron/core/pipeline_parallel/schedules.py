@@ -22,6 +22,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -580,6 +581,7 @@ def forward_backward_no_pipelining(
 
     if not forward_only and config.fine_grained_activation_offloading:
         fine_grained_offloading_reset()
+    paged_stash_reset(enabled=config.moe_paged_stash and not forward_only)
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -937,6 +939,7 @@ def forward_backward_pipelining_with_interleaving(
 
     if not forward_only and config.fine_grained_activation_offloading:
         fine_grained_offloading_reset()
+    paged_stash_reset(enabled=config.moe_paged_stash and not forward_only)
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -1426,10 +1429,8 @@ def forward_backward_pipelining_with_interleaving(
     send_next_wait_handle = None
     send_prev_wait_handle = None
     recv_next_wait_handles = []
-
     for k in range(num_warmup_microbatches):
         cur_model_chunk_id = get_model_chunk_id(k, forward=True)
-
         if config.overlap_p2p_comm_warmup_flush:
             if (
                 not (
@@ -2085,6 +2086,7 @@ def forward_backward_pipelining_without_interleaving(
 
     if not forward_only and config.fine_grained_activation_offloading:
         fine_grained_offloading_reset()
+    paged_stash_reset(enabled=config.moe_paged_stash and not forward_only)
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func

@@ -561,7 +561,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
-            n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
+            n_tensor = torch.ones(1, dtype=torch.int64, device=dev) * n
+            # n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
             _broadcast(n_tensor)
 
             if n == 0:

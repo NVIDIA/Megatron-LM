@@ -1267,6 +1267,7 @@ def validate_args(args, defaults={}):
     if args.fine_grained_activation_offloading:
         assert args.transformer_impl == 'transformer_engine', \
             "Fine-grained activation offloading is only supported with transformer_engine implementation"
+        assert not args.moe_paged_stash, "Fine-grained activation offloading and paged stash cannot be enabled at the same time"
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
@@ -1543,6 +1544,8 @@ def _add_inference_args(parser):
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')
+    group.add_argument('--moe-expert-rank-capacity-factor', type=float, default=None,
+                       help='The capacity factor for each EP rank when packed offloading is enabled.')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
@@ -2365,6 +2368,11 @@ def _add_training_args(parser):
                        help='Use activation function kernel from Transformer Engine in MLP module.')
     group.add_argument('--fine-grained-activation-offloading', action='store_true',
                        help='Enable fine-grained activation offloading.')
+    group.add_argument('--moe-paged-stash', action='store_true',
+                       help='Enable paged stash for MoE expert activations.')
+    group.add_argument('--stash-modules', nargs='*', type=str, default=[],
+                       choices=['expert_fc1', 'moe_act', 'expert_fc2'],
+                       help='The MoE submodules to stash activations for. Choices: "expert_fc1", "moe_act", "expert_fc2".')
     group.add_argument('--offload-modules', nargs='*', type=str, default=[],
                        help='The submodules to offload its input. Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
     group.add_argument('--min-offloaded-tensor-size', type=int, default=1024*1024,
@@ -3204,6 +3212,8 @@ def _add_moe_args(parser):
                        'Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
                        help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
+    group.add_argument('--moe-use-device-initiated-grouped-gemm', action='store_true',
+                       help='Use the cutlass grouped gemm kernel, which allows for the token_per_expert tensor on GPU. This can prevent the GPU-CPU synchronization during the grouped gemm.')
     group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
                        help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
     group.add_argument('--moe-layer-recompute', action='store_true',
