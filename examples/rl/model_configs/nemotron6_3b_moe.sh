@@ -84,9 +84,9 @@ MODEL_OPTIONS="\
   --moe-router-enable-expert-bias \
   --moe-router-topk-scaling-factor 2.5 \
   --disable-gloo-process-groups \
-  --grpo-default-top-k -1 \
-  --grpo-default-temperature 1.0 \
-  --grpo-default-top-p 1.0 \
+  --rl-default-top-k -1 \
+  --rl-default-temperature 1.0 \
+  --rl-default-top-p 1.0 \
   --rl-inference-logprobs-is-correction \
   --rl-importance-sampling-truncation-coef 10.0 \
   --seq-length $MAX_SEQ_LENGTH \
