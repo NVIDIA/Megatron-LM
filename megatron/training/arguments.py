@@ -2039,12 +2039,6 @@ def _add_rl_args(parser):
                        help="Entropy term weight in GRPO loss.")
     group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
                        help="Filter groups with same reward.")
-    group.add_argument('--grpo-default-temperature', type=float, default=1.0,
-                       help="Default temperature for model inference.")
-    group.add_argument('--grpo-default-top-p', type=float, default=0,
-                       help="Default top-p for model inference.")
-    group.add_argument('--grpo-default-top-k', type=int, default=-1,
-                       help="Default top-k for model inference.")
     group.add_argument('--langrl-inference-server-type', type=str,
                        choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
                        help="Type of inference server to use.")
@@ -2053,6 +2047,12 @@ def _add_rl_args(parser):
     group.add_argument('--langrl-external-server', action=argparse.BooleanOptionalAction, required=False, default=False)
     group.add_argument('--langrl-env-config', type=str, default=None,
                        help="Path to YAML config file for RL environment configuration.")
+    group.add_argument('--rl-default-temperature', type=float, default=1.0,
+                       help="Default temperature for model inference.")
+    group.add_argument('--rl-default-top-p', type=float, default=0,
+                       help="Default top-p for model inference.")
+    group.add_argument('--rl-default-top-k', type=int, default=-1,
+                       help="Default top-k for model inference.")
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
     group.add_argument('--rl-offload-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
