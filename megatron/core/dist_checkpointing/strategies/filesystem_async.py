@@ -347,6 +347,8 @@ class FileSystemWriterAsync(FileSystemWriter):
         results_queue: mp.SimpleQueue,
         count_queue: mp.JoinableQueue,
         use_fsync: bool,
+        max_item_retries: int = 3,
+        item_retry_delay: float = 10.0,
         **kwargs,
     ) -> None:
         """
@@ -367,74 +369,142 @@ class FileSystemWriterAsync(FileSystemWriter):
         mem_before = _process_memory()
         use_msc = kwargs.get("use_msc", False)
 
-        # Retry configuration
-        max_retries = kwargs.get("max_ckpt_save_retries", 3)
-        retry_delay = kwargs.get("ckpt_save_retry_delay", 10.0)  # seconds
-
         local_results = []
         local_output = None
 
-        for attempt in range(max_retries):
-            try:
-                file_name, storage_key, (bytes_data, tensor_data) = write_bucket
-                extra_kwargs = {}
-                if "serialization_format" in inspect.signature(_write_item).parameters:
-                    from torch.distributed.checkpoint.filesystem import SerializationFormat
+        def write_item_with_retry(
+            transform_list,
+            stream,
+            data,
+            write_item,
+            storage_key,
+            use_fsync,
+            use_msc,
+            max_item_retries,
+            item_retry_delay,
+            **extra_kwargs
+        ):
+            """
+            Wraps _write_item with retry logic
 
-                    extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
-                if use_msc:
-                    import multistorageclient as msc
+            Args:
+                transform_list: List of storage writer transforms
+                stream: File stream to write to
+                data: Data to write (bytes or tensor)
+                write_item: WriteItem containing metadata
+                storage_key: Storage key for the item
+                use_fsync: Whether to call fsync after writing
+                use_msc: Whether using multistorageclient
+                max_item_retries: Maximum number of retry attempts for this item
+                item_retry_delay: Delay in seconds between retries
+                **extra_kwargs: Additional arguments for _write_item
 
-                    open_file = msc.open
-                else:
-                    open_file = open
+            Returns:
+                WriteResult from _write_item
 
-                # Reset results for each retry attempt
-                local_results = []
+            Raises:
+                Exception: Re-raises the last exception if all retries fail
+            """
+            last_exception = None
+            for attempt in range(max_item_retries):
+                try:
+                    result = _write_item(
+                        *transform_list, stream, data, write_item, storage_key, **extra_kwargs
+                    )
 
-                with open_file(file_name, "wb") as stream:
-                    for write_item, data in bytes_data:
-                        local_results.append(
-                            _write_item(
-                                *transform_list, stream, data, write_item, storage_key, **extra_kwargs
-                            )
-                        )
-
-                    for write_item, tensor in tensor_data:
-                        assert tensor.is_cpu
-                        local_results.append(
-                            _write_item(
-                                *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
-                            )
-                        )
-
+                    # Perform fsync if requested and write was successful
                     if use_fsync:
+                        try:
+                            if use_msc:
+                                stream.fsync()
+                            else:
+                                os.fsync(stream.fileno())
+                        except Exception as fsync_err:
+                            logger.warning(
+                                f"fsync failed for item {write_item.index}: {type(fsync_err).__name__}: {str(fsync_err)}"
+                            )
+                            # Continue despite fsync failure, but log it
+
+                    return result
+
+                except Exception as e:
+                    last_exception = e
+                    is_last_attempt = (attempt == max_item_retries - 1)
+
+                    if is_last_attempt:
+                        logger.error(
+                            f"Failed to write item {write_item.index} after {max_item_retries} attempts. "
+                            f"Last error: {type(e).__name__}: {str(e)}"
+                        )
+                        raise
+                    else:
+                        logger.warning(
+                            f"Write item {write_item.index} failed on attempt {attempt + 1}/{max_item_retries}. "
+                            f"Error: {type(e).__name__}: {str(e)}. Retrying in {item_retry_delay}s..."
+                        )
+                        time_module.sleep(item_retry_delay)
+
+            # Should not reach here, but just in case
+            if last_exception:
+                raise last_exception
+
+        try:
+            file_name, storage_key, (bytes_data, tensor_data) = write_bucket
+            extra_kwargs = {}
+            if "serialization_format" in inspect.signature(_write_item).parameters:
+                from torch.distributed.checkpoint.filesystem import SerializationFormat
+
+                extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
+            if use_msc:
+                import multistorageclient as msc
+
+                open_file = msc.open
+            else:
+                open_file = open
+
+            # Reset results for each retry attempt
+            local_results = []
+
+            with open_file(file_name, "wb") as stream:
+                for write_item, data in bytes_data:
+                    local_results.append(
+                        write_item_with_retry(
+                            transform_list, stream, data, write_item, storage_key,
+                            use_fsync, use_msc, max_item_retries, item_retry_delay, **extra_kwargs
+                        )
+                    )
+
+                for write_item, tensor in tensor_data:
+                    assert tensor.is_cpu
+                    local_results.append(
+                        write_item_with_retry(
+                            transform_list, stream, tensor, write_item, storage_key,
+                            use_fsync, use_msc, max_item_retries, item_retry_delay, **extra_kwargs
+                        )
+                    )
+
+                # Note: fsync is now handled inside write_item_with_retry for each item
+                # but we can still do a final fsync here if needed
+                if use_fsync:
+                    try:
                         if use_msc:
                             stream.fsync()
                         else:
                             os.fsync(stream.fileno())
+                    except Exception as fsync_err:
+                        logger.warning(
+                            f"fsync failed for file {file_name}: {type(fsync_err).__name__}: {str(fsync_err)}"
+                        )
+                        # Continue despite fsync failure, but log it
 
-                local_output = (local_proc_idx, local_results)
-                logger.debug(f"{local_proc_idx} completed successfully on attempt {attempt + 1}")
-                break  # Success, exit retry loop
+            local_output = (local_proc_idx, local_results)
+            logger.debug(f"{local_proc_idx} completed successfully")
 
-            except Exception as e:
-                is_last_attempt = (attempt == max_retries - 1)
-
-                if is_last_attempt:
-                    logger.error(
-                        f"{local_proc_idx} failed after {max_retries} attempts. "
-                        f"Last error: {type(e).__name__}: {str(e)}"
-                    )
-                    local_output = (local_proc_idx, e)  # type: ignore[assignment]
-                else:
-                    logger.warning(
-                        f"{local_proc_idx} failed on attempt {attempt + 1}/{max_retries} "
-                        f"with error: {type(e).__name__}: {str(e)}. "
-                        f"Retrying in {retry_delay:.2f} seconds..."
-                    )
-                    # TODO: Use exponential backoff for retry delay
-                    time_module.sleep(retry_delay)
+        except Exception as e:
+            logger.error(
+                f"{local_proc_idx} failed with {type(e).__name__}: {str(e)}"
+            )
+            local_output = (local_proc_idx, e)  # type: ignore[assignment]
 
         results_queue.put(local_output)
         # Signal this process is done.
