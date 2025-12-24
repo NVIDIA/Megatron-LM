@@ -18,6 +18,8 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
+
+# from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
@@ -1052,14 +1054,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType,
-        attention_bias: Tensor = None,
-        packed_seq_params: PackedSeqParams = None,
+        attention_bias: Optional[Tensor] = None,
+        cp_handler=None,
     ):
         """Forward."""
-        if packed_seq_params is not None:
+        if cp_handler is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
-            if packed_seq_params.cp_group is not None:
-                self.cp_group = packed_seq_params.cp_group
+            if cp_handler.cp_group is not None:
+                self.cp_group = cp_handler.cp_group
                 super().set_context_parallel_group(
                     self.cp_group,
                     torch.distributed.get_process_group_ranks(self.cp_group),
@@ -1068,16 +1070,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 )
             # If cp_group is None but local_cp_size is provided,
             # Indicates to turn off CP dynamically
-            elif packed_seq_params.local_cp_size is not None:
+            elif cp_handler.local_cp_size is not None:
                 assert (
-                    packed_seq_params.local_cp_size == 1
+                    cp_handler.local_cp_size == 1
                 ), "local_cp_size must be == 1 if provided without cp_group"
                 super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
         packed_seq_kwargs = (
-            {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
-            if packed_seq_params is not None
+            {key: getattr(cp_handler, key) for key in self.kept_packed_seq_params}
+            if cp_handler is not None
             else {}
         )
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)

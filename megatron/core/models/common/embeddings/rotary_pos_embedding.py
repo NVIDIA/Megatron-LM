@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.transformer_block import TransformerBlock
     from megatron.core.inference.contexts import BaseInferenceContext
-    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.context_parallel import ContextParallelHandler
 
 import logging
 import math
@@ -177,30 +177,26 @@ class RotaryEmbedding(nn.Module):
 
     @internal_api
     def forward(
-        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+        self, max_seq_len: int, offset: int = 0, cp_handler: Optional[ContextParallelHandler] = None
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
-            packed_seq_params (PackedSeqParams, optional): Packed sequence params. Defaults to None.
+            cp_handler (ContextParallelHandler, optional): Packed sequence params. Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
         """
-        emb = self.get_emb(max_seq_len, offset)
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            # Set CP group to dynamic CP group for CP slicing
-            cp_group = packed_seq_params.cp_group
-        else:
-            cp_group = self.cp_group
+        if cp_handler is None:
+            from megatron.core.context_parallel import DefaultContextParallelHandler
 
-        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension
-            # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            cp_handler = DefaultContextParallelHandler()
+
+        emb = self.get_emb(max_seq_len, offset)
+
+        emb = cp_handler.get_emb_on_this_cp_rank(emb)
 
         return emb
 
@@ -214,7 +210,7 @@ class RotaryEmbedding(nn.Module):
         transformer: TransformerBlock,
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> int:
@@ -226,7 +222,7 @@ class RotaryEmbedding(nn.Module):
                 by the model
             transformer_input (Tensor): Input tensor to the transformer
             transformer_config (TransformerConfig): Transformer config used by the model
-            packed_seq_params (PackedSeqParams): Packed sequence params
+            cp_handler (ContextParallelHandler): Packed sequence params
 
         Returns:
             int: The rotary sequence length
@@ -234,10 +230,10 @@ class RotaryEmbedding(nn.Module):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        if packed_seq_params is not None:
+        if cp_handler is not None and cp_handler.qkv_format == "thd":
             # max_seqlen are the max sequence length in the packed sequence before being divived
             # by the tp and cp size.
-            return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
+            return max(cp_handler.max_seqlen_q, cp_handler.max_seqlen_kv)
         elif inference_context is not None:
             rotary_seq_len = inference_context.max_sequence_length
         else:
@@ -307,7 +303,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         self,
         position_ids: torch.Tensor,
         mrope_section: List[int],
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
@@ -315,7 +311,7 @@ class MultimodalRotaryEmbedding(nn.Module):
             position_ids (torch.Tensor): A postion_id tensor with shape [3, batchsize, seqlens]
             mrope_section (list[int]): Multimodal rope section is for channel dimension of temporal,
                 height and width in rope calculation.
-            packed_seq_params (PackedSeqParams, optional): Packed sequence params. Defaults to None.
+            cp_handler (ContextParallelHandler, optional): Packed sequence params. Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -348,10 +344,10 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            if packed_seq_params.local_cp_size > 1:
+        if cp_handler is not None and cp_handler.local_cp_size is not None:
+            if cp_handler.local_cp_size > 1:
                 # Set CP group to dynamic CP group for CP slicing
-                cp_group = packed_seq_params.cp_group
+                cp_group = cp_handler.cp_group
             else:
                 # Set CP group to None to avoid CP slicing
                 cp_group = None

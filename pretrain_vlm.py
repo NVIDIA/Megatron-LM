@@ -298,7 +298,7 @@ def get_batch(data_iterator):
     data_f = tensor_parallel.broadcast_data(["image", "loss_mask"], data, torch.float32)
 
     batch = dict()
-    packed_seq_params = None
+    cp_handler = None
     image_token_mask = None
     # Create batch with tokens and position_ids for CP sharding.
     tokens = data_i["tokens"].long()
@@ -328,9 +328,9 @@ def get_batch(data_iterator):
         )
         if mp_padding_needed_for_text > 0:
             tokens, position_ids, labels, loss_mask = [torch.nn.functional.pad(item, (0, mp_padding_needed_for_text)) for item in (tokens, position_ids, labels, loss_mask)]
-        packed_seq_params = context_parallel.get_packed_seq_params(tokens, img_seq_len, mp_padding_needed_for_text, cp_size, args.use_packed_sequence)
+        cp_handler = context_parallel.get_cp_handler(tokens, img_seq_len, mp_padding_needed_for_text, cp_size, args.use_packed_sequence)
 
-        if packed_seq_params.qkv_format == 'thd':
+        if cp_handler.qkv_format == 'thd':
             # Reshape from [B,S] to [T,1]
             tokens = (
                 tokens.contiguous()
@@ -349,7 +349,7 @@ def get_batch(data_iterator):
 
     attention_mask = None  # Use the attention mask type defined in layer spec. Typically no mask for the vision model and causal mask for the vision model.
 
-    return tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params
+    return tokens, position_ids, labels, images, loss_mask, attention_mask, cp_handler
 
 
 def forward_step(data_iterator, model: LLaVAModel):
@@ -367,11 +367,11 @@ def forward_step(data_iterator, model: LLaVAModel):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params = get_batch(data_iterator)
+    tokens, position_ids, labels, images, loss_mask, attention_mask, cp_handler = get_batch(data_iterator)
     timers('batch-generator').stop()
 
     output_tensor, loss_mask = model(
-        images, tokens, position_ids, attention_mask, labels, loss_mask, packed_seq_params=packed_seq_params
+        images, tokens, position_ids, attention_mask, labels, loss_mask, cp_handler=cp_handler
     )
 
     return output_tensor, partial(loss_func, loss_mask)

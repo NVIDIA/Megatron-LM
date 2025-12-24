@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.context_parallel import DefaultContextParallelHandler
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -17,14 +17,14 @@ def make_test_packed_seq_params(sequence_length):
     cu_seqlens = torch.IntTensor([0, 6, 19, 22, sequence_length]).cuda()
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
     max_seqlen = seqlens.max().item()
-    packed_seq_params = PackedSeqParams(
+    cp_handler = DefaultContextParallelHandler(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         qkv_format='thd',
     )
-    return packed_seq_params
+    return cp_handler
 
 
 def make_test_packed_padded_seq_params(sequence_length):
@@ -32,7 +32,7 @@ def make_test_packed_padded_seq_params(sequence_length):
     cu_seqlens_padded = torch.IntTensor([0, 20, 48, 56, 100, sequence_length]).cuda()
     seqlens = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
     max_seqlen = seqlens.max().item()
-    packed_seq_params = PackedSeqParams(
+    cp_handler = DefaultContextParallelHandler(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
@@ -41,7 +41,7 @@ def make_test_packed_padded_seq_params(sequence_length):
         max_seqlen_kv=max_seqlen,
         qkv_format='thd',
     )
-    return packed_seq_params
+    return cp_handler
 
 
 class TestParallelAttentionWithPackedSequence:
@@ -90,10 +90,8 @@ class TestParallelAttentionWithPackedSequence:
 
         attention_mask = None
 
-        packed_seq_params = make_test_packed_seq_params(sequence_length)
-        output, bias = self.parallel_attention(
-            hidden_states, attention_mask, packed_seq_params=packed_seq_params
-        )
+        cp_handler = make_test_packed_seq_params(sequence_length)
+        output, bias = self.parallel_attention(hidden_states, attention_mask, cp_handler=cp_handler)
 
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
@@ -121,10 +119,8 @@ class TestParallelAttentionWithPackedSequence:
             sequence_length, 1, 1, self.parallel_attention.config.kv_channels
         ).cuda()
 
-        packed_seq_params = make_test_packed_seq_params(sequence_length)
-        output, bias = self.parallel_attention(
-            hidden_states, attention_mask, packed_seq_params=packed_seq_params
-        )
+        cp_handler = make_test_packed_seq_params(sequence_length)
+        output, bias = self.parallel_attention(hidden_states, attention_mask, cp_handler=cp_handler)
 
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
@@ -157,9 +153,9 @@ class TestParallelAttentionWithPackedSequence:
 
         attention_mask = None
 
-        packed_seq_params = make_test_packed_seq_params(sequence_length)
+        cp_handler = make_test_packed_seq_params(sequence_length)
         output, bias = checkpointed_parallel_attention(
-            hidden_states, attention_mask, packed_seq_params=packed_seq_params
+            hidden_states, attention_mask, cp_handler=cp_handler
         )
 
         assert config.recompute_granularity == 'selective'
@@ -188,10 +184,8 @@ class TestParallelAttentionWithPackedPaddedSequence(TestParallelAttentionWithPac
 
         attention_mask = None
 
-        packed_seq_params = make_test_packed_padded_seq_params(sequence_length)
-        output, bias = self.parallel_attention(
-            hidden_states, attention_mask, packed_seq_params=packed_seq_params
-        )
+        cp_handler = make_test_packed_padded_seq_params(sequence_length)
+        output, bias = self.parallel_attention(hidden_states, attention_mask, cp_handler=cp_handler)
 
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length

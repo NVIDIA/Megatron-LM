@@ -14,6 +14,8 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
+
+# from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
@@ -472,7 +474,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         inference_context: Optional[Any] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
@@ -494,7 +496,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             attention_bias (Tensor, optional): Bias tensor for Q * K.T.
             inference_context (object, optional): Parameters for inference-time optimizations.
-            packed_seq_params (object, optional): Parameters for packed sequence processing.
+            cp_handler (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
 
@@ -539,7 +541,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             rotary_pos_sin=rotary_pos_sin,
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
+            cp_handler=cp_handler,
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
@@ -843,7 +845,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         CUDA graph replay for this layer and microbatch `self.current_microbatch` using TE
         interface. TransformerEngine versions>=1.10 allow keyword arguments with CUDA graph.
         However, CUDA graph accepts only Tensor inputs.
-        Hence, `inference_context` and `packed_seq_params` are excluded from input list.
+        Hence, `inference_context` and `cp_handler` are excluded from input list.
         """
         context = None
         if self.config.cuda_graph_scope and CudaGraphScope.attn not in self.config.cuda_graph_scope:
@@ -851,11 +853,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             args = (hidden_states,)
             kwargs = {}
 
-        assert (kwargs.get('inference_context') is None) and (
-            kwargs.get('packed_seq_params') is None
-        ), (
+        assert (kwargs.get('inference_context') is None) and (kwargs.get('cp_handler') is None), (
             "CUDA graph accepts only Tensor inputs. "
-            "inference_context and packed_seq_params are excluded from input list. "
+            "inference_context and cp_handler are excluded from input list. "
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 

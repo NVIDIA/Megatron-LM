@@ -8,13 +8,10 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel import ContextParallelHandler, DefaultContextParallelHandler
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.models.common.embeddings.rope_utils import (
-    apply_rotary_pos_emb,
-    apply_rotary_pos_emb_with_cos_sin,
-)
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb_with_cos_sin
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -43,9 +40,6 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
-from ..models.common.embeddings.yarn_rotary_pos_embedding import (
-    _yarn_get_concentration_factor_from_config,
-)
 from .enums import AttnMaskType, CudaGraphScope
 from .transformer_config import TransformerConfig
 
@@ -266,7 +260,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_emb=None,
         attn_mask_type=None,
         attention_bias=None,
-        packed_seq_params=None,
+        cp_handler=None,
     ):
         """Forward method with selective activation checkpointing."""
 
@@ -277,14 +271,16 @@ class Attention(MegatronModule, ABC):
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
+            if cp_handler is None:
+                cp_handler = DefaultContextParallelHandler()
+            output_ = cp_handler.core_attn(
+                attn_mod=self.core_attention,
+                query=query,
+                key=key,
+                value=value,
+                attention_mask=attention_mask,
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
             )
             return output_
 
@@ -701,7 +697,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_sin: Optional[Tensor] = None,
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -722,7 +718,7 @@ class Attention(MegatronModule, ABC):
             rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
             Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             attention_bias (Optional[Tensor]): Attention bias.
-            packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
+            cp_handler (Optional[PackedSeqparams]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
 
@@ -776,7 +772,7 @@ class Attention(MegatronModule, ABC):
                 not self.config.test_mode,
                 self.config.fused_single_qkv_rope,
                 inference_context is None,
-                packed_seq_params is None,
+                cp_handler is None,
                 (
                     rotary_pos_emb is not None
                     and rotary_pos_emb[0] is not None
@@ -878,7 +874,7 @@ class Attention(MegatronModule, ABC):
                 )
             )
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if cp_handler is not None and cp_handler.qkv_format == 'thd':
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
@@ -893,15 +889,15 @@ class Attention(MegatronModule, ABC):
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                if packed_seq_params.cu_seqlens_q_padded is not None:
-                    cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+            if cp_handler is not None and cp_handler.qkv_format == 'thd':
+                if cp_handler.cu_seqlens_q_padded is not None:
+                    cu_seqlens_q = cp_handler.cu_seqlens_q_padded
                 else:
-                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
-                if packed_seq_params.cu_seqlens_kv_padded is not None:
-                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+                    cu_seqlens_q = cp_handler.cu_seqlens_q
+                if cp_handler.cu_seqlens_kv_padded is not None:
+                    cu_seqlens_kv = cp_handler.cu_seqlens_kv_padded
                 else:
-                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                    cu_seqlens_kv = cp_handler.cu_seqlens_kv
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
 
@@ -909,27 +905,19 @@ class Attention(MegatronModule, ABC):
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
                     if inference_context is None or inference_context.is_static_batching():
-                        query = apply_rotary_pos_emb(
-                            query,
-                            q_pos_emb,
-                            config=self.config,
-                            cu_seqlens=cu_seqlens_q,
-                            mscale=_yarn_get_concentration_factor_from_config(self.config),
-                            cp_group=self.pg_collection.cp,
+                        if cp_handler is None:
+                            cp_handler = DefaultContextParallelHandler()
+                        query = cp_handler.apply_rotary_pos_emb(
+                            query, q_pos_emb, config=self.config
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
                             query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
                         )
                 if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
-                        key,
-                        k_pos_emb,
-                        config=self.config,
-                        cu_seqlens=cu_seqlens_kv,
-                        mscale=_yarn_get_concentration_factor_from_config(self.config),
-                        cp_group=self.pg_collection.cp,
-                    )
+                    if cp_handler is None:
+                        cp_handler = DefaultContextParallelHandler()
+                    key = cp_handler.apply_rotary_pos_emb(key, k_pos_emb, config=self.config)
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
                     mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
@@ -954,7 +942,7 @@ class Attention(MegatronModule, ABC):
                 attention_mask,
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
             )
         else:
             if self.offload_core_attention and self.training:
@@ -962,14 +950,16 @@ class Attention(MegatronModule, ABC):
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
                 with get_fine_grained_offloading_context(self.offload_core_attention):
-                    core_attn_out = self.core_attention(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
+                    if cp_handler is None:
+                        cp_handler = DefaultContextParallelHandler()
+                    core_attn_out = cp_handler.core_attn(
+                        attn_mod=self.core_attention,
+                        query=query,
+                        key=key,
+                        value=value,
+                        attention_mask=attention_mask,
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
-                        packed_seq_params=packed_seq_params,
                     )
 
             else:
@@ -995,7 +985,7 @@ class Attention(MegatronModule, ABC):
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if cp_handler is not None and cp_handler.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)

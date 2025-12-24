@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -15,7 +16,6 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_set_last_layer,
 )
@@ -427,7 +427,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         context_mask: Tensor,
         rotary_pos_emb: Tensor,
         attention_bias: Tensor,
-        packed_seq_params: PackedSeqParams,
+        cp_handler: ContextParallelHandler,
         use_inner_quantization_context: bool,
     ):
         """Forward method with activation checkpointing."""
@@ -464,7 +464,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             attention_bias=attention_bias,
                             inference_context=None,
-                            packed_seq_params=packed_seq_params,
+                            cp_handler=cp_handler,
                         )
                 return hidden_states, context
 
@@ -597,7 +597,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
         sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -628,7 +628,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 Used as an alternative to apply attention mask for TE cuDNN attention.
             inference_context (BaseInferenceContext, optional): Parameters for inference-time
                 optimizations.
-            packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
+            cp_handler (ContextParallelHandler, optional): Parameters for packed sequence
                 processing.
             dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
                 inference context is for decode-only. This args is only used to uniquely
@@ -706,7 +706,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask=context_mask,
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
+                    cp_handler=cp_handler,
                     use_inner_quantization_context=use_inner_quantization_context,
                 )
             else:
@@ -743,7 +743,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             rotary_pos_cos_sin=rotary_pos_cos_sin,
                             attention_bias=attention_bias,
                             inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
+                            cp_handler=cp_handler,
                             sequence_len_offset=sequence_len_offset,
                         )
 

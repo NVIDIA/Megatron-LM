@@ -301,7 +301,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         attention_mask: Tensor,
         decoder_input: Tensor = None,
         labels: Tensor = None,
-        packed_seq_params=None,
+        cp_handler=None,
         extra_block_kwargs=None,
         runtime_gather_output: Optional[bool] = None,
         loss_mask: Optional[Tensor] = None,
@@ -318,7 +318,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             attention_mask: Attention mask.
             decoder_input: Decoder input tensor.
             labels: Labels for loss computation.
-            packed_seq_params: Parameters for packed sequences.
+            cp_handler: Parameters for packed sequences.
             extra_block_kwargs: Additional keyword arguments for blocks.
             runtime_gather_output: Whether to gather output at runtime.
             loss_mask (torch.Tensor): Used to mask out some portions of the loss
@@ -346,7 +346,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.labels = labels
         self._model_chunk_state.mtp_hidden_states = None
         self._model_chunk_state.loss_mask = loss_mask
-        self._model_chunk_state.packed_seq_params = packed_seq_params
+        self._model_chunk_state.cp_handler = cp_handler
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
         self._model_chunk_state.runtime_gather_output = runtime_gather_output
         self._model_chunk_state.model = model

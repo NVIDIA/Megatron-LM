@@ -8,13 +8,13 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.mamba import MambaModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -660,7 +660,7 @@ class LLaVAModel(MegatronModule):
         return final_embedding, final_labels, final_loss_mask
 
     def _process_embedding_token_parallel(
-        self, combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+        self, combined_embeddings, new_labels, new_loss_mask, cp_handler
     ):
         """Processes the input data for model parallelism support.
 
@@ -680,13 +680,13 @@ class LLaVAModel(MegatronModule):
             combined_embeddings (torch.Tensor): image and text embeddings combined and distributed.
             new_labels (torch.Tensor): Distributed labels for image and text positions.
             new_loss_mask (torch.Tensor): Distributed loss mask.
-            packed_seq_params (PackedSeqParams): Dict with padded token information.
+            cp_handler (PackedSeqParams): Dict with padded token information.
 
         """
 
         # No pre or post processing needed with PP middle chunks.
         if not self.pre_process and not self.post_process:
-            return combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+            return combined_embeddings, new_labels, new_loss_mask, cp_handler
 
         shard_factor = seq_dim = None
         if self.pre_process:
@@ -718,7 +718,7 @@ class LLaVAModel(MegatronModule):
                 batch["new_labels"] = new_labels
                 batch["new_loss_mask"] = new_loss_mask
             # Distribute sequence across CP ranks
-            if packed_seq_params is None or packed_seq_params.qkv_format == 'sbhd':
+            if cp_handler is None or cp_handler.qkv_format == 'sbhd':
                 from megatron.training.utils import get_batch_on_this_cp_rank
 
                 batch = get_batch_on_this_cp_rank(batch)
@@ -731,7 +731,7 @@ class LLaVAModel(MegatronModule):
                 cp_rank = self.cp_group.rank()
                 for key, data in batch.items():
                     index = tex.thd_get_partitioned_indices(
-                        packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
+                        cp_handler.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
                     )
                     batch[key] = data.index_select(1, index)
 
@@ -749,7 +749,7 @@ class LLaVAModel(MegatronModule):
                 combined_embeddings
             )  # [S/(CP*TP),B,H]
 
-        return combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+        return combined_embeddings, new_labels, new_loss_mask, cp_handler
 
     def _apply_tile_tagging(self, image_embeddings, num_image_tiles):
         """Apply tile tagging.
@@ -799,7 +799,7 @@ class LLaVAModel(MegatronModule):
         num_image_tiles: Optional[List[int]] = None,
         image_token_index: Optional[int] = None,
         runtime_gather_output: Optional[bool] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> torch.Tensor:
@@ -822,7 +822,7 @@ class LLaVAModel(MegatronModule):
                 arg in the constructor will be used.
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
-            packed_seq_params (PackedSeqParams): 1) If using sequence packing, must contain
+            cp_handler (PackedSeqParams): 1) If using sequence packing, must contain
                 subsample length information. 2) If using SP/CP with padding mask type,
                 must contain padded token information.
 
@@ -918,9 +918,9 @@ class LLaVAModel(MegatronModule):
         )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
 
         if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
-            combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (
+            combined_embeddings, new_labels, new_loss_mask, cp_handler = (
                 self._process_embedding_token_parallel(
-                    combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+                    combined_embeddings, new_labels, new_loss_mask, cp_handler
                 )
             )
 
@@ -943,7 +943,7 @@ class LLaVAModel(MegatronModule):
                 labels=new_labels,
                 inference_context=inference_context,
                 runtime_gather_output=runtime_gather_output,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
             )
 
         return output, new_loss_mask

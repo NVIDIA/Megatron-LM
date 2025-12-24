@@ -125,7 +125,7 @@ class PreProcessNode(ScheduleNode):
                 input_ids=self.chunk_state.input_ids,
                 position_ids=self.chunk_state.position_ids,
                 decoder_input=self.chunk_state.decoder_input,
-                packed_seq_params=self.chunk_state.packed_seq_params,
+                cp_handler=self.chunk_state.cp_handler,
             )
         )
 
@@ -188,7 +188,7 @@ class PostProcessNode(ScheduleNode):
             mtp_in_postprocess=False,
             loss_mask=self.chunk_state.loss_mask,
             attention_mask=self.chunk_state.attention_mask,
-            packed_seq_params=self.chunk_state.packed_seq_params,
+            cp_handler=self.chunk_state.cp_handler,
             sequence_len_offset=self.chunk_state.sequence_len_offset,
             runtime_gather_output=self.chunk_state.runtime_gather_output,
             extra_block_kwargs=self.chunk_state.extra_block_kwargs,
@@ -361,7 +361,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
             rotary_pos_cos=node.chunk_state.rotary_pos_cos,
             rotary_pos_sin=node.chunk_state.rotary_pos_sin,
-            packed_seq_params=node.chunk_state.packed_seq_params,
+            cp_handler=node.chunk_state.cp_handler,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
         return hidden_states
@@ -540,7 +540,7 @@ def build_mtp_layer_callables(layer):
             node.chunk_state.context is None
         ), f"multi token prediction + cross attention is not yet supported."
         assert (
-            node.chunk_state.packed_seq_params is None
+            node.chunk_state.cp_handler is None
         ), f"multi token prediction + sequence packing is not yet supported."
 
         if layer.config.sequence_parallel:

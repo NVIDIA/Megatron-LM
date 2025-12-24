@@ -8,11 +8,11 @@ import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_set_last_layer,
 )
@@ -126,7 +126,7 @@ def tie_output_layer_state_dict(
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
+def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, cp_handler=None):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -147,14 +147,14 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
         dims (int): The dimension to roll (typically -1 for sequence dimension).
         cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
                                falls back to standard rolling behavior.
-        packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+        cp_handler (ContextParallelHandler): Parameters for packed sequence processing.
                                             If provided, respects sequence boundaries.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
     # Handle packed sequences cases
-    if packed_seq_params is not None:
-        return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
+    if cp_handler is not None and cp_handler.qkv_format == "thd":
+        return _roll_tensor_packed_seq(tensor, shifts, dims, cp_handler, cp_group)
 
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
@@ -224,7 +224,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     return rolled_tensor, rolled_tensor.sum()
 
 
-def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=None):
+def _roll_tensor_packed_seq(tensor, shifts, dims, cp_handler, cp_group=None):
     """Roll tensor with packed sequence support.
     This function handles rolling for packed sequences by respecting sequence boundaries
     """
@@ -235,7 +235,7 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         dims == -1 or dims == tensor.dim() - 1
     ), "Packed sequence roll only supports the last dimension."
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
-    cu_seqlens = packed_seq_params.cu_seqlens_q
+    cu_seqlens = cp_handler.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
 
     rolled_tensor = tensor.clone()
@@ -689,7 +689,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: torch.Tensor,
         embedding: Callable,
         hidden_states: torch.Tensor,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -704,22 +704,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 from gpt model to compute the decoder input.
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
-            packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+            cp_handler (ContextParallelHandler): Parameters for packed sequence processing.
         """
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
         input_ids, _ = roll_tensor(
-            input_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
+            input_ids, shifts=-1, dims=-1, cp_group=self.cp_group, cp_handler=cp_handler
         )
         position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
+            position_ids, shifts=-1, dims=-1, cp_group=self.cp_group, cp_handler=cp_handler
         )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
@@ -763,7 +755,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_sin: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
         inference_params: Optional[InferenceParams] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
         sequence_len_offset: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -803,7 +795,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     rotary_pos_sin=rotary_pos_sin,
                     attention_bias=attention_bias,
                     inference_params=inference_params,
-                    packed_seq_params=packed_seq_params,
+                    cp_handler=cp_handler,
                     sequence_len_offset=sequence_len_offset,
                 )
 
@@ -876,7 +868,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_sin: Tensor = None,
         attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
+        cp_handler: ContextParallelHandler = None,
         sequence_len_offset: Tensor = None,
         embedding=None,
     ):
@@ -909,7 +901,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             position_ids=position_ids,
             embedding=embedding,
             hidden_states=hidden_states,
-            packed_seq_params=packed_seq_params,
+            cp_handler=cp_handler,
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
@@ -925,7 +917,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 rotary_pos_sin=rotary_pos_sin,
                 attention_bias=attention_bias,
                 inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
                 sequence_len_offset=sequence_len_offset,
             )
         else:
@@ -940,7 +932,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 rotary_pos_sin=rotary_pos_sin,
                 attention_bias=attention_bias,
                 inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
                 sequence_len_offset=sequence_len_offset,
             )
 
@@ -1092,7 +1084,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         rotary_pos_sin: Tensor = None,
         attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
+        cp_handler: ContextParallelHandler = None,
         sequence_len_offset: Tensor = None,
         extra_block_kwargs: dict = None,
         embedding=None,
@@ -1125,7 +1117,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
                 **(extra_block_kwargs or {}),

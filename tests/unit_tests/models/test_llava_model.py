@@ -12,7 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.context_parallel import DefaultContextParallelHandler
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -319,7 +319,7 @@ class TestLLaVAModel:
         assert loss.shape == new_loss_mask.shape == torch.Size((5, max_seq_len))
 
         # Try with labels and PackedSeqParams. Only micro batch size 1 is supported in this mode.
-        packed_seq_params = PackedSeqParams(
+        cp_handler = DefaultContextParallelHandler(
             qkv_format="thd",
             cu_seqlens_q=torch.tensor(
                 [0, 512, 1024, 1600], dtype=torch.int32
@@ -339,7 +339,7 @@ class TestLLaVAModel:
             labels[:1],
             loss_mask[:1],
             num_image_tiles=num_image_tiles[:1],
-            packed_seq_params=packed_seq_params,
+            cp_handler=cp_handler,
         )
         self.model.to(torch.float32)
 
@@ -669,7 +669,7 @@ class TestLLaVAModelTokenParallel:
             ).unsqueeze(0)
             qkv_format = 'thd'
 
-        packed_seq_params = PackedSeqParams(
+        cp_handler = DefaultContextParallelHandler(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
             cu_seqlens_q_padded=cu_seqlens_padded,
@@ -679,7 +679,7 @@ class TestLLaVAModelTokenParallel:
             qkv_format=qkv_format,
         )
 
-        return combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+        return combined_embeddings, new_labels, new_loss_mask, cp_handler
 
     @pytest.mark.internal
     def setup_method(self, method):
@@ -722,13 +722,13 @@ class TestLLaVAModelTokenParallel:
         args = create_test_args(cp_size, sequence_parallel)
         set_args(args)
 
-        combined_embeddings, new_labels, new_loss_mask, packed_seq_params = self._prepare_inputs(
+        combined_embeddings, new_labels, new_loss_mask, cp_handler = self._prepare_inputs(
             cp_size, tp_size, sequence_parallel, padding
         )
 
-        combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (
+        combined_embeddings, new_labels, new_loss_mask, cp_handler = (
             model._process_embedding_token_parallel(
-                combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+                combined_embeddings, new_labels, new_loss_mask, cp_handler
             )
         )
 
@@ -791,20 +791,17 @@ def test_get_padding(cp_size, tp_size, has_sp, seq_len, fp8_enabled, expected_pa
     "tokens, img_seq_len, padding_needed, cp_size, expected_seq_len",
     [(torch.ones((1, 100)), 100, 0, 2, 200), (torch.ones((1, 100)), 128, 1, 2, 227)],
 )
-def test_get_packed_seq_params(tokens, img_seq_len, padding_needed, cp_size, expected_seq_len):
+def test_get_cp_handler(tokens, img_seq_len, padding_needed, cp_size, expected_seq_len):
     """Test creating PackedSeqParams for context parallel."""
-    packed_seq_params = context_parallel.get_packed_seq_params(
-        tokens, img_seq_len, padding_needed, cp_size
-    )
+    cp_handler = context_parallel.get_cp_handler(tokens, img_seq_len, padding_needed, cp_size)
 
     assert torch.equal(
-        packed_seq_params.cu_seqlens_q, torch.tensor([0, expected_seq_len], dtype=torch.int32)
+        cp_handler.cu_seqlens_q, torch.tensor([0, expected_seq_len], dtype=torch.int32)
     )
 
     if padding_needed > 0:
         padded_seq_len = tokens.shape[1] + img_seq_len
         assert torch.equal(
-            packed_seq_params.cu_seqlens_q_padded,
-            torch.tensor([0, padded_seq_len], dtype=torch.int32),
+            cp_handler.cu_seqlens_q_padded, torch.tensor([0, padded_seq_len], dtype=torch.int32)
         )
-        assert packed_seq_params.max_seqlen_q == padded_seq_len
+        assert cp_handler.max_seqlen_q == padded_seq_len

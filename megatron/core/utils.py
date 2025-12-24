@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
@@ -59,15 +59,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-try:
-    # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
 
-    # Alias the PyTorch wrapper so we can call tex.* APIs
-    import transformer_engine_torch as tex
-except ImportError:
-    # TE isn’t installed or the torch wrapper is missing
-    tex = None
+if TYPE_CHECKING:
+    from megatron.core.context_parallel import ContextParallelHandler
 
 try:
     _torch_version = PkgVersion(torch.__version__)
@@ -1956,16 +1950,18 @@ def is_submodule(module, parent_module, strict=True):
 
 
 def get_batch_on_this_cp_rank(
-    batch: Dict[str, Any], cp_group: Optional[torch.distributed.ProcessGroup] = None
+    batch: Dict[str, Any], cp_handler: Optional['ContextParallelHandler'] = None
 ):
-    """Slice batch input along sequence dimension into multiple chunks,
+    """Slice batch input along the sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors.
-        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel process group.
-            If provided, uses this group's size and rank. Otherwise, falls back to
-            the current context-parallel settings from parallel_state.
+        cp_handler (ContextParallelHandler): The context parallel handler. It abstracts away
+            the specific details of context parallelism and serves two main purposes:
+            1. Implements context parallel methods (e.g., dispatch, combine).
+            2. Provides a unified interface for necessary source code modifications,
+               preventing context parallel logic from being scattered throughout the codebase.
     """
 
     # With causal masking, each token only attends to its prior tokens. Simply split
@@ -1975,74 +1971,18 @@ def get_batch_on_this_cp_rank(
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
     # Determine CP topology either from provided group or from current context parallel state
-    if cp_group is not None:
-        cp_size = get_pg_size(cp_group)
-        cp_rank = get_pg_rank(cp_group)
-    else:
-        cp_size = parallel_state.get_context_parallel_world_size()
-        cp_rank = parallel_state.get_context_parallel_rank()
+    if cp_handler is None:
+        from megatron.core.context_parallel import DefaultContextParallelHandler
 
-    if cp_size > 1:
-        for key, val in batch.items():
-            if val is not None:
-                seq_dim = 1 if key != 'attention_mask' else 2
-                val = val.view(
-                    *val.shape[0:seq_dim],
-                    2 * cp_size,
-                    val.shape[seq_dim] // (2 * cp_size),
-                    *val.shape[(seq_dim + 1) :],
-                )
-                index = torch.zeros(2, dtype=torch.int64, device=val.device)
-                index[0].fill_(cp_rank)
-                index[1].fill_(2 * cp_size - cp_rank - 1)
-                val = val.index_select(seq_dim, index)
-                val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
-                batch[key] = val
+        cp_handler = DefaultContextParallelHandler()
+
+    for key, val in batch.items():
+        if val is not None:
+            assert isinstance(val, torch.Tensor)
+            seq_dim = 1 if key != 'attention_mask' else 2
+            batch[key] = cp_handler.dispatch(seq_dim=seq_dim, tensor=val)
 
     return batch
-
-
-def get_thd_batch_on_this_cp_rank(
-    batch: Dict[str, Any],
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
-    max_seqlen: torch.Tensor,
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
-):
-    """Slice each sub-sample in a packed sample batch input along
-    sequence dimension into multiple chunks, which are parallelized
-    across GPUs in a context parallel group.
-    """
-    packed_seq_params = PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens_padded,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=int(max_seqlen[0].item()),
-        max_seqlen_kv=int(max_seqlen[0].item()),
-    )
-
-    if cp_group is not None:
-        cp_size = get_pg_size(cp_group)
-        cp_rank = get_pg_rank(cp_group)
-    else:
-        cp_size = parallel_state.get_context_parallel_world_size()
-        cp_rank = parallel_state.get_context_parallel_rank()
-    if cp_size > 1:  # slice batch along sequence dimension for context parallelism
-        assert tex is not None and is_te_min_version("1.10.0"), (
-            "Please update Transformer Engine to >= 1.10 to use "
-            "Context Parallel with THD format data"
-        )
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
-        )
-        for key, data in batch.items():
-            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
-                continue
-            batch[key] = data.index_select(1, index)
-
-    return batch, packed_seq_params
 
 
 ################################

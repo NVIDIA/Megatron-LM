@@ -14,12 +14,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -254,7 +254,7 @@ class GatedDeltaNet(MegatronModule):
         rotary_pos_sin: Optional[Tensor] = None,
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -274,7 +274,7 @@ class GatedDeltaNet(MegatronModule):
             rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
             rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
             attention_bias (Optional[Tensor]): Attention bias.
-            packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
+            cp_handler (Optional[ContextParallelHandler]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
 
@@ -297,7 +297,7 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
-        if packed_seq_params is not None:
+        if cp_handler is not None and cp_handler.qkv_format == "thd":
             # TODO: support packed sequence
             raise NotImplementedError("GDN does not support packed sequence for now.")
 

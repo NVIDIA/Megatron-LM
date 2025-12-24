@@ -20,7 +20,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.context_parallel import DefaultContextParallelHandler
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
@@ -42,7 +42,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     attention_mask = None
     position_ids = None
     num_tiles = None
-    packed_seq_params = None
+    cp_handler = None
 
     args = get_args()
 
@@ -50,7 +50,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     pp_size = get_pipeline_model_parallel_world_size()
     if not is_first_or_last_stage(pp_size):
         # Note these are all set to None above.
-        return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
+        return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, cp_handler
 
     # Broadcast data.
     torch.cuda.nvtx.range_push("get_data")
@@ -94,7 +94,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         cu_lengths = cu_lengths[0]
         max_lengths = max_lengths[0]
 
-        packed_seq_params = PackedSeqParams(
+        cp_handler = DefaultContextParallelHandler(
             qkv_format="thd",
             cu_seqlens_q=cu_lengths,
             cu_seqlens_kv=cu_lengths,
@@ -135,7 +135,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         tokens, position_ids, labels, loss_mask = [torch.nn.functional.pad(item, (0, mp_padding_needed)) for item in (tokens, position_ids, labels, loss_mask)]
 
         # Get PackedSeqParams that indicate the amount of padding for TransformerEngine.
-        packed_seq_params = context_parallel.get_packed_seq_params(tokens, num_image_embeddings, mp_padding_needed, args.context_parallel_size, True)
+        cp_handler = context_parallel.get_cp_handler(tokens, num_image_embeddings, mp_padding_needed, args.context_parallel_size, True)
 
     return (
         tokens,
@@ -145,7 +145,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         position_ids,
         imgs,
         num_tiles,
-        packed_seq_params,
+        cp_handler,
     )
 
 
@@ -274,7 +274,7 @@ def forward_step(data_iterator, model: LLaVAModel):
         position_ids,
         images,
         num_image_tiles,
-        packed_seq_params,
+        cp_handler,
     ) = get_batch(data_iterator, model.module.module.image_token_index, model.module.module.img_seq_len)
     timers('batch-generator').stop()
 
@@ -286,7 +286,7 @@ def forward_step(data_iterator, model: LLaVAModel):
         labels,
         loss_mask,
         num_image_tiles=num_image_tiles,
-        packed_seq_params=packed_seq_params,
+        cp_handler=cp_handler,
     )
     args = get_args()
     if args.use_loss_scaling:

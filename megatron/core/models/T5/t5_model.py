@@ -7,6 +7,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.enums import ModelType
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -14,7 +15,6 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.relative_pos_embedding import RelativePositionEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
@@ -283,7 +283,7 @@ class T5Model(LanguageModule):
         encoder_hidden_states: Tensor = None,
         output_encoder_hidden_only: bool = False,
         inference_context: BaseInferenceContext = None,
-        packed_seq_params: PackedSeqParams = None,
+        cp_handler: ContextParallelHandler = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
@@ -323,7 +323,7 @@ class T5Model(LanguageModule):
             rotary_pos_emb = None
             if self.position_embedding_type == 'rope':
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.encoder, encoder_input, self.config, packed_seq_params
+                    inference_context, self.encoder, encoder_input, self.config, cp_handler
                 )
                 rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
@@ -382,7 +382,7 @@ class T5Model(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                inference_context, self.decoder, decoder_input, self.config, cp_handler
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 

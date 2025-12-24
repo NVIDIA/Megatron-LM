@@ -3,7 +3,7 @@
 
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.context_parallel import DefaultContextParallelHandler
 
 
 def get_padding(
@@ -59,7 +59,7 @@ def get_padding(
     return padding
 
 
-def get_packed_seq_params(tokens, img_seq_len, padding_needed, cp_size, use_packed_sequence=False):
+def get_cp_handler(tokens, img_seq_len, padding_needed, cp_size, use_packed_sequence=False):
     """Get PackedSeqParams for CP.
 
     Args:
@@ -70,7 +70,7 @@ def get_packed_seq_params(tokens, img_seq_len, padding_needed, cp_size, use_pack
         use_packed_sequence (bool): Uses sequence packing.
 
     Returns:
-        packed_seq_params (PackedSeqParams): Parameters to be sent to Transformer Engine.
+        cp_handler (PackedSeqParams): Parameters to be sent to Transformer Engine.
     """
     batch_size = tokens.shape[0]
     # Calculate the valid token seq len that LM backbone should compute on
@@ -98,7 +98,7 @@ def get_packed_seq_params(tokens, img_seq_len, padding_needed, cp_size, use_pack
         # CP with padding mask type requires THD format
         qkv_format = 'thd'
 
-    packed_seq_params = PackedSeqParams(
+    cp_handler = DefaultContextParallelHandler(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
@@ -108,4 +108,4 @@ def get_packed_seq_params(tokens, img_seq_len, padding_needed, cp_size, use_pack
         qkv_format=qkv_format,
     )
 
-    return packed_seq_params
+    return cp_handler

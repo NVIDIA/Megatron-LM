@@ -14,7 +14,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.context_parallel import DefaultContextParallelHandler
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -290,7 +290,7 @@ class TestMultiTokenPrediction:
             [0] + [sum(seq_lengths[: i + 1]) for i in range(len(seq_lengths))], dtype=torch.int32
         ).cuda()
 
-        packed_seq_params = PackedSeqParams(
+        cp_handler = DefaultContextParallelHandler(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=max(seq_lengths),
@@ -304,7 +304,7 @@ class TestMultiTokenPrediction:
             'loss_mask': loss_mask,
             'attention_mask': attention_mask,
             'position_ids': position_ids,
-            'packed_seq_params': packed_seq_params,
+            'cp_handler': cp_handler,
         }
         return batch
 
@@ -491,7 +491,7 @@ class TestMultiTokenPrediction:
         loss_mask = batch['loss_mask']
         attention_mask = batch['attention_mask']
         position_ids = batch['position_ids']
-        packed_seq_params = batch['packed_seq_params']
+        cp_handler = batch['cp_handler']
 
         # Create model
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -505,7 +505,7 @@ class TestMultiTokenPrediction:
             attention_mask=attention_mask,
             labels=labels,
             loss_mask=loss_mask,
-            packed_seq_params=packed_seq_params,
+            cp_handler=cp_handler,
         )
 
         # Verify output shape
@@ -543,7 +543,7 @@ class TestMultiTokenPrediction:
             tensor = torch.tensor([1, 2, 3, 4, 5], dtype=torch.float32).cuda()
             cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32).cuda()
 
-            packed_seq_params = PackedSeqParams(
+            cp_handler = DefaultContextParallelHandler(
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_kv=cu_seqlens,
                 max_seqlen_q=3,
@@ -553,7 +553,7 @@ class TestMultiTokenPrediction:
 
             # Roll by -1 (shift left)
             rolled, sum_val = roll_tensor(
-                tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
+                tensor, shifts=-1, dims=0, cp_group=cp_group, cp_handler=cp_handler
             )
 
             # Expected: [2, 3, 0, 5, 0] - boundaries at indices 2 and 4 are zeroed
@@ -584,7 +584,7 @@ class TestMultiTokenPrediction:
 
             cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
 
-            packed_seq_params = PackedSeqParams(
+            cp_handler = DefaultContextParallelHandler(
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_kv=cu_seqlens,
                 max_seqlen_q=6,  # max(4, 6) - max local seq length per sequence
@@ -594,7 +594,7 @@ class TestMultiTokenPrediction:
 
             # Roll by -1 (shift left) with CP communication
             rolled, sum_val = roll_tensor(
-                tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
+                tensor, shifts=-1, dims=0, cp_group=cp_group, cp_handler=cp_handler
             )
 
             # Verify the rolled tensor matches expected values

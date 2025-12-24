@@ -8,9 +8,9 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.dot_product_attention_context_parallel import (
     AttentionFuncionWithContextParallel,
@@ -153,10 +153,10 @@ class DotProductAttention(MegatronModule):
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
         attention_bias: Tensor = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
     ):
         """Forward."""
-        assert packed_seq_params is None, (
+        assert cp_handler is None, (
             "Packed sequence is not supported by DotProductAttention."
             "Please use TEDotProductAttention instead."
         )

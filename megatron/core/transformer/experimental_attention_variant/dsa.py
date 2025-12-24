@@ -8,12 +8,12 @@ from typing import Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
@@ -520,7 +520,7 @@ class DSAIndexer(MegatronModule):
         x: torch.Tensor,
         qr: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for DSA Indexer that returns both index scores and top-k indices.
@@ -531,29 +531,25 @@ class DSAIndexer(MegatronModule):
             x: hidden states [seqlen, batch, hidden_size].
             qr: Low-rank query tensor [seqlen, batch, q_lora_rank].
             mask: Attention mask [batch, seqlen, seqlen].
-            packed_seq_params: Packed sequence parameters for variable length sequences.
+            cp_handler: Packed sequence parameters for variable length sequences.
 
         Returns:
             index_scores: Index scores [batch, seqlen, seqlen].
             topk_indices: Top-k indices [batch, seqlen, index_topk].
         """
-        assert packed_seq_params is None, "Packed sequence is not supported for DSAttention"
+        assert cp_handler is None, "Packed sequence is not supported for DSAttention"
 
         # =========================================
         # Prepare RoPE params
         # =========================================
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            None, None, x, self.config, packed_seq_params
+            None, None, x, self.config, cp_handler
         )
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len, packed_seq_params=packed_seq_params
-            )
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, cp_handler=cp_handler)
             mscale = 1.0
         else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(
-                rotary_seq_len, packed_seq_params=packed_seq_params
-            )
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, cp_handler=cp_handler)
 
         # =========================================
         # Gather inputs if sp is enabled
@@ -621,7 +617,7 @@ class DSAIndexer(MegatronModule):
         x: torch.Tensor,
         qr: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
     ):
         """
         Forward pass for DSA Indexer.
@@ -630,12 +626,12 @@ class DSAIndexer(MegatronModule):
             x: hidden states [seqlen, batch, hidden_size].
             qr: Low-rank query tensor [seqlen, batch, q_lora_rank].
             mask: Attention mask [batch, seqlen, seqlen].
-            packed_seq_params: Packed sequence parameters for variable length sequences.
+            cp_handler: Packed sequence parameters for variable length sequences.
 
         Returns:
             topk_indices: Top-k indices for sparse attention [batch, seqlen, index_topk].
         """
-        _, topk_indices = self.forward_with_scores(x, qr, mask, packed_seq_params)
+        _, topk_indices = self.forward_with_scores(x, qr, mask, cp_handler)
         return topk_indices
 
 
@@ -739,7 +735,7 @@ class DSAttention(MegatronModule):
         attention_mask: torch.Tensor,
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
-        packed_seq_params: PackedSeqParams = None,
+        cp_handler: ContextParallelHandler = None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -753,7 +749,7 @@ class DSAttention(MegatronModule):
             attention_mask: Attention mask tensor [b, 1, sq, sk].
             attn_mask_type: Type of attention mask.
             attention_bias: Optional attention bias.
-            packed_seq_params: Packed sequence parameters.
+            cp_handler: Packed sequence parameters.
 
         Returns:
             output: Output tensor [sq, b, hidden_size]
@@ -789,7 +785,7 @@ class DSAttention(MegatronModule):
         # Get index scores and top-k indices
         # ===================================
         index_scores, topk_indices = self.indexer.forward_with_scores(
-            x, qr, mask=float_mask, packed_seq_params=packed_seq_params
+            x, qr, mask=float_mask, cp_handler=cp_handler
         )
 
         # ===================================

@@ -17,7 +17,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.context_parallel import DefaultContextParallelHandler
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
@@ -44,14 +44,14 @@ def make_test_packed_seq_params(sequence_length=None, cu_seqlens=None):
     cu_seqlens = torch.IntTensor(cu_seqlens).cuda()
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
     max_seqlen = seqlens.max().item()
-    packed_seq_params = PackedSeqParams(
+    cp_handler = DefaultContextParallelHandler(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         qkv_format='thd',
     )
-    return packed_seq_params
+    return cp_handler
 
 
 def make_test_packed_seq_params_with_padding(
@@ -79,7 +79,7 @@ def make_test_packed_seq_params_with_padding(
     max_seqlen, _ = seqlens_padded.max(dim=0, keepdim=True)
     max_seqlen = max_seqlen.tolist()[0]
 
-    packed_seq_params = PackedSeqParams(
+    cp_handler = DefaultContextParallelHandler(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
@@ -88,7 +88,7 @@ def make_test_packed_seq_params_with_padding(
         max_seqlen_kv=max_seqlen,
         qkv_format='thd',
     )
-    return packed_seq_params
+    return cp_handler
 
 
 def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
@@ -240,9 +240,9 @@ class TestParallelMLAAttention:
             hidden_states = hidden_states.cuda().bfloat16()
 
             attention_mask = None
-            packed_seq_params = make_test_packed_seq_params(sequence_length=sequence_length)
+            cp_handler = make_test_packed_seq_params(sequence_length=sequence_length)
             output, bias = self.parallel_attention(
-                hidden_states, attention_mask, packed_seq_params=packed_seq_params
+                hidden_states, attention_mask, cp_handler=cp_handler
             )
 
             assert config.recompute_granularity is None
@@ -271,19 +271,17 @@ class TestParallelMLAAttention:
             attention_mask = None
 
             # Create packed seq params with both regular and padded cu_seqlens
-            packed_seq_params = make_test_packed_seq_params_with_padding(
-                sequence_length=sequence_length
-            )
+            cp_handler = make_test_packed_seq_params_with_padding(sequence_length=sequence_length)
 
             # Verify that the PackedSeqParams has both regular and padded cu_seqlens
-            assert packed_seq_params.cu_seqlens_q is not None
-            assert packed_seq_params.cu_seqlens_kv is not None
-            assert packed_seq_params.cu_seqlens_q_padded is not None
-            assert packed_seq_params.cu_seqlens_kv_padded is not None
+            assert cp_handler.cu_seqlens_q is not None
+            assert cp_handler.cu_seqlens_kv is not None
+            assert cp_handler.cu_seqlens_q_padded is not None
+            assert cp_handler.cu_seqlens_kv_padded is not None
 
             # Test the forward pass with padded cu_seqlens
             output, bias = self.parallel_attention(
-                hidden_states, attention_mask, packed_seq_params=packed_seq_params
+                hidden_states, attention_mask, cp_handler=cp_handler
             )
 
             assert config.recompute_granularity is None
@@ -294,7 +292,7 @@ class TestParallelMLAAttention:
 
             # Test that the get_query_key_value_tensors function properly handles padded cu_seqlens
             query, key, value = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states, None, None, packed_seq_params, None
+                hidden_states, None, None, cp_handler, None
             )
 
             assert query is not None
@@ -592,10 +590,10 @@ class TestContextParallelMLAAttention:
             hidden_states = hidden_states.cuda()
 
             attention_mask = None
-            packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+            cp_handler = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             output, bias = self.parallel_attention(
-                hidden_states, attention_mask, packed_seq_params=packed_seq_params
+                hidden_states, attention_mask, cp_handler=cp_handler
             )
 
             assert config.recompute_granularity is None
@@ -672,14 +670,14 @@ class TestParallelMLAAttentionPrecision:
                 -1, 1, self.parallel_attention.config.hidden_size
             )
             attention_mask_thd = None
-            packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+            cp_handler = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             # fine-grained check
             query_sbhd, key_sbhd, value_sbhd = self.parallel_attention.get_query_key_value_tensors(
                 hidden_states_sbhd, None, None, None, None
             )
             query_thd, key_thd, value_thd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_thd, None, None, packed_seq_params, None
+                hidden_states_thd, None, None, cp_handler, None
             )
             _query_sbhd = query_sbhd.transpose(0, 1).contiguous().view(*query_thd.shape)
             _key_sbhd = key_sbhd.transpose(0, 1).contiguous().view(*key_thd.shape)
@@ -693,7 +691,7 @@ class TestParallelMLAAttentionPrecision:
                 key_sbhd,
                 value_sbhd,
                 attention_mask_sbhd,
-                packed_seq_params=None,
+                cp_handler=None,
                 attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             query_thd = query_thd.squeeze(1)
@@ -704,7 +702,7 @@ class TestParallelMLAAttentionPrecision:
                 key_thd,
                 value_thd,
                 attention_mask_thd,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
                 attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
@@ -728,7 +726,7 @@ class TestParallelMLAAttentionPrecision:
             )
             # thd
             output_thd, bias_thd = self.parallel_attention(
-                hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
+                hidden_states_thd, attention_mask_thd, cp_handler=cp_handler
             )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             assert torch.equal(_output_sbhd, output_thd)
@@ -825,14 +823,14 @@ class TestContextParallelMLAAttentionPrecision:
                 -1, 1, self.parallel_attention.config.hidden_size
             )
             attention_mask_thd = None
-            packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+            cp_handler = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             # fine-grained check
             query_sbhd, key_sbhd, value_sbhd = self.parallel_attention.get_query_key_value_tensors(
                 hidden_states_sbhd, None, None, None, None
             )
             query_thd, key_thd, value_thd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_thd, None, None, packed_seq_params, None
+                hidden_states_thd, None, None, cp_handler, None
             )
             _query_sbhd = query_sbhd.transpose(0, 1).contiguous().view(*query_thd.shape)
             _key_sbhd = key_sbhd.transpose(0, 1).contiguous().view(*key_thd.shape)
@@ -846,7 +844,7 @@ class TestContextParallelMLAAttentionPrecision:
                 key_sbhd,
                 value_sbhd,
                 attention_mask_sbhd,
-                packed_seq_params=None,
+                cp_handler=None,
                 attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             query_thd = query_thd.squeeze(1)
@@ -857,7 +855,7 @@ class TestContextParallelMLAAttentionPrecision:
                 key_thd,
                 value_thd,
                 attention_mask_thd,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
                 attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
@@ -881,7 +879,7 @@ class TestContextParallelMLAAttentionPrecision:
             )
             # thd
             output_thd, bias_thd = self.parallel_attention(
-                hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
+                hidden_states_thd, attention_mask_thd, cp_handler=cp_handler
             )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             torch.testing.assert_close(_output_sbhd, output_thd, atol=atol, rtol=rtol)
@@ -964,14 +962,14 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
                 -1, 1, self.parallel_attention.config.hidden_size
             )
             attention_mask_thd = None
-            packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+            cp_handler = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             # fine-grained check
             query_sbhd, key_sbhd, value_sbhd = self.parallel_attention.get_query_key_value_tensors(
                 hidden_states_sbhd, None, None, None, None
             )
             query_thd, key_thd, value_thd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_thd, None, None, packed_seq_params, None
+                hidden_states_thd, None, None, cp_handler, None
             )
             _query_sbhd = query_sbhd.transpose(0, 1).contiguous().view(*query_thd.shape)
             _key_sbhd = key_sbhd.transpose(0, 1).contiguous().view(*key_thd.shape)
@@ -985,7 +983,7 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
                 key_sbhd,
                 value_sbhd,
                 attention_mask_sbhd,
-                packed_seq_params=None,
+                cp_handler=None,
                 attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             query_thd = query_thd.squeeze(1)
@@ -996,7 +994,7 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
                 key_thd,
                 value_thd,
                 attention_mask_thd,
-                packed_seq_params=packed_seq_params,
+                cp_handler=cp_handler,
                 attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
@@ -1020,7 +1018,7 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             )
             # thd
             output_thd, bias_thd = self.parallel_attention(
-                hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
+                hidden_states_thd, attention_mask_thd, cp_handler=cp_handler
             )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             assert torch.equal(_output_sbhd, output_thd)
