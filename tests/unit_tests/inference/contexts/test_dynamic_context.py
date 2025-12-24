@@ -73,7 +73,7 @@ class TestDynamicContext:
             num_attention_heads=num_attention_heads,
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
-            use_cuda_graphs_for_non_decode_steps=not is_hybrid_model,
+            use_cuda_graphs_for_non_decode_steps=True,
             buffer_size_gb=buffer_size_gb,
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
