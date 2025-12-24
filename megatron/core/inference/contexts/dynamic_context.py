@@ -442,8 +442,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Set max_requests, max_tokens.
         if max_requests is None:
-            # max_requests is very conservative by default.
-            self.max_requests = self.block_allocator.active_count // self.max_kv_block_count
+            # Maximize compute utilization by defaulting to 1 block per request.
+            self.max_requests = self.block_allocator.total_count - 1  # -1 for dummy block
             self.max_requests = self.max_requests // tp_size * tp_size
             self.max_requests = self.max_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
         else:
@@ -1736,64 +1736,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return active_request_count, resume_request_count, newly_paused_request_ids
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # def evict_overflow_requests(self, next_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    #     """Evict requests that overflow the paused buffer.
-
-    #     Args:
-    #         next_tokens (torch.Tensor): Sampled tokens.
-
-    #     Returns:
-    #         (torch.Tensor) Evicted request ids.
-    #     """
-
-    #     # Evict overflowing requests in the paused buffer.
-    #     evict_request_count = (
-    #         self.block_allocator.get_paused_used()
-    #         - self.block_allocator.paused_count
-    #     )
-
-    #     evict_request_ids = None
-    #     if evict_request_count > 0:
-
-    #         # Eviction index range.
-    #         evict_start_idx = self.paused_request_count - evict_request_count
-    #         evict_end_idx = self.paused_request_count
-    #         evict_request_idxs = torch.arange(
-    #             evict_start_idx,
-    #             evict_end_idx,
-    #             device=torch.cuda.current_device(),
-    #         )
-    #         evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
-
-    #         # Release memory.
-    #         self.release_memory_blocks_from_request_indexes(evict_request_idxs)
-
-    #         # Move active requests to replace evicted paused requests.
-    #         src_idxs = torch.arange(
-    #             self.paused_request_count,
-    #             self.total_request_count,
-    #             device=torch.cuda.current_device(),
-    #         )
-    #         dst_idxs = torch.arange(
-    #             self.paused_request_count - evict_request_count,
-    #             self.total_request_count - evict_request_count,
-    #             device=torch.cuda.current_device(),
-    #         )
-
-    #         self._move_book_keeping_tensors(
-    #             src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
-    #         )
-
-    #         # Update tracking vars.
-    #         self.paused_request_count -= evict_request_count
-    #         self.total_request_count -= evict_request_count
-
-    #         # Reset unused block ids.
-    #         self.request_to_kv_block_ids[self.total_request_count:(self.total_request_count + evict_request_count)] = -1
-
-    #     return evict_request_ids
-    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     def evict_overflow_requests(self, next_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Evict requests that overflow the paused buffer.
 
@@ -1823,16 +1765,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Evict request count.
         evict_request_count = torch.nonzero(paused_block_counts_cumsum <= evict_block_count).numel()
-
-        # >>>
-        if evict_block_count != evict_request_count:
-            from lutil import pax
-            pax({
-                "paused_used" : self.block_allocator.get_paused_used(),
-                "paused count" : self.block_allocator.paused_count,
-            }, "paused_block_counts, paused_block_counts_cumsum",
-                "evict_block_count, evict_request_count")
-        # <<<
 
         # Eviction index range.
         evict_start_idx = self.paused_request_count - evict_request_count
@@ -1871,7 +1803,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_to_kv_block_ids[self.total_request_count:(self.total_request_count + evict_request_count)] = -1
 
         return evict_request_ids
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
