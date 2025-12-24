@@ -25,6 +25,7 @@ class ModuleSpec:
     module: Union[Tuple, type]
     params: dict = field(default_factory=lambda: {})
     submodules: type = None
+    metainfo: dict = field(default_factory=lambda: {})
 
 
 def import_module(module_path: Tuple[str]):
@@ -37,11 +38,12 @@ def import_module(module_path: Tuple[str]):
     try:
         module = __import__(base_path, globals(), locals(), [name])
     except ImportError as e:
-        print(f"couldn't import module due to {e}")
+        print(f"couldn't import module due to {e}")  # pylint: disable=bad-builtin
         return None
     return vars(module)[name]
 
 
+# pylint: disable=missing-function-docstring
 def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
     # If a module clas is already provided return it as is
     if isinstance(spec_or_module, (type, types.FunctionType)):
