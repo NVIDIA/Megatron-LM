@@ -20,6 +20,7 @@ from contextlib import nullcontext
 from functools import reduce
 from importlib.metadata import version
 from typing import Callable, List, Optional, Sequence, Union
+import megatron.core.parallel_state as parallel_state
 
 try:
     import einops
@@ -736,6 +737,15 @@ class FSDPDistributedIndex:
             if contains_submesh(self.device_mesh, self.dp_shard_dim)
             else None
         )
+        # AG group comes from parallel_state, not the mesh
+        self.fsdp_group_ag = (
+            parallel_state.get_data_parallel_group(
+                    with_context_parallel=True,
+                    all_gather=True
+                )
+            if parallel_state.has_separate_all_gather_group()
+            else None
+        )
         # Retrieve the outer-FSDP process group from the DeviceMesh.
         self.outer_fsdp_group = (
             self.device_mesh[self.dp_outer_dim].get_group()
@@ -870,10 +880,12 @@ class FSDPDistributedIndex:
             return self.hybrid_fsdp_group
         return self.fsdp_group
 
-    def get_fsdp_group(self, is_expert_parallel: bool = False) -> ProcessGroup:
+    def get_fsdp_group(self, is_expert_parallel: bool = False, all_gather: bool = False) -> ProcessGroup:
         """Get the FSDP process group."""
         if is_expert_parallel:
             return self.expt_fsdp_group
+        if all_gather:
+            return self.fsdp_group_ag
         return self.fsdp_group
 
     def get_outer_fsdp_group(self) -> ProcessGroup:
