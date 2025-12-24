@@ -156,7 +156,7 @@ class DotProductAttention(MegatronModule):
         cp_handler: Optional[ContextParallelHandler] = None,
     ):
         """Forward."""
-        assert cp_handler is None, (
+        assert cp_handler is None or cp_handler.qkv_format == "sbhd", (
             "Packed sequence is not supported by DotProductAttention."
             "Please use TEDotProductAttention instead."
         )

@@ -25,13 +25,11 @@ def get_cp_handler_cls(
     Raises:
         ValueError: If an unsupported backend is provided.
     """
-    if backend == "transformer_engine":
+    if backend == "transformer_engine" or backend == "local":
         return DefaultContextParallelHandler
     elif backend == "magi":
         return MagiAttnContextParallelHandler
+    elif backend == "transformer_engine_dynamic":
+        return TEDynamicContextParallelHandler
     else:
-        # Defaults or error handling for other backends
-        if backend == "local":
-            pass
-
         raise ValueError(f"Unsupported attention backend for context parallel: {backend}")

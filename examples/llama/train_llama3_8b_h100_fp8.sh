@@ -31,14 +31,14 @@ PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 
 # Fixed model and training parameters
 TP_SIZE=1     
-CP_SIZE=4
+CP_SIZE=1     
 PP_SIZE=1     
 MICRO_BATCH_SIZE=1
-GLOBAL_BATCH_SIZE=32
-NUM_LAYERS=8
+GLOBAL_BATCH_SIZE=128
+NUM_LAYERS=32  
 DTYPE="fp8"
-SEQ_LENGTH=32768
-MAX_POSITION_EMBEDDINGS=32768
+SEQ_LENGTH=8192
+MAX_POSITION_EMBEDDINGS=8192
 
 # Data cache path (useful for both mock and real data)
 DATA_CACHE_PATH="${PWD}/benchmark_cache_llama3_8b_fp8"
@@ -58,6 +58,8 @@ MODEL_ARGS=(
     --hidden-size 4096
     --ffn-hidden-size 14336
     --num-attention-heads 32
+    --group-query-attention
+    --num-query-groups 8
     --kv-channels 128
     --seq-length $SEQ_LENGTH
     --max-position-embeddings $MAX_POSITION_EMBEDDINGS
@@ -72,16 +74,14 @@ MODEL_ARGS=(
     --apply-layernorm-1p 
     --untie-embeddings-and-output-weights
     --disable-bias-linear 
-    --multi-latent-attention
-    --no-rope-fusion
 )
 
 TRAINING_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
-    --train-samples 19531250
-    --lr-decay-samples 19492187
-    --lr-warmup-samples 39062
+    --train-samples 1953125000
+    --lr-decay-samples 1949218748
+    --lr-warmup-samples 3906252
     --lr 0.00015
     --min-lr 0.00001
     --decoupled-lr 5.0e-4      # Specific to decoupled AdamW, ensure optimizer is compatible

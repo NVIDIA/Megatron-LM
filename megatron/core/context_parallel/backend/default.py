@@ -343,10 +343,7 @@ class InterleavedCombineFwdDispatchBwd(torch.autograd.Function):
         Returns:
             Tuple: Gradient w.r.t local input, None, None.
         """
-        grad_aggregated = grad_output.clone()
-        dist.all_reduce(grad_aggregated, op=dist.ReduceOp.SUM, group=ctx.cp_group)
-
-        grad_view = _view_as_chunks(grad_aggregated, ctx.seq_dim, ctx.cp_size)
+        grad_view = _view_as_chunks(grad_output, ctx.seq_dim, ctx.cp_size)
         indices = _get_interleaved_indices(ctx.cp_rank, ctx.cp_size, grad_output.device)
         local_grad_view = grad_view.index_select(ctx.seq_dim, indices)
 
@@ -568,20 +565,16 @@ class PackedCombineFwdDispatchBwd(torch.autograd.Function):
         meta = ctx.meta
         seq_dim = meta["seq_dim"]
 
-        # 1. AllReduce Compact Grad
-        grad_aggregated = grad_output.clone()
-        dist.all_reduce(grad_aggregated, op=dist.ReduceOp.SUM, group=meta["cp_group"])
-
-        # 2. Compact -> Padded
+        # 1. Compact -> Padded
         padded_grad = _copy_compact_to_padded(
-            grad_aggregated,
+            grad_output,
             meta["padded_shape"],
             meta["seqlens_list"],
             meta["seqlens_with_padded_list"],
             seq_dim,
         )
 
-        # 3. Slice Local part
+        # 2. Slice Local part
         local_indices = _get_packed_indices(
             cu_seqlens_padded,
             meta["total_seqlen_padded"],
