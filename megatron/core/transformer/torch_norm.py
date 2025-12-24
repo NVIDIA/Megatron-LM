@@ -10,6 +10,16 @@ class WrappedTorchNorm:
     """
     A conditional wrapper to initialize an instance of PyTorch's
     `LayerNorm` or `RMSNorm` based on input
+
+    Args:
+      config (TransformerConfig): Transformer config.
+
+      hidden_size (int): Transformer hidden dimension.
+
+      eps (float): Epsilon added to denominator, for numerical stability.
+
+      maybe_fuse_quantize (bool): Whether to fuse quantize. Added for compatibility with
+                                  Transformer Engine.
     """
 
     def __new__(
@@ -17,11 +27,7 @@ class WrappedTorchNorm:
         config: TransformerConfig,
         hidden_size: int,
         eps: float = 1e-5,
-        # TODO: unused arguments.
-        # See https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/223
-        persist_layer_norm: bool = False,
-        zero_centered_gamma: bool = False,
-        normalization: str = "LayerNorm",
+        maybe_fuse_quantize: bool = False,
     ):
         assert (
             not config.layernorm_zero_centered_gamma
