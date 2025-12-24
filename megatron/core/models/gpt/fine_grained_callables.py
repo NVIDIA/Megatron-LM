@@ -300,8 +300,9 @@ class TransformerLayerNode(ScheduleNode):
 
         # the output grad memory is last used in wgrad compute, should be safe to release.
         assert self.delay_grads_release, "output grad memory should be valid before wgrad."
-        for tensor in self.output_grads:
-            tensor.untyped_storage().resize_(0)
+        if self.manual_release_grads:
+            for tensor in self.output_grads:
+                tensor.untyped_storage().resize_(0)
         self.output_grads = None
 
         self.bwd_dw_callables = None
