@@ -47,6 +47,11 @@ if __name__ == "__main__":
 
         mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
+        # Enable return_log_probs to allow prompt logprobs computation for echo=True requests
+        # This sets materialize_only_last_token_logits=False in the inference context,
+        # which is required for lm-eval compatibility (loglikelihood evaluation tasks)
+        args.return_log_probs = True
+
         context = get_inference_context(
             None,
             None,

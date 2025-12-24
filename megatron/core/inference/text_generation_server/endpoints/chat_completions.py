@@ -52,14 +52,16 @@ async def chat_completions():
             top_k = 1
             top_p = 0.0
 
-        # Check for 'logprobs' (bool)
+        # Check for 'logprobs' (bool) and 'top_logprobs' (int)
         return_log_probs = bool(req.get("logprobs", False))
+        top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
 
         sampling_params = SamplingParams(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
             return_log_probs=return_log_probs,
+            top_n_logprobs=top_n_logprobs,
             num_tokens_to_generate=int(req.get("max_tokens", 16)),
         )
     except ValueError as e:
@@ -74,6 +76,7 @@ async def chat_completions():
             top_k=sampling_params.top_k,
             top_p=sampling_params.top_p,
             return_log_probs=sampling_params.return_log_probs,
+            top_n_logprobs=sampling_params.top_n_logprobs,
             num_tokens_to_generate=sampling_params.num_tokens_to_generate,
         )
         tasks.append(client.add_request(prompt_tokens, per_req_params))
@@ -104,16 +107,27 @@ async def chat_completions():
                 token_logprobs = getattr(result, 'log_probs', [])
                 tokens = [tokenizer.detokenize([tok]) for tok in result.generated_tokens]
 
+                # Get top_n_logprobs if available
+                generated_top_n_logprobs = getattr(result, 'generated_top_n_logprobs', None)
+
                 logprobs_content = []
-                for tok, lp in zip(tokens, token_logprobs):
-                    # The original server's 'result' object only provides the
-                    # logprob for the *chosen* token, not 'top_logprobs'.
-                    # We map what we have to the new API format.
+                for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):
+                    # Build top_logprobs list for this token position
+                    top_logprobs_list = []
+                    if generated_top_n_logprobs and i < len(generated_top_n_logprobs):
+                        top_n_dict = generated_top_n_logprobs[i]
+                        for token_str, logprob in top_n_dict.items():
+                            top_logprobs_list.append({
+                                "token": token_str,
+                                "logprob": logprob,
+                                "bytes": list(token_str.encode("utf-8")),
+                            })
+
                     entry = {
                         "token": tok,
                         "logprob": lp,
-                        "bytes": list(tok.encode("utf-8")),  # OpenAI API includes this
-                        "top_logprobs": [],  # We don't have this data from the engine
+                        "bytes": list(tok.encode("utf-8")),
+                        "top_logprobs": top_logprobs_list,
                     }
                     logprobs_content.append(entry)
 
