@@ -680,7 +680,9 @@ class LLaVAModel(MegatronModule):
             combined_embeddings (torch.Tensor): image and text embeddings combined and distributed.
             new_labels (torch.Tensor): Distributed labels for image and text positions.
             new_loss_mask (torch.Tensor): Distributed loss mask.
-            cp_handler (PackedSeqParams): Dict with padded token information.
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
 
         """
 
@@ -822,9 +824,9 @@ class LLaVAModel(MegatronModule):
                 arg in the constructor will be used.
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
-            cp_handler (PackedSeqParams): 1) If using sequence packing, must contain
-                subsample length information. 2) If using SP/CP with padding mask type,
-                must contain padded token information.
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
 
         Returns:
             output (torch.Tensor): Loss of shape [b, s] if labels are provided,

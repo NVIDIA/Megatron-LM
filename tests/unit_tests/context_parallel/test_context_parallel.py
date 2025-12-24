@@ -2,37 +2,17 @@
 
 import pytest
 import torch
-from torch import Tensor
 
+from megatron.core import parallel_state
+from megatron.core.context_parallel import get_cp_handler_cls
+from megatron.core.models.common.embeddings import RotaryEmbedding
+from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.context_parallel import DefaultContextParallelHandler, get_cp_handler_cls
-from megatron.core import parallel_state
-
-from megatron.core.models.common.embeddings import RotaryEmbedding
-from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-from megatron.core.process_groups_config import ProcessGroupCollection
-
-
-import torch
-import pytest
-from typing import Optional
-
-# Assuming necessary imports are available in the running environment:
-# from megatron.core import parallel_state, Utils
-# from megatron.core.transformer.transformer_config import TransformerConfig
-# from megatron.core.transformer.custom_layers.transformer_engine import get_gpt_layer_with_transformer_engine_spec
-# from megatron.core.transformer.attention import SelfAttention, AttnMaskType
-# from megatron.core.models.gpt.gpt_embedding import RotaryEmbedding
-# from megatron.core.distributed import ProcessGroupCollection
-# from megatron.core.context_parallel.utils import get_cp_handler_cls
-# from megatron.core.utils import apply_rotary_pos_emb
 
 
 class TestContextParallelHandler:

@@ -184,7 +184,9 @@ class RotaryEmbedding(nn.Module):
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
-            cp_handler (ContextParallelHandler, optional): Packed sequence params. Defaults to None.
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -222,7 +224,9 @@ class RotaryEmbedding(nn.Module):
                 by the model
             transformer_input (Tensor): Input tensor to the transformer
             transformer_config (TransformerConfig): Transformer config used by the model
-            cp_handler (ContextParallelHandler): Packed sequence params
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
 
         Returns:
             int: The rotary sequence length
@@ -311,7 +315,9 @@ class MultimodalRotaryEmbedding(nn.Module):
             position_ids (torch.Tensor): A postion_id tensor with shape [3, batchsize, seqlens]
             mrope_section (list[int]): Multimodal rope section is for channel dimension of temporal,
                 height and width in rope calculation.
-            cp_handler (ContextParallelHandler, optional): Packed sequence params. Defaults to None.
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.

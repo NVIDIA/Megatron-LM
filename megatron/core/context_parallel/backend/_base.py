@@ -30,10 +30,10 @@ class ContextParallelHandler(ABC):
     max_seqlen_q: Optional[int] = None
     max_seqlen_kv: Optional[int] = None
 
-    # 在dcp中使用
+    # Used in DCP (dynamic context parallel)
     local_cp_size: Optional[int] = None
 
-    # 在DefaultContextParallelHandler中使用
+    # Used in DefaultContextParallelHandler
     seqlens_q_list: Optional[List[int]] = None
     seqlens_kv_list: Optional[List[int]] = None
     seqlens_q_padded: Optional[torch.Tensor] = None

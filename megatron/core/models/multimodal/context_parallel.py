@@ -70,7 +70,9 @@ def get_cp_handler(tokens, img_seq_len, padding_needed, cp_size, use_packed_sequ
         use_packed_sequence (bool): Uses sequence packing.
 
     Returns:
-        cp_handler (PackedSeqParams): Parameters to be sent to Transformer Engine.
+        cp_handler (ContextParallelHandler): A unified abstraction that encapsulates
+            Context Parallelism communication details and exposes a backend-agnostic
+            interface for model integration. Defaults to None.
     """
     batch_size = tokens.shape[0]
     # Calculate the valid token seq len that LM backbone should compute on

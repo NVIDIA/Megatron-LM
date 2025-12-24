@@ -628,8 +628,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 Used as an alternative to apply attention mask for TE cuDNN attention.
             inference_context (BaseInferenceContext, optional): Parameters for inference-time
                 optimizations.
-            cp_handler (ContextParallelHandler, optional): Parameters for packed sequence
-                processing.
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
             dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
                 inference context is for decode-only. This args is only used to uniquely
                 identify decode and non-decode cuda graph runners in the cuda graph manager.

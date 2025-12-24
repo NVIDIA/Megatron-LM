@@ -1957,11 +1957,9 @@ def get_batch_on_this_cp_rank(
 
     Args:
         batch (Dict[str, Any]): Input batch tensors.
-        cp_handler (ContextParallelHandler): The context parallel handler. It abstracts away
-            the specific details of context parallelism and serves two main purposes:
-            1. Implements context parallel methods (e.g., dispatch, combine).
-            2. Provides a unified interface for necessary source code modifications,
-               preventing context parallel logic from being scattered throughout the codebase.
+        cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+            Context Parallelism communication details and exposes a backend-agnostic
+            interface for model integration. Defaults to None.
     """
 
     # With causal masking, each token only attends to its prior tokens. Simply split

@@ -166,7 +166,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
-            cp_handler (ContextParallelHandler, optional): Packed sequence params. Defaults to None.
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying Yarn RoPE.

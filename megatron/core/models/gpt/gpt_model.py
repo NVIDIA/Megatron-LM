@@ -728,8 +728,9 @@ class GPTModel(LanguageModule):
             labels (Tensor, optional): Labels for loss computation. Defaults to None.
             inference_context (BaseInferenceContext, optional):
                 Inference context. Defaults to None.
-            cp_handler (ContextParallelHandler, optional):
-                Parameters for packed sequences. Defaults to None.
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
             extra_block_kwargs (dict, optional):
                 Additional keyword arguments for blocks. Defaults to None.
             runtime_gather_output (Optional[bool], optional):

@@ -718,7 +718,9 @@ class Attention(MegatronModule, ABC):
             rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
             Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             attention_bias (Optional[Tensor]): Attention bias.
-            cp_handler (Optional[PackedSeqparams]): Parameters used for THD format.
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
 

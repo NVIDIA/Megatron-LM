@@ -147,8 +147,9 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, cp_handler=None):
         dims (int): The dimension to roll (typically -1 for sequence dimension).
         cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
                                falls back to standard rolling behavior.
-        cp_handler (ContextParallelHandler): Parameters for packed sequence processing.
-                                            If provided, respects sequence boundaries.
+        cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+            Context Parallelism communication details and exposes a backend-agnostic
+            interface for model integration. Defaults to None.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
@@ -704,7 +705,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 from gpt model to compute the decoder input.
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
-            cp_handler (ContextParallelHandler): Parameters for packed sequence processing.
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
         """
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
         input_ids, _ = roll_tensor(

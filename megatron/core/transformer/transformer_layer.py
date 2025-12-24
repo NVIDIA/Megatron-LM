@@ -11,9 +11,9 @@ import torch.distributed
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.packed_seq_params import PackedSeqParams
 
 # from megatron.core.context_parallel import ContextParallelHandler
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -474,7 +474,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         inference_context: Optional[Any] = None,
-        cp_handler: Optional[PackedSeqParams] = None,
+        cp_handler: Optional[ContextParallelHandler] = None,
         sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
@@ -496,7 +496,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             attention_bias (Tensor, optional): Bias tensor for Q * K.T.
             inference_context (object, optional): Parameters for inference-time optimizations.
-            cp_handler (object, optional): Parameters for packed sequence processing.
+            cp_handler (ContextParallelHandler, optional): A unified abstraction that encapsulates
+                Context Parallelism communication details and exposes a backend-agnostic
+                interface for model integration. Defaults to None.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
 
