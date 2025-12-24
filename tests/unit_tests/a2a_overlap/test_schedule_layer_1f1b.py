@@ -306,7 +306,7 @@ class TestA2AOverlap:
             "moe_shared_expert_intermediate_size": 512,
         }
         overlap_config = get_test_config(extra_kwargs=extra_kwargs)
-        extra_kwargs["moe_shared_expert_overlap"] = True
+        extra_kwargs["moe_shared_expert_overlap"] = False
         ref_config = get_test_config(extra_kwargs=extra_kwargs)
         microbatches = 4
         with deterministic_mode():
