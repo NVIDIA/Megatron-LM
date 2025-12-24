@@ -996,57 +996,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return False
 
-    def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
-        """Get and clear the set of request IDs that should be finished due to stop words.
-
-        This callback is called from the controller during bookkeeping to get request IDs
-        that were detected as hitting stop words in the previous step's post_process_requests.
-
-        Args:
-            active_request_ids: List of currently active request IDs.
-
-        Returns:
-            Set of request IDs from active_request_ids that should be marked as finished.
-        """
-        if not self.stop_word_finished_request_ids:
-            return set()
-
-        # Find which stop word finished IDs are in the current active requests
-        result = self.stop_word_finished_request_ids & set(active_request_ids)
-        # Move to "being finished" set so post_process_requests can skip the extra token
-        self.stop_word_being_finished_ids = result
-        # Clear the IDs that we're returning (they'll be marked as finished)
-        self.stop_word_finished_request_ids -= result
-        return result
-
-    def _check_stop_words_for_request_post_append(self, request: DynamicInferenceRequest) -> bool:
-        """Check if a request should stop due to stop words (after token is appended).
-
-        This method is called from post_process_requests after the token has already
-        been appended to request.generated_tokens.
-
-        Args:
-            request: The request to check.
-
-        Returns:
-            bool: True if the generated sequence ends with a stop word, False otherwise.
-        """
-        # Check if request has stop words configured
-        if request.stop_word_ids is None or len(request.stop_word_ids) == 0:
-            return False
-
-        generated_tokens = request.generated_tokens
-
-        # Check if the sequence ends with any stop word
-        for stop_word_ids in request.stop_word_ids:
-            stop_len = len(stop_word_ids)
-            if len(generated_tokens) >= stop_len:
-                # Check if the last stop_len tokens match the stop word
-                if list(generated_tokens[-stop_len:]) == stop_word_ids:
-                    return True
-
-        return False
-
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
         if self.enable_chunked_prefill:
