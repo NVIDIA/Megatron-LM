@@ -3,6 +3,7 @@
 import enum
 import sys
 import copy
+import nvtx
 from collections import deque
 from functools import lru_cache
 import math
@@ -129,7 +130,7 @@ def wrap_dataloader(
         global_ids_this_rank: list of global IDs locally present on this rank.
         """
         dp_rank = dp_group.rank()
-        global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32).cuda()
+        global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32)
         # Create a list of (global_id, seqlen) tuples for scheduling
         global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(len(global_ids))]
         # Get the global IDs locally present on this rank
@@ -147,6 +148,17 @@ def wrap_dataloader(
             torch.distributed.get_process_group_ranks(dp_group)[dp_src_rank] // tp_group.size()
         ) % dp_cp_group.size()
         return hdp_rank
+
+    def cast_inputs_device(inputs, device, skip_device={}):
+        if isinstance(inputs, (list, tuple)):
+            return inputs.__class__(cast_inputs_device(v, device, skip_device) for v in inputs)
+        elif isinstance(inputs, dict):
+            return {k: v if k in skip_device else cast_inputs_device(v, device, skip_device=skip_device) for k, v in inputs.items()}
+        elif isinstance(inputs, torch.Tensor):
+            if not inputs.is_cuda:
+                inputs = inputs.to(device=device, non_blocking=True) # here input is expected to be pinned
+
+        return inputs
 
     def _reroute_samples_to_hdp_ranks(
         batch,
@@ -410,6 +422,7 @@ def wrap_dataloader(
 
             # batch is a list of samples: List[MegatronDataset]
             batch = next(data_iterator)
+            batch = cast_inputs_device(batch, dev)
             # print(f"{batch=}")
             num_micro_batches = batch[0]["num_micro_batches_left"] + 1
 
@@ -434,24 +447,32 @@ def wrap_dataloader(
 
         elif (
             scheduler_type is PackingScheduler.HYBRID_CP
+            or scheduler_type is PackingScheduler.HYBRID_CP_WITH_PP
             or scheduler_type is PackingScheduler.NAIVE_SEQUENCE_PACKING
         ):
             batch = next(data_iterator)
+            batch = cast_inputs_device(batch, dev)
             subsample_seqlens = []
             for sample in batch:
                 subsample_seqlens.extend([sample["tokens"].numel()])
             subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
             subsample_seqlens = subsample_seqlens[subsample_seqlens != 0]
 
+            nvtx.push_range("_get_global_seqlens")
             seqlens_gathered, offsets = _get_global_seqlens(subsample_seqlens, dp_group)
+            nvtx.pop_range()
 
+            nvtx.push_range("_get_global_id_seqlens")
             global_id_seqlens, global_ids_this_rank = _get_global_id_seqlens(
                 subsample_seqlens.shape[0], offsets, seqlens_gathered, dp_group
             )
+            nvtx.pop_range()
 
+            nvtx.push_range("scheduler.get_groups_and_subsamples")
             groups, sample_id_groups = scheduler.get_groups_and_subsamples(
                 global_id_seqlens, config
             )
+            nvtx.pop_range()
 
             # TODO(tailaim): remove this after testing
             set_gbs = set()
@@ -463,7 +484,11 @@ def wrap_dataloader(
             ), f"set_gbs length: {len(set_gbs)} \
             != global_ids_this_rank length: {len(global_id_seqlens)}"
 
+            nvtx.push_range("_unpack_batch")
             batch = _unpack_batch(batch)
+            nvtx.pop_range()
+            
+            nvtx.push_range("_reroute_samples_to_hdp_ranks")
             samples_this_rank_with_id = _reroute_samples_to_hdp_ranks(
                 batch,
                 global_ids_this_rank,
@@ -475,6 +500,7 @@ def wrap_dataloader(
                 dp_cp_group,
                 total_hdp_gpus,
             )
+            nvtx.pop_range()
             batch, sample_id_groups = samples_this_rank_with_id, sample_id_groups
 
             hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
@@ -501,7 +527,9 @@ def wrap_dataloader(
                     if config.hybrid_context_parallel
                     else None
                 )
+                nvtx.push_range("_pack_sequences")
                 new_sample = _pack_sequences(samples, partner_cp_size)
+                nvtx.pop_range()
                 new_samples.append(new_sample)
 
         # TODO(tailaim): do we need to move this to collate function?
@@ -1295,7 +1323,8 @@ def greedy_assign_bucket_to_dp(curr_m, indices_buckets, normal_indexes, except_b
             bwd_flops_for_dp_per_m[bucket_tmp.dp_index].append(bucket_tmp.bwd_flops)
             
             # construct 2d array
-            seq_len_for_dp_per_m[bucket_tmp.dp_index].append([bucket_tmp.seq_len_sum])
+            # correction for memory simulator
+            seq_len_for_dp_per_m[bucket_tmp.dp_index].append([bucket_tmp.seq_len_sum // bucket_tmp.cp_size // config.min_hybrid_context_parallel_size * config.context_parallel_size])
             
             # 更新DP rank的负载统计
             fwd_flops_sum_per_dp_this_m[bucket_tmp.dp_index] += bucket_tmp.fwd_flops[0]
@@ -1386,7 +1415,8 @@ def greedy_assign_bucket_to_dp(curr_m, indices_buckets, normal_indexes, except_b
         # bwd_flops_for_dp_per_m[min_flops_dp_rank].append(used_bwd_flops[bucket_id])
         fwd_flops_for_dp_per_m[min_flops_dp_rank].append(bucket_tmp.fwd_flops)
         bwd_flops_for_dp_per_m[min_flops_dp_rank].append(bucket_tmp.bwd_flops)
-        seq_len_for_dp_per_m[min_flops_dp_rank].append([bucket_tmp.seq_len_sum])
+        # correction for memory simulator
+        seq_len_for_dp_per_m[min_flops_dp_rank].append([bucket_tmp.seq_len_sum // config.min_hybrid_context_parallel_size * config.context_parallel_size])
         buckets_for_dp[min_flops_dp_rank].append(bucket_tmp)
         sample_ids_for_dp[min_flops_dp_rank].append(bucket_tmp.samples)
 
@@ -1744,7 +1774,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
             cp_size = self.gpus_needed(seq_length)
         return (seq_length * seq_length) / cp_size
 
-    def get_groups_and_subsamples(self, sample_id_seqlens, config):
+    def get_groups_and_subsamples(self, sample_id_seqlens, config, return_cp_sizes=False):
         """
         This function recursively forms groups of sub-samples such that all DPxCP ranks
         have a roughly balanced workload in the group.
@@ -1790,26 +1820,49 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         local_sample_id_groups = transpose_2d_list(best_sample_ids)
         local_best_indices_buckets = transpose_2d_list(best_indices_buckets)
         # groups = 
+        min_hybrid_context_parallel_size = config.min_hybrid_context_parallel_size
         for microbatch_idx in range(len(local_sample_id_groups)):
             sample_id_groups.append([])
             groups.append([])
             cp_sizes.append([])
-            for dp_rank in range(len(local_sample_id_groups[microbatch_idx])):
+            dpxcp = len(local_sample_id_groups[microbatch_idx]) * min_hybrid_context_parallel_size
+            for dp_rank in range(dpxcp):
+                # for min_hybrid_context_parallel_rank in range(min_hybrid_context_parallel_size):
                 sample_id_groups[microbatch_idx].append([])
                 groups[microbatch_idx].append([])
                 cp_sizes[microbatch_idx].append([])
-                for local_sample_idx in local_sample_id_groups[microbatch_idx][dp_rank]:
+                origin_dp_rank = dp_rank // min_hybrid_context_parallel_size
+                # if torch.distributed.get_rank() == 0: print(f"{microbatch_idx=}, {dp_rank=}, {origin_dp_rank=}, {local_sample_id_groups[microbatch_idx][origin_dp_rank]=}")
+                for local_sample_idx in local_sample_id_groups[microbatch_idx][origin_dp_rank]:
                     sample_id_groups[microbatch_idx][dp_rank].append(sample_id_seqlens[local_sample_idx][0])
                     groups[microbatch_idx][dp_rank].append(sample_id_seqlens[local_sample_idx][1])
-                    cp_sizes[microbatch_idx][dp_rank].append(local_best_indices_buckets[microbatch_idx][dp_rank].cp_size)
+                    final_cp_size = local_best_indices_buckets[microbatch_idx][origin_dp_rank].cp_size * min_hybrid_context_parallel_size
+                    cp_sizes[microbatch_idx][dp_rank].append(final_cp_size)
 
-
+        # if torch.distributed.get_rank() == 0: print(f"{sample_id_groups=}")
+        # if torch.distributed.get_rank() == 0: print(f"{cp_sizes=}")
         # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {groups=}")
-        if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}")
+        # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}")
+        def flatten(lst):
+            result = []
+            for item in lst:
+                if isinstance(item, list):
+                    result.extend(flatten(item))
+                else:
+                    result.append(item)
+            return result
+
+        # 示例
+        # nested_list = [1, [2, 3], [4, [5, 6]], 7]
+        # print(flatten(nested_list))  # [1, 2, 3, 4, 5, 6, 7]
+
+        # print(f"rank={torch.distributed.get_rank()}, {flatten(sample_id_groups)=}")
         # breakpoint()
 
-        return groups, sample_id_groups, cp_sizes
+        if return_cp_sizes:
+            return groups, sample_id_groups, cp_sizes
 
+        return groups, sample_id_groups
     def split_sample(
         self,
         num_buckets: List[int],
@@ -2321,7 +2374,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                             "imbalanced_bubble_over_compute_time":imbalanced_bubble_over_compute_time,
                         })
 
-                        # print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
+                        # print(f"rank={torch.distributed.get_rank()}, {seq_len_for_dp=}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
                         if peak_memory >= 70 * 1024**3:
                             max_sum_per_iter = sys.float_info.max / 10.0    # skip this m
 

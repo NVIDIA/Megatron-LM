@@ -529,7 +529,7 @@ def wrap_iterator_helper(
                     num_total_tokens_this_GB,
                     sequence_square_sum_this_GB,
                 ) = wrap_dataloader(
-                    data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
+                    data_iterator, config, PackingScheduler.HYBRID_CP_WITH_PP, pg_collection=None
                 )
             elif config.hybrid_context_parallel_scheduler == 'only_packing_no_scheduling':
                 (

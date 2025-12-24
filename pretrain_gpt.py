@@ -6,6 +6,7 @@ from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
+import os
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
@@ -65,7 +66,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         
         #TODO(tailaim): sequence packing doesn't consider the MTP rank,
         # we need to handle this.
-        
+        print(f"{torch.distributed.get_rank()=}, {os.getpid()=}")
         # get batches based on the TP rank you are on
         batch = get_batch_on_this_tp_rank(
             data_iterator,
@@ -189,7 +190,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
-
+    # if parallel_state.get_pipeline_model_parallel_rank() == 0:
+    #     print(f"{tokens.shape=}, dp rank:{parallel_state.get_data_parallel_rank()}")
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
@@ -317,6 +319,7 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     # pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
     store = None
+    # torch.cuda.memory._record_memory_history(max_entries=8000000)
     pretrain(
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),

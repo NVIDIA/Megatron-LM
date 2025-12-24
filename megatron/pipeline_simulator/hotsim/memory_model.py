@@ -252,6 +252,7 @@ class MemoryModel:
             + offload_cache_size
             + kv_gradient_size
             + tp_all_gather_buffer
+            + (1 + 2) * 2 * chunk.batch_size * chunk.length * self.model.intermediate_size  # fc2 bwd & swiglu_back
         )
         self.peak_memory_histogram.append(peak_memory)
 
@@ -294,7 +295,7 @@ class MemoryModel:
         if rank == 0:
             base_memory += self.embedding_size
         if rank == self.config.pipeline_parallel_size - 1:
-            base_memory += self.output_size
+            base_memory += self.output_size + self.embedding_size
         self.memory_histogram = [base_memory]
         self.peak_memory_histogram = [base_memory]
 
