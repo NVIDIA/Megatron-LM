@@ -15,6 +15,7 @@
 import logging
 from importlib.metadata import version
 from typing import List, Optional, Tuple
+import enum
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -329,3 +330,175 @@ def _fp8_quantize_fallback(
             packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
         )
         _multi_tensor_copy_this_to_that(packed_amax_views, amaxes, dummy_overflow_buf)
+
+
+# Check if Transformer Engine has class for fp4 tensors.
+HAVE_TE_FP4_TENSOR_CLASS = False
+if HAVE_TE:
+    if is_te_min_version("2.7.0.dev0"):
+        try:
+            from transformer_engine.pytorch.tensor.nvfp4_tensor import (
+                NVFP4Tensor as FP4_TENSOR_CLASS,
+            )
+
+            HAVE_TE_FP4_TENSOR_CLASS = True
+        except (ImportError, ModuleNotFoundError):
+            HAVE_TE_FP4_TENSOR_CLASS = False
+            FP4_TENSOR_CLASS = None
+    else:
+        HAVE_TE_FP4_TENSOR_CLASS = False
+        FP4_TENSOR_CLASS = None
+else:
+    HAVE_TE_FP4_TENSOR_CLASS = False
+    FP4_TENSOR_CLASS = None
+
+
+def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine NVFP4Tensor."""
+    return HAVE_TE_FP4_TENSOR_CLASS and isinstance(tensor, FP4_TENSOR_CLASS)
+
+
+def modify_nvfp4_rowwise_storage(fp4_tensor: torch.Tensor, new_rowwise_data: torch.Tensor) -> None:
+    """Replace NVFP4 tensor's rowwise raw data with a new uint8 storage view.
+
+    Copies existing bytes into the new buffer, then swaps the underlying pointer.
+    """
+    if not is_nvfp4tensor(fp4_tensor):
+        raise ValueError("modify_nvfp4_rowwise_storage expects an NVFP4 tensor")
+    # Access TE's internal storage fields
+    old_rowwise = getattr(fp4_tensor, "_rowwise_data", None)
+    if old_rowwise is None:
+        raise RuntimeError("NVFP4 tensor is missing rowwise data to replace")
+    assert (
+        old_rowwise.dtype == new_rowwise_data.dtype == torch.uint8
+    ), "Rowwise NVFP4 storage must be uint8"
+    # Preserve existing values and then swap storage
+    new_rowwise_data.detach().copy_(old_rowwise)
+    setattr(fp4_tensor, "_rowwise_data", new_rowwise_data)
+
+
+def quantize_nvfp4_param_shard(
+    model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
+):
+    """Cast shard FP32 master weights to NVFP4 model params (rowwise/columnwise).
+
+    This function wraps Transformer Engine's cast_master_weights_to_nvfp4, which handles:
+    - Two-level NVFP4 scaling (global FP32 scale + per-block FP8 E4M3 scale)
+    - Partial casting with nibble-accurate updates
+    - Coordinated amax reduction across data parallel group
+
+    Args:
+        model_params: List of NVFP4 model parameters (NVFP4Tensor).
+        main_params: List of FP32 master weights (shards).
+        start_offsets: List of starting offsets in the full model weight for each shard.
+        data_parallel_group: Distributed group for amax reduction.
+        fsdp_shard_model_params: Optional list of FSDP sharded model params.
+    """
+    if not HAVE_TE_FP4_TENSOR_CLASS:
+        raise RuntimeError(
+            "NVFP4 shard quantization requires Transformer Engine >= 2.7.0.dev0"
+        )
+
+    try:
+        from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_nvfp4
+    except ImportError:
+        raise RuntimeError(
+            "cast_master_weights_to_nvfp4 not available in this Transformer Engine version"
+        )
+
+    if len(model_params) == 0:
+        return
+
+    # # Debug: print what we're passing to cast_master_weights_to_nvfp4
+    # print(f"\n[FP4_UTILS DEBUG] quantize_nvfp4_param_shard called with {len(model_params)} params")
+    # for i, (mp, main_p, offset) in enumerate(zip(model_params, main_params, start_offsets)):
+    #     mp_shape = tuple(mp.shape) if hasattr(mp, 'shape') else 'N/A'
+    #     main_shape = tuple(main_p.shape) if main_p is not None else 'None'
+    #     print(f"[FP4_UTILS DEBUG]   [{i}] model_param shape={mp_shape}, main_param shape={main_shape}, offset={offset}")
+    #     if i == 0:  # Just show first param details
+    #         print(f"[FP4_UTILS DEBUG]   [{i}] model_param type={type(mp).__name__}")
+    #         if hasattr(mp, '_rowwise_data'):
+    #             print(f"[FP4_UTILS DEBUG]   [{i}] _rowwise_data shape={mp._rowwise_data.shape}")
+
+    args = [model_params, main_params, start_offsets, data_parallel_group]
+    if fsdp_shard_model_params is not None:
+        args.append(fsdp_shard_model_params)
+
+    cast_master_weights_to_nvfp4(*args)
+
+
+def nvfp4_set_raw_data(tensor: torch.Tensor, data: torch.Tensor) -> None:
+    """Set the raw data of a Transformer Engine NVFP4Tensor."""
+    data_attr = "_rowwise_data"
+    old_data = getattr(tensor, data_attr)
+    assert old_data.dtype == data.dtype, "The data types of raw data don't match"
+    assert (
+        old_data.shape == data.shape
+    ), f"Shape {old_data.shape} of old_data doesn't match {data.shape} of new_data"
+    setattr(tensor, data_attr, data)
+
+
+def get_raw_data(tensor: torch.Tensor, get_transpose: bool = False) -> torch.Tensor:
+    """Get the underlying raw storage of a Transformer Engine Float8Tensor or NVFP4Tensor."""
+    if get_transpose:
+        assert fp8_need_transpose_data(tensor), f"Type {type(tensor)} does not need transpose data"
+        data_attr = "_columnwise_data"
+    else:
+        data_attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
+
+    return getattr(tensor, data_attr)
+
+
+def set_raw_data(tensor: torch.Tensor, data: torch.Tensor, set_transpose: bool = False) -> None:
+    """Set the raw data of a Transformer Engine Float8Tensor or NVFP4Tensor."""
+    if set_transpose:
+        assert fp8_need_transpose_data(tensor), f"Type {type(tensor)} does not need transpose data"
+        data_attr = "_columnwise_data"
+    else:
+        data_attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
+
+    old_data = getattr(tensor, data_attr)
+    assert old_data.dtype == data.dtype, "The data types of raw data don't match"
+    assert (
+        old_data.shape == data.shape
+    ), f"Shape {old_data.shape} of old_data doesn't match {data.shape} of new_data"
+    setattr(tensor, data_attr, data)
+
+
+def quantize(
+    model_params: List[torch.Tensor],
+    main_params: List[torch.Tensor],
+    start_offsets: List[int],
+    data_parallel_group: torch.distributed.ProcessGroup,
+    fsdp_shard_model_params: List[Tuple[torch.Tensor, Optional[torch.Tensor]]],
+) -> None:
+    """Quantize sharded parameters to FP8 or NVFP4."""
+    if len(model_params) == 0:
+        return
+
+    if is_nvfp4tensor(model_params[0]):
+        assert all(
+            is_nvfp4tensor(p) for p in model_params
+        ), "All model_params must be NVFP4 tensors"
+        quantize_nvfp4_param_shard(
+            model_params,
+            main_params,
+            start_offsets,
+            data_parallel_group,
+            fsdp_shard_model_params,
+        )
+    elif is_float8tensor(model_params[0]):
+        assert all(
+            is_float8tensor(p) for p in model_params
+        ), "All model_params must be FP8 tensors"
+        fp8_quantize(
+            model_params,
+            main_params,
+            start_offsets,
+            data_parallel_group,
+            fsdp_shard_model_params,
+        )
+    else:
+        raise ValueError(
+            "quantize function only supports FP8 or NVFP4 tensors in model_params"
+        )

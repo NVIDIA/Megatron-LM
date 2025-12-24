@@ -34,14 +34,15 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from .mixed_precision import (
     fp8_discard_transpose_cache,
-    fp8_get_raw_data,
     fp8_need_transpose_data,
     fp8_need_transpose_data_for_meta_device_init,
-    fp8_quantize,
-    fp8_set_raw_data,
+    quantize,
     is_blockwise_float8tensor,
     is_float8tensor,
     is_te_min_version,
+    is_nvfp4tensor,
+    get_raw_data,
+    set_raw_data,
 )
 from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
 from .utils import (
@@ -870,10 +871,9 @@ class DataParallelBuffer:
         else:
             # Build the data parallel buffer index, which contains information
             # on where each parameter / gradient tensor will be stored in this
-            # distributed buffer.
             (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
                 build_data_parallel_buffer_index(
-                    [to_local_if_dtensor(p).shape for p in self.params],
+                    [get_raw_data(to_local_if_dtensor(p)).shape for p in self.params],
                     self.dp_rank,
                     self.dp_world_size,
                     is_data_distributed,
@@ -944,11 +944,8 @@ class DataParallelBuffer:
             for p in self.params:
                 item_id = self.param_idx[p]
                 p = to_local_if_dtensor(p)
-                data = self.get_item_from_bucket(bucket, item_id).view(p.shape)
-                if is_float8tensor(p):
-                    fp8_set_raw_data(p, data, self.is_transpose_buffer)
-                else:
-                    p.data = data
+                data = self.get_item_from_bucket(bucket, item_id).view(get_raw_data(p).shape)
+                set_raw_data(p, data, self.is_transpose_buffer)
         return bucket
 
     def free_bucket_storage(self):
@@ -1117,8 +1114,7 @@ class DataParallelBuffer:
         # When fully sharded, we need to get the slice of the item to be stored in this shard.
         # Otherwise, we can just flatten the entire item since this buffer contains
         # the entire bucket.
-        if is_float8tensor(item_data):
-            item_data = fp8_get_raw_data(item_data, self.is_transpose_buffer)
+        item_data = get_raw_data(item_data, self.is_transpose_buffer)
 
         if self.is_data_distributed:
             # Get the coordinates of the slice of the item that is contained in this shard.
@@ -1851,11 +1847,12 @@ class ParamAndGradBuffer:
             )
             # Check if the parameter group is FP8.
             one_param = group.params[0]
+            is_dtype_nvfp4 = is_nvfp4tensor(one_param)
             is_dtype_float8 = (
                 is_float8tensor(one_param)
                 or meta_device_init_fp8_params.get(self.param_to_name[one_param], (False, False))[0]
             )
-            if is_dtype_float8:
+            if is_dtype_float8 or is_dtype_nvfp4:
                 param_dtype = torch.uint8
                 grad_dtype = torch.bfloat16
             else:
@@ -2161,46 +2158,27 @@ class ParamAndGradBuffer:
                     # Retrieve the newly allocated parameter data from the global bucket.
                     # Attach the bucket-allocated parameter data to the module parameter,
                     # to use the bucket-allocated data for autograd and NCCL.
-                    new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(p_local.shape)
+                    new_param_data = wbuf.get_item_from_bucket(bucket, item_id)\
+                        .view(get_raw_data(p_local).shape)
                     if tbuf:
                         new_transpose_data = tbuf.get_item_from_bucket(
                             transpose_bucket, item_id
-                        ).view(p_local.shape)
+                        ).view(get_raw_data(p_local, True).shape)
                     else:
                         new_transpose_data = None
 
-                    if is_float8tensor(p_local):
-                        old_param_data = fp8_get_raw_data(p_local)
-                        assert old_param_data._base is None
-                        new_param_data.detach().copy_(old_param_data)
-                        fp8_set_raw_data(p_local, new_param_data)
-                        del old_param_data
-                        if new_transpose_data is not None:
-                            old_transpose_data = fp8_get_raw_data(p_local, True)
-                            assert old_transpose_data._base is None
-                            new_transpose_data.detach().copy_(old_transpose_data)
-                            fp8_set_raw_data(p_local, new_transpose_data, True)
-                            del old_transpose_data
-                    elif isinstance(p, DTensor):
-                        old_param_data = p._local_tensor.data
-                        p._local_tensor.data = new_param_data
-                        assert old_param_data._base is None
-                        p._local_tensor.data.detach().copy_(old_param_data)
-                        del old_param_data
-                    else:
-                        # Detach the bucket-allocated parameter data from the computational graph
-                        # before copying the old parameter data into the new parameter data
-                        # to prevent backpropagation into a deleted parameter / Tensor.
-
-                        # Copy the values of the original parameter data into the bucket-allocated
-                        # parameter data. Detach the module parameter because
-                        # parameters that require gradients in the computational
-                        # graph do not support in-place operations.
-                        old_param_data = p.data
-                        p.data = new_param_data
-                        assert old_param_data._base is None
-                        p.data.detach().copy_(old_param_data)
-                        del old_param_data
+                    # Replace the parameter data with the newly allocated buffer data.
+                    old_param_data = get_raw_data(p_local)
+                    assert old_param_data._base is None
+                    new_param_data.detach().copy_(old_param_data)
+                    set_raw_data(p_local, new_param_data)
+                    del old_param_data
+                    if new_transpose_data is not None:
+                        old_transpose_data = get_raw_data(p_local, True)
+                        assert old_transpose_data._base is None
+                        new_transpose_data.detach().copy_(old_transpose_data)
+                        set_raw_data(p_local, new_transpose_data, True)
+                        del old_transpose_data
 
                 # Main Weight (High-Precision) Buffer Initialization
                 if mbuf:
@@ -2608,47 +2586,47 @@ class ParamAndGradBuffer:
         expert_data_parallel_group = None
         clear_quantize_kwargs = lambda kwargs: [d.clear() for d in kwargs.values()]
 
-        def _fp8_quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs):
+        def _quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs):
             if len(dense_param_quantize_kwargs["model_params"]) > 0:
                 # If we have FP8 parameters, we need to quantize them.
-                fp8_quantize(data_parallel_group=data_parallel_group, **dense_param_quantize_kwargs)
+                quantize(data_parallel_group=data_parallel_group, **dense_param_quantize_kwargs)
 
             if len(expert_param_quantize_kwargs["model_params"]) > 0:
                 # If we have FP8 expert parameters, we need to quantize them.
-                fp8_quantize(
+                quantize(
                     data_parallel_group=expert_data_parallel_group, **expert_param_quantize_kwargs
                 )
 
             clear_quantize_kwargs(dense_param_quantize_kwargs)
             clear_quantize_kwargs(expert_param_quantize_kwargs)
 
-        # Special handling of blockwise FP8
+        # Special handling of quantization requiring copy-in/copy-out processing
         BATCH_QUANT_MEMORY_LIMIT_BYTES = 5 * 1024**3  # 5 GB
-        blockwise_fp8_weight_buffers = []
-        blockwise_fp8_param_buffers = []
+        copy_io_weight_buffers = []
+        copy_io_params = []
 
-        def _batch_quantize_blockwise_fp8_params(
-            dense_param_quantize_kwargs, expert_param_quantize_kwargs, blockwise_fp8_param_buffers
+        def _batch_quantize_if_needed(
+            dense_param_quantize_kwargs, expert_param_quantize_kwargs, copy_io_params
         ):
-            if len(blockwise_fp8_param_buffers) == 0:
+            if len(copy_io_params) == 0:
                 return
 
             # Copy original param shards into their blockwise FP8 working buffers
-            for bufs in blockwise_fp8_param_buffers:
+            for bufs in copy_io_params:
                 bufs["bucket_param"].copy_(bufs["param"])
 
             # Apply FP8 quantization to blockwise FP8 parameters
-            _fp8_quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
+            _quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
 
             # Copy quantized params back from working buffers to original param tensors
-            for bufs in blockwise_fp8_param_buffers:
+            for bufs in copy_io_params:
                 bufs["param"].copy_(bufs["bucket_param"])
-            blockwise_fp8_param_buffers.clear()
+            copy_io_params.clear()
 
             # Free bucket storage for blockwise FP8 weight buffers
-            for wbuf in blockwise_fp8_weight_buffers:
+            for wbuf in copy_io_weight_buffers:
                 wbuf.free_bucket_storage()
-            blockwise_fp8_weight_buffers.clear()
+            copy_io_weight_buffers.clear()
 
         for pg in self.parameter_groups:
             mbuf = pg.main_weight_buffer
@@ -2669,7 +2647,7 @@ class ParamAndGradBuffer:
             shard_offsets_in_fp8 = quantize_func_kwargs["start_offsets"]
             shard_model_params = quantize_func_kwargs["fsdp_shard_model_params"]
 
-            has_blockwise_fp8_param = False
+            has_copy_io_param = False
             for param in pg.params:
                 item_id = mbuf.param_idx[param]
                 if wbuf:
@@ -2692,7 +2670,7 @@ class ParamAndGradBuffer:
                     model_param = to_local_if_dtensor(param)
                     main_weight = mbuf.get_item(item_id)
 
-                if is_blockwise_float8tensor(param):
+                if is_blockwise_float8tensor(param) or is_nvfp4tensor(param):
                     fp8_params.append(param)
                     if model_param.numel() == 0:
                         shard_fp32_from_fp8.append(None)
@@ -2714,10 +2692,10 @@ class ParamAndGradBuffer:
                             f" not match model param numel {model_param.numel()}"
                             f" name: {self.param_to_name[param]}"
                         )
-                        blockwise_fp8_param_buffers.append(
+                        copy_io_params.append(
                             {"bucket_param": b_model_param, "param": model_param}
                         )
-                        has_blockwise_fp8_param = True
+                        has_copy_io_param = True
                     continue
 
                 if is_float8tensor(param):
@@ -2735,41 +2713,22 @@ class ParamAndGradBuffer:
                 if model_param.numel() > 0:
                     model_param.data.copy_(main_weight.view(model_param.shape))
 
-            if has_blockwise_fp8_param:
-                blockwise_fp8_weight_buffers.append(wbuf)
+            if has_copy_io_param:
+                copy_io_weight_buffers.append(wbuf)
                 if (
-                    sum([wbuf.bucket_index.size for wbuf in blockwise_fp8_weight_buffers])
+                    sum([wbuf.bucket_index.size for wbuf in copy_io_weight_buffers])
                     > BATCH_QUANT_MEMORY_LIMIT_BYTES
                 ):
-                    _batch_quantize_blockwise_fp8_params(
+                    _batch_quantize_if_needed(
                         dense_param_quantize_kwargs,
                         expert_param_quantize_kwargs,
-                        blockwise_fp8_param_buffers,
+                        copy_io_params,
                     )
 
-        _batch_quantize_blockwise_fp8_params(
-            dense_param_quantize_kwargs, expert_param_quantize_kwargs, blockwise_fp8_param_buffers
+        _batch_quantize_if_needed(
+            dense_param_quantize_kwargs, expert_param_quantize_kwargs, copy_io_params
         )
-        _fp8_quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
-
-    @torch.no_grad()
-    def copy_model_weights_to_main_weights(self):
-        """Copy the model weights to the main weights."""
-        for group in self.parameter_groups:
-            mbuf = group.main_weight_buffer
-            if mbuf is None:
-                continue
-            wbuf = group.model_weight_buffer
-            if mbuf.is_data_distributed:
-                copyin_data = wbuf.get_shard_from_local_buffer()
-            else:
-                copyin_data = wbuf.data
-            assert mbuf.data.numel() == copyin_data.numel(), (
-                f"Master weight buffer size {mbuf.data.numel()} does not match "
-                f"model weight buffer size {copyin_data.numel()}"
-            )
-            # TODO(mxfp8): Make sure it's not a fp8 buf?
-            mbuf.data.copy_(copyin_data.data)
+        _quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
 
     def all_gather_parameters(self, async_op: bool = True):
         """All gather the parameters.
