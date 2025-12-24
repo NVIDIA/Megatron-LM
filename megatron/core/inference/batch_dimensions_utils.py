@@ -25,6 +25,7 @@ class InferenceBatchDimensions:
         token_count : number of total input tokens
         prefill_req_count : number of prefill requests
         decode_req_count : number of decode requests
+        has_explicit_chunked_prefill_req : whether the batch has an explicit chunked prefill request
 
     The batch dimensions are ordered by token_count, then by prefill_req_count,
     then by decode_req_count.
@@ -34,6 +35,7 @@ class InferenceBatchDimensions:
     token_count: int = 0
     prefill_req_count: int = 0
     decode_req_count: int = 0
+    has_explicit_chunked_prefill_req: bool = False
 
     def __str__(self):
         """
@@ -53,6 +55,9 @@ class InferenceBatchDimensions:
         for prefill or decode requests. Otherwise, prefill slots
         can only be used for prefill requests.
         """
+        if real_batch_dim.has_explicit_chunked_prefill_req != self.has_explicit_chunked_prefill_req:
+            return False
+
         if real_batch_dim.prefill_req_count == 0:
             return (
                 self.token_count >= real_batch_dim.token_count
@@ -99,6 +104,10 @@ class InferenceBatchDimensions:
         if self.token_count > self.prefill_req_count * max_sequence_length + self.decode_req_count:
             return False
 
+        # Check if there is an invalid chunked prefill request.
+        if self.prefill_req_count == 0 and self.has_explicit_chunked_prefill_req:
+            return False
+
         return True
 
     def __hash__(self):
@@ -106,7 +115,14 @@ class InferenceBatchDimensions:
         Returns a hash of the batch dimension.
         In cuda graph quick matching, the batch dimension is used as a key in a dictionary.
         """
-        return hash((self.token_count, self.prefill_req_count, self.decode_req_count))
+        return hash(
+            (
+                self.token_count,
+                self.prefill_req_count,
+                self.decode_req_count,
+                self.has_explicit_chunked_prefill_req,
+            )
+        )
 
     def __eq__(self, other: "InferenceBatchDimensions") -> bool:
         """
@@ -114,10 +130,16 @@ class InferenceBatchDimensions:
         """
         if other is None:
             return False
-        return (self.token_count, self.prefill_req_count, self.decode_req_count) == (
+        return (
+            self.token_count,
+            self.prefill_req_count,
+            self.decode_req_count,
+            self.has_explicit_chunked_prefill_req,
+        ) == (
             other.token_count,
             other.prefill_req_count,
             other.decode_req_count,
+            other.has_explicit_chunked_prefill_req,
         )
 
     @property
@@ -129,8 +151,8 @@ class InferenceBatchDimensions:
 
     @staticmethod
     def adjust_batch_dims_for_expert_parallelism(
-        local_batch_dims, decode_only_cuda_graphs: bool
-    ) -> "InferenceBatchDimensions":
+        local_batch_dims, strict: bool, decode_only_cuda_graphs: bool
+    ) -> Optional["InferenceBatchDimensions"]:
         """Adjusted cuda graph batch dimensions for expert parallelism.
             We take the max token count across expert model parallel group.
         Return:
@@ -145,25 +167,45 @@ class InferenceBatchDimensions:
         expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
         # all reduce local work across expert model parallel group
 
+        has_explicit_chunked_prefill_req = local_batch_dims.has_explicit_chunked_prefill_req
         is_non_decode = local_batch_dims.prefill_req_count > 0
-
         sync_tensor = torch.tensor(
-            [local_batch_dims.token_count, int(is_non_decode)],
+            [
+                local_batch_dims.token_count,
+                int(is_non_decode),
+                int(has_explicit_chunked_prefill_req),
+            ],
             dtype=torch.int32,
             device=torch.cuda.current_device(),
         )
+
         torch.distributed.all_reduce(
             sync_tensor, op=torch.distributed.ReduceOp.MAX, group=expert_model_parallel_group
         )
+
         sync_tensor = sync_tensor.cpu()
         is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
-        if decode_only_cuda_graphs and is_any_ep_rank_in_non_decode:
+        any_ep_rank_has_explicit_chunked_prefill_req = sync_tensor[2].item() == 1
+
+        # We force eager mode for scenarios where some ranks will run with CUDA graphs
+        # while others will not. Without this check, the all-to-all communication in the
+        # expert routing layer would pad up to the maximum capacity only for the ranks that
+        # are using CUDA graphs in this step, leading to a NCCL hang.
+        # This can happen in the following cases:
+        #   1. If we only allow decode CUDA graphs but some ranks are running non-decode batches
+        #   2. Some ranks are running explicit chunked prefill requests
+        #       (graphs are not recorded for batches with explicit chunked prefill requests)
+        if (
+            decode_only_cuda_graphs and is_any_ep_rank_in_non_decode
+        ) or any_ep_rank_has_explicit_chunked_prefill_req:
             return None  # indicate no match, run in eager mode
 
+        assert not has_explicit_chunked_prefill_req
         adjusted_batch_dim = InferenceBatchDimensions(
             token_count=int(sync_tensor[0].item()),
             prefill_req_count=local_batch_dims.prefill_req_count,
             decode_req_count=local_batch_dims.decode_req_count,
+            has_explicit_chunked_prefill_req=False,
         )
         return adjusted_batch_dim
 
@@ -421,7 +463,7 @@ class CUDAGraphBatchDimensionBuilder:
             return None
 
         adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
-            real_batch_dim, decode_only_cuda_graphs
+            real_batch_dim, strict=strict, decode_only_cuda_graphs=decode_only_cuda_graphs
         )
 
         if adjusted_batch_dim is None:
