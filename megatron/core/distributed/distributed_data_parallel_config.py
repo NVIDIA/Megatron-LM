@@ -137,6 +137,14 @@ class DistributedDataParallelConfig:
       when nccl_ub is set.
     """
 
+    fsdp_manual_registration: bool = False
+    """If true, manually register the FSDP communication buffers to NCCL user buffer.
+      This option is only effective when use_megatron_fsdp and nccl_ub is set.
+      For symmetric registration with large models, the registration itself can take 
+      a significant amount of time. This option minimizes the number of registration calls
+      to minimize the registration time.
+    """
+
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
