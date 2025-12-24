@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -30,6 +30,9 @@ class SamplingParams:
     top_n_logprobs: int = 0
     return_prompt_top_n_logprobs: bool = False  # Deprecated field for backwards compatibility
     add_BOS: bool = False
+    stop_words: Optional[List[str]] = (
+        None  # List of strings that will stop generation when produced
+    )
 
     def __post_init__(self):
         """Ensure backward compatibility for return_prompt_top_n_logprobs.
