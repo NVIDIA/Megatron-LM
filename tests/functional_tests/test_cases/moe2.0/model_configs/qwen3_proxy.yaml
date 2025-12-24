@@ -16,6 +16,7 @@ MODEL_ARGS:
   --make-vocab-size-divisible-by: 3232
   --untie-embeddings-and-output-weights: true
   # Add attention related args
+  --num-attention-heads: 16
   --group-query-attention: true
   --num-query-groups: 4
   --kv-channels: 128
@@ -31,17 +32,10 @@ MODEL_ARGS:
   --moe-layer-freq: ([0]*1+[1]*15)
   --moe-ffn-hidden-size: 1024
   --moe-shared-expert-intermediate-size: 1024
-  --moe-router-load-balancing-type: aux_loss
+  --moe-router-load-balancing-type: global_aux_loss
   --moe-router-topk: 4
-  --moe-router-pre-softmax: true
-  --moe-grouped-gemm: true
   --moe-aux-loss-coeff: 1e-4
-  --moe-router-group-topk: 2
-  --moe-router-num-groups: 4
-  --moe-router-topk-scaling-factor: 2.0
-  --moe-router-score-function: sigmoid
-  --moe-router-enable-expert-bias: true
-  --moe-router-bias-update-rate: 1e-3
+  --moe-router-score-function: softmax
   --moe-router-dtype: fp32
   # Add regularization args
   --attention-dropout: 0.0
