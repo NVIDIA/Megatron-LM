@@ -587,3 +587,74 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             use_gloo_process_groups=True,  # Should be False when using custom groups
             pg_collection=pg_collection_complete,
         )
+
+
+class QKLayerNormModel(nn.Module):
+    """A model with q_layernorm, k_layernorm, regular layernorm and bias parameters
+    to test the 'apply_wd_to_qk_layernorm' no_weight_decay_cond option.
+    """
+
+    def __init__(self, hidden_size=64):
+        super().__init__()
+        # q_layernorm and k_layernorm should have wd_mult=1.0 when apply_wd_to_qk_layernorm is set
+        self.q_layernorm = nn.LayerNorm(hidden_size, bias=True)
+        self.k_layernorm = nn.LayerNorm(hidden_size, bias=True)
+        # Regular layernorm should have wd_mult=0.0 (1D params)
+        self.regular_layernorm = nn.LayerNorm(hidden_size, bias=False)
+        # Linear layer: weight should have wd_mult=1.0, bias should have wd_mult=0.0
+        self.linear = nn.Linear(hidden_size, hidden_size, bias=True)
+
+
+def test_no_weight_decay_cond_apply_wd_to_qk_layernorm():
+    """
+    Test that no_weight_decay_cond='apply_wd_to_qk_layernorm' correctly assigns
+    wd_mult=1.0 to q_layernorm and k_layernorm parameters while other 1D params
+    (bias, regular layernorm) have wd_mult=0.0.
+
+    This test uses get_megatron_optimizer to build an optimizer and then checks
+    the param_groups to verify the wd_mult assignment.
+    """
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    # Create model with q_layernorm, k_layernorm, and regular layernorm
+    model = QKLayerNormModel(hidden_size=64).bfloat16().cuda()
+    model.requires_grad_(True)
+
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+
+    # Create optimizer config with no_weight_decay_cond='apply_wd_to_qk_layernorm'
+    optimizer_config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        bf16=True,
+        use_distributed_optimizer=False,
+        no_weight_decay_cond='apply_wd_to_qk_layernorm',
+    )
+
+    # Build optimizer
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Count params by wd_mult
+    wd_mult_1_count = 0  # Params with weight decay
+    wd_mult_0_count = 0  # Params without weight decay
+
+    for group in optim.param_groups:
+        wd_mult = group['wd_mult']
+        num_params = len(group['params'])
+        if wd_mult == 1.0:
+            wd_mult_1_count += num_params
+        else:
+            wd_mult_0_count += num_params
+
+    # Expected:
+    # wd_mult=1.0: q_layernorm.weight, q_layernorm.bias, k_layernorm.weight,
+    #              k_layernorm.bias, linear.weight = 5 params
+    # wd_mult=0.0: regular_layernorm.weight, linear.bias = 2 params
+    assert wd_mult_1_count == 5, f"Expected 5 params with wd_mult=1.0, but got {wd_mult_1_count}"
+    assert wd_mult_0_count == 2, f"Expected 3 params with wd_mult=0.0, but got {wd_mult_0_count}"
