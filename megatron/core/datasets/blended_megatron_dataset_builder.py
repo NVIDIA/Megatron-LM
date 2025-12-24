@@ -480,6 +480,9 @@ class BlendedMegatronDatasetBuilder(object):
                 built. In special cases, e.g. when we are building the low level dataset for a
                 RawMegatronDataset instance, we can accept a Callable which returns an Iterable.
 
+            is_built_on_rank (Callable): A callable which returns True if the dataset should be
+                built on the current rank and False otherwise.
+
             synchronize_ranks (bool): Whether to call barrier for rank-0 / barrier / other-ranks
                 behavior. Set to False when we enforce this behavior at higher level.
 

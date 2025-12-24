@@ -116,4 +116,16 @@ class BlockAllocator:
         (except for the dummy block).
         """
 
+        # Reset block bag to so we start consuming from the beginning of the pool
+        # for UVM performance.
+        # *Note*: Resetting the block bag is essential because if engine has been
+        # suspended, then the block bag contains non-unique IDs since the
+        # right-most IDs have been 'popped' off and are owned by the context.
+        # Without resetting the block bag, context request memory will clash and
+        # requests will point to each other's memory blocks, resulting in faulty
+        # generations.
+        self.block_bag = torch.arange(
+            self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+
         self.total_avail = self.total_count - 1

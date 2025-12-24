@@ -110,7 +110,6 @@ def create_args():
     args.no_load_rng = False
     args.log_progress = False
     args.ckpt_fully_parallel_save = False
-    args.dist_ckpt_save_pre_mcore_014 = False
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.auto_detect_ckpt_format = False

@@ -284,23 +284,22 @@ class MambaMixer(MegatronModule):
             )
 
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state  # x B C
-        # weight shape: [conv_dim, 1, d_conv]
-        # bias shape: [conv_dim]
-        self.conv1d = nn.Conv1d(
-            in_channels=conv_dim,
-            out_channels=conv_dim,
-            bias=conv_bias,
-            kernel_size=d_conv,
-            groups=conv_dim,
-            padding=d_conv - 1,
-            device=torch.cuda.current_device(),
-            dtype=config.params_dtype,
-        )
-        setattr(self.conv1d.weight, "tensor_model_parallel", True)
-        setattr(self.conv1d.bias, "tensor_model_parallel", True)
-
-        if self.config.perform_initialization:
-            with get_cuda_rng_tracker().fork():
+        with get_cuda_rng_tracker().fork():
+            # weight shape: [conv_dim, 1, d_conv]
+            # bias shape: [conv_dim]
+            self.conv1d = nn.Conv1d(
+                in_channels=conv_dim,
+                out_channels=conv_dim,
+                bias=conv_bias,
+                kernel_size=d_conv,
+                groups=conv_dim,
+                padding=d_conv - 1,
+                device=torch.cuda.current_device(),
+                dtype=config.params_dtype,
+            )
+            setattr(self.conv1d.weight, "tensor_model_parallel", True)
+            setattr(self.conv1d.bias, "tensor_model_parallel", True)
+            if self.config.perform_initialization:
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
                 else:
@@ -309,8 +308,8 @@ class MambaMixer(MegatronModule):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        if self.config.perform_initialization:
-            with get_cuda_rng_tracker().fork():
+        with get_cuda_rng_tracker().fork():
+            if self.config.perform_initialization:
                 # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
                 dt = torch.exp(
                     torch.rand(
@@ -323,24 +322,26 @@ class MambaMixer(MegatronModule):
                 ).clamp(min=dt_init_floor)
                 # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
                 inv_dt = dt + torch.log(-torch.expm1(-dt))
-        else:
-            inv_dt = torch.empty(
-                self.nheads_local_tp, device=torch.cuda.current_device(), dtype=config.params_dtype
+            else:
+                inv_dt = torch.empty(
+                    self.nheads_local_tp,
+                    device=torch.cuda.current_device(),
+                    dtype=config.params_dtype,
+                )
+
+            self.dt_bias = nn.Parameter(inv_dt)
+            setattr(self.dt_bias, "tensor_model_parallel", True)
+
+            # A parameter
+            assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
+            A = torch.empty(
+                self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
             )
-
-        self.dt_bias = nn.Parameter(inv_dt)
-        setattr(self.dt_bias, "tensor_model_parallel", True)
-
-        # A parameter
-        assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-        A = torch.empty(
-            self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
-        )
-        if self.config.perform_initialization:
-            A = A.uniform_(*A_init_range)
-        A_log = torch.log(A)  # Keep A_log in fp32
-        self.A_log = nn.Parameter(A_log)
-        setattr(self.A_log, "tensor_model_parallel", True)
+            if self.config.perform_initialization:
+                A = A.uniform_(*A_init_range)
+            A_log = torch.log(A)  # Keep A_log in fp32
+            self.A_log = nn.Parameter(A_log)
+            setattr(self.A_log, "tensor_model_parallel", True)
 
         # D "skip" parameter
         self.D = nn.Parameter(

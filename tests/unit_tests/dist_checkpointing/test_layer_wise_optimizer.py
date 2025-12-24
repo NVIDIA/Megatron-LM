@@ -62,6 +62,11 @@ def initialize_real_model(
     virtual_pipeline_model_parallel_size=None,
     **config_kwargs,
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
