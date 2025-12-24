@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 import logging
 import warnings
 from abc import ABC
@@ -672,7 +673,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    self.mlp, False, pre_mlp_layernorm_output, padding_mask=padding_mask
+                    functools.partial(self.mlp, padding_mask=padding_mask),
+                    False,
+                    pre_mlp_layernorm_output,
                 )
         elif should_chunk_mlp_for_prefill:
             # Chunk input along sequence dimension

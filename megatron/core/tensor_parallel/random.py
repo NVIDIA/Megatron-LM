@@ -4,7 +4,6 @@
 # repo: https://github.com/pytorch/pytorch
 
 import contextlib
-import functools
 import logging
 from typing import Optional, Union
 
@@ -543,11 +542,9 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-def checkpoint(function, distribute_saved_activations, *args, **kwargs):
+def checkpoint(function, distribute_saved_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
-    if kwargs:
-        function = functools.partial(function, **kwargs)
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
 
 
