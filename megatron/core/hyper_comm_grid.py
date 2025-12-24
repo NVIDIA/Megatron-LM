@@ -160,7 +160,6 @@ class HyperCommGrid:
 
         logging.info(f"Generated process group for {unique_group_key} with enumeration {rank_enum}")
         self._pgs[unique_group_key] = pg
-
         return pg
 
     def get_pg(self, dims: Union[str, list[str]]) -> dist.ProcessGroup:
