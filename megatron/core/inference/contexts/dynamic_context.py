@@ -1736,10 +1736,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return active_request_count, resume_request_count, newly_paused_request_ids
 
-    def evict_overflow_requests(self, next_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def evict_overflow_requests(
+        self,
+        active_request_count: int,
+        next_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Evict requests that overflow the paused buffer.
 
         Args:
+            active_request_count (int): Number of active requests.
             next_tokens (torch.Tensor): Sampled tokens.
 
         Returns:
@@ -1779,19 +1784,35 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Release memory.
         self.release_memory_blocks_from_request_indexes(evict_request_idxs)
 
-        # Move active requests to replace evicted paused requests.
-        src_idxs = torch.arange(
-            self.paused_request_count,
-            self.total_request_count,
-            device=torch.cuda.current_device(),
-        )
-        dst_idxs = torch.arange(
-            self.paused_request_count - evict_request_count,
-            self.total_request_count - evict_request_count,
-            device=torch.cuda.current_device(),
-        )
+        # Move evicted requests to the right of active requests, while minimizing
+        # movement.
+        if evict_request_count < active_request_count:
+            # Swap all evicted requests with right-most active requests.
+            src_idxs = torch.arange(
+                self.paused_request_count - evict_request_count,
+                self.paused_request_count,
+                device=torch.cuda.current_device(),
+            )
+            dst_idxs = torch.arange(
+                self.total_request_count - evict_request_count,
+                self.total_request_count,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            # Swap all active requests with left-most evicted requests.
+            src_idxs = torch.arange(
+                self.paused_request_count - evict_request_count,
+                self.paused_request_count - evict_request_count + active_request_count,
+                device=torch.cuda.current_device(),
+            )
+            dst_idxs = torch.arange(
+                self.paused_request_count,
+                self.paused_request_count + active_request_count,
+                device=torch.cuda.current_device(),
+            )
 
-        self._move_book_keeping_tensors(
+        # Swap.
+        self._swap_book_keeping_tensors(
             src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
         )
 
@@ -2013,7 +2034,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # 6.b. Evict requests that overflow the paused buffer.
-        evict_request_ids = self.evict_overflow_requests(next_tokens)
+        evict_request_ids = self.evict_overflow_requests(active_request_count, next_tokens)
 
         # 6.c. Resume any additional requests.
         active_request_count, resume_request_count, newly_paused_request_ids = (
