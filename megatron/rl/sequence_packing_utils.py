@@ -413,7 +413,8 @@ def get_default_packed_seq_params(seq_length: int, device: torch.device) -> Pack
         PackedSeqParams configured as a single unpacked sequence.
     """
     # Single sequence spanning the full length = no actual packing
-    cu_seqlens = torch.tensor([0, seq_length], dtype=torch.int32, device=device)
+    cu_seqlens = torch.full((seq_length,), seq_length, dtype=torch.int32, device=device)
+    cu_seqlens[0] = 0
 
     return PackedSeqParams(
         qkv_format='thd',
