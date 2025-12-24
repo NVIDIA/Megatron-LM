@@ -728,6 +728,9 @@ def gen_offloading_plan(
             dtype_index,
         )
     elif assignment_algorithm == "approx_bin_packing":
+        if num_spare_experts_per_ep_rank != 1:
+            raise ValueError(f"approx_bin_packing only supports num_spare_experts_per_ep_rank=1, "
+                            f"got {num_spare_experts_per_ep_rank}")
         count_tokens_from_home_expert_to_spare_expert, _, _ = gen_assignment_for_approx_bp(
             count_tokens_per_expert_from_ep_rank,
             ep_rank,
