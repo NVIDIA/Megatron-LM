@@ -2,7 +2,7 @@
 import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -23,7 +23,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    all_gather_last_dim_from_tensor_parallel_region,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -148,8 +150,8 @@ class Attention(MegatronModule, ABC):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
 
@@ -319,7 +321,9 @@ class Attention(MegatronModule, ABC):
         ), "Virtual pipeline parallelism is not supported for inference"
 
         # Import here to avoid circular imports
-        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+        from megatron.core.transformer.transformer_layer import (
+            get_transformer_layer_offset,
+        )
 
         return get_transformer_layer_offset(
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
@@ -505,7 +509,9 @@ class Attention(MegatronModule, ABC):
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
     @abstractmethod
-    def get_query_key_value_tensors(self, hidden_states, key_value_states, split_qkv=True):
+    def get_query_key_value_tensors(
+        self, hidden_states: Tensor, key_value_states: Optional[Tensor], split_qkv: bool = True
+    ) -> Tuple[Tensor, Tensor, Tensor] | Tuple[Tensor, List[int]]:
         """
         This method needs to be implemented based on whether the derived class
         is "self-attn" or "cross-attn".
@@ -522,7 +528,7 @@ class Attention(MegatronModule, ABC):
         rotary_cos: Tensor,
         rotary_sin: Tensor,
         rotary_interleaved: bool = False,
-    ) -> (Tensor, Tensor):
+    ) -> Tuple[Tensor, Tensor]:
         """
         The flash decoding kernel will do the following in a single execution:
         1. Compute RoPE embedding with precomputed cos & sin tensors
@@ -1028,9 +1034,9 @@ class SelfAttention(Attention):
         config: TransformerConfig,
         submodules: SelfAttentionSubmodules,
         layer_number: int,
-        attn_mask_type=AttnMaskType.padding,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(
             config=config,
@@ -1147,7 +1153,12 @@ class SelfAttention(Attention):
                 "TP",
             )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states=None, split_qkv=True):
+    def get_query_key_value_tensors(
+        self,
+        hidden_states: Tensor,
+        key_value_states: Optional[Tensor] = None,
+        split_qkv: bool = True,
+    ) -> Tuple[Tensor, Tensor, Tensor] | Tuple[Tensor, List[int]]:
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`. If `split_qkv=False`, then
         the unsplit mixed_qkv tensor is returned.
@@ -1236,7 +1247,7 @@ class SelfAttention(Attention):
 
         return query, key, value
 
-    def backward_dw(self) -> NoReturn:
+    def backward_dw(self) -> None:
         """Execute weight update operations"""
         self._backward_qkv_proj()
         self._backward_output_proj()
@@ -1366,7 +1377,7 @@ class CrossAttention(Attention):
         submodules: CrossAttentionSubmodules,
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
-        cp_comm_type: str = None,
+        cp_comm_type: Optional[str] = None,
         pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(
@@ -1407,7 +1418,9 @@ class CrossAttention(Attention):
             is_expert=False,
         )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states, split_qkv=True):
+    def get_query_key_value_tensors(
+        self, hidden_states: Tensor, key_value_states: Optional[Tensor], split_qkv: bool = True
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
         from `key_value_states`.
