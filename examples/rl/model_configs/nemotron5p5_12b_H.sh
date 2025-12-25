@@ -100,7 +100,7 @@ MODEL_OPTIONS="\
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --exit-duration-in-mins 5750 \
-    --seq-length 8191 \
+    --seq-length 8192 \
     --max-position-embeddings 8192 \
     --tensor-model-parallel-size $TP  \
     --pipeline-model-parallel-size $PP  \
