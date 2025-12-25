@@ -852,6 +852,26 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_metadata.request_to_mamba_state_idx[padded_slice]
             )
 
+    def pad_active_slices(self, padding_token_slice: slice):
+        """Pad the active slices of specific tensors."""
+        # Some tensors need to be padded at the token level.
+        padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
+
+        self.token_to_block_idx[padding_token_slice] = self.block_allocator.dummy_block_idx
+        self.token_to_local_position_within_kv_block[padding_token_slice] = 0
+        self.token_to_position_in_request[padding_token_slice] = 0
+
+        # Other tensors need to be padded at the request level.
+        padding_request_slice = slice(
+            self.total_request_count - self.paused_request_count,
+            self.padded_active_request_count,
+        )
+
+        self.active_attn_metadata["mha_metadata"].update(
+            batch_dimensions=self.attn_dimensions,
+            padded_batch_dimensions=self.padded_batch_dimensions
+        )
+
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 
@@ -1355,6 +1375,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # We may need to await GPU stream completion here in the future.
         self._using_cuda_graph_this_step = best_graph is not None
         self.batch_dimensions = batch_dimensions
+        self.attn_dimensions = attn_dimensions
         self.padded_batch_dimensions = padded_batch_dimensions
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
@@ -1369,15 +1390,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.build_active_slices(self.padded_active_request_count)
 
         # Correctly pad to padded active token count.
-        padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
-        self.token_to_block_idx[padding_token_slice] = self.block_allocator.dummy_block_idx
-        self.token_to_local_position_within_kv_block[padding_token_slice] = 0
-        self.token_to_position_in_request[padding_token_slice] = 0
-
-        # Correctly pad to padded active request count.
-        self.active_attn_metadata["mha_metadata"].update(
-            batch_dimensions=attn_dimensions, padded_batch_dimensions=self.padded_batch_dimensions
-        )
+        self.pad_active_slices()
 
     def reset(self) -> None:
         """Reset entire context.
