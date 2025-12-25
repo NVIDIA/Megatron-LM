@@ -438,25 +438,30 @@ def nvfp4_set_raw_data(tensor: torch.Tensor, data: torch.Tensor) -> None:
     setattr(tensor, data_attr, data)
 
 
-def get_raw_data(tensor: torch.Tensor, get_transpose: bool = False) -> torch.Tensor:
-    """Get the underlying raw storage of a Transformer Engine Float8Tensor or NVFP4Tensor."""
-    if get_transpose:
+def _get_data_attr(tensor: torch.Tensor, is_transpose: bool = False) -> str:
+    if is_transpose:
         assert fp8_need_transpose_data(tensor), f"Type {type(tensor)} does not need transpose data"
         data_attr = "_columnwise_data"
+    elif hasattr(tensor, "_rowwise_data"):
+        data_attr = "_rowwise_data"
+    elif hasattr(tensor, "_data"):
+        data_attr = "_data"
     else:
-        data_attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
+        assert not is_nvfp4tensor(tensor), f"Type {type(tensor)} is not a NVFP4 tensor"
+        assert not is_float8tensor(tensor), f"Type {type(tensor)} is not a FP8 tensor"
+        data_attr = "data"
 
-    return getattr(tensor, data_attr)
+    return data_attr
+
+
+def get_raw_data(tensor: torch.Tensor, get_transpose: bool = False) -> torch.Tensor:
+    """Get the underlying raw storage of a Transformer Engine Float8Tensor or NVFP4Tensor."""
+    return getattr(tensor, _get_data_attr(tensor, get_transpose))
 
 
 def set_raw_data(tensor: torch.Tensor, data: torch.Tensor, set_transpose: bool = False) -> None:
     """Set the raw data of a Transformer Engine Float8Tensor or NVFP4Tensor."""
-    if set_transpose:
-        assert fp8_need_transpose_data(tensor), f"Type {type(tensor)} does not need transpose data"
-        data_attr = "_columnwise_data"
-    else:
-        data_attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
-
+    data_attr = _get_data_attr(tensor, set_transpose)
     old_data = getattr(tensor, data_attr)
     assert old_data.dtype == data.dtype, "The data types of raw data don't match"
     assert (
@@ -502,3 +507,37 @@ def quantize(
         raise ValueError(
             "quantize function only supports FP8 or NVFP4 tensors in model_params"
         )
+
+
+def _tensor_dtype(tensor: torch.Tensor) -> torch.dtype:
+    """Get the effective dtype of a Transformer Engine Float8Tensor or NVFP4Tensor."""
+    if is_nvfp4tensor(tensor):
+        return "nvfp4"
+    elif is_float8tensor(tensor):
+        return "nvfp8"
+    else:
+        return tensor.dtype
+
+
+def _dtype_size(dtype: torch.dtype) -> int:
+    """
+    Get the size of the dtype.
+    Args:
+        dtype (torch.dtype): The dtype to get the size of.
+    Returns:
+        int: The size of the dtype.
+    """
+    if dtype == torch.float16 or dtype == torch.bfloat16:
+        return 2
+    elif dtype == torch.float32 or dtype == torch.int32:
+        return 4
+    elif dtype == torch.int64:
+        return 8
+    elif dtype == torch.uint8:
+        return 1
+    elif dtype == "nvfp8":
+        return 1
+    elif dtype == "nvfp4":
+        return 0.5
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")

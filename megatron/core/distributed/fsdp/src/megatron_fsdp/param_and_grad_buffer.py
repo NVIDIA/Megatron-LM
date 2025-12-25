@@ -43,6 +43,8 @@ from .mixed_precision import (
     is_nvfp4tensor,
     get_raw_data,
     set_raw_data,
+    _tensor_dtype,
+    _dtype_size,
 )
 from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
 from .utils import (
@@ -823,6 +825,7 @@ class DataParallelBuffer:
         item_index_map: Optional[Dict[int, TensorItemIndex]] = None,
         bucket_index: Optional[BucketIndex] = None,
         shard_bucket_index: Optional[ShardBucketIndex] = None,
+        use_raw_data_shape: bool = False,
     ) -> None:
         self.ddp_config = ddp_config
         self.params = params
@@ -869,11 +872,16 @@ class DataParallelBuffer:
             self.bucket_index = bucket_index
             self.shard_bucket_index = shard_bucket_index
         else:
+            if use_raw_data_shape:
+                data_shapes = [get_raw_data(to_local_if_dtensor(p)).shape for p in self.params]
+            else:
+                data_shapes = [to_local_if_dtensor(p).shape for p in self.params]
+
             # Build the data parallel buffer index, which contains information
             # on where each parameter / gradient tensor will be stored in this
             (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
                 build_data_parallel_buffer_index(
-                    [get_raw_data(to_local_if_dtensor(p)).shape for p in self.params],
+                    data_shapes,
                     self.dp_rank,
                     self.dp_world_size,
                     is_data_distributed,
@@ -1314,10 +1322,13 @@ def _get_parameter_groups(
     parameter_groups = []
     for name, param in module.named_parameters():
         # We need this information to correctly dynamically allocate Tensors!
-        is_fp8 = is_float8tensor(param)
         is_fp8_meta_device_init = meta_device_init_fp8_params.get(name, (False, False))[0]
+        dtype = _tensor_dtype(param)
+        # TODO: Is it possible to identify data types more elegantly?
+        if dtype not in ["nvfp4", "nvfp8"] and is_fp8_meta_device_init:
+            dtype = "nvfp8"
         param_attrs = dict(
-            dtype="float8" if (is_fp8 or is_fp8_meta_device_init) else param.dtype,
+            dtype=dtype,
             is_expert_param=is_expert_parameter(name, param),
             requires_grad=param.requires_grad,
             fsdp_unit_id=None,
@@ -1654,6 +1665,7 @@ class ParamAndGradBuffer:
         # Initialize the optimizer named parameters.
         self.optimizer_named_parameters = self._init_optimizer_named_parameters()
 
+        self._check_parameter_groups()
         self._log_parameter_groups()
 
     def get_mem_alloc_context(self, groups=None, symmetric=True):
@@ -1760,6 +1772,14 @@ class ParamAndGradBuffer:
         if torch.distributed.get_rank() == 0:
             logger.info("\n".join(log_lines))
 
+    def _check_parameter_groups(self):
+        """
+        Perform bucket grouping consistency checks on the weight buffer,
+        main weight buffer, and gradient buffer.
+        """
+        # TODO: implement consistency checks
+        pass
+
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
         """
         Initialize the buffers for each parameter group.
@@ -1815,7 +1835,7 @@ class ParamAndGradBuffer:
 
         preserve_fp32_weights = self.preserve_fp32_weights
         grad_reduce_in_fp32 = self.grad_reduce_in_fp32
-        buffer_size = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
+        buffer_size = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, torch.uint8: 0}
 
         # Only create HSDP buffers if sharding on DP-Outer. Otherwise, no need to all-gather
         # parameters on DP-Outer, but still need to all-reduce gradients on DP-Outer.
@@ -1890,6 +1910,7 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
+                    use_raw_data_shape=True,
                     **main_buf_extra_kwargs,
                 )
                 if should_create_transpose_weight_buffer:
@@ -2229,11 +2250,11 @@ class ParamAndGradBuffer:
                     torch.bfloat16: torch.empty(
                         buffer_size[torch.bfloat16], dtype=torch.bfloat16, device=self.device
                     ),
-                    "float8": torch.empty(
-                        buffer_size["float8"], dtype=torch.uint8, device=self.device
+                    torch.uint8: torch.empty(
+                        buffer_size[torch.uint8], dtype=torch.uint8, device=self.device
                     ),
                 }
-            offset = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
+            offset = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, torch.uint8: 0}
 
         def _alloc(dtype, size):
             """
@@ -2244,8 +2265,6 @@ class ParamAndGradBuffer:
             If not using a single buffer, then return an empty Tensor on this device.
             """
             if self.buffer_all_in_one:
-                if dtype == torch.uint8:
-                    dtype = "float8"
                 data = self.buffer[dtype][offset[dtype] : offset[dtype] + size]
                 offset[dtype] += size
                 return data
@@ -2679,7 +2698,7 @@ class ParamAndGradBuffer:
                     else:
                         shard_fp32_from_fp8.append(main_weight)
                         shard_offsets_in_fp8.append(wbuf.locate_item_in_global_item(item_id)[0])
-                        bucket = wbuf.fetch_bucket()
+                        bucket = wbuf.fetch_bucket(set_param_data=True)
                         b_model_param = wbuf.get_item_from_bucket(bucket, item_id)[
                             slice(*wbuf.locate_item_in_global_item(item_id))
                         ]
@@ -3704,27 +3723,6 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
 
         setattr(p, "cpu", override_sharded_param_cpu_function_closure(p, cpu_function))
 
-
-def _dtype_size(dtype: torch.dtype) -> int:
-    """
-    Get the size of the dtype.
-    Args:
-        dtype (torch.dtype): The dtype to get the size of.
-    Returns:
-        int: The size of the dtype.
-    """
-    if dtype == torch.float16 or dtype == torch.bfloat16:
-        return 2
-    elif dtype == torch.float32 or dtype == torch.int32:
-        return 4
-    elif dtype == torch.int64:
-        return 8
-    elif dtype == torch.uint8:
-        return 1
-    elif dtype == "float8":
-        return 1
-    else:
-        raise ValueError(f"Unsupported dtype: {dtype}")
 
 
 def to_local_if_dtensor(tensor):
