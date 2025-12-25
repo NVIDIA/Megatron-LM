@@ -1725,7 +1725,7 @@ class KitchenSpecProvider(BackendSpecProvider):
         self.use_kitchen_attention = use_kitchen_attention
         self.kitchen_attention_backend = kitchen_attention_backend
 
-    def column_parallel_linear(self) -> type:
+    def column_parallel_linear(self) -> type[KitchenColumnParallelLinear]:
         """Which column parallel linear module kitchen backend uses"""
         return KitchenColumnParallelLinear
 
@@ -1744,7 +1744,7 @@ class KitchenSpecProvider(BackendSpecProvider):
         # explicitly about whether to include a norm.
         return self.fallback.fuse_layernorm_and_linear()
 
-    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+    def column_parallel_layer_norm_linear(self) -> type[KitchenLayerNormColumnParallelLinear]:
         """Which module for sequential layernorm and linear"""
         return KitchenLayerNormColumnParallelLinear
 

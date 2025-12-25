@@ -2,7 +2,7 @@
 import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -23,12 +23,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import (
-    all_gather_last_dim_from_tensor_parallel_region,
-)
+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
@@ -111,13 +110,45 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+class LinearQkv(Protocol):
+    """Protocol for linear_qkv modules."""
+
+    def forward(self, input: Tensor, /) -> Tuple[Tensor, object]:
+        """Applies linear_qkv."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward pass for the linear_qkv module."""
+        ...
+
+
+class LinearQkvBuilder(Protocol):
+    """Protocol for building linear_qkv layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> LinearQkv: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
     Configuration class for specifying the submodules of a self-attention.
     """
 
-    linear_qkv: Union[ModuleSpec, type] = None
+    linear_qkv: LinearQkvBuilder
     core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
@@ -161,6 +192,9 @@ class Attention(MegatronModule, ABC):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
+
+        assert self.config.kv_channels is not None
+        assert self.config.num_query_groups is not None
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -321,9 +355,7 @@ class Attention(MegatronModule, ABC):
         ), "Virtual pipeline parallelism is not supported for inference"
 
         # Import here to avoid circular imports
-        from megatron.core.transformer.transformer_layer import (
-            get_transformer_layer_offset,
-        )
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
         return get_transformer_layer_offset(
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
@@ -1048,12 +1080,11 @@ class SelfAttention(Attention):
             pg_collection=pg_collection,
         )
 
-        self.linear_qkv = build_module(
-            submodules.linear_qkv,
+        self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
             skip_bias_add=False,
@@ -1164,8 +1195,9 @@ class SelfAttention(Attention):
         the unsplit mixed_qkv tensor is returned.
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
-        mixed_qkv, _ = self.linear_qkv(hidden_states)
+        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
 
+        assert self.config.num_query_groups is not None
         if self.config.num_query_groups < self.world_size:
             # Note that weights are interleaved in the following manner:
             # q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ...
@@ -1378,7 +1410,7 @@ class CrossAttention(Attention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(
             config=config,

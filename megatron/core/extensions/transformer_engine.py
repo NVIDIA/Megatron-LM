@@ -8,7 +8,7 @@ import os
 import pickle
 import warnings
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -61,16 +61,22 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 
-try:
+if TYPE_CHECKING:
+    # For type checking, 
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
-
     HAVE_TE = True
-except ImportError:
-    from unittest.mock import MagicMock
+else:
+    try:
+        import transformer_engine as te
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
-    te = MagicMock()
-    HAVE_TE = False
+        HAVE_TE = True
+    except ImportError:
+        from unittest.mock import MagicMock
+
+        te = MagicMock()
+        HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 
@@ -2357,7 +2363,10 @@ except ImportError:
     pass
 
 try:
-    from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding  # pylint: disable=unused-import
+    from transformer_engine.pytorch import (  # pylint: disable=unused-import
+        Fp8Padding,
+        Fp8Unpadding,
+    )
 
 except ImportError:
     Fp8Padding = None
