@@ -91,7 +91,7 @@ def get_batch(data_iterator, vp_stage=None):
     else:  # packed sequence
         empty_batch['cu_seqlens'] = cu_seqlens
         empty_batch['max_seqlen'] = max_seqlen
-        return empty_batch.value()
+        return empty_batch.values()
 
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
