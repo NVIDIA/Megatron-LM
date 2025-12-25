@@ -26,7 +26,7 @@ import warnings
 from collections import defaultdict, namedtuple
 from contextlib import ExitStack, nullcontext
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast, Union
 
 import torch
 from torch.distributed import _coalescing_manager
@@ -34,17 +34,16 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from .mixed_precision import (
     fp8_discard_transpose_cache,
-    fp8_need_transpose_data,
-    fp8_need_transpose_data_for_meta_device_init,
+    get_nvfp4_rowwise_packed_shape,
     quantize,
     is_blockwise_float8tensor,
-    is_float8tensor,
     is_te_min_version,
     is_nvfp4tensor,
     get_raw_data,
     set_raw_data,
     _tensor_dtype,
     _dtype_size,
+    _meta_device_param_dtype,
 )
 from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
 from .utils import (
@@ -825,7 +824,7 @@ class DataParallelBuffer:
         item_index_map: Optional[Dict[int, TensorItemIndex]] = None,
         bucket_index: Optional[BucketIndex] = None,
         shard_bucket_index: Optional[ShardBucketIndex] = None,
-        use_raw_data_shape: bool = False,
+        use_nvfp4_packed_shape: bool = False,
     ) -> None:
         self.ddp_config = ddp_config
         self.params = params
@@ -872,13 +871,13 @@ class DataParallelBuffer:
             self.bucket_index = bucket_index
             self.shard_bucket_index = shard_bucket_index
         else:
-            if use_raw_data_shape:
-                data_shapes = [get_raw_data(to_local_if_dtensor(p)).shape for p in self.params]
-            else:
-                data_shapes = [to_local_if_dtensor(p).shape for p in self.params]
+            data_shapes = [to_local_if_dtensor(p).shape for p in self.params]
+            if use_nvfp4_packed_shape:
+                data_shapes = [get_nvfp4_rowwise_packed_shape(s) for s in data_shapes]
 
             # Build the data parallel buffer index, which contains information
             # on where each parameter / gradient tensor will be stored in this
+            # distributed buffer.
             (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
                 build_data_parallel_buffer_index(
                     data_shapes,
@@ -1261,7 +1260,7 @@ class ParameterGroup:
 def _get_parameter_groups(
     module: torch.nn.Module,
     policy: BucketingPolicy,
-    meta_device_init_fp8_params: dict,
+    meta_device_param_dtype: dict,
     bucket_group_by_fsdp_unit: bool = True,
 ):
     """
@@ -1271,8 +1270,10 @@ def _get_parameter_groups(
         module (torch.nn.Module): The module whose parameters are to be grouped
             and flattened.
         policy (BucketingPolicy): The bucketing policy.
-        meta_device_init_fp8_params (dict): A dictionary mapping parameter names to
-            a boolean indicating whether the parameter is initialized on the meta device.
+        meta_device_param_dtype (dict): A dictionary that maps parameter names to their data types
+            used when initializing parameters on the meta device. In this context, the
+            fp8/fp4 data type cannot be directly inferred from the tensor itself, so
+            additional information is required.
         bucket_group_by_fsdp_unit (bool): Whether to group buckets by FSDP unit.
 
     Returns:
@@ -1322,11 +1323,7 @@ def _get_parameter_groups(
     parameter_groups = []
     for name, param in module.named_parameters():
         # We need this information to correctly dynamically allocate Tensors!
-        is_fp8_meta_device_init = meta_device_init_fp8_params.get(name, (False, False))[0]
-        dtype = _tensor_dtype(param)
-        # TODO: Is it possible to identify data types more elegantly?
-        if dtype not in ["nvfp4", "nvfp8"] and is_fp8_meta_device_init:
-            dtype = "nvfp8"
+        dtype = meta_device_param_dtype.get(name, _tensor_dtype(param))
         param_attrs = dict(
             dtype=dtype,
             is_expert_param=is_expert_parameter(name, param),
@@ -1638,28 +1635,23 @@ class ParamAndGradBuffer:
             groups=self.ubr_groups, symmetric=not self.ddp_config.disable_symmetric_registration
         )
 
-        # Mark FP8 params. If TransformerEngine is not installed, we can skip this.
-        meta_device_init_fp8_params = {}
+        # If the model is initialized on the meta device, we need a dictionary
+        # to track whether each parameter uses FP8 or FP4 precision. If TransformerEngine
+        # is NOT installed, we can skip this.
+        meta_device_param_dtype = {}
         if reset_parameters_for_meta_device_init_module and HAVE_TE:
             for m in module.modules():
                 if not isinstance(m, TransformerEngineBaseModule):
                     continue
                 for name, param in m.named_parameters(recurse=False):
-                    # The fp8 param initialized from the meta device may NOT be
-                    # an fp8 tensor, according to the internal logic of the TE
-                    # to determine whether this parameter is fp8 or not.
-                    fp8_meta_index = m.param_init_meta[name].fp8_meta_index
-                    if m.primary_weights_in_fp8 and fp8_meta_index is not None:
-                        meta_device_init_fp8_params[self.param_to_name[param]] = (
-                            True,
-                            fp8_need_transpose_data_for_meta_device_init(m),
-                        )
+                    dtype = _meta_device_param_dtype(m, name, param)
+                    meta_device_param_dtype[self.param_to_name[param]] = dtype
 
         # Get the parameter groups.
         (self.parameter_groups, self.param_to_param_group, self.bucket_to_bucket_group) = (
-            _get_parameter_groups(module, bucketing_policy, meta_device_init_fp8_params)
+            _get_parameter_groups(module, bucketing_policy, meta_device_param_dtype)
         )
-        self._init_each_parameter_group_buffers(meta_device_init_fp8_params)
+        self._init_each_parameter_group_buffers(meta_device_param_dtype)
         self._init_distributed_params()
 
         # Initialize the optimizer named parameters.
@@ -1780,7 +1772,7 @@ class ParamAndGradBuffer:
         # TODO: implement consistency checks
         pass
 
-    def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
+    def _init_each_parameter_group_buffers(self, meta_device_param_dtype):
         """
         Initialize the buffers for each parameter group.
         """
@@ -1867,27 +1859,19 @@ class ParamAndGradBuffer:
             )
             # Check if the parameter group is FP8.
             one_param = group.params[0]
-            is_dtype_nvfp4 = is_nvfp4tensor(one_param)
-            is_dtype_float8 = (
-                is_float8tensor(one_param)
-                or meta_device_init_fp8_params.get(self.param_to_name[one_param], (False, False))[0]
+            param_dtype = meta_device_param_dtype.get(
+                self.param_to_name[one_param], _tensor_dtype(one_param)
             )
-            if is_dtype_float8 or is_dtype_nvfp4:
-                param_dtype = torch.uint8
-                grad_dtype = torch.bfloat16
+            if param_dtype in ["nvfp8", "nvfp8_t", "nvfp4"]:
+                wbuf_dtype = torch.uint8
+                gbuf_dtype = torch.bfloat16
             else:
-                param_dtype = group.params[0].dtype
-                grad_dtype = param_dtype
+                wbuf_dtype = param_dtype
+                gbuf_dtype = param_dtype
 
             # Check if the parameter group needs a transpose buffer for model weights.
             # Currently, only mxfp8 needs it.
-            need_transpose_data = is_float8tensor(one_param) and fp8_need_transpose_data(one_param)
-            need_transpose_data_for_meta_device_init = meta_device_init_fp8_params.get(
-                self.param_to_name[one_param], (False, False)
-            )[1]
-            should_create_transpose_weight_buffer = (
-                need_transpose_data or need_transpose_data_for_meta_device_init
-            )
+            should_create_transpose_weight_buffer = (param_dtype == "nvfp8_t")
 
             # Check if the parameter group requires a grad buffer or main weight buffer.
             should_create_grad_buffer_or_main_weight_buffer = (
@@ -1902,7 +1886,7 @@ class ParamAndGradBuffer:
                     group.params,
                     is_data_distributed=is_model_weight_buffer_distributed
                     and main_buf_dp_group.size() > 1,
-                    dtype=param_dtype,
+                    dtype=wbuf_dtype,
                     device=self.device,
                     data_parallel_group=main_buf_dp_group,
                     is_transpose_buffer=False,
@@ -1910,7 +1894,7 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
-                    use_raw_data_shape=True,
+                    use_nvfp4_packed_shape=(param_dtype == "nvfp4"),
                     **main_buf_extra_kwargs,
                 )
                 if should_create_transpose_weight_buffer:
@@ -1919,7 +1903,7 @@ class ParamAndGradBuffer:
                         group.params,
                         is_data_distributed=is_model_weight_buffer_distributed
                         and main_buf_dp_group.size() > 1,
-                        dtype=param_dtype,
+                        dtype=wbuf_dtype,
                         device=self.device,
                         data_parallel_group=main_buf_dp_group,
                         is_transpose_buffer=True,
@@ -1949,7 +1933,7 @@ class ParamAndGradBuffer:
             # Initialize the main grad buffer.
             if should_create_grad_buffer_or_main_weight_buffer:
                 assert (
-                    grad_reduce_in_fp32 or grad_dtype is not torch.uint8
+                    grad_reduce_in_fp32 or gbuf_dtype is not torch.uint8
                 ), "Gradients can not be reduced in FP8. "
                 group.main_grad_buffer = DataParallelBuffer(
                     self.ddp_config,
@@ -1957,7 +1941,7 @@ class ParamAndGradBuffer:
                     # as the number of model parameters.
                     group.params,
                     is_data_distributed=is_grad_buffer_distributed and main_buf_dp_group.size() > 1,
-                    dtype=torch.float32 if grad_reduce_in_fp32 else grad_dtype,
+                    dtype=torch.float32 if grad_reduce_in_fp32 else gbuf_dtype,
                     device=self.device,
                     data_parallel_group=main_buf_dp_group,
                     is_transpose_buffer=False,
@@ -2163,7 +2147,7 @@ class ParamAndGradBuffer:
                             # if we do not need keep cache.
                             if not self.ddp_config.keep_fp8_transpose_cache:
                                 for _param in m.parameters(recurse=False):
-                                    if is_float8tensor(_param):
+                                    if _tensor_dtype(_param) in ["nvfp8", "nvfp8_t"]:
                                         fp8_discard_transpose_cache(_param)
                     # Raise error if a meta parameter still exists after initialization.
                     assert not p.is_meta, (self.param_to_name[p], module_reset_flag)
@@ -2172,9 +2156,9 @@ class ParamAndGradBuffer:
 
                     # Copy the model weight parameter tensor into the buffer.
                     # When distributed, this shards and preserves the data across all ranks.
-                    wbuf.set_item(item_id, p_local)
+                    wbuf.set_item(item_id, get_raw_data(p_local))
                     if tbuf:
-                        tbuf.set_item(item_id, p_local)
+                        tbuf.set_item(item_id, get_raw_data(p_local, True))
 
                     # Retrieve the newly allocated parameter data from the global bucket.
                     # Attach the bucket-allocated parameter data to the module parameter,
@@ -2218,7 +2202,7 @@ class ParamAndGradBuffer:
                         # Nothing else needs to be done, because the main weights
                         # do not require autograd operations, only possibly sharding.
                         p_local = to_local_if_dtensor(p)
-                        assert not is_float8tensor(p_local), (
+                        assert _tensor_dtype(p_local) not in ["nvfp8", "nvfp8_t"], (
                             self.param_to_name[p],
                             "fp8 param should use get_high_precision_init_val method.",
                         )
@@ -2717,7 +2701,7 @@ class ParamAndGradBuffer:
                         has_copy_io_param = True
                     continue
 
-                if is_float8tensor(param):
+                if _tensor_dtype(param) in ["nvfp8", "nvfp8_t", "nvfp4"]:
                     fp8_params.append(param)
                     if model_param.numel() == 0:
                         shard_fp32_from_fp8.append(None)

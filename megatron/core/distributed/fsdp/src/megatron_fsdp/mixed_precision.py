@@ -358,25 +358,6 @@ def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
     return HAVE_TE_FP4_TENSOR_CLASS and isinstance(tensor, FP4_TENSOR_CLASS)
 
 
-def modify_nvfp4_rowwise_storage(fp4_tensor: torch.Tensor, new_rowwise_data: torch.Tensor) -> None:
-    """Replace NVFP4 tensor's rowwise raw data with a new uint8 storage view.
-
-    Copies existing bytes into the new buffer, then swaps the underlying pointer.
-    """
-    if not is_nvfp4tensor(fp4_tensor):
-        raise ValueError("modify_nvfp4_rowwise_storage expects an NVFP4 tensor")
-    # Access TE's internal storage fields
-    old_rowwise = getattr(fp4_tensor, "_rowwise_data", None)
-    if old_rowwise is None:
-        raise RuntimeError("NVFP4 tensor is missing rowwise data to replace")
-    assert (
-        old_rowwise.dtype == new_rowwise_data.dtype == torch.uint8
-    ), "Rowwise NVFP4 storage must be uint8"
-    # Preserve existing values and then swap storage
-    new_rowwise_data.detach().copy_(old_rowwise)
-    setattr(fp4_tensor, "_rowwise_data", new_rowwise_data)
-
-
 def quantize_nvfp4_param_shard(
     model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
 ):
@@ -438,6 +419,16 @@ def nvfp4_set_raw_data(tensor: torch.Tensor, data: torch.Tensor) -> None:
     setattr(tensor, data_attr, data)
 
 
+def get_nvfp4_rowwise_packed_shape(shape: torch.Size) -> torch.Size:
+    """Return packed byte shape for NVFP4 rowwise storage (last dim // 2)."""
+    if len(shape) == 0:
+        return shape
+    assert shape[-1] % 2 == 0, "NVFP4 requires inner dimension divisible by 2"
+    packed = list(shape)
+    packed[-1] = packed[-1] // 2
+    return torch.Size(packed)
+
+
 def _get_data_attr(tensor: torch.Tensor, is_transpose: bool = False) -> str:
     if is_transpose:
         assert fp8_need_transpose_data(tensor), f"Type {type(tensor)} does not need transpose data"
@@ -490,7 +481,6 @@ def quantize(
             main_params,
             start_offsets,
             data_parallel_group,
-            fsdp_shard_model_params,
         )
     elif is_float8tensor(model_params[0]):
         assert all(
@@ -514,9 +504,30 @@ def _tensor_dtype(tensor: torch.Tensor) -> torch.dtype:
     if is_nvfp4tensor(tensor):
         return "nvfp4"
     elif is_float8tensor(tensor):
+        if fp8_need_transpose_data(tensor):
+            return "nvfp8_t"
         return "nvfp8"
     else:
         return tensor.dtype
+
+
+def _meta_device_param_dtype(
+    module: torch.nn.Module,
+    name: str,
+    param: torch.Tensor,
+):
+    if not HAVE_TE_FP8_TENSOR_CLASS:
+        return param.dtype
+
+    fp8_meta_index = module.param_init_meta[name].fp8_meta_index
+    if module.primary_weights_in_fp8 and fp8_meta_index is not None:
+        if HAVE_TE_FP4_TENSOR_CLASS and module.fp8_meta["recipe"].nvfp4():
+            return "nvfp4"
+        if fp8_need_transpose_data_for_meta_device_init(module):
+            return "nvfp8_t"
+        return "nvfp8"
+
+    return param.dtype
 
 
 def _dtype_size(dtype: torch.dtype) -> int:
@@ -535,7 +546,7 @@ def _dtype_size(dtype: torch.dtype) -> int:
         return 8
     elif dtype == torch.uint8:
         return 1
-    elif dtype == "nvfp8":
+    elif dtype in ["nvfp8", "nvfp8_t"]:
         return 1
     elif dtype == "nvfp4":
         return 0.5
