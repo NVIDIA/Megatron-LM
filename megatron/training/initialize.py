@@ -379,7 +379,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
-                moe_alltoall_comm_backend=getattr(args, 'moe_alltoall_comm_backend', 'nccl'),
+                moe_alltoall_distributed_backend=getattr(args, 'moe_alltoall_distributed_backend', 'nccl'),
                 create_gloo_process_groups=args.enable_gloo_process_groups,
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
