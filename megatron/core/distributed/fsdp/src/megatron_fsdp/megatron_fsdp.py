@@ -783,10 +783,12 @@ class MegatronFSDP(torch.nn.Module):
         def _post_forward(module: nn.Module, input: Any, output: Any):
             # When composed with module-hook-based activation recomputation, the
             # post-backward hook is responsible for resharding the module parameters
-            # after the forward pass. Skip resharding the module parameters in this case.
+            # after the forward pass. In this case, the resharding is performed lazily.
             if module._training_state == TrainingState.PRE_BACKWARD:
-                # Skip weight deallocation until the backward pass is complete
-                # during activation recomputation / gradient checkpointing.
+                # Delay parameter resharding because this is currently running inside
+                # the activation recomputation forward. The corresponding backward
+                # pass may still need these parameters, and delaying avoids an
+                # unnecessary all-gather.
                 lazy_release = True
             else:
                 lazy_release = False
