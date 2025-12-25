@@ -57,14 +57,16 @@ class TransformerLayerSchedulePlan:
     moe_combine = None
     mtp_post_process = None
 
-    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
+    def __init__(self, layer, fwd_event, back_event, chunk_state, comp_stream, comm_stream, extra_args={}):
         """Initializes a transformer layer schedule plan.
 
         Args:
             layer (TransformerLayer):
                 split a transformer layer into multiple nodes for fine-grained scheduling.
-            event (torch.cuda.Event):
-                record CUDA event across multiple nodes on different streams for synchronization.
+            fwd_event (torch.cuda.Event):
+                record CUDA event across multiple nodes on different streams for synchronization with regard to forward pass.
+            fwd_event (torch.cuda.Event):
+                record CUDA event across multiple nodes on different streams for synchronization with regard to backward pass.
             chunk_state (ModelChunkState): model state shared in the model chunk.
             comp_stream (torch.cuda.Stream): CUDA stream for computation.
             comm_stream (torch.cuda.Stream): CUDA stream for communication.
@@ -78,14 +80,15 @@ class TransformerLayerSchedulePlan:
         self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
         self.layer = layer
-        self.event = event
+        self.fwd_event = fwd_event
+        self.back_event = back_event
         self.comp_stream = comp_stream
         self.comm_stream = comm_stream
 
         # get callable nodes for transformer/mtp layer
-        self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
+        self._build_callable_nodes(fwd_event, back_event, comp_stream, comm_stream, extra_args)
 
-    def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
+    def _build_callable_nodes(self, fwd_event, back_event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
             attn, post_attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
@@ -122,7 +125,8 @@ class TransformerLayerSchedulePlan:
             bwd_dw_callables = bwd_dw_callable_map.get(name, None)
             return TransformerLayerNode(
                 stream,
-                event,
+                fwd_event,
+                back_event,
                 self.layer_state,
                 self.chunk_state,
                 module,
@@ -292,7 +296,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
-        self._event = torch.cuda.Event()
+        self._fwd_event = torch.cuda.Event()
+        self._back_event = torch.cuda.Event()
         self.pre_process = None
         self.post_process = None
         self.vp_stage = model.vp_stage
@@ -320,12 +325,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         mtp_num_layers = get_mtp_num_layers_to_build(model.config, vp_stage=self.vp_stage)
 
         # build preprocess
-        self.pre_process = PreProcessNode(model, self._model_chunk_state, self._event, comp_stream)
+        self.pre_process = PreProcessNode(model, self._model_chunk_state, self._fwd_event, self._back_event, comp_stream)
         # build layer schedule plan for each layer
         for layer_idx in range(transformer_num_layers):
             layer = model.decoder._get_layer(layer_idx)
             layer_plan = TransformerLayerSchedulePlan(
-                layer, self._event, self._model_chunk_state, comp_stream, comm_stream
+                layer, self._fwd_event, self._back_event, self._model_chunk_state, comp_stream, comm_stream
             )
             self._transformer_layers.append(layer_plan)
 
@@ -337,30 +342,55 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             }
             layer = model.mtp.layers[layer_idx]
             layer_plan = TransformerLayerSchedulePlan(
-                layer, self.event, self.state, comp_stream, comm_stream, extra_args
+                layer, self._fwd_event, self._back_event, self.state, comp_stream, comm_stream, extra_args
             )
             self._transformer_layers.append(layer_plan)
 
         # build post process
         if model.post_process:
             self.post_process = PostProcessNode(
-                model, self._model_chunk_state, self._event, comp_stream
+                model, self._model_chunk_state, self._fwd_event, self._back_event, comp_stream
             )
 
     @property
-    def event(self):
-        """Gets the CUDA event for synchronization."""
-        return self._event
+    def event_fwd(self):
+        """Gets the CUDA event for forward synchronization."""
+        return self._fwd_event
+
+    @property
+    def event_back(self):
+        """Gets the CUDA event for backward synchronization."""
+        return self._back_event
 
     def record_current_stream(self):
         """Records the current CUDA stream in the event."""
         stream = torch.cuda.current_stream()
         self.event.record(stream)
 
+    def record_current_stream_fwd(self):
+        """Records the current CUDA stream in the event for forward synchronization."""
+        stream = torch.cuda.current_stream()
+        self.event_fwd.record(stream)
+
+    def record_current_stream_back(self):
+        """Records the current CUDA stream in the event for backward synchronization."""
+        stream = torch.cuda.current_stream()
+        self.event_back.record(stream)
+
     def wait_current_stream(self):
         """Waits for the event to complete on the current CUDA stream."""
         stream = torch.cuda.current_stream()
         self.event.wait(stream)
+
+    def wait_current_stream_fwd(self):
+        """Waits for the event to complete on the current CUDA stream in the forward pass."""
+        stream = torch.cuda.current_stream()
+        self.event_fwd.wait(stream)
+
+    def wait_current_stream_back(self):
+        """Waits for the event to complete on the current CUDA stream in the backward pass."""
+        stream = torch.cuda.current_stream()
+        self.event_back.wait(stream)
 
     def get_layer(self, i):
         """Gets the transformer layer at the specified index."""
@@ -428,15 +458,15 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             # pp output send/receive sync
             if pre_forward is not None:
                 pre_forward(f_schedule_plan.vp_stage)
-            f_schedule_plan.record_current_stream()
+            f_schedule_plan.record_current_stream_fwd()
             f_input = f_schedule_plan.pre_process.forward()
 
         if b_schedule_plan:
-            b_schedule_plan.record_current_stream()
+            b_schedule_plan.record_current_stream_back()
             assert b_grad is not None
             if pre_backward is not None:
                 pre_backward(b_schedule_plan.vp_stage)
-                b_schedule_plan.record_current_stream()
+                b_schedule_plan.record_current_stream_back()
 
             if b_schedule_plan.post_process is not None:
                 b_grad = b_schedule_plan.post_process.backward(b_grad)
@@ -479,13 +509,13 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             # post_forward()/send_forward_recv_forward() is running in the communication stream,
             # so the p2p comm could be overlapped with the attn backward
             with torch.cuda.stream(get_comm_stream()):
-                f_schedule_plan.wait_current_stream()
+                f_schedule_plan.wait_current_stream_fwd()
                 post_forward(f_input, f_schedule_plan.vp_stage)
 
         # post_backward()/send_backward_recv_backward() is running in the computation stream,
         # so the p2p comm could be overlapped with the wgrad of attn backward
         if b_schedule_plan is not None and post_backward is not None:
-            b_schedule_plan.wait_current_stream()
+            b_schedule_plan.wait_current_stream_back()
             post_backward(b_grad, b_schedule_plan.vp_stage)
 
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
@@ -501,12 +531,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_schedule_plan.pre_process.backward(b_grad)
 
         if f_schedule_plan:
-            f_schedule_plan.wait_current_stream()
+            f_schedule_plan.wait_current_stream_fwd()
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
 
         # Release reference as early as possible, this helps avoid memory leak.
         if b_schedule_plan is not None:
-            b_schedule_plan.release_state()
+            b_schedule_plan.wait_current_stream_back()
 
         return f_input
