@@ -113,7 +113,7 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
                 params={"attn_mask_type": attn_mask_type},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
-                    core_attention=TEDotProductAttention,
+                    core_attention=not_none(TEDotProductAttention),
                     linear_proj=TERowParallelLinear,
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
@@ -159,7 +159,7 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
                         params={"attn_mask_type": attn_mask_type},
                         submodules=SelfAttentionSubmodules(
                             linear_qkv=not_none(TELayerNormColumnParallelLinear),
-                            core_attention=TEDotProductAttention,
+                            core_attention=not_none(TEDotProductAttention),
                             linear_proj=TERowParallelLinear,
                         ),
                     ),

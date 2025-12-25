@@ -62,9 +62,10 @@ from megatron.core.utils import (
 )
 
 if TYPE_CHECKING:
-    # For type checking, 
+    # For type checking, treat transformer_engine as always available.
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
+
     HAVE_TE = True
 else:
     try:
@@ -1160,7 +1161,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         v_channels: Optional[int] = None,
         num_splits: Optional[int] = None,
         cp_comm_type: str = "p2p",
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1334,12 +1335,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Tensor,
+        attention_mask: Optional[Tensor],
         attn_mask_type: AttnMaskType,
-        attention_bias: Tensor = None,
-        packed_seq_params: PackedSeqParams = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
         num_splits: Optional[int] = None,
-    ):
+    ) -> torch.Tensor:
         """Forward."""
         # Default to constructor-provided num_splits unless explicitly overridden
         if num_splits is None:

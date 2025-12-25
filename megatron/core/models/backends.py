@@ -166,7 +166,7 @@ class InferenceSpecProvider(BackendSpecProvider):
             return FusedLayerNorm
         return TENorm
 
-    def core_attention(self) -> type:
+    def core_attention(self) -> type[TEDotProductAttention]:
         """Which module to use for attention"""
         return TEDotProductAttention
 
