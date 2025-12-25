@@ -137,7 +137,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             return x
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         """
         Forward pass.
         """
