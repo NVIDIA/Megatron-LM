@@ -174,6 +174,7 @@ def get_inference_context(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
@@ -368,6 +369,7 @@ def run_inference(
                 request.time_end = get_curr_time()
                 request.state = "finished"
                 request.request_id = finished_request.request_id
+                request.events = finished_request.events
 
                 # Update prompt, in case engine has been suspended and resumed.
                 request.prompt_tokens = finished_request.prompt_tokens.tolist()
@@ -516,7 +518,6 @@ def main():
         )
 
     # Print unique prompts + outputs.
-
     if torch.distributed.get_rank() == 0:
         def escape_str(s):
             return s.replace("\n", "\\n")

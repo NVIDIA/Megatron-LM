@@ -1362,13 +1362,13 @@ class TestDynamicInferenceEngine:
         step_count = env.engine.step_count
         context = env.engine.context
         if max_requests is None:
-            assert context.max_active_requests == 408
+            assert context.max_requests == 408
             assert step_count == 22
         else:
             assert max_requests < len(env.requests), (
                 f"Test is only useful if max_requests ({max_requests}) < "
                 f"num_requests ({len(env.requests)})."
             )
-            assert context.max_active_requests == 4
+            assert context.max_requests == 4
             assert step_count == 34
         assert context.block_allocator.active_count == 409
