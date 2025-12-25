@@ -66,7 +66,7 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 params={"attn_mask_type": AttnMaskType.padding},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
-                    core_attention=TEDotProductAttention,
+                    core_attention=not_none(TEDotProductAttention),
                     linear_proj=TERowParallelLinear,
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
@@ -95,7 +95,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
-                    core_attention=TEDotProductAttention,
+                    core_attention=not_none(TEDotProductAttention),
                     linear_proj=TERowParallelLinear,
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,

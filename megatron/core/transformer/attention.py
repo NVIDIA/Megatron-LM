@@ -175,6 +175,41 @@ class LinearLayerBuilder(Protocol):
     ) -> LinearLayer: ...
 
 
+class CoreAttention(Protocol):
+    """Protocol for core_attention modules."""
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        /,
+        *,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tensor:
+        """Applies dot product attention."""
+        ...
+
+
+class CoreAttentionBuilder(Protocol):
+    """Protocol for building core_attention layers."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        cp_comm_type: Optional[str],
+        softmax_scale: Optional[float],
+        pg_collection: Optional[ProcessGroupCollection],
+    ) -> CoreAttention: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
@@ -182,7 +217,7 @@ class SelfAttentionSubmodules:
     """
 
     linear_qkv: LinearQkvBuilder
-    core_attention: Union[ModuleSpec, type] = None
+    core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
     k_layernorm: Union[ModuleSpec, type] = None
@@ -196,7 +231,7 @@ class CrossAttentionSubmodules:
 
     linear_q: LinearLayerBuilder
     linear_kv: LinearLayerBuilder
-    core_attention: Union[ModuleSpec, type] = None
+    core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -280,8 +315,7 @@ class Attention(MegatronModule, ABC):
             tmp_config.num_query_groups = world_size
         else:
             tmp_config = self.config
-        self.core_attention = build_module(
-            submodules.core_attention,
+        self.core_attention = submodules.core_attention(
             config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
@@ -364,7 +398,7 @@ class Attention(MegatronModule, ABC):
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
+            output_ = apply_module(self.core_attention)(
                 query,
                 key,
                 value,
@@ -422,7 +456,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, AttnMaskType, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, AttnMaskType, Tensor]:
         """
         Saves the generated key and value tensors to the end of the buffers in inference_context.
         Returns the full size keys and values from the provided inference_context, as well as
@@ -1111,7 +1145,7 @@ class Attention(MegatronModule, ABC):
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
-                    core_attn_out = self.core_attention(
+                    core_attn_out = apply_module(self.core_attention)(
                         query,
                         key,
                         value,
@@ -1120,6 +1154,18 @@ class Attention(MegatronModule, ABC):
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
                     )
+%%%%%%% Changes from base to side #2
+-                core_attn_out = self.core_attention(
++                core_attn_out = apply_module(self.core_attention)(
+                     query,
+                     key,
+                     value,
+                     attention_mask,
+                     attn_mask_type=attn_mask_type,
+                     attention_bias=attention_bias,
+                     packed_seq_params=packed_seq_params,
+                 )
+>>>>>>> Conflict 1 of 1 ends
 
             else:
                 # Dynamic batching attention kernel.
