@@ -107,8 +107,8 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 module=CrossAttention,
                 params={"attn_mask_type": AttnMaskType.padding},
                 submodules=CrossAttentionSubmodules(
-                    linear_q=TEColumnParallelLinear,
-                    linear_kv=TEColumnParallelLinear,
+                    linear_q=not_none(TEColumnParallelLinear),
+                    linear_kv=not_none(TEColumnParallelLinear),
                     core_attention=TEDotProductAttention,
                     linear_proj=TERowParallelLinear,
                 ),
