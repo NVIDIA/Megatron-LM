@@ -356,6 +356,7 @@ class TransformerLayerSchedulePlan:
             if f_layer is not None:
                 with f_layer.get_fp8_context():
                     f_input = f_layer.moe_combine.forward(f_input)
+                    f_input = f_layer.post_combine.forward(f_input)
                     f_input = f_layer.mtp_post_process.forward(f_input)
 
             if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
