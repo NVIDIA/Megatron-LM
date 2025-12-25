@@ -13,7 +13,6 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 class MockDynamicInferenceRequest:
     """Mock class for DynamicInferenceRequest to test stop word detection."""
-
     def __init__(
         self,
         request_id: int,
@@ -35,7 +34,6 @@ class TestStopWordDetection:
     ) -> bool:
         """
         Check if a request should stop due to stop words (after token is appended).
-
         This mirrors the logic in DynamicInferenceEngine._check_stop_words_for_request_post_append
         """
         # Check if request has stop words configured
