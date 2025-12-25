@@ -16,6 +16,7 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
     fused_dispatch,
@@ -75,6 +76,11 @@ class MoETokenDispatcher:
         self.tp_size = utils.get_pg_size(self.tp_group)
         self.tp_rank = utils.get_pg_rank(self.tp_group)
         self.ep_size = utils.get_pg_size(self.ep_group)
+
+        # Attributes that need to be captured in cudagraph. These attributes are returned
+        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+        self.cudagraph_attrs = []
+        self.valid_cudagraph_attrs = None
 
     @abstractmethod
     def dispatch_preprocess(
@@ -232,6 +238,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # each element is True if it's between the local_expert_indices. Only useful when cross
         # device token permutation is enabled and **AllGahter** is performed.
         self.global_local_map = None
+
+        # Attributes that need to be captured in cudagraph. These attributes are returned
+        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+        self.cudagraph_attrs = ['routing_map']
 
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
@@ -426,10 +436,35 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "no_sync": 4,
         }
         self.cuda_dtoh_point = "before_permutation_1"
+        if (
+            config.cuda_graph_impl == "transformer_engine"
+            and CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+        ):
+            self.cuda_dtoh_point = "before_ep_alltoall"
         if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
             MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
 
+        # Attributes that need to be captured in cudagraph. These attributes are returned
+        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+        self.cudagraph_attrs = [
+            'tokens_per_expert',
+            'input_splits',
+            'output_splits',
+            'output_splits_tp',
+            'num_out_tokens',
+            'num_global_tokens_per_local_expert',
+            'reversed_local_input_permutation_mapping',
+            'routing_map',
+        ]
+
         self.shared_experts = None
+
+    def set_shared_experts(self, shared_experts):
+        """Set shared expert to the dispatcher."""
+        super().set_shared_experts(shared_experts)
+        if shared_experts.use_shared_expert_gate:
+            self.cudagraph_attrs.append('shared_experts.gate_score')
+        self.cudagraph_attrs.append('shared_experts.cached_fc1_input')
 
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
@@ -1032,7 +1067,9 @@ class _HybridEPManager(_DispatchManager):
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
-        # Release the used handle/num_permuted_tokens which could change in each iteration
+        # Release the used handle/num_permuted_tokens which could change in each iteration.
+        # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
+        # num_dispatched_tokens, because their values never change.
         self.handle = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None
@@ -1315,6 +1352,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "hybridep":
             self._comm_manager = _HybridEPManager(
                 group=self.tp_ep_group,
@@ -1322,6 +1360,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"

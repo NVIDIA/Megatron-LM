@@ -26,6 +26,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
@@ -1017,7 +1018,7 @@ class TextGenerationController:
         # Check whether CUDA graphs are enabled
         enable_cuda_graph = (
             model_config.cuda_graph_impl == "local"
-            and model_config.cuda_graph_scope != "full_iteration"
+            and CudaGraphScope.full_iteration not in model_config.cuda_graph_scope
         )
 
         # Pad batch tokens if necessary
