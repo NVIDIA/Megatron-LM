@@ -1254,10 +1254,12 @@ def validate_args(args, defaults={}):
         if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-            "expandable_segments:True may not be safe when using CUDA Graphs with some specific parallel settings. "
-            "The training may crash with illegal memory access."
-        )
+
+        if torch.cuda.get_device_capability()[0] < 10:
+            assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+                "expandable_segments:True may not be safe when using CUDA Graphs with some specific parallel settings. "
+                "The training may crash with illegal memory access."
+            )
         assert (
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
@@ -1506,15 +1508,20 @@ def _add_inference_args(parser):
                        '"none": no CUDA graph. '
                        '"local": capture the CUDA graph using MCore local implementation. --cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. '
                        '"transformer_engine": capture the CUDA graph using TE make_graphed_callables().')
-    group.add_argument('--cuda-graph-scope', type=str, default='full',
-                       choices=['full', 'attn', 'full_iteration'],
-                       help='Determines the CUDA graphs capturing scope. Valid values are '
-                       '\"full\", \"attn\" and \"full_iteration\". \"Full\" scope captures a whole '
-                       'Transformer layer. \"Attn\" scope only captures operations in '
-                       'TransformerLayer._forward_attention(). \"ful_iteration\" scope captures a '
-                       'whole iteration. '
-                       'full_iteration scope is only supported with --cuda-graph-impl=local, '
-                       'attn scope is only supported with --cuda-graph-impl=transformer_engine.')
+    group.add_argument('--cuda-graph-scope', nargs='+', type=str, default=[],
+                       help='Determines the CUDA graphs capturing scope. '
+                       'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
+                       '"attn": captures operations in TransformerLayer._forward_attention(). '
+                       '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
+                       '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
+                       '"moe_router": captures operations in TransformerLayer._forward_mlp() up to MoELayer.router(), '
+                       'including the shared experts if they are not overlapped with EP comm. '
+                       '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
+                       '"mamba": captures the mamba layer. '
+                       '"full_iteration": captures a whole iteration. '
+                       'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
+                       'If not specified, the default scope is to capture the whole Transformer layer.')
+
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')

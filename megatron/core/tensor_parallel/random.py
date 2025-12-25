@@ -404,6 +404,27 @@ def _fork_rng():
         _set_all_rng_states(*current_states)
 
 
+# Global flag that's toggled whenever inside a checkpointing context
+IS_CHECKPOINTING = False
+
+
+def _set_checkpointing():
+    """Set state to checkpointing enabled."""
+    global IS_CHECKPOINTING
+    IS_CHECKPOINTING = True
+
+
+def _unset_checkpointing():
+    """Unset state to checkpointing enabled."""
+    global IS_CHECKPOINTING
+    IS_CHECKPOINTING = False
+
+
+def is_checkpointing():
+    """Check if currently in a checkpoint context."""
+    return IS_CHECKPOINTING
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -416,6 +437,8 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, distribute_saved_activations, *args):
         """Forward pass."""
+        _set_checkpointing()
+
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
 
@@ -436,6 +459,7 @@ class CheckpointFunction(torch.autograd.Function):
         # Store everything.
         ctx.save_for_backward(*args)
 
+        _unset_checkpointing()
         return outputs
 
     # pylint: disable=missing-function-docstring
@@ -447,6 +471,8 @@ class CheckpointFunction(torch.autograd.Function):
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
             )
+        _set_checkpointing()
+
         inputs = ctx.saved_tensors
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
@@ -471,6 +497,8 @@ class CheckpointFunction(torch.autograd.Function):
         )
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
+
+        _unset_checkpointing()
         return (None, None) + grads
 
 
