@@ -49,6 +49,7 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_b
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
+from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
@@ -603,6 +604,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+        self._state_offloader: Optional[OptimizerStateOffloader] = None
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -2580,6 +2583,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
+        if self._state_offloader is not None:
+            self._state_offloader.sync_before_step()
         update_successful = super().step_with_ready_grads()
 
         timers = self.config.timers
@@ -2600,4 +2605,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if timers is not None:
             timers('params-all-gather').stop()
 
+        # The states are initialized after the first optimizer.step() call.
+        # So we initialize the offloader here to make sure the states are initialized.
+        if self.config.offload_optimizer_states and self._state_offloader is None:
+            self._state_offloader = OptimizerStateOffloader(self)
+
         return update_successful
+
+    def offload_states(self):
+        """Offload states to CPU."""
+        if self._state_offloader is not None:
+            self._state_offloader.offload()
+
+    def reload_offloaded_states(self):
+        """Start async reload of offloaded states."""
+        if self._state_offloader is not None:
+            self._state_offloader.reload()
+
+    def release_offloaded_gpu_states(self):
+        """Release GPU memory after D2H completes. For delayed release case."""
+        if self._state_offloader is not None:
+            self._state_offloader.release_gpu_memory()
