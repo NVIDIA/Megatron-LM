@@ -149,6 +149,32 @@ class LinearQkvBuilder(Protocol):
     ) -> LinearQkv: ...
 
 
+class LinearLayer(Protocol):
+    """Protocol for linear_q and linear_kv modules."""
+
+    def forward(self, input: Tensor, /) -> Tuple[Tensor, object]:
+        """Applies linear_q/linear_kv."""
+        ...
+
+
+class LinearLayerBuilder(Protocol):
+    """Protocol for building linear_q and linear_kv layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+    ) -> LinearLayer: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
@@ -168,8 +194,8 @@ class CrossAttentionSubmodules:
     Configuration class for specifying the submodules of a cross-attention.
     """
 
-    linear_q: Union[ModuleSpec, type] = None
-    linear_kv: Union[ModuleSpec, type] = None
+    linear_q: LinearLayerBuilder
+    linear_kv: LinearLayerBuilder
     core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
@@ -1574,24 +1600,22 @@ class CrossAttention(Attention):
             raise ValueError("Group query attention is not currently supported in cross attention.")
         assert self.query_projection_size == self.kv_projection_size
 
-        self.linear_q = build_module(
-            submodules.linear_q,
+        self.linear_q = submodules.linear_q(
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
         )
 
-        self.linear_kv = build_module(
-            submodules.linear_kv,
+        self.linear_kv = submodules.linear_kv(
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
@@ -1612,8 +1636,9 @@ class CrossAttention(Attention):
         assert split_qkv, "split_qkv must be True for CrossAttention"
         assert not output_gate, "Output gate is not supported in cross attention for now."
 
+        assert key_value_states is not None, "key_value_states cannot be None for CrossAttention"
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-        mixed_kv, _ = self.linear_kv(key_value_states)
+        mixed_kv, _ = apply_module(self.linear_kv)(key_value_states)
 
         # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
         new_tensor_shape = mixed_kv.size()[:-1] + (
@@ -1626,7 +1651,7 @@ class CrossAttention(Attention):
         (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
-        query, _ = self.linear_q(hidden_states)
+        query, _ = apply_module(self.linear_q)(hidden_states)
 
         # [sq, b, hp] --> [sq, b, np, hn]
         new_tensor_shape = query.size()[:-1] + (
