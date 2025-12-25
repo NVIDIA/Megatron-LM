@@ -559,6 +559,7 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
+    hybrid_context_parallel: bool = False,
     min_hybrid_context_parallel_size: int = 1,
 ) -> None:
     """Initialize model data parallel groups.

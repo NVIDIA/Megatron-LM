@@ -66,6 +66,15 @@ import transformer_engine_torch as tex
 
 logger = logging.getLogger(__name__)
 
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn’t installed or the torch wrapper is missing
+    tex = None
 
 try:
     _torch_version = PkgVersion(torch.__version__)
@@ -500,6 +509,10 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
     # TODO(zijiey): remove this function later.
     if not torch.distributed.is_initialized():
         return None
+
+    # if parallel_state is not initialized, pass `tp_group` thru
+    if not parallel_state.is_initialized():
+        return tp_group
 
     if tp_group is None:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
@@ -1954,6 +1967,12 @@ def get_batch_on_this_cp_rank(
 ):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
+
+    Args:
+        batch (Dict[str, Any]): Input batch tensors.
+        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel process group.
+            If provided, uses this group's size and rank. Otherwise, falls back to
+            the current context-parallel settings from parallel_state.
     """
 
     # With causal masking, each token only attends to its prior tokens. Simply split
@@ -2059,8 +2078,6 @@ def get_thd_batch_on_this_cp_rank(
                     continue
                 if data is not None:
                     batch[key] = data.index_select(1, index)
-
-        # batch = {k: (v if k in batch_keys else None) for k, v in batch.items()}
 
         return batch, packed_seq_params
     else:
@@ -2398,4 +2415,37 @@ def internal_api(func: Callable) -> Callable:
             pass
     """
     func._internal_api = True
+    return func
+
+
+def experimental_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as experimental API.
+
+    Use this decorator for:
+    - Experimental features that may change without notice
+    - New APIs under active development
+    - Features that are not yet stable
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks, allowing rapid iteration during development.
+
+    Args:
+        func: The function or class to mark as experimental
+
+    Returns:
+        The original function/class with an experimental API marker
+
+    Example:
+        @experimental_api
+        def new_experimental_feature():
+            '''This API is experimental and may change'''
+            pass
+
+        @experimental_api
+        class ExperimentalModel:
+            '''This model is under active development'''
+            pass
+    """
+    func._experimental_api = True
     return func

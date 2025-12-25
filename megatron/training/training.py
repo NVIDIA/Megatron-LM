@@ -48,8 +48,12 @@ except ImportError:
 
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_linear_attention_variant,
+)
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    get_attr_wrapped_model,
     get_model_config,
     StragglerDetector,
 )
@@ -89,6 +93,7 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
@@ -355,7 +360,7 @@ def num_floating_point_operations(args, num_total_tokens_this_GB, sequence_squar
                     ## core attn
                     + sequence_square_sum_this_GB
                     * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2
+                    / 2 # causal mask (only half of the mask is non-zero)
                     + sequence_square_sum_this_GB * args.num_attention_heads * args.v_head_dim / 2
                 )
             )
@@ -383,8 +388,7 @@ def num_floating_point_operations(args, num_total_tokens_this_GB, sequence_squar
                 )
             )
 
-        linear_attention_variants = ["gated_delta_net"]
-        if args.experimental_attention_variant in linear_attention_variants:
+        if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
@@ -437,7 +441,10 @@ def num_floating_point_operations(args, num_total_tokens_this_GB, sequence_squar
                     )
                 )
             else:
-                raise ValueError(f"Invalid linear_attention_type: {args.linear_attention_type}")
+                raise ValueError(
+                    "Invalid experimental_attention_variant: "
+                    f"{args.experimental_attention_variant}"
+                )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -1093,8 +1100,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
             kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['average_in_collective'] = args.ddp_average_in_collective
-            if args.use_megatron_fsdp and args.use_precision_aware_optimizer:
-                kwargs["preserve_fp32_weights"] = False
             ddp_config = DistributedDataParallelConfig(**kwargs)
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
@@ -1528,6 +1533,7 @@ def training_log(
     max_attention_logit,
     num_total_tokens_this_GB,
     sequence_square_sum_this_GB,
+    pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1717,6 +1723,7 @@ def training_log(
             num_layers=args.num_layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
+            pg_collection=pg_collection,
         )
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
@@ -2133,7 +2140,6 @@ def train(
     args = get_args()
     timers = get_timers()
     
-        
     if getattr(args, 'perform_rl_step', False):
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
 
@@ -2213,6 +2219,8 @@ def train(
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()
+
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
 
     # Tracking loss.
     total_loss_dict = {}
@@ -2600,6 +2608,7 @@ def train(
             max_attention_logit,
             num_total_tokens_this_GB, 
             sequence_square_sum_this_GB
+            pg_collection=model_pg_collection,
         )
 
         # Evaluation.
@@ -2793,16 +2802,24 @@ def evaluate(
                         if args.sft:
                             # normalize over micro batch instead of global
                             val = torch.vstack(val)
-                            local_sum = val[:, 0].sum()
-                            local_tokens = val[:, 1].sum()
-                            pack = torch.stack([local_sum, local_tokens])   
-                            torch.distributed.all_reduce(pack, group=mpu.get_data_parallel_group(with_context_parallel=True))
-                            global_sum, global_tokens = pack[0], pack[1]
-                            if global_tokens.item() == 0:
-                                raise RuntimeError("[LOSS] global valid token count is 0 (all masked across DP/CP)")
-                            else:
-                                total_loss_dict[key][0] += global_sum / global_tokens
-                                total_loss_dict[key][1] += 1
+                            val = val[:, 0] / val[:, 1]
+                            val = val.mean()
+                            torch.distributed.all_reduce(
+                                val,
+                                group=mpu.get_data_parallel_group(with_context_parallel=True)
+                            )
+                            val /= torch.distributed.get_world_size(
+                                group=mpu.get_data_parallel_group(with_context_parallel=True)
+                            )
+                            total_loss_dict[key][0] += val
+                            total_loss_dict[key][1] += 1
+                        else :
+                            val = torch.vstack(val).sum(dim=0)
+                            torch.distributed.all_reduce(
+                                val,
+                                group=mpu.get_data_parallel_group(with_context_parallel=True)
+                            )
+                            total_loss_dict[key] += val
                              
 
                     elif val[0].numel() == 1:
@@ -3026,7 +3043,8 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
 
         # Build dataloders.
-        train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+        if not args.skip_train:
+            train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
 
         valid_dataloaders = None
         test_dataloader = None

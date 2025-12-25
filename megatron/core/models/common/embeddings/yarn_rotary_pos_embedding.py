@@ -13,6 +13,7 @@ from torch import Tensor
 from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import internal_api
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = emb[:, None, None, :]
         return emb, _mscale
 
+    @internal_api
     def forward(
         self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> Tensor:
@@ -168,12 +170,8 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb, _mscale = self.get_emb(max_seq_len, offset)
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            if packed_seq_params.local_cp_size > 1:
-                # Set CP group to dynamic CP group for CP slicing
-                cp_group = packed_seq_params.cp_group
-            else:
-                # Set CP group to None to avoid CP slicing
-                cp_group = None
+            # Set CP group to dynamic CP group for CP slicing
+            cp_group = packed_seq_params.cp_group
         else:
             cp_group = self.cp_group
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
