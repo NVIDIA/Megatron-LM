@@ -891,6 +891,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         graph_scratch_space[-1] = 0
         self.cu_active_sequence_lengths[:batch_size].copy_(graph_scratch_space.roll(1, 0))
 
+    def pad_active_slices(self):
+        """Pad the active slices of specific tensors."""
+        # Some tensors need to be padded at the token level.
+        padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
+
+        self.token_to_block_idx[padding_token_slice] = self.block_allocator.dummy_block_idx
+        self.token_to_local_position_within_kv_block[padding_token_slice] = 0
+        self.token_to_position_in_request[padding_token_slice] = 0
+
+        # Other tensors need to be padded at the request level.
+        padding_request_slice = slice(
+            self.total_request_count - self.paused_request_count,
+            self.padded_active_request_count,
+        )
+
+        self.active_attn_metadata["mha_metadata"].update(
+            batch_dimensions=self.attn_dimensions,
+            padded_batch_dimensions=self.padded_batch_dimensions
+        )
+
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 
@@ -1392,17 +1412,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.build_active_slices(self.padded_active_request_count)
         batch_size = self.total_request_count - self.paused_request_count
 
-        # Update token position indexes.
-        self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
-            self.block_allocator.dummy_block_idx
-        )
-        self.token_to_local_position_within_kv_block[
-            self.active_token_count : self.padded_active_token_count
-        ] = 0
-        self.token_to_position_in_request[
-            self.active_token_count : self.padded_active_token_count
-        ] = 0
-
         self.active_attn_metadata = (
             self.graph_attn_metadata
             if self.using_cuda_graph_this_step()
@@ -1422,9 +1431,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     decode_req_count=adjusted_decode_req_count,
                     has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
                 )
-        self.active_attn_metadata["mha_metadata"].update(
-            batch_dimensions=attn_dimensions, padded_batch_dimensions=self.padded_batch_dimensions
-        )
+        self.attn_dimensions = attn_dimensions
+
+        # Correctly pad to padded active token count.
+        self.pad_active_slices()
 
         if self.is_hybrid_model:
             active_mamba_indices_view = self.mamba_metadata.request_to_mamba_state_idx[active_slice]
