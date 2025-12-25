@@ -419,14 +419,14 @@ class MambaMixer(MegatronModule):
 
         if in_inference_mode:
             if inference_context.is_dynamic_batching():
-                return self.dynamic_inference(hidden_states, inference_context)
+                return self._dynamic_inference(hidden_states, inference_context)
             else:
                 assert inference_context.is_static_batching()
                 assert not self.config.sequence_parallel
                 conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
                 if inference_context.seqlen_offset > 0:
                     # The states are updated inplace
-                    out, out_bias = self.decode(hidden_states, conv_state, ssm_state)
+                    out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
         zxBCdt, _ = self.in_proj(hidden_states)
@@ -439,16 +439,16 @@ class MambaMixer(MegatronModule):
                 "Training with packed sequences is not supported "
                 "in the non-memory-efficient code path."
             )
-            y = self.ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            y = self._ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
-            y = self.ssm_training(zxBCdt, packed_seq_params)
+            y = self._ssm_training(zxBCdt, packed_seq_params)
 
         out, out_bias = self.out_proj(y)
 
         return out, out_bias
 
-    def dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
+    def _dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
         """
         Executes dynamic inference by separating decode and prefill requests and
         running them independently. Also runs the chunked prefill request independently
@@ -473,7 +473,7 @@ class MambaMixer(MegatronModule):
 
         if decode_req_count > 0 and prefill_req_count == 0:
             # Decode-only
-            y = self.ssm_decode(
+            y = self._ssm_decode(
                 zxBCdt.transpose(0, 1),
                 conv_state,
                 ssm_state,
@@ -482,7 +482,7 @@ class MambaMixer(MegatronModule):
         elif decode_req_count == 0 and (prefill_req_count > 0 or has_explicit_chunked_prefill_req):
             if prefill_req_count > 0:
                 # Prefill only (regular prefill requests)
-                y_prefill = self.ssm_prefill(
+                y_prefill = self._ssm_prefill(
                     zxBCdt,
                     conv_state=conv_state,
                     ssm_state=ssm_state,
@@ -500,7 +500,7 @@ class MambaMixer(MegatronModule):
                     context.mamba_metadata.device_chunked_prefill,
                     check_bounds=False,
                 )
-                y_chunked_prefill = self.ssm_prefill(
+                y_chunked_prefill = self._ssm_prefill(
                     zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[1]],
                     conv_state=conv_state,
                     ssm_state=ssm_state,
@@ -529,7 +529,7 @@ class MambaMixer(MegatronModule):
                 check_bounds=False,
             )
             # Decode requests
-            y_decode = self.ssm_decode(
+            y_decode = self._ssm_decode(
                 zxBCdt[:decode_req_count].transpose(0, 1),
                 conv_state,
                 ssm_state,
@@ -538,7 +538,7 @@ class MambaMixer(MegatronModule):
             y_prefill, y_chunked_prefill = None, None
             if prefill_req_count > 0:
                 # Regular prefill requests
-                y_prefill = self.ssm_prefill(
+                y_prefill = self._ssm_prefill(
                     zxBCdt_prefill,
                     conv_state=conv_state,
                     ssm_state=ssm_state,
@@ -556,7 +556,7 @@ class MambaMixer(MegatronModule):
                     context.mamba_metadata.device_chunked_prefill,
                     check_bounds=False,
                 )
-                y_chunked_prefill = self.ssm_prefill(
+                y_chunked_prefill = self._ssm_prefill(
                     zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[1]],
                     conv_state=conv_state,
                     ssm_state=ssm_state,
@@ -593,7 +593,7 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
-    def decode(
+    def _decode(
         self, hidden_states, conv_state, ssm_state, batch_indices: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Performs inference step for decoding."""
@@ -614,7 +614,7 @@ class MambaMixer(MegatronModule):
 
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
 
-        y = self.ssm_decode(
+        y = self._ssm_decode(
             zxBCdt, conv_state=conv_state, ssm_state=ssm_state, batch_indices=batch_indices
         )
 
@@ -627,7 +627,7 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
-    def ssm_training(
+    def _ssm_training(
         self,
         zxBCdt: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None
@@ -715,7 +715,7 @@ class MambaMixer(MegatronModule):
         seq_idx = seq_idx.to(torch.int32).unsqueeze(0)  # Add a batch dimension
         return seq_idx
 
-    def ssm_prefill(
+    def _ssm_prefill(
         self,
         zxBCdt: torch.Tensor,
         conv_state: Optional[torch.Tensor],
@@ -899,7 +899,7 @@ class MambaMixer(MegatronModule):
 
         return y
 
-    def ssm_decode(
+    def _ssm_decode(
         self,
         zxBCdt: torch.Tensor,
         conv_state: torch.Tensor,
