@@ -87,12 +87,12 @@ class MultiLatentAttention(Attention):
     def __init__(
         self,
         config: MLATransformerConfig,
-        submodules: Union[MLASelfAttentionSubmodules],
+        submodules: MLASelfAttentionSubmodules,
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
         cp_comm_type: Optional[str] = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:
 
         super().__init__(
@@ -103,6 +103,7 @@ class MultiLatentAttention(Attention):
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
         )
+        self.config: MLATransformerConfig
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
 
@@ -344,7 +345,7 @@ class MLASelfAttention(MultiLatentAttention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(
             config=config,

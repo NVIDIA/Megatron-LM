@@ -57,7 +57,7 @@ class MegatronModule(torch.nn.Module):
     def sharded_state_dict(
         self,
         prefix: str = '',
-        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Default implementation for sharded state dict for distributed checkpointing.
