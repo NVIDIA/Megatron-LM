@@ -218,7 +218,7 @@ class TransformerBlockSubmodules:
             or instance of the layer normalization to be applied.
     """
 
-    layer_specs: List[ModuleSpec] = None
+    layer_specs: Optional[List[ModuleSpec]] = None
     layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
 
 
@@ -273,7 +273,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config)

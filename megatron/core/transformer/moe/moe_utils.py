@@ -170,7 +170,7 @@ def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_
 class MoEAuxLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
 
-    main_loss_backward_scale: torch.Tensor = None
+    main_loss_backward_scale: Optional[torch.Tensor] = None
 
     @staticmethod
     def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
@@ -311,8 +311,8 @@ def unpermute(
     permuted_tokens: torch.Tensor,
     sorted_indices: torch.Tensor,
     restore_shape: torch.Size,
-    probs: torch.Tensor = None,
-    routing_map: torch.Tensor = None,
+    probs: Optional[torch.Tensor] = None,
+    routing_map: Optional[torch.Tensor] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
 ):
@@ -727,8 +727,8 @@ def save_to_aux_losses_tracker(
     loss: torch.Tensor,
     layer_number: int,
     num_layers: int,
-    reduce_group: torch.distributed.ProcessGroup = None,
-    avg_group: torch.distributed.ProcessGroup = None,
+    reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+    avg_group: Optional[torch.distributed.ProcessGroup] = None,
     reduce_group_has_dp: bool = False,
 ):
     """Save the auxiliary loss for logging.
