@@ -192,6 +192,19 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    qk_clip: bool = False
+    """Whether to clip the query and key weights. Needed for Muon MLA Model training."""
+
+    qk_clip_alpha: float = 0.5
+    """The balancing alpha for qk-clip. Q = Q * (eta ** alpha)"""
+
+    qk_clip_threshold: float = 100
+    """The balancing threshold for qk-clip. eta = min(threshold / max_attention_logits, 1.0)"""
+
+    log_max_attention_logit: bool = False
+    """Whether to log the max attention logit across whole model. Decoupled from qk_clip,
+    defualts to False. Setting qk_clip will automatically log the max logit"""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -208,13 +221,6 @@ class TransformerConfig(ModelParallelConfig):
     no_rope=4 means RoPE is applied for 3 layers, then skipped for 1 layer, repeating this pattern.
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
-
-    moe_deepep_num_sms: int = 20
-    """Number of SMs to use for DeepEP."""
-
-    moe_hybridep_num_sms: int = 16
-    """Number of SMs to use for HybridEP. In pure NVL scenarios, 
-    16 SMs can generally achieve good bandwidth."""
 
     ####################
     # initialization
@@ -412,6 +418,13 @@ class TransformerConfig(ModelParallelConfig):
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
+    use_kitchen_attention: bool = False
+    """Use the kitchen extension for attention (instead of TE's attention)."""
+
+    kitchen_attention_backend: Literal["sdpa", "fa"] = "sdpa"
+    """Which kitchen attention backend to use when use_kitchen_attention=True.
+    "sdpa" for KitchenDotProductAttention, "fa" for KitchenFlashAttention."""
+
     ####################
     # fp4 related
     ####################
@@ -510,7 +523,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of selected groups for group-limited routing."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax(pre-sigmoid) routing for MoE, which means softmax is before the 
+    """Enable pre-softmax(pre-sigmoid) routing for MoE, which means softmax is before the
     top-k selection.
     By default, softmax is done after top-k."""
 
@@ -609,6 +622,16 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    moe_latent_size: Optional[int] = None
+    """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
+
+    moe_deepep_num_sms: int = 20
+    """Number of SMs to use for DeepEP."""
+
+    moe_hybridep_num_sms: int = 16
+    """Number of SMs to use for HybridEP. In pure NVL scenarios,
+    16 SMs can generally achieve good bandwidth."""
+
     ##################
     # Context Parallel
     ##################
@@ -688,6 +711,13 @@ class TransformerConfig(ModelParallelConfig):
     flash_decode: bool = False
     """ Use the optimized flash decoding kernel during inference. """
 
+    batch_invariant_mode: bool = False
+    """If true, uses batch-invariant kernels that provide deterministic forward execution regardless
+       of batch size. This ensures bitwise identical results when the same inputs are processed
+       in different batch configurations. This will significantly affect speed of 
+       training and inference as the kernels are not full optimized.
+       Defaults to False."""
+
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
 
@@ -706,6 +736,9 @@ class TransformerConfig(ModelParallelConfig):
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
 
+    inference_fuse_tp_communication: bool = False
+    """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference. """
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -723,7 +756,7 @@ class TransformerConfig(ModelParallelConfig):
     """The number of groups used in Mamba layers."""
 
     mamba_num_heads: Optional[int] = None
-    """The number of heads used in Mamba layers. 
+    """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
     use_mamba_mem_eff_path: bool = True
@@ -779,9 +812,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
 
-        if self.num_query_groups % self.tensor_model_parallel_size != 0:
+        if (
+            self.num_query_groups % self.tensor_model_parallel_size != 0
+            and self.tensor_model_parallel_size % self.num_query_groups != 0
+        ):
             raise ValueError(
-                f"num_query_groups ({self.num_query_groups}) must be a multiple of "
+                f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
@@ -1606,6 +1642,16 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
+
+        if self.inference_fuse_tp_communication:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_fuse_tp_communication is only supported "
+                "for inference_optimized transformer implementation."
+            )
+        if self.batch_invariant_mode:
+            assert (
+                self.attention_backend == AttnBackend.flash
+            ), "Batch invariant mode only supports FlashAttention"
 
 
 @dataclass
