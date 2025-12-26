@@ -509,6 +509,10 @@ class TransformerConfig(ModelParallelConfig):
     for quantized precisions such as FP8 and FP4. This can remove explicit padding/
     unpadding around GroupedMLP kernels, which improves throughput and reduces peak memory usage."""
 
+    moe_fp8_flow: Optional[bool] = False
+    """Whether to quantize activations to FP8 before DeepEP token dispatch to reduce
+    communication bandwidth and feed them directly into expert up-projection (GroupedMLP/GEMM)."""
+
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
     When using group-limited routing:
@@ -1044,6 +1048,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mla_up_proj",
                     "mlp",
                     "moe",
+                    "moe_expert",
                     "shared_experts",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
@@ -1093,6 +1098,15 @@ class TransformerConfig(ModelParallelConfig):
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
                         )
+
+            if "moe" in self.recompute_modules and "moe_expert" in self.recompute_modules:
+                raise ValueError(
+                    "moe in recompute_modules is not supported with moe_expert in recompute_modules"
+                )
+            if "moe_expert" in self.recompute_modules and (not self.fp8 or (self.fp8 and self.fp8_recipe != 'blockwise')):
+                raise ValueError(
+                    "moe_expert recompute_modules is supported fp8 blockwise recipe"
+                )
 
         if self.moe_layer_recompute:
             warnings.warn(
@@ -1450,6 +1464,10 @@ class TransformerConfig(ModelParallelConfig):
 
             if fused_permute_and_pad_with_probs is None:
                 raise ValueError("fused_permute_and_pad_with_probs is not available.")
+
+        if self.moe_fp8_flow:
+            if self.fp8 is None or (self.fp8 is not None and self.fp8_recipe != "blockwise"):
+                raise ValueError("moe_fp8_flow only support blockwise.")
 
         if (
             self.moe_router_topk == 1
