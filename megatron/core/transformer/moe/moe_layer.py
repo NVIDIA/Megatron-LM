@@ -227,6 +227,9 @@ class MoELayer(BaseMoELayer):
             and "moe" in config.recompute_modules
             and config.cuda_graph_impl != 'local'
         )
+        self.moe_expert_recompute = (
+            config.recompute_granularity == 'selective' and "moe_expert" in config.recompute_modules
+        )
         self.shared_experts_recompute = (
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules

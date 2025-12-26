@@ -1191,6 +1191,7 @@ class _DeepepManager(_DispatchManager):
                 self.group,
                 async_finish=async_finish,
                 allocate_on_comm_stream=allocate_on_comm_stream,
+                config=self.config,
             )
         )
         self.handle = handle
@@ -1248,6 +1249,7 @@ class _DeepepManager(_DispatchManager):
             self.handle,
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
+            config=self.config,
         )
         # Release the handle after combine operation
         self.handle = None
