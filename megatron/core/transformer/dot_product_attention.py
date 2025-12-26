@@ -139,6 +139,39 @@ class DotProductAttention(MegatronModule):
         else:
             raise ValueError("Softmax type not supported")
 
+        # Gated attention parameters: per-head linear projection
+        # gate = sigmoid(hidden_states @ gate_weight.T + gate_bias)
+        if self.config.gated_attention:
+            # gate_weight: [num_heads_per_partition, hidden_size]
+            self.register_parameter(
+                "attention_gate_weight",
+                torch.nn.Parameter(
+                    torch.empty(
+                        (self.num_attention_heads_per_partition, self.config.hidden_size),
+                        device=torch.cuda.current_device(),
+                        dtype=self.config.params_dtype,
+                    )
+                ),
+            )
+            # gate_bias: [num_heads_per_partition]
+            self.register_parameter(
+                "attention_gate_bias",
+                torch.nn.Parameter(
+                    torch.full(
+                        (self.num_attention_heads_per_partition,),
+                        self.config.gated_attention_init_value,
+                        device=torch.cuda.current_device(),
+                        dtype=self.config.params_dtype,
+                    )
+                ),
+            )
+            if config.perform_initialization:
+                # Initialize gate weights with small values
+                self.attention_gate_weight.data.normal_(mean=0.0, std=0.02)
+        else:
+            self.attention_gate_weight = None
+            self.attention_gate_bias = None
+
     def forward(
         self,
         query: Tensor,
@@ -148,6 +181,7 @@ class DotProductAttention(MegatronModule):
         attn_mask_type: AttnMaskType = None,
         attention_bias: Tensor = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        hidden_states: Optional[Tensor] = None,
     ):
         """Forward."""
         assert packed_seq_params is None, (
@@ -241,6 +275,23 @@ class DotProductAttention(MegatronModule):
         # change view [b, np, sq, hn]
         context = context.view(*output_size)
 
+        # Apply gated attention if enabled
+        if self.config.gated_attention:
+            assert hidden_states is not None, (
+                "hidden_states must be provided when gated_attention is enabled"
+            )
+            # hidden_states: [sq, b, hidden_size]
+            # gate_weight: [np, hidden_size]
+            # gate_bias: [np]
+            # Compute gates: [sq, b, np]
+            gates = torch.sigmoid(
+                torch.matmul(hidden_states, self.attention_gate_weight.T) + self.attention_gate_bias
+            )
+            # Reshape gates to [b, np, sq, 1] to match context [b, np, sq, hn]
+            gates = gates.permute(1, 2, 0).unsqueeze(-1)  # [sq, b, np] -> [b, np, sq] -> [b, np, sq, 1]
+            # Apply gates: context = context * gates
+            context = context * gates
+
         # [b, np, sq, hn] --> [sq, b, np, hn]
         context = context.permute(2, 0, 1, 3).contiguous()
 
@@ -256,15 +307,24 @@ class DotProductAttention(MegatronModule):
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
-        """Sharded state dict for the learnable softmax offset parameter"""
+        """Sharded state dict for learnable parameters (softmax_offset and attention_gate_bias)"""
+        state_dict = {}
+        sharding_spec = {}
+
         if self.config.softmax_type == "learnable":
-            state_dict = self.state_dict(prefix="", keep_vars=True)
-        else:
-            state_dict = {}
+            state_dict['softmax_offset'] = self.softmax_offset
+            sharding_spec['softmax_offset'] = 0
+
+        if self.config.gated_attention:
+            state_dict['attention_gate_weight'] = self.attention_gate_weight
+            state_dict['attention_gate_bias'] = self.attention_gate_bias
+            sharding_spec['attention_gate_weight'] = 0  # Shard along head dimension
+            sharding_spec['attention_gate_bias'] = 0  # Shard along head dimension
+
         return make_sharded_tensors_for_checkpoint(
             state_dict,
             prefix,
-            {'softmax_offset': 0},
+            sharding_spec,
             sharded_offsets,
             tp_group=self.tp_group,
             dp_cp_group=metadata['dp_cp_group'],
