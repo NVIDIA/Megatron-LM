@@ -218,7 +218,8 @@ class TestDynamicInferenceEngine:
             num_layers=transformer_config.num_layers
             // transformer_config.pipeline_model_parallel_size,
             kv_channels=transformer_config.kv_channels,
-            num_attention_heads=transformer_config.num_query_groups,
+            num_attention_kv_heads=transformer_config.num_query_groups,
+            num_attention_qo_heads=transformer_config.num_attention_heads,
             max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
             use_cuda_graphs_for_non_decode_steps=True,
