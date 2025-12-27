@@ -23,6 +23,7 @@ MODEL_ARGS:
   --distributed-backend: nccl
   --log-interval: 1
   --transformer-impl: inference_optimized
+  --inference-fuse-tp-communication: true
   --sequence-parallel: true
   --tensor-model-parallel-size: 8
   --pipeline-model-parallel-size: 1
@@ -50,6 +51,9 @@ MODEL_ARGS:
   --incoming-requests-per-step: 32
   --use-flashinfer-fused-rope: true
   --inference-logging-step-interval: 1
+  --cuda-graph-impl: local 
+  --inference-dynamic-batching-max-requests: 128
+  --inference-dynamic-batching-num-cuda-graphs: 2
 METRICS:
   - "generated_tokens"
   - "logprobs"
