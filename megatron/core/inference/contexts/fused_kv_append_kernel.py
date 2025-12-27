@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import triton
 import triton.language as tl

@@ -41,7 +41,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType
+from .enums import AttnBackend, AttnMaskType
 from .transformer_config import TransformerConfig
 
 try:
@@ -965,21 +965,36 @@ class Attention(MegatronModule, ABC):
             else:
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
-                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                )
-                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                if inference_context.attention_backend in [
+                    AttnBackend.flashinfer_fa2,
+                    AttnBackend.flashinfer_fa3,
+                    AttnBackend.flashinfer_trt,
+                ]:
+                    # FlashInfer attention using KV cache directly
+                    pp_layer_offset = self._get_pp_layer_offset_for_inference()
+                    layer_number_adjusted = self.layer_number - pp_layer_offset
+                    kv_cache = inference_context.get_kv_cache_content(layer_number_adjusted)
+                    core_attn_out = inference_context.active_attn_metadata[
+                        "mha_metadata"
+                    ].attention(q, kv_cache, layer_idx=layer_number_adjusted - 1)
+                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                else:
+                    cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                    cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                    )
+                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case

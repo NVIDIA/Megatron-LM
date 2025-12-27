@@ -134,9 +134,10 @@ def get_dynamic_inference_engine(
         params_dtype=args.params_dtype,
         num_layers=args.num_layers // args.pipeline_model_parallel_size,
         kv_channels=args.kv_channels,
-        num_attention_heads=(
+        num_attention_kv_heads=(
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
         ),
+        num_attention_qo_heads=args.num_attention_heads,
         max_sequence_length=args.inference_max_seq_length,
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs if enable_cuda_graph else None

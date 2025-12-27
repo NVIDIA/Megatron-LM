@@ -37,6 +37,15 @@ from megatron.core.utils import internal_api
 from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
+
+try:
+    from .attention_context.flashinfer_metadata import (
+        GraphFlashInferMetadata,
+        NonGraphFlashInferMetadata,
+    )
+    HAVE_FLASHINFER_METADATA = True
+except ImportError:
+    HAVE_FLASHINFER_METADATA = False
 from .dynamic_block_allocator import BlockAllocator
 from ..kv_cache import KVCacheBase, KVCacheLayout, MLACache, create_mhagqa_cache
 
@@ -209,7 +218,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         params_dtype (torch.dtype): Dtype used for KV cache.
         num_layers (int): Number of layers on this pipeline parallel rank.
         kv_channels (int): Hidden dimension per attention head.
-        num_attention_heads (int): Number of attention heads.
+        num_attention_kv_heads (int): Number of key/value attention heads.
+        num_attention_qo_heads (int): Number of query/output attention heads.
         max_sequence_length (int): Max possible sequence length (prompt + output)
             that will occur.
         buffer_size_gb (float): Buffer size reserved on the GPU for the KV cache.
@@ -249,7 +259,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             label, the target dtype, and whether to store the data on GPU.
     """
 
-    DEFAULT_MAX_TOKENS = 16384
+    DEFAULT_MAX_TOKENS = 32768
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
 
@@ -259,7 +269,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         params_dtype: torch.dtype,
         num_layers: int,
         kv_channels: int,
-        num_attention_heads: int,
+        num_attention_kv_heads: int,
+        num_attention_qo_heads: int,
         max_sequence_length: int,
         buffer_size_gb: float,
         max_requests: int = None,
@@ -302,13 +313,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.metrics_writer = metrics_writer
 
         # Per partition num heads and hidden size.
-        projection_size = kv_channels * num_attention_heads
+        projection_size = kv_channels * num_attention_qo_heads
         if tensor_model_parallel_size is None:
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
         else:
             tp_size = tensor_model_parallel_size
-        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_qo_heads)
+        self.num_attention_kv_heads_per_partition = core_divide(num_attention_kv_heads, tp_size)
+        self.num_attention_qo_heads_per_partition = core_divide(num_attention_qo_heads, tp_size)
 
         # Mamba states.
         self.is_hybrid_model = mamba_inference_state_config is not None
@@ -366,7 +378,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * 2  # key, value
                 * self.num_attention_layers
                 * self.block_size_tokens
-                * self.num_attention_heads_per_partition
+                * self.num_attention_kv_heads_per_partition
                 * self.hidden_size_per_attention_head
             )
         assert self.block_size_bytes > 0
@@ -479,7 +491,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=num_cuda_graphs,
-                cuda_graph_max_tokens=self.max_active_requests,
+                cuda_graph_max_tokens=1024, #self.max_active_requests,
                 cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
                 max_requests=self.max_active_requests,
                 max_tokens=self.max_tokens,
@@ -618,7 +630,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                         layout=self._cache_layout,
                         num_chunks=self.block_allocator.total_count,
                         chunk_size=self.block_size_tokens,
-                        num_kv_heads=self.num_attention_heads_per_partition,
+                        num_kv_heads=self.num_attention_kv_heads_per_partition,
                         head_dim=self.hidden_size_per_attention_head,
                         dtype=self.params_dtype,
                         device=torch.cuda.current_device(),
@@ -655,6 +667,66 @@ class DynamicInferenceContext(BaseInferenceContext):
         with ctx_manager:
             allocate_memory_buffer()
             allocate_mamba_states()
+
+        # Initialize attention metadata based on backend.
+        self.graph_attn_metadata = {}
+        self.non_graph_attn_metadata = {}
+        self.active_attn_metadata = None
+
+        if self.attention_backend in [
+            AttnBackend.flashinfer_fa2,
+            AttnBackend.flashinfer_fa3,
+            AttnBackend.flashinfer_trt,
+        ]:
+            # FlashInfer backends use FlashInferMetadata.
+            if not HAVE_FLASHINFER_METADATA:
+                raise ImportError(
+                    "FlashInfer metadata is required for FlashInfer attention backends. "
+                    "Please ensure flashinfer is installed."
+                )
+
+            self.graph_attn_metadata["mha_metadata"] = GraphFlashInferMetadata(
+                max_requests=self.max_active_requests,
+                max_kv_block_count=self.max_kv_block_count,
+                block_size_tokens=self.block_size_tokens,
+                backend=self.attention_backend,
+            )
+
+            self.non_graph_attn_metadata["mha_metadata"] = NonGraphFlashInferMetadata(
+                max_requests=self.max_active_requests,
+                max_kv_block_count=self.max_kv_block_count,
+                block_size_tokens=self.block_size_tokens,
+                backend=self.attention_backend,
+            )
+
+            # Set model parameters for FlashInfer planning.
+            for metadata in [
+                self.graph_attn_metadata["mha_metadata"],
+                self.non_graph_attn_metadata["mha_metadata"],
+            ]:
+                metadata.set_model_params(
+                    num_qo_heads=self.num_attention_qo_heads_per_partition,
+                    num_kv_heads=self.num_attention_kv_heads_per_partition,
+                    head_dim=self.hidden_size_per_attention_head,
+                    params_dtype=self.params_dtype,
+                )
+        else:
+            # Default: Flash Attention backends use MHAMetadata.
+            self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
+                block_count_total=self.block_allocator.total_count,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_active_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+            )
+
+            self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
+                block_count_total=self.block_allocator.total_count,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_active_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+            )
 
         # Reset attention and Mamba state.
         self.reset_attention_state()
@@ -730,7 +802,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             params_dtype=inference_config.params_dtype,
             num_layers=model_config.num_layers // model_config.pipeline_model_parallel_size,
             kv_channels=model_config.kv_channels,
-            num_attention_heads=model_config.num_query_groups,
+            num_attention_kv_heads=model_config.num_query_groups,
+            num_attention_qo_heads=model_config.num_attention_heads,
             max_sequence_length=inference_config.inference_max_seq_length,
             buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,
@@ -847,6 +920,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_to_block_idx=self.token_to_block_idx,
             token_to_local_position_within_kv_block=self.token_to_local_position_within_kv_block,
         )
+
+    def get_kv_cache_content(self, layer_number: int) -> Tensor:
+        """Get raw KV cache content tensor for a layer.
+
+        This method handles the layer_map for hybrid models and returns
+        the raw cache tensor directly (for use with FlashInfer).
+
+        Args:
+            layer_number (int): Layer number (1-based).
+
+        Return:
+            (Tensor) The raw KV cache content tensor.
+        """
+        attention_layer_number = self.layer_map[layer_number - 1]
+        cache = self.memory_buffer[attention_layer_number]
+        return cache.get_content()
 
     def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Optional[Tensor], Tensor]:
         """Read from KV cache.
