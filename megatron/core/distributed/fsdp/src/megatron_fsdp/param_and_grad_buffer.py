@@ -1566,6 +1566,7 @@ class ParamAndGradBuffer:
             reset_parameters_for_meta_device_init_module
         )
         self.ubr_groups = None
+        self.already_registered = False
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
@@ -1669,6 +1670,10 @@ class ParamAndGradBuffer:
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
 
             if NCCL_ALLOCATOR == "MCORE":
+                if self.ddp_config.fsdp_manual_registration:
+                    return functools.partial(
+                        nccl_allocator.MemPoolAllocatorWithoutRegistration, NCCL_MEMORY_POOL
+                    )
                 if len(groups) == 1:
                     # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
@@ -1685,6 +1690,12 @@ class ParamAndGradBuffer:
                         symmetric=symmetric,
                     )
             elif NCCL_ALLOCATOR == "APEX":
+                if self.ddp_config.fsdp_manual_registration:
+                    logging.warning(
+                        "FSDP manual registration is not supported for APEX NCCL allocator."
+                        "falling back to default registration. "
+                        "Please use Megatron Core NCCL allocator for manual registration."
+                    )
                 if symmetric:
                     logging.warning(
                         "Symmetric registration is not supported for APEX NCCL allocator."
@@ -1707,6 +1718,39 @@ class ParamAndGradBuffer:
             return mem_alloc_context
         else:
             return nullcontext
+
+    def manual_buffer_registration(self):
+        """
+        Manually register the FSDP communication buffers to NCCL user buffer.
+        """
+        assert self.ddp_config.nccl_ub, "NCCL UBR is not enabled"
+        assert self.ddp_config.fsdp_double_buffer, "FSDP double buffer is not enabled"
+        assert self.ddp_config.fsdp_manual_registration, "FSDP manual registration is not enabled"
+        assert not self.already_registered, "Mem pool is already registered"
+
+        self.already_registered = True
+
+        global NCCL_MEMORY_POOL
+        torch.cuda.synchronize()
+        torch.distributed.barrier(async_op=False)
+        torch.cuda.synchronize()
+
+        for group in self.ubr_groups:
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    f"[MCORE][FSDP][Manual REG] Registering mem pool to group {group},"
+                    f"group.group_desc:{group.group_desc}, group.size(): {group.size()}"
+                )
+            nccl_allocator.register_mem_pool(
+                NCCL_MEMORY_POOL,
+                group,
+                symmetric=not self.ddp_config.disable_symmetric_registration,
+            )
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
+                    f"group.group_desc:{group.group_desc}, group.size(): {group.size()}"
+                )
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
