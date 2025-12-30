@@ -142,7 +142,9 @@ async def completions():
                 prompt_top_n_logprobs = getattr(result, 'prompt_top_n_logprobs', None) or []
 
                 # Get generated tokens and logprobs
-                generated_tokens_list = list(result.generated_tokens) if result.generated_tokens else []
+                generated_tokens_list = (
+                    list(result.generated_tokens) if result.generated_tokens else []
+                )
                 generated_log_probs = getattr(result, 'generated_log_probs', None) or []
                 generated_top_n_logprobs = getattr(result, 'generated_top_n_logprobs', None) or []
 
@@ -152,13 +154,17 @@ async def completions():
                     all_token_ids = prompt_tokens_list + generated_tokens_list
                     tokens = [tokenizer.detokenize([tok]) for tok in all_token_ids]
 
-                    # Build token_logprobs: [None] for first token, then prompt logprobs, then generated logprobs
+                    # Build token_logprobs: [None] for first token, then prompt logprobs,
+                    # then generated logprobs
                     token_logprobs = [None] + list(prompt_log_probs) + list(generated_log_probs)
 
-                    # Build top_logprobs: [None] for first token, then prompt top_n, then generated top_n
+                    # Build top_logprobs: [None] for first token, then prompt top_n,
+                    # then generated top_n
                     top_logprobs = None
                     if prompt_top_n_logprobs or generated_top_n_logprobs:
-                        top_logprobs = [None] + list(prompt_top_n_logprobs) + list(generated_top_n_logprobs)
+                        top_logprobs = (
+                            [None] + list(prompt_top_n_logprobs) + list(generated_top_n_logprobs)
+                        )
 
                     # Calculate text_offset: cumulative character positions starting from 0
                     text_offset = []
@@ -192,13 +198,7 @@ async def completions():
                     "top_logprobs": top_logprobs,
                 }
 
-            choices.append(
-                {
-                    "index": request_idx,
-                    "text": text_output,
-                    "logprobs": logprobs_data,
-                }
-            )
+            choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
             request_idx += 1
 
     return jsonify({"choices": choices})

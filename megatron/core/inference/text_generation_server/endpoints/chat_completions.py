@@ -117,11 +117,13 @@ async def chat_completions():
                     if generated_top_n_logprobs and i < len(generated_top_n_logprobs):
                         top_n_dict = generated_top_n_logprobs[i]
                         for token_str, logprob in top_n_dict.items():
-                            top_logprobs_list.append({
-                                "token": token_str,
-                                "logprob": logprob,
-                                "bytes": list(token_str.encode("utf-8")),
-                            })
+                            top_logprobs_list.append(
+                                {
+                                    "token": token_str,
+                                    "logprob": logprob,
+                                    "bytes": list(token_str.encode("utf-8")),
+                                }
+                            )
 
                     entry = {
                         "token": tok,

@@ -13,6 +13,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 class MockDynamicInferenceRequest:
     """Mock class for DynamicInferenceRequest to test stop word detection."""
+
     def __init__(
         self,
         request_id: int,
