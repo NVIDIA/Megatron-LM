@@ -113,6 +113,11 @@ class OptimizerConfig:
     fp8_recipe: Optional[str] = None
     """The type of fp8 recipe will affect the processing logic inside distributed optimizer."""
 
+    fp8_param_gather: bool = False
+    """It is the same as fp8_param in TransformerConfig and fp8_param_gather in DistributedDataParallelConfig.
+       If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
+       perform the param all-gather in fp8."""
+
     fp16: bool = False
     """If true, train with fp16 mixed precision training. Defaults to False."""
 
@@ -298,7 +303,7 @@ class OptimizerConfig:
             and (
                 self.main_params_dtype != torch.float32
                 or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
-                or self.optimizer_cpu_offload
+                or (self.optimizer_cpu_offload and not self.fp8_param_gather)
             )
         )
 

@@ -274,8 +274,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     param = param.detach().clone().cpu().pin_memory()
                     offload_params_numel += param.numel()
                     cpu_copy = True
-                if self.param_update_in_fp32 and param.dtype != torch.float32:
-                    param = param.detach().clone().float()
+                if self.param_update_in_fp32:
+                    # In FP8 case, the passed in param_groups is fp32 shard main param, so just do a self-reference
+                    if param.dtype != torch.float32:
+                        param = param.detach().clone().float()
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
