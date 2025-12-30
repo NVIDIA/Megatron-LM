@@ -914,6 +914,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     if k == "param":
                         k = "master_param"
+                        sharded_model_param.copy_(v)
                     self.optimizer.state[sharded_model_param][k] = v
                     continue
 
