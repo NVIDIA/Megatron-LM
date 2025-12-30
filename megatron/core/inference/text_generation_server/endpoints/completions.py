@@ -211,4 +211,4 @@ try:
         return jsonify({"choices": choices})
 
 except ImportError as e:
-    pass
+    logger.warning(f"Could not import flask: {e}")

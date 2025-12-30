@@ -155,4 +155,4 @@ try:
         return jsonify(response)
 
 except ImportError as e:
-    pass
+    logger.warning(f"Could not import flask: {e}")
