@@ -193,6 +193,7 @@ fi
     # --add-qkv-bias \
     # --disable-gloo-process-groups \
     # --hybrid-context-parallel \
+    # --async-hybrid-context-parallel-scheduler \
 
 OPTIONS=" \
     `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory; fi` \
@@ -206,6 +207,7 @@ OPTIONS=" \
     --timing-log-level 1 \
     --timing-log-option minmax \
     --hybrid-context-parallel \
+    --hybrid-context-parallel-scheduler balanced_with_pp \
     --min-hybrid-context-parallel-size $MIN_CP \
     --max-hybrid-context-parallel-size $MAX_CP \
     --sft-sequence-packing \

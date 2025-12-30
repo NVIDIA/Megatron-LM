@@ -2937,11 +2937,14 @@ def _add_distributed_args(parser):
     group.add_argument('--max-hybrid-context-parallel-size', type=int, default=-1,
                         help='Minimum size of the hybrid context parallel groups.')
     group.add_argument('--hybrid-context-parallel-scheduler', type=str, default='balanced',
-                        choices=['balanced', 'only_packing_no_scheduling'],
+                        choices=['balanced', 'balanced_with_pp', 'only_packing_no_scheduling'],
                         help='Scheduler for hybrid context parallel. '
                         'balanced: balanced scheduler for hybrid context parallel. '
+                        'balanced_with_pp: balanced scheduler for hybrid context parallel with pipeline parallel. '
                         'only_packing_no_scheduling: scheduling is already handled by the data sampler, '
                         'this scheduler only performs packing.')
+    group.add_argument('--async-hybrid-context-parallel-scheduler', action='store_true',
+                       default=False, help='Use asynchronize context parallel scheduler to avoid scheduler execution and extra communication time. ')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '
