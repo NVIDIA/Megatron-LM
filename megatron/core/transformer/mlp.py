@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 import gc
 import logging
 import warnings
@@ -87,7 +88,7 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
-        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         if ffn_hidden_size is None:
             if is_expert:
                 raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")
@@ -101,8 +102,13 @@ class MLP(MegatronModule):
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
+        # For GLU/SwiGLU, use stride=2 because each TP rank stores interleaved [gate, up] portions.
+        # This is critical for correct weight resharding across different TP sizes.
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
+            fc1_stride = 2
+        else:
+            fc1_stride = 1
 
         # Use moe_latent_size only for routed experts. 'is_expert' is false for
         # shared_experts.
@@ -120,6 +126,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
+            stride=fc1_stride,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -226,6 +233,7 @@ class MLP(MegatronModule):
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
+
         output, output_bias = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
 
@@ -299,89 +307,26 @@ def apply_swiglu_sharded_factory(
             )
             w_key = key
             v_key = key
-        if flattened_range is None:
-            tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
-            return [
-                ShardedTensor.from_rank_offsets(
-                    w_key,
-                    tensor_w,
-                    *sharded_offsets,
-                    offset_w,
-                    replica_id=replica_id,
-                    prepend_axis_num=prepend_axis_num,
-                ),
-                ShardedTensor.from_rank_offsets(
-                    v_key,
-                    tensor_v,
-                    *sharded_offsets,
-                    offset_v,
-                    replica_id=replica_id,
-                    prepend_axis_num=prepend_axis_num,
-                ),
-            ]
-        else:
-            if singleton_local_shards:
-                raise NotImplementedError(
-                    'singleton_local_shards not implemented for SwiGLU MLP flattened tensors'
-                )
-            # Here we need to map a slice `t` (`flattened_range` specifies slice start and stop)
-            # of the *original* flattened tensor into slices `w` and `v` of chunked
-            # and flattened tensor.
-            # Example:
-            # If original tensor has (16, 5) shape and flattened_range is `slice(8, 64)`,
-            # then `t` has shape `(56,)` and we need to create 2 tensors:
-            # w: first 32 elements of `t` with flattened_range slice(8, 40)
-            # v: last 24 elements of `t` with flattened_range slice(0, 24)
-            # Global offsets are the same as in the non-flattened case
-            assert t.ndim == 1, (key, t.shape)
-            non_flat_local_shape = (original_shape[0] // 2, *original_shape[1:])
-            chunk_numel = original_numel // 2
-            result = []
-            if flattened_range.start < chunk_numel:
-                # Non-empty `w` chunk
-                tensor_w = t[: chunk_numel - flattened_range.start]
-                flattened_range_w = slice(
-                    flattened_range.start, min(chunk_numel, flattened_range.stop)
-                )
-                assert len(tensor_w) == flattened_range_w.stop - flattened_range_w.start
-                result.append(
-                    ShardedTensor.from_rank_offsets_flat(
-                        key,
-                        tensor_w,
-                        non_flat_local_shape,
-                        *sharded_offsets,
-                        offset_w,
-                        replica_id=replica_id,
-                        prepend_axis_num=prepend_axis_num,
-                        flattened_range=flattened_range_w,
-                    )
-                )
-            if flattened_range.stop > chunk_numel:
-                # Non-empty `v` chunk
-                tensor_v = t[-(flattened_range.stop - chunk_numel) :]
-                flattened_range_v = slice(
-                    max(chunk_numel, flattened_range.start) - chunk_numel,
-                    flattened_range.stop - chunk_numel,
-                )
-                assert len(tensor_v) == flattened_range_v.stop - flattened_range_v.start, (
-                    len(tensor_v),
-                    flattened_range_v,
-                )
 
-                result.append(
-                    ShardedTensor.from_rank_offsets_flat(
-                        key,
-                        tensor_v,
-                        non_flat_local_shape,
-                        *sharded_offsets,
-                        offset_v,
-                        replica_id=replica_id,
-                        prepend_axis_num=prepend_axis_num,
-                        flattened_range=flattened_range_v,
-                    )
-                )
-            assert sum(sh_ten.data.numel() for sh_ten in result) == t.numel(), (result, t.shape)
-            return result
+        tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
+        return [
+            ShardedTensor.from_rank_offsets(
+                w_key,
+                tensor_w,
+                *sharded_offsets,
+                offset_w,
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            ),
+            ShardedTensor.from_rank_offsets(
+                v_key,
+                tensor_v,
+                *sharded_offsets,
+                offset_v,
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            ),
+        ]
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():
