@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import os
+import nvtx
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
@@ -63,11 +64,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if args.sft_sequence_packing:
                 
         # get batches based on the TP rank you are on
+        nvtx.push_range("get_batch_on_this_tp_rank")
         batch = get_batch_on_this_tp_rank(
             data_iterator,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
             vp_stage=vp_stage,
         )
+        nvtx.pop_range()
         
         cu_seqlens = batch.pop('cu_seqlens')
         cu_seqlens_padded = batch.pop('cu_seqlens_padded')
@@ -244,10 +247,6 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-        context_parallel_size=args.context_parallel_size,
-        data_parallel_size=args.data_parallel_size,
-        sequence_parallel_size=args.tensor_model_parallel_size*args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
         allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,

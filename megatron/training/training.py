@@ -1748,8 +1748,8 @@ def training_log(
             with open(args.memory_snapshot_path, 'wb') as f:
                 dump(snapshot, f)
 
-        # elapsed_time = timers('interval-time').elapsed(barrier=True)
-        elapsed_time = timers('forward-backward').elapsed(barrier=True)
+        elapsed_time = timers('interval-time').elapsed(barrier=True)
+        # elapsed_time = timers('forward-backward').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
         throughput = num_floating_point_operations(args,num_total_tokens_this_GB, sequence_square_sum_this_GB) / (
@@ -2607,7 +2607,7 @@ def train(
             num_zeros_in_grad,
             max_attention_logit,
             num_total_tokens_this_GB, 
-            sequence_square_sum_this_GB
+            sequence_square_sum_this_GB,
             pg_collection=model_pg_collection,
         )
 

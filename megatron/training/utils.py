@@ -536,6 +536,7 @@ def get_batch_on_this_tp_rank(
 
         assert data_iterator is not None
         data = next(data_iterator)
+        
         batch = {
             'tokens': (
                 data["tokens"].cuda(non_blocking=True)
@@ -587,7 +588,7 @@ def get_batch_on_this_tp_rank(
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
-            n_tensor = torch.tensor(n, dtype=torch.int32, device=dev)
+            n_tensor = torch.tensor(n, dtype=torch.int32, pin_memory=True).to(dev, non_blocking=True)
             _broadcast(n_tensor)
 
             if n == 0:
@@ -599,7 +600,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(buf)
 
         if args.sft_sequence_packing and is_first_or_last_pipeline_stage(vp_stage):
-            seq_len = torch.tensor(batch['labels'].shape[0], dtype=torch.int32, device=torch.cuda.current_device())
+            seq_len = torch.tensor(batch['labels'].shape[0], dtype=torch.int32, pin_memory=True).to(torch.cuda.current_device(), non_blocking=True)
             _broadcast(seq_len)
             
         if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
@@ -648,7 +649,7 @@ def get_batch_on_this_tp_rank(
     else:
         if is_first_or_last_pipeline_stage(vp_stage):
             if args.sft_sequence_packing:
-                seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
+                seq_len = torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
                 _broadcast(seq_len)
                 shape = (seq_len.item())
             else:
@@ -722,20 +723,6 @@ def get_batch_on_this_tp_rank(
             dtype=torch.int32,
             device=torch.cuda.current_device(),
         ) if args.hybrid_context_parallel else None
-
-        def _broadcast_cu_seqlens():
-            dev = torch.cuda.current_device()
-
-            n = torch.empty((), dtype=torch.int32, device=dev)
-            _broadcast(n)
-            n = int(n.item())
-            if n == 0:
-                cu_seqlens = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
-                cu_seqlens = torch.empty(n, dtype=torch.int32, device=dev)
-            _broadcast(cu_seqlens)
-
-            return cu_seqlens if n > 0 else None
 
         if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(tokens)

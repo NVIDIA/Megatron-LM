@@ -162,7 +162,7 @@ class SFTDataset(MegatronDataset):
 
         if sft_sequence_packing:
             # sequence packing need both original sequence length and padded length
-            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
+            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32)
 
         return ret
 
@@ -364,6 +364,6 @@ class MockSFTDataset(SFTDataset):
 
         if sft_sequence_packing:
             # sequence packing need both original sequence length and padded length
-            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
+            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32)
 
         return ret

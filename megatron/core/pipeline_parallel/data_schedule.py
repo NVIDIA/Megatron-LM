@@ -81,7 +81,7 @@ def wrap_dataloader(
         sequence lengths of all subsamples from all ranks.
         """
         # Collect the number of subsamples from all ranks
-        local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
+        local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32)
         dp_subsample_count = [torch.zeros_like(local_len) for _ in range(dp_group.size())]
         torch.distributed.all_gather(dp_subsample_count, local_len, group=dp_group)
 
@@ -89,11 +89,11 @@ def wrap_dataloader(
         dp_subsample_counts = torch.stack(dp_subsample_count, dim=0).cpu().view(-1)
         max_sub_samples = int(dp_subsample_counts.max().item())
 
-        if local_len.item() < max_sub_samples:
+        if subsample_seqlens.shape[0] < max_sub_samples:
             subsample_seqlens_padded = torch.cat(
                 [
                     subsample_seqlens,
-                    torch.zeros(max_sub_samples - local_len.item(), dtype=torch.int32).cuda(),
+                    torch.zeros(max_sub_samples - subsample_seqlens.shape[0], dtype=torch.int32, device=subsample_seqlens.device),
                 ],
                 dim=0,
             )
@@ -149,7 +149,7 @@ def wrap_dataloader(
         ) % dp_cp_group.size()
         return hdp_rank
 
-    def cast_inputs_device(inputs, device, skip_device={}):
+    def cast_inputs_device(inputs, device, skip_device=[]):
         if isinstance(inputs, (list, tuple)):
             return inputs.__class__(cast_inputs_device(v, device, skip_device) for v in inputs)
         elif isinstance(inputs, dict):
@@ -321,8 +321,10 @@ def wrap_dataloader(
         samples: List[MegatronDataset], partner_cp_size: Optional[int] = None
     ) -> Dict[str, torch.Tensor]:
         # TODO(tailaim): do we need attention_mask for sequence packing?
-
+        nvtx.push_range("_pack_sequences")
         def _pack_tensors(tensors):
+            if len(tensors) == 1:
+                return tensors[0].reshape(-1)
             return torch.cat([t.reshape(-1) for t in tensors], dim=0)
 
         tokens = _pack_tensors([sample["tokens"] for sample in samples])
@@ -337,35 +339,24 @@ def wrap_dataloader(
         new_sample["position_ids"] = position_ids
         if partner_cp_size is not None:
             new_sample["local_cp_size"] = torch.tensor(
-                partner_cp_size, dtype=torch.int32, device=dev
+                partner_cp_size, dtype=torch.int32
             )
 
         # create cu_seqlens_padded
-        lengths_padding = np.fromiter(
-            (s["tokens"].numel() for s in samples), dtype=np.int32, count=len(samples)
-        )
-        cu_seqlens_padded = np.empty(len(samples) + 1, dtype=np.int32)
-        cu_seqlens_padded[0] = 0
-        cu_seqlens_padded[1:] = np.cumsum(lengths_padding, out=cu_seqlens_padded[1:])
-        cu_seqlens_padded = (
-            torch.from_numpy(cu_seqlens_padded)
-            .to(device=dev, non_blocking=True, dtype=torch.int32)
-            .reshape(-1)
-        )
+        lengths_padding = torch.tensor([s["tokens"].numel() for s in samples]).reshape(-1)
+        # create max_seqlen
+        max_seqlen = lengths_padding.max().int()
+        new_sample["max_seqlen"] = max_seqlen
+        lengths_padding = lengths_padding.pin_memory().to(dev, non_blocking=True)
+        cu_seqlens_padded = torch.cat([torch.zeros(1, dtype=torch.int32, device=lengths_padding.device), torch.cumsum(lengths_padding, dim=0, dtype=torch.int32).reshape(-1)], dim=0)
         new_sample["cu_seqlens_padded"] = cu_seqlens_padded
 
-        # create max_seqlen
-        max_seqlen = np.max(lengths_padding)
-        max_seqlen = torch.tensor(max_seqlen, device=dev, dtype=torch.int32)
-        new_sample["max_seqlen"] = max_seqlen
 
         # create cu_seqlens without padding
         lengths = torch.stack([s["original_seq_len"] for s in samples], dim=0).reshape(-1)
-        cu_seqlens = torch.empty(lengths.numel() + 1, device=dev, dtype=torch.int32)
-        cu_seqlens[0] = 0
-        cu_seqlens[1:] = torch.cumsum(lengths, dim=0).reshape(-1)
+        cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int32, device=lengths.device), torch.cumsum(lengths, dim=0, dtype=torch.int32).reshape(-1)], dim=0)
         new_sample["cu_seqlens"] = cu_seqlens
-
+        nvtx.pop_range()
         return new_sample
 
     # Convert string to enum if needed
@@ -388,6 +379,7 @@ def wrap_dataloader(
     scheduler = scheduler_map[scheduler_type](config)
     if pg_collection is None:
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        dp_group_gloo = parallel_state.get_data_parallel_group_gloo()
         dp_group = parallel_state.get_data_parallel_group()
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
@@ -422,11 +414,11 @@ def wrap_dataloader(
 
             # batch is a list of samples: List[MegatronDataset]
             batch = next(data_iterator)
-            batch = cast_inputs_device(batch, dev)
             # print(f"{batch=}")
             num_micro_batches = batch[0]["num_micro_batches_left"] + 1
 
             batch_all = [batch] + [next(data_iterator) for _ in range(num_micro_batches - 1)]
+            batch_all = cast_inputs_device(batch_all, dev)
 
             # calculate this two values for tflops calculation
             seqlens_gathered = [
@@ -455,16 +447,16 @@ def wrap_dataloader(
             subsample_seqlens = []
             for sample in batch:
                 subsample_seqlens.extend([sample["tokens"].numel()])
-            subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
+            subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32)
             subsample_seqlens = subsample_seqlens[subsample_seqlens != 0]
 
             nvtx.push_range("_get_global_seqlens")
-            seqlens_gathered, offsets = _get_global_seqlens(subsample_seqlens, dp_group)
+            seqlens_gathered, offsets = _get_global_seqlens(subsample_seqlens, dp_group_gloo)
             nvtx.pop_range()
 
             nvtx.push_range("_get_global_id_seqlens")
             global_id_seqlens, global_ids_this_rank = _get_global_id_seqlens(
-                subsample_seqlens.shape[0], offsets, seqlens_gathered, dp_group
+                subsample_seqlens.shape[0], offsets, seqlens_gathered, dp_group_gloo
             )
             nvtx.pop_range()
 
@@ -525,10 +517,8 @@ def wrap_dataloader(
                     if config.hybrid_context_parallel
                     else None
                 )
-                nvtx.push_range("_pack_sequences")
                 cp_sizes.append(partner_cp_size)
                 new_sample = _pack_sequences(samples, partner_cp_size)
-                nvtx.pop_range()
                 new_samples.append(new_sample)
             
             # if parallel_state.get_pipeline_model_parallel_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}\n{sample_id_groups[0][hdp_rank]=}\n{sample_id_groups[1][hdp_rank]=}\n{sample_id_groups[2][hdp_rank]=}")
@@ -536,8 +526,8 @@ def wrap_dataloader(
         if scheduler_type is PackingScheduler.ONLY_PACKING_NO_SCHEDULING:
             # allreduce to get the total number of microbatches
             mfu_info_to_broadcast_this_hdp_group = torch.tensor(
-                [num_total_tokens, sequence_square_sum], dtype=torch.int64, device=dev
-            )
+                [num_total_tokens, sequence_square_sum], dtype=torch.int64, pin_memory=True
+            ).to(dev, non_blocking=True)
             torch.distributed.all_reduce(mfu_info_to_broadcast_this_hdp_group, group=dp_cp_group)
             num_total_tokens_this_GB = mfu_info_to_broadcast_this_hdp_group[0].item()
             print(f"{num_total_tokens_this_GB=}")
@@ -616,16 +606,24 @@ def wrap_dataloader(
     #                 ).cuda()
     #                 new_samples.append(new_sample)
 
+    if data_iterator is not None:
+        def pin_tensor(sample):
+            for k, v in sample.items():
+                if isinstance(v, torch.Tensor) and v.device == torch.device("cpu"):
+                    sample[k] = v.pin_memory()
+            return sample
+        new_samples = type(new_samples)(map(pin_tensor, new_samples))
+
     if tp_group.size() > 1:
         if tp_group.rank() == 0:
             info_to_broadcast_this_tpgroup = torch.tensor(
                 [num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB],
                 dtype=torch.int64,
-                device=dev,
-            )
+                pin_memory=True
+            ).to(dev, non_blocking=True)
             _broadcast_to_tp_group(info_to_broadcast_this_tpgroup)
         else:
-            info_to_broadcast_this_tpgroup = torch.tensor([0, 0, 0], dtype=torch.int64, device=dev)
+            info_to_broadcast_this_tpgroup = torch.zeros(3, dtype=torch.int64, device=dev)
             _broadcast_to_tp_group(info_to_broadcast_this_tpgroup)
             info_numpy = info_to_broadcast_this_tpgroup.cpu().numpy()
             (num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB) = info_numpy[

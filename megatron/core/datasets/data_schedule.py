@@ -5,7 +5,7 @@ from typing import Any, List, Optional
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
+from megatron.core.pipeline_parallel.data_schedule import BalancedHybridCPscheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 
@@ -15,7 +15,7 @@ class HybridCPDataLoaderWrapper:
     For every __next__ call,
     1. Each DP rank pulls a batch of packed samples.
     2. Extracts the sequence lengths of each sub-sample and all-gathers across the DP group.
-    3. Schedules the sub-samples to the DPxCP ranks using the BalancedCPScheduler.
+    3. Schedules the sub-samples to the DPxCP ranks using the BalancedHybridCPscheduler.
     4. Based on the schedule, reroutes the sub-samples to the correct rank using all-to-all.
     5. Returns the assigned sub-samples to this rank.
 
@@ -42,7 +42,7 @@ class HybridCPDataLoaderWrapper:
             self.dp_cp_group is not None and self.dp_group is not None and self.tp_group is not None
         ), "dp_cp_group, dp_group, tp_group must not be None when using hybrid context parallel"
 
-        self.cp_balancing_scheduler = BalancedCPScheduler(
+        self.cp_balancing_scheduler = BalancedHybridCPscheduler(
             max_seq_len_per_rank=self.config.max_seqlen_per_dp_cp_rank, dp_cp_group=self.dp_cp_group
         )
 

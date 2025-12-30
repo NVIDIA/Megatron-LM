@@ -26,20 +26,26 @@ USE_TE_CE=1
 USE_FLASH_ATTN=0
 USE_FSDP=0
 PROFILE=0
-PROFILE_MEMORY=1
-PROFILE_MEMORY_PATH="/m2v_model/wuguohao03/nv_teamwork/Megatron-LM/logs/output/interactive_hybrid_cp/profile"
+PROFILE_MEMORY=0
 # PROFILE_RANKS=[0,1,2,3,4,5,6,7,8]
 TRAIN_ITERS=10
 USE_MOCK_DATA=1
 MASTER_PORT=6103
-TP=1
-PP=4
+TP=2
+PP=2
 PP_l=
+MIN_CP=1
 NUM_LAYERS=4
 
 MBZ=1
 BZ=256
-NW=8
+HIDDEN_SIZE=5120
+FFN_HIDDEN_SIZE=13824
+HEAD_DIM=128
+NUM_HEAD=$((HIDDEN_SIZE / HEAD_DIM))
+SEQ_LEN=65536 #131072 #81920 #65536
+MAX_SEQLEN_PER_DP_CP_RANK=65536
+NW=16
 AD=0.0
 HD=0.0
 LI=1
@@ -98,22 +104,32 @@ fi
 MODEL_NAME="interactive_hybrid_cp"
 TOKENIZER=None
 
-WORKSPACE="/m2v_model/wuguohao03/nv_teamwork/Megatron-LM/logs"
-SOURCE="/m2v_model/wuguohao03/nv_teamwork/Megatron-LM"
+WORKSPACE="../logs"
+mkdir -p $WORKSPACE
 OUTPUT_BASE="${WORKSPACE}/output"
-OUTPUT="${OUTPUT_BASE}/${MODEL_NAME}"
+OUTPUT="${OUTPUT_BASE}/${MODEL_NAME}/$DATETIME"
 
 FINETUNE_DIR=${OUTPUT}/checkpoints
 LOGS_DIR="${OUTPUT}/logs"
 TENSORBOARD_DIR="${OUTPUT}/tensorboard"
 DATACACHE_DIR="${OUTPUT}/data_cache"
+export NSYS_DIR="${OUTPUT}/nsys"
+PROFILE_MEMORY_PATH="${OUTPUT}/mem_profile"
+
+mkdir -p $FINETUNE_DIR
+mkdir -p $LOGS_DIR
+mkdir -p $TENSORBOARD_DIR
+mkdir -p $DATACACHE_DIR
+mkdir -p $NSYS_DIR
+mkdir -p $COST_DATA_FILE
+mkdir -p $PROFILE_MEMORY_PATH
 
 export HF_DATASETS_CACHE="${OUTPUT}/hf_datasets_cache"
 
 DATA_TRAIN="/home/tailaim/data/thd_formatted_100k.jsonl"
 
-SEQ_LEN=131072 #131072 #81920 #65536
-MAX_SEQLEN_PER_DP_CP_RANK=32768
+CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+MEGATRON_PATH=$( dirname ${CURRENT_DIR})
 
 # if [[ $DEBUG -eq 1 ]]; then
 #     MBZ=1
@@ -149,16 +165,22 @@ if [[ $USE_TE_CE -eq 1 ]]; then
 fi
 
 if [[ $PROFILE -eq 1 ]]; then
-    EXTRA_ARGS+=" --profile --profile-step-start 2 --profile-step-end 4 "
+    EXTRA_ARGS+=" --profile --profile-step-start 2 --profile-step-end 6 "
 fi
 
 echo $USE_MOCK_DATA
 if [[ $USE_MOCK_DATA -eq 1 ]]; then
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"file\",\"path\":\"path/to/file\"}'"
     if [[ $BATCH -eq 0 ]]; then
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} --tokenizer-type NullTokenizer --vocab-size 131072 "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} --tokenizer-type NullTokenizer --vocab-size 131072 "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"linear\",\"min_seq_len\":1024,\"max_seq_len\":32768} "
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/github/github_subset_2.csv\"} "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"indexed_file\",\"path\":\"${DATA_TRAIN}\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":32768,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} "
     else
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1}' --tokenizer-type NullTokenizer --vocab-size 131072 "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1}' --tokenizer-type NullTokenizer --vocab-size 131072 "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"linear\",\"min_seq_len\":1024,\"max_seq_len\":32768} "
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/github/github_subset_2.csv\"} "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"indexed_file\",\"path\":\"${DATA_TRAIN}\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":32768,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} "
     fi
 else
     EXTRA_ARGS+=" --data-path ${DATA_TRAIN} --tokenizer-model ${TOKENIZER} "
@@ -178,23 +200,25 @@ fi
     # --use-gpu-timer \
     # --gpu-timer-interval 1 \
     # 
-
+# --add-qkv-bias \
+# --hybrid-context-parallel \
+# --disable-gloo-process-groups \
 OPTIONS=" \
     `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory; fi` \
     `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory-path $PROFILE_MEMORY_PATH; fi` \
     --no-check-for-nan-in-loss-and-grad \
-    --recompute-activations \
     --recompute-granularity full \
+    --recompute-method uniform \
+    --recompute-num-layers 1 \
     --timing-log-level 1 \
     --timing-log-option minmax \
-    --use-gpu-timer \
-    --gpu-timer-interval 1 \
-    --hybrid-context-parallel \
-    --hybrid-context-parallel-scheduler only_packing_no_scheduling \
+    --min-hybrid-context-parallel-size $MIN_CP \
     --sft-sequence-packing \
+    --hybrid-context-parallel \
+    --hybrid-context-parallel-scheduler "only_packing_no_scheduling" \
     --max-seqlen-per-dp-cp-rank $MAX_SEQLEN_PER_DP_CP_RANK \
     --sft \
-    --vocab-size 32000 \
+    --vocab-size 131072 \
     --tokenizer-type NullTokenizer \
     --legacy-tokenizer \
     --use-distributed-optimizer \
@@ -215,10 +239,9 @@ OPTIONS=" \
     ${PP_l:+--num-layers-per-virtual-pipeline-stage $PP_l} \
     --rerun-mode disabled \
     --num-layers $NUM_LAYERS \
-    --hidden-size 2048 \
-    --ffn-hidden-size 8192 \
-    --add-qkv-bias \
-    --num-attention-heads 16 \
+    --hidden-size $HIDDEN_SIZE \
+    --ffn-hidden-size $FFN_HIDDEN_SIZE \
+    --num-attention-heads $NUM_HEAD \
     --num-workers ${NW} \
     --exit-duration-in-mins 230 \
     --seq-length ${SEQ_LEN} \
@@ -250,7 +273,6 @@ OPTIONS=" \
     --distributed-timeout-minutes 60 \
     --calculate-per-token-loss \
     --attention-backend flash \
-    --disable-gloo-process-groups \
     --use-dist-ckpt \
 "
 
@@ -297,7 +319,7 @@ set -x
 # mpirun --hostfile hostfile -np 24 cat $HOSTFILE
 
 
-mpirun --allow-run-as-root \
+mpirun --allow-run-as-root --noprefix \
         ${HOSTFILE:+--hostfile "$HOSTFILE"} \
         --np $NP \
         --bind-to none --map-by slot \
@@ -328,14 +350,18 @@ mpirun --allow-run-as-root \
         -x TRAIN_MODE=True \
         -x PATH \
         ${LD_LIBRARY_PATH:+-x LD_LIBRARY_PATH} \
-        -x PYTHONPATH="$/m2v_model/wuguohao03/nv_teamwork/Megatron-LM":$PYTHONPATH \
+        -x PYTHONPATH:$MEGATRON_PATH:$PYTHONPATH \
+        -x CUDA_DEVICE_MAX_CONNECTIONS \
+        -x NCCL_IB_SL \
+        -x TOKENIZERS_PARALLELISM \
+        -x PYTORCH_CUDA_ALLOC_CONF \
         -x NCCL_DEBUG=WARN \
         -x http_proxy=http://oversea-squid2.ko.txyun:11080 \
         -x https_proxy=http://oversea-squid2.ko.txyun:11080 \
         -x no_proxy=localhost,127.0.0.1,localaddress,localdomain.com,internal,corp.kuaishou.com,test.gifshow.com,staging.kuaishou.com \
     $PROFILE_WRAPPER \
     with_nccl_local_env \
-    python -u /m2v_model/wuguohao03/nv_teamwork/Megatron-LM/pretrain_gpt.py \
+    python -u $MEGATRON_PATH/pretrain_gpt.py \
         ${OPTIONS} \
         --distributed-backend nccl \
         --master-addr ${MASTER_ADDR}:${MASTER_PORT}
