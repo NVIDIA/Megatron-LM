@@ -386,6 +386,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
                 min_hybrid_context_parallel_size=args.min_hybrid_context_parallel_size,
+                max_hybrid_context_parallel_size=args.max_hybrid_context_parallel_size,
             )
             if args.rank == 0:
                 print(

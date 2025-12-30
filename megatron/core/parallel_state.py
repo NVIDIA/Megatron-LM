@@ -560,6 +560,7 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     hybrid_context_parallel: bool = False,
     min_hybrid_context_parallel_size: int = 1,
+    max_hybrid_context_parallel_size: int = 1,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -974,10 +975,13 @@ def initialize_model_parallel(
     if hybrid_context_parallel:
         # PyTorch is performing lazy initialization of the communicator group.
         # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
+        upper_bound = int(log2(data_parallel_size))
+        if max_hybrid_context_parallel_size != -1:
+            upper_bound = min(int(log2(max_hybrid_context_parallel_size)), upper_bound)
         group_sizes = [
             2**i
             for i in range(
-                int(log2(min_hybrid_context_parallel_size)), int(log2(data_parallel_size))
+                int(log2(min_hybrid_context_parallel_size)), upper_bound
             )
         ]
         if group_sizes[-1] * 2 == data_parallel_size:

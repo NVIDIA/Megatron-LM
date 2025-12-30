@@ -754,6 +754,10 @@ def get_batch_on_this_tp_rank(
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
             tokens = None
             position_ids = None
+            cu_seqlens = None
+            cu_seqlens_padded = None
+            # max_seqlen = None
+
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)

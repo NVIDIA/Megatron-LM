@@ -1474,7 +1474,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # fwd_bwd_tot_time = gpu_timer.elapsed("forward-backward")
         fwd_each_time = gpu_timer.elapsed("forward-compute") # list, len = each virtual pp stage
         bwd_each_time = gpu_timer.elapsed("backward-compute")
-        print(f"rank={torch.distributed.get_rank()}, pp_rank={mpu.get_pipeline_model_parallel_rank()}, dp_rank={mpu.get_data_parallel_rank()}, {fwd_each_time=}, {bwd_each_time=}")
+        # print(f"rank={torch.distributed.get_rank()}, pp_rank={mpu.get_pipeline_model_parallel_rank()}, dp_rank={mpu.get_data_parallel_rank()}, {fwd_each_time=}, {bwd_each_time=}")
         # summary_data_parallel_imbalance(fwd_bwd_tot_time, fwd_each_time, bwd_each_time)
         # summary_pipeline_parallel_imbalance(fwd_bwd_tot_time, fwd_each_time, bwd_each_time)
     gpu_timer.reset()

@@ -8,7 +8,6 @@ PYTHONPATH=
 
 export NCCL_IB_SL=1
 export TOKENIZERS_PARALLELISM="false"
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 #export NVTE_DEBUG=1
 #export NVTE_DEBUG_LEVEL=2
@@ -31,19 +30,21 @@ PROFILE_MEMORY=0
 TRAIN_ITERS=10
 USE_MOCK_DATA=1
 MASTER_PORT=6103
+<<<<<<< HEAD
 TP=2
 PP=2
 PP_l=
-MIN_CP=1
-NUM_LAYERS=4
+MAX_CP=8
+NUM_LAYERS=8
 
 MBZ=1
-BZ=256
+BZ=2048
+>>>>>>> ca5b537084256b226abc0e5a2be510200794bd62
 HIDDEN_SIZE=5120
 FFN_HIDDEN_SIZE=13824
 HEAD_DIM=128
-NUM_HEAD=$((HIDDEN_SIZE / HEAD_DIM))
-SEQ_LEN=65536 #131072 #81920 #65536
+SEQ_LEN=131072 #131072 #81920 #65536 # 32768 #16384
+MIN_SEQ_LEN=256
 MAX_SEQLEN_PER_DP_CP_RANK=65536
 NW=16
 AD=0.0
@@ -51,7 +52,7 @@ HD=0.0
 LI=1
 EXTRA_ARGS=""
 NONDETERMINISTIC_ATTN=1
-NUM_GPU=8
+# NUM_GPU=8
 
 # Remember to update model and job name if running in batch mode!!
 # if [[ $BATCH -eq 0 ]]; then
@@ -88,6 +89,7 @@ else
     MASTER_ADDR=127.0.0.1
     NP=${NP:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}
 fi
+# NP=16
 
 function check_str() {
     if [ ! -v "$1" ]; then echo "Variable $1 is not set."; exit 1; fi
@@ -151,14 +153,6 @@ MEGATRON_PATH=$( dirname ${CURRENT_DIR})
 # else
 # fi
 
-if [[ $USE_CP -eq 1 ]]; then
-    if [[ $BATCH -eq 1 ]]; then
-        CP_SIZE=4
-    else
-        CP_SIZE=4
-    fi
-    EXTRA_ARGS+=" --context-parallel-size ${CP_SIZE} "
-fi
 
 if [[ $USE_TE_CE -eq 1 ]]; then
     EXTRA_ARGS+=" --cross-entropy-loss-fusion --cross-entropy-fusion-impl te"
@@ -172,14 +166,18 @@ echo $USE_MOCK_DATA
 if [[ $USE_MOCK_DATA -eq 1 ]]; then
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"file\",\"path\":\"path/to/file\"}'"
     if [[ $BATCH -eq 0 ]]; then
-    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} --tokenizer-type NullTokenizer --vocab-size 131072 "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":256,\"max_seq_len\":$SEQ_LEN,\"mean_seq_len\":16384,\"lognormal_sigma\":1.1} "
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"linear\",\"min_seq_len\":1024,\"max_seq_len\":32768} "
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/github/github_subset_2.csv\"} "
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/github/github_subset_2.csv\",\"min_seq_len\":$MIN_SEQ_LEN,\"max_seq_len\":$SEQ_LEN} "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/commoncrawl/commoncrawl_subset_2.csv\",\"min_seq_len\":$MIN_SEQ_LEN,\"max_seq_len\":$SEQ_LEN} "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/wikipedia/wikipedia_subset_2.csv\",\"min_seq_len\":$MIN_SEQ_LEN,\"max_seq_len\":$SEQ_LEN} "
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"indexed_file\",\"path\":\"${DATA_TRAIN}\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":32768,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} "
     else
-    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1}' --tokenizer-type NullTokenizer --vocab-size 131072 "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":256,\"max_seq_len\":$SEQ_LEN,\"mean_seq_len\":16384,\"lognormal_sigma\":1.1}' "
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"linear\",\"min_seq_len\":1024,\"max_seq_len\":32768} "
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/github/github_subset_2.csv\"} "
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/github/github_subset_2.csv\",\"min_seq_len\":$MIN_SEQ_LEN,\"max_seq_len\":$SEQ_LEN} "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/commoncrawl/commoncrawl_subset_2.csv\",\"min_seq_len\":$MIN_SEQ_LEN,\"max_seq_len\":$SEQ_LEN} "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/wikipedia/wikipedia_subset_2.csv\",\"min_seq_len\":$MIN_SEQ_LEN,\"max_seq_len\":$SEQ_LEN} "
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"indexed_file\",\"path\":\"${DATA_TRAIN}\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":32768,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} "
     fi
 else
@@ -200,19 +198,27 @@ fi
     # --use-gpu-timer \
     # --gpu-timer-interval 1 \
     # 
-# --add-qkv-bias \
-# --hybrid-context-parallel \
-# --disable-gloo-process-groups \
+    # --hybrid-context-parallel-scheduler only_packing_no_scheduling \
+    # --recompute-activations \
+    # --disable-gloo-process-groups \
+    # --add-qkv-bias \
+    # --disable-gloo-process-groups \
+    # --hybrid-context-parallel \
+
 OPTIONS=" \
     `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory; fi` \
     `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory-path $PROFILE_MEMORY_PATH; fi` \
+    --log-throughput \
+    --log-energy \
     --no-check-for-nan-in-loss-and-grad \
     --recompute-granularity full \
     --recompute-method uniform \
     --recompute-num-layers 1 \
     --timing-log-level 1 \
     --timing-log-option minmax \
+    --hybrid-context-parallel \
     --min-hybrid-context-parallel-size $MIN_CP \
+    --max-hybrid-context-parallel-size $MAX_CP \
     --sft-sequence-packing \
     --hybrid-context-parallel \
     --hybrid-context-parallel-scheduler "only_packing_no_scheduling" \
@@ -310,13 +316,18 @@ else PROFILE_WRAPPER=; fi
 # fi
 
 exec &> >(tee "${LOGS_DIR}/$DATETIME.log")
-echo "HOSTFILE = ${HOSTFILE} MASTER_ADDR = ${MASTER_ADDR}, NP = ${NP}, NUM_GPU = ${NUM_GPU} "
+# echo "HOSTFILE = ${HOSTFILE} MASTER_ADDR = ${MASTER_ADDR}, NP = ${NP}, NUM_GPU = ${NUM_GPU} "
 
 cat $HOSTFILE
 
 set -x
 
 # mpirun --hostfile hostfile -np 24 cat $HOSTFILE
+
+        # -x NVTE_DEBUG=1 \
+        # -x NVTE_DEBUG_LEVEL=2 \
+        # -x NCCL_ALGO=^NVLS,NVLSTree \
+        # -x CUDA_DEVICE_MAX_CONNECTIONS=1 \
 
 
 mpirun --allow-run-as-root --noprefix \
@@ -349,6 +360,7 @@ mpirun --allow-run-as-root --noprefix \
         -x HOSTNAME \
         -x TRAIN_MODE=True \
         -x PATH \
+        -x PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True\
         ${LD_LIBRARY_PATH:+-x LD_LIBRARY_PATH} \
         -x PYTHONPATH:$MEGATRON_PATH:$PYTHONPATH \
         -x CUDA_DEVICE_MAX_CONNECTIONS \

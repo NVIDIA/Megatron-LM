@@ -2152,6 +2152,9 @@ def forward_backward_pipelining_without_interleaving(
     data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
         wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
     )
+    if torch.distributed.get_rank() == 0:
+        print(f"rank={torch.distributed.get_rank()}, {num_microbatches=}")
+
     if is_pp_first_stage(p2p_communicator.pp_group) or is_pp_last_stage(p2p_communicator.pp_group):
         nvtx.push_range("send info_tensor among pp ranks")
         if config.sft_sequence_packing:
@@ -2184,6 +2187,11 @@ def forward_backward_pipelining_without_interleaving(
             )
             torch.distributed.send(info_tensor, dst=next_rank)
     nvtx.pop_range()
+
+    # data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
+    #     wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
+    # )
+
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
         embedding_module = clear_embedding_activation_buffer(

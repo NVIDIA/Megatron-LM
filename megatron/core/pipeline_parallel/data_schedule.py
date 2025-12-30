@@ -9,6 +9,7 @@ from functools import lru_cache
 import math
 from math import ceil, log2
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
+import nvtx
 
 import numpy as np
 import torch
@@ -117,6 +118,7 @@ def wrap_dataloader(
         csum = torch.cumsum(dp_subsample_counts, dim=0, dtype=torch.int32)
         offsets = torch.cat([torch.zeros(1, dtype=torch.int32), csum[:-1]], dim=0)
 
+        nvtx.pop_range()
         return seqlens_gathered, offsets
 
     def _get_global_id_seqlens(num_local_subsamples, offsets, seqlens_gathered, dp_group):
@@ -129,6 +131,7 @@ def wrap_dataloader(
         global_id_seqlens: list of (global_id, seqlen) tuples for scheduling.
         global_ids_this_rank: list of global IDs locally present on this rank.
         """
+        nvtx.push_range("_get_global_id_seqlens")
         dp_rank = dp_group.rank()
         global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32)
         # Create a list of (global_id, seqlen) tuples for scheduling
@@ -138,6 +141,7 @@ def wrap_dataloader(
             offsets[dp_rank] : offsets[dp_rank] + num_local_subsamples
         ]
 
+        nvtx.pop_range()
         return global_id_seqlens, global_ids_this_rank
 
     def _gid_to_src_rank(gid: int, offsets: List[int], dp_group, tp_group, dp_cp_group) -> int:
@@ -179,6 +183,7 @@ def wrap_dataloader(
         Since all CP ranks within a DP group have the same data, we only need
         to transfer data between matching CP ranks.
         """
+        nvtx.push_range("_reroute_samples_to_hdp_ranks")
         gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
         hdp_rank = dp_cp_group.rank()
         dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
@@ -282,6 +287,7 @@ def wrap_dataloader(
         recv_sample_with_id = {
             recv_id: recv_samples[i] for i, recv_id in enumerate(recv_ids_sorted)
         }
+        nvtx.pop_range()
         return recv_sample_with_id
 
     def _unpack_batch(batch):
@@ -327,10 +333,12 @@ def wrap_dataloader(
                 return tensors[0].reshape(-1)
             return torch.cat([t.reshape(-1) for t in tensors], dim=0)
 
+        nvtx.push_range("_pack_tensors")
         tokens = _pack_tensors([sample["tokens"] for sample in samples])
         labels = _pack_tensors([sample["labels"] for sample in samples])
         loss_mask = _pack_tensors([sample["loss_mask"] for sample in samples])
         position_ids = _pack_tensors([sample["position_ids"] for sample in samples])
+        nvtx.pop_range()
 
         new_sample = {}
         new_sample["tokens"] = tokens
@@ -338,6 +346,7 @@ def wrap_dataloader(
         new_sample["loss_mask"] = loss_mask
         new_sample["position_ids"] = position_ids
         if partner_cp_size is not None:
+            nvtx.push_range("create local_cp_size")
             new_sample["local_cp_size"] = torch.tensor(
                 partner_cp_size, dtype=torch.int32
             )
@@ -405,6 +414,17 @@ def wrap_dataloader(
         else:
             data_iterator = data_iterator[0]
 
+    def cast_inputs_device(inputs, device, skip_device={}):
+        if isinstance(inputs, (list, tuple)):
+            return inputs.__class__(cast_inputs_device(v, device, skip_device) for v in inputs)
+        elif isinstance(inputs, dict):
+            return {k: v if k in skip_device else cast_inputs_device(v, device, skip_device=skip_device) for k, v in inputs.items()}
+        elif isinstance(inputs, torch.Tensor):
+            if not inputs.is_cuda:
+                inputs = inputs.to(device=device, non_blocking=True) # here input is expected to be pinned
+
+        return inputs
+
     if data_iterator is not None:
         # indicates TP rank 0, with PP stage 0 or -1.
         local_cp_size = None
@@ -414,6 +434,7 @@ def wrap_dataloader(
 
             # batch is a list of samples: List[MegatronDataset]
             batch = next(data_iterator)
+            batch = cast_inputs_device(batch, dev)
             # print(f"{batch=}")
             num_micro_batches = batch[0]["num_micro_batches_left"] + 1
 
@@ -483,11 +504,7 @@ def wrap_dataloader(
             samples_this_rank_with_id = _reroute_samples_to_hdp_ranks(
                 batch,
                 global_ids_this_rank,
-                global_id_seqlens,
                 sample_id_groups,
-                offsets,
-                dp_group,
-                tp_group,
                 dp_cp_group,
                 total_hdp_gpus,
             )
@@ -521,7 +538,6 @@ def wrap_dataloader(
                 new_sample = _pack_sequences(samples, partner_cp_size)
                 new_samples.append(new_sample)
             
-            # if parallel_state.get_pipeline_model_parallel_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}\n{sample_id_groups[0][hdp_rank]=}\n{sample_id_groups[1][hdp_rank]=}\n{sample_id_groups[2][hdp_rank]=}")
 
         if scheduler_type is PackingScheduler.ONLY_PACKING_NO_SCHEDULING:
             # allreduce to get the total number of microbatches
@@ -530,7 +546,6 @@ def wrap_dataloader(
             ).to(dev, non_blocking=True)
             torch.distributed.all_reduce(mfu_info_to_broadcast_this_hdp_group, group=dp_cp_group)
             num_total_tokens_this_GB = mfu_info_to_broadcast_this_hdp_group[0].item()
-            print(f"{num_total_tokens_this_GB=}")
             sequence_square_sum_this_GB = mfu_info_to_broadcast_this_hdp_group[1].item()
 
     # # broadcast num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB,
@@ -1236,8 +1251,6 @@ class BalancedHybridCPscheduler(BaseScheduler):
         # if torch.distributed.get_rank() == 0:
         #     breakpoint()
         # torch.distributed.barrier()
-        # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {groups=}")
-        # print(f"rank={torch.distributed.get_rank()}, {sample_id_groups=}")
         return groups, sample_id_groups
 
 
@@ -1845,8 +1858,6 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
 
         # if torch.distributed.get_rank() == 0: print(f"{sample_id_groups=}")
         # if torch.distributed.get_rank() == 0: print(f"{cp_sizes=}")
-        # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {groups=}")
-        # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}")
         def flatten(lst):
             result = []
             for item in lst:
@@ -1860,7 +1871,6 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         # nested_list = [1, [2, 3], [4, [5, 6]], 7]
         # print(flatten(nested_list))  # [1, 2, 3, 4, 5, 6, 7]
 
-        # print(f"rank={torch.distributed.get_rank()}, {flatten(sample_id_groups)=}")
         # breakpoint()
 
         if return_cp_sizes:
@@ -2054,6 +2064,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         PP = parallel_state.get_pipeline_model_parallel_world_size()
         UP = parallel_state.get_context_parallel_world_size()
         TP = parallel_state.get_tensor_model_parallel_world_size()
+
         VPP = 1
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             VPP = parallel_state.get_virtual_pipeline_model_parallel_world_size()
@@ -2062,7 +2073,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         #     breakpoint()
         # torch.distributed.barrier()
 
-        max_split_size = 8 # TODO: change to configurable args.
+        max_split_size = config.max_hybrid_context_parallel_size // config.min_hybrid_context_parallel_size
         max_seq_len = config.max_seqlen_per_dp_cp_rank
 
         all_lengths = [sample_seqlens[i][1] for i in range(len(sample_seqlens))]
@@ -2117,8 +2128,12 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                 for i in range(1, len(combination)+1):
                     avg_fwd_flops_with_m.append(mean_fwd_flops_with_m * ratios[i - 1] / i / PP)
 
+                import time
+                st_time = time.time()
                 indices_buckets, sample_ids, max_flops_sum_per_iter, max_seq_per_m, used_flops = \
                     self.solver(all_lengths, all_flops, all_density, num_buckets, avg_fwd_flops_with_m, combination, DP, PP, UP, TP, VPP, max_seq_len, max_split_size, config)
+                ed_time = time.time()
+                if torch.distributed.get_rank() == 0: print(f"solver cost time :{ed_time-st_time}s")
                 
                 if max_flops_sum_per_iter < min_max_flops_sum_per_iter:
                     min_max_flops_sum_per_iter = max_flops_sum_per_iter
@@ -2133,7 +2148,8 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         search_space = 6
         assert DP % config.min_hybrid_context_parallel_size == 0
         limit_item = DP // config.min_hybrid_context_parallel_size
-        limits = [limit_item] * search_space
+        # limits = [limit_item] * search_space
+        limits = [0, 0, limit_item, limit_item, limit_item, limit_item, limit_item, limit_item]
 
         min_max_flops_sum_per_iter, best_indices_buckets, best_sample_ids, best_dp_combination = dynamic_loops_product(limits)
         if torch.distributed.get_rank() == 0: print(f"{best_dp_combination=}")
@@ -2341,13 +2357,14 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
 
                     # if peak_memory >= 70 * 1024**3:
                     #     max_sum_per_iter = sys.float_info.max / 10.0    # skip this m
-                    #     print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
+                        # print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
 
-                # if torch.distributed.get_rank() == 0:
-                #     for k in range(len(bubble_time_list)):
-                #         for key in bubble_time_list[k].keys():
-                #             bubble_time_list[k][key] = round(bubble_time_list[k][key], 3)
-                #         print(f"{k=}, {bubble_time_list[k]}")
+                if torch.distributed.get_rank() == 0:
+                    print(f"{combination=}")
+                    for k in range(len(bubble_time_list)):
+                        for key in bubble_time_list[k].keys():
+                            bubble_time_list[k][key] = round(bubble_time_list[k][key], 3)
+                        print(f"{k=}, {bubble_time_list[k]}")
 
         max_max_iter_sum = max(max_iter_sum_among_dp_list)
         min_max_iter_sum = min(max_iter_sum_among_dp_list)

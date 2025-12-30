@@ -2268,7 +2268,7 @@ def _add_training_args(parser):
                        help='Use the built-in pytorch profiler. '
                        'Useful if you wish to view profiles in tensorboard.',
                        dest='use_pytorch_profiler')
-    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 15, 16, 24, 32],
+    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20, 24, 28, 32, 64, 96, 128, 160, 192, 224],
                        help='Global ranks to profile.')
     group.add_argument('--record-memory-history', action="store_true", default=False,
                        help='Record memory history in last rank.')
@@ -2933,6 +2933,8 @@ def _add_distributed_args(parser):
                        'of each CP rank when we use packed samples with variable sequence lengths. '
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
     group.add_argument('--min-hybrid-context-parallel-size', type=int, default=1,
+                        help='Minimum size of the hybrid context parallel groups.')
+    group.add_argument('--max-hybrid-context-parallel-size', type=int, default=-1,
                         help='Minimum size of the hybrid context parallel groups.')
     group.add_argument('--hybrid-context-parallel-scheduler', type=str, default='balanced',
                         choices=['balanced', 'only_packing_no_scheduling'],

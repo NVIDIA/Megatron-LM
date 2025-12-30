@@ -3,16 +3,28 @@ from typing import Iterable, Mapping
 import matplotlib.pyplot as plt
 import networkx as nx
 
-from .ir import Action, Stats
-from .plotter import Plotter
-from .schedules import (
-    AbstractSchedule,
-    InterleavedSchedule,
-    SlimPipeSchedule,
-    SplitFuseSchedule,
-    kFkBSchedule,
-    HybridSlimSchedule,
-)
+try:
+    from .ir import Action, Stats
+    from .plotter import Plotter
+    from .schedules import (
+        AbstractSchedule,
+        InterleavedSchedule,
+        SlimPipeSchedule,
+        SplitFuseSchedule,
+        kFkBSchedule,
+        HybridSlimSchedule,
+    )
+except:
+    from ir import Action, Stats
+    from plotter import Plotter
+    from schedules import (
+        AbstractSchedule,
+        InterleavedSchedule,
+        SlimPipeSchedule,
+        SplitFuseSchedule,
+        kFkBSchedule,
+        HybridSlimSchedule,
+    )
 
 
 class Solver:
@@ -109,8 +121,8 @@ def test_with_schedule(schedule: AbstractSchedule) -> None:
     timeline = solver.solve()
     # solver.show()
 
-    # plotter = Plotter(schedule)
-    # plotter.draw_timeline(timeline)
+    plotter = Plotter(schedule)
+    plotter.draw_timeline(timeline)
 
     # print(f"The makespan is {max(stats.end_time for stats in timeline.values())}")
     return max(stats.end_time for stats in timeline.values())
@@ -120,7 +132,17 @@ def test_interleaved() -> None:
     """Test the solver with an interleaved schedule."""
     p = 4  # Number of pipeline stages
     v = 2  # Number of microbatches
-    microbatches = [1] * 8  # Cost of each microbatch
+    microbatches_1 = [2, 6, 8, 4, 3, 4, 4, 2]  # Cost of each microbatch
+    microbatches_2 = [4, 8, 5, 4, 10, 3, 3, 3]  # Cost of each microbatch
+    # microbatches = [(microbatches_1[i] + microbatches_2[i])/2 for i in range(len(microbatches_1))]
+    
+    microbatches_balanced = (sum(microbatches_1) + sum(microbatches_2)) // (len(microbatches_1) + len(microbatches_2))
+    microbatches = [microbatches_balanced] * len(microbatches_1)
+    
+    # microbatches = microbatches_2
+    
+    # microbatches = [3, 1, 2, 4, 8/2, 7/2, 4, 2]  # Cost of each microbatch
+    # microbatches = microbatches.sort()
 
     # Build the schedule and dependencies
     schedule = InterleavedSchedule(p, v, microbatches)
@@ -181,7 +203,7 @@ def test_hybrid():
 
 if __name__ == "__main__":
     test_interleaved()
-    test_slimpipe()
-    test_splitfuse()
-    test_kfkb()
-    test_hybrid()
+    # test_slimpipe()
+    # test_splitfuse()
+    # test_kfkb()
+    # test_hybrid()
