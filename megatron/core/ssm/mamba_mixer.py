@@ -455,7 +455,7 @@ class MambaMixer(MegatronModule):
         if it exists.
         """
         sequence_packing_available, reason_for_no_sequence_packing = (
-            _sequence_packing_support(for_inference_not_training=True)
+            _check_mamba_sequence_packing_support(for_inference_not_training=True)
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
