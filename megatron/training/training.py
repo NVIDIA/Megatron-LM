@@ -2608,7 +2608,7 @@ def train(
             num_zeros_in_grad,
             max_attention_logit,
             num_total_tokens_this_GB, 
-            sequence_square_sum_this_GB
+            sequence_square_sum_this_GB,
             pg_collection=model_pg_collection,
         )
 

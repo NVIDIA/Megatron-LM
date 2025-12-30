@@ -537,7 +537,7 @@ def wrap_iterator_helper(
                     num_total_tokens_this_GB,
                     sequence_square_sum_this_GB,
                 ) = wrap_dataloader(
-                    data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
+                    data_iterator, config, PackingScheduler.HYBRID_CP_WITH_PP, pg_collection=None
                 )
             elif config.hybrid_context_parallel_scheduler == 'only_packing_no_scheduling':
                 (
@@ -2185,10 +2185,6 @@ def forward_backward_pipelining_without_interleaving(
     # data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
     #     wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
     # )
-
-    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
-        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
-    )
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:

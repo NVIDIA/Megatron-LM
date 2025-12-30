@@ -8,6 +8,7 @@ from functools import lru_cache
 import math
 from math import ceil, log2
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
+import nvtx
 
 import numpy as np
 import torch
@@ -80,7 +81,8 @@ def wrap_dataloader(
         sequence lengths of all subsamples from all ranks.
         """
         # Collect the number of subsamples from all ranks
-        local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
+        nvtx.push_range("_get_global_seqlens")
+        local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         dp_subsample_count = [torch.zeros_like(local_len) for _ in range(dp_group.size())]
         torch.distributed.all_gather(dp_subsample_count, local_len, group=dp_group)
 
@@ -116,6 +118,7 @@ def wrap_dataloader(
         csum = torch.cumsum(dp_subsample_counts, dim=0, dtype=torch.int32)
         offsets = torch.cat([torch.zeros(1, dtype=torch.int32), csum[:-1]], dim=0)
 
+        nvtx.pop_range()
         return seqlens_gathered, offsets
 
     def _get_global_id_seqlens(num_local_subsamples, offsets, seqlens_gathered, dp_group):
@@ -128,8 +131,9 @@ def wrap_dataloader(
         global_id_seqlens: list of (global_id, seqlen) tuples for scheduling.
         global_ids_this_rank: list of global IDs locally present on this rank.
         """
+        nvtx.push_range("_get_global_id_seqlens")
         dp_rank = dp_group.rank()
-        global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32).cuda()
+        global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32, pin_memory=True).to("cuda", non_blocking=True)
         # Create a list of (global_id, seqlen) tuples for scheduling
         global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(len(global_ids))]
         # Get the global IDs locally present on this rank
@@ -137,6 +141,7 @@ def wrap_dataloader(
             offsets[dp_rank] : offsets[dp_rank] + num_local_subsamples
         ]
 
+        nvtx.pop_range()
         return global_id_seqlens, global_ids_this_rank
 
     def _gid_to_src_rank(gid: int, offsets: List[int], dp_group, tp_group, dp_cp_group) -> int:
@@ -167,6 +172,7 @@ def wrap_dataloader(
         Since all CP ranks within a DP group have the same data, we only need
         to transfer data between matching CP ranks.
         """
+        nvtx.push_range("_reroute_samples_to_hdp_ranks")
         gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
         hdp_rank = dp_cp_group.rank()
         dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
@@ -270,6 +276,7 @@ def wrap_dataloader(
         recv_sample_with_id = {
             recv_id: recv_samples[i] for i, recv_id in enumerate(recv_ids_sorted)
         }
+        nvtx.pop_range()
         return recv_sample_with_id
 
     def _unpack_batch(batch):
@@ -310,13 +317,16 @@ def wrap_dataloader(
     ) -> Dict[str, torch.Tensor]:
         # TODO(tailaim): do we need attention_mask for sequence packing?
 
+        nvtx.push_range("_pack_sequences")
         def _pack_tensors(tensors):
             return torch.cat([t.reshape(-1) for t in tensors], dim=0)
 
+        nvtx.push_range("_pack_tensors")
         tokens = _pack_tensors([sample["tokens"] for sample in samples])
         labels = _pack_tensors([sample["labels"] for sample in samples])
         loss_mask = _pack_tensors([sample["loss_mask"] for sample in samples])
         position_ids = _pack_tensors([sample["position_ids"] for sample in samples])
+        nvtx.pop_range()
 
         new_sample = {}
         new_sample["tokens"] = tokens
@@ -324,9 +334,11 @@ def wrap_dataloader(
         new_sample["loss_mask"] = loss_mask
         new_sample["position_ids"] = position_ids
         if partner_cp_size is not None:
+            nvtx.push_range("create local_cp_size")
             new_sample["local_cp_size"] = torch.tensor(
-                partner_cp_size, dtype=torch.int32, device=dev
-            )
+                partner_cp_size, dtype=torch.int32, pin_memory=True
+            ).to(dev, non_blocking=True)
+            nvtx.pop_range()
 
         # create cu_seqlens_padded
         lengths_padding = np.fromiter(
@@ -335,25 +347,33 @@ def wrap_dataloader(
         cu_seqlens_padded = np.empty(len(samples) + 1, dtype=np.int32)
         cu_seqlens_padded[0] = 0
         cu_seqlens_padded[1:] = np.cumsum(lengths_padding, out=cu_seqlens_padded[1:])
+        nvtx.push_range("create cu_seqlens_padded")
         cu_seqlens_padded = (
-            torch.from_numpy(cu_seqlens_padded)
+            torch.from_numpy(cu_seqlens_padded).pin_memory()
             .to(device=dev, non_blocking=True, dtype=torch.int32)
             .reshape(-1)
         )
+        nvtx.pop_range()
         new_sample["cu_seqlens_padded"] = cu_seqlens_padded
 
         # create max_seqlen
+        nvtx.push_range("create max_seqlen")
         max_seqlen = np.max(lengths_padding)
-        max_seqlen = torch.tensor(max_seqlen, device=dev, dtype=torch.int32)
+        max_seqlen = torch.tensor(max_seqlen, dtype=torch.int32, pin_memory=True).to(dev, non_blocking=True)
         new_sample["max_seqlen"] = max_seqlen
+        nvtx.pop_range()
 
         # create cu_seqlens without padding
-        lengths = torch.stack([s["original_seq_len"] for s in samples], dim=0).reshape(-1)
-        cu_seqlens = torch.empty(lengths.numel() + 1, device=dev, dtype=torch.int32)
-        cu_seqlens[0] = 0
-        cu_seqlens[1:] = torch.cumsum(lengths, dim=0).reshape(-1)
-        new_sample["cu_seqlens"] = cu_seqlens
+        nvtx.push_range("create max_seqlen")
+        lengths = torch.stack([torch.zeros_like(samples[0]["original_seq_len"])] + [s["original_seq_len"] for s in samples], dim=0).reshape(-1)
+        # cu_seqlens = torch.empty(lengths.numel() + 1, device=dev, dtype=torch.int32)
+        # cu_seqlens[0] = 0
+        # cu_seqlens[1:] = torch.cumsum(lengths, dim=0).reshape(-1)
+        cu_seqlens = torch.cumsum(lengths, dim=0).reshape(-1)
+        new_sample["cu_seqlens"] = cu_seqlens.to(torch.int32)
+        nvtx.pop_range()
 
+        nvtx.pop_range()
         return new_sample
 
     # Convert string to enum if needed
@@ -401,6 +421,17 @@ def wrap_dataloader(
         else:
             data_iterator = data_iterator[0]
 
+    def cast_inputs_device(inputs, device, skip_device={}):
+        if isinstance(inputs, (list, tuple)):
+            return inputs.__class__(cast_inputs_device(v, device, skip_device) for v in inputs)
+        elif isinstance(inputs, dict):
+            return {k: v if k in skip_device else cast_inputs_device(v, device, skip_device=skip_device) for k, v in inputs.items()}
+        elif isinstance(inputs, torch.Tensor):
+            if not inputs.is_cuda:
+                inputs = inputs.to(device=device, non_blocking=True) # here input is expected to be pinned
+
+        return inputs
+
     if data_iterator is not None:
         # indicates TP rank 0, with PP stage 0 or -1.
         local_cp_size = None
@@ -410,10 +441,12 @@ def wrap_dataloader(
 
             # batch is a list of samples: List[MegatronDataset]
             batch = next(data_iterator)
+            batch = cast_inputs_device(batch, dev)
             # print(f"{batch=}")
             num_micro_batches = batch[0]["num_micro_batches_left"] + 1
 
             batch_all = [batch] + [next(data_iterator) for _ in range(num_micro_batches - 1)]
+            batch_all = cast_inputs_device(batch_all, dev)
 
             # calculate this two values for tflops calculation
             seqlens_gathered = [
@@ -438,10 +471,11 @@ def wrap_dataloader(
             or scheduler_type is PackingScheduler.NAIVE_SEQUENCE_PACKING
         ):
             batch = next(data_iterator)
+            batch = cast_inputs_device(batch, dev)
             subsample_seqlens = []
             for sample in batch:
                 subsample_seqlens.extend([sample["tokens"].numel()])
-            subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
+            subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
             subsample_seqlens = subsample_seqlens[subsample_seqlens != 0]
 
             seqlens_gathered, offsets = _get_global_seqlens(subsample_seqlens, dp_group)
@@ -514,7 +548,6 @@ def wrap_dataloader(
             )
             torch.distributed.all_reduce(mfu_info_to_broadcast_this_hdp_group, group=dp_cp_group)
             num_total_tokens_this_GB = mfu_info_to_broadcast_this_hdp_group[0].item()
-            print(f"{num_total_tokens_this_GB=}")
             sequence_square_sum_this_GB = mfu_info_to_broadcast_this_hdp_group[1].item()
 
     # # broadcast num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB,
