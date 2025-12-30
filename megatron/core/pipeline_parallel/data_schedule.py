@@ -3,12 +3,14 @@
 import enum
 import sys
 import copy
+import nvtx
 from collections import deque
 from functools import lru_cache
 import math
 from math import ceil, log2
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
 import nvtx
+import time
 
 import numpy as np
 import torch
@@ -81,8 +83,7 @@ def wrap_dataloader(
         sequence lengths of all subsamples from all ranks.
         """
         # Collect the number of subsamples from all ranks
-        nvtx.push_range("_get_global_seqlens")
-        local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32)
         dp_subsample_count = [torch.zeros_like(local_len) for _ in range(dp_group.size())]
         torch.distributed.all_gather(dp_subsample_count, local_len, group=dp_group)
 
@@ -90,11 +91,11 @@ def wrap_dataloader(
         dp_subsample_counts = torch.stack(dp_subsample_count, dim=0).cpu().view(-1)
         max_sub_samples = int(dp_subsample_counts.max().item())
 
-        if local_len.item() < max_sub_samples:
+        if subsample_seqlens.shape[0] < max_sub_samples:
             subsample_seqlens_padded = torch.cat(
                 [
                     subsample_seqlens,
-                    torch.zeros(max_sub_samples - local_len.item(), dtype=torch.int32).cuda(),
+                    torch.zeros(max_sub_samples - subsample_seqlens.shape[0], dtype=torch.int32, device=subsample_seqlens.device),
                 ],
                 dim=0,
             )
@@ -133,7 +134,7 @@ def wrap_dataloader(
         """
         nvtx.push_range("_get_global_id_seqlens")
         dp_rank = dp_group.rank()
-        global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32, pin_memory=True).to("cuda", non_blocking=True)
+        global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32)
         # Create a list of (global_id, seqlen) tuples for scheduling
         global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(len(global_ids))]
         # Get the global IDs locally present on this rank
@@ -152,6 +153,17 @@ def wrap_dataloader(
             torch.distributed.get_process_group_ranks(dp_group)[dp_src_rank] // tp_group.size()
         ) % dp_cp_group.size()
         return hdp_rank
+
+    def cast_inputs_device(inputs, device, skip_device=[]):
+        if isinstance(inputs, (list, tuple)):
+            return inputs.__class__(cast_inputs_device(v, device, skip_device) for v in inputs)
+        elif isinstance(inputs, dict):
+            return {k: v if k in skip_device else cast_inputs_device(v, device, skip_device=skip_device) for k, v in inputs.items()}
+        elif isinstance(inputs, torch.Tensor):
+            if not inputs.is_cuda:
+                inputs = inputs.to(device=device, non_blocking=True) # here input is expected to be pinned
+
+        return inputs
 
     def _reroute_samples_to_hdp_ranks(
         batch,
@@ -316,9 +328,10 @@ def wrap_dataloader(
         samples: List[MegatronDataset], partner_cp_size: Optional[int] = None
     ) -> Dict[str, torch.Tensor]:
         # TODO(tailaim): do we need attention_mask for sequence packing?
-
         nvtx.push_range("_pack_sequences")
         def _pack_tensors(tensors):
+            if len(tensors) == 1:
+                return tensors[0].reshape(-1)
             return torch.cat([t.reshape(-1) for t in tensors], dim=0)
 
         nvtx.push_range("_pack_tensors")
@@ -336,43 +349,24 @@ def wrap_dataloader(
         if partner_cp_size is not None:
             nvtx.push_range("create local_cp_size")
             new_sample["local_cp_size"] = torch.tensor(
-                partner_cp_size, dtype=torch.int32, pin_memory=True
-            ).to(dev, non_blocking=True)
+                partner_cp_size, dtype=torch.int32
+            )
             nvtx.pop_range()
 
         # create cu_seqlens_padded
-        lengths_padding = np.fromiter(
-            (s["tokens"].numel() for s in samples), dtype=np.int32, count=len(samples)
-        )
-        cu_seqlens_padded = np.empty(len(samples) + 1, dtype=np.int32)
-        cu_seqlens_padded[0] = 0
-        cu_seqlens_padded[1:] = np.cumsum(lengths_padding, out=cu_seqlens_padded[1:])
-        nvtx.push_range("create cu_seqlens_padded")
-        cu_seqlens_padded = (
-            torch.from_numpy(cu_seqlens_padded).pin_memory()
-            .to(device=dev, non_blocking=True, dtype=torch.int32)
-            .reshape(-1)
-        )
-        nvtx.pop_range()
+        lengths_padding = torch.tensor([s["tokens"].numel() for s in samples]).reshape(-1)
+        # create max_seqlen
+        max_seqlen = lengths_padding.max().int()
+        new_sample["max_seqlen"] = max_seqlen
+        lengths_padding = lengths_padding.pin_memory().to(dev, non_blocking=True)
+        cu_seqlens_padded = torch.cat([torch.zeros(1, dtype=torch.int32, device=lengths_padding.device), torch.cumsum(lengths_padding, dim=0, dtype=torch.int32).reshape(-1)], dim=0)
         new_sample["cu_seqlens_padded"] = cu_seqlens_padded
 
-        # create max_seqlen
-        nvtx.push_range("create max_seqlen")
-        max_seqlen = np.max(lengths_padding)
-        max_seqlen = torch.tensor(max_seqlen, dtype=torch.int32, pin_memory=True).to(dev, non_blocking=True)
-        new_sample["max_seqlen"] = max_seqlen
-        nvtx.pop_range()
 
         # create cu_seqlens without padding
-        nvtx.push_range("create max_seqlen")
-        lengths = torch.stack([torch.zeros_like(samples[0]["original_seq_len"])] + [s["original_seq_len"] for s in samples], dim=0).reshape(-1)
-        # cu_seqlens = torch.empty(lengths.numel() + 1, device=dev, dtype=torch.int32)
-        # cu_seqlens[0] = 0
-        # cu_seqlens[1:] = torch.cumsum(lengths, dim=0).reshape(-1)
-        cu_seqlens = torch.cumsum(lengths, dim=0).reshape(-1)
-        new_sample["cu_seqlens"] = cu_seqlens.to(torch.int32)
-        nvtx.pop_range()
-
+        lengths = torch.stack([s["original_seq_len"] for s in samples], dim=0).reshape(-1)
+        cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int32, device=lengths.device), torch.cumsum(lengths, dim=0, dtype=torch.int32).reshape(-1)], dim=0)
+        new_sample["cu_seqlens"] = cu_seqlens
         nvtx.pop_range()
         return new_sample
 
@@ -396,6 +390,7 @@ def wrap_dataloader(
     scheduler = scheduler_map[scheduler_type](config)
     if pg_collection is None:
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        dp_group_gloo = parallel_state.get_data_parallel_group_gloo()
         dp_group = parallel_state.get_data_parallel_group()
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
@@ -475,19 +470,24 @@ def wrap_dataloader(
             subsample_seqlens = []
             for sample in batch:
                 subsample_seqlens.extend([sample["tokens"].numel()])
-            subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32)
             subsample_seqlens = subsample_seqlens[subsample_seqlens != 0]
 
-            seqlens_gathered, offsets = _get_global_seqlens(subsample_seqlens, dp_group)
+            nvtx.push_range("_get_global_seqlens")
+            seqlens_gathered, offsets = _get_global_seqlens(subsample_seqlens, dp_group_gloo)
+            nvtx.pop_range()
 
+            nvtx.push_range("_get_global_id_seqlens")
             global_id_seqlens, global_ids_this_rank = _get_global_id_seqlens(
-                subsample_seqlens.shape[0], offsets, seqlens_gathered, dp_group
+                subsample_seqlens.shape[0], offsets, seqlens_gathered, dp_group_gloo
             )
+            nvtx.pop_range()
 
+            nvtx.push_range("scheduler.get_groups_and_subsamples")
             groups, sample_id_groups = scheduler.get_groups_and_subsamples(
                 global_id_seqlens, config
             )
-            # if torch.distributed.get_rank() == 0: print(f"\n{groups=}\n{sample_id_groups=}\n{global_id_seqlens=}")
+            nvtx.pop_range()
 
             set_gbs = set()
             for group in sample_id_groups:
@@ -498,7 +498,11 @@ def wrap_dataloader(
             ), f"set_gbs length: {len(set_gbs)} \
             != global_ids_this_rank length: {len(global_id_seqlens)}"
 
+            nvtx.push_range("_unpack_batch")
             batch = _unpack_batch(batch)
+            nvtx.pop_range()
+            
+            nvtx.push_range("_reroute_samples_to_hdp_ranks")
             samples_this_rank_with_id = _reroute_samples_to_hdp_ranks(
                 batch,
                 global_ids_this_rank,
@@ -510,6 +514,7 @@ def wrap_dataloader(
                 dp_cp_group,
                 total_hdp_gpus,
             )
+            nvtx.pop_range()
             batch, sample_id_groups = samples_this_rank_with_id, sample_id_groups
 
             hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
@@ -543,8 +548,8 @@ def wrap_dataloader(
         if scheduler_type is PackingScheduler.ONLY_PACKING_NO_SCHEDULING:
             # allreduce to get the total number of microbatches
             mfu_info_to_broadcast_this_hdp_group = torch.tensor(
-                [num_total_tokens, sequence_square_sum], dtype=torch.int64, device=dev
-            )
+                [num_total_tokens, sequence_square_sum], dtype=torch.int64, pin_memory=True
+            ).to(dev, non_blocking=True)
             torch.distributed.all_reduce(mfu_info_to_broadcast_this_hdp_group, group=dp_cp_group)
             num_total_tokens_this_GB = mfu_info_to_broadcast_this_hdp_group[0].item()
             sequence_square_sum_this_GB = mfu_info_to_broadcast_this_hdp_group[1].item()
@@ -622,16 +627,24 @@ def wrap_dataloader(
     #                 ).cuda()
     #                 new_samples.append(new_sample)
 
+    if data_iterator is not None:
+        def pin_tensor(sample):
+            for k, v in sample.items():
+                if isinstance(v, torch.Tensor) and v.device == torch.device("cpu"):
+                    sample[k] = v.pin_memory()
+            return sample
+        new_samples = type(new_samples)(map(pin_tensor, new_samples))
+
     if tp_group.size() > 1:
         if tp_group.rank() == 0:
             info_to_broadcast_this_tpgroup = torch.tensor(
                 [num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB],
                 dtype=torch.int64,
-                device=dev,
-            )
+                pin_memory=True
+            ).to(dev, non_blocking=True)
             _broadcast_to_tp_group(info_to_broadcast_this_tpgroup)
         else:
-            info_to_broadcast_this_tpgroup = torch.tensor([0, 0, 0], dtype=torch.int64, device=dev)
+            info_to_broadcast_this_tpgroup = torch.zeros(3, dtype=torch.int64, device=dev)
             _broadcast_to_tp_group(info_to_broadcast_this_tpgroup)
             info_numpy = info_to_broadcast_this_tpgroup.cpu().numpy()
             (num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB) = info_numpy[
@@ -1319,7 +1332,8 @@ def greedy_assign_bucket_to_dp(curr_m, indices_buckets, normal_indexes, except_b
             bwd_flops_for_dp_per_m[bucket_tmp.dp_index].append(bucket_tmp.bwd_flops)
             
             # construct 2d array
-            seq_len_for_dp_per_m[bucket_tmp.dp_index].append([bucket_tmp.seq_len_sum // bucket_tmp.cp_size])
+            # correction for memory simulator
+            seq_len_for_dp_per_m[bucket_tmp.dp_index].append([bucket_tmp.seq_len_sum // bucket_tmp.cp_size // config.min_hybrid_context_parallel_size * config.context_parallel_size])
             
             # 更新DP rank的负载统计
             fwd_flops_sum_per_dp_this_m[bucket_tmp.dp_index] += bucket_tmp.fwd_flops[0]
@@ -1410,7 +1424,8 @@ def greedy_assign_bucket_to_dp(curr_m, indices_buckets, normal_indexes, except_b
         # bwd_flops_for_dp_per_m[min_flops_dp_rank].append(used_bwd_flops[bucket_id])
         fwd_flops_for_dp_per_m[min_flops_dp_rank].append(bucket_tmp.fwd_flops)
         bwd_flops_for_dp_per_m[min_flops_dp_rank].append(bucket_tmp.bwd_flops)
-        seq_len_for_dp_per_m[min_flops_dp_rank].append([bucket_tmp.seq_len_sum])
+        # correction for memory simulator
+        seq_len_for_dp_per_m[min_flops_dp_rank].append([bucket_tmp.seq_len_sum // config.min_hybrid_context_parallel_size * config.context_parallel_size])
         buckets_for_dp[min_flops_dp_rank].append(bucket_tmp)
         sample_ids_for_dp[min_flops_dp_rank].append(bucket_tmp.samples)
 
@@ -1868,7 +1883,6 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
             return groups, sample_id_groups, cp_sizes
 
         return groups, sample_id_groups
-
     def split_sample(
         self,
         num_buckets: List[int],
@@ -2137,11 +2151,18 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
 
             return min_max_flops_sum_per_iter, best_indices_buckets, best_sample_ids, best_dp_combination
 
-        search_space = 6
+        search_space = config.search_space
         assert DP % config.min_hybrid_context_parallel_size == 0
         limit_item = DP // config.min_hybrid_context_parallel_size
         # limits = [limit_item] * search_space
-        limits = [0, 0, limit_item, limit_item, limit_item, limit_item, limit_item, limit_item]
+        if isinstance(search_space, int):
+            limits = [limit_item] * search_space
+        elif isinstance(search_space, list):
+            limits = [0] * max(search_space)
+            for idx in search_space:
+                limits[idx] = limit_item
+        else:
+            raise Exception(f"`search_space` should be int or list, but {type(search_space)} found.")
 
         min_max_flops_sum_per_iter, best_indices_buckets, best_sample_ids, best_dp_combination = dynamic_loops_product(limits)
         if torch.distributed.get_rank() == 0: print(f"{best_dp_combination=}")
@@ -2315,7 +2336,8 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                     max_iter_sum_among_dp_list.append(max_iter_sum_among_dp)
                     max_sum_per_iter = max(max_sum_per_iter, max_iter_sum_among_dp)
 
-                    peak_memory = simulate_memory(seq_len_for_dp, config)
+                    if config.run_memory_simulator:
+                        peak_memory = simulate_memory(seq_len_for_dp, config)
 
                     forward_cost_cmp = torch.tensor(forward_cost_cmp).flatten().tolist()
                     backward_cost_cmp = torch.tensor(backward_cost_cmp).flatten().tolist()
@@ -2347,9 +2369,9 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                         "imbalanced_bubble_over_compute_time":imbalanced_bubble_over_compute_time,
                     })
 
-                    # if peak_memory >= 70 * 1024**3:
-                    #     max_sum_per_iter = sys.float_info.max / 10.0    # skip this m
-                        # print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
+                    if config.run_memory_simulator and peak_memory >= 70 * 1024**3:
+                        max_sum_per_iter = sys.float_info.max / 10.0    # skip this m
+                        print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
 
                 if torch.distributed.get_rank() == 0:
                     print(f"{combination=}")

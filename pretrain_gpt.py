@@ -6,6 +6,8 @@ from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
+import os
+import nvtx
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
@@ -62,11 +64,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if args.sft_sequence_packing:
                 
         # get batches based on the TP rank you are on
+        nvtx.push_range("get_batch_on_this_tp_rank")
         batch = get_batch_on_this_tp_rank(
             data_iterator,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
             vp_stage=vp_stage,
         )
+        nvtx.pop_range()
         
         cu_seqlens = batch.pop('cu_seqlens')
         cu_seqlens_padded = batch.pop('cu_seqlens_padded')
@@ -182,7 +186,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
-
+    # if parallel_state.get_pipeline_model_parallel_rank() == 0:
+    #     print(f"{tokens.shape=}, dp rank:{parallel_state.get_data_parallel_rank()}")
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
@@ -309,6 +314,7 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     # pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
     store = None
+    # torch.cuda.memory._record_memory_history(max_entries=8000000)
     pretrain(
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),

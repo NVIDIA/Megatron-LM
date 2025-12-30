@@ -162,7 +162,7 @@ class SFTDataset(MegatronDataset):
 
         if sft_sequence_packing:
             # sequence packing need both original sequence length and padded length
-            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
+            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32)
 
         return ret
 
@@ -190,6 +190,7 @@ class SFTDataset(MegatronDataset):
 
         return loss_mask, position_ids, attention_mask
 
+
 class MockSFTLowLevelDataset:
     """The low-level mock dataset for SFT
 
@@ -211,57 +212,8 @@ class MockSFTLowLevelDataset:
         # either choose to load sequence lengths from external file, or generate random sequence lengths
         
         assert "mode" in config, f"mode must be set, either 'file' or 'distribution'"
-        
-        if config["mode"] == "parquet_file":
-            from itertools import chain
-            # import pyarrow.parquet as pq
-            import pyarrow.dataset as ds
-            from transformers import AutoTokenizer
-            from megatron.training import get_args
-            
-            # dataset = pq.ParquetDataset(config["path"])
-            dataset = ds.dataset(config["path"], format='parquet')
-            tokenizer = AutoTokenizer.from_pretrained("/ytech_m2v5_hdd/workspace/kling_mm/Models/Qwen2.5-VL-7B-Instruct", use_fast=True)
-            self.size = dataset.count_rows()
-            class DatasetWrapper:
-                def __init__(self, dataset, tokenizer):
-                    self.tokenizer = tokenizer
-                    self.dataset = dataset
 
-                def __getitem__(self, idx):
-                    start = time.time()
-                    sample = self.dataset.take([idx], columns=["content"])["content"]
-                    end_0 = time.time()
-                    sample = sample.tolist()[0]
-                    end_1 = time.time()
-                    input_ids = self.tokenizer(sample, return_tensors="np", truncation=True, max_length=config["max_seq_len"])["input_ids"].squeeze(0)
-                    end_2 = time.time()
-                    # print(f"rank: {torch.distributed.get_rank()}, sample time_cost: {end_0 - start}, to_string time_cost: {end_1 - end_0}, tokenize time_cost: {end_2 - end_1}")
-                    return input_ids
-
-            self.dataset = DatasetWrapper(dataset, tokenizer)
-            self.sequence_lengths = None
-
-
-            # def data_generator():
-            #     gbs = get_args().global_batch_size
-            #     dataset_chunks = iter(dataset.fragments)
-            #     f = next(dataset_chunks)
-            #     dataset_chunk = iter([])
-            #     batch = []
-            #     while True:
-            #         try:
-            #             raw_text = next(dataset_chunk)["content"].to_string()
-            #             batch.append(raw_text)
-            #         except StopIteration:
-            #             f = next(dataset_chunks)
-            #             dataset_chunk = f.scanner(batch_size=4).to_batches()
-            #         if len(batch) == gbs:
-            #             for input_ids in tokenizer(batch, return_tensors="np", truncation=True, max_length=config["max_seq_len"])["input_ids"]:
-            #                 yield input_ids
-            #             batch = []
-            # self.data_generator = data_generator()
-        elif config["mode"] == "indexed_file":
+        if config["mode"] == "indexed_file":
             self.dataset = IndexedDataset(config["path"])
             self.size = len(self.dataset)
             self.sequence_lengths = self.dataset.sequence_lengths
@@ -299,7 +251,6 @@ class MockSFTLowLevelDataset:
         return self.size
 
     def __getitem__(self, idx: int) -> List[np.ndarray]:
-        # print(f"{idx=}, {self.size=}, {len(self.sequence_lengths)=}, {idx % self.size=}")
         if hasattr(self, "dataset") and self.dataset is not None:
             return self.dataset[idx]
         length = self.sequence_lengths[idx % len(self.sequence_lengths)]
@@ -416,6 +367,6 @@ class MockSFTDataset(SFTDataset):
 
         if sft_sequence_packing:
             # sequence packing need both original sequence length and padded length
-            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
+            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32)
 
         return ret

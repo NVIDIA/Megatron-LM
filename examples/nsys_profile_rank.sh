@@ -9,7 +9,7 @@ set -e
 #     --python-sampling-frequency 1000 --python-sampling true \
 #     $@ || true
 
-nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o "datetime_${DATETIME}_gpt_sft_hetero_cp_iter2_4_flash_global_8192_rank${OMPI_COMM_WORLD_RANK}" $@ || true
+nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o "$NSYS_DIR/datetime_${DATETIME}_gpt_sft_hetero_cp_iter2_4_flash_global_8192_rank${OMPI_COMM_WORLD_RANK}" $@ || true
 
 # PROFILE_RANKS=(0 1 2 3 4 5 6 7 8)
 

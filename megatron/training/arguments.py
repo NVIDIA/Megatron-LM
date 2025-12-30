@@ -2945,6 +2945,15 @@ def _add_distributed_args(parser):
                         'this scheduler only performs packing.')
     group.add_argument('--async-hybrid-context-parallel-scheduler', action='store_true',
                        default=False, help='Use asynchronize context parallel scheduler to avoid scheduler execution and extra communication time. ')
+    group.add_argument('--run-memory-simulator', action='store_true',
+                       default=False, help='run memory simulator for pp scheduler. ')
+    group.add_argument('--search-space', nargs='+', type=int, default=[1,2,3,4,5,6],
+                       help='search space for `PipelineAwareBalancedHybridCPscheduler`, '
+                       'if only one param, it means the range of the search space.'
+                       'For example, 4 means choose PP*1, PP*2, PP*3, PP*4 to search.'
+                       'if more than one param, it means the selected number of microbatch to search.'
+                       'For example, [1,2,3,4] means choose PP*1, PP*2, PP*3, PP*4 to search'
+                       '[2,4] means only choose PP*2 and PP*4 to search.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '

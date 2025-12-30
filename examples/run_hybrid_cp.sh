@@ -26,7 +26,6 @@ USE_FLASH_ATTN=0
 USE_FSDP=0
 PROFILE=0
 PROFILE_MEMORY=0
-PROFILE_MEMORY_PATH="/m2v_model/wuguohao03/nv_teamwork/Megatron-LM/logs/output/interactive_hybrid_cp/profile"
 # PROFILE_RANKS=[0,1,2,3,4,5,6,7,8]
 TRAIN_ITERS=10
 USE_MOCK_DATA=1
@@ -107,20 +106,32 @@ fi
 MODEL_NAME="interactive_hybrid_cp"
 TOKENIZER=None
 
-WORKSPACE="/m2v_model/wuguohao03/nv_teamwork/Megatron-LM/logs"
-SOURCE="/m2v_model/wuguohao03/nv_teamwork/Megatron-LM"
+WORKSPACE="../logs"
+mkdir -p $WORKSPACE
 OUTPUT_BASE="${WORKSPACE}/output"
-OUTPUT="${OUTPUT_BASE}/${MODEL_NAME}"
+OUTPUT="${OUTPUT_BASE}/${MODEL_NAME}/$DATETIME"
 
 FINETUNE_DIR=${OUTPUT}/checkpoints
 LOGS_DIR="${OUTPUT}/logs"
 TENSORBOARD_DIR="${OUTPUT}/tensorboard"
 DATACACHE_DIR="${OUTPUT}/data_cache"
+export NSYS_DIR="${OUTPUT}/nsys"
+PROFILE_MEMORY_PATH="${OUTPUT}/mem_profile"
+
+mkdir -p $FINETUNE_DIR
+mkdir -p $LOGS_DIR
+mkdir -p $TENSORBOARD_DIR
+mkdir -p $DATACACHE_DIR
+mkdir -p $NSYS_DIR
+mkdir -p $COST_DATA_FILE
+mkdir -p $PROFILE_MEMORY_PATH
 
 export HF_DATASETS_CACHE="${OUTPUT}/hf_datasets_cache"
 
 DATA_TRAIN="/home/tailaim/data/thd_formatted_100k.jsonl"
 
+CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+MEGATRON_PATH=$( dirname ${CURRENT_DIR})
 
 # if [[ $DEBUG -eq 1 ]]; then
 #     MBZ=1
@@ -194,6 +205,7 @@ fi
     # --disable-gloo-process-groups \
     # --hybrid-context-parallel \
     # --async-hybrid-context-parallel-scheduler \
+    # --hybrid-context-parallel-scheduler "only_packing_no_scheduling" \
 
 OPTIONS=" \
     `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory; fi` \
@@ -206,11 +218,13 @@ OPTIONS=" \
     --recompute-num-layers 1 \
     --timing-log-level 1 \
     --timing-log-option minmax \
+    --sft-sequence-packing \
     --hybrid-context-parallel \
-    --hybrid-context-parallel-scheduler balanced_with_pp \
     --min-hybrid-context-parallel-size $MIN_CP \
     --max-hybrid-context-parallel-size $MAX_CP \
-    --sft-sequence-packing \
+    --hybrid-context-parallel \
+    --hybrid-context-parallel-scheduler only_packing_no_scheduling \
+    --async-hybrid-context-parallel-scheduler \
     --max-seqlen-per-dp-cp-rank $MAX_SEQLEN_PER_DP_CP_RANK \
     --sft \
     --vocab-size $SEQ_LEN \
@@ -317,9 +331,10 @@ set -x
         # -x NVTE_DEBUG_LEVEL=2 \
         # -x NCCL_ALGO=^NVLS,NVLSTree \
         # -x CUDA_DEVICE_MAX_CONNECTIONS=1 \
+        # -x PYTHONPATH="$/m2v_model/wuguohao03/nv_teamwork/Megatron-LM":"/m2v_model/wangchenyu05/hot_switch/TransformerEngine":$PYTHONPATH \
 
 
-mpirun --allow-run-as-root \
+mpirun --allow-run-as-root --noprefix \
         ${HOSTFILE:+--hostfile "$HOSTFILE"} \
         --np $NP \
         --bind-to none --map-by slot \
@@ -348,17 +363,22 @@ mpirun --allow-run-as-root \
         -x TASK_RECORD_URL \
         -x HOSTNAME \
         -x TRAIN_MODE=True \
+        -x NSYS_DIR=$NSYS_DIR \
         -x PATH \
         -x PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True\
         ${LD_LIBRARY_PATH:+-x LD_LIBRARY_PATH} \
-        -x PYTHONPATH="$/m2v_model/wuguohao03/nv_teamwork/Megatron-LM":"/m2v_model/wangchenyu05/hot_switch/TransformerEngine":$PYTHONPATH \
+        -x PYTHONPATH:$MEGATRON_PATH:$PYTHONPATH \
+        -x CUDA_DEVICE_MAX_CONNECTIONS \
+        -x NCCL_IB_SL \
+        -x TOKENIZERS_PARALLELISM \
+        -x PYTORCH_CUDA_ALLOC_CONF \
         -x NCCL_DEBUG=WARN \
         -x http_proxy=http://oversea-squid2.ko.txyun:11080 \
         -x https_proxy=http://oversea-squid2.ko.txyun:11080 \
         -x no_proxy=localhost,127.0.0.1,localaddress,localdomain.com,internal,corp.kuaishou.com,test.gifshow.com,staging.kuaishou.com \
     $PROFILE_WRAPPER \
     with_nccl_local_env \
-    python -u /m2v_model/wuguohao03/nv_teamwork/Megatron-LM/pretrain_gpt.py \
+    python -u $MEGATRON_PATH/pretrain_gpt.py \
         ${OPTIONS} \
         --distributed-backend nccl \
         --master-addr ${MASTER_ADDR}:${MASTER_PORT}
