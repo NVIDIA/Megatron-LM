@@ -26,7 +26,7 @@ USE_TE_CE=1
 USE_FLASH_ATTN=0
 USE_FSDP=0
 PROFILE=0
-PROFILE_MEMORY=1
+PROFILE_MEMORY=0
 PROFILE_MEMORY_PATH="/m2v_model/wuguohao03/nv_teamwork/Megatron-LM/logs/output/interactive_hybrid_cp/profile"
 # PROFILE_RANKS=[0,1,2,3,4,5,6,7,8]
 TRAIN_ITERS=10
@@ -35,17 +35,24 @@ MASTER_PORT=6103
 TP=1
 PP=4
 PP_l=
+MIN_CP=1
 NUM_LAYERS=4
 
 MBZ=1
 BZ=256
-NW=8
+HIDDEN_SIZE=5120
+FFN_HIDDEN_SIZE=13824
+HEAD_DIM=128
+NUM_HEAD=$((HIDDEN_SIZE / HEAD_DIM))
+SEQ_LEN=65536 #131072 #81920 #65536
+MAX_SEQLEN_PER_DP_CP_RANK=65536
+NW=16
 AD=0.0
 HD=0.0
 LI=1
 EXTRA_ARGS=""
 NONDETERMINISTIC_ATTN=1
-NUM_GPU=8
+# NUM_GPU=8
 
 # Remember to update model and job name if running in batch mode!!
 # if [[ $BATCH -eq 0 ]]; then
@@ -112,8 +119,6 @@ export HF_DATASETS_CACHE="${OUTPUT}/hf_datasets_cache"
 
 DATA_TRAIN="/home/tailaim/data/thd_formatted_100k.jsonl"
 
-SEQ_LEN=131072 #131072 #81920 #65536
-MAX_SEQLEN_PER_DP_CP_RANK=32768
 
 # if [[ $DEBUG -eq 1 ]]; then
 #     MBZ=1
@@ -149,16 +154,22 @@ if [[ $USE_TE_CE -eq 1 ]]; then
 fi
 
 if [[ $PROFILE -eq 1 ]]; then
-    EXTRA_ARGS+=" --profile --profile-step-start 2 --profile-step-end 4 "
+    EXTRA_ARGS+=" --profile --profile-step-start 2 --profile-step-end 6 "
 fi
 
 echo $USE_MOCK_DATA
 if [[ $USE_MOCK_DATA -eq 1 ]]; then
     # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"file\",\"path\":\"path/to/file\"}'"
     if [[ $BATCH -eq 0 ]]; then
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} --tokenizer-type NullTokenizer --vocab-size 131072 "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} --tokenizer-type NullTokenizer --vocab-size 131072 "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"linear\",\"min_seq_len\":1024,\"max_seq_len\":32768} "
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/github/github_subset_2.csv\"} "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"indexed_file\",\"path\":\"${DATA_TRAIN}\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":32768,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} "
     else
-    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1}' --tokenizer-type NullTokenizer --vocab-size 131072 "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":16384,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1}' --tokenizer-type NullTokenizer --vocab-size 131072 "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"distribution\",\"type\":\"linear\",\"min_seq_len\":1024,\"max_seq_len\":32768} "
+    EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"file\",\"path\":\"/m2v_model/wuguohao03/dataset/github/github_subset_2.csv\"} "
+    # EXTRA_ARGS+=" --mock-data --sft-mock-dataset-config-json {\"mode\":\"indexed_file\",\"path\":\"${DATA_TRAIN}\",\"type\":\"lognormal\",\"min_seq_len\":1024,\"max_seq_len\":32768,\"mean_seq_len\":8192,\"lognormal_sigma\":1.1} "
     fi
 else
     EXTRA_ARGS+=" --data-path ${DATA_TRAIN} --tokenizer-model ${TOKENIZER} "
@@ -178,23 +189,25 @@ fi
     # --use-gpu-timer \
     # --gpu-timer-interval 1 \
     # 
+    # --hybrid-context-parallel-scheduler only_packing_no_scheduling \
+    # --recompute-activations \
+    # --disable-gloo-process-groups \
 
 OPTIONS=" \
     `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory; fi` \
     `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory-path $PROFILE_MEMORY_PATH; fi` \
     --no-check-for-nan-in-loss-and-grad \
-    --recompute-activations \
     --recompute-granularity full \
+    --recompute-method uniform \
+    --recompute-num-layers 1 \
     --timing-log-level 1 \
     --timing-log-option minmax \
-    --use-gpu-timer \
-    --gpu-timer-interval 1 \
     --hybrid-context-parallel \
-    --hybrid-context-parallel-scheduler only_packing_no_scheduling \
+    --min-hybrid-context-parallel-size $MIN_CP \
     --sft-sequence-packing \
     --max-seqlen-per-dp-cp-rank $MAX_SEQLEN_PER_DP_CP_RANK \
     --sft \
-    --vocab-size 32000 \
+    --vocab-size $SEQ_LEN \
     --tokenizer-type NullTokenizer \
     --legacy-tokenizer \
     --use-distributed-optimizer \
@@ -215,10 +228,10 @@ OPTIONS=" \
     ${PP_l:+--num-layers-per-virtual-pipeline-stage $PP_l} \
     --rerun-mode disabled \
     --num-layers $NUM_LAYERS \
-    --hidden-size 2048 \
-    --ffn-hidden-size 8192 \
+    --hidden-size $HIDDEN_SIZE \
+    --ffn-hidden-size $FFN_HIDDEN_SIZE \
     --add-qkv-bias \
-    --num-attention-heads 16 \
+    --num-attention-heads $NUM_HEAD \
     --num-workers ${NW} \
     --exit-duration-in-mins 230 \
     --seq-length ${SEQ_LEN} \
@@ -250,7 +263,6 @@ OPTIONS=" \
     --distributed-timeout-minutes 60 \
     --calculate-per-token-loss \
     --attention-backend flash \
-    --disable-gloo-process-groups \
     --use-dist-ckpt \
 "
 
@@ -288,7 +300,7 @@ else PROFILE_WRAPPER=; fi
 # fi
 
 exec &> >(tee "${LOGS_DIR}/$DATETIME.log")
-echo "HOSTFILE = ${HOSTFILE} MASTER_ADDR = ${MASTER_ADDR}, NP = ${NP}, NUM_GPU = ${NUM_GPU} "
+# echo "HOSTFILE = ${HOSTFILE} MASTER_ADDR = ${MASTER_ADDR}, NP = ${NP}, NUM_GPU = ${NUM_GPU} "
 
 cat $HOSTFILE
 
@@ -296,6 +308,8 @@ set -x
 
 # mpirun --hostfile hostfile -np 24 cat $HOSTFILE
 
+        # -x NVTE_DEBUG=1 \
+        # -x NVTE_DEBUG_LEVEL=2 \
 
 mpirun --allow-run-as-root \
         ${HOSTFILE:+--hostfile "$HOSTFILE"} \
@@ -328,7 +342,7 @@ mpirun --allow-run-as-root \
         -x TRAIN_MODE=True \
         -x PATH \
         ${LD_LIBRARY_PATH:+-x LD_LIBRARY_PATH} \
-        -x PYTHONPATH="$/m2v_model/wuguohao03/nv_teamwork/Megatron-LM":$PYTHONPATH \
+        -x PYTHONPATH="$/m2v_model/wuguohao03/nv_teamwork/Megatron-LM":"/m2v_model/wangchenyu05/hot_switch/TransformerEngine":$PYTHONPATH \
         -x NCCL_DEBUG=WARN \
         -x http_proxy=http://oversea-squid2.ko.txyun:11080 \
         -x https_proxy=http://oversea-squid2.ko.txyun:11080 \
