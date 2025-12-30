@@ -387,7 +387,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     .to(model_param.device)
                                     .float()
                                 )
-                                model_param.clear_high_precision_init_val()
+                                # When --fp8-param-gather on, the high precision value
+                                # should leave for further initializing the main param.
+                                # model_param.clear_high_precision_init_val()
                             else:
                                 shard_main_param = model_param.float().view(-1)[
                                     param_range.start : param_range.end
@@ -924,9 +926,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
-            dst_tensors = {"param": main_param, **optim_state}
-            for key in dst_tensors:
-                dst_tensors[key].copy_(tensors[key])
+            if isinstance(self.optimizer, HybridDeviceOptimizer):
+                for k, v in tensors.items():
+                    if k == "param":
+                        k = "master_param"
+                    optim_state[k] = v
+            else:
+                dst_tensors = {"param": main_param, **optim_state}
+                for key in dst_tensors:
+                    dst_tensors[key].copy_(tensors[key])
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
@@ -2046,6 +2054,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for model_param, tensors in recv_tensors.items():
                     self._set_main_param_and_optimizer_states(model_param, tensors)
 
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
+
     @torch.no_grad()
     def load_parameter_state_from_fully_reshardable(self, state_dict: dict):
         """Load counterpart of sharded_param_state_fully_reshardable.
@@ -2526,7 +2537,48 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the model params. This copy does not make use of the grad buffer as
         an intermediary.
         """
+        # Utility method for copying group params.
+        def copy_group_params(model_groups, shard_main_groups):
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                for model_param, shard_main_param in zip(model_group, shard_main_group):
+
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_main_param.nelement()
+
+                    if state_dict is not None:
+                        # Use param from state_dict to initialize main_param
+                        model_param = model_param_to_state_dict_param_map[model_param]
+
+                    if is_float8tensor(model_param):
+                        if hasattr(model_param, 'get_high_precision_init_val'):
+                            shard_model_param = (
+                                model_param.get_high_precision_init_val()
+                                .view(-1)[param_range.start : param_range.end]
+                                .clone()
+                                .to(model_param.device)
+                                .float()
+                            )
+                            model_param.clear_high_precision_init_val()
+                        else:
+                            shard_model_param = dequantize_fp8_tensor(model_param).view(-1)[
+                                param_range.start : param_range.end
+                            ]
+                    else:
+                        shard_model_param = model_param.view(-1)[
+                            param_range.start : param_range.end
+                        ]
+                    shard_main_param.data.copy_(shard_model_param)
+
         if isinstance(self.optimizer, HybridDeviceOptimizer):
+            # Copy model groups to shard groups. 
+            # HDO uses `shard_params` as param_groups:
+            # bf16 case, `shard_params` shares the same underlying storage, after loading ckpt, it was updated.
+            # fp8 case, `shard_params` is fp32 copy of model params, after loading ckpt, it is not updated, so the 
+            # explicit "model param -> shard param copy" is needed.
+            if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
+                copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
             self.optimizer.update_fp32_param_by_new_param()
             return
 
@@ -2546,29 +2598,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             model_param_to_state_dict_param_map = self._build_model_param_to_state_dict_param_map(
                 state_dict
             )
-
-        # Utility method for copying group params.
-        def copy_group_params(model_groups, shard_main_groups):
-            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
-                for model_param, shard_main_param in zip(model_group, shard_main_group):
-
-                    param_range_map = self._get_model_param_range_map(model_param)
-                    param_range = param_range_map["param"]
-                    assert param_range.size == shard_main_param.nelement()
-
-                    if state_dict is not None:
-                        # Use param from state_dict to initialize main_param
-                        model_param = model_param_to_state_dict_param_map[model_param]
-
-                    if is_float8tensor(model_param):
-                        shard_model_param = dequantize_fp8_tensor(model_param).view(-1)[
-                            param_range.start : param_range.end
-                        ]
-                    else:
-                        shard_model_param = model_param.view(-1)[
-                            param_range.start : param_range.end
-                        ]
-                    shard_main_param.data.copy_(shard_model_param)
 
         # Copy model groups to shard groups.
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
