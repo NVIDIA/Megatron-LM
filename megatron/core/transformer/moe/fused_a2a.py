@@ -321,7 +321,14 @@ def init_hybrid_ep_buffer(
     )
 
 
-@internal_api
+def reset_hybrid_ep_buffer():
+    '''
+    Reset the HybridEP buffer
+    '''
+    global _hybrid_ep_buffer
+    _hybrid_ep_buffer = None
+
+
 class HybridEPDispatch(torch.autograd.Function):
     '''
     Fused dispatch operation for permute + dispatch a2a + permute using the HybridEP backend
