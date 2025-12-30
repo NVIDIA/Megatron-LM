@@ -244,7 +244,9 @@ def forward_step_calc_loss(
 
     num_tokens = torch.tensor(0, dtype=torch.int)
     if is_last_stage:
-        if not collect_non_loss_data:
+        if loss_func is None:
+            forward_data_store.append(output_tensor)
+        elif not collect_non_loss_data:
             outputs = loss_func(output_tensor)
             if len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs

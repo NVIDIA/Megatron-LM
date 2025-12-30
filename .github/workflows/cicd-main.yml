@@ -202,11 +202,6 @@ jobs:
       && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
-      - name: Taint node for job isolation
-        if: contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
-        shell: bash
-        run: taint-node.sh
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -291,7 +286,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           file: ./docker/Dockerfile.ci.dev
           push: true
@@ -364,11 +359,6 @@ jobs:
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
     steps:
-      - name: Taint node for job isolation
-        if: contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
-        shell: bash
-        run: taint-node.sh
-
       - name: Checkout
         uses: actions/checkout@v4
       - name: main
@@ -496,11 +486,6 @@ jobs:
       && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
-      - name: Taint node for job isolation
-        if: contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
-        shell: bash
-        run: taint-node.sh
-
       - name: Checkout
         uses: actions/checkout@v4
       - name: main
@@ -636,3 +621,21 @@ jobs:
           path: |
             .coverage
           include-hidden-files: true
+
+  cleanup-taint-node:
+    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    needs:
+      - is-not-external-contributor
+      - cicd-container-build
+      - cicd-unit-tests-latest
+      - cicd-integration-tests-latest
+      - Coverage
+      - Coverage_Fake
+    if: |
+      always()
+      && !cancelled()
+      && contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
+    steps:
+      - name: Taint node for cleanup
+        shell: bash
+        run: taint-node.sh
