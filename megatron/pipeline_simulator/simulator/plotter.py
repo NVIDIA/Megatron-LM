@@ -4,9 +4,12 @@ import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
 
-from .ir import Action, B, F, Stats
-from .schedules import AbstractSchedule
-
+try:
+    from .ir import Action, B, F, Stats
+    from .schedules import AbstractSchedule
+except:
+    from ir import Action, B, F, Stats
+    from schedules import AbstractSchedule
 
 class Plotter:
     def __init__(self, schedule: AbstractSchedule) -> None:
@@ -81,4 +84,4 @@ class Plotter:
 
         ax.invert_yaxis()
         plt.axis("off")
-        plt.show()
+        plt.savefig("/m2v_model/wuguohao03/nv_teamwork/Megatron-LM/megatron/pipeline_simulator/simulator/pipeline.png")

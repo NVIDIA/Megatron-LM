@@ -44,6 +44,8 @@ class TransformerConfig(ModelParallelConfig):
     # model architecture
     ####################
     min_hybrid_context_parallel_size: int = 1
+    
+    max_hybrid_context_parallel_size: int = 1
 
     vocab_size: int = 0
 

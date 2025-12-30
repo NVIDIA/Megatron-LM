@@ -266,7 +266,10 @@ class MockSFTLowLevelDataset:
             self.size = len(self.dataset)
             self.sequence_lengths = self.dataset.sequence_lengths
         elif config["mode"] == "file":
+            min_seq_len = config["min_seq_len"]
+            max_seq_len = config["max_seq_len"]
             self.sequence_lengths = np.array(pd.read_csv(config["path"])).flatten()
+            self.sequence_lengths = self.sequence_lengths[(min_seq_len <= self.sequence_lengths) & (self.sequence_lengths <= max_seq_len)]
             self.size = len(self.sequence_lengths)
         elif config["mode"] == "distribution":
             min_seq_len = config["min_seq_len"]

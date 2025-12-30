@@ -50,6 +50,7 @@ class InterleavedSchedule(AbstractSchedule):
         self.p = p
         self.v = v
         self.microbatches = microbatches
+        self.backward_microbatches = None
         if backward_microbatches is not None:
             self.backward_microbatches = backward_microbatches
 
@@ -514,6 +515,7 @@ class kFkBSchedule(AbstractSchedule):
         self.p = p
         self.k = k
         self.microbatches = microbatches
+        self.backward_microbatches = None
         if backward_microbatches is not None:
             self.backward_microbatches = backward_microbatches
 

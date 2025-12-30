@@ -539,7 +539,6 @@ def wrap_dataloader(
                 new_sample = _pack_sequences(samples, partner_cp_size)
                 new_samples.append(new_sample)
             
-            # if parallel_state.get_pipeline_model_parallel_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}\n{sample_id_groups[0][hdp_rank]=}\n{sample_id_groups[1][hdp_rank]=}\n{sample_id_groups[2][hdp_rank]=}")
 
         if scheduler_type is PackingScheduler.ONLY_PACKING_NO_SCHEDULING:
             # allreduce to get the total number of microbatches
@@ -1245,8 +1244,6 @@ class BalancedHybridCPscheduler(BaseScheduler):
         # if torch.distributed.get_rank() == 0:
         #     breakpoint()
         # torch.distributed.barrier()
-        # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {groups=}")
-        # print(f"rank={torch.distributed.get_rank()}, {sample_id_groups=}")
         return groups, sample_id_groups
 
 
@@ -1322,7 +1319,7 @@ def greedy_assign_bucket_to_dp(curr_m, indices_buckets, normal_indexes, except_b
             bwd_flops_for_dp_per_m[bucket_tmp.dp_index].append(bucket_tmp.bwd_flops)
             
             # construct 2d array
-            seq_len_for_dp_per_m[bucket_tmp.dp_index].append([bucket_tmp.seq_len_sum])
+            seq_len_for_dp_per_m[bucket_tmp.dp_index].append([bucket_tmp.seq_len_sum // bucket_tmp.cp_size])
             
             # 更新DP rank的负载统计
             fwd_flops_sum_per_dp_this_m[bucket_tmp.dp_index] += bucket_tmp.fwd_flops[0]
@@ -1852,8 +1849,6 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
 
         # if torch.distributed.get_rank() == 0: print(f"{sample_id_groups=}")
         # if torch.distributed.get_rank() == 0: print(f"{cp_sizes=}")
-        # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {groups=}")
-        # if torch.distributed.get_rank() == 0: print(f"rank={torch.distributed.get_rank()}, {cp_sizes=}")
         def flatten(lst):
             result = []
             for item in lst:
@@ -1867,7 +1862,6 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         # nested_list = [1, [2, 3], [4, [5, 6]], 7]
         # print(flatten(nested_list))  # [1, 2, 3, 4, 5, 6, 7]
 
-        # print(f"rank={torch.distributed.get_rank()}, {flatten(sample_id_groups)=}")
         # breakpoint()
 
         if return_cp_sizes:
@@ -2062,6 +2056,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         PP = parallel_state.get_pipeline_model_parallel_world_size()
         UP = parallel_state.get_context_parallel_world_size()
         TP = parallel_state.get_tensor_model_parallel_world_size()
+
         VPP = 1
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             VPP = parallel_state.get_virtual_pipeline_model_parallel_world_size()
@@ -2070,7 +2065,7 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         #     breakpoint()
         # torch.distributed.barrier()
 
-        max_split_size = 8 # TODO: change to configurable args.
+        max_split_size = config.max_hybrid_context_parallel_size // config.min_hybrid_context_parallel_size
         max_seq_len = config.max_seqlen_per_dp_cp_rank
 
         all_lengths = [sample_seqlens[i][1] for i in range(len(sample_seqlens))]
@@ -2125,8 +2120,12 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                 for i in range(1, len(combination)+1):
                     avg_fwd_flops_with_m.append(mean_fwd_flops_with_m * ratios[i - 1] / i / PP)
 
+                import time
+                st_time = time.time()
                 indices_buckets, sample_ids, max_flops_sum_per_iter, max_seq_per_m, used_flops = \
                     self.solver(all_lengths, all_flops, all_density, num_buckets, avg_fwd_flops_with_m, combination, DP, PP, UP, TP, VPP, max_seq_len, max_split_size, config)
+                ed_time = time.time()
+                if torch.distributed.get_rank() == 0: print(f"solver cost time :{ed_time-st_time}s")
                 
                 if max_flops_sum_per_iter < min_max_flops_sum_per_iter:
                     min_max_flops_sum_per_iter = max_flops_sum_per_iter
@@ -2141,7 +2140,8 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
         search_space = 6
         assert DP % config.min_hybrid_context_parallel_size == 0
         limit_item = DP // config.min_hybrid_context_parallel_size
-        limits = [limit_item] * search_space
+        # limits = [limit_item] * search_space
+        limits = [0, 0, limit_item, limit_item, limit_item, limit_item, limit_item, limit_item]
 
         min_max_flops_sum_per_iter, best_indices_buckets, best_sample_ids, best_dp_combination = dynamic_loops_product(limits)
         if torch.distributed.get_rank() == 0: print(f"{best_dp_combination=}")
@@ -2349,13 +2349,14 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
 
                     # if peak_memory >= 70 * 1024**3:
                     #     max_sum_per_iter = sys.float_info.max / 10.0    # skip this m
-                    #     print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
+                        # print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
 
-                # if torch.distributed.get_rank() == 0:
-                #     for k in range(len(bubble_time_list)):
-                #         for key in bubble_time_list[k].keys():
-                #             bubble_time_list[k][key] = round(bubble_time_list[k][key], 3)
-                #         print(f"{k=}, {bubble_time_list[k]}")
+                if torch.distributed.get_rank() == 0:
+                    print(f"{combination=}")
+                    for k in range(len(bubble_time_list)):
+                        for key in bubble_time_list[k].keys():
+                            bubble_time_list[k][key] = round(bubble_time_list[k][key], 3)
+                        print(f"{k=}, {bubble_time_list[k]}")
 
         max_max_iter_sum = max(max_iter_sum_among_dp_list)
         min_max_iter_sum = min(max_iter_sum_among_dp_list)
