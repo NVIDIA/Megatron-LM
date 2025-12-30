@@ -90,6 +90,7 @@ class DynamicEngineTestConfig:
 
     context_buffer_size_gb: float = 0.1  # enough room for all tokens.
     context_block_size_tokens: int = 256
+    context_max_requests: Optional[int] = None
     context_max_tokens: Optional[int] = None
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
@@ -220,9 +221,10 @@ class TestDynamicInferenceEngine:
             num_attention_heads=transformer_config.num_query_groups,
             max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
-            use_cuda_graphs_for_non_decode_steps=not test_config.model_provider == "mamba",
+            use_cuda_graphs_for_non_decode_steps=True,
             buffer_size_gb=test_config.context_buffer_size_gb,
             block_size_tokens=test_config.context_block_size_tokens,
+            max_requests=test_config.context_max_requests,
             max_tokens=test_config.context_max_tokens,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=transformer_config.pipeline_model_parallel_size,
@@ -433,7 +435,7 @@ class TestDynamicInferenceEngine:
         # the only thing that differs between requests is num_tokens_to_generate,
         # and engine.async_step() doesn't use this sampling param's
         # num_tokens_to_generate.
-        result = env.engine.step_modern(verbose=False)
+        result = env.engine.step_modern()
 
         # Suspend + resume.
         if (
@@ -766,7 +768,7 @@ class TestDynamicInferenceEngine:
             test_config = DynamicEngineTestConfig(num_requests=8, use_fixed_output_lengths=True)
             env = self._build_test_env(test_config)
 
-            engine_task = asyncio.create_task(env.engine.run_engine(verbose=False))
+            engine_task = asyncio.create_task(env.engine.run_engine())
 
             request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
 
@@ -1259,7 +1261,7 @@ class TestDynamicInferenceEngine:
 
         # Step engine until all requests are finished
         while env.engine.has_unfinished_requests():
-            result = env.engine.step_modern(verbose=False)
+            result = env.engine.step_modern()
 
         # Validate results
         for request in requests_to_add:
@@ -1346,3 +1348,28 @@ class TestDynamicInferenceEngine:
                     assert (
                         abs(log_prob - top_n_dict[token_str]) < 0.1
                     ), f"Request {request.request_id}, token {i}: log_prob mismatch {log_prob} vs {top_n_dict[token_str]}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("max_requests", [None, 4])
+    @torch.inference_mode()
+    def test_max_requests(self, max_requests: int | None):
+        """Test max requests."""
+        env = self._run_test(
+            context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
+        )
+        step_count = env.engine.step_count
+        context = env.engine.context
+        if max_requests is None:
+            assert context.max_active_requests == 408
+            assert step_count == 22
+        else:
+            assert max_requests < len(env.requests), (
+                f"Test is only useful if max_requests ({max_requests}) < "
+                f"num_requests ({len(env.requests)})."
+            )
+            assert context.max_active_requests == 4
+            assert step_count == 34
+        assert context.block_allocator.active_count == 409

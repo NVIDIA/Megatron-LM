@@ -155,7 +155,7 @@ def get_inference_context(
         max_sequence_length = args.inference_max_seq_length
 
     metrics_writer = None
-    if args.inference_wandb_logging_step_interval > 0:
+    if args.inference_logging_step_interval > 0 and args.inference_wandb_logging:
         metrics_writer = get_wandb_writer()
 
     # Inference context.
@@ -174,6 +174,7 @@ def get_inference_context(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
@@ -311,7 +312,7 @@ def run_inference(
         # Step inference engine (i.e., generate a token for each active request).
         # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
         try:
-            result = engine.step_modern(verbose=True)
+            result = engine.step_modern()
         except EngineSuspendedError as e:
             result = e
             pass # ignore error in order to call 'engine.resume()' below.
@@ -398,6 +399,10 @@ def run_inference(
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
 
+    # Resume engine (NOOP if not suspended).
+    if engine.is_suspended:
+        engine.resume()
+
     return {
         "step_times" : step_times,
         "add_times" : add_times,
@@ -442,6 +447,7 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         top_n_logprobs=args.top_n_logprobs,
+        stop_words=args.stop_words,
     ) 
 
     model = get_model()
@@ -476,7 +482,7 @@ def main():
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=not args.disable_chunked_prefill,
-        inference_logging_step_interval=args.inference_wandb_logging_step_interval,
+        inference_logging_step_interval=args.inference_logging_step_interval,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
@@ -487,6 +493,11 @@ def main():
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
     for _ in range(args.inference_repeat_n):
+
+        # Reset engine.
+        engine.reset()
+
+        # Trial.
         t = get_curr_time()
         result = run_inference(requests, engine)
         step_times = result["step_times"]
@@ -576,7 +587,8 @@ def main():
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric
-            json_results["throughput"] = throughputs
+            if args.record_throughput:
+                json_results["throughput"] = throughputs
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
@@ -618,11 +630,11 @@ def main():
         )
         print(
             f"{setup_prefix} … "
-            f"throughput: {throughput:.3f} tok/s",
+            f"throughput: {throughput:.3f} tok/s … ",
             f"total time: {total_time:.3f}s … "
             f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
             f"steps: {engine.step_count:d} … "
-            f"capture {capture_str} … "
+            f"capture {capture_str}"
         )
         print("~~~")
 
