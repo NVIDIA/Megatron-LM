@@ -1,17 +1,7 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # This file is adapted from code in https://github.com/Jiayi-Pan/TinyZero
 
 import re
-
-from datasets import load_dataset
-
-raw_dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split='train')
-
-TRAIN_SIZE = 327680
-TEST_SIZE = 1024
-
-assert len(raw_dataset) > TRAIN_SIZE + TEST_SIZE
-train_dataset = raw_dataset.select(range(TRAIN_SIZE))
-test_dataset = raw_dataset.select(range(TRAIN_SIZE, TRAIN_SIZE + TEST_SIZE))
 
 
 def extract_solution(solution_str: str, remove_prompt: bool = False):

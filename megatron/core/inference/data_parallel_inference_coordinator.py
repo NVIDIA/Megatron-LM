@@ -254,6 +254,7 @@ class DataParallelInferenceCoordinator:
                                 msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True),
                             ]
                         )
+                    break  # Exit the main loop after STOP_ACKs have been processed.
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
@@ -301,7 +302,8 @@ class DataParallelInferenceCoordinator:
             coordinator.start()
         except KeyboardInterrupt:
             logging.info("Coordinator process interrupted. Exiting...")
-            coordinator.stop()
+        coordinator.stop()
+        logging.info("Inference Coordinator: shut down successfully.")
 
     def stop(self):
         """

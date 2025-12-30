@@ -146,12 +146,7 @@ if __name__ == "__main__":
             with open(args.eagle_config)as f:
                 eagle_config = json.load(f)
             mtsp_config["config"]["eagle_architecture_config"].update(eagle_config)
-        # Update eagle hidden_size and vocab_size according to the base model
-        mtsp_config["config"]["eagle_architecture_config"]["hidden_size"] = unwrapped_model.config.hidden_size
-        mtsp_config["config"]["eagle_architecture_config"]["vocab_size"] = unwrapped_model.vocab_size
-        if not args.eagle_config or "draft_vocab_size" not in eagle_config:
-            # If draft_vocab_size is not provided, set it to vocab_size
-            mtsp_config["config"]["eagle_architecture_config"]["draft_vocab_size"] = unwrapped_model.vocab_size
+        
         if args.export_offline_model:
             mtsp_config["config"]["eagle_offline"] = True
 
