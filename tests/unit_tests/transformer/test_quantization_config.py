@@ -8,8 +8,8 @@ from megatron.core.quantization.quant_config import GlobMatcher, MatchContext, R
 
 try:
     from megatron.core.extensions.kitchen import (
-        AutogradFunctionImplementation,
         HAVE_KITCHEN,
+        AutogradFunctionImplementation,
         QAttentionParamsConfigSchema,
         QFlashAttentionParamsConfigSchema,
         QLinearParamsConfigSchema,

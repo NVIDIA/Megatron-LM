@@ -50,7 +50,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+    from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
 except ImportError:
     HAVE_KITCHEN = False

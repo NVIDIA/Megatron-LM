@@ -3,6 +3,7 @@
 HAVE_KITCHEN = False
 
 from unittest.mock import MagicMock
+
 AutogradFunctionImplementation = MagicMock()
 KitchenSpecProvider = MagicMock()
 
