@@ -30,8 +30,8 @@ PROFILE_MEMORY=0
 TRAIN_ITERS=10
 USE_MOCK_DATA=1
 MASTER_PORT=6103
-TP=2
-PP=2
+TP=1
+PP=8
 PP_l=
 MIN_CP=1
 MAX_CP=8
@@ -204,6 +204,8 @@ fi
     # --add-qkv-bias \
     # --disable-gloo-process-groups \
     # --hybrid-context-parallel \
+    # --async-hybrid-context-parallel-scheduler \
+    # --hybrid-context-parallel-scheduler "only_packing_no_scheduling" \
 
 OPTIONS=" \
     `if [ $PROFILE_MEMORY == 1 ]; then echo --profile-memory; fi` \
@@ -216,15 +218,16 @@ OPTIONS=" \
     --recompute-num-layers 1 \
     --timing-log-level 1 \
     --timing-log-option minmax \
+    --sft-sequence-packing \
     --hybrid-context-parallel \
     --min-hybrid-context-parallel-size $MIN_CP \
     --max-hybrid-context-parallel-size $MAX_CP \
-    --sft-sequence-packing \
     --hybrid-context-parallel \
-    --hybrid-context-parallel-scheduler "only_packing_no_scheduling" \
+    --hybrid-context-parallel-scheduler only_packing_no_scheduling \
+    --async-hybrid-context-parallel-scheduler \
     --max-seqlen-per-dp-cp-rank $MAX_SEQLEN_PER_DP_CP_RANK \
     --sft \
-    --vocab-size 131072 \
+    --vocab-size $SEQ_LEN \
     --tokenizer-type NullTokenizer \
     --legacy-tokenizer \
     --use-distributed-optimizer \
@@ -328,6 +331,7 @@ set -x
         # -x NVTE_DEBUG_LEVEL=2 \
         # -x NCCL_ALGO=^NVLS,NVLSTree \
         # -x CUDA_DEVICE_MAX_CONNECTIONS=1 \
+        # -x PYTHONPATH="$/m2v_model/wuguohao03/nv_teamwork/Megatron-LM":"/m2v_model/wangchenyu05/hot_switch/TransformerEngine":$PYTHONPATH \
 
 
 mpirun --allow-run-as-root --noprefix \
@@ -359,6 +363,7 @@ mpirun --allow-run-as-root --noprefix \
         -x TASK_RECORD_URL \
         -x HOSTNAME \
         -x TRAIN_MODE=True \
+        -x NSYS_DIR=$NSYS_DIR \
         -x PATH \
         -x PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True\
         ${LD_LIBRARY_PATH:+-x LD_LIBRARY_PATH} \

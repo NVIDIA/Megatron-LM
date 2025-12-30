@@ -10,6 +10,7 @@ import math
 from math import ceil, log2
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
 import nvtx
+import time
 
 import numpy as np
 import torch
@@ -350,6 +351,7 @@ def wrap_dataloader(
             new_sample["local_cp_size"] = torch.tensor(
                 partner_cp_size, dtype=torch.int32
             )
+            nvtx.pop_range()
 
         # create cu_seqlens_padded
         lengths_padding = torch.tensor([s["tokens"].numel() for s in samples]).reshape(-1)
@@ -504,7 +506,11 @@ def wrap_dataloader(
             samples_this_rank_with_id = _reroute_samples_to_hdp_ranks(
                 batch,
                 global_ids_this_rank,
+                global_id_seqlens,
                 sample_id_groups,
+                offsets,
+                dp_group,
+                tp_group,
                 dp_cp_group,
                 total_hdp_gpus,
             )
@@ -2145,11 +2151,18 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
 
             return min_max_flops_sum_per_iter, best_indices_buckets, best_sample_ids, best_dp_combination
 
-        search_space = 6
+        search_space = config.search_space
         assert DP % config.min_hybrid_context_parallel_size == 0
         limit_item = DP // config.min_hybrid_context_parallel_size
         # limits = [limit_item] * search_space
-        limits = [0, 0, limit_item, limit_item, limit_item, limit_item, limit_item, limit_item]
+        if isinstance(search_space, int):
+            limits = [limit_item] * search_space
+        elif isinstance(search_space, list):
+            limits = [0] * max(search_space)
+            for idx in search_space:
+                limits[idx] = limit_item
+        else:
+            raise Exception(f"`search_space` should be int or list, but {type(search_space)} found.")
 
         min_max_flops_sum_per_iter, best_indices_buckets, best_sample_ids, best_dp_combination = dynamic_loops_product(limits)
         if torch.distributed.get_rank() == 0: print(f"{best_dp_combination=}")
@@ -2323,7 +2336,8 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                     max_iter_sum_among_dp_list.append(max_iter_sum_among_dp)
                     max_sum_per_iter = max(max_sum_per_iter, max_iter_sum_among_dp)
 
-                    peak_memory = simulate_memory(seq_len_for_dp, config)
+                    if config.run_memory_simulator:
+                        peak_memory = simulate_memory(seq_len_for_dp, config)
 
                     forward_cost_cmp = torch.tensor(forward_cost_cmp).flatten().tolist()
                     backward_cost_cmp = torch.tensor(backward_cost_cmp).flatten().tolist()
@@ -2355,9 +2369,9 @@ class PipelineAwareBalancedHybridCPscheduler(BaseScheduler):
                         "imbalanced_bubble_over_compute_time":imbalanced_bubble_over_compute_time,
                     })
 
-                    # if peak_memory >= 70 * 1024**3:
-                    #     max_sum_per_iter = sys.float_info.max / 10.0    # skip this m
-                        # print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
+                    if config.run_memory_simulator and peak_memory >= 70 * 1024**3:
+                        max_sum_per_iter = sys.float_info.max / 10.0    # skip this m
+                        print(f"rank={torch.distributed.get_rank()}, Peak memory usage: {peak_memory / 1024**3:.2f} GiB, {combination=}")
 
                 if torch.distributed.get_rank() == 0:
                     print(f"{combination=}")

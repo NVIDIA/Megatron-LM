@@ -47,6 +47,10 @@ class TransformerConfig(ModelParallelConfig):
     
     max_hybrid_context_parallel_size: int = 1
 
+    run_memory_simulator = False
+
+    search_space = 6
+
     vocab_size: int = 0
 
     num_layers: int = 0

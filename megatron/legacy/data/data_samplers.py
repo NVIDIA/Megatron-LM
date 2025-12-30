@@ -36,7 +36,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'single':
         if args.sft_sequence_packing:
-            if True:    # TODO: add flag.
+            if args.async_hybrid_context_parallel_scheduler:
                 assert args.hybrid_context_parallel_scheduler == "only_packing_no_scheduling"
                 batch_sampler = MegatronSFTPrefetchDPBalancedSampler(
                     dataset=dataset,

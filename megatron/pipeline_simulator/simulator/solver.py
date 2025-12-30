@@ -121,8 +121,8 @@ def test_with_schedule(schedule: AbstractSchedule) -> None:
     timeline = solver.solve()
     # solver.show()
 
-    plotter = Plotter(schedule)
-    plotter.draw_timeline(timeline)
+    # plotter = Plotter(schedule)
+    # plotter.draw_timeline(timeline)
 
     # print(f"The makespan is {max(stats.end_time for stats in timeline.values())}")
     return max(stats.end_time for stats in timeline.values())

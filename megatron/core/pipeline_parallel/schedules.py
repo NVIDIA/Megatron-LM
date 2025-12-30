@@ -538,6 +538,15 @@ def wrap_iterator_helper(
                     num_total_tokens_this_GB,
                     sequence_square_sum_this_GB,
                 ) = wrap_dataloader(
+                    data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
+                )
+            elif config.hybrid_context_parallel_scheduler == 'balanced_with_pp':
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_GB,
+                    sequence_square_sum_this_GB,
+                ) = wrap_dataloader(
                     data_iterator, config, PackingScheduler.HYBRID_CP_WITH_PP, pg_collection=None
                 )
             elif config.hybrid_context_parallel_scheduler == 'only_packing_no_scheduling':
@@ -2176,16 +2185,17 @@ def forward_backward_pipelining_without_interleaving(
             p2p_communicator.pp_group, p2p_communicator.pp_group.rank() - 1
         )
         torch.distributed.recv(info_tensor, src=prev_rank)
-        info_tensor = info_tensor.cpu()
-        num_microbatches = int(info_tensor[0].item())
-        num_total_tokens_this_GB = int(info_tensor[1].item())
-        sequence_square_sum_this_GB = info_tensor[2].item()
 
         if not is_pp_last_stage(p2p_communicator.pp_group):
             next_rank = torch.distributed.get_global_rank(
                 p2p_communicator.pp_group, p2p_communicator.pp_group.rank() + 1
             )
             torch.distributed.send(info_tensor, dst=next_rank)
+
+        info_tensor = info_tensor.cpu()
+        num_microbatches = int(info_tensor[0].item())
+        num_total_tokens_this_GB = int(info_tensor[1].item())
+        sequence_square_sum_this_GB = info_tensor[2].item()
     nvtx.pop_range()
 
     # data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
