@@ -724,6 +724,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
 
+        using_fused_tp_inference_kernel = (not self.training) and (
+            self.config.inference_fuse_tp_communication
+        )
+
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
