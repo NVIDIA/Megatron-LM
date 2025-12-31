@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.inference.contexts.attention_context.mamba_metadata import (
     MambaInferenceStateConfig,
 )
@@ -1198,3 +1199,51 @@ class TestDynamicContext:
                 )
 
                 current_global_token_offset += expected_len
+
+    @pytest.mark.internal
+    def test_pipeline_parallel_uneven_layers(self):
+        """
+        Test that DynamicInferenceContext synchronizes the total block count across
+        pipeline stages when they have unequal layer counts.
+        """
+        pp_size = 2
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=pp_size)
+
+        rank = parallel_state.get_pipeline_model_parallel_rank()
+
+        if rank == 0:
+            local_num_layers = 12
+        else:
+            local_num_layers = 4
+
+        context = DynamicInferenceContext(
+            params_dtype=torch.float32,
+            num_layers=local_num_layers,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            max_tokens=1024,
+            pipeline_model_parallel_size=pp_size,
+            tensor_model_parallel_size=1,
+            unified_memory_level=0,
+        )
+
+        # Collect the total block counts on each rank
+        local_total_blocks = torch.tensor(
+            [context.block_allocator.total_count], device='cuda', dtype=torch.long
+        )
+        gathered_block_counts = [torch.zeros_like(local_total_blocks) for _ in range(pp_size)]
+        torch.distributed.all_gather(
+            gathered_block_counts,
+            local_total_blocks,
+            group=parallel_state.get_pipeline_model_parallel_group(),
+        )
+        all_counts = [t.item() for t in gathered_block_counts]
+
+        # Verify that there is only 1 unique value across all ranks
+        unique_counts = set(all_counts)
+        assert (
+            len(unique_counts) == 1
+        ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
