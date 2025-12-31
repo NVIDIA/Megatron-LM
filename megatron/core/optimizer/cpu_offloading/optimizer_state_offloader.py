@@ -26,10 +26,7 @@ class OptimizerStateOffloader:
     MASTER_WEIGHT_KEY = 'master_param'
 
 
-    def __init__(
-        self,
-        distrib_optimizer: "DistributedOptimizer",
-    ):
+    def __init__(self, distrib_optimizer: "DistributedOptimizer"):
         """
         Args:
             distrib_optimizer: The DistributedOptimizer to offload states and master weights from.
@@ -69,23 +66,34 @@ class OptimizerStateOffloader:
         self._offloaded_state_keys: Tuple[str, ...] = ()
         self._offloaded_mcore_master_weights = False
 
+        # Track whether optimizer states (exp_avg, exp_avg_sq) have been initialized.
+        # These are lazily initialized by FusedAdam during the first optimizer.step().
+        # Master weights (shard_fp32_from_float16_groups) are available from the start.
+        self._optimizer_states_initialized = False
+
+    def mark_optimizer_states_initialized(self):
+        """
+        Mark that optimizer states (exp_avg, exp_avg_sq) are now available.
+        Should be called after the first optimizer.step() completes.
+        """
+        self._optimizer_states_initialized = True
+
     def _get_state_keys_to_offload(
         self, offload_optimizer_states: bool, offload_master_weights: bool
     ) -> Tuple[str, ...]:
         """Get the state keys in FusedAdam to offload based on configuration."""
         keys = []
-        if offload_optimizer_states:
-            keys.extend(self.OPTIMIZER_STATE_KEYS)
-        if offload_master_weights and self.optimizer_contains_master_weights:
-            keys.append(self.MASTER_WEIGHT_KEY)
+        # Skip optimizer states offloading if they haven't been initialized yet.
+        # Optimizer states are lazily initialized by FusedAdam during the first optimizer.step().
+        if self._optimizer_states_initialized:
+            if offload_optimizer_states:
+                keys.extend(self.OPTIMIZER_STATE_KEYS)
+            if offload_master_weights and self.optimizer_contains_master_weights:
+                keys.append(self.MASTER_WEIGHT_KEY)
         return tuple(keys)
 
     def _ensure_state_cpu_buffer(
-        self,
-        param: torch.Tensor,
-        state_key: str,
-        gpu_tensor: torch.Tensor,
-        pin_memory: bool = True,
+        self, param: torch.Tensor, state_key: str, gpu_tensor: torch.Tensor, pin_memory: bool = True
     ) -> torch.Tensor:
         """Get or create a CPU buffer for a state tensor."""
         if param not in self._opt_state_cpu_buffers:
@@ -155,10 +163,7 @@ class OptimizerStateOffloader:
                     continue
 
                 cpu_buffer = self._ensure_state_cpu_buffer(
-                    param,
-                    state_key,
-                    gpu_tensor,
-                    use_pin_memory,
+                    param, state_key, gpu_tensor, use_pin_memory
                 )
                 cpu_buffer.copy_(gpu_tensor, non_blocking=use_pin_memory)
                 gpu_tensor.record_stream(self._d2h_stream)
@@ -246,9 +251,7 @@ class OptimizerStateOffloader:
                 is_allocate_stage,
             )
 
-    def offload(
-        self, offload_optimizer_states: bool = True, offload_master_weights: bool = True
-    ):
+    def offload(self, offload_optimizer_states: bool = True, offload_master_weights: bool = True):
         """
         Offload optimizer states and/or master weights to CPU.
         Starts async D2H transfer that can overlap with other operations.
