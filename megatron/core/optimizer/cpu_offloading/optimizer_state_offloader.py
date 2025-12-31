@@ -25,7 +25,6 @@ class OptimizerStateOffloader:
     OPTIMIZER_STATE_KEYS = ('exp_avg', 'exp_avg_sq')
     MASTER_WEIGHT_KEY = 'master_param'
 
-
     def __init__(self, distrib_optimizer: "DistributedOptimizer"):
         """
         Args:
