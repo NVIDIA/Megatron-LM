@@ -1,5 +1,3 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
 import pytest
 import torch
 
@@ -12,7 +10,6 @@ test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
 @pytest.mark.parametrize('order', test_parallel_order)
-@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_initialize_and_destroy_model_parallel(order):
     with pytest.raises(AssertionError):
@@ -499,3 +496,39 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     assert expert_dp_group == expert_rank_generator.get_ranks(
         "dp"
     ), f"{expert_dp_group} != {expert_rank_generator.get_ranks('dp')}."
+
+
+def test_separate_all_gather_group():
+    """Test separate all-gather group for improved communication overlap."""
+    # Test without creating AG group (default)
+    Utils.initialize_model_parallel(
+        context_parallel_size=world_size,
+        create_all_gather_group=False,
+    )
+    assert not ps.has_separate_all_gather_group()
+    assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is None
+    Utils.destroy_model_parallel()
+
+    # Test with creating AG group
+    Utils.initialize_model_parallel(
+        context_parallel_size=world_size,
+        create_all_gather_group=True,
+    )
+    assert ps.has_separate_all_gather_group()
+    assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is not None
+
+    # Verify it returns the correct group
+    ag_group = ps.get_data_parallel_group(
+        with_context_parallel=True, all_gather=True
+    )
+    regular_group = ps.get_data_parallel_group(
+        with_context_parallel=True, all_gather=False
+    )
+    assert ag_group is not None
+    assert regular_group is not None
+    # They should have the same ranks but different communicators
+    ag_ranks = torch.distributed.get_process_group_ranks(ag_group)
+    regular_ranks = torch.distributed.get_process_group_ranks(regular_group)
+    assert ag_ranks == regular_ranks
+
+    Utils.destroy_model_parallel()
