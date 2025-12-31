@@ -389,6 +389,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     if (
                         not self.is_moe_layer
                         or CudaGraphScope.moe_router not in self.config.cuda_graph_scope
+                        or self.config.cuda_graph_impl == "local"
                     ):
                         # Not a MoE layer, or not capturing the router part.
                         return True

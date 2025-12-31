@@ -451,7 +451,9 @@ def _get_all_rng_states():
     return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker
 
 
-def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker):
+def _set_all_rng_states(
+    cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker, graph_safe: bool = False
+):
     """Set all the rng states."""
     torch.set_rng_state(cpu_rng_state)
     _set_cuda_rng_state(
@@ -632,8 +634,9 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False):
+    def __init__(self, fp8=False, cudagraph_capturable=False):
         self.fp8 = fp8 is not None
+        self.cudagraph_capturable = cudagraph_capturable
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
@@ -643,9 +646,17 @@ class CheckpointWithoutOutput(object):
 
     def checkpoint(self, run_function, *args):
         """Checkpoint function."""
+
+        # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
+        # may be called in a separate graph warmup.
+        from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+        if is_graph_warmup():
+            return run_function(*args)
+
         self.run_function = run_function
 
-        self.rng_states = _get_all_rng_states()
+        self.rng_states = _get_all_rng_states(self.cudagraph_capturable)
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
@@ -656,11 +667,13 @@ class CheckpointWithoutOutput(object):
     def _recompute(self, _):
         """Used as a hook to recompute the output."""
 
-        if self.ctx is None:
-            # The recomputation has been triggered already. Just return.
+        # Handle cudagraphs, do nothing if currently in graph warmup
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+        if is_graph_warmup():
             return
 
-        if not torch.autograd._is_checkpoint_valid():
+        if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
@@ -719,6 +732,12 @@ class CheckpointWithoutOutput(object):
         in the forward pass and the gradient of the hook_tensor is computed before the recomputed
         tensors are used.
         """
+
+        from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+        if is_graph_warmup():
+            return
+
         # use resize to release the output tensor memory and still keep the metadata in the tensors.
         # the metadata is still needed for backward
         for output in self.outputs:

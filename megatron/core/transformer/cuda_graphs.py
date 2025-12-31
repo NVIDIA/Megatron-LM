@@ -64,7 +64,7 @@ except:
     HAVE_TQDM = False
 
 _IS_GRAPH_CAPTURING = False
-
+_IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
 
 # Freeze GC during capture.
@@ -82,7 +82,6 @@ except ImportError:
 
 def is_graph_capturing():
     """Query if currently capturing."""
-    global _IS_GRAPH_CAPTURING
     return _IS_GRAPH_CAPTURING
 
 
@@ -96,6 +95,22 @@ def _set_capture_end():
     """Set graph capture has ended."""
     global _IS_GRAPH_CAPTURING
     _IS_GRAPH_CAPTURING = False
+
+
+def is_graph_warmup():
+    """Query if currently warming up for graph capture."""
+    return _IS_GRAPH_WARMUP
+
+
+def _set_warmup_start():
+    """Set graph warmup has started."""
+    global _IS_GRAPH_WARMUP
+    _IS_GRAPH_WARMUP = True
+
+
+def _set_warmup_end():
+    """Set graph warmup has ended."""
+    global _IS_GRAPH_WARMUP
 
 
 @dataclass
@@ -844,6 +859,7 @@ class _CudaGraphRunner(torch.nn.Module):
         ctx = torch.no_grad() if not self.grad_enabled else nullcontext()
         with ctx:
             # warmup again as case graph capture mode may execute a different codepath
+            _set_warmup_start()
             for _ in range(self.num_warmup_steps):
                 with self.get_quantization_context():
 
@@ -867,6 +883,7 @@ class _CudaGraphRunner(torch.nn.Module):
                         only_inputs=True,
                         allow_unused=True,
                     )
+            _set_warmup_end()
 
             with self.get_quantization_context():
                 torch.cuda.synchronize()
