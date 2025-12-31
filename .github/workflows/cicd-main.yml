@@ -128,6 +128,8 @@ jobs:
             echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
           fi
 
+          echo "minor change"
+
       - name: Find Comment
         uses: peter-evans/find-comment@v4
         if: startsWith(github.ref, 'refs/heads/pull-request/')
