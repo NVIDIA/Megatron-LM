@@ -13,10 +13,9 @@ from examples.inference.gpt.gpt_dynamic_inference import (
     get_model,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_server import run_text_generation_server
+from megatron.core.inference.text_generation_server import run_flask_server
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_mamba_inference_state_config_from_model
+from megatron.core.utils import get_mamba_inference_state_config_from_model, trace_async_exceptions
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args, get_tokenizer
 from megatron.training.initialize import initialize_megatron
@@ -29,6 +28,47 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
     return parser
 
+
+
+@trace_async_exceptions
+async def run_text_generation_server(
+    engine: DynamicInferenceEngine,
+    coordinator_port: int,
+    flask_port: int,
+):
+    """Runs the Flask server from rank 0 and initializes the DynamicInferenceEngine on all ranks.
+
+    Args:
+        engine (DynamicInferenceEngine): The dynamic inference engine.
+        coordinator_port (int): The network port for the dynamic inference DP coordinator.
+        flask_port (int): The network for port the frontend Flask server.
+    """
+
+    rank = torch.distributed.get_rank()
+
+    await engine.start_listening_to_data_parallel_coordinator(
+        inference_coordinator_port=coordinator_port, launch_inference_coordinator=True
+    )
+
+    server_task = None
+    if rank == 0:
+        server_task = asyncio.create_task(
+            run_flask_server(
+                coordinator_port=coordinator_port,
+                tokenizer=engine.controller.tokenizer,
+                rank=rank,
+                flask_port=flask_port,
+            )
+        )
+    engine_task = engine.engine_loop_task
+
+    tasks_to_run = [engine_task]
+    if server_task:
+        assert rank == 0
+
+        tasks_to_run.append(server_task)
+
+    await asyncio.gather(*tasks_to_run)
 
 if __name__ == "__main__":
     with torch.inference_mode():
@@ -68,20 +108,10 @@ if __name__ == "__main__":
             random_seed=args.seed,
         )
 
-        default_sampling_params = SamplingParams(
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            return_log_probs=args.return_log_probs,
-            num_tokens_to_generate=args.num_tokens_to_generate,
-            termination_id=tokenizer.eod,
-        )
-
         asyncio.run(
             run_text_generation_server(
                 engine,
                 args.inference_coordinator_port,
                 args.port,
-                default_sampling_params=default_sampling_params,
             )
         )

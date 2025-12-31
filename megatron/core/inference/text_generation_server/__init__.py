@@ -1,3 +1,3 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from .text_generation_server import run_text_generation_server
+from .flask_server import run_flask_server
