@@ -387,9 +387,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     .to(model_param.device)
                                     .float()
                                 )
-                                # When --fp8-param-gather on, the high precision value
-                                # should leave for further initializing the main param.
-                                # model_param.clear_high_precision_init_val()
+                                model_param.clear_high_precision_init_val()
                             else:
                                 shard_main_param = model_param.float().view(-1)[
                                     param_range.start : param_range.end
