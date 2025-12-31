@@ -555,6 +555,11 @@ class CheckpointWithoutOutput(object):
 
     def _recompute(self, _):
         """Used as a hook to recompute the output."""
+
+        if self.ctx is None:
+            # The recomputation has been triggered already. Just return.
+            return
+
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "
