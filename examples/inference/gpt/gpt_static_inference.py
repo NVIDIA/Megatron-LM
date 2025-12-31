@@ -104,7 +104,13 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
-    return StaticInferenceEngine(text_generation_controller=text_generation_controller, legacy=args.use_legacy_static_engine)
+    engine_kwargs = {
+        "text_generation_controller" : text_generation_controller,
+        "legacy" : args.use_legacy_static_engine,
+    }
+    if not args.use_legacy_static_engine:
+        engine_kwargs["buffer_size_gb"] = args.inference_dynamic_batching_buffer_size_gb
+    return StaticInferenceEngine(**engine_kwargs)
 
 
 async def generate(

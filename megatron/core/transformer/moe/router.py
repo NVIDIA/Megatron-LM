@@ -1,10 +1,11 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
 
+from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -373,6 +374,7 @@ class TopKRouter(Router):
             global_aux_loss,
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
+            reduce_group_has_dp=True,
         )
         return probs
 
@@ -383,8 +385,20 @@ class TopKRouter(Router):
         aux_loss: torch.Tensor,
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
+        reduce_group_has_dp: bool = False,
     ):
-        """Attach aux loss function to activation and add to logging."""
+        """Attach aux loss function to activation and add to logging.
+
+        Args:
+            activation (torch.Tensor): The activation tensor to attach the loss to.
+            aux_loss_coeff (float): The coefficient for the auxiliary loss.
+            aux_loss (torch.Tensor): The auxiliary loss tensor.
+            aux_loss_name (str): The name of the auxiliary loss for logging.
+            reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
+            reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
+                Set this to True if the reduce group has data parallel ranks. This flag is used to
+                ensure the correct reduction in aux loss tracking.
+        """
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the
         # correct layer_number for MTP. It does not affect the correctness of the calculation
@@ -398,6 +412,7 @@ class TopKRouter(Router):
             self.layer_number,
             num_layers,
             reduce_group=reduce_group,
+            reduce_group_has_dp=reduce_group_has_dp,
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
@@ -468,6 +483,16 @@ class TopKRouter(Router):
         else:
             return input
 
+    @jit_fuser
+    def _apply_expert_bias(self, routing_map: torch.Tensor):
+        """
+        Update expert bias and tokens_per_expert
+        Prevent extra local tokens accumulation on evaluation or activation recomputation
+        """
+        if self.enable_expert_bias and torch.is_grad_enabled():
+            with torch.no_grad():
+                self.local_tokens_per_expert += routing_map.sum(dim=0)
+
     def routing(self, logits: torch.Tensor):
         """Top-k routing function
 
@@ -526,11 +551,8 @@ class TopKRouter(Router):
                 probs, scores_for_aux_loss, routing_map_for_aux_loss
             )
 
-        # Update expert bias and tokens_per_expert
-        # Prevent extra local tokens accumulation on evaluation or activation recomputation
-        if self.enable_expert_bias and torch.is_grad_enabled():
-            with torch.no_grad():
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+        # Optionally apply expert bias
+        self._apply_expert_bias(routing_map)
 
         return probs, routing_map
 

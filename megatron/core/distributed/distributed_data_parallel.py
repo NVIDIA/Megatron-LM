@@ -8,7 +8,7 @@ import torch
 
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..fp8_utils import is_float8tensor
+from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
@@ -500,26 +500,34 @@ class DistributedDataParallel(_BaseDataParallel):
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_param_sync(force_sync=force_sync)
-            # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
-            # the param.data, since param buffer is not mapped to model params for MXFP8 case.
-            # The paramaters are cast from bf16 to MXFP8 during copy.
-            # In the case of "overlap_param_gather=True", the param copy is done
-            # in "finish_param_sync" stage after zeroing the shared gardient buffers.
-            if (
-                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                and not self.ddp_config.overlap_param_gather
-            ):
-                for bucket in bucket_group.buckets:
-                    for param in bucket.params:
-                        param_start, param_end = bucket.param_to_index[param]
-                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                        param.data.copy_(param_slice.view(param.data.shape))
-                    # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
-                    # We cannot zero out the entire grad buffer because one grad buffer may
-                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
-                    # it would clear the data of those param buffers that have not yet completed AG.
-                    bucket.param_data.zero_()
+
+            if not self.ddp_config.overlap_param_gather:
+                # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
+                # the param.data, since param buffer is not mapped to model params for MXFP8 case.
+                # The paramaters are cast from bf16 to MXFP8 during copy.
+                # In the case of "overlap_param_gather=True", the param copy is done
+                # in "finish_param_sync" stage after zeroing the shared gardient buffers.
+                if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                    for bucket in bucket_group.buckets:
+                        for param in bucket.params:
+                            param_start, param_end = bucket.param_to_index[param]
+                            param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                            param.data.copy_(param_slice.view(param.data.shape))
+                        # All-gathered params are not needed after being copied to param.data.
+                        # Zero out the param buffer (shared with grad buffer) for gradient
+                        # accumulation. We cannot zero out the entire grad buffer because one grad
+                        # buffer may correspond to multiple param buffers. If we zero out the entire
+                        # grad buffer, it would clear the data of those param buffers that have not
+                        # yet completed AG.
+                        bucket.param_data.zero_()
+                else:
+                    fp8_params = []
+                    for bucket in bucket_group.buckets:
+                        for param in bucket.params:
+                            if is_float8tensor(param):
+                                fp8_params.append(param)
+                    if len(fp8_params) > 0:
+                        post_all_gather_processing(fp8_params)
 
     def start_grad_sync(self, *unused):
         """

@@ -1,5 +1,7 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import logging
 import shutil
-from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 
@@ -11,6 +13,8 @@ from torch.nn.functional import mse_loss
 from torch.optim import Adam
 
 from tests.unit_tests.test_utilities import Utils
+
+logger = logging.getLogger(__name__)
 
 HSDP = "hsdp"
 DP = "dp"
@@ -36,15 +40,22 @@ SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
 
 def destroy_device_mesh(device_mesh):
-    from torch.distributed.device_mesh import _mesh_resources
 
     # Teardown device mesh.
     del device_mesh
-    _mesh_resources.mesh_stack.clear()
-    _mesh_resources.child_to_root_mapping.clear()
-    _mesh_resources.root_to_flatten_mapping.clear()
-    _mesh_resources.flatten_name_to_root_dims.clear()
-    _mesh_resources.mesh_dim_group_options.clear()
+    try:
+        from torch.distributed.device_mesh import _mesh_resources
+
+        _mesh_resources.child_to_root_mapping.clear()
+        _mesh_resources.root_to_flatten_mapping.clear()
+        _mesh_resources.mesh_stack.clear()
+        _mesh_resources.mesh_dim_group_options.clear()
+        _mesh_resources.flatten_name_to_root_dims.clear()
+    except Exception as e:
+        # Global _MeshEnv is on a convoluted deprecation path.
+        # Attempt to clean the global state, otherwise skip.
+        logger.warning(f"Did not clean the deprecated DeviceMesh global state. Skipping...\n{e}")
+        pass
 
 
 class ToyCNN(torch.nn.Module):
@@ -127,9 +138,9 @@ class ToyTETransformer(torch.nn.Module):
         return x
 
 
-def build_toy_model_and_optimizer(model_type: str, init_model_with_meta_device: bool, seed=None):
+def build_toy_model(model_type: str, init_model_with_meta_device: bool, seed=None):
     """
-    Helper function to build a toy model and optimizer for testing Megatron-FSDP.
+    Helper function to build a toy model for testing Megatron-FSDP.
     """
     # Set the seed to make sure the same model is initialized on all ranks.
     if seed is not None:
@@ -158,10 +169,9 @@ def build_toy_model_and_optimizer(model_type: str, init_model_with_meta_device: 
                 model_dim=DIM_SIZE, num_heads=2, num_layers=NUM_LAYERS, output_dim=DIM_SIZE
             )
             fsdp_unit_modules = [te.pytorch.TransformerLayer]
-        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
     # Return the toy model, optimizer, and FSDP unit modules.
-    return toy_model, toy_adam, fsdp_unit_modules
+    return toy_model, fsdp_unit_modules
 
 
 def build_distributed_environment(mesh_dim_config: tuple):
@@ -264,9 +274,8 @@ class TestMegatronFsdpFullyShard:
         device_mesh = build_distributed_environment(mesh_dim_config)
 
         # Construct toy model.
-        toy_model, toy_adam, fsdp_unit_modules = build_toy_model_and_optimizer(
-            model_type, init_model_with_meta_device
-        )
+        toy_model, fsdp_unit_modules = build_toy_model(model_type, init_model_with_meta_device)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -315,7 +324,7 @@ class TestMegatronFsdpFullyShard:
             # Validate gradients exist in the Torch Module, i.e. non-None and non-zero.
             grads_exist = any(
                 isinstance(p.grad, torch.Tensor) and p.grad.to_local().count_nonzero().item() > 0
-                for p in model.module.parameters()
+                for p in model.parameters()
             )
             sharding_group = (
                 device_mesh[HSDP].get_group()
@@ -326,27 +335,19 @@ class TestMegatronFsdpFullyShard:
                 # Because of uneven sharding, we need to gather the result from all ranks
                 # to verify if any gradients exist or not at this step of training.
                 grads_exist_gathered = [None] * sharding_group.size()
-                torch.distributed.gather_object(
-                    grads_exist,
-                    object_gather_list=grads_exist_gathered if sharding_group.rank() == 0 else None,
-                    group=sharding_group,
-                    group_dst=0,
+                torch.distributed.all_gather_object(
+                    object_list=grads_exist_gathered, obj=grads_exist, group=sharding_group
                 )
-                if sharding_group.rank() == 0:
-                    # Gradients exist on at least one of the optimizer sharding ranks.
-                    # Update grads_exist on Rank 0 only.
-                    grads_exist = any(grads_exist_gathered)
-                torch.distributed.barrier()
+                # Gradients exist on at least one of the optimizer sharding ranks.
+                grads_exist = any(grads_exist_gathered)
 
             # Gradients do not exist until synchronization is activated.
-            # Use collected result on Rank 0 only.
-            if sharding_group.rank() == 0:
-                if step == NUM_STEPS - 1:
-                    assert grads_exist, "Root module gradients should exist on final microbatch."
-                else:
-                    assert (
-                        not grads_exist
-                    ), "Root module gradients should not exist prior to optimization step."
+            if step == NUM_STEPS - 1:
+                assert grads_exist, "Root module gradients should exist on final microbatch."
+            else:
+                assert (
+                    not grads_exist
+                ), "Root module gradients should not exist prior to optimization step."
             torch.distributed.barrier()
 
             # Optimizer step. Apply accumulated gradients to the model weights.
@@ -403,9 +404,8 @@ class TestMegatronFsdpFullyShard:
         accuracy tests are non-trivial, i.e. don't just use the initialized weights.
         """
         # Test model.
-        toy_model, toy_adam, fsdp_unit_modules = build_toy_model_and_optimizer(
-            model_type, False, seed=0
-        )
+        toy_model, fsdp_unit_modules = build_toy_model(model_type, False, seed=0)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -484,9 +484,8 @@ class TestMegatronFsdpFullyShard:
         """
         # Initialize a new model for checkpoint loading. Set a different seed to force a different model init,
         # to ensure the checkpoint loading is accurate and non-trivial.
-        toy_model, toy_adam, fsdp_unit_modules = build_toy_model_and_optimizer(
-            model_type, False, seed=1
-        )
+        toy_model, fsdp_unit_modules = build_toy_model(model_type, False, seed=1)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -598,3 +597,44 @@ class TestMegatronFsdpFullyShard:
 
         # Destroy device mesh.
         destroy_device_mesh(device_mesh)
+
+    @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS_PARAMS, OPTIM_GRADS, OPTIM, NO_SHARD])
+    def test_fully_shard_ez(self, shard_strategy):
+        """
+        Test fully_shard(device_mesh=None). Represents the easiest entrypoint to Megatron-FSDP.
+        """
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+            fully_shard_model,
+            fully_shard_optimizer,
+        )
+
+        # Construct toy model.
+        toy_model, fsdp_unit_modules = build_toy_model(TRANSFORMER, False)
+
+        # Fully-shard the model.
+        mfsdp_model = fully_shard_model(
+            module=toy_model, fsdp_unit_modules=fsdp_unit_modules, zero_dp_strategy=shard_strategy
+        )
+
+        # Initialize the distributed optimizer on the MegatronFSDP model.
+        toy_adam = Adam(params=mfsdp_model.parameters(), lr=0.01)
+        optimizer = fully_shard_optimizer(optimizer=toy_adam)
+
+        # Mock input and target.
+        toy_input = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+        toy_target = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+
+        for step in range(NUM_STEPS):
+
+            # Forward pass.
+            output = mfsdp_model(toy_input, toy_input)
+
+            # Loss.
+            loss = mse_loss(output, toy_target)
+
+            # Backward pass.
+            loss.backward()
+
+            # Optimizer step.
+            optimizer.step()
+            optimizer.zero_grad()

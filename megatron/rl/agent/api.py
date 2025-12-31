@@ -8,6 +8,8 @@ from typing import Generic, TypeVar
 import numpy as np
 from pydantic import BaseModel
 
+from megatron.core.utils import trace_async_exceptions
+
 from ..__init__ import Request, TypeLookupable
 from ..inference import (
     ChatInferenceInterface,
@@ -17,8 +19,6 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
-
-from megatron.core.utils import trace_async_exceptions
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -173,6 +173,11 @@ class GroupedRolloutGenerator(Agent, ABC):
 
     parallel_generation_tasks: int = 512
     buffer_size: int = 10
+
+    def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
+        super().__init__(**kwargs)
+        if parallel_generation_tasks is not None:
+            self.parallel_generation_tasks = parallel_generation_tasks
 
     @abstractmethod
     async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...

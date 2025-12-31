@@ -156,6 +156,37 @@ def init() -> None:
     logging.info(f"[MCORE][NCCL_ALLOCATOR] Initialized NCCL Allocator")
 
 
+# register_mem_pool/deregister_mem_pool are used for manual (de)registration of the memory pool.
+# They are used in the case of FSDP manual registration.
+def register_mem_pool(pool, group, symmetric=True):
+    """
+    Register a memory pool to a group.
+    symmetric: bool, this is for future use.
+    """
+    backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
+    if symmetric:
+        try:
+            backend.register_mem_pool(pool, symm=symmetric)
+        except TypeError:
+            # Older PyTorch/APIs without 'symm' keyword.
+            logging.warning(
+                f"[MCORE][NCCL_ALLOCATOR] Failed in symmetric registration."
+                f"Falling back to registration api without 'symm' keyword!!"
+            )
+            backend.register_mem_pool(pool)
+    else:
+        backend.register_mem_pool(pool)
+
+
+def deregister_mem_pool(pool, group):
+    """
+    Deregister a memory pool from a group.
+    """
+    backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
+    if pool.snapshot():
+        backend.deregister_mem_pool(pool)
+
+
 # Preserve the original APEX NCCL allocator interface for backward compatibility
 class nccl_mem:
     """
@@ -313,4 +344,21 @@ class MultiGroupMemPoolAllocator:
                     f"[MCORE][MultiGroupMemPoolAllocator] Failed to register mem pool to"
                     f"{repr(group)}({desc}) group!!"
                 )
+        self.mem_context.__exit__(*args)
+
+
+class MemPoolAllocatorWithoutRegistration:
+    """
+    An allocator class that uses allocates memory without registering to any communication group.
+    Users are expected to register the memory manually to the communication groups.
+    """
+
+    def __init__(self, pool):
+        self.pool = pool
+        self.mem_context = torch.cuda.use_mem_pool(self.pool)
+
+    def __enter__(self):
+        self.mem_context.__enter__()
+
+    def __exit__(self, *args):
         self.mem_context.__exit__(*args)

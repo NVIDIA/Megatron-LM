@@ -1,22 +1,34 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
-from typing import Callable, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 
 from ..utils import is_te_min_version
 
 
+@dataclass(frozen=True, slots=True)
+class ParamKey:
+    """Key to group parameters by. All such grouped parameters can share an
+    optimizer config specification."""
+
+    # TODO: Can add layer_id here later.
+
+    name: Union[str, Tuple[str]] = field(default_factory=tuple)
+    """Parameter name(s)."""
+
+    attr: Union[str, Tuple[str]] = field(default_factory=tuple)
+    """Parameter attribute(s)."""
+
+
 @dataclass
 class OptimizerConfig:
-    """Configuration for optimizer."""
+    """Base optimizer configuration object."""
 
     ##############
     # General
     ##############
-    optimizer: str = 'adam'
-    """Optimizer to use (one of Adam or SGD)."""
 
     lr: Optional[float] = None
     """Initial learning rate. Depending on decay style and initial warmup, the learning rate at each
@@ -25,14 +37,6 @@ class OptimizerConfig:
 
     min_lr: Optional[float] = None
     """Minumum value for learning rate. The scheduler clip values below this threshold."""
-
-    decoupled_lr: Optional[float] = None
-    """Separate learning rate for the input and output layer."""
-
-    decoupled_min_lr: Optional[float] = None
-    """Minimum value for learning rate for the input and output layer. The scheduler clip values
-       below this threshold.
-    """
 
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
@@ -78,6 +82,9 @@ class OptimizerConfig:
     exp_avg_sq_dtype: torch.dtype = torch.float32
     """dtype of exp_avg_sq when enabling precision-aware-optimizer"""
 
+    optimizer: str = 'adam'
+    """Optimizer name. NOTE: Deprecated, use individual optimizer classes instead."""
+
     ###############
     # Loss scaling
     ###############
@@ -98,10 +105,10 @@ class OptimizerConfig:
     hysteresis: int = 2
     """Hysteresis for dynamic loss scaling."""
 
-    ##############
-    # Optimizer
-    ##############
-    # Adam
+    ###################################################################################
+    # Optimizer (NOTE: Deprecated, use individual optimizer classes instead.).
+    ###################################################################################
+    # Adam.
     adam_beta1: float = 0.9
     """First coefficient for computing running averages of gradient and its square in Adam
     optimizer.
@@ -234,6 +241,7 @@ class OptimizerConfig:
             try:
                 import inspect
 
+                # TODO: Move this below?
                 from transformer_engine.pytorch.optimizers import FusedAdam as Adam
 
                 adam_args = inspect.signature(Adam).parameters
@@ -266,3 +274,35 @@ class OptimizerConfig:
             assert (
                 self.exp_avg_sq_dtype == torch.float32
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
+
+
+@dataclass
+class AdamOptimizerConfig(OptimizerConfig):
+    """Adam optimizer configuration object."""
+
+    optimizer: str = 'adam'
+    """Optimizer name."""
+
+    adam_beta1: float = 0.9
+    """First coefficient for computing running averages of gradient and its square in Adam
+    optimizer.
+    """
+
+    adam_beta2: float = 0.999
+    """Second coefficient for computing running averages of gradient and its square in Adam
+    optimizer.
+    """
+
+    adam_eps: float = 1e-08
+    """Term added to the denominator to improve numerical stability in Adam optimizer."""
+
+
+@dataclass
+class SGDOptimizerConfig(OptimizerConfig):
+    """SGD optimizer configuration object."""
+
+    optimizer: str = 'sgd'
+    """Optimizer name."""
+
+    sgd_momentum: float = 0.9
+    """Momentum factor for SGD optimizer."""

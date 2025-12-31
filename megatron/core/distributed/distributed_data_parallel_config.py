@@ -137,6 +137,14 @@ class DistributedDataParallelConfig:
       when nccl_ub is set.
     """
 
+    fsdp_manual_registration: bool = False
+    """If true, manually register the FSDP communication buffers to NCCL user buffer.
+      This option is only effective when use_megatron_fsdp and nccl_ub is set.
+      For symmetric registration with large models, the registration itself can take 
+      a significant amount of time. This option minimizes the number of registration calls
+      to minimize the registration time.
+    """
+
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
@@ -146,6 +154,14 @@ class DistributedDataParallelConfig:
         """Check the validity of the config."""
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+            # Using mxfp8 param without overlap param gather and overlap grad reduce will cause NaN.
+            # TODO: Remove this assertion when the issue is fixed.
+            assert (
+                self.overlap_param_gather
+            ), "--overlap-param-gather is required when using mxfp8 params"
+            assert (
+                self.overlap_grad_reduce
+            ), "--overlap-grad-reduce is required when using mxfp8 params"
 
         if self.nccl_ub:
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):

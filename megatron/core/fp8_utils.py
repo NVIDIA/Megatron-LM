@@ -85,6 +85,13 @@ except ImportError:
     Fp8Padding = None
     Fp8Unpadding = None
 
+try:
+    from transformer_engine.pytorch.tensor.utils import (
+        post_all_gather_processing as te_post_all_gather_processing,
+    )
+except ImportError:
+    te_post_all_gather_processing = None
+
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine Float8Tensor.
@@ -247,7 +254,15 @@ if HAVE_TE and is_te_min_version("2.2"):
                 raise NotImplementedError(
                     f"FSDP with --fp8-param-gather is not supported in TE v{get_te_version()}"
                 )
-        cast_master_weights_to_fp8(*args)
+
+        # For newer TE versions (i.e., have post_all_gather_processing function), we keep the
+        # columnwise data and manually call post_all_gather_processing after all-gather, this
+        # makes fp8 params compatible with CUDA graph.
+        kwargs = {}
+        if te_post_all_gather_processing is not None:
+            kwargs["manual_post_all_gather_processing"] = True
+
+        cast_master_weights_to_fp8(*args, **kwargs)
 
     def _correct_amax_history_if_needed_impl(model: List[torch.nn.Module]) -> None:
         pass
@@ -481,6 +496,20 @@ def correct_amax_history_if_needed(model: List[torch.nn.Module]):
     _correct_amax_history_if_needed_impl(model)
 
 
+def post_all_gather_processing(model_params):
+    """
+    Post-processing after all-gather for weights in distributed optimizer.
+    - tensorwise: may need to create a transposed view to match backend GEMM.
+    - blockwise: create column-wise storage.
+    """
+    if te_post_all_gather_processing is not None:
+        te_post_all_gather_processing(model_params)
+    else:
+        # If the TE version is old and does not have post_all_gather_processing function, this is
+        # a no-op, and the transpose/columnwise data will be created in the next forward pass.
+        pass
+
+
 def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
     """Check if the layer is in bf16."""
     num_bf16_layers_at_start = (
@@ -542,6 +571,7 @@ if HAVE_TE:
                     fp8_format=fp8_format
                 )
             elif config.fp8_recipe == Fp8Recipe.custom:
+                assert config.fp8_quantizer_factory is not None
                 fp8_recipe = _get_custom_recipe(config.fp8_quantizer_factory)
             else:
                 raise ValueError(
@@ -660,8 +690,13 @@ if HAVE_TE:
 
         @wraps(original_forward)
         def padded_forward(input_tensor, *args, **kwargs):
-            # Only do padding for fp8 if we are in fp8 context
-            if not FP8GlobalStateManager.is_fp8_enabled():
+            is_context_quantized = FP8GlobalStateManager.is_fp8_enabled()
+            if hasattr(module, "will_execute_quantized"):
+                module_uses_quant = module.will_execute_quantized(is_context_quantized)
+            else:
+                module_uses_quant = is_context_quantized
+            # Only do padding for fp8 if we are in fp8 or fp4 context
+            if not module_uses_quant:
                 return original_forward(input_tensor, *args, **kwargs)
 
             # With sequence parallelism we need to all-gather before padding

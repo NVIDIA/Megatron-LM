@@ -23,6 +23,7 @@ class TestGlobalMetadataReuse:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev  # Issue #2856
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
     def test_global_metadata_reuse(self, tmp_path_dist_ckpt, tp, pp):
@@ -94,6 +95,7 @@ class TestGlobalMetadataReuse:
 
             assert resume_ckpt_context['save_strategy'].validated_loaded_metadata_reuse
 
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev  # Issue #2856
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
     def test_no_global_metadata_reuse_on_different_parallelism(self, tmp_path_dist_ckpt, tp, pp):

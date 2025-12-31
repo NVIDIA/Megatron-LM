@@ -91,7 +91,7 @@ class MoEModelTestContainer:
             sequence_parallel=tp_size > 1,
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
-            moe_enable_deepep=kwargs.get("moe_enable_deepep", False),
+            moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
         )
 
         # init moe layer
@@ -280,15 +280,15 @@ class MoEModelTestContainer:
         """Test if the routing map is padded correctly for FP8 training.
 
         The test runs the forward flow twice:
-        1. First with moe_router_padding_for_fp8=False
-        2. Then with moe_router_padding_for_fp8=True
+        1. First with moe_router_padding_for_quantization=False
+        2. Then with moe_router_padding_for_quantization=True
 
         We verify that:
         1. The results are the same in both cases
         2. The number of tokens received by each expert is padded to a multiple of 16
         """
-        # First run with moe_router_padding_for_fp8 = False
-        moe_layer = self.new_moe_layer(moe_router_padding_for_fp8=False)
+        # First run with moe_router_padding_for_quantization = False
+        moe_layer = self.new_moe_layer(moe_router_padding_for_quantization=False)
 
         num_tokens = 32
         hidden_states = torch.randn(
@@ -309,8 +309,8 @@ class MoEModelTestContainer:
         grad_1 = hidden_states.grad.clone()
         hidden_states.grad = None
 
-        # Run with moe_router_padding_for_fp8 = True
-        moe_layer_2 = self.new_moe_layer(moe_router_padding_for_fp8=True, fp8="hybrid")
+        # Run with moe_router_padding_for_quantization = True
+        moe_layer_2 = self.new_moe_layer(moe_router_padding_for_quantization=True, fp8="hybrid")
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = moe_layer_2.router(hidden_states)
@@ -411,7 +411,16 @@ def is_deep_ep_available():
     return HAVE_DEEP_EP
 
 
-@pytest.mark.skipif(not is_deep_ep_available(), reason="Deep EP is not available")
+def is_hybrid_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
+
+    return HAVE_HYBRIDEP
+
+
+@pytest.mark.skipif(
+    not is_deep_ep_available() and not is_hybrid_ep_available(),
+    reason="Deep EP and Hybrid EP are not available",
+)
 class TestFlexDispatcher:
     def setup_method(self, method):
         pass
@@ -421,9 +430,14 @@ class TestFlexDispatcher:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4)])
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    def test_forward_backward(self, tp_size, ep_size, permute_fusion):
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
+    def test_forward_backward(self, tp_size, ep_size, permute_fusion, moe_flex_dispatcher_backend):
+        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
         if permute_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
@@ -435,8 +449,8 @@ class TestFlexDispatcher:
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="flex",
             moe_permute_fusion=permute_fusion,
-            hidden_size=32,
-            moe_enable_deepep=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_dropless_test()
@@ -448,7 +462,14 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    def test_capacity_forward_backward(self, tp_size, ep_size, permute_fusion):
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
+    def test_capacity_forward_backward(
+        self, tp_size, ep_size, permute_fusion, moe_flex_dispatcher_backend
+    ):
+        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
         if permute_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
@@ -463,8 +484,8 @@ class TestFlexDispatcher:
             moe_expert_capacity_factor=0.5,
             moe_pad_expert_input_to_capacity=False,
             moe_permute_fusion=permute_fusion,
-            hidden_size=32,
-            moe_enable_deepep=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_capacity_test()
@@ -478,7 +499,14 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", [True])
-    def test_router_padding_for_fp8_forward_backward(self, tp_size, ep_size, permute_fusion):
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
+    def test_router_padding_for_fp8_forward_backward(
+        self, tp_size, ep_size, permute_fusion, moe_flex_dispatcher_backend
+    ):
+        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
         if permute_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
@@ -491,8 +519,8 @@ class TestFlexDispatcher:
             moe_token_dispatcher_type="flex",
             moe_pad_expert_input_to_capacity=False,
             moe_permute_fusion=permute_fusion,
-            hidden_size=32,
-            moe_enable_deepep=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_router_padding_for_fp8_test()

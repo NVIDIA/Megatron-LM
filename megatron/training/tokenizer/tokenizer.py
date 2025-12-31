@@ -63,7 +63,7 @@ def build_tokenizer(args, **kwargs):
             pattern=pattern,
             vocab_size=args.vocab_size,
             num_special_tokens=args.tiktoken_num_special_tokens,
-            special_tokens=args.tiktoken_special_tokens,
+            special_tokens=args.tokenizer_special_tokens,
         )
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None

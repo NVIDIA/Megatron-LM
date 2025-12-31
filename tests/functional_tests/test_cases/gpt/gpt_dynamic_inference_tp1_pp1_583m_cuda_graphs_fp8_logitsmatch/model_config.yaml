@@ -46,8 +46,6 @@ MODEL_ARGS:
   --return-log-probs: true
   --num-tokens-to-generate: 30
   --enable-cuda-graph: true
-  --inference-dynamic-batching-buffer-guaranteed-fraction: 0
-  --inference-dynamic-batching-buffer-overflow-factor: 0.2
   --inference-dynamic-batching-buffer-size-gb: 20
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors
@@ -56,6 +54,7 @@ MODEL_ARGS:
   --incoming-requests-per-sec: -1 # all requests arrive up front.
   --inference-repeat-n: 8
   --use-flashinfer-fused-rope: true
+  --inference-logging-step-interval: 1
 METRICS:
   - "generated_tokens"
   - "logprobs"
