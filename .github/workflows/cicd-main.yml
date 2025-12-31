@@ -87,7 +87,7 @@ jobs:
           IS_MEMBER="${{ steps.check-sso.outputs.is_member }}"
 
           # If external contributor is disabled, check if user is a repo collaborator or an org collaborator to NVIDIA or NVIDIA-NeMo
-          if [ "${{ env.DISABLE_EXTERNAL_CONTRIBUTOR }}" == "true" ] && [ "${{ steps.check-sso.outputs.is_member }}" != "true" ] ]; then
+          if [ "${{ env.DISABLE_EXTERNAL_CONTRIBUTOR }}" == "true" ] && [ "${{ steps.check-sso.outputs.is_member }}" != "true" ]; then
             PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
 
             echo "Checking if $PR_AUTHOR is a repo collaborator..."
