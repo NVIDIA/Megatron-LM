@@ -606,6 +606,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
         self._state_offloader: Optional[OptimizerStateOffloader] = None
+        if self.config.offload_optimizer_states or self.config.offload_master_weights:
+            self._state_offloader = OptimizerStateOffloader(self)
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -2605,10 +2607,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if timers is not None:
             timers('params-all-gather').stop()
 
-        # The states are initialized after the first optimizer.step() call.
-        # So we initialize the offloader here to make sure the states are initialized.
-        if self.config.offload_optimizer_states and self._state_offloader is None:
-            self._state_offloader = OptimizerStateOffloader(self)
+        if self._state_offloader is not None:
+            self._state_offloader.mark_optimizer_states_initialized()
 
         return update_successful
 
