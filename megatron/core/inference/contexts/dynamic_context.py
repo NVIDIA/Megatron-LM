@@ -263,6 +263,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_tokens: int = DEFAULT_MAX_TOKENS,
         block_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
+        pipeline_model_parallel_size: Optional[int] = None,
         cache_mla_latent: bool = False,
         kv_lora_rank: Optional[int] = None,
         qk_pos_emb_head_dim: Optional[int] = None,
@@ -304,6 +305,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = tensor_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+
+        if pipeline_model_parallel_size is None:
+            pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        else:
+            pp_size = pipeline_model_parallel_size
 
         # Mamba states.
         self.is_hybrid_model = mamba_inference_state_config is not None
@@ -387,6 +393,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_count_total = buffer_size_bytes // (
             self.block_size_bytes + mamba_states_memory_per_request
         )
+
+        # If using pipeline parallelism synchronize the total block count in case the
+        # pipeline stages have different layer allocations. Non-uniform block counts
+        # can lead to some ranks pausing requests earlier than other ranks
+        # (i.e., divergence in the scheduling behavior).
+        if pp_size > 1:
+            block_count_total_tensor = torch.tensor(
+                block_count_total, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(
+                block_count_total_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=parallel_state.get_pipeline_model_parallel_group(),
+            )
+            block_count_total = block_count_total_tensor.item()
+
         self.block_allocator = BlockAllocator(
             context=self,
             total_count=(
@@ -735,6 +757,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_layers=model_config.num_layers // model_config.pipeline_model_parallel_size,
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
+            tensor_model_parallel_size=model_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=model_config.pipeline_model_parallel_size,
             max_sequence_length=max_sequence_length,
             buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,

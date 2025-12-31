@@ -230,6 +230,7 @@ class TestDynamicInferenceEngine:
             max_requests=test_config.context_max_requests,
             max_tokens=test_config.context_max_tokens,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=transformer_config.pipeline_model_parallel_size,
             mamba_inference_state_config=mamba_inference_state_config,
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
