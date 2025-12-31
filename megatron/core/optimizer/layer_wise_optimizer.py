@@ -45,6 +45,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         config: OptimizerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
         init_state_fn_list: Optional[List[Callable]] = None,
+        model_chunks: Optional[List] = None,
+        async_allgather: Optional[bool] = False,
     ) -> None:
         """
         Initialize LayerWiseDistributedOptimizer.
@@ -58,6 +60,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
+
+        # set bucket lw params list for async allgather
+        self.async_allgather = async_allgather
+        if self.async_allgather:
+            assert model_chunks is not None, "model_chunks must be provided if async_allgather is True"
+            self.set_bucket_lw_params_list(model_chunks)
+
         if init_state_fn_list:
             assert len(init_state_fn_list) == len(
                 optimizers
@@ -143,6 +152,28 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
 
+    def set_bucket_lw_params_list(self, model_chunks: List[MegatronModule]):
+        for model_chunk in model_chunks:
+            for group in model_chunk.bucket_groups:
+                for bucket in group:
+                    # find all params that belong to this bucket and keep their sharding structure
+                    bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
+                    for bucket_list, full_params_list in zip(bucket_params_list, self.dp_cp_params_list):
+                        for param in full_params_list:
+                            if param in bucket.params:
+                                bucket_list.append(param)
+                    bucket.set_lw_params_list(bucket_params_list)
+            # do the same for expert parallel
+            for group in model_chunk.expert_parallel_bucket_groups:
+                for bucket in group:
+                    # find all params that belong to this bucket and keep their sharding structure
+                    bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.expt_dp))]
+                    for bucket_list, full_params_list in zip(bucket_params_list, self.expt_dp_params_list):
+                        for param in full_params_list:
+                            if param in bucket.params:
+                                bucket_list.append(param)
+                    bucket.set_lw_params_list(bucket_params_list)
+
     @torch.no_grad()
     def allgather_params(self) -> None:
         """All-gather updated params from all ranks."""
@@ -223,8 +254,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """step function for layer-wise optimizer."""
         update_successful, grad_norm, num_zeros_in_grad = super().step()
 
-        # All gather updated params.
-        self.allgather_params()
+        # All gather updated params. If async_allgather is True, the allgather is done in the forward pre-hook.
+        if not self.async_allgather:
+            self.allgather_params()
 
         return update_successful, grad_norm, num_zeros_in_grad
 
