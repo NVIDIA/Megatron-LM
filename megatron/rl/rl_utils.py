@@ -936,7 +936,7 @@ def prepare_data_for_update(
 
             # Wrap forward_backward_func for Full iteration CUDA graph
             forward_backward_func = get_forward_backward_func()
-            if args.enable_cuda_graph and args.cuda_graph_scope == "full_iteration":
+            if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
                 forward_backward_func = FullCudaGraphWrapper(
                     forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
                 )
