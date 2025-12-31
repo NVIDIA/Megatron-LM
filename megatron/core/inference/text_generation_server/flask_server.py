@@ -2,6 +2,7 @@
 
 import logging
 import socket
+from contextlib import contextmanager
 
 try:
     from flask import Flask
@@ -17,6 +18,18 @@ from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import temp_log_level, trace_async_exceptions
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def temp_log_level(level, logger=None):
+    """Enables temporarily overriding the logging level."""
+    logger = logger or logging.getLogger()
+    old_level = logger.level
+    logger.setLevel(level)
+    try:
+        yield
+    finally:
+        logger.setLevel(old_level)
 
 
 @trace_async_exceptions

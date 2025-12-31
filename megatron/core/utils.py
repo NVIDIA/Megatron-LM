@@ -874,18 +874,6 @@ def log_on_each_pipeline_stage(
         logger.log(*args, **kwargs)
 
 
-@contextmanager
-def temp_log_level(level, logger=None):
-    """Enables temporarily overriding the logging level."""
-    logger = logger or logging.getLogger()
-    old_level = logger.level
-    logger.setLevel(level)
-    try:
-        yield
-    finally:
-        logger.setLevel(old_level)
-
-
 def check_param_hashes_across_dp_replicas(
     model: List[torch.nn.Module], cross_check: bool = False
 ) -> bool:
@@ -2238,21 +2226,6 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
                 _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
     return loop
-
-
-def get_mamba_inference_metadata_from_model(model):
-    """Returns necessary metadata for Mamba model inference if it exists."""
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
-
-    decoder = get_attr_wrapped_model(model, "decoder")
-    layer_type_list = getattr(decoder, "layer_type_list", None)
-    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
-    else:
-        mamba_conv_states_shape = None
-        mamba_ssm_states_shape = None
-
-    return layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
 
 
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
