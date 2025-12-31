@@ -339,8 +339,27 @@ def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
-        rng_state_list = ShardedObject('rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
-                                       replica_id=mpu.get_data_parallel_rank(with_context_parallel=True))
+        ep_size = mpu.get_expert_model_parallel_world_size()
+
+        if ep_size > 1:
+            # Shard RNG by PP, TP, DP when using expert parallelism.
+            dp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+            dp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+            rng_state_list = ShardedObject(
+                'rng_state',
+                rng_state_list,
+                (pp_size, tp_size, dp_size),
+                (pp_rank, tp_rank, dp_rank),
+                replica_id=0,
+            )
+        else:
+            rng_state_list = ShardedObject(
+                'rng_state',
+                rng_state_list,
+                (pp_size, tp_size),
+                (pp_rank, tp_rank),
+                replica_id=mpu.get_data_parallel_rank(with_context_parallel=True),
+            )
     elif ckpt_format == "fsdp_dtensor":
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -378,25 +397,12 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
     if args.use_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
         metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
 
-    # Force pre-mcore 0.14 behavior for PyTorch versions below 2.6a0
-    force_pre_mcore_014 = not is_torch_min_version("2.6a0")
-    if force_pre_mcore_014 and not args.dist_ckpt_save_pre_mcore_014:
-        logger.warning(f"PyTorch version {get_torch_version()} below 2.6 detected."
-                       f" Forcing dist_ckpt_save_pre_mcore_014 behavior.")
-
-    if args.dist_ckpt_save_pre_mcore_014 or force_pre_mcore_014:
-        if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
-            if args.ckpt_fully_parallel_save:
-                metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
-            else:
-                metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
-    else:
-        if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
-            if args.dist_ckpt_optim_fully_reshardable:
-                metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
-                metadata['distrib_optim_fully_reshardable_mem_efficient'] = args.distrib_optim_fully_reshardable_mem_efficient
-            else:
-                metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
+    if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
+        if args.dist_ckpt_optim_fully_reshardable:
+            metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
+            metadata['distrib_optim_fully_reshardable_mem_efficient'] = args.distrib_optim_fully_reshardable_mem_efficient
+        else:
+            metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
@@ -1364,6 +1370,9 @@ def load_args_from_checkpoint(
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
+    _set_arg('moe_router_score_function', force=True)
+    _set_arg('moe_router_enable_expert_bias', force=True)
+    _set_arg('moe_router_topk_scaling_factor', force=True)
 
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)
@@ -1375,6 +1384,9 @@ def load_args_from_checkpoint(
     # Heterogeneous args.
     _set_arg('heterogeneous_layers_config_path', force=True)
     _set_arg('heterogeneous_layers_config_encoded_json', force=True)
+
+    # MoE latent projection.
+    _set_arg('moe_latent_size', force=True)
 
     # Tokenizer args.
     _set_arg('tokenizer_type', force=True)

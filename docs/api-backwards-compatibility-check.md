@@ -182,7 +182,7 @@ def _internal_compute(x, y, z):  # Added parameter
 ### Example 4: Deprecation Workflow
 
 ```python
-from megatron.core.backwards_compatibility_decorators import deprecated
+from megatron.core.utils import deprecated
 
 # Version 1.0 - Add deprecation
 @deprecated(

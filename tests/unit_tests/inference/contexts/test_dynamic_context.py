@@ -102,13 +102,15 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
+            rounder=64,
         )
 
         if not is_hybrid_model:
             assert dynamic_context.block_allocator.total_count == 491
             assert dynamic_context.block_allocator.active_count == 245
             assert dynamic_context.max_total_requests == 490
-            assert dynamic_context.max_active_requests == 245
+            # We make max_active_requests divisible by the REQUEST_ROUNDER.
+            assert dynamic_context.max_active_requests == 192
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_metadata is None
@@ -116,7 +118,7 @@ class TestDynamicContext:
             assert dynamic_context.block_allocator.total_count == 555
             assert dynamic_context.block_allocator.active_count == 277
             assert dynamic_context.max_total_requests == 554
-            assert dynamic_context.max_active_requests == 277
+            assert dynamic_context.max_active_requests == 256
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_metadata is not None
@@ -507,9 +509,8 @@ class TestDynamicContext:
             torch.tensor([2, 1], device='cuda', dtype=torch.int32),
         )
 
-        termination_idx = DynamicInferenceRequest.get_metadata_labels()["termination_id"]
         assert torch.equal(
-            dynamic_context.request_metadata[:2, termination_idx],
+            dynamic_context.request_metadata["termination_id"][:2],
             torch.tensor([7.0, 8.0], device='cuda'),
         )
 

@@ -374,7 +374,7 @@ class _MMapBinReader(_BinReader):
     """A _BinReader that memory maps the data (.bin) file
 
     Args:
-        bin_path (str): bin_path (str): The path to the data (.bin) file.
+        bin_path (str): The path to the data (.bin) file.
     """
 
     def __init__(self, bin_path: str) -> None:
@@ -416,7 +416,7 @@ class _FileBinReader(_BinReader):
     """A _BinReader that reads from the data (.bin) file using a file pointer
 
     Args:
-        bin_path (str): bin_path (str): The path to the data (.bin) file.
+        bin_path (str): The path to the data (.bin) file.
     """
 
     def __init__(self, bin_path: str) -> None:
@@ -453,7 +453,7 @@ class _S3BinReader(_BinReader):
     """A _BinReader that reads from the data (.bin) file from S3
 
     Args:
-        bin_path (str): bin_path (str): The path to the data (.bin) file.
+        bin_path (str): The path to the data (.bin) file.
 
         bin_chunk_nbytes (int, optional): If not None, then maintain an in-memory cache to speed
             up calls to the `read` method. Furthermore, on a cache miss, download this number of
@@ -539,7 +539,9 @@ class _MultiStorageClientBinReader(_BinReader):
     """A _BinReader that reads from the data (.bin) file using the multi-storage client.
 
     Args:
-        bin_path (str): bin_path (str): The path to the data (.bin) file.
+        bin_path (str): The path to the data (.bin) file.
+
+        object_storage_config (ObjectStorageConfig): The object storage config.
     """
 
     def __init__(self, bin_path: str, object_storage_config: ObjectStorageConfig) -> None:
