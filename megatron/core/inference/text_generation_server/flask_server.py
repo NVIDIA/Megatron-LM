@@ -15,7 +15,7 @@ except ImportError as e:
 
 import megatron.core.inference.text_generation_server.endpoints as endpoints
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.utils import temp_log_level, trace_async_exceptions
+from megatron.core.utils import trace_async_exceptions
 
 logger = logging.getLogger(__name__)
 
