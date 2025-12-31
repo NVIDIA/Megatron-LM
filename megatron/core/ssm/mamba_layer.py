@@ -89,11 +89,7 @@ class MambaLayer(GraphableMegatronModule):
         """Register the mamba layer for cudagraphs."""
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-        if (
-            "full" in self.config.cuda_graph_scope
-            or "mamba" in self.config.cuda_graph_scope
-            or self.config.cuda_graph_scope == []
-        ):
+        if not self.config.cuda_graph_scope or CudaGraphScope.mamba in self.config.cuda_graph_scope:
             self.cudagraph_manager = CudaGraphManager(config)
 
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:

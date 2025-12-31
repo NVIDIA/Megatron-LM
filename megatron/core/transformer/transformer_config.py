@@ -1663,7 +1663,10 @@ class TransformerConfig(ModelParallelConfig):
                 else:
                     # The recompute module should be inside or outside of the graph scope.
                     # Recompute module coverring graph scope is not allowed.
-                    if self.cuda_graph_impl == "transformer_engine" and "moe" in self.recompute_modules:
+                    if (
+                        self.cuda_graph_impl == "transformer_engine"
+                        and "moe" in self.recompute_modules
+                    ):
                         assert (
                             CudaGraphScope.moe_router not in self.cuda_graph_scope
                         ), "moe recompute is not supported with moe_router CUDA graph."

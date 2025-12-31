@@ -1294,7 +1294,7 @@ def validate_args(args, defaults={}):
         ):
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        if args.transformer_impl == 'transformer_engine':
+        if args.cuda_graph_impl == "transformer_engine":
             assert (
                 "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
                 or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
@@ -1552,11 +1552,7 @@ def _add_inference_args(parser):
                        '"none": no CUDA graph. '
                        '"local": capture the CUDA graph using MCore local implementation. --cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. '
                        '"transformer_engine": capture the CUDA graph using TE make_graphed_callables().')
-<<<<<<< HEAD
     group.add_argument('--cuda-graph-scope', nargs='+', type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope, default=[],
-=======
-    group.add_argument('--cuda-graph-scope', nargs='+', type=str, default=[],
->>>>>>> faa5371c8f (cleanup)
                        help='Determines the CUDA graphs capturing scope. '
                        'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
                        '"attn": captures operations in TransformerLayer._forward_attention(). '
@@ -1568,13 +1564,8 @@ def _add_inference_args(parser):
                        '"mamba": captures the mamba layer. '
                        '"full_iteration": captures a whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
-<<<<<<< HEAD
                        'If not specified, the default scope is to capture the whole Transformer layer. '
                        'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.')
-=======
-                       'If not specified, the default scope is to capture the whole Transformer layer.')
-
->>>>>>> faa5371c8f (cleanup)
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')

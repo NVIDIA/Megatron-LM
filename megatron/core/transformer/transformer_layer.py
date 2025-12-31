@@ -468,14 +468,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
         # If full scope, just cudagraph the entire layer
-        if "full" in self.config.cuda_graph_scope or self.config.cuda_graph_scope == []:
+        if not self.config.cuda_graph_scope:
             self.cudagraph_manager = CudaGraphManager(config)
         elif (
-            "attn" in self.config.cuda_graph_scope
+            CudaGraphScope.attn in self.config.cuda_graph_scope
             and self.submodules_config.self_attention != IdentityOp
         ):
             self.cudagraph_manager = CudaGraphManager(config)
-        elif "mlp" in self.config.cuda_graph_scope and self.submodules_config.mlp != IdentityOp:
+        elif (
+            CudaGraphScope.mlp in self.config.cuda_graph_scope
+            and self.submodules_config.mlp != IdentityOp
+        ):
             # Cudagraphing MoE layers are supposed handled by MoeTransforerLayer
             assert not self.is_moe_layer
             self.cudagraph_manager = CudaGraphManager(config)
@@ -669,36 +672,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         return pre_mlp_layernorm_output
-
-    def _forward_post_mlp(
-        self, mlp_output_with_bias, residual, using_fused_tp_inference_kernel=False
-    ):
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        nvtx_range_push(suffix="mlp_bda")
-        if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # MLP module.
-            hidden_states = mlp_output_with_bias[0]
-        else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
-                )
-        nvtx_range_pop(suffix="mlp_bda")
-
-        # Jit compiled function creates 'view' tensor. This tensor
-        # potentially gets saved in the MPU checkpoint function context,
-        # which rejects view tensors. While making a viewless tensor here
-        # won't result in memory savings (like the data loader, or
-        # p2p_communication), it serves to document the origin of this
-        # 'view' tensor.
-        output = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-        )
-
-        return output
 
     def _forward_mlp(self, hidden_states, inference_context=None):
         """
@@ -1236,7 +1209,7 @@ class MoETransformerLayer(TransformerLayer):
     """
     A Transformer layer specialized for Mixture-of-Experts (MoE) architectures.
 
-    Implements specific functionality to support CUDA graph capture for MoE layers. 
+    Implements specific functionality to support CUDA graph capture for MoE layers.
     Due to the dynamic nature of MoE, capturing the entire layer in a single CUDA graph
     can be challenging. This class supports "partial" CUDA graphs by decomposing the
     MLP forward pass into router, expert-compute, and post-process stages.
@@ -1268,9 +1241,8 @@ class MoETransformerLayer(TransformerLayer):
         )
 
         if (
-            "full" in self.config.cuda_graph_scope
-            or "moe_router" in self.config.cuda_graph_scope
-            or self.config.cuda_graph_scope == []
+            not self.config.cuda_graph_scope
+            or CudaGraphScope.moe_router in self.config.cuda_graph_scope
         ):
 
             self.use_partial_cudagraphs = True
@@ -1280,7 +1252,7 @@ class MoETransformerLayer(TransformerLayer):
             self.cudagraph_manager_postprocess = CudaGraphManager(
                 self.config, self, function_name="_forward_mlp_postprocess"
             )
-        elif "moe" in self.config.cuda_graph_scope:
+        elif CudaGraphScope.moe in self.config.cuda_graph_scope:
             self.cudagraph_manager = CudaGraphManager(config)
 
     def _forward_mlp_router(self, hidden_states):
@@ -1306,8 +1278,8 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
-        self.mlp.fwd_execution_map = ("expert_compute")
-        return self.mlp(None, intermediate_tensors=(hidden_states, probs, routing_map)) 
+        self.mlp.fwd_execution_map = "expert_compute"
+        return self.mlp(None, intermediate_tensors=(hidden_states, probs, routing_map))
 
     def _forward_mlp_postprocess(self, residual, output, shared_expert_output, mlp_bias):
         """

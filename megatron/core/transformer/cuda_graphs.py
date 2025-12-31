@@ -27,13 +27,8 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
-<<<<<<< HEAD
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
-=======
-from megatron.core.transformer.module import MegatronModule
->>>>>>> f771b57603 (run autoformat)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_attr_wrapped_model,
