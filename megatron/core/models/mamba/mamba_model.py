@@ -16,7 +16,11 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.utils import WrappedTensor, deprecate_inference_params
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    is_using_quantization_scales,
+)
 
 
 class MambaModel(LanguageModule):
@@ -201,6 +205,15 @@ class MambaModel(LanguageModule):
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations
+            if (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and is_using_quantization_scales(self.config)
+            ):
+                decoder_input[inference_context.padding_slice] = 0.0
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
