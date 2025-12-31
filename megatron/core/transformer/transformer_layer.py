@@ -389,6 +389,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     if (
                         not self.is_moe_layer
                         or CudaGraphScope.moe_router not in self.config.cuda_graph_scope
+                        or self.config.cuda_graph_impl == "local"
                     ):
                         # Not a MoE layer, or not capturing the router part.
                         return True
@@ -554,7 +555,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                cudagraph_capturable=self.config.cuda_graph_impl == "local"
+            )
+
             input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                 self.input_layernorm, hidden_states
             )
@@ -636,7 +640,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
     def _forward_pre_mlp_layernorm(self, hidden_states):
         if self.recompute_pre_mlp_layernorm:
-            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                cudagraph_capturable=self.config.cuda_graph_impl == "local"
+            )
             pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                 self.pre_mlp_layernorm, hidden_states
             )
@@ -711,12 +717,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
-        if self.recompute_pre_mlp_layernorm:
-            # discard the output of the pre-mlp layernorm and register the recompute
-            # as a gradient hook of mlp_output_with_bias[0]
-            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
-                mlp_output_with_bias[0]
-            )
         nvtx_range_pop(suffix="mlp")
 
         if (
@@ -748,6 +748,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+
+        if self.recompute_pre_mlp_layernorm:
+            # discard the output of the pre-mlp layernorm and register the recompute
+            # as a gradient hook of mlp_output_with_bias[0]
+            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+                mlp_output_with_bias[0]
+            )
+
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )
