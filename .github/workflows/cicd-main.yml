@@ -51,6 +51,7 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
+      DISABLE_EXTERNAL_CONTRIBUTOR: ${{ vars.DISABLE_EXTERNAL_CONTRIBUTOR }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -83,7 +84,7 @@ jobs:
           fi
 
           # Use SSO membership check result
-          IS_MEMBER="${{ steps.check-sso.outputs.is_member }}"
+          IS_MEMBER="${{ steps.check-sso.outputs.is_member == 'true' || (steps.check-sso.outputs.is_org_member == 'true' && env.DISABLE_EXTERNAL_CONTRIBUTOR == 'true') }}"
           if [ "$IS_MEMBER" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
           else
@@ -125,6 +126,12 @@ jobs:
             NVIDIA Megatron-LM is currently transitioning to development on Github. We will aim to review your PR after we complete our transition and stabilize our Github development process.
 
             Thank you for your understanding.
+
+      - name: exit
+        run: |
+          if [ "${{ env.DISABLE_EXTERNAL_CONTRIBUTOR }}" == "true" ] && [ "${{ steps.check-sso.outputs.is_member }}" != "true" ] && [ "${{ steps.check-sso.outputs.is_org_member }}" != "true" ]; then
+            exit 1
+          fi
 
   pre-flight:
     needs: [is-not-external-contributor]
