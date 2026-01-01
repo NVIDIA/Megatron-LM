@@ -80,7 +80,6 @@ class AudioEncoderWrapper(torch.nn.Module):
             hidden = self.encoder(input_features).last_hidden_state  # [b, s, h]
             if seq_lengths is not None:
                 seq_len = hidden.shape[1]
-                # breakpoint()
                 mask = torch.arange(seq_len, device=hidden.device)[None, :] < seq_lengths[:, None]
                 hidden = hidden[mask]
             return hidden
