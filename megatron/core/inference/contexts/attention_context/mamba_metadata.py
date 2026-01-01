@@ -70,20 +70,6 @@ class MambaMetadata:
         """
         self.request_to_mamba_state_idx_cudagraph_only.fill_(-1)
 
-    def update_cudagraph_mapping(
-        self, active_mamba_indices: torch.Tensor, num_active_requests: int
-    ) -> None:
-        """
-        Updates the dedicated CUDA graph mapping tensor with the indices
-        of currently active requests.
-
-        Args:
-            active_mamba_indices (Tensor): Tensor containing the Mamba slot indices
-                                           for active requests.
-            num_active_requests (int): The number of active requests.
-        """
-        self.request_to_mamba_state_idx_cudagraph_only[0:num_active_requests] = active_mamba_indices
-
     def allocate_slot(self) -> Optional[int]:
         """
         Allocates a new slot for a request in the Mamba state buffers.
