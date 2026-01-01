@@ -147,6 +147,9 @@ class OptimizerConfig:
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
+    num_distributed_optimizer_instances: int = 1
+    """Number of Distributed Optimizer copies across Data Parallel domain."""
+
     #######################
     # Optimizer Offload
     #######################

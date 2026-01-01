@@ -1869,7 +1869,7 @@ class ParamAndGradBuffer:
                 hsdp_buf_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
                 )
-                main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank()
+                main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank(is_expert_parallel=group.is_expert_param)
             else:
                 main_buf_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
@@ -2048,7 +2048,7 @@ class ParamAndGradBuffer:
         # Specifically, replace the Torch module's parameter data with tensors
         # whose memory managed by the model weight buffer, and store a shard
         # of all the parameters across ranks in the model weight buffer.
-        for group in self.parameter_groups:
+        for group_id, group in enumerate(self.parameter_groups):
             wbuf = group.model_weight_buffer
             if wbuf:
                 with self.mem_alloc_context():
@@ -2369,7 +2369,7 @@ class ParamAndGradBuffer:
         or "no_shard" is utilized.
         """
         dist_main_weight = {}
-        for pg in self.parameter_groups:
+        for group_id, pg in enumerate(self.parameter_groups):
             wbuf = pg.model_weight_buffer
             mbuf = pg.main_weight_buffer
             for item_id, orig_param in enumerate(pg.params):
