@@ -54,16 +54,39 @@ class MetadataBase:
         assert real_batch_size <= padded_batch_size
         assert tensor_buf.shape[0] >= padded_batch_size
         assert unpadded_tensor.shape[0] >= real_batch_size
+        tensor_buf[0:real_batch_size] = unpadded_tensor[:real_batch_size]
+        self.tensor_pad(
+            tensor_buf, real_batch_size, padded_batch_size, is_cumulative_tensor, pad_value
+        )
+        return tensor_buf
+
+    def tensor_pad(
+        self,
+        tensor_buf,
+        real_batch_size,
+        padded_batch_size,
+        is_cumulative_tensor=False,
+        pad_value=0,
+    ):
+        """
+        Pad the tensor_buf with zero or the last value of the tensor,
+        depending on whether the tensor is cumulative.
+        Args:
+            tensor_buf: The destination tensor, at least padded_batch_size long.
+            real_batch_size: The real batch size.
+            padded_batch_size: Padded boundary of the tensor.
+            is_cumulative_tensor: Whether the tensor is cumulative.
+                If True, we pad the tensor_buf with the last value of the tensor_buf.
+            pad_value: The value to pad the tensor_buf with when the tensor is not cumulative.
+        """
         if is_cumulative_tensor:
             if real_batch_size == 0:
                 value = pad_value
             else:
-                value = unpadded_tensor[real_batch_size - 1]
+                value = tensor_buf[real_batch_size - 1]
         else:
             value = pad_value
-        tensor_buf[0:real_batch_size] = unpadded_tensor[:real_batch_size]
-        tensor_buf[real_batch_size:padded_batch_size] = value
-        return tensor_buf
+        tensor_buf[real_batch_size:padded_batch_size].fill_(value)
 
     def __str__(self):
         """

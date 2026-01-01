@@ -464,28 +464,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
 
-        # Attention metadata initialization (tensors are now handled by MHAMetadata classes)
-
-        self.num_prefill_requests = 0
-        self.graph_attn_metadata = {}
-        self.non_graph_attn_metadata = {}
-        self.active_attn_metadata = None
-
-        self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
-            block_count_total=self.block_allocator.total_count,
-            max_kv_block_count=self.max_kv_block_count,
-            max_requests=self.max_total_requests,
-            block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
-        )
-
-        self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
-            block_count_total=self.block_allocator.total_count,
-            max_kv_block_count=self.max_kv_block_count,
-            max_requests=self.max_total_requests,
-            block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
-        )
+        # FlashInfer.
+        if use_flashinfer_fused_rope is True:
+            assert HAVE_FLASHINFER, "flashinfer is not installed"
+        elif use_flashinfer_fused_rope is None:
+            use_flashinfer_fused_rope = HAVE_FLASHINFER
+        self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
 
         # CUDA graph config list
         is_expert_parallel = parallel_state.get_expert_model_parallel_world_size() > 1
@@ -507,12 +491,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
 
-        # FlashInfer.
-        if use_flashinfer_fused_rope is True:
-            assert HAVE_FLASHINFER, "flashinfer is not installed"
-        elif use_flashinfer_fused_rope is None:
-            use_flashinfer_fused_rope = HAVE_FLASHINFER
-        self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
+        # Attention metadata initialization (padding is now handled by MHAMetadata classes)
+        self.num_prefill_requests = 0
+        self.graph_attn_metadata = {}
+        self.non_graph_attn_metadata = {}
+        self.active_attn_metadata = None
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
@@ -617,8 +600,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_kv_length_offsets = torch.empty_like(self.request_kv_length_offsets)
         self.active_request_to_kv_block_ids = torch.empty_like(self.request_to_kv_block_ids)
 
-        self.active_sequence_lengths = torch.empty_like(self.request_query_lengths)
         self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
+        self.cu_active_request_query_lengths = torch.empty_like(self.request_query_lengths)
+        self.active_sequence_lengths = torch.empty_like(self.request_query_lengths)
+        self.cu_active_sequence_lengths = torch.empty_like(self.request_query_lengths)
 
         # Memory buffer.
         def allocate_memory_buffer():
@@ -683,7 +668,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             allocate_mamba_states()
 
         # Reset attention and Mamba state.
-        self.reset_attention_state()
+        self.reset_attention_state(is_init=True)
         self.reset_mamba_state()
 
     def deallocate_all_tensors(self):
@@ -894,11 +879,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_to_kv_block_ids[padded_slice]
         )
 
+        graph_scratch_space = torch.cumsum(self.active_request_query_lengths[:batch_size], dim=0)
+        self.active_request_last_token_idxs[:batch_size].copy_(graph_scratch_space - 1)
+        graph_scratch_space[-1] = 0
+        self.cu_active_request_query_lengths[:batch_size].copy_(graph_scratch_space.roll(1, 0))
+
         self.active_sequence_lengths[:batch_size].copy_(
             (self.active_request_query_lengths + self.active_request_kv_length_offsets)[:batch_size]
         )
-        graph_scratch_space = torch.cumsum(self.active_request_query_lengths[:batch_size], dim=0)
-        self.active_request_last_token_idxs[:batch_size].copy_(graph_scratch_space - 1)
+        graph_scratch_space = torch.cumsum(self.active_sequence_lengths[:batch_size], dim=0)
+        graph_scratch_space[-1] = 0
+        self.cu_active_sequence_lengths[:batch_size].copy_(graph_scratch_space.roll(1, 0))
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1089,8 +1080,38 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         return key
 
-    def reset_attention_state(self) -> None:
-        """Reset state used within attention, after each step."""
+    def reset_attention_state(self, *, is_init: bool = False) -> None:
+        """Reset state used within attention, after each step.
+
+        Args:
+            is_init (bool): True if this is being called from `__init__()`.
+        """
+        if is_init:
+            self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
+                block_count_total=self.block_allocator.total_count,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_total_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+                query_lengths_buf=self.active_request_query_lengths,
+                cu_query_seq_lengths_buf=self.cu_active_request_query_lengths,
+                kv_seq_lengths_buf=self.active_sequence_lengths,
+                cu_kv_seq_lengths_buf=self.cu_active_sequence_lengths,
+                block_table_buf=self.active_request_to_kv_block_ids,
+            )
+
+            self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
+                block_count_total=self.block_allocator.total_count,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_total_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+                query_lengths_buf=self.active_request_query_lengths,
+                cu_query_seq_lengths_buf=self.cu_active_request_query_lengths,
+                kv_seq_lengths_buf=self.active_sequence_lengths,
+                cu_kv_seq_lengths_buf=self.cu_active_sequence_lengths,
+                block_table_buf=self.active_request_to_kv_block_ids,
+            )
         # Attention metadata reset is now handled by MHAMetadata.reset()
         for attn_metadata in self.non_graph_attn_metadata.values():
             attn_metadata.reset()
@@ -1401,13 +1422,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                     decode_req_count=adjusted_decode_req_count,
                     has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
                 )
-
         self.active_attn_metadata["mha_metadata"].update(
-            request_query_lengths=self.active_request_query_lengths[:batch_size],
-            request_kv_length_offsets=self.active_request_kv_length_offsets[:batch_size],
-            request_to_kv_block_ids=self.active_request_to_kv_block_ids[:batch_size],
-            batch_dimensions=attn_dimensions,
-            padded_batch_dimensions=self.padded_batch_dimensions,
+            batch_dimensions=attn_dimensions, padded_batch_dimensions=self.padded_batch_dimensions
         )
 
         if self.is_hybrid_model:
