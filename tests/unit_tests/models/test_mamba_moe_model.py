@@ -4,21 +4,18 @@ import inspect
 import json
 import os
 import sys
-import torch
 from typing import Any, Dict, Mapping, Tuple
 
 import pytest  # type: ignore[import]
 
-from megatron.core.activations import squared_relu
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import AttnBackend
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_args, set_global_variables
-from megatron.core.transformer.enums import AttnBackend
-
 from tests.unit_tests.test_utilities import Utils
 
 GOLDEN_CONFIG: Dict[str, Any] = {
@@ -252,7 +249,6 @@ SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
 ALLOW_ADDED_FIELDS = set()
 
-VALID_SIZES = {torch.Size([3072]), torch.Size([128, 2688]), torch.Size([5]), torch.Size([5152, 2688]), torch.Size([32]), torch.Size([2688]), torch.Size([2688, 1856]), torch.Size([2048]), torch.Size([2304, 2688]), torch.Size([2688, 2048]), torch.Size([0]), torch.Size([3072, 1, 4]), torch.Size([1856, 2688]), torch.Size([65536, 2688]), torch.Size([128])}
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:
     """Normalize a config object into a JSON-serializable dict."""
@@ -278,7 +274,9 @@ def assert_config_matches_golden(cfg: Any) -> None:
         parts = [header]
         if changed:
             formatted = {k: {"expected": golden[k], "actual": current[k]} for k in sorted(changed)}
-            parts.append(f"Changed field details:\n{json.dumps(formatted, indent=2, sort_keys=True)}")
+            parts.append(
+                f"Changed field details:\n{json.dumps(formatted, indent=2, sort_keys=True)}"
+            )
         pytest.fail("\n".join(parts))
 
 
@@ -308,9 +306,7 @@ def _ser(obj: Any) -> Any:
         return f"<unserializable:{type(obj).__name__}>"
 
 
-def _diff_configs(
-    expected: Mapping[str, Any], actual: Mapping[str, Any]
-) -> Tuple[set, set, set]:
+def _diff_configs(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> Tuple[set, set, set]:
     """Return added, removed, and changed top-level keys between dicts."""
     expected_keys = set(expected)
     actual_keys = set(actual)
@@ -329,7 +325,7 @@ class TestMambaMoEModel:
 
         sys.argv = ['test_mamba_moe_model.py']
         args = parse_args()
-        
+
         # The following args would be set from the nano v3 checkpoint.
         args.num_layers = 52
         args.hidden_size = 2688
@@ -339,25 +335,25 @@ class TestMambaMoEModel:
         args.group_query_attention = True
         args.kv_channels = 128
         args.position_embedding_type = 'none'
-        args.add_position_embedding=True
-        args.use_rotary_position_embeddings=False
-        args.rotary_base=10000
-        args.rotary_percent=1.0
-        args.rotary_interleaved=False
+        args.add_position_embedding = True
+        args.use_rotary_position_embeddings = False
+        args.rotary_base = 10000
+        args.rotary_percent = 1.0
+        args.rotary_interleaved = False
         args.add_bias_linear = False
         args.add_qkv_bias = False
-        args.squared_relu=True
+        args.squared_relu = True
         args.swiglu = False
-        args.untie_embeddings_and_output_weights=True
-        args.apply_layernorm_1p=False
+        args.untie_embeddings_and_output_weights = True
+        args.apply_layernorm_1p = False
         args.normalization = "RMSNorm"
         args.apply_query_key_layer_scaling = False
         args.attention_dropout = 0.0
         args.hidden_dropout = 0.0
-        args.hybrid_override_pattern="MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
-        args.spec=["megatron.core.models.mamba.mamba_layer_specs", "mamba_stack_spec"]
-        args.hybrid_attention_ratio=0.0
-        args.hybrid_mlp_ratio=0.0
+        args.hybrid_override_pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+        args.spec = ["megatron.core.models.mamba.mamba_layer_specs", "mamba_stack_spec"]
+        args.hybrid_attention_ratio = 0.0
+        args.hybrid_mlp_ratio = 0.0
         args.num_experts = 128
         args.moe_layer_freq = 1
         args.moe_ffn_hidden_size = 1856
@@ -368,18 +364,17 @@ class TestMambaMoEModel:
         args.moe_router_score_function = "sigmoid"
         args.moe_router_enable_expert_bias = True
         args.moe_router_topk_scaling_factor = 2.5
-        args.mamba_state_dim=128
-        args.mamba_head_dim=64
-        args.mamba_num_groups=8
-        args.mamba_num_heads=64
-        args.is_hybrid_model=True
-        args.tokenizer_type="TikTokenizer"
-        args.tiktoken_pattern="v2"
-        args.tokenizer_model="/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+        args.mamba_state_dim = 128
+        args.mamba_head_dim = 64
+        args.mamba_num_groups = 8
+        args.mamba_num_heads = 64
+        args.is_hybrid_model = True
+        args.tokenizer_type = "TikTokenizer"
+        args.tiktoken_pattern = "v2"
+        args.tokenizer_model = "/mnt/artifacts/model/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
         args.padded_vocab_size = 131072
 
         # The following args would be set in the user's nano v3 config.
-        args.activation_func = squared_relu
         args.async_tensor_model_parallel_allreduce = True
         args.attention_backend = AttnBackend.flash
         args.bf16 = True
@@ -451,7 +446,9 @@ class TestMambaMoEModel:
         assert self.model.post_process is True, "post_process should be True"
         assert self.model.hybrid_attention_ratio == 0.0, "hybrid_attention_ratio should be 0.0"
         assert self.model.hybrid_mlp_ratio == 0.0, "hybrid_mlp_ratio should be 0.0"
-        assert self.model.hybrid_override_pattern == args.hybrid_override_pattern, f"hybrid_override_pattern should be {args.hybrid_override_pattern}"
+        assert (
+            self.model.hybrid_override_pattern == args.hybrid_override_pattern
+        ), f"hybrid_override_pattern should be {args.hybrid_override_pattern}"
 
         # check correct number of parameters
         num_weights = sum([p.numel() for p in self.model.parameters()])
@@ -466,4 +463,4 @@ class TestMambaMoEModel:
 
     def test_forward(self):
         """Test the forward pass of the Mamba MoE model."""
-        pass 
+        pass
