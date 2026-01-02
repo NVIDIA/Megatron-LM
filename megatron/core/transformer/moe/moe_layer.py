@@ -305,13 +305,13 @@ class MoELayer(BaseMoELayer):
         experts (e.g., via an All-to-All communication)
         """
         output = self.token_dispatcher.token_combine(output)
-        output = self.token_dispatcher.combine_postprocess(output)
         return output
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed."""
 
+        output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 
