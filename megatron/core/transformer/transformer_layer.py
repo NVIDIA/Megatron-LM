@@ -1220,6 +1220,7 @@ class MoETransformerLayer(TransformerLayer):
         self.is_moe_layer = True
         self.use_partial_cudagraphs = False
         self.moe_layer_recompute = False
+        self.token_dispatcher_attrs = {}
 
         super().__init__(*args, **kwargs)
 
@@ -1244,6 +1245,7 @@ class MoETransformerLayer(TransformerLayer):
         if (
             not self.config.cuda_graph_scope
             or CudaGraphScope.moe_router in self.config.cuda_graph_scope
+            or CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope
         ):
 
             self.use_partial_cudagraphs = True
@@ -1268,9 +1270,18 @@ class MoETransformerLayer(TransformerLayer):
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
         router_outputs = self.mlp(pre_mlp_layernorm_output, intermediate_tensors=())
+
+        for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
+            attr = getattr(self.mlp.token_dispatcher, attr_name)
+            if torch.is_tensor(attr):
+                if attr_name in self.token_dispatcher_attrs:
+                    self.token_dispatcher_attrs[attr_name].copy_(attr)
+                else:
+                        self.token_dispatcher_attrs[attr_name] = attr.detach()
+
         return residual, *router_outputs
 
-    def _forward_mlp_expert_compute(self, hidden_states, probs, routing_map):
+    def _forward_mlp_expert_compute(self, hidden_states, probs):
         """
         Executes the actual computation of the experts.
 
@@ -1279,8 +1290,11 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
+        for name, attr in self.token_dispatcher_attrs.items():
+            setattr(self.mlp.token_dispatcher, name, attr)
+
         self.mlp.fwd_execution_map = "expert_compute"
-        return self.mlp(None, intermediate_tensors=(hidden_states, probs, routing_map))
+        return self.mlp(None, intermediate_tensors=(hidden_states, probs))
 
     def _forward_mlp_postprocess(self, residual, output, shared_expert_output, mlp_bias):
         """
@@ -1305,12 +1319,10 @@ class MoETransformerLayer(TransformerLayer):
         """
 
         def _forward_mlp_partial_cudagraphs(hidden_states, inference_context=None):
-            residual, hidden_states, probs, routing_map, shared_expert_output = (
-                self._forward_mlp_router(hidden_states)
+            residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
+                hidden_states
             )
-            expert_output, mlp_bias = self._forward_mlp_expert_compute(
-                hidden_states, probs, routing_map
-            )
+            expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs)
             return self._forward_mlp_postprocess(
                 residual, expert_output, shared_expert_output, mlp_bias
             )

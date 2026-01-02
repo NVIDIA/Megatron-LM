@@ -219,15 +219,7 @@ class MoELayer(BaseMoELayer):
         producing routing probabilities and a mapping.
         """
         probs, routing_map = self.router(hidden_states)
-
-        # Project the hidden_states from hidden dimension down to latent dimenion.
-        if self.config.moe_latent_size:
-            assert (
-                not self.shared_expert_overlap
-            ), "Shared expert overlap not supported when MoE latent projections are used."
-            hidden_states, _ = self.fc1_latent_proj(hidden_states)
-
-        return hidden_states, probs, routing_map
+        return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(
@@ -238,7 +230,12 @@ class MoELayer(BaseMoELayer):
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher.
         """
-
+        # Project the hidden_states from hidden dimension down to latent dimenion.
+        if self.config.moe_latent_size:
+            assert (
+                not self.shared_expert_overlap
+            ), "Shared expert overlap not supported when MoE latent projections are used."
+            hidden_states, _ = self.fc1_latent_proj(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
@@ -322,7 +319,7 @@ class MoELayer(BaseMoELayer):
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
 
-        hidden_states, probs, routing_map = self.route(hidden_states)
+        probs, routing_map = self.route(hidden_states)
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
@@ -352,16 +349,11 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    hidden_states, probs, routing_map = self.route(hidden_states)
-
-                    if intermediate_tensors is not None:
-                        return hidden_states, probs, routing_map, shared_expert_output
-
-                if "expert_compute" in self.fwd_execution_map:
-                    if intermediate_tensors is not None:
-                        hidden_states, probs, routing_map = intermediate_tensors
-
+                    probs, routing_map = self.route(hidden_states)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+
+                    if intermediate_tensors is not None:
+                        return hidden_states, probs, shared_expert_output
 
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
@@ -372,6 +364,9 @@ class MoELayer(BaseMoELayer):
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
             if "expert_compute" in self.fwd_execution_map:
+                if intermediate_tensors is not None:
+                    hidden_states, probs = intermediate_tensors
+
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
