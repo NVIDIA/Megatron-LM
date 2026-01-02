@@ -64,7 +64,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cross_entropy_loss_fusion": True,
     "cuda_graph_impl": "none",
     "cuda_graph_retain_backward_graph": False,
-    "cuda_graph_scope": "full",
+    "cuda_graph_scope": [],
     "cuda_graph_use_single_mempool": False,
     "cuda_graph_warmup_steps": 3,
     "deallocate_pipeline_outputs": True,
