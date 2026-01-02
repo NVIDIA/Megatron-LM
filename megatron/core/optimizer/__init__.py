@@ -88,9 +88,25 @@ def _matches(param: torch.nn.Parameter, param_name: str, param_key: ParamKey) ->
     return False
 
 
+def _get_no_wd_cond_fn(no_wd_decay_cond_type):
+    """Get the no weight decay condition function."""
+    
+    apply_wd_to_qk_layernorm = (no_wd_decay_cond_type == 'apply_wd_to_qk_layernorm')
+
+    def no_wd_cond_fn(name, param):
+        if apply_wd_to_qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name):
+            """Applies weight decay to qk layernorm as a special case"""
+            no_wd = False
+        else:
+            no_wd = name.endswith(".bias") or len(param.shape) == 1
+        return no_wd
+
+    return no_wd_cond_fn
+
+
 def _get_param_groups(
     model_chunks: List[MegatronModule],
-    config: OptimizerConfig,
+    optimizer_config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, OptimizerConfig]],
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
@@ -100,7 +116,7 @@ def _get_param_groups(
     Args:
         model_chunks (List[MegatronModule]): model chunks to create parameter
             groups for.
-        config (OptimizerConfig): optimizer configuration object.
+        optimizer_config (OptimizerConfig): optimizer configuration object.
         config_overrides (Optional[Dict[LayerKey, OptimizerConfig]): optimizer overrides,
             specified on a per-layer basis.
     Returns:
@@ -119,7 +135,7 @@ def _get_param_groups(
             uses_default_config = False
             # Get optimizer config for this parameter.
             if config_overrides is None:
-                config_for_param = config
+                config_for_param = optimizer_config
                 uses_default_config = True
             else:
                 config_for_param = None
@@ -129,7 +145,7 @@ def _get_param_groups(
                         break
                 # Fall back to default config.
                 if config_for_param is None:
-                    config_for_param = config
+                    config_for_param = optimizer_config
                     uses_default_config = True
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
@@ -137,7 +153,8 @@ def _get_param_groups(
             # TODO: Make sure there is a way to support old no_weight_decay_func functionality
             # and default_skip_embedding_weight_decay:
             #     or (default_skip_embedding_weight_decay and "embedding" in name)
-            no_wd = name.endswith(".bias") or len(param.shape) == 1
+            no_wd_cond_fn = _get_no_wd_cond_fn(optimizer_config.no_weight_decay_cond)
+            no_wd = no_wd_cond_fn(name, param)
             if not no_wd:
                 wd_mult = 1.0
             else:
@@ -173,12 +190,12 @@ def _get_param_groups(
     for key in params_key:
         wd_mult, is_expert_parallel, _ = key
         params = params_map[key] if key in params_map else []
-        config, uses_default_config = None, True
+        param_config, uses_default_config = None, True
         if key not in configs_map:
             assert params == []
         else:
-            config, uses_default_config = configs_map[key]
-            assert config is not None
+            param_config, uses_default_config = configs_map[key]
+            assert param_config is not None
 
         # TODO: Remove "backwards compatible" fields below eventually.
         param_group = {
@@ -191,9 +208,9 @@ def _get_param_groups(
         }
 
         # Stick relevant fields into param_group from config object.
-        if config is not None:
-            param_group['max_lr'] = config.lr
-            param_group['min_lr'] = config.min_lr
+        if param_config is not None:
+            param_group['max_lr'] = param_config.lr
+            param_group['min_lr'] = param_config.min_lr
             # TODO: Add other relevant arguments (e.g., weight decay, optimizer)
             # here as well.
         param_groups.append(param_group)
