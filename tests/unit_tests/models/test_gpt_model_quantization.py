@@ -16,10 +16,8 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import nvidia_kitchen  # type: ignore[import-not-found]
-
-    HAVE_KITCHEN = True
     from megatron.core.extensions.kitchen import (
+        HAVE_KITCHEN,
         KitchenColumnParallelGroupedLinear,
         KitchenColumnParallelLinear,
         KitchenDotProductAttention,
