@@ -54,7 +54,7 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
 ## Ease of use
 - Checkpoint converter for Mixtral models, see the [example](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mixtral) for details.
 - MoE Layer Frequency to customize the hybrid MoE/Dense layer architecture
-- Distributed checkpoining
+- Distributed checkpointing
 - Per-layer logging
 - Upcycling Support
 
@@ -402,11 +402,11 @@ To find a good parallel mapping that help you achieve a high throughput of a new
 
 For a specific model, the best parallel mapping varies based on the model architecture, trained sequence length and the hardware platform.
 Here we provide some general rules to get better performance:
-1. Keep the model parallism size as small as possible. 
-    - For the large language models, model parallism is often required to prevent OOM, but it will bring communication overhead and hurt performance. 
+1. Keep the model parallelism size as small as possible. 
+    - For the large language models, model parallelism is often required to prevent OOM, but it will bring communication overhead and hurt performance. 
     - With distributed optimizer, master weights and optimizer states will be sharded across all DP ranks with slight communication overhead.
-    So try to reduce the model parallism size and increase data parallism size when there are lots of free GPU memory during training.
-2. Ensure the EPxTP communication winthin the NVLink domain.
+    So try to reduce the model parallelism size and increase data parallelism size when there are lots of free GPU memory during training.
+2. Ensure the EPxTP communication within the NVLink domain.
     - Communications of EP and TP should remain within the NVLink domain as much as possible, as both are communication-intensive.
     - If the model is too large and requires scaling across multiple nodes, consider PP before TP and EP. See item 3 for details.
 3. Use Pipeline Parallelism to scale the model further.
@@ -430,7 +430,7 @@ MoE Parallel Folding separates the MoE related parallel groups from Dense groups
 By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 
 ### Advantages of MoE Parallel Folding
-1. The CP and EP group are folded together by defualt, such that:
+1. The CP and EP group are folded together by default, such that:
     1. It reduces the minimal required GPUs to turn on both CP and EP. For example, the traditional way with (CP=8, EP=8) needs at least 64 GPUs, for now it only requires 8 GPUs.
     2. The CP and EP communication can be both put in the NVLink domain.
 2. We can set different TP sizes for Attention and MoE part.
@@ -460,7 +460,7 @@ By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 **OOM Caused by Token Distribution Imbalance when Training From Scratch**  
 MoE suffers from a severe load imbalance issue when the router is under-trained, leading to the model easily running out of memory (OOM), which typically occurs in the first 100~300 steps when training from scratch. 
 Therefore, there are two recommended ways during the first 200 steps to avoid the OOM problem, which can be removed after the token distribution is more stable:
-1. Increase the `expert-tensor-parallel-size` and decrease `expert-model-parallel-size` to replace EP with TP in MoELayer, this can prevent the load imbalancing between EP ranks. Since current ETP implementation has some memeory overhead, you can further enable activation recomputation only for MoE Layer by adding `--moe-layer-recompute`.
+1. Increase the `expert-tensor-parallel-size` and decrease `expert-model-parallel-size` to replace EP with TP in MoELayer, this can prevent the load imbalancing between EP ranks. Since current ETP implementation has some memory overhead, you can further enable activation recomputation only for MoE Layer by adding `--moe-layer-recompute`.
 2. Setting capacity factor to a relatively small number like 1.0 by adding `--moe-token-capacity-factor 1.0`.
 
 **Leverage DeepSeek's DeepEP for High-Performance Cross-Node Token Dispatching**
