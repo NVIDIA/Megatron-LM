@@ -7,7 +7,10 @@ import pytest
 import torch
 
 from megatron.core import config, parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -343,6 +346,75 @@ class MoEModelTestContainer:
             grad_1, hidden_states.grad
         ), "Gradients do not match between padded and non-padded versions"
 
+    @pytest.mark.internal
+    def dispatcher_permute_padding_for_quantization_test(self):
+        """Test permute padding behavior for FP8 training.
+
+        Run the dispatch flow twice with identical routing:
+        1) moe_permute_padding_for_quantization = False
+            -> naive permute + quantization padding/unpadding
+        2) moe_permute_padding_for_quantization = True
+            -> fused permute+pad and fused unpermute+unpad
+
+        """
+        self.config.fp8 = "hybrid"
+        self.config.moe_grouped_gemm = True
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
+        )
+        moe_layer = (
+            MoELayer(self.config, transformer_layer_spec.submodules.mlp.submodules)
+            .cuda()
+            .to(dtype=self.test_dtype)
+        )
+        moe_layer.set_layer_number(0)
+        num_tokens = 32
+        hidden_states = torch.randn(
+            (num_tokens, moe_layer.config.hidden_size), dtype=self.test_dtype
+        ).cuda()
+        hidden_states.requires_grad = True
+        probs, indices = moe_layer.router(hidden_states)
+
+        # First run with moe_permute_padding_for_quantization = False, navie permute + pad
+        moe_layer.config.moe_permute_padding_for_quantization = False
+        (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs, indices
+        )
+        actual_tokens_per_expert = tokens_per_expert_1.tolist()
+        permuted_input_paded_1, tokens_per_expert_1 = moe_layer.experts.quantization_padding(
+            permuted_input_1, actual_tokens_per_expert
+        )
+        permuted_probs_paded_1, _ = moe_layer.experts.quantization_padding(
+            permuted_probs_1.unsqueeze(-1), actual_tokens_per_expert
+        )
+
+        restored_hidden_states_1 = moe_layer.experts.quantization_unpadding(
+            permuted_input_paded_1, actual_tokens_per_expert
+        )
+        restored_hidden_states_1, _ = token_unpermutation(
+            moe_layer.token_dispatcher, restored_hidden_states_1
+        )
+
+        # Run with moe_permute_padding_for_quantization = True, Fuse permute + pad
+        moe_layer.config.moe_permute_padding_for_quantization = True
+        (permuted_input_paded_2, tokens_per_expert_paded_2, permuted_probs_paded_2) = (
+            token_permutation(moe_layer.token_dispatcher, hidden_states, probs, indices)
+        )
+        restored_hidden_states_2, _ = token_unpermutation(
+            moe_layer.token_dispatcher, permuted_input_paded_2
+        )
+
+        # Check that the results are the same
+        torch.testing.assert_close(
+            permuted_input_paded_2, permuted_input_paded_1
+        ), "permuted hidden states do not match between between permute+pad and fused_permute_pad versions"
+        torch.testing.assert_close(
+            permuted_probs_paded_2.unsqueeze(-1), permuted_probs_paded_1
+        ), "permuted probs do not match between between permute+pad and fused_permute_pad versions"
+        torch.testing.assert_close(
+            restored_hidden_states_1, restored_hidden_states_2
+        ), "Restored hidden states do not match between unpermute+unpad and fused_unpermute_unpad versions"
+
     def set_params(self):
         # TODO: Set consistent parameters for various parallelisms.
         raise NotImplementedError
@@ -525,3 +597,31 @@ class TestFlexDispatcher:
         )
         container.dispatcher_router_padding_for_fp8_test()
         config.ENABLE_EXPERIMENTAL = False
+
+    @pytest.mark.skipif(
+        not is_te_min_version("2.12.0"),
+        reason="TE 2.12.0 is required for MoE fused_permute_pad with FP8.",
+    )
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep"])
+    def test_permute_padding_for_quantization(self, tp_size, ep_size, moe_flex_dispatcher_backend):
+        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=32,
+            moe_router_topk=4,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_pad_expert_input_to_capacity=False,
+            moe_permute_fusion=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
+            test_dtype=torch.bfloat16,
+        )
+        container.dispatcher_permute_padding_for_quantization_test()
