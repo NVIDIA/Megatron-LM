@@ -20,6 +20,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
@@ -184,7 +185,9 @@ class SharedExpertMLP(MLP):
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         with torch.cuda.stream(self.stream):
             # [s, b, 4 * h/p]
-            intermediate_parallel, bias_parallel = self.linear_fc1(self.cached_fc1_input)
+            intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
+                self.cached_fc1_input
+            )
             self.cached_fc1_input = None
 
             if self.config.use_te_activation_func:

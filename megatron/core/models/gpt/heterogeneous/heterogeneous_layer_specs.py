@@ -144,7 +144,9 @@ def _get_heterogenous_mlp_spec(mlp_config: MLPConfig, use_te: bool):
         mlp = ModuleSpec(
             module=MLP,
             submodules=MLPSubmodules(
-                linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
+                linear_fc1=(
+                    not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
+                ),
                 linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
             ),
         )
