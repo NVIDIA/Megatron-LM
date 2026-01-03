@@ -1,8 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
 
 import copy
 import logging
 from copy import deepcopy
+from dataclasses import dataclass
 from functools import partial
 from math import ceil
 from typing import Optional, Tuple
@@ -40,7 +42,7 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
 )
-from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -509,6 +511,18 @@ class GroupedMLP(MegatronModule):
         pass
 
 
+@dataclass
+class TEGroupedMLPSubmodules:
+    """
+    The dataclass for ModuleSpecs of TEGroupedMLP submodules
+    including  linear fc1, activation function, linear fc2.
+    """
+
+    linear_fc1: ModuleSpec | type = None
+    activation_func: ModuleSpec | type = None
+    linear_fc2: ModuleSpec | type = None
+
+
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -518,9 +532,9 @@ class TEGroupedMLP(MegatronModule):
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
     def __init__(
         self,
-        num_local_experts,
+        num_local_experts: int,
         config: TransformerConfig,
-        submodules: MLPSubmodules,
+        submodules: TEGroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)

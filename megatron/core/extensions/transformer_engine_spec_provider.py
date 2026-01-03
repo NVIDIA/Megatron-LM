@@ -18,7 +18,12 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import (
+    GroupedMLP,
+    SequentialMLP,
+    TEGroupedMLP,
+    TEGroupedMLPSubmodules,
+)
 from megatron.core.utils import get_te_version, is_te_min_version
 
 
@@ -60,14 +65,18 @@ class TESpecProvider(BackendSpecProvider):
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> Tuple[type, Optional[MLPSubmodules]]:
+    ) -> (
+        tuple[type[TEGroupedMLP], TEGroupedMLPSubmodules]
+        | tuple[type[SequentialMLP], MLPSubmodules]
+        | tuple[type[GroupedMLP], None]
+    ):
         """Which module and submodules to use for grouped mlp"""
         if (
             moe_use_grouped_gemm
             and TEColumnParallelGroupedLinear is not None
             and not moe_use_legacy_grouped_gemm
         ):
-            return TEGroupedMLP, MLPSubmodules(
+            return TEGroupedMLP, TEGroupedMLPSubmodules(
                 linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
             )
         elif moe_use_grouped_gemm:
