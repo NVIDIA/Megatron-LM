@@ -176,7 +176,7 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
                         module=MLP,
                         submodules=MLPSubmodules(
                             linear_fc1=not_none(TELayerNormColumnParallelLinear),
-                            linear_fc2=TERowParallelLinear,
+                            linear_fc2=not_none(TERowParallelLinear),
                         ),
                     ),
                     mlp_bda=get_bias_dropout_add,
@@ -192,7 +192,7 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
         module=MLP,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
-            linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+            linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
         ),
     )
 
@@ -201,6 +201,7 @@ def get_norm_mlp_module_spec_te() -> ModuleSpec:
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=not_none(TELayerNormColumnParallelLinear), linear_fc2=TERowParallelLinear
+            linear_fc1=not_none(TELayerNormColumnParallelLinear),
+            linear_fc2=not_none(TERowParallelLinear),
         ),
     )

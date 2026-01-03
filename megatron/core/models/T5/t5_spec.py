@@ -77,7 +77,7 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 module=MLP,
                 submodules=MLPSubmodules(
                     linear_fc1=not_none(TELayerNormColumnParallelLinear),
-                    linear_fc2=TERowParallelLinear,
+                    linear_fc2=not_none(TERowParallelLinear),
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -119,7 +119,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 module=MLP,
                 submodules=MLPSubmodules(
                     linear_fc1=not_none(TELayerNormColumnParallelLinear),
-                    linear_fc2=TERowParallelLinear,
+                    linear_fc2=not_none(TERowParallelLinear),
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
