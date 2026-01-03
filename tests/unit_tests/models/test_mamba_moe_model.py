@@ -16,7 +16,12 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import destroy_global_vars, get_args, set_args, set_global_variables
+from megatron.training.global_vars import (
+    destroy_global_vars,
+    get_args,
+    set_args,
+    set_global_variables,
+)
 from tests.unit_tests.test_utilities import Utils
 
 GOLDEN_CONFIG: Dict[str, Any] = {
@@ -461,13 +466,13 @@ class TestMambaMoEModel:
     def test_load_checkpoint(self):
         """Test loading the nano v3 checkpoint."""
         args = get_args()
-        args.pretrained_checkpoint = "/mnt/artifacts/model/nemotron6/3b_hybrid_moe/checkpoints/phase2_lc_reinit_emb"
+        args.pretrained_checkpoint = (
+            "/mnt/artifacts/model/nemotron6/3b_hybrid_moe/checkpoints/phase2_lc_reinit_emb"
+        )
         set_args(args)
         if os.path.exists(args.pretrained_checkpoint):
             iteration, num_floating_point_operations_so_far = load_checkpoint(
-                [self.model],
-                None,
-                None,
+                [self.model], None, None
             )
 
     def test_forward(self):
