@@ -1159,7 +1159,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
         num_splits: Optional[int] = None,
-        cp_comm_type: str = "p2p",
+        cp_comm_type: Optional[str] = "p2p",
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if not HAVE_TE:

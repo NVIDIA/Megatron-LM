@@ -77,7 +77,7 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
         submodules=CrossAttentionSubmodules(
             linear_q=not_none(TEColumnParallelLinear),
             linear_kv=not_none(TEColumnParallelLinear),
-            core_attention=TEDotProductAttention,
+            core_attention=not_none(TEDotProductAttention),
             linear_proj=TERowParallelLinear,
         ),
     )
