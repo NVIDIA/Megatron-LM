@@ -74,7 +74,8 @@ def get_bert_layer_with_transformer_engine_spec():
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                    linear_fc1=not_none(TELayerNormColumnParallelLinear),
+                    linear_fc2=TERowParallelLinear,
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
