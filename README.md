@@ -191,7 +191,7 @@ This container comes with all dependencies pre-installed with compatible version
 
 ```bash
 # Run container with mounted directories
-docker run --runtime --nvidia --gpus all -it --rm \
+docker run --gpus all -it --rm \
   -v /path/to/megatron:/workspace/megatron \
   -v /path/to/dataset:/workspace/dataset \
   -v /path/to/checkpoints:/workspace/checkpoints \
