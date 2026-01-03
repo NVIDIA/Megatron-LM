@@ -324,7 +324,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                 "weight_decay": config.weight_decay,
                 "betas": (config.adam_beta1, config.adam_beta2),
                 "eps": config.adam_eps,
+                "capturable": config.optimizer_cuda_graph,
             }
+            print (f'!!! ADAM optimizer CUDA graph enabled {config.optimizer_cuda_graph} on_device_clip_grad {config.on_device_clip_grad}')
 
             # set Adam class and weight decay mode depending
             # on source of optimizer (Torch or TE/Apex)

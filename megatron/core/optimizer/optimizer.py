@@ -196,7 +196,7 @@ class MegatronOptimizer(ABC):
         """Compute and return grad norm."""
         grads_for_norm = self.get_main_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group(), on_device=self.config.on_device_clip_grad,
         )
         return total_norm
 
@@ -208,7 +208,7 @@ class MegatronOptimizer(ABC):
         else:
             grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group(), on_device=self.config.on_device_clip_grad,
         )
 
         if params:
