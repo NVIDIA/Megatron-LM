@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euox pipefail
+# set -euox pipefail
 
 GIT_VERSION=$(git version | awk '{print $3}')
 GIT_MAJOR=$(echo $GIT_VERSION | awk -F. '{print $1}')
