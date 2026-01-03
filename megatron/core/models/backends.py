@@ -1,14 +1,16 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
 
 import warnings
 from abc import abstractmethod
-from typing import Optional, Protocol, Tuple
+from typing import Optional, Protocol
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
+from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLPSubmodules
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
+from megatron.core.typed_torch import not_none
 
 try:
     import apex  # pylint: disable=unused-import
@@ -19,8 +21,9 @@ try:
     LNImpl = FusedLayerNorm
 except ImportError:
     warnings.warn("Apex is not installed. Falling back to Torch Norm")
-    LNImpl = WrappedTorchNorm
+    FusedLayerNorm = None
     HAVE_APEX = False
+    LNImpl = WrappedTorchNorm
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
@@ -72,7 +75,7 @@ class BackendSpecProvider(Protocol):
     @abstractmethod
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> Tuple[type, Optional[MLPSubmodules]]:
+    ) -> tuple[type, MLPSubmodules | TEGroupedMLPSubmodules | None]:
         """Which module and submodules to use for grouped mlp"""
         ...
 
@@ -116,7 +119,7 @@ class LocalSpecProvider(BackendSpecProvider):
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> Tuple[type, Optional[MLPSubmodules]]:
+    ) -> tuple[type[GroupedMLP], None] | tuple[type[SequentialMLP], MLPSubmodules]:
         """Which module and submodules to use for grouped mlp"""
         if moe_use_grouped_gemm:
             warnings.warn(
@@ -163,7 +166,7 @@ class InferenceSpecProvider(BackendSpecProvider):
             # TENorm significantly harms convergence when used
             # for QKLayerNorm if TE Version < 1.9;
             # we instead use the Apex implementation.
-            return FusedLayerNorm
+            return not_none(FusedLayerNorm)
         return TENorm
 
     def core_attention(self) -> type[TEDotProductAttention]:
@@ -176,7 +179,7 @@ class InferenceSpecProvider(BackendSpecProvider):
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> Tuple[type, Optional[MLPSubmodules]]:
+    ) -> tuple[type, MLPSubmodules | TEGroupedMLPSubmodules | None]:
         raise NotImplementedError(
             "MOE is not supported with inference optimized transformer implementation."
         )
