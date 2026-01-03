@@ -72,7 +72,7 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Add a deterministic number of requests per step. This arg is "
         "prioritized over `--incoming-requests-per-sec` below (which is non-"
         "deterministic). Note that the number of requests added per step is "
-        "additionally limited by the inference context's `max_active_requests`, "
+        "additionally limited by the inference context's `max_requests`, "
         "`max_tokens`, and KV buffer size.",
     )
     group.add_argument(
@@ -393,7 +393,7 @@ def build_dynamic_engine_setup_prefix(
 
     Args:
         args (Namespace): Command-line arguments for this run.
-        context (DynamicInferenceContext): Stores limits such as `max_active_requests`,
+        context (DynamicInferenceContext): Stores limits such as `max_requests`,
             `max_tokens`, and `gtd_request_count`.
         requests (List[DynamicInferenceRequest]): List of inference requests.
 
@@ -430,7 +430,7 @@ def build_dynamic_engine_setup_prefix(
     buffer_limits_str = (
         f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
         f"{context.block_allocator.active_count} chunks "
-        f"[r {context.max_active_requests}, t {context.max_tokens}]"
+        f"[r {context.max_requests}, t {context.max_tokens}]"
     )
 
     parts = [
