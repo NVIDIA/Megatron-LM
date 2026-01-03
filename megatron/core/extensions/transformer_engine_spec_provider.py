@@ -1,7 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
 
 import warnings
-from typing import Optional, Tuple
+from typing import Optional, cast
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
@@ -17,7 +18,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import (
     GroupedMLP,
     SequentialMLP,
@@ -99,6 +100,8 @@ class TESpecProvider(BackendSpecProvider):
                 linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
             )
 
-    def activation_func(self) -> type:
+    def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
-        return TEActivationOp
+        # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
+        # design these classes always meet the interface.
+        return cast(TEActivationFunctionBuilder, TEActivationOp)

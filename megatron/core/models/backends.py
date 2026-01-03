@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import warnings
 from abc import abstractmethod
-from typing import Optional, Protocol, Tuple
+from typing import Optional, Protocol, cast
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
-from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLPSubmodules
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
@@ -78,7 +78,7 @@ class BackendSpecProvider(Protocol):
         ...
 
     @abstractmethod
-    def activation_func(self) -> type:
+    def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
         ...
 
@@ -130,7 +130,7 @@ class LocalSpecProvider(BackendSpecProvider):
                 linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
             )
 
-    def activation_func(self) -> type:
+    def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
         return None
 
@@ -171,9 +171,11 @@ class InferenceSpecProvider(BackendSpecProvider):
         """Which module to use for attention"""
         return TEDotProductAttention
 
-    def activation_func(self) -> type:
+    def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
-        return TEActivationOp
+        # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
+        # design these classes always meet the interface.
+        return cast(TEActivationFunctionBuilder, TEActivationOp)
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool

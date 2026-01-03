@@ -36,7 +36,12 @@ from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_gpu,
 )
 from megatron.core.tensor_parallel.utils import divide
-from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
+from megatron.core.transformer.mlp import (
+    MLP,
+    MLPSubmodules,
+    TEActivationFunctionBuilder,
+    apply_swiglu_sharded_factory,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_utils import (
@@ -557,7 +562,12 @@ class TEGroupedMLPSubmodules:
     """
 
     linear_fc1: LinearFc1Builder
-    activation_func: ModuleSpec | type = None
+
+    activation_func: TEActivationFunctionBuilder | None = None
+    """
+    Builder for an activation function module; only used if config.use_te_activation_func is True.
+    """
+
     linear_fc2: ModuleSpec | type = None
 
 
@@ -604,7 +614,7 @@ class TEGroupedMLP(MegatronModule):
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
-            self.activation_func = build_module(submodules.activation_func, config=self.config)
+            self.activation_func = apply_module(submodules.activation_func(config=self.config))
         else:
             self.activation_func = self.config.activation_func
 
