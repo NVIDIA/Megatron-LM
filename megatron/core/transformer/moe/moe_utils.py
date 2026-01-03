@@ -11,6 +11,7 @@ from megatron.core import parallel_state
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -918,6 +919,7 @@ def get_moe_layer_wise_logging_tracker():
     return _MOE_LAYER_WISE_LOGGING_TRACKER
 
 
+@internal_api
 class RandomSTE(torch.autograd.Function):
     """
     Straight-Through Estimator(STE) function that returns random values
@@ -926,26 +928,14 @@ class RandomSTE(torch.autograd.Function):
     This is used to generate random logits of router for load-balanced benchmark.
     """
 
-    generator = None
-    random_logits = None
-
     @staticmethod
     def forward(ctx, logits):
         """
         Forward pass returns random logits with rank-specific seed.
         """
-        if is_graph_capturing() and RandomSTE.random_logits is not None:
-            return RandomSTE.random_logits
-
-        if RandomSTE.generator is None:
-            global_rank = torch.distributed.get_rank()
-            base_seed = 42
-            seed = base_seed + global_rank
-            RandomSTE.generator = torch.Generator(device=logits.device)
-            RandomSTE.generator.manual_seed(seed)
-
-        RandomSTE.random_logits = logits.clone().normal_(generator=RandomSTE.generator)
-        return RandomSTE.random_logits
+        with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
+            random_logits = logits.clone().normal_()
+        return random_logits
 
     @staticmethod
     def backward(ctx, grad_output):
