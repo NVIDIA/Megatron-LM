@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass
-from typing import Callable, ContextManager, Optional
+from typing import Callable, ContextManager, Literal, Optional
 
 import torch
 
@@ -20,7 +20,7 @@ class ModelParallelConfig:
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
-    pipeline_model_parallel_comm_backend: Optional[str] = None
+    pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
     """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
        If None, the default backend will be used.
     """
@@ -57,7 +57,9 @@ class ModelParallelConfig:
     """Distributes Moe Experts across sub data parallel dimension."""
 
     expert_tensor_parallel_size: Optional[int] = None
-    """Intra-layer tensor model parallelsm for expert layer. Splits tensors across GPU ranks."""
+    """Intra-layer tensor model parallelsm for expert layer. Splits tensors across GPU ranks.
+       Default is None, which will be set to the value of tensor_model_parallel_size.
+    """
 
     moe_extended_tp: bool = False
     """NOTE: Deprecated from MCore v0.10. This flag is ignored.
@@ -218,7 +220,7 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: str = 'native'
+    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
     """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
        from Transformer Engine library is used. Defaults to 'native'.
     """
@@ -233,10 +235,8 @@ class ModelParallelConfig:
        If true, the AllGather -> Gemm overlap for FC1 layer of MLP gets disabled
     """
 
-    tp_comm_bootstrap_backend: str = 'nccl'
-    """
-       Set the bootstrapping backend out of 'nccl', 'mpi', and 'gloo'
-    """
+    tp_comm_bootstrap_backend: Literal['nccl', 'mpi', 'gloo'] = 'nccl'
+    """Set the bootstrapping backend of Tensor parallel communications."""
 
     overlap_moe_expert_parallel_comm: bool = False
     """Overlap EP A2A communications with independent computations of different micro-batches
