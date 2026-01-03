@@ -34,10 +34,11 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.typed_torch import not_none
 from megatron.core.utils import divide
 
 try:
@@ -184,7 +185,7 @@ class InternViTSelfAttention(SelfAttention):
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=qkv_bias,
             skip_bias_add=False,
@@ -196,20 +197,16 @@ class InternViTSelfAttention(SelfAttention):
             self.hidden_size_per_attention_head * self.num_attention_heads_per_partition
         )  # 512 for internvit
 
-        self.q_layernorm = build_module(
-            submodules.q_layernorm,
+        self.q_layernorm = not_none(submodules.q_layernorm)(
             hidden_size=qk_layernorm_hidden_size,
             config=self.config,
             eps=self.config.layernorm_epsilon,
-            compute_var=True,
         )
 
-        self.k_layernorm = build_module(
-            submodules.k_layernorm,
+        self.k_layernorm = not_none(submodules.k_layernorm)(
             hidden_size=qk_layernorm_hidden_size,
             config=self.config,
             eps=self.config.layernorm_epsilon,
-            compute_var=True,
         )
 
 
@@ -249,8 +246,8 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
                     linear_qkv=TEColumnParallelLinear if use_te else ColumnParallelLinear,
                     core_attention=TEDotProductAttention if use_te else DotProductAttention,
                     linear_proj=TERowParallelLinear if use_te else RowParallelLinear,
-                    q_layernorm=InternViTRMSNorm,
-                    k_layernorm=InternViTRMSNorm,
+                    q_layernorm=partial(InternViTRMSNorm, compute_var=True),
+                    k_layernorm=partial(InternViTRMSNorm, compute_var=True),
                 ),
             ),
             self_attn_bda=get_bias_dropout_add_layer_scaling,
