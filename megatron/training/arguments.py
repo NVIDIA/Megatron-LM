@@ -1690,6 +1690,9 @@ def _add_retro_args(parser):
 
 
 def _add_network_size_args(parser):
+    transformer_factory = ArgumentGroupFactory(TransformerConfig)
+    transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+
     group = parser.add_argument_group(title='network size')
 
     group.add_argument('--num-layers', type=int, default=None,
@@ -2274,15 +2277,9 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false',
                        help='Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
                        dest='tp_comm_bulk_wgrad')
-    group.add_argument('--tp-comm-bootstrap-backend', default='nccl', type=str,
-                       choices=['nccl', 'mpi', 'gloo'],
-                       help='Set the bootstrapping backend of Tensor parallel communications.')
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None,
                        help='If set, initialize weights on the CPU. This eliminates init differences based on tensor parallelism.')
-    group.add_argument('--deterministic-mode', action='store_true',
-                       help='Choose code that has deterministic execution. This usually '
-                       'means slower execution, but is good for debugging and testing.')
     group.add_argument('--calculate-per-token-loss', action='store_true',
                        help=('Scale cross entropy loss by the number of non-padded tokens in the '
                              'global batch, versus the default behavior of assuming all tokens are non-padded.'))
@@ -2320,12 +2317,6 @@ def _add_training_args(parser):
                       choices=['rope', 'yarn'],
                       help='Type of rope to use. Note that MLA takes yarn by default, '
                       'and common attention takes rope by default.')
-    group.add_argument('--cross-entropy-loss-fusion', action='store_true',
-                       help='Enabled fusion of cross entropy loss calculation.',
-                       dest='cross_entropy_loss_fusion')
-    group.add_argument('--cross-entropy-fusion-impl', type=str, default='native',
-                       choices=['native', 'te'],
-                       help='Implementation of cross entropy loss calculation.')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
@@ -2372,8 +2363,6 @@ def _add_training_args(parser):
                        'This kernel supports only a set of hidden sizes. Please '
                        'check persist_ln_hidden_sizes if your hidden '
                        'size is supported.')
-    group.add_argument('--sequence-parallel', action='store_true',
-                       help='Enable sequence parallel optimization.')
     group.add_argument('--no-gradient-accumulation-fusion',
                        action='store_false',
                        help='Disable fusing gradient accumulation to weight '
@@ -2392,10 +2381,6 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-split-rs', action='store_false',
                        help='Disables the Reduce-Scatter overlap with fprop GEMM.',
                        dest='tp_comm_split_rs')
-    group.add_argument('--pipeline-model-parallel-comm-backend', type=str, default=None,
-                       choices=['nccl', 'ucc'],
-                       help='Select a communicator backend for pipeline parallel communication. '
-                       'If None, the default backend will be used.')
     group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
                        help='The communicator group names to use high priority streams.')
     group.add_argument('--use-te-activation-func', action='store_true',
@@ -2602,10 +2587,6 @@ def _add_checkpointing_args(parser):
 def _add_mixed_precision_args(parser):
     group = parser.add_argument_group(title='mixed precision')
 
-    group.add_argument('--fp16', action='store_true',
-                       help='Run model in fp16 mode.')
-    group.add_argument('--bf16', action='store_true',
-                       help='Run model in bfloat16 mode.')
     group.add_argument('--grad-reduce-in-bf16', action='store_true',
                        help='Reduce gradients in bfloat16.')
     group.add_argument('--loss-scale', type=float, default=None,
@@ -2645,10 +2626,6 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     group = parser.add_argument_group(title='distributed')
 
-    group.add_argument('--tensor-model-parallel-size', type=int, default=1,
-                       help='Degree of tensor model parallelism.')
-    group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
-                       help='Degree of pipeline model parallelism.')
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
                        help=('The number of transformer layers on the first pipeline stage of the decoder. '
@@ -2694,10 +2671,6 @@ def _add_distributed_args(parser):
     group.add_argument('--defer-embedding-wgrad-compute', action='store_true',
                        default=False, help='If set, defers the vocabulary projection linear layer weight'
                        'gradient compute to pipeline flush.', dest='defer_embedding_wgrad_compute')
-    group.add_argument('--wgrad-deferral-limit', type=int, default=0, help='Number of micro-batches for which'
-                       'weight gradient computation of vocabulary projection is deferred, defaults to 0 which'
-                       'means all the micro-batches are deferred. Invalid if `defer-embedding-wgrad-compute`'
-                       'is not set')
     group.add_argument('--no-align-grad-reduce', action='store_false',
                        help='If not set, all PP stages will launch gradient reduces simultaneously. '
                        'Otherwise, each PP stage will independently launch as needed.',
@@ -2728,10 +2701,6 @@ def _add_distributed_args(parser):
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
-    group.add_argument('--use-ring-exchange-p2p', action='store_true',
-                       default=False, help='If set, use custom-built ring exchange '
-                       'for p2p communications. Note that this option will require '
-                       'a custom built image that support ring-exchange p2p.')
     group.add_argument('--local-rank', type=int, default=int(os.getenv('LOCAL_RANK', '0')),
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
@@ -2795,20 +2764,12 @@ def _add_distributed_args(parser):
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')
-    group.add_argument('--context-parallel-size', type=int, default=1,
-                       help='Degree of context parallelism.')
     group.add_argument('--cp-comm-type', nargs='+', type=str, default=["p2p"],
                        help='Inter-gpu communication type for context parallelism: '
                        'p2p, a2a, allgather or a2a+p2p. If a single string is provided, '
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
-    group.add_argument('--hierarchical-context-parallel-sizes', nargs='+', type=int, default=None,
-                       help='Degrees of the hierarchical context parallelism. Users should '
-                       'provide a list to specify the sizes for different levels. '
-                       '--hierarchical-context-parallel-sizes 2 4 indicates every two adjacent gpus '
-                       'forms the first level of cp groups and the cp ranks with the same odevity '
-                       'forms the second level of cp groups.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '
@@ -3168,10 +3129,6 @@ def _add_vision_args(parser):
 def _add_moe_args(parser):
     group = parser.add_argument_group(title="moe")
     # General arguments
-    group.add_argument('--expert-model-parallel-size', type=int, default=1,
-                       help='Degree of expert model parallelism.')
-    group.add_argument('--expert-tensor-parallel-size', type=int, default=None,
-                       help='Degree of expert model parallelism. Default is None, which will be set to the value of --tensor-model-paralle-size.')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in MoE (None means no MoE)')
     group.add_argument('--moe-layer-freq', type=moe_freq_type, default=1,
@@ -3208,8 +3165,6 @@ def _add_moe_args(parser):
     group.add_argument('--moe-layer-recompute', action='store_true',
                        help='Enable checkpointing for moe_layer, should be used when memory is not sufficient. '
                        'Deprecated. Use "--recompute-granularity selective --recompute-modules moe" instead.')
-    group.add_argument('--moe-extended-tp', action='store_true',
-                       help='Deprecated. Use --expert-tensor-parallel-size instead.')
     group.add_argument('--moe-use-upcycling', action='store_true',
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
@@ -3297,12 +3252,6 @@ def _add_moe_args(parser):
     group.add_argument('--moe-apply-probs-on-input', action='store_true',
                        help='Apply probs before mlp activation for moe routing.')
     # MoE communication overlap arguments
-    group.add_argument('--overlap-moe-expert-parallel-comm', action='store_true',
-                       help='Overlap the EP A2A communication by batch-level overlapping in 1f1b stage.')
-    group.add_argument('--delay-wgrad-compute', action='store_true',
-                       help='Delay the wgrad compute for batch-level overlapping')
-    group.add_argument('--ep-overlap-early-attn-memory-release', action='store_true',
-                       help='Release the memory of the attention module early in EP overlap.')
 
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
@@ -3412,18 +3361,6 @@ def _add_experimental_args(parser):
                             'hybrid ratio arguments, then the number of each type'
                             'of layer in the override pattern must match number in'
                             'the overidden pattern')
-    group.add_argument('--mamba-state-dim', type=int, default=128,
-                       help='State dimension for Mamba layers.')
-    group.add_argument('--mamba-head-dim', type=int, default=64,
-                       help='Head dimension for Mamba layers.')
-    group.add_argument('--mamba-num-groups', type=int, default=8,
-                       help='Number of groups for Mamba layers.')
-    group.add_argument('--mamba-num-heads', type=int, default=None,
-                       help='Number of heads for Mamba layers.'
-                       'If not set, then the number of heads will be '
-                       '--hidden-size * expand // --mamba-head-dim')
-    group.add_argument('--is-hybrid-model', default=False, action="store_true",
-                       help='Indicates whether the model is a hybrid model.')
     group.add_argument('--disable-mamba-mem-eff-path', default=False, action="store_true",
                        help='Disable Mamba efficient path.')
     group.add_argument('--yaml-cfg', type=str, default=None,
