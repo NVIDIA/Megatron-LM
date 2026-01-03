@@ -22,9 +22,11 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     get_pg_rank,
     is_torch_min_version,
@@ -390,21 +392,22 @@ class MultiTokenPredictionLayerSubmodules:
     Dataclass for specifying the submodules of a MultiTokenPrediction module.
 
     Args:
-        hnorm (Union[ModuleSpec, type]): Specification or instance of the
-             hidden states normalization to be applied.
-        enorm (Union[ModuleSpec, type]): Specification or instance of the
-            embedding normalization to be applied.
+        hnorm: Specification or instance of the hidden states normalization to be applied.
+        enorm: Specification or instance of the embedding normalization to be applied.
         eh_proj (Union[ModuleSpec, type]): Specification or instance of the
             linear projection to be applied.
         transformer_layer (Union[ModuleSpec, type]): Specification
             or instance of the transformer block to be applied.
     """
 
-    enorm: Union[ModuleSpec, type] = None
-    hnorm: Union[ModuleSpec, type] = None
+    enorm: LayerNormBuilder
+    hnorm: LayerNormBuilder
+    # TODO(nschank): Move this back below transformer_layer once eh_proj and transformer_layer have
+    # their defaults removed.
+    layer_norm: LayerNormBuilder
+
     eh_proj: Union[ModuleSpec, type] = None
     transformer_layer: Union[ModuleSpec, type] = None
-    layer_norm: Union[ModuleSpec, type] = None
 
 
 def get_mtp_layer_spec(
@@ -629,15 +632,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             + f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
         )
 
-        self.enorm = build_module(
-            self.submodules.enorm,
+        self.enorm = self.submodules.enorm(
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
 
-        self.hnorm = build_module(
-            self.submodules.hnorm,
+        self.hnorm = self.submodules.hnorm(
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
@@ -670,8 +671,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             layer_number=self.layer_number + diff_transformer_layer_offset,
         )
 
-        self.final_layernorm = build_module(
-            self.submodules.layer_norm,
+        self.final_layernorm = self.submodules.layer_norm(
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
@@ -727,9 +727,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         Concatenate the tokens before sending to transformer layer.
         """
-        decoder_input = self.enorm(decoder_input)
+        decoder_input = apply_module(self.enorm)(decoder_input)
         decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
-        hidden_states = self.hnorm(hidden_states)
+        hidden_states = apply_module(self.hnorm)(hidden_states)
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
         # and the (i + K)-th token's embedding, and combine them with linear projection.
@@ -812,7 +812,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
 
         # Layer norm before shared head layer.
-        hidden_states = self.final_layernorm(hidden_states)
+        hidden_states = apply_module(self.final_layernorm)(hidden_states)
         # TENorm produces a "viewed" tensor. This will result in schedule.py's
         # deallocate_output_tensor() throwing an error, so a viewless tensor is
         # created to prevent this.
