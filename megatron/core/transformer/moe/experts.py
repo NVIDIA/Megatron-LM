@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 from math import ceil
-from typing import Optional, Tuple
+from typing import Optional, Protocol, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -49,6 +50,7 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.typed_torch import apply_module, not_none
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -511,6 +513,42 @@ class GroupedMLP(MegatronModule):
         pass
 
 
+class LinearFc1Interface(Protocol):
+    """Interface for linear_fc1 module in MLP."""
+
+    def forward(
+        self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: list[int], /
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward method for linear_fc1 module."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward method for linear_fc1 module."""
+        ...
+
+
+class LinearFc1Builder(Protocol):
+    """Protocol describing how to build a linear_fc1 layer in TEGroupedMLP."""
+
+    def __call__(
+        self,
+        num_local_experts: int,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str | None,
+        pg_collection: ProcessGroupCollection | None,
+    ) -> LinearFc1Interface:
+        """Builds a linear_fc1 layer for TEGroupedMLP."""
+        ...
+
+
 @dataclass
 class TEGroupedMLPSubmodules:
     """
@@ -518,7 +556,7 @@ class TEGroupedMLPSubmodules:
     including  linear fc1, activation function, linear fc2.
     """
 
-    linear_fc1: ModuleSpec | type = None
+    linear_fc1: LinearFc1Builder
     activation_func: ModuleSpec | type = None
     linear_fc2: ModuleSpec | type = None
 
@@ -548,17 +586,16 @@ class TEGroupedMLP(MegatronModule):
         self.tp_group = pg_collection.expt_tp
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
-        ffn_hidden_size = self.config.moe_ffn_hidden_size
+        ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        self.linear_fc1 = build_module(
-            submodules.linear_fc1,
+        self.linear_fc1 = submodules.linear_fc1(
             self.num_local_experts,
             self.input_size if self.config.moe_latent_size is None else self.config.moe_latent_size,
             ffn_hidden_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=True,
@@ -656,7 +693,7 @@ class TEGroupedMLP(MegatronModule):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
-        tokens_per_expert = tokens_per_expert.tolist()
+        tokens_per_expert: list[int] = tokens_per_expert.tolist()
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
@@ -681,7 +718,7 @@ class TEGroupedMLP(MegatronModule):
         with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
         ) as permuted_local_hidden_states:
-            fc1_output, bias_parallel = self.linear_fc1(
+            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
                 permuted_local_hidden_states, tokens_per_expert
             )
         if self.offload_expert_fc1:
