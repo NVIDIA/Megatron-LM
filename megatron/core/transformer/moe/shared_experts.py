@@ -238,7 +238,7 @@ class SharedExpertMLP(MLP):
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         with torch.cuda.stream(self.stream):
             # [s, b, h]
-            self.cached_fc2_output, _ = self.linear_fc2(self.cached_fc2_input)
+            self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
             self.cached_fc2_input = None
 
     def post_forward_comm(self):

@@ -2,6 +2,7 @@
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
+from __future__ import annotations
 
 import os
 import warnings
@@ -1134,7 +1135,7 @@ class RowParallelLinear(torch.nn.Module):
         stride: int = 1,
         keep_master_weight_for_test: bool = False,
         is_expert: bool = False,
-        tp_comm_buffer_name: str = None,  # Not used
+        tp_comm_buffer_name: str | None = None,  # Not used
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(RowParallelLinear, self).__init__()
@@ -1242,7 +1243,7 @@ class RowParallelLinear(torch.nn.Module):
         else:
             return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
-    def forward(self, input_):
+    def forward(self, input_: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward of RowParallelLinear
 
         Args:
@@ -1299,6 +1300,13 @@ class RowParallelLinear(torch.nn.Module):
             output = output_
             output_bias = self.bias
         return output, output_bias
+
+    def backward_dw(self) -> None:
+        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled.
+
+        Not supported - does nothing.
+        """
+        pass
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
