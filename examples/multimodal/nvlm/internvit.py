@@ -61,7 +61,7 @@ class InternViTRMSNorm(MegatronModule):
 
     def __init__(
         self,
-        config,
+        config: TransformerConfig,
         hidden_size: int,
         eps: float = 1e-6,
         sequence_parallel: bool = False,
@@ -93,7 +93,7 @@ class InternViTRMSNorm(MegatronModule):
 
         return x * torch.rsqrt(var + self.eps)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run RMSNorm with an option to compute custom statistic."""
         var = None
         if self._compute_var:

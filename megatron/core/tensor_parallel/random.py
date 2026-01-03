@@ -2,10 +2,12 @@
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
+from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Optional, Union
+from collections.abc import Callable
+from typing import Any, Optional, TypeVar, TypeVarTuple, Union
 
 import torch
 from torch import _C
@@ -493,6 +495,10 @@ def is_checkpointing():
     return IS_CHECKPOINTING
 
 
+_R = TypeVar('_R')
+_Ts = TypeVarTuple('_Ts')
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -503,7 +509,12 @@ class CheckpointFunction(torch.autograd.Function):
 
     # pylint: disable=missing-function-docstring
     @staticmethod
-    def forward(ctx, run_function, distribute_saved_activations, *args):
+    def forward(
+        ctx: Any,
+        run_function: Callable[[*_Ts], _R],
+        distribute_saved_activations: bool,
+        *args: *_Ts,
+    ) -> _R:
         """Forward pass."""
         _set_checkpointing()
 
@@ -570,7 +581,9 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-def checkpoint(function, distribute_saved_activations, *args):
+def checkpoint(
+    function: Callable[[*_Ts], _R], distribute_saved_activations: bool, *args: *_Ts
+) -> _R:
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
@@ -578,12 +591,17 @@ def checkpoint(function, distribute_saved_activations, *args):
 
 class CheckpointWithoutOutputFunction(torch.autograd.Function):
     """
-    Checkpoint Function Helper for CheckpointWithouOutput.
+    Checkpoint Function Helper for CheckpointWithoutOutput.
     Save context for recompute.
     """
 
     @staticmethod
-    def forward(ctx, run_function, checkpoint_without_output_obj, *args):
+    def forward(
+        ctx: Any,
+        run_function: Callable[[*_Ts], _R],
+        checkpoint_without_output_obj: CheckpointWithoutOutput,
+        *args: *_Ts,
+    ) -> _R:
         """Forward pass."""
         if checkpoint_without_output_obj.fp8:
             fp8 = FP8GlobalStateManager.is_fp8_enabled()
@@ -641,7 +659,7 @@ class CheckpointWithoutOutput(object):
         self.ctx = None
         self.outputs = None
 
-    def checkpoint(self, run_function, *args):
+    def checkpoint(self, run_function: Callable[[*_Ts], _R], *args: *_Ts) -> _R:
         """Checkpoint function."""
 
         # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
