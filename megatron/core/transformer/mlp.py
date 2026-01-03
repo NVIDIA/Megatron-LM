@@ -81,6 +81,22 @@ class LinearFc1Builder(Protocol):
         ...
 
 
+class TEActivationFunctionInterface(Protocol):
+    """Interface for activation_function module in MLP."""
+
+    def forward(self, input_: torch.Tensor, /) -> torch.Tensor:
+        """Forward method for activation_function module."""
+        ...
+
+
+class TEActivationFunctionBuilder(Protocol):
+    """Protocol for activation_function module in MLP."""
+
+    def __call__(self, *, config: TransformerConfig) -> TEActivationFunctionInterface:
+        """Builds an activation function module for MLP."""
+        ...
+
+
 @dataclass
 class MLPSubmodules:
     """
@@ -89,7 +105,12 @@ class MLPSubmodules:
     """
 
     linear_fc1: LinearFc1Builder
-    activation_func: Union[ModuleSpec, type] = None
+
+    activation_func: TEActivationFunctionBuilder | None = None
+    """
+    Builder for an activation function module; only used if config.use_te_activation_func is True.
+    """
+
     linear_fc2: Union[ModuleSpec, type] = None
 
 
@@ -170,7 +191,7 @@ class MLP(MegatronModule):
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
-            self.activation_func = build_module(submodules.activation_func, config=self.config)
+            self.activation_func = apply_module(submodules.activation_func(config=self.config))
         else:
             self.activation_func = self.config.activation_func
 
