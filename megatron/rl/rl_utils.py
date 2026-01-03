@@ -4,6 +4,7 @@ import gc
 
 # Keep this to make the env registered.
 import itertools
+import json
 import logging
 import math
 import pickle
@@ -305,9 +306,10 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args={
-                'temperature': args.grpo_default_temperature,
+                'temperature': args.rl_default_temperature,
                 'max_tokens': args.inference_max_seq_length,
-                'top_p': args.grpo_default_top_p,
+                'top_p': args.rl_default_top_p,
+                'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
         )
@@ -796,9 +798,14 @@ def prepare_trajectories(
         inference_logprobs = None
 
     # Some sanity checks regarding the tokenization
-    assert (
-        tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
-    ), "First token should be bos"
+    if not args.rl_skip_bos_token:
+        assert (
+            tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
+        ), "First token should be bos"
+    else:
+        assert (
+            tokenizer.bos is None or (trajs[:, 0] != tokenizer.bos).all()
+        ), "First token should not be bos"  
     assert (
         tokenizer.bos is None or (trajs[:, 1] != tokenizer.bos).all()
     ), "Second token should not be bos"
@@ -1211,9 +1218,10 @@ def evaluate_and_print_results_rl(
                     validation=True,
                     rank_info=None,
                     generation_args={
-                        'temperature': args.grpo_default_temperature,
+                        'temperature': args.rl_default_temperature,
                         'max_tokens': args.seq_length,
-                        'top_p': args.grpo_default_top_p,
+                        'top_p': args.rl_default_top_p,
+                        'top_k': args.rl_default_top_k,
                     },
                 )
                 evaluation_responses = loop.run_until_complete(agent.run_evaluation(request))

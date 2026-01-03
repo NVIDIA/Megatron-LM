@@ -10,6 +10,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
@@ -181,6 +182,7 @@ class MambaModel(LanguageModule):
         labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
         runtime_gather_output: Optional[bool] = None,
+        packed_seq_params: PackedSeqParams = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
@@ -189,6 +191,9 @@ class MambaModel(LanguageModule):
         processing layer (optional).
 
         It either returns the Loss values if labels are given or the final hidden units
+
+        packed_seq_params is unused but included to maintain compatibility with
+        GPTModel's forward signature.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.

@@ -137,6 +137,6 @@ MODEL_OPTIONS="\
     --straggler-minmax-count 16 \
     --check-weight-hash-across-dp-replicas-interval 20000 \
     --rerun-mode disabled \
-    --grpo-default-temperature 0.9 \
-    --grpo-default-top-p 0.95 \
+    --rl-default-temperature 0.9 \
+    --rl-default-top-p 0.95 \
   "
