@@ -38,6 +38,10 @@ from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.inference.unified_memory import (
+    advise_managed_module_parameters_preferred_location,
+    prefetch_managed_module_parameters,
+)
 from megatron.core.utils import get_asyncio_loop, log_single_rank
 from megatron.rl.sequence_packing_utils import (
     get_microbatch_dataloader,
@@ -71,7 +75,12 @@ from megatron.training.global_vars import (
     get_wandb_writer,
 )
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
-from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0, unwrap_model
+from megatron.training.utils import (
+    get_ltor_masks_and_position_ids,
+    get_nvtx_range,
+    print_rank_0,
+    unwrap_model,
+)
 from megatron.core.utils import get_pg_size, get_attr_wrapped_model
 from megatron.core.process_groups_config import ProcessGroupCollection
 from wandb import wandb_run
@@ -83,6 +92,29 @@ logger = logging.getLogger(__name__)
 
 # Global variable to store packing context for forward_step
 _GLOBAL_PACKING_CONTEXT = None
+
+
+def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool) -> None:
+    """Prefetch RL *separate inference model* weights to CPU/GPU (UVM-only path).
+
+    Gated only by user args; this assumes the separate inference model was allocated with UVM when enabled.
+    """
+    args = get_args()
+    if not args.rl_offload_inference_model_weights_when_idle:
+        return
+    if args.rl_inference_model_unified_memory_level != 1:
+        return
+
+    device = -1 if to_cpu else int(torch.cuda.current_device())
+    advise_managed_module_parameters_preferred_location(model_core, device=device, include_buffers=True)
+    nbytes = prefetch_managed_module_parameters(model_core, device=device, include_buffers=True)
+    # Ensure pages are resident before we enter CUDA-graph capture / inference, or before training continues.
+    torch.cuda.synchronize()
+
+    if to_cpu:
+        print_rank_0(f"[Rank 0] offloaded {nbytes / 1024**2:.2f} MB of separate RL inference model weights to CPU (other ranks may vary)")
+    else:
+        print_rank_0(f"[Rank 0] prefetched {nbytes / 1024**2:.2f} MB of separate RL inference model weights to GPU (other ranks may vary)")
 
 
 def verify_model_weights_swap(
@@ -428,6 +460,11 @@ def get_environment_rollouts(
 
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
+        # If the separate inference model weights were prefetched to CPU while idle, bring them
+        # back to GPU before refit/copy and before any CUDA-graph'd inference.
+        with nvtx_range("prefetch-inference-model-weights-to-gpu"):
+            inf_core = unwrap_model(inference_model[0])
+            _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
         swap_model_weights(model, inference_model, args.refit_method)
         if args.rl_verify_model_weights_swap and args.curr_iteration == 0:
             verify_model_weights_swap(
@@ -1535,6 +1572,11 @@ def megatron_rl_inference_mode(
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
 
     lang_module.eval()
+    # If this is a separate RL inference model allocated with UVM, ensure weights are resident on GPU
+    # before any CUDA-graph capture/replay or inference.
+    with nvtx_range("prefetch-inference-model-weights-to-gpu"):
+        model_core = unwrap_model(model[0])
+        _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
     # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
@@ -1601,6 +1643,11 @@ def megatron_rl_inference_mode(
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none":
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
+
+        # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
+        # GPU memory during training.
+        with nvtx_range("prefetch-inference-model-weights-to-cpu"):
+            _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):

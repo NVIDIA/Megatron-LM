@@ -13,6 +13,7 @@ import math
 import os
 import sys
 from typing import Any, Optional
+from contextlib import nullcontext
 
 import torch.distributed
 
@@ -78,7 +79,10 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
-
+from megatron.core.inference.unified_memory import (
+                    advise_managed_module_parameters_preferred_location,
+                    prefetch_managed_module_parameters,
+                )
 from megatron.core.optimizer.qk_clip import clip_qk
 
 try:
@@ -112,6 +116,7 @@ from megatron.core.parallel_state import (
     destroy_model_parallel,
     update_pg_timeout
 )
+from megatron.core.inference.unified_memory import create_unified_mempool
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
@@ -788,15 +793,37 @@ def pretrain(
             # Build an isolated inference config so training config remains unchanged
             inference_config = copy.deepcopy(config)
             inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
-    
-            inference_model = get_model(
-                model_provider,
-                model_type,
-                wrap_with_ddp=False,
-                pg_collection=inference_pg_collection,
-                config=inference_config,
+
+            # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
+            # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
+            uvm_mempool = None
+            uvm_level = args.rl_inference_model_unified_memory_level
+            if uvm_level and uvm_level > 0:
+                uvm_mempool = create_unified_mempool()
+
+            mempool_ctx = (
+                torch.cuda.use_mem_pool(uvm_mempool) if uvm_mempool is not None else nullcontext()
             )
+            with mempool_ctx:
+                inference_model = get_model(
+                    model_provider,
+                    model_type,
+                    wrap_with_ddp=False,
+                    pg_collection=inference_pg_collection,
+                    config=inference_config,
+                )
             inference_model[0].eval()
+
+            # If requested, immediately prefetch weights to CPU to keep them off GPU when idle.
+            if (
+                uvm_mempool is not None
+                and args.rl_offload_inference_model_weights_when_idle
+            ):
+                inference_core = unwrap_model(inference_model[0])
+                advise_managed_module_parameters_preferred_location(inference_core, device=-1, include_buffers=True)
+                nbytes = prefetch_managed_module_parameters(inference_core, device=-1, include_buffers=True)
+                torch.cuda.synchronize()
+                print_rank_0(f"[Rank 0] initially offloaded {nbytes / 1024**2:.2f} MB of separate RL inference model weights to CPU (other ranks may vary)")
 
 
     # Data stuff.
