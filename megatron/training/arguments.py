@@ -87,6 +87,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_simulation_args(parser)
 
     return parser
 
@@ -1312,6 +1313,41 @@ def validate_args(args, defaults={}):
     
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
+
+    # Simulation execute mode validation
+    if args.execute_mode is not None:
+        if args.execute_mode == 'router_balanced':
+            # Automatically enable force load balancing for router_balanced mode
+            args.moe_router_force_load_balancing = True
+        elif args.execute_mode == 'load_router_map':
+            # Validate that router_map_path is provided for load_router_map mode
+            assert args.router_map_path is not None, \
+                "When execute-mode is 'load_router_map', --router-map-path must be provided."
+
+    # Validate simulate-result-dir when simulate-global-step is enabled
+    if args.simulate_global_step:
+        # Validate skip-execute and load-result-dir dependencies
+        if args.skip_execute:
+            assert args.load_result_dir is not None, \
+                "When --skip-execute is enabled, --load-result-dir must be provided to load previous results."
+            if args.rank == 0:
+                print(f"Skip-execute mode enabled, will load results from: {args.load_result_dir}", flush=True)
+        else:
+            assert args.simulate_result_dir is not None, \
+                "When --simulate-global-step is enabled (without --skip-execute), --simulate-result-dir must be provided."
+
+        # Auto-disable incompatible options in simulation mode
+        if args.overlap_grad_reduce:
+            if args.rank == 0:
+                print("WARNING: --overlap-grad-reduce is incompatible with --simulate-global-step, "
+                      "automatically disabling it.", flush=True)
+            args.overlap_grad_reduce = False
+
+        if args.overlap_param_gather:
+            if args.rank == 0:
+                print("WARNING: --overlap-param-gather is incompatible with --simulate-global-step, "
+                      "automatically disabling it.", flush=True)
+            args.overlap_param_gather = False
 
     # Print arguments.
     _print_args("arguments", args)
@@ -3542,4 +3578,28 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned", 
                        help='SFT prompt format.')
+    return parser
+
+def _add_simulation_args(parser):
+    group = parser.add_argument_group(title='simulation')
+    group.add_argument('--simulate-global-step', action="store_true",
+                       help='If True, simulate global step with only ep size gpus')
+    group.add_argument('--execute-mode', type=str, required=False, default='router_balanced',
+                       choices=['router_balanced', 'load_router_map'],
+                       help='Execution mode for simulation. '
+                       'router_balanced: force load-balanced routing by enabling moe-router-force-load-balancing. '
+                       'load_router_map: load routing map from a precomputed file dumped from inference.')
+    group.add_argument('--router-map-path', type=str, required=False, default=None,
+                       help='Path to the routing map file (required when execute-mode is load_router_map). '
+                       'This file should contain the routing map dumped from inference.')
+    group.add_argument('--simulate-result-dir', type=str, required=False, default=None,
+                       help='Directory path to store all profile results. '
+                       'Required when simulate-global-step is enabled.')
+    group.add_argument('--skip-execute', action='store_true',
+                       help='Skip actual model execution and load results from a previous run. '
+                       'When enabled, requires --load-result-dir to be specified.')
+    group.add_argument('--load-result-dir', type=str, required=False, default=None,
+                       help='Directory path to load previously saved simulation results. '
+                       'Used with --skip-execute to reanalyze existing results without re-execution.')
+
     return parser
