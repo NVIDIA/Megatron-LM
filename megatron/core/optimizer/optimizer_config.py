@@ -24,7 +24,19 @@ class ParamKey:
 
 @dataclass
 class OptimizerConfig:
-    """Base optimizer configuration object."""
+    """Configuration object for Megatron optimizers.
+
+    Attributes:
+        lr (float, optional): Initial learning rate.
+        min_lr (float, optional): Minimum learning rate for scheduler clipping.
+        weight_decay (float): L2 regularization coefficient. Defaults to 0.01.
+        fp16 (bool): Whether to use FP16 mixed precision. Defaults to False.
+        bf16 (bool): Whether to use BF16 mixed precision. Defaults to False.
+        loss_scale (float, optional): Static loss scale factor.
+        initial_loss_scale (float): Initial scale for dynamic scaling.
+        clip_grad (float): Global L2 norm threshold for clipping. Defaults to 1.0.
+        use_distributed_optimizer (bool): Whether to shard state across DP ranks.
+    """
 
     ##############
     # General

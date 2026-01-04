@@ -92,9 +92,15 @@ class Range:
 
 
 class DistributedOptimizer(MixedPrecisionOptimizer):
-    """Distributed optimizer, for all data types (fp16, bf16, and fp32).
+    """Optimizer that shards state across data-parallel ranks.
 
-    See __init__() below for argument details.
+    This class reduces memory usage by distributing optimizer states (like 
+    momentum and variance buffers) across GPUs in the data-parallel group.
+
+    Attributes:
+        model_chunks (List[MegatronModule]): Model segments being optimized.
+        per_model_buffers (Dict): Buffers managing contiguous params/grads.
+        data_parallel_group (ProcessGroup): Group for sharding and all-gathers.
     """
 
     # enumerates fully reshardable optimizer formats (as opposed to formats
@@ -217,15 +223,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @classmethod
     def _build_gbuf_range_map(cls, param_and_grad_buffer: _ParamAndGradBuffer):
         """
-        Build mapping between params and their grad buffers. These mappings are
-        partitioned according to data type.
-
-        Iterate through all buckets of grad buffer to construct param ranges
-        that this rank "owns" (the dp_rank'th shard of each bucket, where each
-        shard is 1/dp_world_size of the bucket).
+        Builds a map between parameters and their ranges in the grad buffer.
 
         Args:
-            param_and_grad_buffer (_ParamAndGradBuffer): buffer to build mapping for.
+            param_and_grad_buffer (_ParamAndGradBuffer): The buffer to map.
+
+        Returns:
+            Dict: Mapping of parameter dtypes to bucket ranges.
         """
         return {
             (param_and_grad_buffer.param_dtype, param_and_grad_buffer.grad_dtype): [

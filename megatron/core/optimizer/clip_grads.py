@@ -53,22 +53,15 @@ def get_grad_norm_fp32(
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> float:
-    """Calculate the norm of gradients in fp32.
+    """Calculate the p-norm of gradients in FP32 precision.
 
-    This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
-    added functionality to handle model parallel parameters.
-
-    Arguments:
-        grads_for_norm (Iterable[Tensor] or Tensor): an iterable of Tensors or a single
-            Tensor that will be used for calculating the grad norm.
-        norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
-            infinity norm.
-        grad_stats_parallel_group (group): Process group for reducing the grad norms. This is
-            generally the model-parallel group for non-distributed optimizers, and the entire
-            world for the distributed optimizer.
+    Args:
+        grads_for_norm (Union[List[torch.Tensor], torch.Tensor]): Gradient tensors.
+        norm_type (Union[int, float]): Type of p-norm (e.g., 2 for L2, 'inf' for max).
+        grad_stats_parallel_group (ProcessGroup, optional): Group for reduction.
 
     Returns:
-        Total norm of the parameters (viewed as a single vector).
+        float: The calculated total norm across the specified process group.
     """
 
     if isinstance(grads_for_norm, torch.Tensor):
@@ -141,17 +134,14 @@ def clip_grad_by_total_norm_fp32(
     total_norm: float,
     use_decoupled_grad: bool = False,
 ):
-    """Clips gradient of an iterable of parameters in fp32 by total norm.
-
-    Note that the gradients are modified in place.
+    """Clips gradients in-place based on a pre-calculated total norm.
 
     Args:
-        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
-            single Tensor that will have gradients normalized.
-        max_norm (float or int): max norm of the gradients.
-        total_norm (float): total norm of the gradients.
-        use_decoupled_grad (bool, optional): whether to read grad from ".grad" or ".decoupled_grad",
-            default value is False.
+        parameters (Union[List[torch.Tensor], torch.Tensor]): Tensors to clip.
+        max_norm (Union[int, float]): Maximum allowed norm.
+        total_norm (float): The current total norm of the gradients.
+        use_decoupled_grad (bool, optional): If True, clips 'decoupled_grad' 
+            instead of 'grad'. Defaults to False.
     """
     # Grads.
     params = []

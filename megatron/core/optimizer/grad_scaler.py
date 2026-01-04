@@ -9,6 +9,11 @@ import torch
 
 
 class MegatronGradScaler(ABC):
+    """Abstract base class for gradient scalers.
+
+    Args:
+        initial_scale (float): The initial value for the loss scale.
+    """
     def __init__(self, initial_scale: float):
         """Initialize scale value with the input initial scale."""
         assert initial_scale > 0.0
@@ -37,7 +42,10 @@ class MegatronGradScaler(ABC):
 
 class ConstantGradScaler(MegatronGradScaler):
     """
-    Constant grad scaler (loss scale is never adjusted regardless of NaNs seen in gradients).
+    Grad scaler with a fixed scale factor.
+
+    The loss scale is never adjusted, regardless of whether NaNs or Infs
+    are detected in the gradients.
     """
 
     def update(self, found_inf: bool):
@@ -52,10 +60,19 @@ class ConstantGradScaler(MegatronGradScaler):
 
 class DynamicGradScaler(MegatronGradScaler):
     """
-    Grad scaler with dynamic scale that gets adjusted during training.
+    Grad scaler that dynamically adjusts the scale factor during training.
 
-    Reduces loss scale by `backoff_factor` if `hysteresis` number of NaNs are seen in a row. Increases
-    loss scale by `growth_factor` if NaNs are not seen for `growth_interval` iterations.
+    Reduces the loss scale if consecutive iterations produce non-finite gradients 
+    (NaN/Inf). Increases the loss scale if gradients remain finite for a 
+    specified interval.
+
+    Args:
+        initial_scale (float): Initial loss scale value.
+        min_scale (float): Minimum permissible loss scale.
+        growth_factor (float): Multiplier for increasing the scale. Must be > 1.
+        backoff_factor (float): Multiplier for decreasing the scale. Must be < 1.
+        growth_interval (int): Iterations without NaNs before increasing scale.
+        hysteresis (int): Consecutive iterations with NaNs before decreasing scale.
     """
 
     def __init__(
