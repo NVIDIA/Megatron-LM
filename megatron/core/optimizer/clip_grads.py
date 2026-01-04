@@ -55,13 +55,19 @@ def get_grad_norm_fp32(
 ) -> float:
     """Calculate the p-norm of gradients in FP32 precision.
 
+    This function handles model-parallel parameters and ensures that norms are 
+    properly reduced across the specified process group.
+
     Args:
-        grads_for_norm (Union[List[torch.Tensor], torch.Tensor]): Gradient tensors.
-        norm_type (Union[int, float]): Type of p-norm (e.g., 2 for L2, 'inf' for max).
-        grad_stats_parallel_group (ProcessGroup, optional): Group for reduction.
+        grads_for_norm (Union[List[torch.Tensor], torch.Tensor]): Gradient tensors 
+            to be used for calculating the norm.
+        norm_type (Union[int, float]): Type of the used p-norm. Can be 'inf' 
+            for infinity norm. Defaults to 2.
+        grad_stats_parallel_group (ProcessGroup, optional): Process group for 
+            reducing the grad norms.
 
     Returns:
-        float: The calculated total norm across the specified process group.
+        float: Total norm of the parameters (viewed as a single vector).
     """
 
     if isinstance(grads_for_norm, torch.Tensor):

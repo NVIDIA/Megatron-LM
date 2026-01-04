@@ -471,35 +471,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         distributed_optimizer_instance_id: int,
     ):
         """
-        Distributed optimizer, for all data types (fp16, bf16, and fp32).
+        Initializes the distributed optimizer for FP16, BF16, and FP32.
 
-        The steps in this method create the core mapping between param and grad buffers,
-        parameters, and parameter shard ranges, that is needed for converting between model
-        param indexes and main parameter shard indexes. This method also updates the optimizer
-        parameter groups with the newly created shards.
+        This method establishes the core mapping between parameter/gradient buffers, 
+        individual parameters, and shard ranges.
 
         Args:
-            optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
-            config (OptimizerConfig): configuration object for optimizer.
-            grad_scaler (MegatronGradScaler): used for scaling gradients. Note that
-                this can be None. This case happens when `bf16 = True` and we don't
-                use any loss scale. Note that for `bf16 = True`, we can have
-                a constant gradient scaler. Also for `bf16 = False`, we
-                always require a grad scaler.
-            init_state_fn (Callable, optional): function to initialize state in the optimizer.
-            model_chunks (List[MegatronModule]): list of model chunks.
-            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): the implementation of the
-                distributed optimizer is centered on using a contiguous buffer for
-                communicating grads & params between the model state and the optimizer state.
-                You can find a more detailed description in
-                https://github.com/NVIDIA/Megatron-LM/blob/main/docs/source/distrib_optimizer.md.
-            data_parallel_group (torch.distributed.ProcessGroup): data-parallel group to use to
-                all-gather params after optimizer.step().
-            data_parallel_group_gloo (torch.distributed.ProcessGroup): gloo data-parallel group
-                (used in checkpoint loading and saving).
-            data_parallel_group_idx (int): index in data-parallel group (used by
-                distributed checkpointing logic).
-            distributed_optimizer_instance_id (int): index of the Distributed Optimizer instance.
+            optimizer (torch.optim.Optimizer): The base optimizer (e.g., Adam).
+            config (OptimizerConfig): Configuration object for the optimizer.
+            grad_scaler (MegatronGradScaler): Scaler for gradient values.
+            init_state_fn (Callable, optional): Function to initialize state.
+            model_chunks (List[MegatronModule]): List of model segments to optimize.
+            per_model_buffers (Dict): Buffers managing contiguous gradients and parameters.
+            data_parallel_group (ProcessGroup): Group used to all-gather parameters.
+            data_parallel_group_gloo (ProcessGroup, optional): Gloo group for checkpointing.
+            data_parallel_group_idx (int): Global index within the data-parallel group.
+            distributed_optimizer_instance_id (int): Unique identifier for this instance.
         """
 
         if has_config_logger_enabled(config):
