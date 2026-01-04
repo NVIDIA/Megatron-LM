@@ -55,7 +55,7 @@ EOF
 COPY docker/patches/deepep.patch /workspace/deepep.patch
 RUN bash -ex <<"EOF"
     cd /workspace
-    uv pip install nvidia-nvshmem-cu13
+    uv pip install nvidia-nvshmem-cu13==3.4.5
     pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
         ln -s libnvshmem_host.so.3 libnvshmem_host.so
     popd
