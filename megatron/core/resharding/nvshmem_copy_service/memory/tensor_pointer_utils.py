@@ -22,7 +22,7 @@ class TensorPointerExtractor:
 
         Returns:
             int: Memory address of the tensor data
-        
+
         Examples:
 
             >>> import torch
@@ -41,5 +41,3 @@ class TensorPointerExtractor:
             return tensor.data.ptr
         else:  # Assume raw integer pointer
             return tensor
-
-

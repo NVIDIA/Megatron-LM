@@ -6,16 +6,11 @@ This package is an in-tree integration of the standalone
 can use it without relying on an external library.
 """
 
-from .service import RemoteCopyService
 from . import nvshmem_types
 from .core import GPUResourceManager, KernelLauncher, PipelineExecutor
 from .memory import DoubleBufferManager, TensorPointerExtractor
-from .planning import (
-    CommunicationScheduler,
-    GPUExecutionPlanner,
-    TaskSegmenter,
-    WorkloadPacker,
-)
+from .planning import CommunicationScheduler, GPUExecutionPlanner, TaskSegmenter, WorkloadPacker
+from .service import RemoteCopyService
 
 __all__ = [
     "RemoteCopyService",
@@ -30,5 +25,3 @@ __all__ = [
     "TaskSegmenter",
     "WorkloadPacker",
 ]
-
-

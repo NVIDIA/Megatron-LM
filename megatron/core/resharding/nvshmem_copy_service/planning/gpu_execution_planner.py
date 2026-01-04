@@ -5,7 +5,7 @@ Converts high-level task descriptions into GPU-ready metadata
 (pointer arrays, sizes, chunking) for kernel execution.
 """
 
-from typing import List, Dict, Tuple, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cupy as cp
 import torch
@@ -13,9 +13,9 @@ import torch
 from ..logger import PELogger
 from ..memory.tensor_pointer_utils import TensorPointerExtractor
 from ..nvshmem_types import (
-    SendRequest,
     ReceiveRequest,
     ScheduledBatch,
+    SendRequest,
     WorkloadGroup,
     WorkloadSummary,
 )
@@ -64,20 +64,14 @@ class GPUExecutionPlanner:
 
                 # Plan kernel args for packing
                 send_batch.gpu_plan = self._plan_kernel_args(
-                    ptrs,
-                    positions,
-                    sizes,
-                    is_pack=True,
-                    buffer_base=send_slots[i % 2].data_ptr(),
+                    ptrs, positions, sizes, is_pack=True, buffer_base=send_slots[i % 2].data_ptr()
                 )
                 task_ids = [t.task_id for t in send_batch.tasks]
                 PELogger.debug(
                     f"  Iter {i} send plan: {len(send_batch.tasks)} tasks → "
                     f"PE {send_batch.dest_pe}, {send_batch.total_size} bytes"
                 )
-                displayed_ids = (
-                    task_ids[:10] if len(task_ids) <= 10 else task_ids[:10] + ["..."]
-                )
+                displayed_ids = task_ids[:10] if len(task_ids) <= 10 else task_ids[:10] + ["..."]
                 PELogger.debug(f"    Send task IDs: {displayed_ids}")
 
             recv_batch = sched["recv"]
@@ -105,9 +99,7 @@ class GPUExecutionPlanner:
 
                 # Create fast lookup map for receive requests
                 relevant_reqs: Dict[int, ReceiveRequest] = {
-                    r.task_id: r
-                    for r in receive_requests
-                    if r.src_pe == recv_batch.src_pe
+                    r.task_id: r for r in receive_requests if r.src_pe == recv_batch.src_pe
                 }
 
                 # Match summary tasks with receive requests
@@ -136,11 +128,7 @@ class GPUExecutionPlanner:
 
                 # Plan kernel args for unpacking
                 recv_batch.gpu_plan = self._plan_kernel_args(
-                    ptrs,
-                    positions,
-                    sizes,
-                    is_pack=False,
-                    buffer_base=recv_slots[i % 2].data_ptr(),
+                    ptrs, positions, sizes, is_pack=False, buffer_base=recv_slots[i % 2].data_ptr()
                 )
 
                 if recv_batch.gpu_plan is None:
@@ -225,5 +213,3 @@ class GPUExecutionPlanner:
         cp_sizes = cp.asarray(d_sizes)
 
         return (cp_src_addrs, cp_dst_addrs, cp_sizes, total_chunks)
-
-

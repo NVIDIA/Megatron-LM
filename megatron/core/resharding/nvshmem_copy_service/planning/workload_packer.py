@@ -1,7 +1,7 @@
-from typing import List, Dict
+from typing import Dict, List
 
 from ..logger import PELogger
-from ..nvshmem_types import SendRequest, WorkloadGroup, MAX_SEGMENT_SIZE, MAX_TASKS_PER_BATCH
+from ..nvshmem_types import MAX_SEGMENT_SIZE, MAX_TASKS_PER_BATCH, SendRequest, WorkloadGroup
 
 
 class WorkloadPacker:
@@ -11,9 +11,7 @@ class WorkloadPacker:
     """
 
     def pack_workloads(
-        self,
-        send_requests: List[SendRequest],
-        n_pes: int,
+        self, send_requests: List[SendRequest], n_pes: int
     ) -> Dict[int, List[WorkloadGroup]]:
         """
         Groups requests by destination PE and packs them into batches.
@@ -51,9 +49,7 @@ class WorkloadPacker:
         return workloads
 
     def _pack_single_destination(
-        self,
-        tasks: List[SendRequest],
-        dest_pe: int,
+        self, tasks: List[SendRequest], dest_pe: int
     ) -> List[WorkloadGroup]:
         if not tasks:
             return []
@@ -72,19 +68,13 @@ class WorkloadPacker:
             if (would_exceed_size or would_exceed_task_cap) and current_batch.tasks:
                 # Finalize current batch
                 batches.append(current_batch)
-                task_first_10_string = ", ".join(
-                    [str(t.task_id) for t in current_batch.tasks[:10]]
-                )
+                task_first_10_string = ", ".join([str(t.task_id) for t in current_batch.tasks[:10]])
                 PELogger.debug(
                     f"  Packed batch to PE {dest_pe} idx {len(batches) - 1}: "
                     f"{task_first_10_string}... (total {len(current_batch.tasks)} tasks)"
                 )
                 # Start new batch
-                current_batch = WorkloadGroup(
-                    dest_pe=dest_pe,
-                    tasks=[],
-                    total_size=0,
-                )
+                current_batch = WorkloadGroup(dest_pe=dest_pe, tasks=[], total_size=0)
 
             # Add task to current batch
             current_batch.tasks.append(task)
@@ -95,5 +85,3 @@ class WorkloadPacker:
             batches.append(current_batch)
 
         return batches
-
-

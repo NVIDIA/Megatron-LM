@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Any
+from typing import Any, List
 
 # Constants
 MAX_SEGMENT_SIZE = 256 * 1024 * 1024  # 256MB
@@ -57,5 +57,3 @@ class TransferMetadata:
     sizes: Any  # cupy array of uint64 (sizes)
     num_tasks: int
     total_size: int
-
-

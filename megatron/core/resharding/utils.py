@@ -82,9 +82,7 @@ class ReshardPlan:
     recv_ops: list[TransferOp]
 
     def __str__(self):
-        return (
-            f"ReshardPlan(sends={len(self.send_ops)}, recvs={len(self.recv_ops)})"
-        )
+        return f"ReshardPlan(sends={len(self.send_ops)}, recvs={len(self.recv_ops)})"
 
 
 # -----------------------------------------------------------------------------
@@ -162,7 +160,7 @@ def extract_param_metadata(
     is_tp = bool(getattr(param, 'tensor_model_parallel', False))
     partition_dim = int(getattr(param, 'partition_dim', 0))
     partition_stride = int(getattr(param, 'partition_stride', 1))
-    
+
     # SwiGLU/GLU compatibility: For gated linear units, fc1 stores interleaved [gate, up] portions
     # and requires partition_stride=2 for correct resharding. New models set this at construction
     # time (MLP sets partition_stride=2 on weight when gated_linear_unit=True). For legacy models
@@ -171,7 +169,7 @@ def extract_param_metadata(
     # and stride doesn't affect single-block transfers.
     # if 'mlp.linear_fc1' in param_name and is_tp and partition_stride == 1:
     #     partition_stride = 2
-    
+
     # EP detection: Megatron convention - expert params are not allreduced
     is_ep = not bool(getattr(param, 'allreduce', True))
 

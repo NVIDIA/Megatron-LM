@@ -2,7 +2,7 @@
 import copy
 import os
 import types
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 import pytest
 import torch
@@ -20,17 +20,16 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-
 
 try:
     import nvshmem.core
+
     has_nvshmem = True
 except Exception:
     has_nvshmem = False
-
 
 
 def _build_pg_collection(
@@ -123,6 +122,7 @@ def _set_pg_collection(module, tp_group, dp_group):
     module.pg_collection = types.SimpleNamespace(tp=tp_group, dp=dp_group, ep=None, pp=None)
     return module
 
+
 @pytest.mark.parametrize(
     "refit_backend",
     [
@@ -153,7 +153,7 @@ def _set_pg_collection(module, tp_group, dp_group):
         (2, 1, 1, 1, 2, 1, None),  # TP2,PP1 -> TP1,PP2
         (1, 2, 1, 2, 1, 1, None),  # TP1,PP2 -> TP2,PP1
         (1, 1, 2, 1, 1, 4, 4),  # EP2 -> EP4
-        (1, 1, 2, 1, 1, 1, 4),   # EP2 -> EP1
+        (1, 1, 2, 1, 1, 1, 4),  # EP2 -> EP1
         (1, 1, 1, 1, 1, 2, 4),
         (1, 1, 2, 1, 2, 2, 4),
     ],
@@ -187,7 +187,7 @@ def test_swap_gpt_parametrized(
     # Small GPT config
     seq_len = 8
     vocab_size = 128
-    # --group-query-attention   --num-query-groups 8 
+    # --group-query-attention   --num-query-groups 8
     cfg = TransformerConfig(
         num_layers=4 if (src_pp > 1 or dst_pp > 1) else 2,
         hidden_size=32,

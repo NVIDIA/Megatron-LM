@@ -5,25 +5,22 @@ Orchestrates the pack/send/unpack pipeline with double-buffering
 and proper stream synchronization.
 """
 
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
 import nvshmem.core
 import torch
 
 from ..logger import PELogger
-from ..nvshmem_types import SendRequest, ReceiveRequest, ScheduledBatch
-from .kernel_launcher import KernelLauncher
 from ..memory.double_buffer_manager import DoubleBufferManager
+from ..nvshmem_types import ReceiveRequest, ScheduledBatch, SendRequest
+from .kernel_launcher import KernelLauncher
 
 
 class PipelineExecutor:
     """Executes pipelined NVSHMEM communication with pack/send/unpack overlap."""
 
     def __init__(
-        self,
-        kernel_launcher: KernelLauncher,
-        buffer_manager: DoubleBufferManager,
-        my_pe: int,
+        self, kernel_launcher: KernelLauncher, buffer_manager: DoubleBufferManager, my_pe: int
     ):
         """
         Initialize pipeline executor.
@@ -77,9 +74,7 @@ class PipelineExecutor:
         self.unpack_events = unpack_events
 
     def execute_pipeline(
-        self,
-        iter_schedules: List[Dict[str, Optional[ScheduledBatch]]],
-        num_iterations: int,
+        self, iter_schedules: List[Dict[str, Optional[ScheduledBatch]]], num_iterations: int
     ) -> None:
         """
         Execute pipelined communication.
@@ -109,10 +104,7 @@ class PipelineExecutor:
             torch.cuda.nvtx.range_push(f"Iteration {i}")
             has_send = iter_schedules[i]["send"] is not None
             has_recv = iter_schedules[i]["recv"] is not None
-            has_next_send = (
-                i + 1 < num_iterations
-                and iter_schedules[i + 1]["send"] is not None
-            )
+            has_next_send = i + 1 < num_iterations and iter_schedules[i + 1]["send"] is not None
             has_prior_recv = i > 0 and iter_schedules[i - 1]["recv"] is not None
 
             slot = i % 2
@@ -130,9 +122,7 @@ class PipelineExecutor:
                 if has_recv
                 else ""
             )
-            PELogger.debug(
-                f"Iteration {i}/{num_iterations}: slot={slot}{send_info}{recv_info}"
-            )
+            PELogger.debug(f"Iteration {i}/{num_iterations}: slot={slot}{send_info}{recv_info}")
 
             # Step 1: Pack NEXT iteration (async)
             if has_next_send:
@@ -164,9 +154,7 @@ class PipelineExecutor:
                 batch = iter_schedules[i]["send"]
                 assert batch is not None
                 transfer_size = batch.total_size
-                PELogger.debug(
-                    f"  Send current: {transfer_size} bytes → PE {batch.dest_pe}"
-                )
+                PELogger.debug(f"  Send current: {transfer_size} bytes → PE {batch.dest_pe}")
 
                 nvshmem.core.put(
                     self.buffer_manager.recv_slots[slot][0:transfer_size],
@@ -233,9 +221,7 @@ class PipelineExecutor:
         )
 
     def process_self_moves(
-        self,
-        send_requests: List[SendRequest],
-        receive_requests: List[ReceiveRequest],
+        self, send_requests: List[SendRequest], receive_requests: List[ReceiveRequest]
     ) -> None:
         """
         Handle same-PE transfers (where src_pe == dest_pe == my_pe).
@@ -247,12 +233,8 @@ class PipelineExecutor:
             receive_requests: List of receive requests
         """
         # Match send/recv requests where src_pe == dest_pe == my_pe
-        local_sends = {
-            r.task_id: r for r in send_requests if r.dest_pe == self.my_pe
-        }
-        local_recvs = [
-            r for r in receive_requests if r.src_pe == self.my_pe
-        ]
+        local_sends = {r.task_id: r for r in send_requests if r.dest_pe == self.my_pe}
+        local_recvs = [r for r in receive_requests if r.src_pe == self.my_pe]
 
         if local_recvs:
             PELogger.debug(f"Processing {len(local_recvs)} self-moves")
@@ -263,9 +245,7 @@ class PipelineExecutor:
                 if recv_req.task_id in local_sends:
                     send_req = local_sends[recv_req.task_id]
                     PELogger.debug(
-                        "  Self-move: task_id=%d, size=%d bytes",
-                        recv_req.task_id,
-                        send_req.size,
+                        "  Self-move: task_id=%d, size=%d bytes", recv_req.task_id, send_req.size
                     )
 
                     # Create views of the tensors with offsets
@@ -285,5 +265,3 @@ class PipelineExecutor:
 
         if num_processed > 0:
             PELogger.info("Self-moves complete: %d transfers", num_processed)
-
-

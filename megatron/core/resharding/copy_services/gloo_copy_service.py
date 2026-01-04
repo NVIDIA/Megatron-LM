@@ -56,11 +56,15 @@ class GlooCopyService(CopyService):
         # Allocate a CPU buffer that matches the destination view; we'll
         # copy into dest_tensor after the Gloo recv completes.
         cpu_buffer = torch.empty_like(dest_tensor, device="cpu").contiguous()
-        self.recv_ops.append((RecvOp(task_id=None, tensor=cpu_buffer, src_rank=src_rank), dest_tensor))
+        self.recv_ops.append(
+            (RecvOp(task_id=None, tensor=cpu_buffer, src_rank=src_rank), dest_tensor)
+        )
 
     def submit_recv_with_id(self, task_id: int, dest_tensor: torch.Tensor, src_rank: int):
         cpu_buffer = torch.empty_like(dest_tensor, device="cpu").contiguous()
-        self.recv_ops.append((RecvOp(task_id=task_id, tensor=cpu_buffer, src_rank=src_rank), dest_tensor))
+        self.recv_ops.append(
+            (RecvOp(task_id=task_id, tensor=cpu_buffer, src_rank=src_rank), dest_tensor)
+        )
 
     def run(self):
         total_ops = len(self.send_ops) + len(self.recv_ops)

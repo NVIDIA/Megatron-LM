@@ -5,7 +5,7 @@ Handles NVSHMEM initialization, CUDA device setup, stream management,
 and event lifecycle.
 """
 
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 import nvshmem.core
 import torch
@@ -49,8 +49,7 @@ class GPUResourceManager:
         # torch.distributed must be initialized before calling this
         if not dist.is_initialized():
             raise RuntimeError(
-                "torch.distributed must be initialized before "
-                "GPUResourceManager.init()"
+                "torch.distributed must be initialized before " "GPUResourceManager.init()"
             )
 
         # Get current CUDA device (already set by caller based on LOCAL_RANK)
@@ -165,12 +164,8 @@ class GPUResourceManager:
         Returns:
             tuple: (pack_events, unpack_events) lists of torch.cuda.Event
         """
-        pack_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(num_events)
-        ]
-        unpack_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(num_events)
-        ]
+        pack_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
+        unpack_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
         return pack_events, unpack_events
 
     def finalize(self) -> None:
@@ -179,5 +174,3 @@ class GPUResourceManager:
         self.my_pe = -1
         self.n_pes = -1
         # Streams are automatically cleaned up when objects are deleted
-
-

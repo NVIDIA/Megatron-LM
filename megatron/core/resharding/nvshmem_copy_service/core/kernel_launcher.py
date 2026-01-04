@@ -5,7 +5,7 @@ Handles kernel compilation, launching, and stream coordination.
 """
 
 import os
-from typing import Tuple, Optional, Any
+from typing import Any, Optional, Tuple
 
 import cupy as cp
 import torch
@@ -24,20 +24,13 @@ class KernelLauncher:
     def load_kernels(self) -> None:
         """Load and compile CUDA kernels from source."""
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        kernel_path = os.path.join(
-            current_dir,
-            "..",
-            "kernels",
-            "chunked_kernel.cu",
-        )
+        kernel_path = os.path.join(current_dir, "..", "kernels", "chunked_kernel.cu")
 
         with open(kernel_path, "r") as f:
             kernel_source = f.read()
 
         self.chunked_copy_kernel = cp.RawKernel(
-            kernel_source,
-            "chunked_batched_copy_kernel",
-            options=("-std=c++11",),
+            kernel_source, "chunked_batched_copy_kernel", options=("-std=c++11",)
         )
 
     def set_streams(self, pack_stream, unpack_stream) -> None:
@@ -141,5 +134,3 @@ class KernelLauncher:
         nvtx.range_pop()
         # Record event on PyTorch stream
         unpack_event.record(stream=torch_unpack_stream)
-
-

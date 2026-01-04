@@ -275,9 +275,7 @@ def build_centralized_reshard_plan(
                         "not found in source model."
                     )
                 # Choose a representative source metadata with DP round-robin balancing
-                src_metadata = select_src_metadata_balanced(
-                    src_meta_list, dst_metadata, dst_rank
-                )
+                src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
                 sources = _determine_source_ranks_for_dst_param(
                     resolved_name, src_metadata, dst_metadata, dst_rank
                 )

@@ -13,7 +13,8 @@ Similar to the C++ Logger implementation, provides:
 - Support for TRACE, DEBUG, INFO, SUMMARY, WARN, ERROR levels
 
 """
-#TODO(Peter): We need to remove this logger and use the regular Megatron logger.
+
+# TODO(Peter): We need to remove this logger and use the regular Megatron logger.
 
 import logging
 import os
@@ -206,5 +207,3 @@ class PELogger:
                 handler.close()
             cls._logger.handlers.clear()
             cls._logger = None
-
-

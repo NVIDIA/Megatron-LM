@@ -45,11 +45,7 @@ class ValidationSummary:
         return self.failed_tasks == 0
 
 
-def generate_deterministic_data(
-    task_id: int,
-    size: int,
-    device: str = "cuda",
-) -> torch.Tensor:
+def generate_deterministic_data(task_id: int, size: int, device: str = "cuda") -> torch.Tensor:
     """
     Generate deterministic data pattern for a task.
 
@@ -70,10 +66,7 @@ def generate_deterministic_data(
 
 
 def validate_received_data(
-    task_id: int,
-    tensor: torch.Tensor,
-    size: int,
-    src_pe: int = -1,
+    task_id: int, tensor: torch.Tensor, size: int, src_pe: int = -1
 ) -> ValidationResult:
     """
     Validate received data against expected deterministic pattern.
@@ -90,11 +83,7 @@ def validate_received_data(
     recv_data = tensor[:size]
 
     # Generate expected pattern on same device
-    expected = generate_deterministic_data(
-        task_id,
-        size,
-        device=recv_data.device.type,
-    )
+    expected = generate_deterministic_data(task_id, size, device=recv_data.device.type)
 
     # Compare
     mismatches_mask = recv_data != expected
@@ -151,5 +140,3 @@ def log_validation_summary(summary: ValidationSummary) -> None:
                 len(failed_tasks),
                 task_ids[:15] if len(task_ids) <= 15 else task_ids[:15] + ["..."],
             )
-
-

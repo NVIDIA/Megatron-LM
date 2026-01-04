@@ -1,6 +1,6 @@
 from typing import List
 
-from ..nvshmem_types import SendRequest, ReceiveRequest, MAX_SEGMENT_SIZE
+from ..nvshmem_types import MAX_SEGMENT_SIZE, ReceiveRequest, SendRequest
 
 # Constants for ID encoding (from C++ implementation)
 REQUEST_ID_BASE = 1000000000
@@ -93,5 +93,3 @@ class TaskSegmenter:
             output_requests.append(new_req)
 
         return output_requests
-
-

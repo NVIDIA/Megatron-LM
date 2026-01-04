@@ -3,7 +3,7 @@ from typing import Dict, List, Tuple
 import torch
 
 from ..logger import PELogger
-from ..nvshmem_types import WorkloadGroup, ScheduledBatch, WorkloadSummary
+from ..nvshmem_types import ScheduledBatch, WorkloadGroup, WorkloadSummary
 
 
 class CommunicationScheduler:
@@ -16,10 +16,7 @@ class CommunicationScheduler:
         self.num_iterations = 0
 
     def build_schedule(
-        self,
-        workloads: Dict[int, List[WorkloadGroup]],
-        my_pe: int,
-        n_pes: int,
+        self, workloads: Dict[int, List[WorkloadGroup]], my_pe: int, n_pes: int
     ) -> Tuple[Dict[int, List[ScheduledBatch]], Dict[Tuple[int, int, int], WorkloadSummary]]:
         """
         Main scheduling method.
@@ -30,9 +27,7 @@ class CommunicationScheduler:
            - global workload summaries (key: (src, dest, batch_idx) -> summary)
         """
         total_local_batches = sum(len(groups) for groups in workloads.values())
-        PELogger.info(
-            f"Building schedule: {total_local_batches} local batches, {n_pes} PEs"
-        )
+        PELogger.info(f"Building schedule: {total_local_batches} local batches, {n_pes} PEs")
 
         # Step 1: Collect all batches across all PE pairs
         PELogger.debug("Collecting batches from all PEs...")
@@ -47,17 +42,11 @@ class CommunicationScheduler:
         # Step 3: Exchange detailed workload summaries (Task IDs/Sizes)
         # This is needed for receivers to know what tasks are in each batch
         PELogger.debug("Exchanging workload summaries...")
-        global_summaries = self._exchange_workload_summaries(
-            workloads,
-            my_pe,
-            n_pes,
-        )
+        global_summaries = self._exchange_workload_summaries(workloads, my_pe, n_pes)
         PELogger.debug(f"Exchanged {len(global_summaries)} workload summaries")
 
         # Step 4: Build schedule map for this PE
-        my_batches = [
-            b for b in all_batches if b.src_pe == my_pe or b.dest_pe == my_pe
-        ]
+        my_batches = [b for b in all_batches if b.src_pe == my_pe or b.dest_pe == my_pe]
         my_batches.sort(key=lambda x: x.iteration)
 
         final_schedule: Dict[int, List[ScheduledBatch]] = {}
@@ -67,10 +56,7 @@ class CommunicationScheduler:
         return final_schedule, global_summaries
 
     def _collect_all_batches(
-        self,
-        workloads: Dict[int, List[WorkloadGroup]],
-        my_pe: int,
-        n_pes: int,
+        self, workloads: Dict[int, List[WorkloadGroup]], my_pe: int, n_pes: int
     ) -> List[ScheduledBatch]:
         """
         Exchanges batch counts and details with all PEs to build a global view.
@@ -100,12 +86,7 @@ class CommunicationScheduler:
                 continue
             for src, dest, idx in pe_batches:
                 global_batches.append(
-                    ScheduledBatch(
-                        src_pe=src,
-                        dest_pe=dest,
-                        batch_index=idx,
-                        iteration=-1,
-                    )
+                    ScheduledBatch(src_pe=src, dest_pe=dest, batch_index=idx, iteration=-1)
                 )
 
         PELogger.debug(f"  Global batches collected: {len(global_batches)} total")
@@ -139,10 +120,7 @@ class CommunicationScheduler:
                     iteration += 1
 
     def _has_conflict(
-        self,
-        batch: ScheduledBatch,
-        iteration: int,
-        all_batches: List[ScheduledBatch],
+        self, batch: ScheduledBatch, iteration: int, all_batches: List[ScheduledBatch]
     ) -> bool:
         for other in all_batches:
             if other.iteration == iteration and other is not batch:
@@ -151,10 +129,7 @@ class CommunicationScheduler:
         return False
 
     def _exchange_workload_summaries(
-        self,
-        workloads: Dict[int, List[WorkloadGroup]],
-        my_pe: int,
-        n_pes: int,
+        self, workloads: Dict[int, List[WorkloadGroup]], my_pe: int, n_pes: int
     ) -> Dict[Tuple[int, int, int], WorkloadSummary]:
         """
         Exchange detailed workload content using torch.distributed.
@@ -181,9 +156,7 @@ class CommunicationScheduler:
                 batch_count += 1
                 total_tasks += len(group.tasks)
 
-        PELogger.debug(
-            f"  Local summaries: {batch_count} batches, {total_tasks} tasks"
-        )
+        PELogger.debug(f"  Local summaries: {batch_count} batches, {total_tasks} tasks")
 
         # Gather all summaries from all PEs using torch.distributed
         all_summaries_list: List[Dict[Tuple[int, int, int], Dict[str, object]] | None] = [
@@ -206,5 +179,3 @@ class CommunicationScheduler:
 
         PELogger.debug(f"  Exchanged {len(global_map)} workload summaries")
         return global_map
-
-

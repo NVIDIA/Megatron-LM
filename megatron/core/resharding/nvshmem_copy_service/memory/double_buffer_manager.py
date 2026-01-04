@@ -28,12 +28,10 @@ class DoubleBufferManager:
         """Allocate NVSHMEM symmetric buffers for double-buffering."""
         for i in range(2):
             self.send_slots[i] = nvshmem.core.interop.torch.bytetensor(
-                (self.slot_size,),
-                dtype=torch.uint8,
+                (self.slot_size,), dtype=torch.uint8
             )
             self.recv_slots[i] = nvshmem.core.interop.torch.bytetensor(
-                (self.slot_size,),
-                dtype=torch.uint8,
+                (self.slot_size,), dtype=torch.uint8
             )
             # Zero out buffers
             self.send_slots[i].zero_()
@@ -72,5 +70,3 @@ class DoubleBufferManager:
             if self.recv_slots[i] is not None:
                 nvshmem.core.interop.torch.free_tensor(self.recv_slots[i])
                 self.recv_slots[i] = None
-
-
