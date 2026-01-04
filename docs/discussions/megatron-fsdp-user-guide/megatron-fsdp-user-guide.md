@@ -7,6 +7,8 @@
 
 ## Megatron-FSDP Quick Start
 
+We recommend using the latest [NVIDIA NeMo Framework Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo/tags), which provides a tested software stack and optimized performance.
+
 For your reference, we provide an example launch script for DeepSeek-V3: [`sbatch_mfsdp_deepseek_v3.sh`](./example-scripts/sbatch_mfsdp_deepseek_v3.sh).
 
 ### Required Configurations
@@ -63,7 +65,7 @@ Uses persistently allocated double buffers for temporarily-defined memory needed
 
 #### 6. Add `--use-nccl-ub`
 
-Allocates and registers NCCL user buffers for param and grad buffers. This option enables an SM-efficient NCCL algorithm that could improve the performance of overlapped computations. This flag will be much more effective when used together with SHARP if the FSDP communication includes both NVL and IB domains. Enabling this option will cause additional memory overhead due to the requirement to enable the `fsdp_double_buffer` option.
+Allocates and [registers NCCL user buffers](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#) for param and grad buffers. This option enables an SM-efficient NCCL algorithm that could improve the performance of overlapped computations. This flag will be much more effective when used together with [SHARP](https://docs.nvidia.com/networking/display/sharpv3130) if the FSDP communication includes both NVL and IB domains. Enabling this option will cause additional memory overhead due to the requirement to enable the `fsdp_double_buffer` option.
 
 - **Only effective when using Megatron-LM.**
 - Defaults to `False`.
@@ -72,7 +74,7 @@ Allocates and registers NCCL user buffers for param and grad buffers. This optio
 
 ## Checkpoint Conversion from 3D-Parallel to Megatron-FSDP
 
-Megatron-FSDP introduces a new checkpoint format `fsdp_dtensor`. To help you smoothly transition from 3D-Parallel to Megatron-FSDP, we provide a script for converting checkpoints from the `torch_dist` format to the `fsdp_dtensor` format. Using DeepSeek-V3 as an example, the detailed conversion process is described below.
+Megatron-FSDP introduces `fsdp_dtensor`, a DTensor-based distributed checkpoint format that serves as its standard. To help you smoothly transition from 3D-Parallel to Megatron-FSDP, we provide a script for converting checkpoints from the `torch_dist` format to the `fsdp_dtensor` format. Using DeepSeek-V3 as an example, the detailed conversion process is described below.
 
 ### Step 1: Generate 3D-Parallel Checkpoint with `param_to_param_group_map`
 

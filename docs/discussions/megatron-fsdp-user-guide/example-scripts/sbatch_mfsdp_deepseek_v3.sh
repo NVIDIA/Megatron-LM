@@ -175,7 +175,7 @@ else
 fi
 
 if [ "${WANDB}" = 1 ]; then
-    export WANDB_API_KEY=your_own_wandb_api_key 
+    export WANDB_API_KEY=${WANDB_API_KEY:-"your_own_wandb_api_key"}
     PRETRAIN_ARGS=(
         "${PRETRAIN_ARGS[@]}"
         --wandb-project your_own_wandb_project
