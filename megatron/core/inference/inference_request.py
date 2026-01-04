@@ -6,12 +6,13 @@ import time
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.utils import experimental_api
 
 
 def serialize_tensor(tensor: torch.Tensor) -> bytes:
@@ -228,6 +229,7 @@ class DynamicInferenceEvent:
         return event
 
 
+@experimental_api
 @dataclass(kw_only=True)
 class DynamicInferenceRequest(InferenceRequest):
     """Class for one inference request
@@ -244,6 +246,7 @@ class DynamicInferenceRequest(InferenceRequest):
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     latency: Optional[float] = None
     finished_chunk_token_count = 0
+    stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
@@ -313,21 +316,27 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
-        return [getattr(sp, field) for field in self.get_metadata_labels().keys()]
+        return [getattr(sp, field) for field, _, _ in self.get_metadata_types()]
 
     @staticmethod
-    def get_metadata_labels() -> Dict[str, int]:
-        """Provides human-readable labels for the tracked metadata fields."""
-        ret = [
-            "temperature",
-            "top_k",
-            "top_p",
-            "termination_id",
-            "return_log_probs",
-            "skip_prompt_log_probs",
-            "top_n_logprobs",
+    def get_metadata_types() -> List[Tuple[str, torch.dtype, bool]]:
+        """Keeps track of all request metadata names, dtypes, and target device.
+
+        Returns:
+            List[Tuple[str, torch.dtype, bool]]: Mapping from metadata name to:
+                name (str) - The name of the metadata field.
+                dtype (torch.dtype) - The datatype of the metadata.
+                on_device (bool) - Whether the metadata lives on GPU (True) or CPU (False).
+        """
+        return [
+            ("temperature", torch.float32, False),  # CPU for torch sampling
+            ("top_k", torch.int32, False),  # CPU for torch sampling
+            ("top_p", torch.float32, False),  # CPU for torch sampling
+            ("termination_id", torch.int64, True),
+            ("return_log_probs", torch.bool, False),  # CPU for non-selective logprobs
+            ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
+            ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
         ]
-        return {k: v for v, k in enumerate(ret)}
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
         """Add event."""
@@ -408,12 +417,12 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
-    def suspend(self, tokenizer: MegatronTokenizer):
+    def suspend(self, tokenizer: MegatronTokenizer | None = None):
         """Suspend request by storing references to previous prompt, generations,
         and sampling params.
 
         Args:
-            tokenizer (MegatronTokenizer): The tokenizer.
+            tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
         """
 
         old_request = self[-1]
@@ -430,7 +439,6 @@ class DynamicInferenceRequestRecord:
             ),
             dim=0,
         )
-        new_prompt_str = tokenizer.detokenize(new_prompt_tokens.tolist())
 
         # New sampling params.
         new_sampling_params = SamplingParams(
@@ -446,17 +454,16 @@ class DynamicInferenceRequestRecord:
         # New request.
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
-            prompt=new_prompt_str,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
         )
         self.requests.append(new_request)
 
-    def merge(self, tokenizer: MegatronTokenizer) -> DynamicInferenceRequest:
+    def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
         """Merge requests into a single suspend-agnostic request object.
 
         Args:
-            tokenizer (MegatronTokenizer): The tokenizer.
+            tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
 
         Returns:
             (DynamicInferenceRequest) Merged request.
@@ -469,16 +476,18 @@ class DynamicInferenceRequestRecord:
                 return [v for r in self.requests for v in getattr(r, key)]
 
         prompt_tokens = self.requests[0].prompt_tokens
+        prompt_text = self.requests[0].prompt
         generated_tokens = merge_lists("generated_tokens")
+        generated_text = "".join(r.generated_text for r in self.requests)
 
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
-            prompt=tokenizer.detokenize(prompt_tokens.tolist()),
+            prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
-            generated_text=tokenizer.detokenize(generated_tokens),
+            generated_text=generated_text,
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
             generated_log_probs=merge_lists("generated_log_probs"),

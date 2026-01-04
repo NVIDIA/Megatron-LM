@@ -20,7 +20,7 @@ We require the following pieces of data:
 * Tokenizer
 * Dataset
 
-It also requires the installation of the [NVIDIA Model Optimizer library](https://github.com/NVIDIA/TensorRT-Model-Optimizer) (minimum version 0.15)
+It also requires the installation of the [NVIDIA Model Optimizer library](https://github.com/NVIDIA/Model-Optimizer)
 
 ### Teacher checkpoint format
 
@@ -66,7 +66,7 @@ be distinguished separately using the additional flag `--export-kd-teacher-ckpt-
 
 ## Distillation API and design
 
-Knowledge Distillation is done via the [NVIDIA Model Optimizer library](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+Knowledge Distillation is done via the [NVIDIA Model Optimizer library](https://github.com/NVIDIA/Model-Optimizer).
 
 The model creation step wraps the base model as the student in a
 `modelopt.torch.distill.DistillationModel` wrapper which also contains the teacher model.
