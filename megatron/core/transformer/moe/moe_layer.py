@@ -326,11 +326,10 @@ class MoELayer(BaseMoELayer):
 
         return outputs
 
-    def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
+    def backward_dw(self):
         """Compute weight gradients for experts and shared experts."""
-        if routed_experts:
-            self.experts.backward_dw()
-        if shared_experts and self.use_shared_expert and not self.shared_expert_overlap:
+        self.experts.backward_dw()
+        if self.use_shared_expert and not self.shared_expert_overlap:
             self.shared_experts.backward_dw()
 
     def set_for_recompute_pre_mlp_layernorm(self):
