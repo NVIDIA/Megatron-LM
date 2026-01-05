@@ -7,8 +7,6 @@ else
     TOKENIZER_MODEL=${HF_MODEL_CKPT}
 fi
 
-#TOKENIZER_MODEL="/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
-
 MODEL_ARGS=" \
     --save-interval 100000 \
     --micro-batch-size 1 \
