@@ -959,7 +959,7 @@ def print_torch_dcp_in_json(torch_dcp_dir, model_weight_prefix="model.module"):
         for key, value in state_dict.items():
             new_key = key.replace("module.module", model_weight_prefix)
             new_state_dict[new_key] = value
-
+        
         # Convert state dict to JSON-serializable format
         serializable_dict = {k: v.tolist() if hasattr(v, "tolist") else v for k, v in new_state_dict.items()}
 
