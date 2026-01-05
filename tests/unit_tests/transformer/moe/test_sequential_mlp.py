@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from importlib.metadata import version
+from typing import cast
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -41,7 +43,8 @@ class TestParallelSequentialMLP:
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
         self.sequential_mlp = MoELayer(
-            transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            transformer_config,
+            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
         )
 
     def teardown_method(self, method):

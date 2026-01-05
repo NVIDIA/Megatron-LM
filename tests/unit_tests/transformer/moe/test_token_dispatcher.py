@@ -2,6 +2,7 @@
 
 import copy
 import dataclasses
+from typing import cast
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
@@ -104,7 +106,10 @@ class MoEModelTestContainer:
         )
         new_config = dataclasses.replace(self.config, **kargs)
         moe_layer = (
-            MoELayer(new_config, transformer_layer_spec.submodules.mlp.submodules)
+            MoELayer(
+                new_config,
+                cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
+            )
             .cuda()
             .to(dtype=self.test_dtype)
         )

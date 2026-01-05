@@ -3,6 +3,7 @@
 import gc
 import os
 import sys
+from typing import cast
 
 import pytest
 import torch
@@ -37,6 +38,7 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -327,7 +329,9 @@ class TestLLaVACudaGraph:
         # Get layer specs
         language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
         vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        vision_projection_spec = deepcopy(
+            cast(TransformerLayerSubmodules, language_layer_spec.submodules).mlp.submodules
+        )
 
         # Set vision model type
         vision_config.vision_model_type = "clip"

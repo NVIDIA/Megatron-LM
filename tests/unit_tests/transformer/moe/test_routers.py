@@ -10,6 +10,7 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -47,7 +48,8 @@ class TestTop2Router:
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
         self.sequential_mlp = MoELayer(
-            self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            self.transformer_config,
+            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
         )
         self.router = cast(Router, self.sequential_mlp.router)
 
@@ -318,7 +320,8 @@ class TestGroupLimitedRouter:
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
         self.moe_layer = MoELayer(
-            self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            self.transformer_config,
+            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
         ).cuda()
         self.router = cast(Router, self.moe_layer.router)
 
@@ -425,7 +428,8 @@ class TestAuxLossFreeTop2Router:
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
         self.moe_layer = MoELayer(
-            self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            self.transformer_config,
+            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
         )
         self.router = cast(Router, self.moe_layer.router)
         assert self.router.expert_bias is not None
@@ -473,10 +477,12 @@ class TestAuxLossFreeTop2Router:
                 num_experts=self.transformer_config.num_moe_experts, moe_grouped_gemm=False
             )
             moe_layer_ref = MoELayer(
-                self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
+                self.transformer_config,
+                cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
             )
             moe_layer_fused = MoELayer(
-                self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
+                self.transformer_config,
+                cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
             )
             router_ref = moe_layer_ref.router.cuda()
             router_fused = moe_layer_fused.router.cuda()
