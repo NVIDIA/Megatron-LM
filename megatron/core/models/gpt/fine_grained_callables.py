@@ -12,6 +12,8 @@ from megatron.core import tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
+    fine_grained_offloading_group_start,
+    get_fine_grained_offloading_context,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphScope
@@ -441,13 +443,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
+                if layer.offload_mlp_norm:
+                    hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-                    pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                        layer.pre_mlp_layernorm, hidden_states
-                    )
+                    with get_fine_grained_offloading_context(layer.offload_mlp_norm):
+                        pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                            layer.pre_mlp_layernorm, hidden_states
+                        )
                 else:
-                    pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+                    with get_fine_grained_offloading_context(layer.offload_mlp_norm):
+                        pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
