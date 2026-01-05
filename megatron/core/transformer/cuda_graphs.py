@@ -10,6 +10,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import fields, is_dataclass
 from enum import Enum
+from math import ceil
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -1510,7 +1511,7 @@ class TECudaGraphHelper:
         """
         return self._graphs_created
 
-    def _get_sample_arguments(self, order):
+    def _get_sample_arguments(self, order, chunk_id_list=None):
         """
         Generate sample arguments and keyword arguments for CUDA Graph capturing with
         memory-optimized buffer reuse.
@@ -1539,6 +1540,9 @@ class TECudaGraphHelper:
             order (List[int]): The forward/backward execution order from
                 convert_schedule_table_to_order(). Positive integers represent forward passes
                 (1-indexed chunk ID), negative integers represent backward passes.
+            chunk_id_list (List[Tuple[int, int]]): The list of chunk IDs and layer IDs in the
+                order. This is useful only when overlap_moe_expert_parallel_comm is enabled,
+                the order maps each layers' idx to their original chunk id.
 
         Returns:
             Tuple[List[Tuple], List[Dict]]: A tuple containing:
@@ -1560,9 +1564,11 @@ class TECudaGraphHelper:
         assert self.num_model_chunks == max(
             order
         ), "num_model_chunks must match the max chunk id in order."
-        assert (
-            self.num_microbatches == len(order) // self.num_model_chunks // 2
-        ), "num_microbatches must match the number of microbatches in order."
+        if chunk_id_list is None:
+            # check only if 1f1b overlap is disabled.
+            assert (
+                self.num_microbatches == len(order) // self.num_model_chunks // 2
+            ), "num_microbatches must match the number of microbatches in order."
 
         # Generate sample arguments and keyword arguments for capturing.
         sample_args = [None] * (len(self.flattened_callables) * self.num_microbatches)
@@ -1645,8 +1651,8 @@ class TECudaGraphHelper:
         consumed_sample_queue = {}
         layer_sample_keys_cache = {}
         fwd_idx = [0] * self.num_model_chunks
-        for chunk_id in order:
-            model_chunk_idx = abs(chunk_id) - 1
+        for idx, chunk_id in enumerate(order):
+            model_chunk_idx = abs(ceil(chunk_id)) - 1
 
             if chunk_id > 0:
                 if model_chunk_idx not in fwd_sample_queues:
@@ -1655,7 +1661,14 @@ class TECudaGraphHelper:
                 sample_start_idx = (prefix_num_layers[model_chunk_idx] * self.num_microbatches) + (
                     fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
                 )
-                for layer_idx, layer in enumerate(self.callables_per_chunk[model_chunk_idx]):
+                if chunk_id_list:
+                    model_chunk_idx = chunk_id_list[idx][0]
+                    callables_curr_chunk = [
+                        self.callables_per_chunk[model_chunk_idx][chunk_id_list[idx][1]]
+                    ]
+                else:
+                    callables_curr_chunk = self.callables_per_chunk[model_chunk_idx]
+                for layer_idx, layer in enumerate(callables_curr_chunk):
                     per_callable_fwd_idx = sample_start_idx + layer_idx
 
                     # Get sample_args and sample_kwargs for index per_callable_fwd_idx.
@@ -1692,7 +1705,7 @@ class TECudaGraphHelper:
                         # reuse the static inputs of a previous forward pass for this forward pass.
                         # If not, we still need to generate the new static inputs.
                         sample_keys = layer_sample_keys_cache[id(layer)]
-
+                    model_chunk_idx = abs(chunk_id) - 1
                     fwd_sample_queues[model_chunk_idx].append((sample_keys, per_callable_fwd_idx))
                     if consumed_sample_queue.get(sample_keys, []):
                         # We can reuse the static inputs of a previous forward pass for this
@@ -1714,13 +1727,16 @@ class TECudaGraphHelper:
                         # Unfortunately, no previous static inputs are available for reuse,
                         # sample_args is still None. Last attempt: generate the new static inputs
                         # for this forward pass.
+                        if chunk_id_list:
+                            model_chunk_idx = chunk_id_list[idx][0]
                         sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
                             _get_layer_static_inputs(
                                 layer, self.chunks_with_decoder[model_chunk_idx]
                             )
                         )
+                        model_chunk_idx = abs(chunk_id) - 1
                 fwd_idx[model_chunk_idx] += 1
-            else:
+            elif ceil(chunk_id) == chunk_id:
                 num_consumed_samples = min(
                     len(fwd_sample_queues[model_chunk_idx]),
                     self.num_layers_per_chunk[model_chunk_idx],
@@ -1734,6 +1750,9 @@ class TECudaGraphHelper:
                 fwd_sample_queues[model_chunk_idx] = fwd_sample_queues[model_chunk_idx][
                     num_consumed_samples:
                 ]
+            else:
+                # skip register static inputs for wgrad backward graphs
+                continue
 
         return sample_args, sample_kwargs
 
@@ -1746,12 +1765,16 @@ class TECudaGraphHelper:
         # Get the PP and VPP scheduling order.
         from megatron.core.pipeline_parallel.schedules import (
             convert_schedule_table_to_order,
+            get_overlap_moe_expert_parallel_comm_order,
             get_pp_rank_microbatches,
             get_schedule_table,
         )
 
         # If PP is not enabled, we only need to capture one microbatch.
-        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
+        if (
+            parallel_state.get_pipeline_model_parallel_world_size() == 1
+            and not self.config.overlap_moe_expert_parallel_comm
+        ):
             assert (
                 self.num_model_chunks == 1
             ), "If PP is not enabled, there should be only one model chunk."
@@ -1780,9 +1803,36 @@ class TECudaGraphHelper:
             level=logging.DEBUG,
             msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
+        chunk_id_list = None
+        if self.config.overlap_moe_expert_parallel_comm:
+            wgrad_in_graph_scope = CudaGraphScope.attn in self.config.cuda_graph_scope or (
+                CudaGraphScope.moe_router in self.config.cuda_graph_scope
+                and self.config.moe_shared_expert_intermediate_size is not None
+                and not self.config.moe_shared_expert_overlap
+            )
+            capture_wgrad_graph = self.config.delay_wgrad_compute and wgrad_in_graph_scope
+            order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
+                order, self.num_layers_per_chunk, capture_wgrad_graph
+            )
+            self.num_layers_per_chunk = [1] * sum(self.num_layers_per_chunk)
+            self.num_model_chunks = max(order)
+            _order_without_wgrad = []
+            for c_id in order:
+                if ceil(c_id) != c_id:
+                    continue
+                _order_without_wgrad.append(c_id)
+            self.num_microbatches = len(_order_without_wgrad) // self.num_model_chunks // 2
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=None,
+                dp_cp_group=None,
+                level=logging.DEBUG,
+                msg=f'Rank {torch.distributed.get_rank()}: '
+                f'ORDER after overlap_moe_expert_parallel_comm {order}',
+            )
 
         # Generate sample arguments and keyword arguments for capturing.
-        sample_args, sample_kwargs = self._get_sample_arguments(order)
+        sample_args, sample_kwargs = self._get_sample_arguments(order, chunk_id_list)
 
         def get_make_graphed_callables_kwargs():
             kwargs = {
@@ -1919,13 +1969,17 @@ class TECudaGraphHelper:
             for layer_number, layer in enumerate(layers):
                 layer.cuda_graphs = []
                 for batch_number in range(self.num_microbatches):
-                    layer.cuda_graphs.append(
-                        graphs[
+                    if self.config.overlap_moe_expert_parallel_comm:
+                        graph_idx = (
+                            num_layers_accumulated + layer_number
+                        ) * self.num_microbatches + batch_number
+                    else:
+                        graph_idx = (
                             num_layers_accumulated * self.num_microbatches
                             + batch_number * len(layers)
                             + layer_number
-                        ]
-                    )
+                        )
+                    layer.cuda_graphs.append(graphs[graph_idx])
             num_layers_accumulated += len(layers)
 
         self._finish_capturing(start_time)
