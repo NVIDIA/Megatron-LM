@@ -2,17 +2,6 @@
 
 from __future__ import annotations
 
-"""
-NVSHMEM-based implementation of the CopyService interface.
-
-This wraps the higher-level RemoteCopyService so it can be used anywhere a
-CopyService is expected (e.g., refit/reshard execution).
-
-NOTE: This is a first, minimal wiring. It currently mirrors the point-to-point
-semantics of execute_reshard_plan by treating each send/recv pair as an
-independent NVSHMEM "task" defined over contiguous slices.
-"""
-
 import logging
 from typing import Dict
 
