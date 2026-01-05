@@ -177,6 +177,7 @@ def get_inference_context(
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
@@ -446,6 +447,7 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         top_n_logprobs=args.top_n_logprobs,
+        stop_words=args.stop_words,
     ) 
 
     model = get_model()

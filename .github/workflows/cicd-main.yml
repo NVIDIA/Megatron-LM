@@ -51,6 +51,7 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
+      DISABLE_EXTERNAL_CONTRIBUTOR: ${{ vars.DISABLE_EXTERNAL_CONTRIBUTOR }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -84,6 +85,43 @@ jobs:
 
           # Use SSO membership check result
           IS_MEMBER="${{ steps.check-sso.outputs.is_member }}"
+
+          # If external contributor is disabled, check if user is a repo collaborator or an org collaborator to NVIDIA or NVIDIA-NeMo
+          if [ "${{ env.DISABLE_EXTERNAL_CONTRIBUTOR }}" == "true" ] && [ "${{ steps.check-sso.outputs.is_member }}" != "true" ]; then
+            PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
+
+            echo "Checking if $PR_AUTHOR is a repo collaborator..."
+            API_URL="https://api.github.com/repos/$REPO/collaborators/$PR_AUTHOR"
+            REPO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              $API_URL)
+
+            echo "Checking if $PR_AUTHOR is an org collaborator to NVIDIA-NeMo..."
+            API_URL="https://api.github.com/orgs/NVIDIA-NeMo/members/$PR_AUTHOR"
+            ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              $API_URL)
+
+            echo "Checking if $PR_AUTHOR is an org collaborator to NVIDIA..."
+            API_URL="https://api.github.com/orgs/NVIDIA/members/$PR_AUTHOR"
+            ORG_NVIDIA_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              $API_URL)
+
+            if [ "$REPO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_MEMBERSHIP_RESPONSE" -eq 204 ]; then
+              IS_MEMBER="true"
+            else
+              exit 1
+            fi
+          fi
+
+          # Use SSO membership check result
           if [ "$IS_MEMBER" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
           else
