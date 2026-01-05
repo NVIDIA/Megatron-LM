@@ -1,5 +1,4 @@
-# megatron/core/transformer/adaptive_layernorm.py
-import torch
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import torch.nn as nn
 from typing import Tuple
 from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
