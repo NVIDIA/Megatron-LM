@@ -9,7 +9,13 @@ and proper stream synchronization.
 
 from typing import Dict, List, Optional
 
-import nvshmem.core
+try:
+    import nvshmem.core
+
+    HAVE_NVSHMEM = True
+except ImportError:
+    HAVE_NVSHMEM = False
+
 import torch
 
 from ..logger import PELogger

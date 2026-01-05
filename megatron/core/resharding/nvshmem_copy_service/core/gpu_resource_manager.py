@@ -10,7 +10,13 @@ and event lifecycle.
 import logging
 from typing import Dict, Optional
 
-import nvshmem.core
+try:
+    import nvshmem.core
+
+    HAVE_NVSHMEM = True
+except ImportError:
+    HAVE_NVSHMEM = False
+
 import torch
 import torch.distributed as dist
 from cuda.core.experimental import Device
@@ -50,6 +56,11 @@ class GPUResourceManager:
         """
         if self.initialized:
             return
+
+        if not HAVE_NVSHMEM:
+            raise RuntimeError(
+                "nvshmem.core is not available. Please install nvshmem to use GPUResourceManager."
+            )
 
         # torch.distributed must be initialized before calling this
         if not dist.is_initialized():

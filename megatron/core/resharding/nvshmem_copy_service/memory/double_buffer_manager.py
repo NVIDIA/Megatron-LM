@@ -6,7 +6,13 @@ Double buffer management for NVSHMEM symmetric memory.
 Manages send and receive buffers with double-buffering for pipelined communication.
 """
 
-import nvshmem.core.interop.torch
+try:
+    import nvshmem.core.interop.torch
+
+    HAVE_NVSHMEM = True
+except ImportError:
+    HAVE_NVSHMEM = False
+
 import torch
 
 from ..nvshmem_types import MAX_SEGMENT_SIZE
@@ -28,6 +34,12 @@ class DoubleBufferManager:
 
     def allocate(self) -> None:
         """Allocate NVSHMEM symmetric buffers for double-buffering."""
+        if not HAVE_NVSHMEM:
+            raise RuntimeError(
+                "nvshmem.core.interop.torch is not available. "
+                "Please install nvshmem to use DoubleBufferManager."
+            )
+
         for i in range(2):
             self.send_slots[i] = nvshmem.core.interop.torch.bytetensor(
                 (self.slot_size,), dtype=torch.uint8

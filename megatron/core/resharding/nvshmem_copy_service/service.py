@@ -10,7 +10,13 @@ GPU resource management, and pipelined execution.
 
 from typing import Dict, List, Optional, Tuple
 
-import nvshmem.core
+try:
+    import nvshmem.core
+
+    HAVE_NVSHMEM = True
+except ImportError:
+    HAVE_NVSHMEM = False
+
 import torch.cuda.nvtx as nvtx
 
 from .core import GPUResourceManager, KernelLauncher, PipelineExecutor
@@ -81,6 +87,11 @@ class RemoteCopyService:
         Args:
             log_level: Logging level (TRACE, DEBUG, INFO, WARN, ERROR)
         """
+        if not HAVE_NVSHMEM:
+            raise RuntimeError(
+                "nvshmem.core is not available. Please install nvshmem to use NVSHMEMCopyService."
+            )
+
         # Initialize GPU resources (NVSHMEM, device, streams)
         self.gpu_resources.init()
 
