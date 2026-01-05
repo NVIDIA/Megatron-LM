@@ -119,7 +119,8 @@ class ScheduleNode:
         self,
         forward_func: Callable,
         stream: torch.cuda.Stream,
-        event: torch.cuda.Event,
+        fwd_event: torch.cuda.Event,
+        back_event: torch.cuda.Event,
         backward_func: Optional[Callable] = None,
         free_input: bool = False,
         name: str = "schedule_node",
@@ -133,9 +134,12 @@ class ScheduleNode:
                 - 'compute' stream: Used for computational nodes like attention and experts.
                 - 'communicate' stream: Used for nodes that handle token communication,
                   such as token dispatch and combine operations in MoE layers.
-            event (torch.cuda.Event): The CUDA event used for synchronization. Each
-                microbatch within a model chunk shares the same event, which is used
-                to manage dependencies between nodes operating on different streams.
+            fwd_event (torch.cuda.Event): The CUDA event used for forward pass synchronization.
+                 It is used to manage dependencies between nodes operating on different streams 
+                 in forward pass. 
+            back_event (torch.cuda.Event): The CUDA event used for backward pass synchronization.
+                 It is used to manage dependencies between nodes operating on different streams 
+                 in backward pass. 
             backward_func (callable, optional): Function for the backward pass.
             free_input (bool): Flag to indicate if the input should be freed after the
                 forward pass.
@@ -145,7 +149,8 @@ class ScheduleNode:
         self.forward_func = forward_func
         self.backward_func = backward_func if backward_func else self.default_backward_func
         self.stream = stream
-        self.event = event
+        self.fwd_event = fwd_event
+        self.back_event = back_event
         self.free_input = free_input
         self.inputs = None
         self.outputs = None
@@ -170,7 +175,7 @@ class ScheduleNode:
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
-        with stream_acquire_context(self.stream, self.event):
+        with stream_acquire_context(self.stream, self.fwd_event):
             torch.cuda.nvtx.range_push(f"{self.name} forward")
             with torch.cuda.stream(self.stream):
                 self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
@@ -212,7 +217,7 @@ class ScheduleNode:
         return self._backward(*output_grad)
 
     def _backward(self, *output_grad):
-        with stream_acquire_context(self.stream, self.event):
+        with stream_acquire_context(self.stream, self.back_event):
             torch.cuda.nvtx.range_push(f"{self.name} backward")
             with torch.cuda.stream(self.stream):
                 outputs = self.output

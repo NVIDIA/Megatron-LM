@@ -83,16 +83,17 @@ class PreProcessNode(ScheduleNode):
     before the main transformer layers.
     """
 
-    def __init__(self, gpt_model, chunk_state, event, stream):
+    def __init__(self, gpt_model, chunk_state, fwd_event, back_event, stream):
         """Initializes a preprocessing node.
 
         Args:
             gpt_model: The GPT model instance.
             chunk_state (TransformerChunkState): State shared within a chunk
-            event: CUDA event for synchronization.
+            fwd_event: CUDA event for forward synchronization.
+            back_event: CUDA event for backward synchronization.
             stream: CUDA stream for execution.
         """
-        super().__init__(weak_method(self.forward_impl), stream, event, name="pre_process")
+        super().__init__(weak_method(self.forward_impl), stream, fwd_event, back_event, name="pre_process")
         self.gpt_model = gpt_model
         self.chunk_state = chunk_state
 
@@ -136,16 +137,17 @@ class PostProcessNode(ScheduleNode):
     after the main transformer layers.
     """
 
-    def __init__(self, gpt_model, chunk_state, event, stream):
+    def __init__(self, gpt_model, chunk_state, fwd_event, back_event, stream):
         """Initializes a postprocessing node.
 
         Args:
             gpt_model: The GPT model instance.
             chunk_state (TransformerChunkState): State shared within a chunk
-            event: CUDA event for synchronization.
+            fwd_event: CUDA event for forward synchronization.
+            back_event: CUDA event for backward synchronization.
             stream: CUDA stream for execution.
         """
-        super().__init__(weak_method(self.forward_impl), stream, event, name="post_process")
+        super().__init__(weak_method(self.forward_impl), stream, fwd_event, back_event, name="post_process")
         self.gpt_model = gpt_model
         self.chunk_state = chunk_state
 
@@ -206,7 +208,8 @@ class TransformerLayerNode(ScheduleNode):
     def __init__(
         self,
         stream,
-        event,
+        fwd_event,
+        back_event,
         layer_state,
         chunk_state,
         submodule,
@@ -218,7 +221,8 @@ class TransformerLayerNode(ScheduleNode):
 
         Args:
             stream (torch.cuda.Stream): CUDA stream for execution
-            event (torch.cuda.Event): Synchronization event
+            fwd_event (torch.cuda.Event): Forward synchronization event
+            back_event (torch.cuda.Event): Backward synchronization event
             layer_state (TransformerLayerState): State shared within a layer
             chunk_state (TransformerChunkState): State shared within a chunk
             submodule (function): The submodule contain forward and dw function
@@ -236,7 +240,8 @@ class TransformerLayerNode(ScheduleNode):
         super().__init__(
             weak_method(self.forward_impl),
             stream,
-            event,
+            fwd_event,
+            back_event,
             weak_method(self.backward_impl),
             free_input=free_input,
             name=name,

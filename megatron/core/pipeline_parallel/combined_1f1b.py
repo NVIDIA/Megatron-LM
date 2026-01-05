@@ -405,7 +405,7 @@ def combined_forward_backward_step(
         from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
 
         loss_node = ScheduleNode(
-            loss_func, torch.cuda.current_stream(), f_schedule_plan.event, name="loss_func"
+            loss_func, torch.cuda.current_stream(), f_schedule_plan.event_fwd, f_schedule_plan.event_back, name="loss_func"
         )
         loss_func = loss_node.forward
         output_tensor, num_tokens = forward_step_calc_loss(
