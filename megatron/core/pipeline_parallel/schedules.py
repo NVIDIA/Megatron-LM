@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 from functools import partial
@@ -18,6 +18,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -231,7 +232,9 @@ def forward_step_calc_loss(
 
     num_tokens = torch.tensor(0, dtype=torch.int)
     if is_last_stage:
-        if not collect_non_loss_data:
+        if loss_func is None:
+            forward_data_store.append(output_tensor)
+        elif not collect_non_loss_data:
             outputs = loss_func(output_tensor)
             if len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs
@@ -649,7 +652,7 @@ def forward_backward_no_pipelining(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and config.cuda_graph_scope != "full_iteration"
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
 
@@ -1916,7 +1919,7 @@ def forward_backward_pipelining_with_interleaving(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and config.cuda_graph_scope != "full_iteration"
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
@@ -2304,7 +2307,7 @@ def forward_backward_pipelining_without_interleaving(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and config.cuda_graph_scope != "full_iteration"
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
 
