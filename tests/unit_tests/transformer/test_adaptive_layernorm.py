@@ -1,4 +1,4 @@
-
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import torch
 from megatron.core.transformer.adaptive_layernorm import AdaLayerNormZero
 from megatron.core.transformer import TransformerConfig
