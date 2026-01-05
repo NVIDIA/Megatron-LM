@@ -2210,16 +2210,6 @@ def unwrap_model(model, module_instances=None):
     return unwrapped_model
 
 
-def maybe_cat(a, b, dim=0, *, required=False):
-    """Concatenates `a` and `b` along `dim` if `a` and `b` exist."""
-    xs = [t for t in (a, b) if t is not None]
-    if not xs:
-        if required:
-            raise ValueError("both tensors are None")
-        return None
-    return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
-
-
 _ASYNC_IO_LOOP: asyncio.AbstractEventLoop | None = None
 
 
@@ -2236,6 +2226,11 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
                 _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
     return loop
+
+
+def is_using_quantization_scales(config):
+    """Returns whether the model is using quantization scales based on the config."""
+    return getattr(config, "fp8", False) or getattr(config, "fp4", False)
 
 
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
