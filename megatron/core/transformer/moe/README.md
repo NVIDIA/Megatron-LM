@@ -107,8 +107,6 @@ Detailed documentation for each feature is available in the [Feature Documentati
 ### Use the pre-defined config to train the popular MoE models
 We have provided some pre-defined config to train the popular MoE models in the [Megatron-MoE-Model-Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo/tree/main) repository. You can use them as a reference to configure your training script. Currently we have added the config for Mixtral 8x7B, Mixtral 8x22B, DeepSeek-V3, Qwen3-30B-A3B, Qwen3-235B-A22B.
 
-## Best Practices to achieve high performance on MoE training
-
 ### General Performance Tips
 #### Training arguments
 The following flags are general performance flags that can help to achieve higher performance on almost all workloads. Check if you have enabled all of them in your training script.
@@ -146,9 +144,9 @@ export NCCL_NVLS_ENABLE=0 # Disable NVLS to prevent memory overhead
 - Use the latest version of [TransformerEngine](https://github.com/NVIDIA/TransformerEngine).
 - Use the latest [NGC PyTorch Docker Image](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
 
-### Best Practices to achieve high performance on MoE training
+## Best Practices to achieve high performance on MoE training
 
-分布式训练涉及通信、显存、计算之间的各种tradeoff，这也使得找到一个最优的parallel mapping比较复杂，这里我们提供了一个相对通用的流程来帮助你找到一个最优的并行训练配置。
+Distributed training involves complex trade-offs between **communication**, **memory**, and **computation**, making it challenging to find an optimal parallelism configuration. This section provides a systematic workflow to help you identify the best parallel mapping for your model and hardware.
 
 ### Step 1: Find the feasible parallel mapping under the memory capacity of the GPU
 To find the best parallel mapping, we need to first know the feasible parallel mapping for the model under the memory capacity of the GPU.
@@ -157,6 +155,7 @@ The consumption of memory consists of three parts:
 - Weight and gradient memory
 - Optimizer states memory
 Different parallel strategies will shard these tensor memory in different ways.
+
 | Parallel Strategy | Peak Activation Memory          | Weight Memory  | Optimizer states                  | Communication (Per-Layer) |
 |:-----------------:|:-------------------------------:|:--------------:|:---------------------------------:|:-------------------------:|
 | TP                | 1/N (with SP on)                | 1/N            | 1/N                               |        High               |
@@ -168,103 +167,175 @@ Different parallel strategies will shard these tensor memory in different ways.
 We provide the argument of `--fake-init-process-group` to emulate distributed training on one GPU. This is useful to find the feasible parallel mapping under the memory capacity of the GPU. See https://github.com/NVIDIA/Megatron-LM/pull/2254 for detailed usage.
 
 ### Step 2: Select Optimal Parallelism Strategy
-To find a good parallel mapping that help you achieve a high throughput of a new model, there are some general rule that could help. Here is an overview of properties in different aspects for each parallel strategy.
 
-For a specific model, the best parallel mapping varies based on the model architecture, trained sequence length and the hardware platform.
-Here we provide some general rules to get better performance:
-1. Keep the model parallism size as small as possible. 
-    - For the large language models, model parallism is often required to prevent OOM, but it will bring communication overhead and hurt performance. 
-    - With distributed optimizer, master weights and optimizer states will be sharded across all DP ranks with slight communication overhead.
-    So try to reduce the model parallism size and increase data parallism size when there are lots of free GPU memory during training.
-2. Ensure the EPxTP communication winthin the NVLink domain.
-    - Communications of EP and TP should remain within the NVLink domain as much as possible, as both are communication-intensive.
-    - If the model is too large and requires scaling across multiple nodes, consider PP before TP and EP. See item 3 for details.
-3. Use Pipeline Parallelism to scale the model further.
-    - Enable Virtual Pipeline Parallelism(VPP) to reduce pp bubbles when PP_size >= 2 by setting `num_layers_per_virtual_pipeline_stage`.
-    - VPP_size tuning: the legal values of vpp_size are all common divisors of num_layers/pp_size, E.g., num_layers=24, pp_size=4, then we can pick vpp_size from {1, 2, 3, 6}. The larger the vpp_size, the lower the pipeline bubbles, while the larger number of P2P communications between each PP stages. Empirically a value in the middle often gives the best trade-off. `VPP_size=num_layers / PP_size / num_layers_per_virtual_pipeline_stage`
-4. Prefer EP over TP for the expert layer when possible:
-    - TP saves more memory than EP, but EP can achieve better GEMM efficiency and less communication overhead than TP.
-    - If EP size increased to the number of expert, the local token permutation/un-permutation for experts computation are omitted.
-    - Simplify the computation graph of MoE layers, more convenient for performing potential comm-computation overlapping.
-    - In practice, EP8TP1 is better than EP4TP2 for 8x7B.
-5. Enable Context Parallelism for long context training.
-    - The efficiency of CP largely depends on whether its communication can be overlapped with computation. 
-    - Empirically, use CP when sequence length >= 8K.
+The optimal parallelism configuration varies based on **model architecture**, **sequence length**, and **hardware platform**. Below are general guidelines to help you achieve high throughput.
+
+#### Guideline 1: Minimize Model Parallelism, Maximize Data Parallelism
+
+| Aspect | Recommendation |
+|--------|----------------|
+| **Goal** | Keep TP/EP/PP as small as possible while avoiding OOM |
+| **Why** | Model parallelism introduces communication overhead that hurts performance |
+| **How** | Use distributed optimizer (`--use-distributed-optimizer`) to shard optimizer states across DP ranks, freeing memory for larger DP size |
+
+#### Guideline 2: Keep EP and TP Communication Within NVLink Domain
+
+| Aspect | Recommendation |
+|--------|----------------|
+| **Goal** | Ensure EP×TP fits within a single node (typically 8 GPUs) |
+| **Why** | EP and TP are communication-intensive; NVLink provides much higher bandwidth than cross-node interconnects |
+| **Scaling** | When scaling beyond one node, prefer PP over expanding TP/EP across nodes |
+
+**Note:**
+For very large MoE models like DeepSeek-V3, the EP communication may exceed the NVLink bandwidth. In this case, consider using 1F1B A2A Overlap to overlap the EP communication.
+
+#### Guideline 3: Use Pipeline Parallelism (PP) for Multi-Node Scaling
+
+| Aspect | Recommendation |
+|--------|----------------|
+| **Goal** | Use PP to distribute layers across nodes while keeping EP×TP within NVLink |
+| **VPP** | Enable Virtual Pipeline Parallelism to reduce pipeline bubbles when `PP ≥ 2` |
+| **Config** | Set `--num-layers-per-virtual-pipeline-stage` to control VPP size |
+
+**VPP Size Tuning:**
+- Valid values: all divisors of `num_layers / PP_size`
+- Example: `num_layers=24, PP=4` → valid VPP sizes: `{1, 2, 3, 6}`
+- Trade-off: Larger VPP = fewer bubbles but more P2P communications
+- Recommendation: A middle value often gives the best balance
+
+#### Guideline 4: Prefer EP over TP for Expert Layers
+
+| EP Advantages | Details |
+|---------------|---------|
+| **Better GEMM efficiency** | Larger local matrix sizes improve GPU utilization |
+| **Lower communication** | EP has less communication overhead than TP for MoE layers |
+| **Simpler computation graph** | Easier to overlap communication with computation |
+| **Token permutation** | When `EP = num_experts`, local token permutation is eliminated |
+
+**Example:** For Mixtral 8x7B, `EP8×TP1` outperforms `EP4×TP2`.
+
+#### Guideline 5: Enable Context Parallelism (CP) for Long Sequences
+
+| Aspect | Recommendation |
+|--------|----------------|
+| **When to use** | Sequence length ≥ 8K tokens |
+| **Key factor** | CP efficiency depends on overlapping communication with computation |
+| **Config** | Set `--context-parallel-size` to partition sequences across GPUs |
 
 ### Step 3: Enable Performance Features based on your profiling bottlenecks
+* Bottlenecked on Memory
+- 如果显存压力特别大，导致不得不开full recompute或者开特别大的并行维度，可以尝试使用overhead更小的memory优化方案，比如
+    - selective recompute, 
+    - activation offloading, 
+    - optimizer offloading等，请查看对应的文档。
+* Bottlenecked on Communication Optimization
+- 如果发现通信成为瓶颈，可以分析通信的瓶颈在哪里，然后尝试启用对应的
+    - DP communication overlap, before 
+    - TP communication
+    - EP communication
+    - PP communication overlap
+* Bottlenecked on CPU Overhead
+    - 如果发现在timeline中，GPU kernel的launch在等待CPU导致bubble特别多，说明CPU overhead比较大
+        * Disable GC
+        * 开启partial cuda graph
+        * 尝试减小TP并行或者增大micro batch size
+* slow compuation 
+    * 确保下列的fusion已开启: --moe-router-fusion, --moe-grouped-gemm, --moe-permute-fusion
+    * 尝试使用更低精度的计算来加速，比如FP8
 
-#### Memory Optimization
-
-#### Communication Optimization
-- **1F1B Overlap**: `--overlap-moe-expert-parallel-comm`
-- **Shared Expert Overlap**: `--moe-shared-expert-overlap`
-- **DeepEP**: `--moe-token-dispatcher-type flex --moe-enable-deepep`
-
-#### Compute Optimization
-- **Router Fusion**: `--moe-router-fusion`
-- **GroupedGEMM**: `--moe-grouped-gemm`
-- **Permute Fusion**: `--moe-permute-fusion`
-
-#### Memory Optimization
-- **Precision-aware Optimizer**: Automatic with distributed optimizer
-- **Selective Recomputation**: `--recompute-granularity selective`
-- **FP8 Training**: `--fp8 --moe-router-padding-for-fp8`
 
 ## Feature Documentation
 
 ### Router and Load Balancing
 
+Routers determine which expert(s) handle each token. A lightweight MLP scores every token and applies `softmax` or `sigmoid` to compute routing probabilities. The router then selects the top-K experts for each token.
+
+> **Note**: The router logits is better to remain in **FP32** or **FP64** rather than BF16 by --moe-router-dtype fp32. At high expert counts, FP32 precision yields better accuracy because output hidden states of experts are multiplied by router scores and accumulated to get the final output.
+
 #### Router Types
-- **Top-K Router**: Standard routing with configurable K
-- **Group-limited Routing**: Node/device-aware routing
-- **Aux-loss-free**: Dynamic bias-based load balancing
+
+| Router Types | Description | Config |
+|-------------|-------------|----------|
+| **Top-K Router** | Standard routing with configurable K, uses softmax for probability computation | --moe-router-topk 8 |
+| **Group Top-K Router** | Selects top-K expert groups, then routes experts in selected groups | --moe-router-num-groups 8 --moe-router-group-topk 4 |
+| **Router score function** | Score function to calculate the probs from output logits of router | --moe-router-score-function softmax/sigmoid |
+
+#### Load Balancing Strategies
+
+| Strategy | Description | Config |
+|----------|-------------|--------|
+| **aux_loss** | Auxiliary loss for balancing expert usage on a micro-batch | `--moe-router-load-balancing-type aux_loss` |
+| **seq_aux_loss** | Sequence-level auxiliary loss for balancing expert usage on each sequence| `--moe-router-load-balancing-type seq_aux_loss` |
+| **global_aux_loss** | Global auxiliary loss for balancing expert usage on a global batch across all ranks | `--moe-router-load-balancing-type global_aux_loss` |
+| **sinkhorn** | Optimal transport formulation for balancing expert usage | `--moe-router-load-balancing-type sinkhorn` |
+| **aux loss free** | Dynamic bias-based load balancing strategy without auxiliary loss | `--moe-router-enable-expert-bias --moe-router-bias-update-rate 1e-3`|
+| **none** | No load balancing | `--moe-router-load-balancing-type none` |
 
 ### Token Dispatching
 
-#### Dispatcher Types
-- **allgather**: Best for TP-only or large Top-K
-- **alltoall**: Recommended for EP > 1
-- **flex**: Advanced dispatcher with DeepEP support
+After routing, tokens are **dispatched** to the GPU hosting the assigned expert. After expert computation, tokens are sent back and **combined** to restore the original sequence.
 
-#### Token Drop Policies
-```bash
-# Dropless (default, recommended)
-# No additional flags needed
+| Dispatcher | Description | Best For | Config |
+|------------|-------------|----------|--------|
+| **alltoall** | NCCL-based All-to-All communication for token exchange | Standard EP > 1 setups | `--moe-token-dispatcher-type alltoall` |
+| **FlexDispatcher with [DeepEP](https://github.com/deepseek-ai/DeepEP) backend** | Removes redundant tokens during cross-node communication, fuses intra/inter-node communication into single kernel | Cross-node EP, fine-grained MoE (DeepSeek-V3) | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
+| **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
+| **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
 
-# With capacity factor
---moe-expert-capacity-factor 1.0
---moe-pad-expert-input-to-capacity  # Optional padding
-```
+### Upcycling
+Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
 
-#### Load Balancing Strategies
-```bash
-# Auxiliary loss (recommended for most cases)
---moe-router-load-balancing-type aux_loss
---moe-aux-loss-coeff 1e-2
+In addition to the default upcycling strategy, we also support granular upcycling strategy which is a more state-of-the-art upcycling strategy from [our recent research work](https://arxiv.org/abs/2410.07524). For the default upcycling strategy, we duplicate the existing MLP to multiple experts, with each expert starting from a copy of the MLP. For the granular upcycling strategy, we use `--moe-upcycling-granularity` to specify how many times smaller is the expert hidden size compared with the original dense FFN hidden size. For using granular upcycling strategy, please set `--moe-upcycling-granularity` as a positive integer. If this param is set to 1, it means using the default upcycling strategy.
 
-# Sinkhorn algorithm
---moe-router-load-balancing-type sinkhorn
+Note: The MoE model structure is defined through script arguments. All MoE-related arguments (such as `--num-experts`) can be customized; however, other model structure arguments must be consistent with those of the dense model. For granular upcycling strategy, the moe's FFN hidden size should be set as dense FFN hidden size divided by `--moe-upcycling-granularity`.
 
-# Aux-loss-free (DeepSeek-V3 style)
---moe-router-load-balancing-type none
---moe-router-enable-expert-bias
---moe-router-bias-update-rate 1e-3
-```
+## Training Optimizations
+MoE training faces three fundamental performance bottlenecks: **Memory Wall**, **Communication Wall**, and **Compute Efficiency Wall**. The following optimizations address each of these challenges.
 
-### Selective Computation
+### MoE Parallel Folding
+**The Problem with Traditional Approaches:**
+- Prior MoE frameworks constrain **EP ≤ DP** (Expert Parallelism must be a sub-group of Data Parallelism), which severely limits scalability.
+- Applying the same TP/CP to both attention and MoE is suboptimal:
+  - High TP benefits attention but hurts MoE (small per-expert dims make TP overhead prohibitive)
+  - High CP benefits long-context attention but is unnecessary for MoE (tokens processed independently)
 
-### Precision-aware Optimizer
+**MoE Parallel Folding** is Megatron Core's solution that **decouples attention and MoE parallelism**:
 
-The parallelism patterns of the shared experts follow the settings of the dense part, i.e., the attention module. The shared experts are not distributed but replicated in EP ranks.
+| Parallelism Group | Attention Layers | MoE Layers |
+|-------------------|------------------|------------|
+| **Dimensions** | TP × CP × DP × PP | ETP × EP × EDP × PP |
 
-We also have an experimental feature that tries to overlap the communications and computations in the shared experts and the dispatcher.
-We can set `--moe-shared-expert-overlap` and use `alltoall` dispatcher to enable it.
-The overlapping relies on the envirionment setting `CUDA_DEVICE_MAX_CONNECTIONS=1`.
-The `AllGather` and `ReduceScatter` communications in the shared experts are overlapped with `permute`/`unpermute` in the dispatcher.
-The `MLP` computation part in the shared experts are overlapped with the `AlltoAll` communications in the dispatcher.
-Both the forward and the backward pass can overlap. But to get the overlapping in the backward pass, the PyTorch version should `>= 2.2.0`.
+#### Key Benefits
 
-### Checkpointing
+1. **Breaks the EP ≤ DP Constraint**
+   - Traditional: TP=4, CP=2, DP=8, PP=4 → max EP=8
+   - With Folding: Same attention config, but MoE uses ETP=1, EP=64, EDP=1 → 8× more expert parallelism
+
+2. **Reduces Minimum GPU Requirements**
+   - Traditional CP=8, EP=8 requires at least 64 GPUs
+   - With Folding: CP and EP are folded together, only 8 GPUs needed
+
+3. **Enables Independent Optimization**
+   - Use high TP for attention (memory efficiency)
+   - Use ETP=1 for MoE (better GEMM efficiency, less communication)
+
+4. **Keeps High-Bandwidth Communication in NVLink Domain**
+   - Both CP and EP communication can remain within NVLink domain
+
+> **Reference**: [MoE Parallel Folding: Heterogeneous Parallelism Mappings for Efficient Large-Scale MoE Model Training](https://arxiv.org/abs/2504.14960)
+
+### Memory Optimization
+
+Memory optimization is critical for large-scale MoE training, as MoE models maintain all expert parameters even though only a subset is activated per token.
+
+| Optimization | Description | Config |
+|--------------|-------------|--------|
+| **FP8 Activation** | Stores linear layer inputs in FP8 instead of BF16, reducing activation memory by ~50% | `--fp8` |
+| **Fine-grained Recomputation** | Selectively recomputes specific modules (e.g., `mla_up_proj`, `layernorm`, `moe_act`) instead of full layers | `--recompute-granularity selective --recompute-modules mla_up_proj layernorm moe_act` |
+| **Fine-grained Activation Offloading** | Offloads activations to CPU memory, overlapping D2H/H2D transfers with computation | See `docs/source/api-guide/fine_grained_activation_offloading.md` |
+| **Precision-aware Optimizer** | Stores optimizer states (exp_avg, exp_avg_sq) in BF16 instead of FP32, reducing optimizer memory by 50% | `--use-precision-aware-optimizer --exp-avg-dtype bf16 --exp-avg-sq-dtype bf16` |
+
+#### Checkpointing / Recomputation
 A new output-discarding checkpointing method is also supported. This method discards the output memory of certain submodules during the forward pass and recomputes them during the backward pass, which can save memory compared to standard checkpointing. This can be enabled for specific submodules using the `--recompute-granularity selective --recompute-modules [submodule1, submodule2, ...]` argument. The supported submodules are:
 
 * `moe_act`: Recompute the GroupedMLP activation function.
@@ -274,48 +345,7 @@ A new output-discarding checkpointing method is also supported. This method disc
 * `mlp`: Recompute the dense MLP submodule (uses standard checkpointing rather than output-discarding) which is useful for hybrid-models like DeepSeek-V3.
 * `moe`: Recompute the MoE layer submodule (uses standard checkpointing rather than output-discarding).
 
-### Upcycling
-Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
-
-In addition to the default upcycling strategy, we also support granular upcycling strategy which is a more state-of-the-art upcycling strategy from [our recent research work](https://arxiv.org/abs/2410.07524). For the default upcycling strategy, we duplicate the existing MLP to multiple experts, with each expert starting from a copy of the MLP. For the granular upcycling strategy, we use `--moe-upcycling-granularity` to specify how many times smaller is the expert hidden size compared with the original dense FFN hidden size. For using granular upcycling strategy, please set `--moe-upcycling-granularity` as a positive integer. If this param is set to 1, it means using the default upcycling strategy.
-
-Note: The MoE model structure is defined through script arguments. All MoE-related arguments (such as `--num-experts`) can be customized; however, other model structure arguments must be consistent with those of the dense model. For granular upcycling strategy, the moe's FFN hidden size should be set as dense FFN hidden size divided by `--moe-upcycling-granularity`.
-
-### Leverage DeepSeek's DeepEP for High-Performance Cross-Node Token Dispatching
-- [DeepSeek-DeepEP](https://github.com/deepseek-ai/deepep) provides a highly optimized implementation for MoE token dispatching and combining operations, specifically designed for large-scale MoE training scenarios.
-- DeepEP is particularly recommended for training large-scale, fine-grained MoE architectures such as DeepSeek-V3 and other advanced MoE models.
-- To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-flex-dispatcher-backend=deepep` in your command line arguments.
-
-### Integrate HybridEP for High-Performance Intra-Node Token Dispatching
-- [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) is developed by NVIDIA as an optimized solution for large-scale MoE (Mixture of Experts) all-to-all communication. It is designed to leverage NVIDIA GPU hardware capabilities, significantly reducing Streaming Multiprocessor (SM) resource usage.
-- HybridEP currently supports intra-node and multi-node NVLink scenarios.
-- To enable HybridEP, set `--moe-token-dispatcher-type=flex` and
-  `--moe-flex-dispatcher-backend=hybridep` in your command line arguments.
-
-### CUDA Graph Support
-CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are two implementations:
-
-1. `--cuda-graph-impl=local`: Captures cuda graphs using the MCore-internal cuda graph manager.
-2. `--cuda-graph-impl=transformer_engine`: Captures cuda graphs using the TE `make_graphed_callables()` interface.
-
-To use `--cuda-graph-impl=transformer_engine`, the user should call related methods `TECudaGraphHelper.create_cudagraphs()` and `TECudaGraphHelper.cuda_graph_set_manual_hooks()` in the training script. Please refer to the usage in `megatron/training/training.py`.
-
-For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-scope=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-scope`.
-
-
-
-### FP8 Training
-
-```bash
-# Basic FP8 training
---fp8
---fp8-param-gather
-
-# MoE-specific FP8 optimizations
---moe-router-padding-for-fp8
-```
-
-### Fine-grained Activation Offloading (collaborated with rednote)
+#### Fine-grained Activation Offloading
 Offload the input activation at the granularity of modules
 
 **Usage**
@@ -329,16 +359,88 @@ Offload the input activation at the granularity of modules
 ```
 For more details, please refer to the ```docs/source/api-guide/fine_grained_activation_offloading.md```
 
-### MoE Related Arguments
-| Item | Description |
-| --- | --- |
-| --num-experts | Number of Experts in MoE (None means no MoE) |
-| --expert-model-parallel-size | Degree of expert model parallelism. Default is 1. |
-| --moe-ffn-hidden-size | MoE Feed-Forward Network hidden size. Default is None. |
+### Communication Optimization
 
-<details>
-<summary>View all MoE arguments</summary>
+EP communication (All-to-All) can consume 30-40% of training time without optimization. These features hide or reduce communication overhead.
 
+| Optimization | Description | Config |
+|--------------|-------------|--------|
+| **EP A2A Overlap** | Overlaps EP All-to-All communication with computation by merging FWD-BWD passes of adjacent microbatches | `--moe-ep-a2a-overlap` |
+| **Shared Expert Overlap** | Runs shared expert computation concurrently with EP token transfer | `--moe-shared-expert-overlap` |
+
+### Compute Optimization
+
+Fine-grained MoE produces many small operations that can underutilize GPU resources. These optimizations reduce kernel launch overhead and improve GPU utilization.
+
+| Optimization | Description | Config |
+|--------------|-------------|--------|
+| **Grouped GEMM** | Batches multiple expert GEMM operations into a single kernel call, improving GPU utilization | `--moe-grouped-gemm` |
+| **Router Fusion** | Fuses router projection, top-k selection, softmax, and auxiliary loss into fewer kernels | `--moe-router-fusion` |
+| **Permute Fusion** | Fuses token permutation/unpermutation operations into optimized single kernels | `--moe-permute-fusion` |
+| **FP8 Training** | Uses FP8 Tensor Core operations for faster GEMMs on Hopper/Blackwell GPUs | `--fp8 --fp8-recipe blockwise` |
+
+
+### FP8 Training
+
+FP8 training provides benefits across all three performance walls:
+
+| Wall | FP8 Benefit | Impact |
+|------|-------------|--------|
+| **Memory** | 50% activation reduction | Stores linear layer inputs in FP8 instead of BF16 |
+| **Memory** | Eliminate BF16 weight copies | Native FP8 casts directly from FP32 to FP8 |
+| **Communication** | 50% EP dispatch volume | Dispatches tokens in FP8 instead of BF16 |
+| **Communication** | 50% parameter all-gather | With FP8 primary weights (except MXFP8) |
+| **Compute** | Faster Tensor Core GEMMs | FP8 ops on Hopper/Blackwell are faster than BF16 |
+
+#### FP8 Recipes
+
+| Recipe | Scaling Granularity | Format | Platform | Use Case |
+|--------|---------------------|--------|----------|----------|
+| **Per-tensor** | Whole tensor | E4M3/E5M2 hybrid | Hopper, Blackwell | Conservative, initial experimentation |
+| **Blockwise** | 1×128 (activations), 128×128 (weights) | E4M3 | Hopper | **Production-proven** (DeepSeek-V3, Minimax-M2) |
+| **MXFP8** | 1×32 | E4M3 + E8M0 scaling | Blackwell | Native hardware support on GB200 |
+
+> **Recommendation**: Use **blockwise FP8** on Hopper for production training. It has been validated at scale on DeepSeek-V3 class models.
+
+#### MoE-Specific FP8 Optimizations
+
+| Optimization | Description | Config |
+|--------------|-------------|--------|
+| **Routing Map Padding** | Pads routing map (not tokens) to align M dimension to 16/32, avoiding per-tensor padding overhead | `--moe-router-padding-for-fp8` |
+| **FP8 Primary Weights** | Casts FP32 master weights directly to FP8, eliminating BF16 intermediate copy | `--fp8-param-gather` (Need additional `--reuse-grad-buf-for-mxfp8-param-ag` for MXFP8) |
+
+
+#### Example Configuration
+
+```bash
+# Blockwise FP8 on Hopper (recommended for production)
+--fp8-format e4m3
+--fp8-recipe blockwise
+--fp8-param-gather
+--moe-router-padding-for-fp8
+
+# MXFP8 on Blackwell
+--fp8-format e4m3
+--fp8-recipe mxfp8
+--moe-router-padding-for-fp8
+--fp8-param-gather 
+--reuse-grad-buf-for-mxfp8-param-ag
+```
+
+> **Note**: For blockwise and MXFP8 recipes with current scaling, training loss curves show negligible difference compared to BF16 baselines.
+
+
+### CUDA Graph
+CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are two implementations:
+
+1. `--cuda-graph-impl=local`: Captures cuda graphs using the MCore-internal cuda graph manager.
+2. `--cuda-graph-impl=transformer_engine`: Captures cuda graphs using the TE `make_graphed_callables()` interface.
+
+To use `--cuda-graph-impl=transformer_engine`, the user should call related methods `TECudaGraphHelper.create_cudagraphs()` and `TECudaGraphHelper.cuda_graph_set_manual_hooks()` in the training script. Please refer to the usage in `megatron/training/training.py`.
+
+For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-scope=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-scope`.
+
+## MoE Arguments Reference
 ### Core Arguments
 | Argument | Description | Default |
 |----------|-------------|---------|
@@ -402,15 +504,7 @@ For more details, please refer to the ```docs/source/api-guide/fine_grained_acti
 | --moe-per-layer-logging | Per-layer logging | False |
 | --moe-router-force-load-balancing | Force load balancing (experimental) | False |
 
-</details>
-
 ## Examples
-
-### Training Script Example
-
-<details>
-<summary>Complete Mixtral 8x7B training script</summary>
-
 ```bash
 #!/bin/bash
 
@@ -538,6 +632,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](../../../../CONTRIBUTING.
 If you use Megatron-Core MoE in your research, please cite:
 
 ```bibtex
+
 @article{megatron-lm,
   title={Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism},
   author={Shoeybi, Mohammad and Patwary, Mostofa and Puri, Raul and LeGresley, Patrick and Casper, Jared and Catanzaro, Bryan},
@@ -545,62 +640,10 @@ If you use Megatron-Core MoE in your research, please cite:
   year={2019}
 }
 
-#### Advantages of MoE Parallel Folding
-1. The CP and EP group are folded together by defualt, such that:
-    1. It reduces the minimal required GPUs to turn on both CP and EP. For example, the traditional way with (CP=8, EP=8) needs at least 64 GPUs, for now it only requires 8 GPUs.
-    2. The CP and EP communication can be both put in the NVLink domain.
-2. We can set different TP sizes for Attention and MoE part.
-    1. For MoE, EP is often more efficient than TP. But in the traditional way, only using EP can get OOM for most models.
-    2. With MoE parallel folding, we can turn on TP for Attention part and setting TP=1 for MoE models, which often gets better MFU.
-
-### End-to-End Training Practice
-**Use the latest NVIDIA PyTorch or NeMo Docker Image**
-- [NGC PyTorch Image](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
-- [NGC NeMo Image](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo)
-
-**Token Dispatcher Choices**
-- Token Dispatcher sends tokens to the designated expert, involves tensor rearangement and communications.
-- Dispatcher `allgather` is the default option. It achieves better performance and efficiency when only tensor parallelism is used or when the Top-k value is very large.
-- Dispatcher `alltoall` is recommended if expert parallelism is applied.
-- Dispatcher `flex` is a new dispatcher decouples communication group from model parallelism. It supports two backends(DeepEP and HybridEP) selectable via `--moe-flex-dispatcher-backend`.
-
-**Enable Communication Overlap**
-- Enable `--overlap-param-gather` and `--overlap-grad-reduce` with distributed optimizer.
-- Enable `--tp-comm-overlap` when TP>1.
-- Enable p2p comm overlap when PP > 1 by setting `num_layers_per_virtual_pipeline_stage`.
-
-**Enable GroupedGEMM when num_local_experts>1 with `--moe-grouped-gemm`**
-- GroupedGEMM has higher efficiency than vanilla sequential GEMMs for each expert.
-- Recommend to use the TE version of Grouped GEMM (by upgrading to MCore v0.8 and TE v1.9), which support Gradient Accumulation Fusion and FP8 Training.
-
-**OOM Caused by Token Distribution Imbalance when Training From Scratch**  
-MoE suffers from a severe load imbalance issue when the router is under-trained, leading to the model easily running out of memory (OOM), which typically occurs in the first 100~300 steps when training from scratch. 
-Therefore, there are two recommended ways during the first 200 steps to avoid the OOM problem, which can be removed after the token distribution is more stable:
-1. Increase the `expert-tensor-parallel-size` and decrease `expert-model-parallel-size` to replace EP with TP in MoELayer, this can prevent the load imbalancing between EP ranks. Since current ETP implementation has some memeory overhead, you can further enable activation recomputation only for MoE Layer by adding `--moe-layer-recompute`.
-2. Setting capacity factor to a relatively small number like 1.0 by adding `--moe-token-capacity-factor 1.0`.
-
-**Leverage DeepSeek's DeepEP for High-Performance Cross-Node Token Dispatching**
-- The primary advantage of DeepEP is its cross-node token communication efficiency, which delivers substantial performance improvements when deploying expert parallelism across multiple nodes with large TopK values.
-- To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-enable-deepep` in your command line arguments.
-
-**FP8 Training Best Practice**
-- Using latest version of [TransformerEngine](https://github.com/NVIDIA/TransformerEngine).
-- Enable router padding with `--moe-router-padding-for-quantization` to reduce padding overhead.
-- Enable native FP8 weights with `--fp8-param-gather` to reduce weights memory cost.
-
-### Reference Best Parallel Mapping
-
-Here are the reference parallel mappings of MCore v0.8 for Mixtral 8x7B and 8x22B models:
-|        Model            | Vocab Size| Dispatcher | Precision | #GPUs | SEQ LEN | TP | EP | PP | VP | MBS | GBS |
-|:-----------------------:|:---------:|:----------:|:---------:|:-----:|:-------:|:--:|:--:|:--:|:--:|:---:|:---:|
-| Mixtral 8x7B(Dropless)  |   32K     | All-to-All | BF16      | 64    | 4096    | 1  | 8  | 4  | 8  | 1   | 256 |
-| Mixtral 8x22B(Dropless) |   32K     | All-to-All | BF16      | 128   | 4096    | 4  | 2  | 8  | 7  | 1   | 256 |
-
-Detailed Benchmark Information:  
-Server:
-- 8xH100 80GB HBM3 
-- NVLink 4th Generation
-- InfiniBand 8x400 Gbit/s
-
-Docker Image:
-- PyTorch 24.09 with TransformerEngine v1.11
+@article{moe-parallel-folding,
+    title={MoE Parallel Folding: Heterogeneous Parallelism Mappings for Efficient Large-Scale MoE Model Training with Megatron Core}, 
+    author={Liu, Dennis and Yan, Zijie and Yao, Xin and Liu, Tong and Korthikanti, Vijay and Wu, Evan and Fan, Shiqing and Deng, Gao and Bai, Hongxiao and Chang, Jianbin and Aithal, Ashwath and Andersch, Michael and Shoeybi, Mohammad and Yao, Jiajie and Zhou, Chandler and Wu, David and Li, Xipeng and Yang, June},
+    year={2025},
+    journal={arXiv preprint arXiv:2504.14960},
+}
+```
