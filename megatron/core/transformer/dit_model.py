@@ -26,8 +26,21 @@ class DiTModel(nn.Module):
         num_attention_heads: int,
         mlp_hidden_size: int,
         conditioning_dim: int,
-    ):
+    ) -> None:
         super().__init__()
+
+        # Input validation
+        for name, val in [
+            ("hidden_size", hidden_size),
+            ("num_layers", num_layers),
+            ("num_attention_heads", num_attention_heads),
+            ("mlp_hidden_size", mlp_hidden_size),
+            ("conditioning_dim", conditioning_dim),
+        ]:
+            if not isinstance(val, int) or val <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {val}")
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_attention_heads")
 
         self.hidden_size = hidden_size
 
@@ -68,7 +81,26 @@ class DiTModel(nn.Module):
             timesteps: Tensor of shape [batch] or [batch, 1]
             conditioning: Tensor of shape [batch, conditioning_dim]
         """
-
+        # Input validation and device checks
+        if x.dim() != 3:
+            raise ValueError(f"x must be 3D [batch, seq_len, hidden_size], got {x.shape}")
+        if x.size(2) != self.hidden_size:
+            raise ValueError(
+                f"x.size(2)={x.size(2)} does not match model "
+                f"hidden_size={self.hidden_size}"
+            )
+        batch = x.size(0)
+        if timesteps.size(0) != batch:
+            raise ValueError(f"timesteps batch {timesteps.size(0)} != x batch {batch}")
+        if conditioning.size(0) != batch:
+            raise ValueError(f"conditioning batch {conditioning.size(0)} != x batch {batch}")
+        # Allow timesteps to be [batch] or [batch, 1]
+        if timesteps.dim() not in (1, 2):
+            raise ValueError(f"timesteps must be [batch] or [batch, 1], got {timesteps.shape}")
+        # Device checks
+        device = x.device
+        if timesteps.device != device or conditioning.device != device:
+            raise ValueError("x, timesteps, and conditioning must be on the same device")
         # Ensure timestep shape
         if timesteps.dim() == 1:
             timesteps = timesteps.unsqueeze(-1)
