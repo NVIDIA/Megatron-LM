@@ -66,6 +66,37 @@ from .optimizer_config import (
 logger = logging.getLogger(__name__)
 
 
+def get_standard_config_overrides(
+    decoupled_lr: float | None = None, decoupled_min_lr: float | None = None
+) -> Dict[ParamKey, ParamGroupOverride]:
+    """Get the standard config overrides for the optimizer, taking care of decoupled LR and skipping weight decay on bias parameters and length 1 parameters.
+
+    Args:
+        decoupled_lr (float | None): decoupled learning rate.
+        decoupled_min_lr (float | None): decoupled minimum learning rate.
+
+    Returns:
+        Dict[ParamKey, ParamGroupOverride]: standard config overrides.
+    """
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
+    if decoupled_lr is not None:
+        decoupled_lr_config: ParamGroupOverride = {"max_lr": decoupled_lr}
+        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
+        if decoupled_min_lr is not None:
+            decoupled_lr_config["min_lr"] = decoupled_min_lr
+        config_overrides[decoupled_param_key] = decoupled_lr_config
+
+    # Next construct the standard param group overrides for no weight decay on bias parameters
+    #  as well as any length 1 parameters.
+    param_length_1_match = ParamPredicate(
+        name="param_len_1", fn=lambda param: len(param.shape) == 1
+    )
+    param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
+    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+
+    return config_overrides
+
+
 def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,

@@ -64,9 +64,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.optimizer_param_scheduler import ParamGroupOverride
-from megatron.core.optimizer.optimizer_config import ParamPredicate
-from megatron.core.optimizer.optimizer_config import ParamKey
+from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -1172,21 +1170,9 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     else:
         raise ValueError("Invalid optimizer type!")
 
-    # Construct the appropriate config_overrides object.
-    # TODO: add more logic here as needed down the road.
-    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
-    if args.decoupled_lr is not None:
-        decoupled_lr_config: ParamGroupOverride = {"max_lr": args.decoupled_lr}
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        if args.decoupled_min_lr is not None:
-            decoupled_lr_config["min_lr"] = args.decoupled_min_lr
-        config_overrides[decoupled_param_key] = decoupled_lr_config
-    
-    # Next construct the standard param group overrides for no weight decay on bias parameters 
-    #  as well as any length 1 parameters.
-    param_length_1_match = ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1)
-    param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
-    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+    # Construct the appropriate config_overrides object. This default handles many cases, but
+    #  can be added to as needed by the user, or replaced entirely with a custom override.
+    config_overrides = get_standard_config_overrides(args.decoupled_lr, args.decoupled_min_lr)
 
     return config, config_overrides
 
