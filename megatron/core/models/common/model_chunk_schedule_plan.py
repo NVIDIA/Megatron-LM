@@ -17,6 +17,7 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
+from megatron.core.transformer.moe.paged_stash import paged_stash_set_last_layer
 
 
 class ModelChunkState:
@@ -498,6 +499,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             b_layer = b_schedule_plan.pop_layer()
             torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b")
+            if f_layer.layer.config.moe_paged_stash:
+                paged_stash_set_last_layer(i == f_num_layers - 1)
             f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
                 b_layer,
@@ -526,6 +529,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             torch.cuda.nvtx.range_push(f"layer_{i}f")
             if f_layer.layer.config.fine_grained_activation_offloading:
                 fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
+            if f_layer.layer.config.moe_paged_stash:
+                paged_stash_set_last_layer(i == f_num_layers - 1)
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
             torch.cuda.nvtx.range_pop()
 
