@@ -447,4 +447,4 @@ def get_global_peak_memory_stats_bytes() -> dict:
         t = torch.tensor([peak_alloc], device="cuda", dtype=torch.int64)
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
         peak_alloc = int(t[0].item())
-    return {"mem_max_allocated_bytes": peak_alloc}
+    return {"mem-max-allocated-bytes": peak_alloc}

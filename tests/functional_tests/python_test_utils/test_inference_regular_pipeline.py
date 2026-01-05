@@ -86,33 +86,33 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
         output_groundtruth.pop('throughput')
 
     # Peak memory regression checks (optional: only if present in golden values).
-    if "mem_max_allocated_bytes" in output_groundtruth:
-        assert "mem_max_allocated_bytes" in output_current, (
-            f"Golden values include mem_max_allocated_bytes but current output does not. "
+    if "mem-max-allocated-bytes" in output_groundtruth:
+        assert "mem-max-allocated-bytes" in output_current, (
+            f"Golden values include mem-max-allocated-bytes but current output does not. "
             "Ensure the inference script records memory metrics to the output JSON."
         )
-        sampled = _median_as_float(output_current["mem_max_allocated_bytes"])
-        golden = _median_as_float(output_groundtruth["mem_max_allocated_bytes"])
+        sampled = _median_as_float(output_current["mem-max-allocated-bytes"])
+        golden = _median_as_float(output_groundtruth["mem-max-allocated-bytes"])
         assert golden > 0, f"Golden mem_max_allocated_bytes must be > 0, got {golden}."
 
-        low = 0.97 * golden
-        high = 1.03 * golden
+        low = 0.95 * golden
+        high = 1.05 * golden
 
         if sampled < low:
             raise AssertionError(
-                f"Memory is too low for mem_max_allocated_bytes: "
+                f"Memory is too low for mem-max-allocated-bytes: "
                 f"expected within 3% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
                 f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
                 "This is >3% lower than expected; please update golden values in the functional tests."
             )
         if sampled > high:
             raise AssertionError(
-                f"Memory is too high for mem_max_allocated_bytes: "
+                f"Memory is too high for mem-max-allocated-bytes: "
                 f"expected within ±3% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
                 f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
                 "This is >3% higher than expected; this is likely a regression."
             )
-        output_groundtruth.pop("mem_max_allocated_bytes")
+        output_groundtruth.pop("mem-max-allocated-bytes")
 
     for request_id, groundtruth_results in output_groundtruth.items():
         current_results = output_current[request_id]

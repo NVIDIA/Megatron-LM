@@ -158,5 +158,5 @@
         ]
     },
     "throughput": [12.319796866345767, 12.319796866345767],
-    "mem_max_allocated_bytes": 12067065856
+    "mem-max-allocated-bytes": 12067065856
 }
