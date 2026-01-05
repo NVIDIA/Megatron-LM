@@ -1021,7 +1021,11 @@ class DataParallelBuffer:
         # start of the item.
         return (start, end)
 
-    def locate_item_in_global_item(self, item_id: int) -> Tuple[int, int]:
+    def locate_item_in_global_item(
+        self,
+        item_id: int,
+        shard_only: bool,
+    ) -> Tuple[int, int]:
         """
         Return the coordinates of the slice of the item that is contained
         in this buffer shard. In other words, this returns the coordinates
@@ -1032,7 +1036,7 @@ class DataParallelBuffer:
         and can simply return the coordinates of the entire item.
         """
         item_index = self.item_index_map[item_id]
-        if not self.is_data_distributed:
+        if not shard_only and not self.is_data_distributed:
             # Buffer is not sharded, so we don't need to compute item-shard intersection.
             return (0, item_index.size)
 
@@ -1137,25 +1141,25 @@ class DataParallelBuffer:
         if shard.numel() > 0:
             shard.data.copy_(item_data.flatten())
 
-    def get_item(self, item_id: int, only_shard: bool = False) -> torch.Tensor:
+    def get_item(self, item_id: int, shard_only: bool = False) -> torch.Tensor:
         """
         Retrieve a tensor item managed by the `DataParallelBuffer` instance,
         i.e. get all the item data stored in this sharded or unsharded buffer.
 
         The storage of the item is mapped to the communication bucket.
-        If `only_shard` is True, returns only the shard of the item corresponding
+        If `shard_only` is True, returns only the shard of the item corresponding
             to the current process / rank, a "virtual shard" for unsharded buffers.
         Otherwise, returns the entire item, which could be a bucket shard or bucket.
 
         Args:
             item_id (int): The ID of the tensor item to retrieve.
-            only_shard (bool, optional): Whether to return only the shard of the
+            shard_only (bool, optional): Whether to return only the shard of the
                 item. Defaults to False.
 
         Returns:
             torch.Tensor: The retrieved tensor item.
         """
-        if only_shard:
+        if shard_only:
             # Get segment of the item saved in the shard associated with this rank.
             # Used in situations where the buffer is unsharded but another buffer
             # associated with this buffer's data is sharded, so you need to retrieve
@@ -1171,7 +1175,12 @@ class DataParallelBuffer:
 
         return self.data[start:end]
 
-    def get_item_from_bucket(self, bucket: Bucket, item_id: int):
+    def get_item_from_bucket(
+        self,
+        bucket: Bucket,
+        item_id: int,
+        shard_only: bool = False,
+    ):
         """
         Get Tensor item data from the given bucket specified by the item ID.
         """
@@ -1180,6 +1189,13 @@ class DataParallelBuffer:
         start_index = item_index.global_data_index - bucket_index.global_data_index
         end_index = start_index + item_index.size
         item = bucket.data[start_index:end_index]
+
+        if shard_only:
+            item_slice = slice(*self.locate_item_in_global_item(
+                item_id, shard_only=True
+            ))
+            item = item[item_slice]
+
         return item
 
     def get_shard_from_bucket(self, bucket: Bucket):
@@ -2407,7 +2423,7 @@ class ParamAndGradBuffer:
                 # Register model training and high-precision parameters as DTensor(s).
                 if mbuf:
                     dist_param = make_fsdp_dtensor(
-                        local_tensor=mbuf.get_item(item_id, only_shard=sharded_optimizer_state),
+                        local_tensor=mbuf.get_item(item_id, shard_only=sharded_optimizer_state),
                         param=orig_param,
                         dist_index=self.dist_index,
                         is_sharded_param=sharded_optimizer_state,
@@ -2420,7 +2436,7 @@ class ParamAndGradBuffer:
                 elif wbuf:
                     assert tbuf is None, "Transpose buffer should only exist when main params exist"
                     dist_param = make_fsdp_dtensor(
-                        local_tensor=wbuf.get_item(item_id, only_shard=sharded_optimizer_state),
+                        local_tensor=wbuf.get_item(item_id, shard_only=sharded_optimizer_state),
                         param=orig_param,
                         dist_index=self.dist_index,
                         is_sharded_param=sharded_optimizer_state,
@@ -2535,7 +2551,7 @@ class ParamAndGradBuffer:
             # Retrieve the gradient from the gradient buffer.
             item_id = group.main_grad_buffer.param_idx[orig_param]
             optimizer_grad = group.main_grad_buffer.get_item(
-                item_id, only_shard=sharded_optimizer_state
+                item_id, shard_only=sharded_optimizer_state
             )
             if group.main_weight_buffer is not None:
                 # Convert the gradient to the main weight buffer dtype.
@@ -2605,31 +2621,31 @@ class ParamAndGradBuffer:
 
         # Special handling of quantization requiring copy-in/copy-out processing
         BATCH_QUANT_MEMORY_LIMIT_BYTES = 5 * 1024**3  # 5 GB
-        copy_io_weight_buffers = []
-        copy_io_params = []
+        copy_io_quant_wbufs = []
+        copy_io_quant_params = []
 
         def _batch_quantize_if_needed(
-            dense_param_quantize_kwargs, expert_param_quantize_kwargs, copy_io_params
+            dense_param_quantize_kwargs, expert_param_quantize_kwargs, copy_io_quant_params
         ):
-            if len(copy_io_params) == 0:
+            if len(copy_io_quant_params) == 0:
                 return
 
             # Copy original param shards into their blockwise FP8 working buffers
-            for bufs in copy_io_params:
+            for bufs in copy_io_quant_params:
                 bufs["bucket_param"].copy_(bufs["param"])
 
             # Apply FP8 quantization to blockwise FP8 parameters
             _quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
 
             # Copy quantized params back from working buffers to original param tensors
-            for bufs in copy_io_params:
+            for bufs in copy_io_quant_params:
                 bufs["param"].copy_(bufs["bucket_param"])
-            copy_io_params.clear()
+            copy_io_quant_params.clear()
 
             # Free bucket storage for blockwise FP8 weight buffers
-            for wbuf in copy_io_weight_buffers:
+            for wbuf in copy_io_quant_wbufs:
                 wbuf.free_bucket_storage()
-            copy_io_weight_buffers.clear()
+            copy_io_quant_wbufs.clear()
 
         for pg in self.parameter_groups:
             mbuf = pg.main_weight_buffer
@@ -2650,24 +2666,17 @@ class ParamAndGradBuffer:
             shard_offsets_in_fp8 = quantize_func_kwargs["start_offsets"]
             shard_model_params = quantize_func_kwargs["fsdp_shard_model_params"]
 
-            has_copy_io_param = False
+            use_copy_in_out_quant = False
             for param in pg.params:
                 item_id = mbuf.param_idx[param]
                 if wbuf:
-                    if wbuf.is_data_distributed or mbuf.is_data_distributed:
-                        model_param = wbuf.get_item(item_id, only_shard=True)
-                        if tbuf:
-                            transpose_param = tbuf.get_item(item_id, only_shard=True)
-                        else:
-                            transpose_param = None
-                        main_weight = mbuf.get_item(item_id, only_shard=True)
+                    use_wbuf_shard = (wbuf.is_data_distributed or mbuf.is_data_distributed)
+                    model_param = wbuf.get_item(item_id, shard_only=use_wbuf_shard)
+                    if tbuf:
+                        transpose_param = tbuf.get_item(item_id, shard_only=use_wbuf_shard)
                     else:
-                        model_param = wbuf.get_item(item_id)
-                        if tbuf:
-                            transpose_param = tbuf.get_item(item_id)
-                        else:
-                            transpose_param = None
-                        main_weight = mbuf.get_item(item_id)
+                        transpose_param = None
+                    main_weight = mbuf.get_item(item_id, shard_only=use_wbuf_shard)
                 else:
                     assert not mbuf.is_data_distributed
                     model_param = to_local_if_dtensor(param)
@@ -2681,11 +2690,14 @@ class ParamAndGradBuffer:
                         shard_model_params.append([None, None])
                     else:
                         shard_fp32_from_fp8.append(main_weight)
-                        shard_offsets_in_fp8.append(wbuf.locate_item_in_global_item(item_id)[0])
+                        shard_offsets_in_fp8.append(
+                            wbuf.locate_item_in_global_item(item_id, shard_only=use_wbuf_shard)[0])
                         bucket = wbuf.fetch_bucket(set_param_data=True)
-                        b_model_param = wbuf.get_item_from_bucket(bucket, item_id)[
-                            slice(*wbuf.locate_item_in_global_item(item_id))
-                        ]
+                        b_model_param = wbuf.get_item_from_bucket(
+                            bucket,
+                            item_id,
+                            shard_only=use_wbuf_shard,
+                        )
                         assert (
                             transpose_param is None
                         ), "Blockwise FP8 does not support transpose param."
@@ -2695,10 +2707,10 @@ class ParamAndGradBuffer:
                             f" not match model param numel {model_param.numel()}"
                             f" name: {self.param_to_name[param]}"
                         )
-                        copy_io_params.append(
+                        copy_io_quant_params.append(
                             {"bucket_param": b_model_param, "param": model_param}
                         )
-                        has_copy_io_param = True
+                        use_copy_in_out_quant = True
                     continue
 
                 if _tensor_dtype(param) in ["nvfp8", "nvfp8_t", "nvfp4"]:
@@ -2709,27 +2721,28 @@ class ParamAndGradBuffer:
                         shard_model_params.append([None, None])
                     else:
                         shard_fp32_from_fp8.append(main_weight)
-                        shard_offsets_in_fp8.append(wbuf.locate_item_in_global_item(item_id)[0])
+                        shard_offsets_in_fp8.append(
+                            wbuf.locate_item_in_global_item(item_id, shard_only=use_wbuf_shard)[0])
                         shard_model_params.append([model_param, transpose_param])
                     continue
 
                 if model_param.numel() > 0:
                     model_param.data.copy_(main_weight.view(model_param.shape))
 
-            if has_copy_io_param:
-                copy_io_weight_buffers.append(wbuf)
+            if use_copy_in_out_quant:
+                copy_io_quant_wbufs.append(wbuf)
                 if (
-                    sum([wbuf.bucket_index.size for wbuf in copy_io_weight_buffers])
+                    sum([wbuf.bucket_index.size for wbuf in copy_io_quant_wbufs])
                     > BATCH_QUANT_MEMORY_LIMIT_BYTES
                 ):
                     _batch_quantize_if_needed(
                         dense_param_quantize_kwargs,
                         expert_param_quantize_kwargs,
-                        copy_io_params,
+                        copy_io_quant_params,
                     )
 
         _batch_quantize_if_needed(
-            dense_param_quantize_kwargs, expert_param_quantize_kwargs, copy_io_params
+            dense_param_quantize_kwargs, expert_param_quantize_kwargs, copy_io_quant_params
         )
         _quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
 
