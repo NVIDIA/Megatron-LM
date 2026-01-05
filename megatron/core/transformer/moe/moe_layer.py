@@ -257,14 +257,21 @@ class MoELayer(BaseMoELayer):
 
         return output, mlp_bias
 
-    def combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
-        """Combines expert outputs via communication and adds shared expert output.
+    def combine(self, output: torch.Tensor):
+        """Combines expert outputs via communication.
 
         This method uses the token dispatcher to combine the outputs from different
-        experts (e.g., via an All-to-All communication). It then adds the output
-        from the shared expert if it exists.
+        experts (e.g., via an All-to-All communication).
         """
         output = self.token_dispatcher.token_combine(output)
+        return output
+
+    def post_combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
+        """Post-processes combined output and adds shared expert output.
+
+        This method applies post-processing to the combined expert outputs and
+        adds the output from the shared expert if it exists.
+        """
         output = self.token_dispatcher.combine_postprocess(output)
         if shared_expert_output is not None:
             output = output + shared_expert_output
@@ -291,7 +298,7 @@ class MoELayer(BaseMoELayer):
                 "are enabled without also enabling sequence parallelism."
             )
 
-        # MoE forward: route -> dispatch -> compute -> combine
+        # MoE forward: route -> dispatch -> compute -> combine -> post-combine
         def custom_forward(hidden_states):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
@@ -307,7 +314,8 @@ class MoELayer(BaseMoELayer):
 
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
-            output = self.combine(output, shared_expert_output)
+            output = self.combine(output)
+            output = self.post_combine(output, shared_expert_output)
             return output, mlp_bias
 
         if self.moe_layer_recompute:

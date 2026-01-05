@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 from typing import Optional
 
+import os
 import torch
 from torch import Tensor
 
@@ -42,6 +43,7 @@ class TransformerLayerSchedulePlan:
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
+    ├── post_combine (TransformerLayerNode): combine post process -> mlp_bda
     └── mtp_post_process (PostProcessNode): mtp post process
 
     Note that MTP layer has the same operation and execution order with TransformerLayer regarding
@@ -57,6 +59,7 @@ class TransformerLayerSchedulePlan:
     moe_dispatch = None
     mlp = None
     moe_combine = None
+    post_combine = None
     mtp_post_process = None
 
     def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
@@ -105,6 +108,9 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'moe_combine') and self.moe_combine is not None:
             del self.moe_combine
             self.moe_combine = None
+        if hasattr(self, 'post_combine') and self.post_combine is not None:
+            del self.post_combine
+            self.post_combine = None
         if hasattr(self, 'mtp_post_process') and self.mtp_post_process is not None:
             del self.mtp_post_process
             self.mtp_post_process = None
@@ -171,6 +177,7 @@ class TransformerLayerSchedulePlan:
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
+            post_combine_module,
             mtp_post_process_module,
         ) = fwd_callables
 
@@ -182,10 +189,12 @@ class TransformerLayerSchedulePlan:
             self.post_attn = create_node(comp_stream, post_attn_module, "post_attn")
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
             self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
+            self.post_combine = create_node(comp_stream, post_combine_module, "post_combine")
         else:
             self.post_attn = NoopScheduleNode()
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
+            self.post_combine = NoopScheduleNode()
 
         if is_mtp:
             self.mtp_post_process = create_node(
@@ -208,18 +217,45 @@ class TransformerLayerSchedulePlan:
         )
 
     @staticmethod
-    def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
+    def run(
+        f_layer, 
+        b_layer, 
+        f_input=None, 
+        b_grad=None, 
+        is_last_layer_in_bwd=False,
+        fine_grained_overlap=False,
+        post_forward=None,
+        post_backward=None,
+        f_schedule_plan=None,
+        b_schedule_plan=None,
+        is_last_layer=False,
+    ):
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
         This function interleaves forward and backward operations, overlapping the communications
         (dispatch or combine) of one with the computations (att or mlp) of the other
         to maximize parallelism and efficiency.
 
+        Two execution modes are supported:
+
+        1) Coarse-grained overlap (fine_grained_overlap = False):
+
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
         comm_stream: combine_bwd            | dispatch_fwd->dispatch_bwd  | combine_fwd
         comp_stream: attn_fwd->post_attn_fwd| mlp_bwd->mlp_bwd_dw->mlp_fwd| post_attn_bwd->attn_bwd
         For MTP, mtp_post_process_fwd is executed after the combine_fwd in the comp_stream,
         and mtp_post_process_bwd is executed before the combine_bwd in the comp_stream.
+
+        2) Fine-grained overlap (fine_grained_overlap = True):
+
+        This mode further decomposes communication and computation into smaller
+        stages and interleaves them more aggressively, including post-processing
+        steps (e.g., MTP / post-combine hooks).
+
+        The execution timeline becomes:
+
+        comm_stream: combine_bwd                                 | dispatch_fwd | dispatch_bwd | combine_fwd                                         | PP_fwd     | PP_bwd        |
+        comp_stream: post_combine_bwd → attn_fwd → post_attn_fwd | mlp_bwd      | mlp_fwd      | mlp_bwd_dw → post_attn_bwd → post_combine_fwd       | attn_bwd   | attn_bwd_dw   |
 
         Args:
             f_layer (TransformerLayerSchedulePlan): Forward layer (for current microbatch)
@@ -228,13 +264,25 @@ class TransformerLayerSchedulePlan:
             b_grad (Tensor): Gradient for backward computation
             is_last_layer_in_bwd (bool):
                 Whether the current layer is the last layer in the backward pass.
-
+            fine_grained_overlap (bool):
+                Enable fine-grained communication / computation overlap
+            post_forward (callable or None):
+                The function to call after the forward pass
+            post_backward (callable or None):
+                The function to call after the backward pass
+            f_schedule_plan (TransformerModelChunkSchedulePlan):
+                The forward schedule plan
+            b_schedule_plan (TransformerModelChunkSchedulePlan):
+                The backward schedule plan
+            is_last_layer (bool):
+                Whether the current layer is the overlap boundary layer of the current chunk
         Returns:
             Functions or values for next iteration's computation
         """
 
         if b_layer is not None:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
+            b_grad = b_layer.post_combine.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
@@ -242,38 +290,83 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.attn.forward(f_input)
                 f_input = f_layer.post_attn.forward(f_input)
 
-        if b_layer is not None:
-            b_grad = b_layer.mlp.backward(b_grad)
+        if fine_grained_overlap:
+            if f_layer is not None:
+                with f_layer.get_fp8_context():
+                    f_input = f_layer.moe_dispatch.forward(f_input)
 
-        if f_layer is not None:
-            with f_layer.get_fp8_context():
-                f_input = f_layer.moe_dispatch.forward(f_input)
+            if b_layer is not None:
+                b_grad = b_layer.mlp.backward(b_grad)
 
-        if b_layer is not None:
-            b_layer.mlp.backward_dw()
-            b_grad = b_layer.moe_dispatch.backward(b_grad)
+            if b_layer is not None:
+                b_grad = b_layer.moe_dispatch.backward(b_grad)
 
-        if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
-            b_grad = b_layer.post_attn.backward(b_grad)
-            b_grad = b_layer.attn.backward(b_grad)
+            if f_layer is not None:
+                with f_layer.get_fp8_context():
+                    f_input = f_layer.mlp.forward(f_input)
 
-        if f_layer is not None:
-            with f_layer.get_fp8_context():
-                f_input = f_layer.mlp.forward(f_input)
+            if f_layer is not None:
+                with f_layer.get_fp8_context():
+                    f_input = f_layer.moe_combine.forward(f_input)
 
-        if f_layer is not None:
-            with f_layer.get_fp8_context():
-                f_input = f_layer.moe_combine.forward(f_input)
-                f_input = f_layer.mtp_post_process.forward(f_input)
+            if b_layer is not None:
+                b_layer.mlp.backward_dw()
+                b_grad = b_layer.post_attn.backward(b_grad)
 
-        if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
-            b_grad = b_layer.post_attn.backward(b_grad)
-            b_grad = b_layer.attn.backward(b_grad)
+            if f_layer is not None:
+                with f_layer.get_fp8_context():
+                    f_input = f_layer.post_combine.forward(f_input)
+                    f_input = f_layer.mtp_post_process.forward(f_input)
 
-        # Delay the last attn_dw in backward pass (attn_dw of the first layer)
-        # for overlapping with the p2p comm
-        if b_layer is not None and not is_last_layer_in_bwd:
-            b_layer.attn.backward_dw()
+            if is_last_layer:
+                if f_schedule_plan is not None and post_forward is not None:
+                    f_schedule_plan.wait_current_stream()
+                    post_forward(f_input, f_schedule_plan.vp_stage)
+            
+            if b_layer is not None:
+                b_grad = b_layer.attn.backward(b_grad)
+
+            if is_last_layer:
+                if b_schedule_plan is not None and post_backward is not None:
+                    b_schedule_plan.wait_current_stream()
+                    post_backward(b_grad, b_schedule_plan.vp_stage)
+
+            if b_layer is not None:
+                b_layer.attn.backward_dw()
+        else:
+            if b_layer is not None:
+                b_grad = b_layer.mlp.backward(b_grad)
+
+            if f_layer is not None:
+                with f_layer.get_fp8_context():
+                    f_input = f_layer.moe_dispatch.forward(f_input)
+
+            if b_layer is not None:
+                b_layer.mlp.backward_dw()
+                b_grad = b_layer.moe_dispatch.backward(b_grad)
+
+            if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
+                b_grad = b_layer.post_attn.backward(b_grad)
+                b_grad = b_layer.attn.backward(b_grad)
+
+            if f_layer is not None:
+                with f_layer.get_fp8_context():
+                    f_input = f_layer.mlp.forward(f_input)
+
+            if f_layer is not None:
+                with f_layer.get_fp8_context():
+                    f_input = f_layer.moe_combine.forward(f_input)
+                    f_input = f_layer.post_combine.forward(f_input)
+                    f_input = f_layer.mtp_post_process.forward(f_input)
+
+            if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
+                b_grad = b_layer.post_attn.backward(b_grad)
+                b_grad = b_layer.attn.backward(b_grad)
+
+            # Delay the last attn_dw in backward pass (attn_dw of the first layer)
+            # for overlapping with the p2p comm
+            if b_layer is not None and not is_last_layer_in_bwd:
+                b_layer.attn.backward_dw()
 
         return f_input, b_grad
 
@@ -489,6 +582,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
         overlapped_layers = min(f_num_layers, b_num_layers)
+        equal_layers = (f_num_layers == b_num_layers)
+        fine_grained_overlap = os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1"
 
         f_layer = b_layer = None
         # combined forward and backward pass for overlapped layers
@@ -504,6 +599,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 f_input=f_input,
                 b_grad=b_grad,
                 is_last_layer_in_bwd=(i == b_num_layers - 1),
+                fine_grained_overlap = fine_grained_overlap,
+                post_forward=post_forward if fine_grained_overlap else None,
+                post_backward=post_backward if fine_grained_overlap else None,
+                f_schedule_plan=f_schedule_plan if fine_grained_overlap else None,
+                b_schedule_plan=b_schedule_plan if fine_grained_overlap else None,
+                is_last_layer=(i == overlapped_layers - 1 and equal_layers) if fine_grained_overlap else False,
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
@@ -514,7 +615,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_layer = b_schedule_plan.pop_layer()
             torch.cuda.nvtx.range_push(f"layer_{b_schedule_plan.num_layers()}b")
             _, b_grad = TransformerLayerSchedulePlan.run(
-                None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
+                None,
+                b_layer,
+                b_grad=b_grad,
+                is_last_layer_in_bwd=(i == b_num_layers - 1),
+                fine_grained_overlap = fine_grained_overlap,
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
@@ -526,28 +631,35 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             torch.cuda.nvtx.range_push(f"layer_{i}f")
             if f_layer.layer.config.fine_grained_activation_offloading:
                 fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
-            f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
+            f_input, _ = TransformerLayerSchedulePlan.run(
+                f_layer,
+                None,
+                f_input=f_input,
+                fine_grained_overlap = fine_grained_overlap,
+            )
             torch.cuda.nvtx.range_pop()
 
-        if f_schedule_plan is not None and post_forward is not None:
-            # post_forward()/send_forward_recv_forward() is running in the communication stream,
-            # so the p2p comm could be overlapped with the attn backward
-            with torch.cuda.stream(get_comm_stream()):
-                f_schedule_plan.wait_current_stream()
-                post_forward(f_input, f_schedule_plan.vp_stage)
+        if (not equal_layers and fine_grained_overlap) or not fine_grained_overlap:  
+            if f_schedule_plan is not None and post_forward is not None:
+                # post_forward()/send_forward_recv_forward() is running in the communication stream,
+                # so the p2p comm could be overlapped with the attn backward
+                with torch.cuda.stream(get_comm_stream()):
+                    f_schedule_plan.wait_current_stream()
+                    post_forward(f_input, f_schedule_plan.vp_stage)
 
-        # post_backward()/send_backward_recv_backward() is running in the computation stream,
-        # so the p2p comm could be overlapped with the wgrad of attn backward
-        if b_schedule_plan is not None and post_backward is not None:
-            b_schedule_plan.wait_current_stream()
-            post_backward(b_grad, b_schedule_plan.vp_stage)
+            # post_backward()/send_backward_recv_backward() is running in the computation stream,
+            # so the p2p comm could be overlapped with the wgrad of attn backward
+            if b_schedule_plan is not None and post_backward is not None:
+                b_schedule_plan.wait_current_stream()
+                post_backward(b_grad, b_schedule_plan.vp_stage)
 
-        # Delay the last attn_dw in backward pass (attn_dw of the first layer)
-        # for overlapping with the p2p comm
-        if b_num_layers > 0:
-            assert b_layer is not None
-            b_layer.attn.backward_dw()
-            b_layer.release_state()
+        if not fine_grained_overlap:
+            # Delay the last attn_dw in backward pass (attn_dw of the first layer)
+            # for overlapping with the p2p comm
+            if b_num_layers > 0:
+                assert b_layer is not None
+                b_layer.attn.backward_dw()
+                b_layer.release_state()
 
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
