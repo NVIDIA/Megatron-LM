@@ -1730,14 +1730,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count += resume_request_count
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
-        # finally, swap the chunked prefill to the end of the active requests to obey the invariance
-        if self.chunked_prefill_request_id != -1:
-            self._swap_book_keeping_tensors(
-                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
-                dst_idxs=torch.tensor([active_request_count + self.paused_request_count - 1]),
-                next_tokens=next_tokens,
-            )
-
         # Remove resumed requests from newly_paused_request_ids. We do this by
         # truncating the end of newly_paused_request_ids, which works because we
         # resume requests in LIFO order. If resume_request_count >
@@ -1843,10 +1835,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 device=torch.cuda.current_device(),
             )
 
-        # Swap.
+        # Swap evicted and active requests.
         self._swap_book_keeping_tensors(
             src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
         )
+
+        # Swap the chunked prefill request to the end of the active requests to
+        # obey the invariance.
+        if self.chunked_prefill_request_id != -1:
+            self._swap_book_keeping_tensors(
+                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
+                dst_idxs=torch.tensor([self.total_request_count - evict_request_count - 1]),
+                next_tokens=next_tokens,
+            )
 
         # Update tracking vars.
         self.paused_request_count -= evict_request_count
