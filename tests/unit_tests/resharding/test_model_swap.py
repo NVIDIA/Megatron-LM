@@ -222,7 +222,7 @@ def test_swap_gpt_parametrized(
         dst_cfg.add_bias_linear = False
         # Require Transformer Engine for TEGroupedMLP; skip if unavailable
         try:
-            import transformer_engine  # noqa: F401
+            import transformer_engine
         except Exception:
             Utils.destroy_model_parallel()
             pytest.skip("Transformer Engine not available; skipping TE-grouped MoE test")
