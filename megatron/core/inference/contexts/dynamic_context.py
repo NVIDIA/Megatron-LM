@@ -1740,7 +1740,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return active_request_count, resume_request_count, newly_paused_request_ids
 
-    def evict_overflow_requests(
+    def evict_overflow_paused_requests(
         self,
         active_request_count: int,
         next_tokens: torch.Tensor,
@@ -2067,7 +2067,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # 6.b. Evict requests that overflow the paused buffer.
-        evict_request_ids = self.evict_overflow_requests(active_request_count, next_tokens)
+        evict_request_ids = self.evict_overflow_paused_requests(active_request_count, next_tokens)
 
         # 6.c. Resume any additional requests.
         active_request_count, resume_request_count, newly_paused_request_ids = (
