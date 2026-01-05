@@ -244,7 +244,6 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.moe_dispatch.backward(b_grad)
 
         if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
-            b_grad = b_layer.post_attn.backward(b_grad)
             b_grad = b_layer.attn.backward(b_grad)
 
         if f_layer is not None:
