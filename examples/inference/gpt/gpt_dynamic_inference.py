@@ -26,6 +26,7 @@ from examples.inference.gpt.utils import (
     build_dynamic_engine_setup_prefix,
     build_requests,
     get_curr_time,
+    get_global_peak_memory_stats_bytes,
 )
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -61,20 +62,6 @@ import logging
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
-
-def _get_global_peak_memory_stats_bytes() -> dict:
-    """Peak allocated CUDA memory aggregated across ranks (MAX), in bytes.
-
-    Uses `torch.cuda.max_memory_allocated()` and assumes peak stats were reset
-    before the benchmark run.
-    """
-    peak_alloc = int(torch.cuda.max_memory_allocated())
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        t = torch.tensor([peak_alloc], device="cuda", dtype=torch.int64)
-        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
-        peak_alloc = int(t[0].item())
-    return {"mem-max-allocated-bytes": peak_alloc}
-
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -533,7 +520,7 @@ def main():
             f"request.state == '{request.state}' != 'finished'."
         )
 
-    peak_mem_stats = _get_global_peak_memory_stats_bytes()
+    peak_mem_stats = get_global_peak_memory_stats_bytes()
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
