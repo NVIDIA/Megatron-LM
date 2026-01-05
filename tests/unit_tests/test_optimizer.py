@@ -33,7 +33,7 @@ try:
     from transformer_engine.pytorch.fp8 import check_fp8_block_scaling_support
 
     fp8_block_scaling_available, reason_for_no_fp8_block_scaling = check_fp8_block_scaling_support()
-    from transformer_engine.common.recipe import Float8BlockScaling, Format
+    from transformer_engine.common.recipe import DelayedScaling, Float8BlockScaling, Format
 except:
     fp8_block_scaling_available = False
     reason_for_no_fp8_block_scaling = "FP8 block scaled GEMM requires Hopper and CUDA >= 12.9."
