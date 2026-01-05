@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 def get_standard_config_overrides(
     decoupled_lr: float | None = None, decoupled_min_lr: float | None = None
 ) -> Dict[ParamKey, ParamGroupOverride]:
-    """Get the standard config overrides for the optimizer, taking care of decoupled LR and skipping weight decay on bias parameters and length 1 parameters.
+    """Get standard config overrides for the optimizer, handling decoupled LR and common wd skips.
 
     Args:
         decoupled_lr (float | None): decoupled learning rate.
@@ -116,13 +116,23 @@ def _get_param_groups(
             groups for.
         config (OptimizerConfig): optimizer configuration object.
         config_overrides (Optional[Dict[ParamKey, ParamGroupOverride]): optimizer overrides,
-            specified on a per-layer basis.
+            specified on a per-layer basis. NOTE: if you want to skip applying weight decay on bias
+            and length 1 parameters, and also do not want to do any other overrides, set this to an
+            empty dictionary rather than the default value of None.
     Returns:
         List of parameter groups.
     """
 
     # Map (pg_overrides, is_expert_parallel) to params.
     params_map = {}
+
+    if config_overrides is None:
+        # TODO remove this default behavior eventually.
+        #  This is only needed for backwards compatibility with the old config overrides API where
+        #  the config_overrides argument by default lead to bias parameters and length 1 parameters.
+        #  We assume that users of decoupled LR already provide config overrides so will adapt
+        #  to the new API.
+        config_overrides = get_standard_config_overrides()
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
