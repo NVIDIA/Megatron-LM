@@ -444,7 +444,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
                 if layer.offload_mlp_norm:
-                    hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
+                    hidden_states = fine_grained_offloading_group_start(
+                        hidden_states, name="mlp_norm"
+                    )
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
                     with get_fine_grained_offloading_context(layer.offload_mlp_norm):
