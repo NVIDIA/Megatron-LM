@@ -966,7 +966,11 @@ class _CudaGraphRunner(torch.nn.Module):
         # if an input buffer requires a copy, and does not have metadata attached to it at this
         # point, it will not be reused after this forward pass, so return it to the pool
         for buf in self.fwd_graph_input_surface:
-            if not buf.can_skip_replay_copy and not hasattr(buf, "cg_buffer_metadata"):
+            if (
+                hasattr(buf, "can_skip_replay_copy")
+                and not buf.can_skip_replay_copy
+                and not hasattr(buf, "cg_buffer_metadata")
+            ):
                 assert _CudagraphGlobalRecord.tensor_reuse_pool.owns(buf)
                 _CudagraphGlobalRecord.tensor_reuse_pool.insert(buf)
 
