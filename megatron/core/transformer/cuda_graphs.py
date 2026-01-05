@@ -1663,7 +1663,9 @@ class TECudaGraphHelper:
                 )
                 if chunk_id_list:
                     model_chunk_idx = chunk_id_list[idx][0]
-                    callables_curr_chunk = [self.callables_per_chunk[model_chunk_idx][chunk_id_list[idx][1]]]
+                    callables_curr_chunk = [
+                        self.callables_per_chunk[model_chunk_idx][chunk_id_list[idx][1]]
+                    ]
                 else:
                     callables_curr_chunk = self.callables_per_chunk[model_chunk_idx]
                 for layer_idx, layer in enumerate(callables_curr_chunk):

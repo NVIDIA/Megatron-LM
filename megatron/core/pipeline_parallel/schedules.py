@@ -847,16 +847,16 @@ def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, s
 def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
     """
     This functions gets the order for overlap_moe_expert_parallel_comm schedule for the original
-    chunk-wise order list. Each chunk is transformered to chunks with only 1 layer so that 
+    chunk-wise order list. Each chunk is transformered to chunks with only 1 layer so that
     layers between 2 chunks can now overlap with each other while following the graph order.
-    If capture_wgrad_graph is True, the wgrad backward graph is also added to the order by 
+    If capture_wgrad_graph is True, the wgrad backward graph is also added to the order by
     decreasing the layer id by 0.5.
 
     Args:
         order (List[int]): The original chunk-wise order list. Positive values represent forward
             passes for chunks, negative values represent backward passes. The absolute value
             indicates the chunk ID (1-indexed).
-        num_layers_per_chunk (List[int]): Number of graphable layers in each chunk. The length 
+        num_layers_per_chunk (List[int]): Number of graphable layers in each chunk. The length
             of this list equals the number of chunks.
         capture_wgrad_graph (bool): If True, weight gradient computation graphs are added to the
             order by appending entries with layer_id - 0.5.

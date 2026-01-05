@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 import os
 
 import pytest
@@ -156,6 +158,7 @@ def test_get_pipeline_parallel_order(
     assert len(overlapped_order) == len(order) * layers_per_chunk * 3 // 2
     assert len(chunk_id_list) == len(overlapped_order)
     from math import ceil
+
     order_cnt = {}
     accumulated_order = 0
     prev_o = 0
