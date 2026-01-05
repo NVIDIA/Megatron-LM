@@ -101,16 +101,16 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
         if sampled < low:
             raise AssertionError(
                 f"Memory is too low for mem-max-allocated-bytes: "
-                f"expected within 3% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
+                f"expected within 5% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
                 f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
-                "This is >3% lower than expected; please update golden values in the functional tests."
+                "This is >5% lower than expected; please update golden values in the functional tests."
             )
         if sampled > high:
             raise AssertionError(
                 f"Memory is too high for mem-max-allocated-bytes: "
-                f"expected within ±3% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
+                f"expected within ±5% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
                 f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
-                "This is >3% higher than expected; this is likely a regression."
+                "This is >5% higher than expected; this is likely a regression."
             )
         output_groundtruth.pop("mem-max-allocated-bytes")
 
