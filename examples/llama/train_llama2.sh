@@ -84,6 +84,8 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
 CKPT_FORMAT="${CKPT_FORMAT:-torch}"
 EVAL_ITERS="${EVAL_ITERS:-'-1'}"
 DATA_CACHE_PATH="${DATA_CACHE_PATH:-/root/cache}"
+MEGATRON_FSDP="${MEGATRON_FSDP:-0}"
+FP8_PARAM_GATHER="${FP8_PARAM_GATHER:-0}"
 
 TOKENIZER_TYPE="${TOKENIZER_TYPE:-HuggingFaceTokenizer}"
 if [ "$TOKENIZER_TYPE" == "Llama2Tokenizer" ]; then
@@ -97,10 +99,13 @@ else
     TOKENIZER_MODEL="${TOKENIZER_MODEL:-NousResearch/Llama-2-7b-chat-hf}"
 fi
 
-if [ "$FSDP" -eq 1 ] && [ "$TP" -gt 1 ]; then
-    echo "It is not recommended to use FSDP and TP together. Disabling TP."
-    TP=1
-    echo "Resetting TP=$TP"
+if [ "$FSDP" -eq 1 ] || [ "$MEGATRON_FSDP" -eq 1 ]; then
+    unset CUDA_DEVICE_MAX_CONNECTIONS
+    if [ "$TP" -gt 1 ]; then
+        echo "It is not recommended to use FSDP and TP together. Disabling TP."
+        TP=1
+        echo "Resetting TP=$TP"
+    fi
 fi
 
 EXPERIMENT_DIR="experiment"
@@ -339,10 +344,18 @@ if [ "$TE_FP8" -eq 1 ]; then
         exit
     fi
 
-    if [ "$FSDP" -eq 1 ]; then
+    if [ "$FP8_PARAM_GATHER" -eq 1 ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --fp8-param-gather" 
+    fi
+
+    if [ "$MEGATRON_FSDP" -eq 1 ]; then
         EXTRA_ARGS="$EXTRA_ARGS --keep_fp8_weight_transpose_cache" 
     fi
     
+fi
+
+if [ "$MEGATRON_FSDP" -eq 1 ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --use-megatron-fsdp --ckpt-format fsdp_dtensor --data-parallel-sharding-strategy optim_grads_params --fsdp-double-buffer"
 fi
 
 if [ -n "${WANDB_API_KEY}" ]; then

@@ -85,8 +85,10 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
 EVAL_ITERS="${EVAL_ITERS:-'-1'}"
 CKPT_FORMAT="${CKPT_FORMAT:-torch}"
 DATA_CACHE_PATH="${DATA_CACHE_PATH:-/root/cache}"
+MEGATRON_FSDP="${MEGATRON_FSDP:-0}"
+FP8_PARAM_GATHER="${FP8_PARAM_GATHER:-0}"
 
-if [ "$FSDP" -eq 1 ]; then
+if [ "$FSDP" -eq 1 ] || [ "$MEGATRON_FSDP" -eq 1 ]; then
     unset CUDA_DEVICE_MAX_CONNECTIONS
     if [ "$TP" -gt 1 ]; then
         echo "It is not recommended to use FSDP and TP together. Disabling TP."
@@ -322,6 +324,13 @@ if [ "$TE_FP8" -eq 1 ]; then
         exit
     fi
 
+    if [ "$FP8_PARAM_GATHER" -eq 1 ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --fp8-param-gather" 
+    fi
+
+    if [ "$MEGATRON_FSDP" -eq 1 ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --keep_fp8_weight_transpose_cache" 
+    fi
 fi
 
 if [ -n "${WANDB_API_KEY}" ]; then
@@ -331,6 +340,10 @@ if [ -n "${WANDB_API_KEY}" ]; then
     "
 else
    LOGGING_ARGS=""
+fi
+
+if [ "$MEGATRON_FSDP" -eq 1 ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --use-megatron-fsdp --ckpt-format fsdp_dtensor --data-parallel-sharding-strategy optim_grads_params --fsdp-double-buffer"
 fi
 
 run_cmd="
