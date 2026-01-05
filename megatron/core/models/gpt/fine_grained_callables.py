@@ -230,7 +230,7 @@ class TransformerLayerNode(ScheduleNode):
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
             bwd_dw_callables (list): List of weight gradient functions for the layer.
-            extra_args (dict): Extra arguments for the node: is_moe, enable_deepep.
+            extra_args (dict): Extra arguments for the node: is_moe, config.
         """
         # determine whether to free input memory
         config = extra_args.get("config", None)
