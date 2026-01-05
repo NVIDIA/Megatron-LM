@@ -2,6 +2,7 @@
 
 import sys
 from dataclasses import dataclass, fields
+from typing import cast
 
 import pytest
 import torch
@@ -75,7 +76,7 @@ class TestSpecCustomization:
 
     def test_import_module(self):
         self_attention_cls = import_module(
-            module_path=('megatron.core.transformer.attention', 'SelfAttention')
+            module_path=('megatron.core.transformer.identity_ops', 'SelfAttention')
         )
         assert id(self_attention_cls) == id(SelfAttention)
 
@@ -256,7 +257,9 @@ class TestSpecCustomization:
 
         # Build the self-attention module from the spec
         self_attention = build_module(
-            layer_spec.submodules.self_attention, config=self.config, layer_number=1
+            cast(TransformerLayerSubmodules, layer_spec.submodules).self_attention,
+            config=self.config,
+            layer_number=1,
         )
 
         assert isinstance(self_attention, SelfAttention)

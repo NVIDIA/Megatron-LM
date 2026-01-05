@@ -1,4 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+from typing import cast
 
 import pytest
 import torch
@@ -6,13 +7,14 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -45,12 +47,10 @@ class TestMoELayerInit:
             moe_ffn_hidden_size=128,
             add_bias_linear=False,
         )
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
         )
-        moe_layer = MoELayer(
-            self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        )
+        moe_layer = MoELayer(self.transformer_config, submodules.mlp.submodules)
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
@@ -77,7 +77,8 @@ class TestMoELayerInit:
             num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
         )
         moe_layer = MoELayer(
-            self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            self.transformer_config,
+            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
         )
         Utils.destroy_model_parallel()
 
@@ -110,7 +111,7 @@ class TestMoELayerInit:
             bf16=True,
             params_dtype=torch.bfloat16,
         )
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
         )
 
@@ -118,9 +119,7 @@ class TestMoELayerInit:
         Utils.fake_initialize_model_parallel(
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
         )
-        moe_layer = MoELayer(
-            transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        ).cuda()
+        moe_layer = MoELayer(transformer_config, submodules.mlp.submodules).cuda()
 
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
@@ -241,7 +240,8 @@ class TestMoELayerFP16:
         )
 
         moe_layer = MoELayer(
-            transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            transformer_config,
+            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
         ).cuda()
 
         hidden_states = torch.randn(

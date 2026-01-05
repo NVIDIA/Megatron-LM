@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from typing import cast
+
 import pytest
 import torch
 
@@ -7,6 +9,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -45,7 +48,8 @@ class TestSharedExperts:
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
         self.moe_layer = MoELayer(
-            transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            transformer_config,
+            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
         )
 
         assert isinstance(self.moe_layer, MoELayer)
@@ -107,7 +111,8 @@ class TestSharedExpertsOverlap:
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
         self.moe_layer = MoELayer(
-            transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            transformer_config,
+            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
         )
 
         assert isinstance(self.moe_layer, MoELayer)

@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+from typing import cast
 
 import pytest
 import torch
@@ -8,12 +9,15 @@ from packaging import version
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -43,7 +47,7 @@ class TestParallelAttention:
         )
         self.parallel_attention = SelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
 
@@ -136,7 +140,7 @@ class TestParallelAttention:
         transformer_config.recompute_granularity = 'selective'
         checkpointed_parallel_attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
         config = checkpointed_parallel_attention.config
@@ -186,7 +190,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
 
@@ -206,7 +210,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
 
@@ -226,7 +230,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
         attention.cuda()
@@ -260,7 +264,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
         attention.cuda()
@@ -295,7 +299,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
         attention.cuda()
@@ -329,7 +333,7 @@ class TestClipQK:
         )
         attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
         )
         attention.cuda()
@@ -374,7 +378,7 @@ class TestSelfAttention:
         )
         self.self_attention = SelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
             pg_collection=pg_collection,
