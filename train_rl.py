@@ -301,8 +301,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             )
             output_tensor = loss
 
-    if runtime_state.sequence_packing_metadata:
-        num_empty_bins = runtime_state.sequence_packing_metadata['num_empty_bins']
+    if runtime_state.packing_context:
+        num_empty_bins = runtime_state.packing_context.stats['total_empty_bins']
     else:
         num_empty_bins = None
 

@@ -895,7 +895,7 @@ def prepare_data_for_update(
         if args.rl_use_sequence_packing:
             with nvtx_range("sequence_packing", time=True):
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
-                    trajs, 
+                    trajs,
                     generation_masks, 
                     inference_logprobs, 
                     global_advantages, 
@@ -969,6 +969,7 @@ def prepare_data_for_update(
                         packed_seq_params=b_packed_seq_params,
                     ),
                     None,
+                    0  # These tokens do not count toward the tokens/second calculation
                 )
 
             dtype = (

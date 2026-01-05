@@ -70,6 +70,7 @@ class PackingContext:
     original_inference_logprobs: Optional[torch.Tensor] = None
     bin_advantages: List[torch.Tensor] = field(default_factory=list)
     cached_packed_seq_params: List[Optional[PackedSeqParams]] = field(default_factory=list)
+    stats: Optional[dict] = None
 
 
 def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext, logprobs_is_correction: bool):
@@ -156,7 +157,6 @@ def log_packing_efficiency(packing_context: PackingContext):
     packing_efficiency = my_tokens / total_capacity if total_capacity > 0 else 0
     avg_seq_length = total_tokens / len(packing_info.seq_lengths)
     rank = mpu.get_data_parallel_rank()
-    data_parallel_world_size = mpu.get_data_parallel_world_size()
 
     log_single_rank(logger, logging.INFO, f"[Sequence Packing] Statistics:")
     log_single_rank(
@@ -189,98 +189,110 @@ def log_packing_efficiency(packing_context: PackingContext):
     )
 
     # Add detailed per-rank sequence distribution analysis
-    if torch.distributed.is_initialized():
-        # Gather sequence counts from all ranks
-        seq_counts_per_bin = [len(indices) for indices in my_bin_seq_indices]
-        non_empty_bins = [c for c in seq_counts_per_bin if c > 0]
 
-        # Create tensor with rank statistics
-        rank_stats = torch.tensor(
-            [
-                float(rank),
-                float(len(my_bin_seq_indices)),  # total bins
-                float(len(non_empty_bins)),  # non-empty bins
-                float(my_sequences),  # total sequences
-                (
-                    float(min(non_empty_bins)) if non_empty_bins else 0.0
-                ),  # min sequences per bin
-                (
-                    float(max(non_empty_bins)) if non_empty_bins else 0.0
-                ),  # max sequences per bin
-                (
-                    float(my_sequences / len(non_empty_bins)) if non_empty_bins else 0.0
-                ),  # avg sequences per non-empty bin
-            ],
-            device='cuda',
+    # Gather sequence counts from all ranks
+    seq_counts_per_bin = [len(indices) for indices in my_bin_seq_indices]
+    non_empty_bins = [c for c in seq_counts_per_bin if c > 0]
+    empty_bins_on_rank = len(my_bin_seq_indices) - len(non_empty_bins)
+
+    # Create tensor with rank statistics
+    rank_stats = torch.tensor(
+        [
+            float(rank),
+            float(len(my_bin_seq_indices)),  # total bins
+            float(len(non_empty_bins)),  # non-empty bins
+            float(my_sequences),  # total sequences
+            (
+                float(min(non_empty_bins)) if non_empty_bins else 0.0
+            ),  # min sequences per bin
+            (
+                float(max(non_empty_bins)) if non_empty_bins else 0.0
+            ),  # max sequences per bin
+            (
+                float(my_sequences / len(non_empty_bins)) if non_empty_bins else 0.0
+            ),  # avg sequences per non-empty bin
+            float(empty_bins_on_rank),  # empty bins on each rank
+        ],
+        device='cuda',
+    )
+
+    # Gather from all ranks
+    world_size = mpu.get_data_parallel_world_size()
+    all_rank_stats = [torch.zeros_like(rank_stats) for _ in range(world_size)]
+    torch.distributed.all_gather(
+        all_rank_stats, rank_stats, group=mpu.get_data_parallel_group()
+    )
+    all_rank_stats_tensor = torch.stack(all_rank_stats, dim=0)
+
+    # Print detailed statistics for each rank
+    if rank == 0:
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[Sequence Packing] Per-rank distribution ({packing_info.packing_algo} algorithm):",
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "[Sequence Packing]  Rank | Total Bins | Non-empty | Sequences | Min/Bin | Max/Bin | Avg/Bin",
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "[Sequence Packing]  -----|------------|-----------|-----------|---------|---------|--------",
+        )
+        for stats in all_rank_stats:
+            r = int(stats[0].item())
+            total_bins = int(stats[1].item())
+            non_empty = int(stats[2].item())
+            sequences = int(stats[3].item())
+            min_seq = int(stats[4].item())
+            max_seq = int(stats[5].item())
+            avg_seq = stats[6].item()
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[Sequence Packing]   {r:3d} | {total_bins:10d} | {non_empty:9d} | {sequences:9d} | {min_seq:7d} | {max_seq:7d} | {avg_seq:6.1f}",
+            )
+
+        # Also show first few bins for rank 0 as example
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[Sequence Packing]  Example (Rank 0 first 10 bins): {seq_counts_per_bin[:10]}",
         )
 
-        # Gather from all ranks
-        world_size = mpu.get_data_parallel_world_size()
-        all_rank_stats = [torch.zeros_like(rank_stats) for _ in range(world_size)]
-        torch.distributed.all_gather(
-            all_rank_stats, rank_stats, group=mpu.get_data_parallel_group()
+        # Show the improvement from round-robin
+        total_seqs_all_ranks = sum(int(stats[3].item()) for stats in all_rank_stats)
+        avg_seqs_per_rank = total_seqs_all_ranks / world_size
+        max_deviation = max(
+            abs(int(stats[3].item()) - avg_seqs_per_rank)
+            for stats in all_rank_stats
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[Sequence Packing]  Round-robin distribution quality:",
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[Sequence Packing]  - Average sequences per rank: {avg_seqs_per_rank:.1f}",
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[Sequence Packing]  - Max deviation from average: {max_deviation:.0f} sequences ({max_deviation/avg_seqs_per_rank*100:.1f}%)",
         )
 
-        # Print detailed statistics for each rank
-        if rank == 0:
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[Sequence Packing] Per-rank distribution ({packing_info.packing_algo} algorithm):",
-            )
-            log_single_rank(
-                logger,
-                logging.INFO,
-                "[Sequence Packing]  Rank | Total Bins | Non-empty | Sequences | Min/Bin | Max/Bin | Avg/Bin",
-            )
-            log_single_rank(
-                logger,
-                logging.INFO,
-                "[Sequence Packing]  -----|------------|-----------|-----------|---------|---------|--------",
-            )
-            for stats in all_rank_stats:
-                r = int(stats[0].item())
-                total_bins = int(stats[1].item())
-                non_empty = int(stats[2].item())
-                sequences = int(stats[3].item())
-                min_seq = int(stats[4].item())
-                max_seq = int(stats[5].item())
-                avg_seq = stats[6].item()
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"[Sequence Packing]   {r:3d} | {total_bins:10d} | {non_empty:9d} | {sequences:9d} | {min_seq:7d} | {max_seq:7d} | {avg_seq:6.1f}",
-                )
+    result = {
+        "total_num_bins": int(torch.sum(all_rank_stats_tensor[:, 1]).item()),
+        "total_non_empty_bins": int(torch.sum(all_rank_stats_tensor[:, 2]).item()),
+        "total_empty_bins": int(torch.sum(all_rank_stats_tensor[:, 7]).item()),
+        "total_sequences": int(torch.sum(all_rank_stats_tensor[:, 3]).item()),
+    }
 
-            # Also show first few bins for rank 0 as example
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[Sequence Packing]  Example (Rank 0 first 10 bins): {seq_counts_per_bin[:10]}",
-            )
-
-            # Show the improvement from round-robin
-            total_seqs_all_ranks = sum(int(stats[3].item()) for stats in all_rank_stats)
-            avg_seqs_per_rank = total_seqs_all_ranks / world_size
-            max_deviation = max(
-                abs(int(stats[3].item()) - avg_seqs_per_rank)
-                for stats in all_rank_stats
-            )
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[Sequence Packing]  Round-robin distribution quality:",
-            )
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[Sequence Packing]  - Average sequences per rank: {avg_seqs_per_rank:.1f}",
-            )
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[Sequence Packing]  - Max deviation from average: {max_deviation:.0f} sequences ({max_deviation/avg_seqs_per_rank*100:.1f}%)",
-            )
+    return result
 
 def get_actual_sequence_lengths(sequences: torch.Tensor, pad_token: int) -> List[int]:
     """Get actual sequence lengths for pre-padded sequences.
@@ -1058,7 +1070,8 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         cached_packed_seq_params=cached_packed_seq_params,
     )
 
-    log_packing_efficiency(packing_context)
+    stats_aggregated_over_all_ranks = log_packing_efficiency(packing_context)
+    packing_context.stats = stats_aggregated_over_all_ranks
 
     return packing_context
 
