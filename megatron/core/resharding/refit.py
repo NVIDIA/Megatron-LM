@@ -17,10 +17,9 @@ from . import build_centralized_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
-from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 
 # Supported refit backend names
-RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
+RefitBackendName = Literal["nccl", "gloo"]
 
 
 def swap_model_weights(
@@ -44,9 +43,6 @@ def swap_model_weights(
         elif refit_method == "gloo":
             # Debug / fallback backend: run refit over CPU/Gloo instead of NCCL.
             service = GlooCopyService()
-            reshard_model_weights(src_model, target_model, service=service)
-        elif refit_method == "nvshmem":
-            service = NVSHMEMCopyService()
             reshard_model_weights(src_model, target_model, service=service)
         else:
             raise ValueError(f"Unknown refit_method '{refit_method}'")
