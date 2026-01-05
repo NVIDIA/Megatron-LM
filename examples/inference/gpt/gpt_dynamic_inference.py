@@ -536,7 +536,7 @@ def main():
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
-            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+            print(f"\n{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
 
             # ---- Group all outputs for this prompt ----
             output_map = defaultdict(list)
