@@ -7,9 +7,15 @@ Handles kernel compilation, launching, and stream coordination.
 """
 
 import os
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 
-import cupy as cp
+try:
+    import cupy as cp
+
+    HAVE_CUPY = True
+except ImportError:
+    HAVE_CUPY = False
+
 import torch
 import torch.cuda.nvtx as nvtx
 
@@ -18,13 +24,16 @@ class KernelLauncher:
     """Manages CUDA kernel loading and launching for data pack/unpack operations."""
 
     def __init__(self):
-        self.chunked_copy_kernel: Optional[cp.RawKernel] = None
+        self.chunked_copy_kernel = None
         # Cached CuPy stream wrappers for efficient kernel launching
-        self.cp_pack_stream: Optional[cp.cuda.ExternalStream] = None
-        self.cp_unpack_stream: Optional[cp.cuda.ExternalStream] = None
+        self.cp_pack_stream = None
+        self.cp_unpack_stream = None
 
     def load_kernels(self) -> None:
         """Load and compile CUDA kernels from source."""
+        if not HAVE_CUPY:
+            raise RuntimeError("cupy is not available. Please install cupy to use KernelLauncher.")
+
         current_dir = os.path.dirname(os.path.abspath(__file__))
         kernel_path = os.path.join(current_dir, "..", "kernels", "chunked_kernel.cu")
 

@@ -16,8 +16,6 @@ Similar to the C++ Logger implementation, provides:
 
 """
 
-# TODO(Peter): We need to remove this logger and use the regular Megatron logger.
-
 import logging
 import os
 from datetime import datetime

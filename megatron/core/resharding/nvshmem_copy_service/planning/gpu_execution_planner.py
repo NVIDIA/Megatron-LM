@@ -9,7 +9,13 @@ Converts high-level task descriptions into GPU-ready metadata
 
 from typing import Dict, List, Optional, Tuple
 
-import cupy as cp
+try:
+    import cupy as cp
+
+    HAVE_CUPY = True
+except ImportError:
+    HAVE_CUPY = False
+
 import torch
 
 from ..logger import PELogger
@@ -42,6 +48,11 @@ class GPUExecutionPlanner:
             recv_slots: List of receive buffer slots
             receive_requests: List of all receive requests for matching
         """
+        if not HAVE_CUPY:
+            raise RuntimeError(
+                "cupy is not available. Please install cupy to use GPUExecutionPlanner."
+            )
+
         PELogger.debug(f"Creating GPU plans for {len(iter_schedules)} iterations")
         for i, sched in enumerate(iter_schedules):
             send_batch = sched["send"]
@@ -151,7 +162,7 @@ class GPUExecutionPlanner:
         sizes: List[int],
         is_pack: bool,
         buffer_base: int,
-    ) -> Optional[Tuple[cp.ndarray, cp.ndarray, cp.ndarray, int]]:
+    ) -> Optional[Tuple[object, object, object, int]]:
         """
         Generate GPU-ready pointer arrays for kernel execution.
 
