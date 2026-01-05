@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import hashlib
 import inspect
 import json
 import os
@@ -7,6 +8,7 @@ import sys
 from typing import Any, Dict, Mapping, Tuple
 
 import pytest  # type: ignore[import]
+import torch
 
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
@@ -17,6 +19,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
+    get_args,
     set_args,
     set_global_variables,
 )
@@ -391,7 +394,7 @@ class TestMambaMoEModel:
         args.init_method_std = 0.014
         args.lr = 3e-5
         args.max_position_embeddings = 1024
-        args.micro_batch_size = 1
+        args.micro_batch_size = 2
         args.moe_aux_loss_coeff = 0.0
         args.moe_grouped_gemm = True
         args.moe_route_load_balancing_type = "aux_loss"
@@ -444,7 +447,11 @@ class TestMambaMoEModel:
             rotary_percent=args.rotary_percent,
         )
 
-        # check that the model is initialized as expected
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_constructor(self):
+        args = get_args()
         assert_config_matches_golden(self.model.config)
         assert self.model.pre_process is True, "pre_process should be True"
         assert self.model.post_process is True, "post_process should be True"
@@ -458,9 +465,51 @@ class TestMambaMoEModel:
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 8449294624, f"Expected 8449294624 parameters, got {num_weights}"
 
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
+    def test_set_input_tensor(self):
+
+        args = get_args()
+
+        config: TransformerConfig = self.model.config
+        sequence_length = self.model.max_sequence_length
+        micro_batch_size = args.micro_batch_size
+
+        # [sequence length, batch size, hidden size]
+        input_tensor = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
+
+        self.model.set_input_tensor(input_tensor)
+
+        assert self.model.decoder.input_tensor.shape[0] == sequence_length
+        assert self.model.decoder.input_tensor.shape[1] == micro_batch_size
+        assert self.model.decoder.input_tensor.shape[2] == config.hidden_size
 
     def test_forward(self):
         """Test the forward pass of the Mamba MoE model."""
-        pass
+
+        args = get_args()
+
+        # we must override this to avoid the need to initialize the optimizer
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        sequence_length = self.model.max_sequence_length
+        micro_batch_size = args.micro_batch_size
+
+        self.model.cuda()
+        
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        logits = self.model.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            runtime_gather_output=True
+        )
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == self.model.vocab_size
