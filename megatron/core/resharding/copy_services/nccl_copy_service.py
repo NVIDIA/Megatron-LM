@@ -51,12 +51,15 @@ class NCCLCopyService(CopyService):
         self.send_ops.append(SendOp(task_id=None, tensor=src_tensor, dest_rank=dest_rank))
 
     def submit_send_with_id(self, task_id: int, src_tensor: torch.Tensor, dest_rank: int):
+        """Submit a send operation with a unique task identifier."""
         self.send_ops.append(SendOp(task_id=task_id, tensor=src_tensor, dest_rank=dest_rank))
 
     def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int):
+        """Submit a receive operation."""
         self.recv_ops.append(RecvOp(task_id=None, tensor=dest_tensor, src_rank=src_rank))
 
     def submit_recv_with_id(self, task_id: int, dest_tensor: torch.Tensor, src_rank: int):
+        """Submit a receive operation with a unique task identifier."""
         self.recv_ops.append(RecvOp(task_id=task_id, tensor=dest_tensor, src_rank=src_rank))
 
     def run(self):

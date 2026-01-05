@@ -1,6 +1,9 @@
+import logging
 from typing import List
 
 from ..nvshmem_types import MAX_SEGMENT_SIZE, ReceiveRequest, SendRequest
+
+logger = logging.getLogger(__name__)
 
 # Constants for ID encoding (from C++ implementation)
 REQUEST_ID_BASE = 1000000000
@@ -24,13 +27,13 @@ class TaskSegmenter:
     def _validate_segmentation(self, task_id: int, size: int) -> bool:
         num_segments = self._calculate_num_segments(size)
         if num_segments > MAX_SEGMENTS_PER_REQUEST:
-            print(
+            logger.error(
                 f"Error: Task {task_id} requires {num_segments} segments, "
                 f"exceeds max {MAX_SEGMENTS_PER_REQUEST}"
             )
             return False
         if task_id >= MAX_REQUESTS:
-            print(f"Error: Task ID {task_id} exceeds max {MAX_REQUESTS}")
+            logger.error(f"Error: Task ID {task_id} exceeds max {MAX_REQUESTS}")
             return False
         return True
 

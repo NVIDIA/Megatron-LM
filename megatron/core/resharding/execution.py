@@ -8,7 +8,6 @@ import torch
 import torch.distributed as dist
 
 from .copy_services.base import CopyService
-from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from .utils import ReshardPlan
 
 logger = logging.getLogger(__name__)

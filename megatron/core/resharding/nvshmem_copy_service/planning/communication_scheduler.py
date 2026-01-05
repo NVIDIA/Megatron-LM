@@ -1,7 +1,5 @@
 from typing import Dict, List, Tuple
 
-import torch
-
 from ..logger import PELogger
 from ..nvshmem_types import ScheduledBatch, WorkloadGroup, WorkloadSummary
 

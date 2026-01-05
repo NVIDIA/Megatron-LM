@@ -42,6 +42,7 @@ class ValidationSummary:
 
     @property
     def all_passed(self) -> bool:
+        """Check if all validated tasks passed."""
         return self.failed_tasks == 0
 
 

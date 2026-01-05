@@ -8,6 +8,8 @@ MAX_TASKS_PER_BATCH = 10000
 
 @dataclass
 class SendRequest:
+    """Container for a send operation request."""
+
     task_id: int
     src_tensor: Any  # cupy.ndarray or pointer
     src_pos: int
@@ -17,6 +19,8 @@ class SendRequest:
 
 @dataclass
 class ReceiveRequest:
+    """Container for a receive operation request."""
+
     task_id: int
     dest_tensor: Any  # cupy.ndarray or pointer
     dest_pos: int
@@ -26,6 +30,8 @@ class ReceiveRequest:
 
 @dataclass
 class WorkloadGroup:
+    """Container for a group of send requests to a specific destination PE."""
+
     dest_pe: int
     tasks: List[SendRequest] = field(default_factory=list)
     total_size: int = 0
@@ -33,6 +39,8 @@ class WorkloadGroup:
 
 @dataclass
 class ScheduledBatch:
+    """Metadata for a scheduled communication batch."""
+
     src_pe: int
     dest_pe: int
     batch_index: int
@@ -46,6 +54,8 @@ class ScheduledBatch:
 
 @dataclass
 class WorkloadSummary:
+    """Summary of a workload group for communication with other PEs."""
+
     total_size: int
     task_ids: List[int]
     task_sizes: List[int]
@@ -53,6 +63,8 @@ class WorkloadSummary:
 
 @dataclass
 class TransferMetadata:
+    """GPU-resident metadata for communication tasks."""
+
     ptrs: Any  # cupy array of uint64 (pointers)
     sizes: Any  # cupy array of uint64 (sizes)
     num_tasks: int

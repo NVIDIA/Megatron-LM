@@ -5,20 +5,14 @@ Converts high-level task descriptions into GPU-ready metadata
 (pointer arrays, sizes, chunking) for kernel execution.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cupy as cp
 import torch
 
 from ..logger import PELogger
 from ..memory.tensor_pointer_utils import TensorPointerExtractor
-from ..nvshmem_types import (
-    ReceiveRequest,
-    ScheduledBatch,
-    SendRequest,
-    WorkloadGroup,
-    WorkloadSummary,
-)
+from ..nvshmem_types import ReceiveRequest, ScheduledBatch
 
 
 class GPUExecutionPlanner:

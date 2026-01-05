@@ -131,7 +131,7 @@ class RemoteCopyService:
             dest_pe: Destination PE rank
         """
         if dest_pe >= self.n_pes or dest_pe < 0:
-            print(f"Error: Invalid destination PE {dest_pe}")
+            PELogger.error(f"Error: Invalid destination PE {dest_pe}")
             return
 
         req = SendRequest(task_id, src_tensor, src_pos, size, dest_pe)
@@ -151,7 +151,7 @@ class RemoteCopyService:
             src_pe: Source PE rank
         """
         if src_pe >= self.n_pes or src_pe < 0:
-            print(f"Error: Invalid source PE {src_pe}")
+            PELogger.error(f"Error: Invalid source PE {src_pe}")
             return
 
         req = ReceiveRequest(task_id, dest_tensor, dest_pos, size, src_pe)

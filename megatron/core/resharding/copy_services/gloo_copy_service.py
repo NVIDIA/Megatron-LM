@@ -50,9 +50,11 @@ class GlooCopyService(CopyService):
         self.send_ops.append(SendOp(task_id=None, tensor=src_tensor, dest_rank=dest_rank))
 
     def submit_send_with_id(self, task_id: int, src_tensor: torch.Tensor, dest_rank: int):
+        """Submit a send operation with a unique task identifier."""
         self.send_ops.append(SendOp(task_id=task_id, tensor=src_tensor, dest_rank=dest_rank))
 
     def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int):
+        """Submit a receive operation."""
         # Allocate a CPU buffer that matches the destination view; we'll
         # copy into dest_tensor after the Gloo recv completes.
         cpu_buffer = torch.empty_like(dest_tensor, device="cpu").contiguous()
@@ -61,6 +63,7 @@ class GlooCopyService(CopyService):
         )
 
     def submit_recv_with_id(self, task_id: int, dest_tensor: torch.Tensor, src_rank: int):
+        """Submit a receive operation with a unique task identifier."""
         cpu_buffer = torch.empty_like(dest_tensor, device="cpu").contiguous()
         self.recv_ops.append(
             (RecvOp(task_id=task_id, tensor=cpu_buffer, src_rank=src_rank), dest_tensor)

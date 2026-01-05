@@ -12,7 +12,7 @@ independent NVSHMEM "task" defined over contiguous slices.
 """
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict
 
 import torch
 import torch.distributed as dist

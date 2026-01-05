@@ -5,12 +5,15 @@ Handles NVSHMEM initialization, CUDA device setup, stream management,
 and event lifecycle.
 """
 
+import logging
 from typing import Dict, Optional
 
 import nvshmem.core
 import torch
 import torch.distributed as dist
-from cuda.core.experimental import Device, system
+from cuda.core.experimental import Device
+
+logger = logging.getLogger(__name__)
 
 
 class GPUResourceManager:
@@ -86,7 +89,7 @@ class GPUResourceManager:
             initializer_method="uid",
         )
 
-        print("NVSHMEM initialized")
+        logger.info("NVSHMEM initialized")
 
         self.my_pe = nvshmem.core.my_pe()
         self.n_pes = nvshmem.core.n_pes()
@@ -116,7 +119,7 @@ class GPUResourceManager:
             "copy": self.torch_copy_stream,
         }
 
-        print("Stream mapping built")
+        logger.info("Stream mapping built")
 
         self.initialized = True
 
