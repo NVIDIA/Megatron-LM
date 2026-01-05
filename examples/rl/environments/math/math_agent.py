@@ -25,7 +25,7 @@ NEGATIVE_REWARD = 0.0
 PARTIAL_END_REWARD = 0.75
 
 class MathAgent(RewardOnlyAgent):
-    def __init__(self, format_reward: float = 0.0, answer_format: str = "tagged", **kwargs):
+    def __init__(self, format_reward: float = 0.0, answer_format: str = "tagged", assistant_prefix: str = None, **kwargs):
         super().__init__(**kwargs)
         assert answer_format in ["tagged", "boxed"], "Invalid answer format"
         self.format_reward = format_reward
