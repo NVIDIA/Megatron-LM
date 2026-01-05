@@ -12,7 +12,7 @@ _NON_REQUEST_TOP_LEVEL_KEYS = {
     # System-level metrics
     "throughput",
     # Peak memory metrics (added by inference scripts; optionally checked if present in golden values)
-    "mem_max_allocated_bytes",
+    "mem-max-allocated-bytes",
 }
 
 
