@@ -42,11 +42,15 @@ class TransformerConfig(ModelParallelConfig):
     # model architecture
     ####################
 
-    num_layers: int = 0
+    num_layers: Optional[int] = None
     """Number of transformer layers in a transformer block."""
 
     mtp_num_layers: Optional[int] = None
-    """Number of Multi-Token Prediction (MTP) Layers."""
+    """Number of Multi-Token Prediction (MTP) Layers.
+    MTP extends the prediction scope to multiple future tokens at each position.
+    This MTP implementation sequentially predict additional tokens
+    by using D sequential modules to predict D additional tokens.
+    """
 
     mtp_loss_scaling_factor: Optional[float] = None
     """Weighting factor of Multi-Token Prediction (MTP) loss."""
@@ -93,10 +97,10 @@ class TransformerConfig(ModelParallelConfig):
     """If set, the loss layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""
 
-    hidden_size: int = 0
+    hidden_size: Optional[int] = None
     """Transformer hidden size."""
 
-    num_attention_heads: int = 0
+    num_attention_heads: Optional[int] = None
     """Number of transformer attention heads."""
 
     attention_backend: AttnBackend = AttnBackend.auto
@@ -186,7 +190,7 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):1 ratio, one full attention layer after (N-1) SWA layers.
     - A list that defines a custom pattern, e.g.: [1,1,1,1,0,0,0,0], where 1 represents SWA. """
 
-    normalization: str = "LayerNorm"
+    normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
     qk_layernorm: bool = False
@@ -266,7 +270,7 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     apply_query_key_layer_scaling: bool = False
     """If true, scale Q * K^T by 1 / layer-number. This improve numeric stability when training with
-    fp16."""
+    fp16. Also sets `attention_softmax_in_fp32` to True."""
 
     attention_softmax_in_fp32: bool = True
     """If True, run attention masking and softmax in fp32. This should be True if
@@ -469,7 +473,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
-    Without this, the shared experts execute before the router."""
+    Without this, the shared experts execute before the router. 
+    Only effective when moe-shared-expert-intermediate-size is set.
+    """
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -477,7 +483,7 @@ class TransformerConfig(ModelParallelConfig):
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
     moe_ffn_hidden_size: Optional[int] = None
-    """MoE Feed-Forward Network hidden size"""
+    """MoE Feed-Forward Network hidden size. If not specified, defaults to the ffn_hidden_size."""
 
     moe_router_load_balancing_type: Union[str, List[str]] = "aux_loss"
     """The load balancing strategy for the router.
@@ -538,10 +544,10 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
-    moe_router_score_function: str = "softmax"
+    moe_router_score_function: Literal['softmax', 'sigmoid'] = "softmax"
     """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
 
-    moe_router_dtype: Optional[str] = None
+    moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
@@ -587,14 +593,14 @@ class TransformerConfig(ModelParallelConfig):
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
 
-    moe_token_dispatcher_type: str = "allgather"
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: str = "deepep"
+    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
     the MNNVL case."""
@@ -611,7 +617,7 @@ class TransformerConfig(ModelParallelConfig):
     the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
     default setting is False."""
 
-    moe_token_drop_policy: str = "probs"
+    moe_token_drop_policy: Literal['probs', 'position'] = "probs"
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
     the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
     be dropped.
@@ -686,7 +692,7 @@ class TransformerConfig(ModelParallelConfig):
     """DEPRECATED and replaced by cuda_graph_impl.
     When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
-    cuda_graph_impl: str = "none"
+    cuda_graph_impl: Literal['none', 'local', 'transformer_engine'] = "none"
     """Determines the CUDA graph capture implementation.
     "none": no CUDA graph.
     "local": capture the CUDA graph using MCore local implementation. Either partial CUDA graph
@@ -738,8 +744,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_sampling_seed: int = 42
     """ Random seed to use for sampling during inference. """
 
-    symmetric_ar_type: Optional[str] = None
-    """Type of symmetric all reduce to use"""
+    symmetric_ar_type: Optional[Literal['two_shot', "one_shot", "multimem_all_reduce"]] = None
+    """What type of symmetric all reduce to use. The default is None
+    which is no use of symetric memory.
+    """
 
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
@@ -786,7 +794,9 @@ class TransformerConfig(ModelParallelConfig):
     quant_recipe: Optional[RecipeConfig] = None
     """Configuration of any per-module quantization settings to be applied to the model"""
 
-    transformer_impl: str = "transformer_engine"
+    transformer_impl: Literal['local', 'transformer_engine', 'inference_optimized'] = (
+        "transformer_engine"
+    )
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 

@@ -1462,18 +1462,9 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--no-fp8-wgrad', action='store_false',
                        help='Execute wgrad in higher precision even for FP8 runs',
                        dest='fp8_wgrad')
-    group.add_argument('--transformer-impl', default='transformer_engine',
-                       choices=['local', 'transformer_engine', 'inference_optimized'],
-                       help='Which Transformer implementation to use.')
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
-    group.add_argument('--first-last-layers-bf16', action='store_true',
-                       help='Construct first and last layers in bf16 when doing FP8 training.')
-    group.add_argument('--num-layers-at-start-in-bf16', type=int, default=1,
-                       help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
-    group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
-                       help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
 
     # FP4 related arguments
     group.add_argument('--fp4-format', default=None,
@@ -1519,24 +1510,14 @@ def _add_inference_args(parser):
                        choices=["megatron", "huggingface"],
                        help='Select either Megatron or Huggingface as the '
                        'Bert embedder.')
-    group.add_argument('--flash-decode', default=False, action="store_true",
-                       help='Whether to use the flash decoding kernel.')
     group.add_argument('--enable-cuda-graph', default=False, action="store_true",
                        help='Deprecated. Use --cuda-graph-impl=local instead. '
                        'Use local implementation of CUDA graph capture and replay. '
                        '--cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. ')
-    group.add_argument("--cuda-graph-warmup-steps", type=int, default=3,
-                       help="Number of CUDA graph warmup steps")
     group.add_argument('--external-cuda-graph', action='store_true',
                        help='Deprecated. Use --cuda-graph-impl=transformer_engine instead. '
                        'Use TE make_graphed_callables() to capture the CUDA graph. '
                        'Use --cuda-graph-scope=\"attn\", \"mlp\", \"moe\", \"moe_router\", \"moe_preprocess\", \"mamba\" for partial capture. ')
-    group.add_argument('--cuda-graph-impl', type=str, default='none',
-                       choices=['none', 'local', 'transformer_engine'],
-                       help='Determines the CUDA graph capture implementation. '
-                       '"none": no CUDA graph. '
-                       '"local": capture the CUDA graph using MCore local implementation. --cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. '
-                       '"transformer_engine": capture the CUDA graph using TE make_graphed_callables().')
     group.add_argument('--cuda-graph-scope', nargs='+', type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope, default=[],
                        help='Determines the CUDA graphs capturing scope. '
                        'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
@@ -1611,15 +1592,9 @@ def _add_inference_args(parser):
                        '1) allocate `memory_buffer` in unified memory. '
                        'Eventually, additional levels will be included to '
                        'control other tensors within the context.')
-    group.add_argument('--symmetric-ar-type', type=str, default=None,
-                       choices=['two_shot', "one_shot", "multimem_all_reduce", None],
-                       help='What type of symmetric all reduce to use. The default is none which is no use of symetric memory')
     group.add_argument('--nccl-all-reduce-for-prefill',
                        action='store_true', default=False,
                        help='When using symmeric all reduce kernels this will use regular nccl kernels for prefill. This can be more effecient when prefill is large as the nccl kernels can be more bandwith optimized')
-    group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
-                       help='Number of chunks along sequence dimension for MLP '
-                       'computation during prefill')
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
                        help='Disable chunked prefill (chunked prefill is enabled by default).')
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
@@ -1635,9 +1610,6 @@ def _add_inference_args(parser):
                        required=False, default=False, help='Enable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int, default=12346,
                        help="This port will be used to setup the inference coordinator on node-0")
-    group.add_argument("--inference-fuse-tp-communication", action="store_true", default=False,
-                       help="Use the fused communication kernel for tensor parallelism during inference. This "
-                       "kernel fuses reduce-scatter + residual-add + rms-norm + all-gather into one operation.")
     return parser
 
 
@@ -1695,34 +1667,14 @@ def _add_network_size_args(parser):
 
     group = parser.add_argument_group(title='network size')
 
-    group.add_argument('--num-layers', type=int, default=None,
-                       help='Number of transformer layers.')
     group.add_argument('--encoder-num-layers', type=int, default=None,
                        help='Number of encoder transformer layers.')
     group.add_argument('--decoder-num-layers', type=int, default=None,
                        help='Number of decoder transformer layers.')
-    group.add_argument('--hidden-size', type=int, default=None,
-                       help='Transformer hidden size.')
-    group.add_argument('--ffn-hidden-size', type=int, default=None,
-                       help='Transformer Feed-Forward Network hidden size. '
-                       'This is set to 4*hidden-size if not provided')
-    group.add_argument('--num-attention-heads', type=int, default=None,
-                       help='Number of transformer attention heads.')
     group.add_argument('--attention-backend', type=lambda attn_backend: AttnBackend[attn_backend], default=AttnBackend.auto, choices = list(AttnBackend), help='Attention backend to use (flash,fused,unfused,local,auto). Defaults to auto')
-    group.add_argument('--kv-channels', type=int, default=None,
-                       help='Projection weights dimension in multi-head '
-                       'attention. This is set to '
-                       '   args.hidden_size // args.num_attention_heads '
-                       'if not provided.')
     group.add_argument('--group-query-attention', action='store_true',
                           help='Use group-query attention.')
     group.add_argument('--num-query-groups', type=int, default=1)
-    group.add_argument('--attention-output-gate', action='store_true',
-                       help='Whether to apply output gate to the attention.')
-    group.add_argument('--softmax-type', type=str, default='vanilla',
-                       choices=['learnable', 'vanilla', 'off-by-one'],
-                       help='Type of softmax to use for the attention. Supports both a fixed offset and '
-                       'learnable offset.')
     group.add_argument('--window-size', type=tuple_type, default=None,
                        help='Window size for window attention. If not provided, '
                             'window attention will be disabled.')
@@ -1750,8 +1702,6 @@ def _add_network_size_args(parser):
                        help='Base to use for rotary positional embeddings, default 10000')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%%')
-    group.add_argument('--rotary-interleaved', action='store_true',
-                          help='Use interleaved rotary embedding.')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--use-rope-scaling', action='store_true',
@@ -1771,23 +1721,14 @@ def _add_network_size_args(parser):
                        action='store_false',
                        help='Disable position embedding. Deprecated: use --position-embedding-type',
                        dest='add_position_embedding')
-    group.add_argument('--mrope-section', nargs='+', type=int, default=None,
-                       help='Multimodal rope section is for channel dimension, empty by default.')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
-    group.add_argument('--normalization', default='LayerNorm',
-                       choices=['LayerNorm', 'RMSNorm'],
-                       help='Which normalization technique to use.')
     group.add_argument('--norm-epsilon', type=float, default=1e-5,
                        help='Epsilon for layer norm and RMS norm.')
     group.add_argument('--apply-layernorm-1p', action='store_true',
                        help='Adjust LayerNorm weights such that they are centered '
                        'around zero. This improves numerical stability.')
-    group.add_argument('--apply-residual-connection-post-layernorm',
-                       action='store_true',
-                       help='If set, use original BERT residula connection '
-                       'ordering.')
     group.add_argument('--openai-gelu', action='store_true',
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'
@@ -1798,12 +1739,6 @@ def _add_network_size_args(parser):
                        help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--quick-geglu', action='store_true',
                        help='Use quick geglu activation instead of default gelu')
-    group.add_argument('--activation-func-clamp-value', type=float, default=None,
-                       help='Clamp the output of the linear_fc1 in the activation function. Only used when '
-                            'activation_func is quick_gelu.')
-    group.add_argument('--glu-linear-offset', type=float, default=0.0,
-                       help='Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). '
-                            'Only used when gated_linear_unit is True')
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
@@ -1812,20 +1747,11 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.')
-    group.add_argument('--multi-latent-attention', action='store_true',
-                       help='Use multi-latent attention for model.')
-    group.add_argument('--mtp-num-layers', type=int, default=None,
-                       help='Number of Multi-Token Prediction (MTP) Layers.'
-                       'MTP extends the prediction scope to multiple future tokens at each position.'
-                       'This MTP implementation sequentially predict additional tokens '
-                       'by using D sequential modules to predict D additional tokens.')
     group.add_argument('--mtp-loss-scaling-factor', type=float, default=0.1,
                        help='Scaling factor of Multi-Token Prediction (MTP) loss. '
                        'We compute the average of the MTP losses across all depths, '
                        'and multiply it the scaling factor to obtain the overall MTP loss, '
                        'which serves as an additional training objective.')
-    group.add_argument('--moe-latent-size', type=int, default=None,
-                       help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
     return parser
 
 
@@ -1937,10 +1863,6 @@ def _add_ft_package_args(parser):
 
 
 def _add_config_logger_args(parser):
-    group = parser.add_argument_group(title='config logger')
-    group.add_argument('--config-logger-dir', type=str, default='',
-                       help='If set, will dump all configs to --config-logger-dir',
-                       dest='config_logger_dir')
     return parser
 
 
@@ -2007,8 +1929,6 @@ def _add_logging_args(parser):
     group.add_argument('--log-world-size-to-tensorboard',
                        action='store_true',
                        help='Enable world size logging to tensorboard.')
-    group.add_argument('--log-max-attention-logit', action='store_true',
-                       help='Enable max attention logit logging to tensorboard.')
     group.add_argument('--wandb-project', type=str, default='',
                        help='The wandb project name. Ignore wandb by default.')
     group.add_argument('--wandb-entity', type=str, default='',
@@ -2028,10 +1948,6 @@ def _add_logging_args(parser):
 def _add_regularization_args(parser):
     group = parser.add_argument_group(title='regularization')
 
-    group.add_argument('--attention-dropout', type=float, default=0.1,
-                       help='Post attention dropout probability.')
-    group.add_argument('--hidden-dropout', type=float, default=0.1,
-                       help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
     group.add_argument('--clip-grad', type=float, default=1.0,
@@ -2246,11 +2162,6 @@ def _add_training_args(parser):
                        '"shared_experts": recompute the shared experts in the MoE layer.'
                        '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
                        '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
-    group.add_argument('--cpu-offloading-num-layers', type=int, default=0,
-                       help='The number of Transformer layers to offload to CPU.')
-    group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
-                       help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
-                       dest='clone_scatter_output_in_embedding')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--disable-gloo-process-groups', action='store_false',
@@ -2280,9 +2191,6 @@ def _add_training_args(parser):
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None,
                        help='If set, initialize weights on the CPU. This eliminates init differences based on tensor parallelism.')
-    group.add_argument('--calculate-per-token-loss', action='store_true',
-                       help=('Scale cross entropy loss by the number of non-padded tokens in the '
-                             'global batch, versus the default behavior of assuming all tokens are non-padded.'))
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
@@ -2304,8 +2212,6 @@ def _add_training_args(parser):
                        help='Disable bias and swiglu fusion, the fusion is '
                        'available only when using megatron-core.',
                        dest='bias_swiglu_fusion')
-    group.add_argument('--use-fused-weighted-squared-relu', action='store_true',
-                       help='Use fused weighted squared relu when using MoE.')
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
@@ -2323,15 +2229,6 @@ def _add_training_args(parser):
     group.add_argument('--disable-bias-linear', action='store_false',
                        help='Disable bias in the linear layers',
                        dest='add_bias_linear')
-    group.add_argument('--add-qkv-bias', action='store_true',
-                       help='Enable bias only in the QKV linear layers',
-                       dest='add_qkv_bias')
-    group.add_argument('--qk-clip', action='store_true',
-                       help='Whether to use qk-clip for training stabilization, strongly recommended for Muon.')
-    group.add_argument('--qk-clip-alpha', type=float, default=0.5,
-                       help='The balancing alpha for qk-clip.')
-    group.add_argument('--qk-clip-threshold', type=float, default=100,
-                       help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd', 'muon', 'dist_muon'],
                        help='Optimizer function')
@@ -2383,14 +2280,6 @@ def _add_training_args(parser):
                        dest='tp_comm_split_rs')
     group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
                        help='The communicator group names to use high priority streams.')
-    group.add_argument('--use-te-activation-func', action='store_true',
-                       help='Use activation function kernel from Transformer Engine in MLP module.')
-    group.add_argument('--batch-invariant-mode', action='store_true',
-                       help='Use batch-invariant kernels for deterministic forward execution regardless '
-                       'of batch size. Ensures bitwise identical results when the same inputs are '
-                       'processed in different batch configurations. This is more strict than deterministic-mode '
-                       'which only ensures bitwise identical results when the same inputs are processed in the same batch configuration. '
-                       'This will significantly affect speed of training and inference as the kernels are not full optimized.')
 
 
     return parser
@@ -2411,9 +2300,6 @@ def _add_initialization_args(parser):
     rng_factory = ArgumentGroupFactory(RNGConfig)
     group = rng_factory.build_group(parser, "RNG and initialization")
 
-    group.add_argument('--init-method-std', type=float, default=0.02,
-                       help='Standard deviation of the zero mean normal '
-                       'distribution used for weight initialization.')
     group.add_argument('--embedding-init-method-std', type=float, default=None,
                        help='Standard deviation of the zero mean normal '
                        'distribution used for embedding weight initialization. '
@@ -2601,11 +2487,6 @@ def _add_mixed_precision_args(parser):
                        help='Window over which to raise/lower dynamic scale.')
     group.add_argument('--hysteresis', type=int, default=2,
                        help='hysteresis for dynamic loss scaling')
-    group.add_argument('--fp32-residual-connection', action='store_true',
-                       help='Move residual connections to fp32.')
-    group.add_argument('--apply-query-key-layer-scaling', action='store_true',
-                       help='Scale Q * K^T by 1 / layer-number. '
-                       'Useful for fp16 training. Also sets `attention_softmax_in_fp32` to True.')
     group.add_argument('--attention-softmax-in-fp32', action='store_true',
                        help='Run attention masking and softmax in fp32.')
     group.add_argument('--accumulate-allreduce-grads-in-fp32',
@@ -2614,9 +2495,6 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
-    group.add_argument('--disable-bf16-reduced-precision-matmul', action='store_true',
-                       help='If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to '
-                       'prevent matmul from using reduced precision accumulation when using BF16.')
     group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
                        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
 
@@ -2709,12 +2587,6 @@ def _add_distributed_args(parser):
                        'complete it instead. Also turns on '
                        '--use-cpu-initialization flag. This is for '
                        'external DDP manager.' )
-    group.add_argument('--account-for-embedding-in-pipeline-split', action='store_true',
-                       default=False, help='If set, *input* embedding layer will be treated as a standard transformer'
-                       'layer in the context of partition and placement for pipeline parallelism.')
-    group.add_argument('--account-for-loss-in-pipeline-split', action='store_true',
-                       default=False, help='If set, loss layer will be treated as a standard transformer'
-                       'layer in the context of partition and placement for pipeline parallelism.')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
@@ -3119,8 +2991,6 @@ def _add_vision_args(parser):
                        help='warmup teacher temperaure epochs')
 
     # regularization arguments
-    group.add_argument('--qk-layernorm', action='store_true',
-                       help='Whether to layer normalize the q and k attention embeddings.')
     group.add_argument('--qk-l2-norm', action='store_true',
                        help='Use llama 4 qk l2 norm')
 
@@ -3139,29 +3009,6 @@ def _add_moe_args(parser):
                             'where 1 indicates an expert layer and 0 indicates a dense layer. '
                             'Examples: "([0]+[1]*23)": 1 dense layer followed by 23 expert layers, '
                             '"([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.')
-    group.add_argument('--moe-ffn-hidden-size', type=int, default=None,
-                       help='The hidden size of each expert\'s feed-forward network (ffn). '
-                       'If not specified, defaults to the ffn_hidden_size.')
-    group.add_argument('--moe-shared-expert-intermediate-size', type=int, default=None,
-                       help='Shared expert total ffn hidden size. '
-                       'It should be equal to "num_shared_experts * ffn_size_of_each_shared_expert" if there are multiple shared experts. '
-                       'None means no shared expert. '
-                       'By default, the shared experts execute before the router. However, when '
-                       '--moe-shared-expert-overlap or --overlap-moe-expert-parallel-comm is set, '
-                       'the shared experts execute after the router, before the routed experts. '
-                       'This makes the gradients from the router and the shared experts added in '
-                       'different orders to the hidden_states, causing minor numerical differences '
-                       'in the hidden_states gradient.')
-    group.add_argument('--moe-shared-expert-gate', action='store_true',
-                       help='Enable gate for shared expert. Only effective when moe-shared-expert-intermediate-size is set.')
-    group.add_argument('--moe-shared-expert-overlap', action='store_true',
-                       help='Enable overlapping between shared expert computations and dispatcher communications. '
-                       'Without this, the shared experts execute before the router. '
-                       'Only effective when moe-shared-expert-intermediate-size is set.')
-    group.add_argument('--moe-grouped-gemm', action='store_true',
-                       help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
-    group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
-                       help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
     group.add_argument('--moe-layer-recompute', action='store_true',
                        help='Enable checkpointing for moe_layer, should be used when memory is not sufficient. '
                        'Deprecated. Use "--recompute-granularity selective --recompute-modules moe" instead.')
@@ -3173,84 +3020,13 @@ def _add_moe_args(parser):
                        choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
-    group.add_argument('--moe-router-dtype', type=str,
-                       choices=['fp32', 'fp64'],
-                       default=None,
-                       help='Data type for routing computation and expert output weighted averaging. '
-                            'Fp32/fp64 enhances numerical stability, especially with numerous experts. '
-                            'The perf impact should be negligible when used with permute fusion. '
-                            'None means no changes for dtype.')
     group.add_argument('--moe-router-fusion', action='store_true',
                        help='Enable fusion for MoE TopK routing and aux-loss computation. This is only supported in TransformerEngine 2.7.0 and above.')
-    group.add_argument('--moe-router-score-function', type=str,
-                       choices=['softmax', 'sigmoid'],
-                       default='softmax',
-                       help='Score function for MoE TopK routing. Can be "softmax" or "sigmoid".')
-    group.add_argument('--moe-router-topk', type=int, default=2,
-                       help='Number of experts to route to for each token. The default is 2.')
-    group.add_argument('--moe-router-pre-softmax', action='store_true',
-                       help='Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k.')
-    group.add_argument('--moe-router-num-groups', type=int, default=None,
-                       help='Number of groups to divide experts into for group-limited routing. When using group-limited routing: 1) Experts are divided into equal-sized groups, 2) For each token, a subset of groups are selected based on routing scores (sum of top-2 expert scores within each group), 3) From these selected groups, moe_router_topk experts are chosen.'
-                       'Two common use cases: 1) Device-limited routing: Set equal to expert parallel size (EP) to limit each token to experts on a subset of devices (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434) 2) Node-limited routing: Set equal to number of nodes in EP group to limit each token to experts on a subset of nodes (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)')
-    group.add_argument('--moe-router-group-topk', type=int, default=None,
-                       help='Number of selected groups for group-limited routing.')
-    group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
-                       help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')
-    group.add_argument('--moe-router-enable-expert-bias', action='store_true',
-                       help='TopK routing with dynamic expert bias in the aux-loss-free load balancing strategy. '
-                       'The routing decision is based on the sum of the routing scores and the expert bias. '
-                       'See https://arxiv.org/abs/2408.15664 for details.')
-    group.add_argument('--moe-router-bias-update-rate', type=float, default=1e-3,
-                       help='Expert bias update rate in the aux-loss-free load balancing strategy. '
-                       'The expert bias is updated based on the number of assigned tokens to each expert in a global batch, '
-                       'where the bias is increased for the experts with less assigned tokens and decreased for the experts with more assigned tokens. '
-                       'The default value 1e-3 is same as that used in DeepSeekV3.')
-    group.add_argument('--moe-router-force-load-balancing', action='store_true',
-                       help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
-    group.add_argument('--moe-router-padding-for-quantization', action='store_true',
-                       help='Pad the routing_map to make sure the number of tokens each expert received '
-                       'is a multiple of 16/32 for FP8/FP4 precision. It is suggested to enable this for '
-                       'dropless training with FP8/FP4 precision when num_local_experts > 1. This is a more '
-                       'efficient way to pad for FP8/FP4 which eliminates the explicit padding in the '
-                       'GroupedMLP layer.')
-    group.add_argument('--moe-router-padding-for-fp8', action='store_true',
-                       help='[Compatibility alias for --moe-router-padding-for-quantization] '
-                       'Enabling this will also enable --moe-router-padding-for-quantization.')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
-    group.add_argument('--moe-z-loss-coeff', type=float, default=None,
-                       help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.')
-    group.add_argument('--moe-input-jitter-eps', type=float, default=None,
-                       help='Add noise to the input tensor by applying jitter with a specified epsilon value.')
-    group.add_argument('--moe-per-layer-logging', action='store_true',
-                       help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
     # Token dispatcher arguments
-    group.add_argument('--moe-token-dispatcher-type', type=str,
-                       choices=['allgather', 'alltoall', 'flex'],
-                       default='allgather',
-                       help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
     group.add_argument('--moe-enable-deepep', action='store_true',
                        help='DEPRECATED: Please use --moe-flex-dispatcher-backend=deepep instead.')
-    group.add_argument('--moe-flex-dispatcher-backend', type=str,
-                       choices=['deepep', 'hybridep'],
-                       default='deepep',
-                       help='The backend to use for flex token dispatcher. The default is "deepep". Options are "deepep" and "hybridep".')
-    group.add_argument('--moe-deepep-num-sms', type=int, default=20,
-                       help='Number of SMs to use for DeepEP.')
-    group.add_argument('--moe-hybridep-num-sms', type=int, default=16,
-                       help='Number of SMs to use for HybridEP.')
-    group.add_argument('--moe-permute-fusion', action='store_true',
-                       help='Fuse token rearrangement ops during token dispatching.')
-    # Token dropping arguments
-    group.add_argument('--moe-expert-capacity-factor', type=float, default=None,
-                       help='The capacity factor for each expert, None means no token will be dropped.')
-    group.add_argument('--moe-pad-expert-input-to-capacity', action='store_true',
-                       help='Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set.')
-    group.add_argument('--moe-token-drop-policy', type=str, default='probs', choices=['probs', 'position'],
-                       help='The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
-    group.add_argument('--moe-apply-probs-on-input', action='store_true',
-                       help='Apply probs before mlp activation for moe routing.')
     # MoE communication overlap arguments
 
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
