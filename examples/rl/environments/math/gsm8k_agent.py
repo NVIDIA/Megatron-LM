@@ -23,8 +23,8 @@ assert (
 
 
 class GSM8KAgent(MathAgent):
-    def __init__(self, answer_format: str = "boxed", format_reward: float = 0.0, **kwargs):
-        super().__init__(format_reward=format_reward, answer_format=answer_format, **kwargs)
+    def __init__(self, answer_format: str = "boxed", format_reward: float = 0.0, assistant_prefix: str = "Assistant: Let me solve this step by step.\n<think>", **kwargs):
+        super().__init__(format_reward=format_reward, answer_format=answer_format, assistant_prefix=assistant_prefix, **kwargs)
         self.env_id: str = "gsm8k"
 
     def reformat_datum(self, datum: dict) -> dict:
