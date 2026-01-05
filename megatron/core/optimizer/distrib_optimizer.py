@@ -606,7 +606,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
         self._state_offloader: Optional[OptimizerStateOffloader] = None
-        if self.config.offload_optimizer_states or self.config.offload_master_weights:
+        if self.config.offload_optimizer_states:
             self._state_offloader = OptimizerStateOffloader(self)
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
