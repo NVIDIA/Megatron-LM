@@ -822,13 +822,18 @@ class _CudaGraphRunner(torch.nn.Module):
             if not isinstance(ten, ArgMetadata):
                 return ten
 
-            assert hasattr(ten, "cg_buffer_metadata") and ten.cg_buffer_metadata.is_cudagraph_input
-            global fwd_buffer_reuse_ref_count
-
             # the input tensor is resued from another cudagraph's input or output
-            if ten.cg_buffer_metadata.fwd_cudagraph_buffer is not None:
+            if (
+                hasattr(ten, "cg_buffer_metadata")
+                and ten.cg_buffer_metadata.fwd_cudagraph_buffer is not None
+            ):
+                global fwd_buffer_reuse_ref_count
                 buf = ten.cg_buffer_metadata.fwd_cudagraph_buffer
-                assert buf.cg_buffer_metadata.capture_reuse_count > 0
+
+                assert (
+                    ten.cg_buffer_metadata.is_cudagraph_input
+                    and buf.cg_buffer_metadata.capture_reuse_count > 0
+                )
 
                 if (
                     ten.cg_buffer_metadata.input_use_count > 1
@@ -856,7 +861,8 @@ class _CudaGraphRunner(torch.nn.Module):
             # if a buffer is used for multiple inputs, create it now
             for ten in self.get_tensors(args, kwargs):
                 if (
-                    ten.cg_buffer_metadata.input_use_count > 1
+                    hasattr(ten, 'cg_buffer_metadata')
+                    and ten.cg_buffer_metadata.input_use_count > 1
                     and ten.cg_buffer_metadata.fwd_cudagraph_buffer is None
                 ):
                     buf = _CudagraphGlobalRecord.tensor_reuse_pool.get(ten)
