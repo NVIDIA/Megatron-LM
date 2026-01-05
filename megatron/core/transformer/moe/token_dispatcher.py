@@ -1767,7 +1767,7 @@ class MoESyncFreeElasticExpertDispatcher:
         self.ep_size = self.ep_group.size()
         self.ep_rank = self.ep_group.rank()
 
-        self.weight_chunk_size = config.hidden_size  # send weight by chunk for hybrid-ep
+        self.weight_chunk_size = config.hidden_size * 2 # send weight by chunk for hybrid-ep
         self.num_total_experts = config.moe_num_echo_experts
         self.num_local_echo_experts = config.moe_num_echo_experts // self.ep_size
         self.num_local_home_experts = config.num_moe_experts // self.ep_size
