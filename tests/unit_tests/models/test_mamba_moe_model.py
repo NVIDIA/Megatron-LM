@@ -451,8 +451,12 @@ class TestMambaMoEModel:
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
+        """Sanity check for the constructor of the Mamba MoE model."""
+
         args = get_args()
+
         assert_config_matches_golden(self.model.config)
+
         assert self.model.pre_process is True, "pre_process should be True"
         assert self.model.post_process is True, "post_process should be True"
         assert self.model.hybrid_attention_ratio == 0.0, "hybrid_attention_ratio should be 0.0"
@@ -460,8 +464,6 @@ class TestMambaMoEModel:
         assert (
             self.model.hybrid_override_pattern == args.hybrid_override_pattern
         ), f"hybrid_override_pattern should be {args.hybrid_override_pattern}"
-
-        # check correct number of parameters
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 8449294624, f"Expected 8449294624 parameters, got {num_weights}"
 
@@ -483,7 +485,7 @@ class TestMambaMoEModel:
         assert self.model.decoder.input_tensor.shape[2] == config.hidden_size
 
     def test_forward(self):
-        """Test the forward pass of the Mamba MoE model."""
+        """Basic smoke test for the forward pass of the Mamba MoE model."""
 
         args = get_args()
 
@@ -495,7 +497,7 @@ class TestMambaMoEModel:
         micro_batch_size = args.micro_batch_size
 
         self.model.cuda()
-        
+
         data = list(range(sequence_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
@@ -507,7 +509,7 @@ class TestMambaMoEModel:
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            runtime_gather_output=True
+            runtime_gather_output=True,
         )
 
         assert logits.shape[0] == micro_batch_size
