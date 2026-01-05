@@ -604,6 +604,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
+        # Rebuild model_param_group_index_map to reflect parameter reordering.
+        # The _build_model_and_main_param_groups method reorders parameters by dtype
+        # (FP32 first, then FP16/BF16), so we need to update the mapping to match
+        # the new positions in optimizer.param_groups.
+        for group_index, group_range in enumerate(self.opt_group_ranges):
+            param_order = 0
+            # First, add FP32 params (in the same order as they appear in group_range["params"])
+            for model_param in group_range["params"]:
+                if model_param.type() == 'torch.cuda.FloatTensor':
+                    self.model_param_group_index_map[model_param] = (group_index, param_order)
+                    param_order += 1
+            # Then, add FP16/BF16 params (in the same order as they appear in group_range["params"])
+            for model_param in group_range["params"]:
+                if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                    self.model_param_group_index_map[model_param] = (group_index, param_order)
+                    param_order += 1
+
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
