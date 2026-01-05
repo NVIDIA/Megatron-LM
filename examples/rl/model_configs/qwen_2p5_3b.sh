@@ -92,5 +92,4 @@ MODEL_OPTIONS="\
   --make-vocab-size-divisible-by 64 \
   --clip-grad 1.0 \
   --rl-use-sequence-packing \
-  --rl-sequence-packing-bin-size 8192 \
   --rl-sequence-packing-algo fifo"

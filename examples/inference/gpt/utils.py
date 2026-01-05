@@ -103,6 +103,15 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help='Skip prompt log probs.',
     )
     group.add_argument(
+        "--stop-words",
+        metavar='WORD',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Stop words to terminate generation. Each word should be quoted and '
+        'separated by space. Example: --stop-words "\\n\\n" "END" "###"',
+    )
+    group.add_argument(
         "--output-path",
         type=str,
         default=None,
@@ -134,6 +143,13 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action='store_true',
         default=False,
         help='Use flashinfer fused rope implementation.',
+    )
+    group.add_argument(
+        "--no-record-throughput",
+        action='store_false',
+        dest="record_throughput",
+        help="Disable throughput recording in --output-file"
+        
     )
 
     return parser

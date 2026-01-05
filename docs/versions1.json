@@ -1,0 +1,13 @@
+[
+    {
+        "name": "latest",
+        "version": "latest",
+        "url": "https://docs.nvidia.com/megatron-core/latest/"
+    },
+    {
+        "name": "0.15.0",
+        "version": "0.15.0",
+        "url": "https://docs.nvidia.com/megatron-core/0.15.0/"
+    }
+]
+
