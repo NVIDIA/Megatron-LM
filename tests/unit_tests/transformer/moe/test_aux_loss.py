@@ -581,7 +581,7 @@ class TestRouterAuxLoss:
 class TestPaddingMaskAuxLoss:
     """Test padding mask support in various aux loss types."""
 
-    def setup_model_parallel(self, tp_size=1, ep_size=1, cp_size=1):
+    def setup_model_parallel(self, tp_size=1, ep_size=1, cp_size=1, sequence_parallel=False):
         """Initialize model parallel with given configuration.
 
         Args:
@@ -615,6 +615,10 @@ class TestPaddingMaskAuxLoss:
             bf16=True,
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+            sequence_parallel=sequence_parallel and tp_size > 1,
         )
 
     def new_router(self, **kwargs):
@@ -685,11 +689,9 @@ class TestPaddingMaskAuxLoss:
             aux_loss_without_mask = tracker[loss_name]["values"][0].clone()
             grad_without_mask = router.weight.grad.clone()
 
-            # The aux loss with mask should be close to the aux loss without mask
-            torch.testing.assert_close(
-                aux_loss_with_mask, aux_loss_without_mask, rtol=1e-2, atol=1e-3
-            )
-            torch.testing.assert_close(grad_with_mask, grad_without_mask, rtol=1e-2, atol=1e-3)
+            # The aux loss with mask should be equal to the aux loss without mask
+            assert torch.equal(aux_loss_with_mask, aux_loss_without_mask)
+            assert torch.equal(grad_with_mask, grad_without_mask)
 
             clear_aux_losses_tracker()
         finally:
@@ -749,8 +751,8 @@ class TestPaddingMaskAuxLoss:
             grad_without_mask = router.weight.grad.clone()
 
             # The z_loss with mask should be close to the z_loss without mask
-            torch.testing.assert_close(z_loss_with_mask, z_loss_without_mask, rtol=1e-2, atol=1e-3)
-            torch.testing.assert_close(grad_with_mask, grad_without_mask, rtol=1e-2, atol=1e-3)
+            assert torch.equal(z_loss_with_mask, z_loss_without_mask)
+            assert torch.equal(grad_with_mask, grad_without_mask)
 
             clear_aux_losses_tracker()
         finally:

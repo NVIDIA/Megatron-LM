@@ -298,6 +298,11 @@ class GPTModel(LanguageModule):
         if decoder_input is not None:
             pass
         elif self.pre_process:
+            if padding_mask is not None:
+                assert padding_mask.shape == input_ids.shape, (
+                    f"padding_mask shape {padding_mask.shape} does not match "
+                    f"input_ids shape {input_ids.shape}"
+                )
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
             if padding_mask is not None and self.config.sequence_parallel:
                 padding_mask = (
@@ -699,6 +704,7 @@ class GPTModel(LanguageModule):
         runtime_gather_output: Optional[bool] = None,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
     ):
         """Builds a computation schedule plan for the model.
 
@@ -724,6 +730,7 @@ class GPTModel(LanguageModule):
             inference_params (InferenceParams, optional):
                 Parameters for inference. Defaults to None.
             loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
+            padding_mask (Optional[Tensor], optional): Padding mask. Defaults to None.
 
         Returns:
             TransformerModelChunkSchedulePlan: The model chunk schedule plan.
@@ -742,6 +749,7 @@ class GPTModel(LanguageModule):
             extra_block_kwargs,
             runtime_gather_output,
             loss_mask,
+            padding_mask,
         )
 
     def sharded_state_dict(
