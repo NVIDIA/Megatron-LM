@@ -69,7 +69,8 @@ class Net(nn.Module):
 )
 def test_get_param_groups_no_overrides(mock_get_world_size):
     net = Net()
-    param_groups = _get_param_groups([net], OptimizerConfig(optimizer='adam', lr=0.01), None)
+    # NOTE: to get no overrides, supply an empty dictionary rather than None.
+    param_groups = _get_param_groups([net], OptimizerConfig(optimizer='adam', lr=0.01), {})
     assert len(param_groups) == 1
     pg0 = param_groups[0]
     assert pg0.keys() == {
@@ -90,6 +91,21 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
     assert pg0['is_decoupled_lr'] == False
     assert pg0['max_lr'] == 0.01  # from the optimizer config default for lr
     assert pg0['min_lr'] is None  # from the optimizer config default.
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_default_overrides(mock_get_world_size):
+    """Test that the default overrides are applied to the parameter groups."""
+    net = Net()
+    # NOTE: to get legacy default overrides, supply None.
+    param_groups = _get_param_groups([net], OptimizerConfig(optimizer='adam', lr=0.01), None)
+    assert len(param_groups) == 2
+    pg0, pg1 = param_groups
+    wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
+    assert wd_mults == {1.0, 0.0}
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
