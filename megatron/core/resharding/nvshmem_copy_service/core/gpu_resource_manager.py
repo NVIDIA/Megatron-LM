@@ -12,6 +12,7 @@ from typing import Dict, Optional
 
 try:
     import nvshmem.core
+    from cuda.core.experimental import Device
 
     HAVE_NVSHMEM = True
 except ImportError:
@@ -19,7 +20,6 @@ except ImportError:
 
 import torch
 import torch.distributed as dist
-from cuda.core.experimental import Device
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ class GPUResourceManager:
     """Manages GPU resources including NVSHMEM, streams, and events."""
 
     def __init__(self):
-        self.device: Optional[Device] = None
+        self.device = None
         self.my_pe: int = -1
         self.n_pes: int = -1
         self.initialized: bool = False
