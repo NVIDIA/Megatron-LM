@@ -1,3 +1,5 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 """
 Utilities for extracting data pointers from different tensor types.
 

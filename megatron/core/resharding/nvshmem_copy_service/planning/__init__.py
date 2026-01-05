@@ -1,3 +1,5 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 """Planning components for task segmentation, workload packing, and scheduling."""
 
 from .communication_scheduler import CommunicationScheduler

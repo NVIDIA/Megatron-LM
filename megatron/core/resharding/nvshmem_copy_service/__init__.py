@@ -1,3 +1,5 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 """
 NVSHMEM-based remote copy service and supporting components.
 

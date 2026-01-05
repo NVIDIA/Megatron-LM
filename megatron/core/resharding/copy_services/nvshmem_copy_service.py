@@ -1,3 +1,5 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 from __future__ import annotations
 
 """
@@ -28,7 +30,9 @@ class NVSHMEMCopyService(CopyService):
 
     def __init__(self):
         if not dist.is_initialized():
-            raise RuntimeError("torch.distributed must be initialized before NVSHMEMCopyService()")
+            raise RuntimeError(
+                "torch.distributed must be initialized before NVSHMEMCopyService()"
+            )
 
         self.rank = dist.get_rank()
         self._remote = RemoteCopyService()
@@ -48,7 +52,9 @@ class NVSHMEMCopyService(CopyService):
             self._remote.init(log_level="INFO")
             self._initialized = True
             logger.info(
-                "NVSHMEMCopyService initialized: PE %d / %d", self._remote.my_pe, self._remote.n_pes
+                "NVSHMEMCopyService initialized: PE %d / %d",
+                self._remote.my_pe,
+                self._remote.n_pes,
             )
 
     def submit_send(self, src_tensor: torch.Tensor, dest_rank: int):
@@ -77,7 +83,12 @@ class NVSHMEMCopyService(CopyService):
     # a small adapter layer that batches up matched send/recv slices.
     #
 
-    def submit_send_with_id(self, task_id: int, src_tensor: torch.Tensor, dest_rank: int):
+    def submit_send_with_id(
+        self,
+        task_id: int,
+        src_tensor: torch.Tensor,
+        dest_rank: int,
+    ):
         """Register a send with an explicit, globally shared task_id."""
         self._ensure_initialized()
 
@@ -102,10 +113,19 @@ class NVSHMEMCopyService(CopyService):
 
         # Use public API on RemoteCopyService
         self._remote.register_send(
-            task_id=task_id, src_tensor=src_bytes, src_pos=0, size=num_bytes, dest_pe=dest_rank
+            task_id=task_id,
+            src_tensor=src_bytes,
+            src_pos=0,
+            size=num_bytes,
+            dest_pe=dest_rank,
         )
 
-    def submit_recv_with_id(self, task_id: int, dest_tensor: torch.Tensor, src_rank: int):
+    def submit_recv_with_id(
+        self,
+        task_id: int,
+        dest_tensor: torch.Tensor,
+        src_rank: int,
+    ):
         """Register a recv with an explicit, globally shared task_id."""
         self._ensure_initialized()
 
@@ -129,7 +149,11 @@ class NVSHMEMCopyService(CopyService):
         )
 
         self._remote.register_receive(
-            task_id=task_id, dest_tensor=dst_bytes, dest_pos=0, size=num_bytes, src_pe=src_rank
+            task_id=task_id,
+            dest_tensor=dst_bytes,
+            dest_pos=0,
+            size=num_bytes,
+            src_pe=src_rank,
         )
 
     def run(self):
@@ -180,3 +204,5 @@ class NVSHMEMCopyService(CopyService):
         self._remote.run()
         self._remote.clear_requests()
         logger.info("NVSHMEMCopyService: NVSHMEM transfers complete")
+
+

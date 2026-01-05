@@ -1,3 +1,5 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 """
 Remote Copy Service - Main orchestrator for NVSHMEM-based GPU-to-GPU transfers.
 

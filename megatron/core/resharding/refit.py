@@ -74,13 +74,11 @@ def reshard_model_weights(
     if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
         raise RuntimeError("Target model missing pg_collection required for NCCL reshard")
 
-    # TODO(Peter): We should figure out why this happens. Seems like a bug in Orthotope.
     # Fill missing DP group on the source using Megatron's parallel state if not provided
     if getattr(src_core.pg_collection, "dp", None) is None:
         src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
 
     # caching plan for reuse
-    # TODO(Peter): Find a better place to cache this.
     cached_plan: Optional[Any] = getattr(tgt_core, "_cached_reshard_plan", None)
     if cached_plan is None:
         plan = build_centralized_reshard_plan(src_core, tgt_core, num_experts=num_experts)

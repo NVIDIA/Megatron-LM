@@ -1,3 +1,5 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 from typing import Dict, List
 
 from ..logger import PELogger
