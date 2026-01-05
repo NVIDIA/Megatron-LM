@@ -30,6 +30,7 @@ class MathAgent(RewardOnlyAgent):
         assert answer_format in ["tagged", "boxed"], "Invalid answer format"
         self.format_reward = format_reward
         self.answer_format = answer_format
+        self.assistant_prefix = assistant_prefix
 
     def compute_score(self, response: str, golden: dict, golden_key: str = "answer") -> float:
         """Take a response and a golden answer and return a score. Supports tagged or boxed answers.
