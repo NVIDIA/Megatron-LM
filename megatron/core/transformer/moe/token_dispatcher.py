@@ -1082,21 +1082,18 @@ class _HybridEPManager(_DispatchManager):
             )
             # We cannot predict the actual number of tokens after the dispatch op,
             # so we set it to the worst case in drop_and_pad mode
-            metadata.num_dispatched_tokens = (
+            # In drop_and_pad mode, the number of tokens after the permute op can be computed on the CPU
+            metadata.num_permuted_tokens = (
                 self.capacity * self.group.size() * self.num_local_experts
             )
-            # In drop_and_pad mode, the number of tokens after the permute op can be computed on the CPU
-            metadata.num_permuted_tokens = self.num_dispatched_tokens
             metadata.tokens_per_expert = torch.full(
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
         elif self.received_token_capacity is not None:
-            metadata.num_dispatched_tokens = int(
+            metadata.num_permuted_tokens = int(
                 self.received_token_capacity * num_tokens * self.router_topk
             )
-            metadata.num_permuted_tokens = metadata.num_dispatched_tokens
         else:
-            metadata.num_dispatched_tokens = None
             metadata.num_permuted_tokens = None
 
     def dispatch(
@@ -1127,13 +1124,11 @@ class _HybridEPManager(_DispatchManager):
             num_local_experts=self.num_local_experts,
             num_sms_dispatch_api=self.config.moe_hybridep_num_sms,
             num_sms_combine_api=self.config.moe_hybridep_num_sms,
-            num_dispatched_tokens=metadata.num_dispatched_tokens,
             num_permuted_tokens=metadata.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
         if not self.drop_and_pad and self.received_token_capacity is None:
-            metadata.num_dispatched_tokens = metadata.tokens_per_expert.sum()
-            metadata.num_permuted_tokens = metadata.num_dispatched_tokens
+            metadata.num_permuted_tokens = metadata.tokens_per_expert.sum()
         return dispatched_hidden
 
     def combine(
@@ -1145,7 +1140,6 @@ class _HybridEPManager(_DispatchManager):
     ) -> torch.Tensor:
         hidden_states = hybrid_ep_combine(
             x=hidden_states,
-            num_dispatched_tokens=metadata.num_dispatched_tokens,
             num_permuted_tokens=metadata.num_permuted_tokens,
             handle=metadata.handle,
             pad_multiple=self.pad_multiple,

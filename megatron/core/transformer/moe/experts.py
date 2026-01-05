@@ -930,8 +930,19 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = tokens_per_expert.long().cuda()
         else:
             tokens_per_expert = tokens_per_expert.long().cpu().tolist()
+        received_num_tokens = permuted_local_hidden_states.shape[0]
         actual_tokens_per_expert = tokens_per_expert
         use_hybrid_ep_dispatcher = self.config.moe_flex_dispatcher_backend == "hybridep" and self.config.moe_token_dispatcher_type == "flex"
+
+        permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
+        if (
+            self.config.moe_received_token_capacity is not None
+            and not self.config.moe_use_device_initiated_grouped_gemm
+        ):
+            # Without device-initiated grouped gemm, we need to make sure the tensor size dones't exceed sum of tokens_per_expert.
+            permuted_local_hidden_states = permuted_local_hidden_states[: sum(tokens_per_expert)]
+            permuted_probs = permuted_probs[: sum(tokens_per_expert)]
+
         if (self.config.fp8 or self.config.fp4) and not use_hybrid_ep_dispatcher:
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
@@ -942,15 +953,6 @@ class TEGroupedMLP(MegatronModule):
         else:
             permuted_probs = permuted_probs.unsqueeze(-1)
 
-        permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
-        received_num_tokens = permuted_local_hidden_states.shape[0]
-        if (
-            self.config.moe_received_token_capacity is not None
-            and not self.config.moe_use_device_initiated_grouped_gemm
-        ):
-            # Without device-initiated grouped gemm, we need to make sure the tensor size dones't exceed sum of tokens_per_expert.
-            permuted_local_hidden_states = permuted_local_hidden_states[: sum(tokens_per_expert)]
-            permuted_probs = permuted_probs[: sum(tokens_per_expert)]
 
         if self.config.moe_apply_probs_on_input:
             assert (

@@ -336,7 +336,6 @@ class HybridEPDispatch(torch.autograd.Function):
         num_local_experts,
         num_sms_dispatch_api=24,
         num_sms_combine_api=24,
-        num_dispatched_tokens=None,
         num_permuted_tokens=None,
         pad_multiple=None,
     ):
@@ -359,7 +358,7 @@ class HybridEPDispatch(torch.autograd.Function):
         # will be put on the CPU to avoid the potential sync in combine/backward pass,
         # but if we provide the num_dispatched_tokens and num_permuted_tokens on CPU,
         # we do not need to the D2H here.
-        use_host_meta = num_dispatched_tokens is None or num_permuted_tokens is None
+        non_blocking = num_permuted_tokens is not None
         # Process the dispatch
         (
             dispatched_hidden,
@@ -374,15 +373,13 @@ class HybridEPDispatch(torch.autograd.Function):
             scaling_factor=None,
             num_of_experts_per_rank=num_local_experts,
             pad_multiple=pad_multiple,
-            num_dispatched_tokens=num_dispatched_tokens,
             num_permuted_tokens=num_permuted_tokens,
-            use_host_meta=use_host_meta,
+            non_blocking=non_blocking,
             use_fp8=False,
         )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
-        ctx.num_dispatched_tokens = num_dispatched_tokens
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -402,7 +399,6 @@ class HybridEPDispatch(torch.autograd.Function):
             probs=grad_probs,
             handle=handle,
             pad_multiple=ctx.pad_multiple,
-            num_dispatched_tokens=ctx.num_dispatched_tokens,
         )
         return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
 
@@ -414,7 +410,7 @@ class HybridEPCombine(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, x, handle, num_dispatched_tokens=None, num_permuted_tokens=None, pad_multiple=None
+        ctx, x, handle, num_permuted_tokens=None, pad_multiple=None
     ):
         '''
         Forward pass of fused combine of the HybridEP backend
@@ -423,11 +419,9 @@ class HybridEPCombine(torch.autograd.Function):
             hidden=x,
             handle=handle,
             pad_multiple=pad_multiple,
-            num_dispatched_tokens=num_dispatched_tokens,
         )
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
-        ctx.num_dispatched_tokens = num_dispatched_tokens
         ctx.num_permuted_tokens = num_permuted_tokens
         return combined_hidden
 
@@ -442,7 +436,6 @@ class HybridEPCombine(torch.autograd.Function):
             scaling_factor=None,
             handle=handle,
             pad_multiple=ctx.pad_multiple,
-            num_dispatched_tokens=ctx.num_dispatched_tokens,
             num_permuted_tokens=ctx.num_permuted_tokens,
         )
         return dispatched_hidden, None, None, None, None
@@ -528,7 +521,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                 num_sms_dispatch_api=num_sms_dispatch_api,
                 num_sms_combine_api=num_sms_combine_api,
             )
-        use_host_meta = num_dispatched_weights is None
+        non_blocking = num_dispatched_weights is not None
         if fp8_dispatch:
             assert scale_tensor.dtype == torch.float32
             assert weight_tensor.shape[1] // scale_tensor.shape[1] == 128
@@ -545,17 +538,14 @@ class HybridEPExpertDispatch(torch.autograd.Function):
             probs=None,
             scaling_factor=scale_tensor,
             pad_multiple=None,
-            num_dispatched_tokens=num_dispatched_weights * num_chunks_per_weight,
             num_permuted_tokens=num_dispatched_weights * num_chunks_per_weight,
-            use_host_meta=use_host_meta,
+            non_blocking=non_blocking,
         )
 
         ctx.handle = handle
-        if use_host_meta:
-            ctx.num_dispatched_tokens = tokens_per_expert.sum()
-            ctx.num_permuted_tokens = ctx.num_dispatched_tokens
+        if non_blocking:
+            ctx.num_permuted_tokens = tokens_per_expert.sum()
         else:
-            ctx.num_dispatched_tokens = num_dispatched_weights * num_chunks_per_weight
             ctx.num_permuted_tokens = num_dispatched_weights * num_chunks_per_weight
 
         # Wrap the data into quantized tensor
@@ -608,7 +598,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         num_chunks_per_weight = ctx.num_chunks_per_weight
         weight_shape = ctx.weight_shape
         if ctx.fp8_dispatch:
-            ctx.handle[-1].hidden_dim //= 2
+            ctx.handle[-2].hidden_dim //= 2
         # chunk the grad_expert_weights into pieces
         expert_grad_tensor = torch.stack(grad_expert_weights, dim=0).reshape(ctx.num_local_echo_experts*num_chunks_per_weight, -1)
 
@@ -618,7 +608,6 @@ class HybridEPExpertDispatch(torch.autograd.Function):
             probs=None,
             handle=ctx.handle,
             pad_multiple=None,
-            num_dispatched_tokens=ctx.num_dispatched_tokens,
         )
         # Extract grad for each expert
         weight_grad_list = [weight_grad.reshape(weight_shape) for weight_grad in combined_expert_grad.chunk(ctx.num_local_home_experts, dim=0)]
@@ -648,7 +637,6 @@ if HAVE_HYBRIDEP:
         num_local_experts,
         num_sms_dispatch_api=24,
         num_sms_combine_api=24,
-        num_dispatched_tokens=None,
         num_permuted_tokens=None,
         pad_multiple=None,
     ):
@@ -691,12 +679,11 @@ if HAVE_HYBRIDEP:
             num_local_experts,
             num_sms_dispatch_api,
             num_sms_combine_api,
-            num_dispatched_tokens,
             num_permuted_tokens,
             pad_multiple,
         )
 
-    def hybrid_ep_combine(x, handle, num_dispatched_tokens, num_permuted_tokens, pad_multiple):
+    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple):
         '''
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
@@ -718,7 +705,7 @@ if HAVE_HYBRIDEP:
                 is performed.
         '''
         return HybridEPCombine.apply(
-            x, handle, num_dispatched_tokens, num_permuted_tokens, pad_multiple
+            x, handle, num_permuted_tokens, pad_multiple
         )
 
 else:
