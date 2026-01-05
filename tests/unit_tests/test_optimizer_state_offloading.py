@@ -42,6 +42,7 @@ def create_model_and_optimizer(hidden_size=256, offload_optimizer_states=True, *
     default_config = dict(
         optimizer='adam',
         bf16=True,
+        lr=0.001,
         use_distributed_optimizer=True,
         offload_optimizer_states=offload_optimizer_states,
     )
