@@ -38,7 +38,6 @@ def weak_method(method):
     return wrapped_func
 
 
-@internal_api
 def should_free_input(name, is_moe, config):
     """Determine if the node should free its input memory.
 
@@ -53,14 +52,6 @@ def should_free_input(name, is_moe, config):
     # For dense layers [attn, fake, mlp, fake], the input is needed during backward pass
     if not is_moe:
         return False
-    enable_deepep = (
-        config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "deepep"
-    )
-    enable_hybridep = (
-        config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "hybridep"
-    )
     # Define which nodes should free input memory
     # Since we split the computing graph into multiple nodes, we can manually control
     # when and how to free the input memory.
@@ -69,13 +60,11 @@ def should_free_input(name, is_moe, config):
     free_input_nodes = {
         "mlp": True,
         "moe_combine": True,
-        # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
-        # and probs before dispatch A2A and it's not needed anymore after the forward pass
-        # For DeepEP and HybridEP dispatcher mode, they are both needed in backward pass
-        # and cannot be freed.
-        # If moe_preprocess is in cuda graph scope, tokens and probs are fixed size tensors,
-        # so they cannot be freed.
-        "moe_dispatch": not (enable_deepep or enable_hybridep)
+        # For non-deepep mode, the input is the un-dispatched tokens and probs before dispatch A2A
+        # and it's not needed anymore after the forward pass. If moe_preprocess is in cuda graph
+        # scope, tokens and probs are fixed size tensors, so they cannot be freed.
+        # For deepep mode, they are both needed in backward pass, so they cannot be freed.
+        "moe_dispatch": config.moe_token_dispatcher_type == "alltoall"
         and (CudaGraphScope.moe_preprocess not in config.cuda_graph_scope),
     }
 
@@ -241,7 +230,7 @@ class TransformerLayerNode(ScheduleNode):
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
             bwd_dw_callables (list): List of weight gradient functions for the layer.
-            extra_args (dict): Extra arguments for the node: is_moe, config.
+            extra_args (dict): Extra arguments for the node: is_moe, enable_deepep.
         """
         # determine whether to free input memory
         config = extra_args.get("config", None)
@@ -430,7 +419,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
-                local_tokens, probs, _ = layer.mlp.preprocess(
+                local_tokens, probs= layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )
                 return hidden_states, local_tokens, probs, shared_expert_output
@@ -484,7 +473,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
         expert_output, _ = layer.mlp.routed_experts_compute(
-            dispatched_tokens, dispatched_probs, None
+            dispatched_tokens, dispatched_probs
         )
 
         if layer.recompute_pre_mlp_layernorm:

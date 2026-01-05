@@ -35,7 +35,7 @@ class TransformerLayerSchedulePlan:
     mtp post process nodes.
 
     layer (TransformerLayerSchedulePlan)
-    ├── attn (TransformerLayerNode): attention -> router -> dispatch preprocess
+    ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
@@ -149,11 +149,6 @@ class TransformerLayerSchedulePlan:
             )
         else:
             self.mtp_post_process = NoopScheduleNode()
-
-        # mlp and combine may receive dgrad from attn, which is managed by cuda graph.
-        if CudaGraphScope.attn in self.config.cuda_graph_scope:
-            self.mlp.manual_grads_release = False
-            self.moe_combine.manual_grads_release = False
 
     def get_fp8_context(self):
         """
