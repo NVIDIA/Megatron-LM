@@ -25,7 +25,7 @@ NEGATIVE_REWARD = 0.0
 PARTIAL_END_REWARD = 0.75
 
 class MathAgent(RewardOnlyAgent):
-    def __init__(self, format_reward: float = 0.0, answer_format: str = "tagged", assistant_prefix: str = None, **kwargs):
+    def __init__(self, format_reward: float = 0.0, answer_format: str = "tagged", assistant_prefix: str = "Assistant: Let me solve this step by step.\n<think>", **kwargs):
         super().__init__(**kwargs)
         assert answer_format in ["tagged", "boxed"], "Invalid answer format"
         self.format_reward = format_reward
@@ -112,12 +112,6 @@ class MathAgent(RewardOnlyAgent):
         else:
             raise ValueError(f"Invalid answer format: {self.answer_format}")
 
-        if self.assistant_prefix is not None:
-            assert isinstance(self.assistant_prefix, str), "assistant_prefix must be a string"
-            assistant_prefix = self.assistant_prefix
-        else:
-            assistant_prefix = "Assistant: Let me solve this step by step.\n<think>"
-
         if self.chat_mode:
             prefix = f"""{kwargs[problem_key]}\n{answer_format}"""
         else:
@@ -125,5 +119,5 @@ class MathAgent(RewardOnlyAgent):
     The question will be a word math problem. Show your work in <think> </think> tags. 
     {answer_format}
     User: {kwargs[problem_key]}
-    {assistant_prefix}"""
+    {self.assistant_prefix}"""
         return prefix
