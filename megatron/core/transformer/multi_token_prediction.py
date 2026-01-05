@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -13,18 +13,22 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.utils import is_vp_last_stage
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.utils import (
+    get_pg_rank,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
@@ -53,7 +57,11 @@ except ImportError:
 
 
 def tie_word_embeddings_state_dict(
-    sharded_state_dict: ShardedStateDict, word_emb_weight: Tensor, word_emb_weight_key: str
+    sharded_state_dict: ShardedStateDict,
+    word_emb_weight: Tensor,
+    word_emb_weight_key: str,
+    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
 ) -> None:
     """tie the embedding of the mtp processing stage in a given sharded state dict.
 
@@ -61,13 +69,15 @@ def tie_word_embeddings_state_dict(
         sharded_state_dict (ShardedStateDict): state dict with the weight to tie.
         word_emb_weight (Tensor): weight of the word embedding.
         word_emb_weight_key (str): key of the word embedding in the sharded state dict.
+        tp_group (torch.distributed.ProcessGroup): The tensor parallel group
+        dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
 
     Returns: None, acts in-place
     """
     mtp_word_emb_replica_id = (
         1,  # copy of embedding in pre processing stage
         0,
-        parallel_state.get_data_parallel_rank(with_context_parallel=True),
+        get_pg_rank(dp_cp_group),
     )
     assert word_emb_weight_key in sharded_state_dict
     del sharded_state_dict[word_emb_weight_key]
@@ -76,11 +86,17 @@ def tie_word_embeddings_state_dict(
         key=word_emb_weight_key,
         replica_id=mtp_word_emb_replica_id,
         allow_shape_mismatch=True,
+        tp_group=tp_group,
+        dp_cp_group=dp_cp_group,
     )
 
 
 def tie_output_layer_state_dict(
-    sharded_state_dict: ShardedStateDict, output_layer_weight: Tensor, output_layer_weight_key: str
+    sharded_state_dict: ShardedStateDict,
+    output_layer_weight: Tensor,
+    output_layer_weight_key: str,
+    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
 ) -> None:
     """tie the output layer of the mtp processing stage in a given sharded state dict.
 
@@ -88,13 +104,15 @@ def tie_output_layer_state_dict(
         sharded_state_dict (ShardedStateDict): state dict with the weight to tie.
         output_layer_weight (Tensor): weight of the output layer.
         output_layer_weight_key (str): key of the output layer in the sharded state dict.
+        tp_group (torch.distributed.ProcessGroup): The tensor parallel group
+        dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
 
     Returns: None, acts in-place
     """
     mtp_output_layer_replica_id = (
         1,  # copy of output layer in post processing stage
         0,
-        parallel_state.get_data_parallel_rank(with_context_parallel=True),
+        get_pg_rank(dp_cp_group),
     )
     assert output_layer_weight_key in sharded_state_dict
     del sharded_state_dict[output_layer_weight_key]
@@ -103,10 +121,12 @@ def tie_output_layer_state_dict(
         key=output_layer_weight_key,
         replica_id=mtp_output_layer_replica_id,
         allow_shape_mismatch=True,
+        tp_group=tp_group,
+        dp_cp_group=dp_cp_group,
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None):
+def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -118,15 +138,24 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None):
     For CP>1: Splits tensor into chunks, performs rolling within each chunk, then exchanges
     boundary elements between adjacent CP ranks to maintain sequence continuity.
 
+    For packed sequences: Respects sequence boundaries when rolling to avoid mixing tokens
+    from different sequences.
+
     Args:
         tensor (Tensor): The input tensor to roll.
         shifts (int): The shift of the tensor (typically -1 for MTP).
         dims (int): The dimension to roll (typically -1 for sequence dimension).
         cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
                                falls back to standard rolling behavior.
+        packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+                                            If provided, respects sequence boundaries.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
+    # Handle packed sequences cases
+    if packed_seq_params is not None:
+        return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
+
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
@@ -191,6 +220,91 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None):
 
     # Concatenate the processed chunks back into a single tensor
     rolled_tensor = torch.cat(rolled_tensor_list, dim=dims)
+
+    return rolled_tensor, rolled_tensor.sum()
+
+
+def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=None):
+    """Roll tensor with packed sequence support.
+    This function handles rolling for packed sequences by respecting sequence boundaries
+    """
+
+    # Notice: This is a naive implementation to test the correctness,
+    # a better solution will only sync the boundary tokens once.
+    assert (
+        dims == -1 or dims == tensor.dim() - 1
+    ), "Packed sequence roll only supports the last dimension."
+    assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
+    cu_seqlens = packed_seq_params.cu_seqlens_q
+    assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
+
+    rolled_tensor = tensor.clone()
+
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_size == 1:
+        # CP disabled: roll each packed sequence independently within its boundaries
+        for i in range(len(cu_seqlens) - 1):
+            start_idx = cu_seqlens[i]
+            end_idx = cu_seqlens[i + 1]
+            seq_slice = tensor[..., start_idx:end_idx]
+            rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
+            # Zero out the last position(s) that would cross sequence boundaries
+            rolled_seq[..., shifts:] = 0
+            rolled_tensor[..., start_idx:end_idx] = rolled_seq
+        return rolled_tensor, rolled_tensor.sum()
+
+    # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
+    local_rank = torch.distributed.get_rank(group=cp_group)
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+    next_rank = global_ranks[(local_rank + 1) % cp_size]
+    prev_rank = global_ranks[(local_rank - 1) % cp_size]
+
+    # Iterate over each sequence individually
+    for i in range(len(cu_seqlens) - 1):
+        start_idx = cu_seqlens[i]
+        end_idx = cu_seqlens[i + 1]
+
+        # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
+        local_start_idx = start_idx // cp_size
+        local_end_idx = end_idx // cp_size
+        tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
+
+        # The following code is very similar as the code in roll_tensor function
+        local_chunks = tensor_slice.chunk(2, dim=dims)
+        rolled_chunks = [torch.roll(chunk, shifts=shifts, dims=dims) for chunk in local_chunks]
+
+        tensor_send_list = []
+        tensor_recv_list = []
+        for chunk in rolled_chunks:
+            boundary = chunk.select(dims, shifts).contiguous().clone()
+            tensor_send_list.append(boundary)
+            tensor_recv_list.append(torch.empty_like(boundary))
+
+        ops = []
+        if local_rank != 0:
+            ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
+            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
+        else:
+            tensor_recv_list[1].zero_()
+
+        if local_rank != cp_size - 1:
+            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
+            ops.append(torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank))
+        else:
+            tensor_recv_list[0].copy_(tensor_send_list[1])
+
+        for op in ops:
+            op.wait()
+
+        index = [slice(None)] * rolled_chunks[0].dim()
+        index[dims] = shifts
+        for chunk, recv in zip(rolled_chunks, tensor_recv_list):
+            chunk[tuple(index)] = recv
+
+        seq_result = torch.cat(rolled_chunks, dim=dims)
+
+        # update the rolled tensor
+        rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
 
     return rolled_tensor, rolled_tensor.sum()
 
@@ -332,25 +446,103 @@ def get_mtp_layer_spec_for_backend(
     return mtp_layer_spec
 
 
-def get_mtp_layer_offset(config: TransformerConfig) -> int:
+def mtp_on_this_rank(
+    config: TransformerConfig, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
+) -> bool:
+    """
+    Check if there is MTP on the current rank.
+
+    Behavior:
+        - If a custom pipeline model parallel layout is provided in the config:
+            - If virtual pipeline parallelism is enabled (and `ignore_virtual` is False), checks
+              whether any MTP layers are present on this (pp_rank, vp_stage) pair.
+            - Otherwise, checks all virtual pipeline ranks of the current pipeline rank. Returns
+              True if any virtual sub-rank includes at least one MTP layer.
+        - If no custom layout is provided, assumes all MTP layers (if any) are placed on the last
+          pipeline stage. The function returns True only on the last pipeline stage.
+    """
+    mtp_on_this_rank = False
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    if config.pipeline_model_parallel_layout is not None:
+        # with custom PP layout, we support put MTP layers on any pipeline stage
+        layout = config.pipeline_model_parallel_layout.layout
+        if (
+            not ignore_virtual
+            and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
+        ):
+            assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
+            num_layers_to_build = layout[pp_rank][vp_stage].count(LayerType.mtp)
+            mtp_on_this_rank = num_layers_to_build > 0
+        else:
+            for vpp_rank in range(len(layout[pp_rank])):
+                num_layers_to_build = layout[pp_rank][vpp_rank].count(LayerType.mtp)
+                if num_layers_to_build > 0:
+                    mtp_on_this_rank = True
+                    break
+    else:
+        # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
+        if config.mtp_num_layers is not None:
+            mtp_on_this_rank = parallel_state.is_pipeline_last_stage(
+                ignore_virtual=ignore_virtual, vp_stage=vp_stage
+            )
+        else:
+            mtp_on_this_rank = False
+    return mtp_on_this_rank
+
+
+def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
+    """Get the ranks of the MTP layers."""
+    mtp_ranks = set()
+    if config.mtp_num_layers is None:
+        return []
+    if config.pipeline_model_parallel_layout is None:
+        return [pp_ranks[-1]]
+    layout = config.pipeline_model_parallel_layout.layout
+    for pp_rank in range(len(layout)):
+        for vpp_rank in range(len(layout[pp_rank])):
+            num_layers_to_build = layout[pp_rank][vpp_rank].count(LayerType.mtp)
+            if num_layers_to_build:
+                mtp_ranks.add(pp_ranks[pp_rank])
+    return list(mtp_ranks)
+
+
+def get_mtp_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
     """Get the offset of the MTP layer."""
-    # Currently, we only support put all of MTP layers on the last pipeline stage.
-    return 0
+    # TODO(shifangx): Currently, we only support put all of MTP layers
+    # on the last pipeline stage, so the offset is always 0.
+    # We will support more flexible MTP placement in the future.
+    if config.pipeline_model_parallel_size > 1:
+        if config.pipeline_model_parallel_layout:
+            offset = config.pipeline_model_parallel_layout.get_layer_offset(
+                layer_type=LayerType.mtp, vp_stage=vp_stage
+            )
+        else:
+            offset = 0
+    else:
+        offset = 0
+    return offset
 
 
 def get_mtp_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
     """Get the number of MTP layers to build."""
-    # Currently, we only support put all of MTP layers on the last pipeline stage.
-    vp_size = config.virtual_pipeline_model_parallel_size
-    if pp_rank is None:
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1
-    if is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size) and is_last_pp_stage:
-        return config.mtp_num_layers if config.mtp_num_layers else 0
+    if config.pipeline_model_parallel_layout is not None:
+        # If we have a custom PP layout, get the number of mtp layers in the layout array.
+        num_layers_to_build = config.pipeline_model_parallel_layout.get_num_layers_to_build(
+            layer_type=LayerType.mtp, vp_stage=vp_stage
+        )
+        assert num_layers_to_build == config.mtp_num_layers or num_layers_to_build == 0, (
+            f"Currently, we only support put all of MTP layers on the last pipeline stage, "
+            f"so the number of MTP layers to build ({num_layers_to_build}) must match "
+            f"mtp_num_layers ({config.mtp_num_layers}) or be 0."
+        )
     else:
-        return 0
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
+            num_layers_to_build = config.mtp_num_layers if config.mtp_num_layers else 0
+        else:
+            num_layers_to_build = 0
+    return num_layers_to_build
 
 
 class MTPLossAutoScaler(torch.autograd.Function):
@@ -430,7 +622,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
-        self.layer_number = layer_number
+        self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
 
@@ -472,8 +664,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
         )
+
+        diff_transformer_layer_offset = self.config.num_layers - get_transformer_layer_offset(
+            self.config, vp_stage
+        )
         self.transformer_layer = build_module(
-            self.submodules.transformer_layer, config=self.config, vp_stage=vp_stage
+            self.submodules.transformer_layer,
+            config=self.config,
+            vp_stage=vp_stage,
+            layer_number=self.layer_number + diff_transformer_layer_offset,
         )
 
         self.final_layernorm = build_module(
@@ -490,6 +689,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: torch.Tensor,
         embedding: Callable,
         hidden_states: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -504,10 +704,23 @@ class MultiTokenPredictionLayer(MegatronModule):
                 from gpt model to compute the decoder input.
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
+            packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
         """
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
-        input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1, cp_group=self.cp_group)
-        position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1, cp_group=self.cp_group)
+        input_ids, _ = roll_tensor(
+            input_ids,
+            shifts=-1,
+            dims=-1,
+            cp_group=self.cp_group,
+            packed_seq_params=packed_seq_params,
+        )
+        position_ids, _ = roll_tensor(
+            position_ids,
+            shifts=-1,
+            dims=-1,
+            cp_group=self.cp_group,
+            packed_seq_params=packed_seq_params,
+        )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -569,6 +782,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         else:
             fp8_context = nullcontext()
             transformer_layer_fp8_context = nullcontext()
+
+        # TODO: currently ignoring FP4 in MTP layers because we need more numerical validation
 
         with rng_context:
             with fp8_context:
@@ -688,15 +903,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, f"multi token prediction + cross attention is not yet supported."
-        assert (
-            packed_seq_params is None
-        ), f"multi token prediction + sequence packing is not yet supported."
 
         input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
             embedding=embedding,
             hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
@@ -897,10 +1110,12 @@ class MultiTokenPredictionBlock(MegatronModule):
             (Tensor): The mtp loss tensor of shape [b, s].
         """
         # get hidden states from previous mtp stages
-        offset = get_mtp_layer_offset(self.config)
+        offset = get_mtp_layer_offset(self.config, self.vp_stage)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hidden_states = hidden_states_list[offset]
         for layer_number in range(len(self.layers)):
+            if self.config.fine_grained_activation_offloading:
+                fine_grained_offloading_set_last_layer(layer_number == len(self.layers) - 1)
             (hidden_states, input_ids, position_ids) = self.layers[layer_number](
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -942,7 +1157,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
-            offset = get_mtp_layer_offset(self.config)
+            offset = get_mtp_layer_offset(self.config, self.vp_stage)
             sharded_prefix = f'{layer_prefix}{layer.layer_number - 1 }.'
 
             state_dict_prefix = f'{layer_prefix}{layer.layer_number - 1 - offset}.'

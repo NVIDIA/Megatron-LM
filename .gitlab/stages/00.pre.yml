@@ -21,29 +21,6 @@ include:
     - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
 
-pre:mirror_to_github:
-  rules:
-    - if: '($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $CI_PIPELINE_SOURCE == "push"'
-      allow_failure: true
-    - when: never
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  stage: .pre
-  image: python:3.10
-  variables:
-    GIT_STRATEGY: "clone"
-  script:
-    - git checkout $CI_COMMIT_BRANCH
-    - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
-    - git push -u github $CI_COMMIT_BRANCH
-  retry:
-    max: 2
-
 pre:create_ci_branches:
   rules:
     - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
@@ -61,6 +38,7 @@ pre:create_ci_branches:
       - branch: ci-upgrade-dependencies
       - branch: ci-approve-main
       - branch: ci-approve-dev
+      - branch: ci-sync-branches
   tags:
     - arch/amd64
     - env/prod
@@ -90,6 +68,7 @@ pre:create_ci_branches_dev:
       - branch: ci-dev-rebuild-mcore-nemo-image
       - branch: ci-dev-mr
       - branch: ci-dev-nightly
+      - branch: ci-dev-weekly
       - branch: ci-dev-upgrade-dependencies
   tags:
     - arch/amd64

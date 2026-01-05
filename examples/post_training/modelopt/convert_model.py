@@ -18,12 +18,13 @@ from megatron.core.enums import ModelType
 from megatron.core.parallel_state import destroy_model_parallel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_provider import model_provider
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
 from megatron.training import get_args, get_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
+from model_provider import model_provider
 
 ALGO_TO_CONFIG = {
     "eagle1": mtsp.config.EAGLE1_DEFAULT_CFG,
@@ -120,13 +121,13 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]
 
     if args.pretrained_model_path is not None:
-        import_dtype = torch.float16 if args.fp16 else torch.bfloat16 
+        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
         print_rank_0("Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype)))
@@ -168,10 +169,10 @@ if __name__ == "__main__":
             tokenizer = get_tokenizer()
             for i in range(unwrapped_model.eagle_config.parallel_draft_step - 1):
                 mask_token = "[MASK_{}]".format(i)
-                tokenizer._tokenizer.add_tokens([mask_token], special_tokens=True) 
+                tokenizer._tokenizer.add_tokens([mask_token], special_tokens=True)
                 token_id = tokenizer._tokenizer.convert_tokens_to_ids(mask_token)
                 setattr(unwrapped_model, "mask_token_{}".format(i), torch.tensor(token_id))
-                
+
     elif args.algorithm == "medusa":
         config = {"medusa_num_heads": args.export_num_medusa_heads, "medusa_num_layers": 1}
         unwrapped_model = mtsp.convert(unwrapped_model, [("medusa", config)])

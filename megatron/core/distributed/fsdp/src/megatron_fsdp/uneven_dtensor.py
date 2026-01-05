@@ -365,7 +365,9 @@ def _assemble_full_tensor_from_uneven_chunks(
 
     # Wrap into a replicated DTensor and return
     return DTensor.from_local(
-        full_tensor, placements=[Replicate()], device_mesh=dtensor.device_mesh
+        full_tensor,
+        placements=[Replicate()] * len(dtensor.placements),
+        device_mesh=dtensor.device_mesh,
     )
 
 

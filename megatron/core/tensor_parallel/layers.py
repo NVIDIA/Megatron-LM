@@ -86,12 +86,16 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def param_is_not_tensor_parallel_duplicate(param):
+def param_is_not_tensor_parallel_duplicate(param, tp_group=None):
     """Returns true if the passed-in parameter is not a duplicate parameter
     on another TP rank."""
-    return (hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel) or (
-        get_tensor_model_parallel_rank() == 0
-    )
+    if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
+        return True
+    # Prefer provided tp_group when available (new explicit path).
+    if tp_group is not None:
+        return tp_group.rank() == 0
+    # Fallback to legacy global state (back-compat).
+    return get_tensor_model_parallel_rank() == 0
 
 
 def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
@@ -320,6 +324,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                 key=weight_prefix,
                 allow_shape_mismatch=True,
                 prepend_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata["dp_cp_group"],
             )
         }
 
@@ -1064,7 +1070,12 @@ class ColumnParallelLinear(torch.nn.Module):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0, "bias": 0},
+            sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
 
     def set_extra_state(self, state: Any):
@@ -1310,7 +1321,12 @@ class RowParallelLinear(torch.nn.Module):
         """Sharding along axis 1, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 1}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 1},
+            sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
 
     def set_extra_state(self, state: Any):

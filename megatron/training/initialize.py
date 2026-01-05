@@ -346,6 +346,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
+        if args.fake_process_group:
+            from torch.testing._internal.distributed.fake_pg import FakeStore
+            store = FakeStore()
+            init_process_group_kwargs['backend'] = 'fake'
+            init_process_group_kwargs['store'] = store
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
@@ -364,6 +369,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 use_sharp=args.use_sharp,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
+                hybrid_context_parallel=args.hybrid_context_parallel,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,

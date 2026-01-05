@@ -17,9 +17,15 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
-from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
+from ..fp8_utils import (
+    is_float8tensor,
+    is_mxfp8tensor,
+    modify_underlying_storage,
+    post_all_gather_processing,
+)
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
+from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +157,13 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
             self.communication_stream = None
+            assert (
+                not self.ddp_config.reduce_scatter_with_fp32_accumulation
+            ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
+
+        global dist_reduce_scatter_func
+        if self.ddp_config.reduce_scatter_with_fp32_accumulation:
+            dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
 
         self.reset()
         self.param_gather_handle = None
@@ -303,10 +316,7 @@ class _ParamAndGradBucketGroup:
             # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
             # we need to copy the param_data from the shared_param/grad_buffer to param.data
             # after the param all-gather.
-            if (
-                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                and self.ddp_config.overlap_param_gather
-            ):
+            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 for bucket in self.buckets:
                     for param in bucket.params:
                         param_start, param_end = bucket.param_to_index[param]
@@ -318,6 +328,14 @@ class _ParamAndGradBucketGroup:
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
+            else:
+                fp8_params = []
+                for bucket in self.buckets:
+                    for param in bucket.params:
+                        if is_float8tensor(param):
+                            fp8_params.append(param)
+                if len(fp8_params) > 0:
+                    post_all_gather_processing(fp8_params)
 
     def start_grad_sync(self):
         """
@@ -382,6 +400,7 @@ class _ParamAndGradBucketGroup:
             communication_group = self.data_parallel_group
 
         # Coalesce communication kernels across buckets in the bucket group.
+        grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer:
@@ -392,7 +411,7 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    dist_reduce_scatter_func(
+                    grad_reduce_handle = dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
                         op=reduce_op,
@@ -434,7 +453,16 @@ class _ParamAndGradBucketGroup:
                     )
 
         if async_op:
-            self.grad_reduce_handle = cm
+            if self.ddp_config.reduce_scatter_with_fp32_accumulation:
+                assert (
+                    len(self.buckets) == 1
+                ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
+                # torch.distributed._coalescing_manager does not correctly handle calling our custom
+                # collective handle's .wait() method, so we take matters into our own hands here.
+                assert grad_reduce_handle is not None
+                self.grad_reduce_handle = grad_reduce_handle
+            else:
+                self.grad_reduce_handle = cm
         else:
             # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
             # `cm` is not None, which is different from when `_coalescing_manager` is not used in
@@ -686,7 +714,10 @@ class _ParamAndGradBuffer:
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
             mem_alloc_context = functools.partial(
-                nccl_allocator.nccl_mem, pool, group=self.data_parallel_group
+                nccl_allocator.nccl_mem,
+                pool,
+                group=self.data_parallel_group,
+                symmetric=not self.ddp_config.disable_symmetric_registration,
             )
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.

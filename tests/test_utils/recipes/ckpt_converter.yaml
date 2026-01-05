@@ -48,7 +48,7 @@ products:
   - test_case: [ckpt_converter]
     products:
       - environment: [dev]
-        scope: [mr-broken]
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly-broken]
