@@ -111,6 +111,12 @@ class MathAgent(RewardOnlyAgent):
         else:
             raise ValueError(f"Invalid answer format: {self.answer_format}")
 
+        if self.assistant_prefix is not None:
+            assert isinstance(self.assistant_prefix, str), "assistant_prefix must be a string"
+            assistant_prefix = self.assistant_prefix
+        else:
+            assistant_prefix = "Assistant: Let me solve this step by step.\n<think>"
+
         if self.chat_mode:
             prefix = f"""{kwargs[problem_key]}\n{answer_format}"""
         else:
@@ -118,7 +124,5 @@ class MathAgent(RewardOnlyAgent):
     The question will be a word math problem. Show your work in <think> </think> tags. 
     {answer_format}
     User: {kwargs[problem_key]}
-    Assistant: """
-    # Assistant: Let me solve this step by step.
-    # <think>"""
+    {assistant_prefix}"""
         return prefix
