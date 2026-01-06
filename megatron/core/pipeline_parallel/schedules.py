@@ -402,7 +402,8 @@ def forward_step(
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func, num_empty_bins = forward_step_func(data_iterator, model)
+            output = forward_step_func(data_iterator, model)
+            output_tensor, loss_func, num_empty_bins = output
         else:
             output_tensor, loss_func, num_empty_bins = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
