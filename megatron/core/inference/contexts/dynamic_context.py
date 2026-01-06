@@ -174,7 +174,7 @@ class ContextErrorFactory:
             "ActiveRequestCountOverflowError": ActiveRequestCountOverflowError,
         }[obj["type"]]
         error = ContextOverflowError(**{k: v for k, v in obj.items() if k != "type"})
-        error.__class__ = error_cls  # todo (@lmcafe): better/safer alternative?
+        error.__class__ = error_cls  # todo (@lmcafee): better/safer alternative?
         return error
 
 
@@ -399,6 +399,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         paused_buffer_size_bytes = (
             0 if paused_buffer_size_gb is None else int(paused_buffer_size_gb * 1024**3)
         )
+        # TODO: Add parameter to control fraction of memory assigned to KV cache
+        # versus Mamba state.
         block_count = buffer_size_bytes // (self.block_size_bytes + mamba_states_memory_per_request)
         paused_block_count = paused_buffer_size_bytes // (
             self.block_size_bytes + mamba_states_memory_per_request
@@ -1878,7 +1880,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
-    # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
         """Update context state after calling engine.step().
 
