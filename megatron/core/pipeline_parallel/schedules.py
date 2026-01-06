@@ -1212,7 +1212,7 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id, microbatch_id
         )
 
-        output_tensor, num_tokens = forward_step(
+        output_tensor, num_tokens, num_empty_bins = forward_step(
             forward_step_func,
             data_iterator[model_chunk_id],
             model[model_chunk_id],
