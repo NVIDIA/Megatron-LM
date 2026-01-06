@@ -17,6 +17,8 @@ name: Oncall Assign
 on:
   pull_request_target:
     types: [opened, ready_for_review]
+    branches:
+      - main
 
 permissions:
   pull-requests: write
