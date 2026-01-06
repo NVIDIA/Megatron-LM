@@ -250,6 +250,10 @@ def permute(
                                        and pads the number of tokens to the expert capacity.
                                        If set to true, routing_map has a fixed number of non-zeros
                                        in each column.
+        tokens_per_expert : torch.Tensor
+            Tensor of shape `[num_experts]` containing actual token counts per expert.
+        align_size : int
+            the alignment size for the input tensor for fp8 or fp4.
     """
     if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
@@ -260,18 +264,23 @@ def permute(
         return permuted_input, None, sorted_indices
 
     if fused and probs is not None:
-        if tokens_per_expert is not None and align_size > 0:
+        if not HAVE_TE or (
+            fused_permute_and_pad_with_probs is None and fused_permute_with_probs is None
+        ):
+            raise ValueError(
+                "Transformer Engine (TE) fused kernel is not available. "
+                "fused_permute_with_probs typically requires TE >= 2.1.0, and "
+                "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
+            )
+        if fused_permute_and_pad_with_probs is not None:
             return fused_permute_and_pad_with_probs(
                 tokens, probs, routing_map, tokens_per_expert, align_size
             )
         else:
-            if not HAVE_TE or fused_permute_with_probs is None:
-                raise ValueError(
-                    "fused_permute_with_probs is not available. Please install TE >= 2.1.0."
-                )
-            return fused_permute_with_probs(
+            output, permuted_probs, row_id_map = fused_permute_with_probs(
                 tokens, probs, routing_map, num_out_tokens=num_out_tokens
             )
+            return output, permuted_probs, row_id_map, None, tokens_per_expert
 
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
@@ -347,6 +356,10 @@ def unpermute(
         fused (bool, optional): Whether use the fused unpermute function.
         drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
                                        and pads the number of tokens to the expert capacity.
+        pad_offsets : torch.Tensor, default = None
+            Tensor of per-expert cumulative padding offsets used to remove padding added
+            during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
+            and is required when unpermuting padded outputs.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
