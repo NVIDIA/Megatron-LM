@@ -411,15 +411,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # can lead to some ranks pausing requests earlier than other ranks
         # (i.e., divergence in the scheduling behavior).
         if pp_size > 1:
-            block_count_total_tensor = torch.tensor(
-                block_count_total, dtype=torch.int32, device=torch.cuda.current_device()
+            block_count_tensor = torch.tensor(
+                block_count, dtype=torch.int32, device=torch.cuda.current_device()
             )
             torch.distributed.all_reduce(
-                block_count_total_tensor,
+                block_count_tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=parallel_state.get_pipeline_model_parallel_group(),
             )
-            block_count_total = block_count_total_tensor.item()
+            block_count = block_count_tensor.item()
 
         self.block_allocator = BlockAllocator(
             context=self,
