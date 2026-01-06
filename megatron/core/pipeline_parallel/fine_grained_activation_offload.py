@@ -440,7 +440,7 @@ class PipelineOffloadManager:
     def flush_delayed_groups(self):
         """Flush the delayed groups."""
         debug_rank("flushing delayed groups")
-        for group_hook, forced_released_tensors in self._delayed_offload_groups:
+        for group_hook, forced_released_tensors in reversed(self._delayed_offload_groups):
             group_hook(forced_released_tensors)
         self._delayed_offload_groups = []
 
@@ -766,7 +766,8 @@ class ChunkOffloadHandler:
             f"------finish_all_groups {self} {self._max_group_size} {self._offloaded_group_index}"
         )
         # TODO: check if this is correct
-        if len(self._groups_to_reload) == 0 and self._offloaded_group_index > 0:
+        # Mark it as finished when all groups are finished and there are no groups to offload or reload
+        if len(self._groups_to_reload) == 0 and len(self._groups_to_offload) == 0 and self._offloaded_group_index > 0:
             return True
         assert name is not None, "Name is required"
         for group in self.offload_groups[self._offloaded_group_index :]:
