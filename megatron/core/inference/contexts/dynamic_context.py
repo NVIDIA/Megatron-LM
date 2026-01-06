@@ -1719,6 +1719,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # tensor.
         self.request_to_kv_block_ids[request_indexes] = -1
 
+        # Free Mamba slots.
+        if self.is_hybrid_model:
+            self.mamba_metadata.free_slots(request_indexes)
+
     def resume_paused_requests(
         self,
         active_request_count: int,
@@ -1879,7 +1883,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count -= evict_request_count
 
         # Reset unused block ids.
-        self.request_to_kv_block_ids[self.total_request_count:(self.total_request_count + evict_request_count)] = -1
+        evict_slice = slice(self.total_request_count, self.total_request_count + evict_request_count)
+        self.request_to_kv_block_ids[evict_slice] = -1
+        if self.is_hybrid_model:
+            self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
 
         return evict_request_ids
 
@@ -1957,9 +1964,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
                 self.release_memory_blocks_from_request_indexes(finished_idxs)
 
-                if self.is_hybrid_model:
-                    self.mamba_metadata.free_slots(finished_idxs)
-
             # Reset request/token counts.
             self.request_to_kv_block_ids.fill_(-1)
             self.total_request_count = 0
@@ -1986,10 +1990,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 + self.paused_request_count
             )
             self.release_memory_blocks_from_request_indexes(finished_idxs)
-
-            if self.is_hybrid_model:
-                # Get the Mamba state indices for finished requests and free them
-                self.mamba_metadata.free_slots(finished_idxs)
 
             if active_request_count > 0:
                 finished_idxs_on_left = (

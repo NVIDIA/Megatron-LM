@@ -14,6 +14,10 @@ from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional
+# >>>
+# pip install termcolor
+from termcolor import colored
+# <<<
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -115,6 +119,13 @@ def get_model() -> MegatronModule:
         partial(model_provider, model_builder),
         wrap_with_ddp=False
     )
+    # >>>
+    # from lutil import pax
+    # pax("model", {
+    #     "model / module" : model[0].module,
+    #     "params" : sum(t.numel() for t in model[0].parameters()),
+    # })
+    # <<<
 
     # Load checkpoint.
     assert args.load is not None
@@ -458,6 +469,10 @@ def main():
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
+    # >>>
+    # from lutil import pax
+    # pax("requests")
+    # <<<
     context = get_inference_context(
         requests,
         sampling_params,
@@ -570,7 +585,7 @@ def main():
                 # >>>
                 # print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
                 # +++
-                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}{', ******** EVICTED ********' if evicted else ''}] {escaped_output_text}")
+                print(colored(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}{', ******** EVICTED ********' if evicted else ''}] {escaped_output_text}", "blue" if evicted else "white"))
                 # <<<
                 text_hashes.append(o_hash)
 
