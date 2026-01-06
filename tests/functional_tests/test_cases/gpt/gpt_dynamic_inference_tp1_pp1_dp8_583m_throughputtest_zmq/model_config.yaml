@@ -42,6 +42,7 @@ MODEL_ARGS:
   --return-log-probs: true
   --num-tokens-from-file: true
   --inference-dynamic-batching-buffer-size-gb: 20
+  --inference-dynamic-batching-cuda-graph-max-tokens: 2048
   --cuda-graph-impl: local
   --cuda-graph-scope: full_iteration
   --no-check-for-nan-in-loss-and-grad: true
@@ -55,6 +56,7 @@ MODEL_ARGS:
   --incoming-requests-per-step: 128
   --use-flashinfer-fused-rope: true
   --throughput-check-only: true
+  --inference-logging-step-interval: 1
 METRICS:
   - "generated_tokens"
   - "logprobs"

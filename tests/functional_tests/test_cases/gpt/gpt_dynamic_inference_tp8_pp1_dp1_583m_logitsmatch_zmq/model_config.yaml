@@ -42,9 +42,6 @@ MODEL_ARGS:
   --top_k: 1
   --return-log-probs: true
   --num-tokens-to-generate: 30
-  --inference-dynamic-batching-max-requests-override: 8 # hardcode decode padding tokens to 7 for reproducibility
-  --inference-dynamic-batching-buffer-guaranteed-fraction: 0
-  --inference-dynamic-batching-buffer-overflow-factor: 0.2
   --inference-dynamic-batching-buffer-size-gb: 20
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors
@@ -52,7 +49,7 @@ MODEL_ARGS:
   --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
   --incoming-requests-per-step: 32
   --use-flashinfer-fused-rope: true
-
+  --inference-logging-step-interval: 1
 METRICS:
   - "generated_tokens"
   - "logprobs"
