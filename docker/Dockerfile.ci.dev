@@ -55,14 +55,14 @@ EOF
 COPY docker/patches/deepep.patch /workspace/deepep.patch
 RUN bash -ex <<"EOF"
     cd /workspace
-    uv pip install nvidia-nvshmem-cu13
+    uv pip install nvidia-nvshmem-cu13==3.4.5
     pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
         ln -s libnvshmem_host.so.3 libnvshmem_host.so
     popd
 
     git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
-        git checkout 1dddd194c26911c35b4f53a148617dd73de0ffc9
+        git checkout 83e0d156807f31abed4ea55c2fa6eb4b62a11b82
         patch -p1 < /workspace/deepep.patch
     popd
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.
