@@ -383,7 +383,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )
         else:
             self.final_layernorm = None  # Either this or nn.Identity
-        
+
         if self.config.inference_fuse_tp_communication:
             self._setup_fused_tp_communication()
 

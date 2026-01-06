@@ -506,9 +506,6 @@ def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
 
 def get_mtp_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
     """Get the offset of the MTP layer."""
-    # TODO(shifangx): Currently, we only support put all of MTP layers
-    # on the last pipeline stage, so the offset is always 0.
-    # We will support more flexible MTP placement in the future.
     if config.pipeline_model_parallel_size > 1:
         if config.pipeline_model_parallel_layout:
             offset = config.pipeline_model_parallel_layout.get_layer_offset(
