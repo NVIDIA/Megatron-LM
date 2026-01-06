@@ -2,7 +2,7 @@ import torch
 import argparse
 import megatron
 
-from megatron.core.transformer.moe.offloading_planner import gen_offloading_plan, gen_offloading_plan2
+from megatron.core.transformer.moe.offloading_planner import gen_offloading_plan
 
 def baseline_routing(scores, num_experts, EP, topk):
     # Pick top-k largest along columns (dim=1)
@@ -155,8 +155,10 @@ def main():
     parser.add_argument('--threshold-multiplier', type=float, default=0.0, help='Threshold multiplier for average tokens per expert')
     parser.add_argument('--spare-expert-per-ep-rank', type=int, default=1, help='Number of spare experts per EP rank')
     parser.add_argument('--batch-test', action='store_true', help='Enable batch test mode with CUDA graph capture')
-    parser.add_argument('--user-data', action='store_true', help='Enable batch test mode with CUDA graph capture')
     parser.add_argument('--num-iterations', type=int, default=100, help='Number of iterations for batch test mode')
+    parser.add_argument('--assignment-algorithm', type=str, default='approx_bin_packing', 
+                        choices=['one_shot_greedy', 'approx_bin_packing'],
+                        help='Assignment algorithm to use (default: one_shot_greedy)')
 
     
     args = parser.parse_args()
@@ -182,13 +184,13 @@ def main():
 
     # Compile the balanced_routing function
     compiled_balanced_routing = torch.compile(gen_offloading_plan)
-    compiled_balanced_routing = gen_offloading_plan
+    # compiled_balanced_routing = gen_offloading_plan
     
     if args.batch_test:
         # Use the same static-shape CUDA graph flow as in the else-branch
         # Warm up run
         ep_rank_static = torch.zeros(1, device=device, dtype=torch.int32)
-        rerouting_map, rerouted_probs, expert_offloading_map = compiled_balanced_routing(routing_map_all_rank[0], probs[0], tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
+        rerouting_map, rerouted_probs, expert_offloading_map = compiled_balanced_routing(routing_map_all_rank[0], probs[0], tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier, assignment_algorithm=args.assignment_algorithm)
         
         routing_map_static = torch.empty_like(routing_map_all_rank[0])
         routing_map_static.copy_(routing_map_all_rank[0])
@@ -199,7 +201,7 @@ def main():
         # Capture CUDA graph
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            rerouting_map_static, rerouted_probs_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, probs_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
+            rerouting_map_static, rerouted_probs_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, probs_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier, assignment_algorithm=args.assignment_algorithm)
         # Arrays to store statistics across iterations
         max_tokens_before_offloading = []
         max_tokens_after_offloading = []
@@ -251,30 +253,17 @@ def main():
         print(f"Max tokens after offloading - Mean: {sum(max_tokens_after_offloading)/len(max_tokens_after_offloading):.2f}, Max: {max(max_tokens_after_offloading)}, Min: {min(max_tokens_after_offloading)}")
         print(f"Max number of offloaded experts - Mean: {sum(max_num_offloaded_expert)/len(max_num_offloaded_expert):.2f}, Max: {max(max_num_offloaded_expert)}, Min: {min(max_num_offloaded_expert)}")
     
-
-    
-    elif args.user_data:
-        tokens_to_ep_ranks_before_offloading = torch.load("/lustre/fsw/coreai_mlperf_training/users/nanz/moe/megatron-lm/results/Qwen3_2048_train/num_global_tokens_per_expert_layer_1_dprank_0_tprank_0.pt")
-        tokens_to_ep_ranks_before_offloading = tokens_to_ep_ranks_before_offloading.squeeze()
-        batch = tokens_to_ep_ranks_before_offloading.view(-1, args.EP, tokens_to_ep_ranks_before_offloading.shape[-1])[0]
-
-        import pdb; pdb.set_trace()
-        _, aa = gen_offloading_plan2(batch, 0, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
-        x = ((batch.sum(dim=0)-128*128) * ((batch.sum(dim=0)-128*128) > 0)).tolist()
-        y = (-(batch.sum(dim=0)-128*128) * ((batch.sum(dim=0)-128*128) <= 0)).tolist()
-        solve_ball_bin_placement(x, y, args.spare_expert_per_ep_rank)
-        
     else:
         # Normal mode: single run with sanity check
         # Warm up run
         ep_rank_static = torch.zeros(1, device=device, dtype=torch.int32)
-        torch.cuda.profiler.start()
+        # torch.cuda.profiler.start()
         for i in range(10):
             torch.cuda.nvtx.range_push(str(i))
-            rerouting_map, rerouted_probs, expert_offloading_map = compiled_balanced_routing(routing_map_all_rank[0], probs[0], tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
+            rerouting_map, rerouted_probs, expert_offloading_map = compiled_balanced_routing(routing_map_all_rank[0], probs[0], tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier, assignment_algorithm=args.assignment_algorithm)
             torch.cuda.nvtx.range_pop()
-        torch.cuda.profiler.stop()
-        torch.cuda.profiler.start()
+        # torch.cuda.profiler.stop()
+        # torch.cuda.profiler.start()
         routing_map_static = torch.empty_like(routing_map_all_rank[0])
         routing_map_static.copy_(routing_map_all_rank[0])
         probs_static = torch.empty_like(probs[0])
@@ -284,7 +273,7 @@ def main():
         # Capture CUDA graph
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            rerouting_map_static, rerouted_probs_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, probs_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
+            rerouting_map_static, rerouted_probs_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, probs_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier, assignment_algorithm=args.assignment_algorithm)
         
         torch.cuda.profiler.start()
         # Replay the graph
@@ -294,7 +283,7 @@ def main():
             routing_map_static.copy_(routing_map_all_rank[ep])
             probs_static.copy_(probs[ep])
             graph.replay()
-            # rerouting_map_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
+            # rerouting_map_static, rerouted_probs_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, probs_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier, assignment_algorithm="approx_bin_packing")
             rerouting_map_all_rank[ep].copy_(rerouting_map_static)
             rerouted_probs_all_rank[ep].copy_(rerouted_probs_static)
         torch.cuda.profiler.stop()

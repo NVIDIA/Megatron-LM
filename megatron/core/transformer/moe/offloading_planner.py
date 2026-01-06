@@ -1,8 +1,196 @@
 import torch
-from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 import triton
 import triton.language as tl
-from typing import Union
+from typing import Union, Literal
+
+
+@triton.jit
+def approx_bin_packing_kernel(
+    count_spillover_remaining_ptr,
+    capacity_spare_sorted_ptr,
+    indices_spare_sort_ptr,
+    count_tokens_from_expert_to_ep_rank_ptr,
+    bucket_items_ptr,
+    bucket_heads_ptr,
+    bucket_tails_ptr,
+    m_ptr,
+    interval_size_ptr,
+    num_experts: tl.constexpr,
+    num_ep_ranks: tl.constexpr,
+    num_buckets: tl.constexpr,
+    max_items_per_bucket: tl.constexpr,
+):
+    """
+    Triton kernel for approximate bin packing.
+    
+    Bucket structure:
+    - bucket 0: values >= m
+    - bucket i: values in range [m - i*interval_size, m - (i-1)*interval_size)
+    - bucket num_buckets-1: smallest positive values
+    """
+    m = tl.load(m_ptr)
+    interval_size = tl.load(interval_size_ptr)
+    
+    current_bucket = 0
+    done = False
+    
+    for ep_rank_iter in range(num_ep_ranks):
+        if not done:
+            spare_capacity = tl.load(capacity_spare_sorted_ptr + ep_rank_iter)
+            
+            if spare_capacity <= 0:
+                done = True
+            
+            if not done:
+                ep_rank_idx = tl.load(indices_spare_sort_ptr + ep_rank_iter)
+                
+                expert_idx = -1
+                found_item = False
+                
+                for search_bucket in range(current_bucket, num_buckets):
+                    if not found_item:
+                        head = tl.load(bucket_heads_ptr + search_bucket)
+                        tail = tl.load(bucket_tails_ptr + search_bucket)
+                        
+                        has_items = head < tail
+                        
+                        if has_items:
+                            bucket_offset = search_bucket * max_items_per_bucket + head
+                            candidate_idx = tl.load(bucket_items_ptr + bucket_offset)
+                            remaining = tl.load(count_spillover_remaining_ptr + candidate_idx)
+                            
+                            tl.store(bucket_heads_ptr + search_bucket, head + 1)
+                            
+                            if remaining > 0:
+                                expert_idx = candidate_idx
+                                found_item = True
+                                current_bucket = search_bucket
+                        else:
+                            current_bucket = search_bucket + 1
+                
+                if found_item:
+                    spillover_to_place = tl.load(count_spillover_remaining_ptr + expert_idx)
+                    to_place = tl.minimum(spillover_to_place, spare_capacity)
+                    
+                    assignment_offset = expert_idx * num_ep_ranks + ep_rank_idx
+                    tl.store(count_tokens_from_expert_to_ep_rank_ptr + assignment_offset, to_place)
+                    
+                    new_remaining = spillover_to_place - to_place
+                    tl.store(count_spillover_remaining_ptr + expert_idx, new_remaining)
+                    
+                    if new_remaining > 0:
+                        new_bucket_idx_int = 0
+                        if new_remaining < m:
+                            bucket_calc = (m - new_remaining) // interval_size + 1
+                            new_bucket_idx_int = tl.minimum(bucket_calc, num_buckets - 1)
+                            new_bucket_idx_int = tl.maximum(new_bucket_idx_int, 0)
+                        
+                        if new_bucket_idx_int < num_buckets:
+                            tail = tl.load(bucket_tails_ptr + new_bucket_idx_int)
+                            bucket_offset = new_bucket_idx_int * max_items_per_bucket + tail
+                            tl.store(bucket_items_ptr + bucket_offset, expert_idx)
+                            tl.store(bucket_tails_ptr + new_bucket_idx_int, tail + 1)
+                else:
+                    done = True
+
+
+def approx_bin_packing_triton(count_spillover_per_expert, capacity_spare_per_ep_rank, avg_tokens_per_ep_rank, num_buckets=8):
+    """
+    Triton-accelerated approximate bin packing algorithm.
+    
+    Args:
+        count_spillover_per_expert: Spillover tokens per expert (num_experts,), sorted descending, torch.Tensor on device
+        capacity_spare_per_ep_rank: Spare capacities per EP rank (num_ep_ranks,), sorted descending, torch.Tensor on device
+        avg_tokens_per_ep_rank: Average tokens per EP rank (scalar tensor on device)
+        num_buckets: Number of buckets for approximate sorting
+    
+    Returns:
+        tuple: (count_tokens_from_expert_to_ep_rank, count_spillover_remaining)
+            - count_tokens_from_expert_to_ep_rank: shape (num_experts, num_ep_ranks)
+            - count_spillover_remaining: shape (num_experts,)
+    """
+    device = count_spillover_per_expert.device
+    num_experts = count_spillover_per_expert.shape[0]
+    num_ep_ranks = capacity_spare_per_ep_rank.shape[0]
+    
+    count_spillover_per_expert = count_spillover_per_expert.to(torch.int32)
+    capacity_spare_per_ep_rank = capacity_spare_per_ep_rank.to(torch.int32)
+    
+    count_tokens_from_expert_to_ep_rank = torch.zeros(num_experts, num_ep_ranks, dtype=torch.int32, device=device)
+    count_spillover_remaining = count_spillover_per_expert.clone()
+    
+    m_tensor = avg_tokens_per_ep_rank.to(torch.int32).reshape(1)
+    interval_size_tensor = (m_tensor // (num_buckets - 1) if num_buckets > 1 else m_tensor).reshape(1)
+    
+    # Compute bucket indices for each expert
+    bucket_indices = torch.where(
+        count_spillover_per_expert <= 0,
+        torch.full_like(count_spillover_per_expert, num_buckets, dtype=torch.int32),
+        torch.where(
+            count_spillover_per_expert >= m_tensor,
+            torch.zeros_like(count_spillover_per_expert, dtype=torch.int32),
+            ((m_tensor - count_spillover_per_expert) // interval_size_tensor).to(torch.int32) + 1
+        )
+    ).clamp(0, num_buckets - 1).to(torch.int32)
+    
+    bucket_indices = torch.where(count_spillover_per_expert <= 0, num_buckets, bucket_indices).to(torch.int32)
+    
+    max_items_per_bucket = num_experts + num_ep_ranks
+    total_buckets = num_buckets + 1
+    
+    bucket_items_size = num_buckets * max_items_per_bucket
+    bucket_items_with_trash = torch.full((bucket_items_size + 1,), -1, dtype=torch.int32, device=device)
+    trash_bin_index = bucket_items_size
+    
+    bucket_heads = torch.zeros(num_buckets, dtype=torch.int32, device=device)
+    
+    # Count items per bucket
+    bucket_counts_all = torch.zeros(total_buckets, dtype=torch.int64, device=device)
+    ones = torch.ones(num_experts, dtype=torch.int64, device=device)
+    bucket_counts_all.scatter_add_(0, bucket_indices.to(torch.int64), ones)
+    bucket_counts = bucket_counts_all[:num_buckets]
+    bucket_tails = bucket_counts.to(torch.int32)
+    
+    # Compute positions within buckets
+    bucket_offsets_all = torch.cat([torch.zeros(1, dtype=torch.int64, device=device), 
+                                     torch.cumsum(bucket_counts_all, dim=0)[:-1]])
+    
+    expert_indices = torch.arange(num_experts, device=device, dtype=torch.int64)
+    bucket_start_for_each = bucket_offsets_all[bucket_indices]
+    position_within_bucket = (expert_indices - bucket_start_for_each).to(torch.int32)
+    
+    valid_mask = bucket_indices < num_buckets
+    clamped_bucket_indices = torch.clamp(bucket_indices, 0, num_buckets - 1)
+    flat_indices = clamped_bucket_indices.to(torch.int64) * max_items_per_bucket + position_within_bucket.to(torch.int64)
+    
+    scatter_indices = torch.where(valid_mask, flat_indices, torch.full_like(flat_indices, trash_bin_index))
+    scatter_values = torch.where(valid_mask, expert_indices.to(torch.int32), torch.full_like(expert_indices, -1, dtype=torch.int32))
+    bucket_items_with_trash.scatter_(0, scatter_indices, scatter_values)
+    
+    bucket_items = bucket_items_with_trash[:bucket_items_size].contiguous()
+    
+    capacity_spare_sorted = capacity_spare_per_ep_rank
+    indices_spare_sort = torch.arange(num_ep_ranks, device=device, dtype=torch.int32)
+    
+    grid = (1,)
+    approx_bin_packing_kernel[grid](
+        count_spillover_remaining,
+        capacity_spare_sorted,
+        indices_spare_sort,
+        count_tokens_from_expert_to_ep_rank,
+        bucket_items,
+        bucket_heads,
+        bucket_tails,
+        m_tensor,
+        interval_size_tensor,
+        num_experts=num_experts,
+        num_ep_ranks=num_ep_ranks,
+        num_buckets=num_buckets,
+        max_items_per_bucket=max_items_per_bucket,
+    )
+    
+    return count_tokens_from_expert_to_ep_rank, count_spillover_remaining
+
 
 def one_shot_greedy_assignment(
     count_tokens_per_chunk: torch.Tensor,
@@ -52,6 +240,7 @@ def one_shot_greedy_assignment(
     overlap_end = torch.minimum(count_tokens_per_chunk_end, capacity_per_bucket_end)
     count_tokens_from_chunk_to_bucket = (overlap_end - overlap_start).clamp(min=0)
     return count_tokens_from_chunk_to_bucket
+
 
 def reclaim_spare_experts(
     count_tokens_per_ep_rank: torch.Tensor,
@@ -443,6 +632,7 @@ def gen_offloading_plan(
     num_spare_experts_per_ep_rank: int = 1,
     threshold_multiplier: float = 0.0,
     dtype_index: torch.dtype = torch.int32,
+    assignment_algorithm: Literal["one_shot_greedy", "approx_bin_packing"] = "approx_bin_packing",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generate an offloading plan to redistribute tokens from overloaded experts to spare experts.
@@ -451,7 +641,7 @@ def gen_offloading_plan(
     from overloaded experts to spare experts to achieve better load balancing.
     The algorithm works in phases:
     1. Calculate spillover tokens that need to be offloaded from each expert
-    2. Use greedy assignment to match spillover tokens to spare expert capacity
+    2. Use assignment algorithm to match spillover tokens to spare expert capacity
     3. Apply threshold-based filtering to disable some offloading assignments
     4. Execute the offloading plan using breadth-first and depth-first allocation
     5. Generate the final rerouting map with token movements
@@ -500,6 +690,13 @@ def gen_offloading_plan(
             Default: torch.int32
             Description: Data type used for index tensors in the computation
 
+        assignment_algorithm: Algorithm to use for token assignment
+            Type: Literal["one_shot_greedy", "approx_bin_packing"]
+            Default: "one_shot_greedy"
+            Description: 
+                - "one_shot_greedy": Uses gen_assignment with one_shot_greedy_assignment
+                - "approx_bin_packing": Uses gen_assignment_for_approx_bp
+
     Returns:
         tuple containing:
             - map_token_to_all_experts: Updated routing map after offloading
@@ -521,15 +718,28 @@ def gen_offloading_plan(
                            i offloads tokens to spare expert j
     """
 
-
-    count_tokens_from_home_expert_to_spare_expert, _, map_home_expert_to_spare = gen_assignment(
-        count_tokens_per_expert_from_ep_rank,
-        ep_rank,
-        num_ep_ranks,
-        num_spare_experts_per_ep_rank,
-        threshold_multiplier,
-        dtype_index,
-    )
+    if assignment_algorithm == "one_shot_greedy":
+        count_tokens_from_home_expert_to_spare_expert, _, _ = gen_assignment(
+            count_tokens_per_expert_from_ep_rank,
+            ep_rank,
+            num_ep_ranks,
+            num_spare_experts_per_ep_rank,
+            threshold_multiplier,
+            dtype_index,
+        )
+    elif assignment_algorithm == "approx_bin_packing":
+        if num_spare_experts_per_ep_rank != 1:
+            raise ValueError(f"approx_bin_packing only supports num_spare_experts_per_ep_rank=1, "
+                            f"got {num_spare_experts_per_ep_rank}")
+        count_tokens_from_home_expert_to_spare_expert, _, _ = gen_assignment_for_approx_bp(
+            count_tokens_per_expert_from_ep_rank,
+            ep_rank,
+            num_ep_ranks,
+            dtype_index,
+        )
+    else:
+        raise ValueError(f"Unknown assignment algorithm: {assignment_algorithm}. "
+                        f"Expected 'one_shot_greedy' or 'approx_bin_packing'.")
 
     
     # Create map_home_expert_to_spare with shape (num_home_experts, num_spare_experts)
@@ -579,7 +789,9 @@ def gen_assignment(
     dtype_index: torch.dtype = torch.int32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Generate token assignment from home experts to spare experts.
+    Generate token assignment from home experts to spare experts using one_shot_greedy algorithm.
+    
+    For approx_bin_packing, use gen_assignment_for_approx_bp instead.
     
     Args:
         count_tokens_per_expert_from_ep_rank: Token distribution per expert from all EP ranks
@@ -614,7 +826,7 @@ def gen_assignment(
                 Shape: [num_ep_ranks]
     """
     # Phase 1: calculate how many tokens need to be offloaded from home experts
-    count_spillover_per_home_expert, capacity_spare_per_ep_rank = gen_intermediate(
+    count_spillover_per_home_expert, capacity_spare_per_ep_rank, avg_tokens_per_ep_rank = gen_intermediate(
         count_tokens_per_expert_from_ep_rank,
         ep_rank,
         num_ep_ranks,
@@ -626,7 +838,6 @@ def gen_assignment(
     device = count_tokens_per_expert_from_ep_rank.device
     count_tokens_per_expert = count_tokens_per_expert_from_ep_rank.sum(dim=0).to(dtype_index)
     count_tokens_per_ep_rank = count_tokens_per_expert.view(num_ep_ranks, -1).sum(dim=1)
-    avg_tokens_per_ep_rank = count_tokens_per_ep_rank.sum() // num_ep_ranks
     
     # Sort count_spillover_per_home_expert in descending order and capacity_spare_per_ep_rank in descending order
     count_spillover_sorted, indices_spillover_sort = torch.sort(count_spillover_per_home_expert, descending=True)
@@ -635,7 +846,6 @@ def gen_assignment(
     # Here tokens from an expert are regarded as a single chunk.
     # Space in each ep rank is regarded as a single bucket.
     count_tokens_from_chunk_to_bucket_sorted = one_shot_greedy_assignment(count_spillover_sorted, capacity_spare_sorted)
-
     # Find top num_spare_experts_per_ep_rank token chunks for each EP rank (on sorted assignment)
     # Get the topk largest chunks (tokens from an expert) for each bucket (each ep rank is a bucket).
     # idx_spare_bucket_max means the index of the topk largest chunks in the sorted space.
@@ -671,6 +881,77 @@ def gen_assignment(
     return count_tokens_from_home_expert_to_spare_expert, count_spillover_per_home_expert, capacity_spare_per_ep_rank
 
 
+def gen_assignment_for_approx_bp(
+    count_tokens_per_expert_from_ep_rank: torch.Tensor,
+    ep_rank: Union[torch.Tensor, int],
+    num_ep_ranks: int,
+    dtype_index: torch.dtype = torch.int32,
+    num_buckets: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Generate token assignment from home experts to EP ranks using approx_bin_packing.
+    
+    This function computes spillover and spare capacity, sorts them, runs the
+    approx_bin_packing_triton kernel, and recovers the original order.
+    
+    Args:
+        count_tokens_per_expert_from_ep_rank: Token distribution per expert from all EP ranks
+            Shape: [num_ep_ranks, num_experts]
+            Type: torch.Tensor (int)
+            
+        ep_rank: Current EP rank index
+            Type: Union[torch.Tensor, int]
+            
+        num_ep_ranks: Number of expert parallel ranks
+            Type: int
+            
+        dtype_index: Data type for index tensors
+            Type: torch.dtype
+            Default: torch.int32
+            
+        num_buckets: Number of priority buckets for approximate bin packing
+            Type: int
+            Default: 8
+    
+    Returns:
+        tuple containing:
+            - count_tokens_from_chunk_to_bucket: Assignment matrix in original order
+                Shape: [num_experts, num_ep_ranks]
+            - count_spillover_per_home_expert: Spillover tokens per expert
+                Shape: [num_experts]
+            - capacity_spare_per_ep_rank: Spare capacity per EP rank
+                Shape: [num_ep_ranks]
+    """
+    # Calculate spillover and spare capacity (using 1 spare expert per EP rank, no threshold)
+    count_spillover_per_home_expert, capacity_spare_per_ep_rank, avg_tokens_per_ep_rank = gen_intermediate(
+        count_tokens_per_expert_from_ep_rank,
+        ep_rank,
+        num_ep_ranks,
+        num_spare_experts_per_ep_rank=1,
+        threshold_multiplier=0.0,
+        dtype_index=dtype_index,
+    )
+    
+    # Sort spillover and spare capacity in descending order
+    count_spillover_sorted, indices_spillover_sort = torch.sort(count_spillover_per_home_expert, descending=True)
+    capacity_spare_sorted, indices_spare_sort = torch.sort(capacity_spare_per_ep_rank, descending=True)
+    
+    # Run approx bin packing on sorted tensors
+    count_tokens_from_chunk_to_bucket_sorted, _ = approx_bin_packing_triton(
+        count_spillover_sorted, 
+        capacity_spare_sorted,
+        avg_tokens_per_ep_rank,
+        num_buckets=num_buckets
+    )
+    
+    # Recover original order: unsort rows (experts) and columns (EP ranks)
+    inverse_spillover_perm = torch.argsort(indices_spillover_sort)
+    inverse_spare_perm = torch.argsort(indices_spare_sort)
+    
+    count_tokens_from_chunk_to_bucket = count_tokens_from_chunk_to_bucket_sorted[inverse_spillover_perm][:, inverse_spare_perm]
+    return count_tokens_from_chunk_to_bucket.to(dtype_index), count_spillover_per_home_expert, capacity_spare_per_ep_rank
+
+
 def gen_intermediate(
     count_tokens_per_expert_from_ep_rank: torch.Tensor,
     ep_rank: Union[torch.Tensor, int],
@@ -678,7 +959,7 @@ def gen_intermediate(
     num_spare_experts_per_ep_rank: int = 1,
     threshold_multiplier: float = 0.0,
     dtype_index: torch.dtype = torch.int32,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Calculate spillover tokens and spare capacity.
     
@@ -711,6 +992,8 @@ def gen_intermediate(
                 Shape: [num_home_experts]
             - capacity_spare_per_ep_rank: Spare capacity per EP rank
                 Shape: [num_ep_ranks]
+            - avg_tokens_per_ep_rank: Average tokens per EP rank
+                Type: torch.Tensor (scalar)
     """
     device = count_tokens_per_expert_from_ep_rank.device
     count_tokens_per_expert = count_tokens_per_expert_from_ep_rank.sum(dim=0).to(dtype_index)
@@ -732,7 +1015,7 @@ def gen_intermediate(
     # 3. Recover the spillover counts in original order of the experts (unsorted). and concat results from all ep ranks.
     count_spillover_per_home_expert = torch.scatter(torch.empty_like(count_spillover_per_expert_sorted), 1, indices_local_expert_sorted, count_spillover_per_expert_sorted).view(-1)
     
-    return count_spillover_per_home_expert, capacity_spare_per_ep_rank
+    return count_spillover_per_home_expert, capacity_spare_per_ep_rank, avg_tokens_per_ep_rank
 
 
 
