@@ -402,6 +402,7 @@ class TopKRouter(Router):
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
             valid_token_count=local_num_tokens,
+            reduce_group_has_dp=True,
         )
         return probs
 
@@ -413,18 +414,22 @@ class TopKRouter(Router):
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
+        reduce_group_has_dp: bool = False,
     ):
         """Attach aux loss function to activation and add to logging.
 
         Args:
-            activation (torch.Tensor): Activation tensor to attach the aux loss to.
-            aux_loss_coeff (float): Coefficient for the aux loss.
-            aux_loss (torch.Tensor): Computed aux loss.
-            aux_loss_name (str): Name of the aux loss for logging.
-            reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
+            activation (torch.Tensor): The activation tensor to attach the loss to.
+            aux_loss_coeff (float): The coefficient for the auxiliary loss.
+            aux_loss (torch.Tensor): The auxiliary loss tensor.
+            aux_loss_name (str): The name of the auxiliary loss for logging.
+            reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
             valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
                 If None, uses activation.shape[0]. Defaults to None.
+            reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
+                Set this to True if the reduce group has data parallel ranks. This flag is used to
+                ensure the correct reduction in aux loss tracking.
         """
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the
@@ -439,6 +444,7 @@ class TopKRouter(Router):
             self.layer_number,
             num_layers,
             reduce_group=reduce_group,
+            reduce_group_has_dp=reduce_group_has_dp,
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.

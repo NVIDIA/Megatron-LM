@@ -1,12 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+import enum
 import inspect
 import io
 import os
 import pickle
 import warnings
-from typing import Any, Callable, List, Optional, Tuple
+from contextlib import nullcontext
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -16,15 +18,19 @@ from torch.nn.parameter import Parameter
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
+    get_amax_reduction_group,
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
+    model_parallel_is_initialized,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
@@ -54,6 +60,7 @@ from megatron.core.utils import (
 
 try:
     import transformer_engine as te
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
     HAVE_TE = True
 except ImportError:
@@ -61,6 +68,222 @@ except ImportError:
 
     te = MagicMock()
     HAVE_TE = False
+
+_TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+
+
+class TransformerEngineConfigType(enum.Enum):
+    """Configuration object types in config dictionary"""
+
+    TEQuantizationParams = "TEQuantizationParams"
+
+
+@dataclasses.dataclass
+class TEQuantizationRecipe:
+    """Class to capture options for opening an autocast context in forward"""
+
+    fp8_quantization_recipe: Optional[Fp8Recipe] = None
+    """
+    An FP8 quantization override if the module should use FP8.
+    If no FP8 or FP4 quantization is configured, the recipe is execution
+    in high-precision (BF16).
+    """
+    fp4_quantization_recipe: Optional[Fp4Recipe] = None
+    """
+    An FP4 quantization override if the module should use FP4.
+    If no FP8 or FP4 quantization is configured, the recipe is execution
+    in high-precision (BF16).
+    """
+    custom_recipe_factory: Optional[str] = None
+    """The path to a custom recipe factory if a custom Fp4 or Fp8 recipe is configured"""
+    fp8_format: str = "e4m3"
+    """A format to select from an FP8Recipe"""
+    override_quantized_autocast: bool = True
+    """
+    If the quantization autocast context for a targeted module is enabled,
+    whether to override it and change (or disable) the quantization recipe.
+    """
+    override_nonquantized_autocast: bool = False
+    """
+    If the quantization autocast context for a targeted module is not enabled,
+    whether to override it and enable a quantization recipe.
+    """
+    tp_only_amax_red: bool = False
+    """
+    If an amax reduction is applicable, such as in per-tensor quantization recipe,
+    whether to reduce only along TP groups.
+    """
+
+    @classmethod
+    def parse_from_config(cls, quant_config: Dict[Any, Any]) -> "TEQuantizationRecipe":
+        """
+        Parse config from quantization dictionary.
+        """
+        kwargs = {}
+        class_keys = cls.get_config_keys()
+        for field in class_keys:
+            if field in quant_config:
+                kwargs[field] = quant_config[field]
+        for field in quant_config:
+            if field not in class_keys:
+                raise ValueError(f"Field '{field}' not valid for this configuration.")
+        instance = TEQuantizationRecipe(**kwargs)
+        if instance.fp8_quantization_recipe == Fp8Recipe.delayed:
+            raise ValueError("Delayed scaling not in scope of te per-module quantization config.")
+        if (
+            instance.fp8_quantization_recipe is not None
+            and instance.fp4_quantization_recipe is not None
+        ):
+            raise ValueError("fp8 and fp4 quantization settings are mutually exclusive.")
+        if (
+            instance.fp8_quantization_recipe == Fp8Recipe.custom
+            or instance.fp4_quantization_recipe == Fp4Recipe.custom
+        ):
+            if instance.custom_recipe_factory is None:
+                raise ValueError("custom fp8 or fp4 recipe requires custom_recipe_factory")
+        return instance
+
+    @classmethod
+    def get_config_keys(cls) -> Set[str]:
+        """Get expected keys from the dataclass fields."""
+        return {field.name for field in dataclasses.fields(cls)}
+
+
+@dataclasses.dataclass
+class TEQuantizationParams:
+    """Class to capture precision options for training and evaluation."""
+
+    training_recipe: TEQuantizationRecipe
+    """Precision override for when self.training is True"""
+    evaluation_recipe: Optional[TEQuantizationRecipe]
+    """
+    Precision override for when self.training is False.
+    If None, training_recipe is used.
+    """
+
+    @staticmethod
+    def parse_from_config(quant_config: QuantizationConfig) -> "TEQuantizationParams":
+        """Parses quantization config for a layer or throw an error."""
+        config = quant_config.config
+        try:
+            config_type = TransformerEngineConfigType(config[_TE_CONFIG_TYPE_KEY])
+        except KeyError:
+            raise ValueError(
+                f"TransformerEngine config dictionary must have '{_TE_CONFIG_TYPE_KEY}' key."
+            )
+        except ValueError:
+            raise ValueError(f"Unsupported config type '{config[_TE_CONFIG_TYPE_KEY]}'.")
+
+        if config_type == TransformerEngineConfigType.TEQuantizationParams:
+            if 'training_recipe' not in config.keys():
+                raise ValueError(
+                    "TransformerEngine config dictionary must have 'training_recipe' key"
+                )
+            training_recipe = TEQuantizationRecipe.parse_from_config(config['training_recipe'])
+            if 'evaluation_recipe' not in config.keys():
+                evaluation_recipe = None
+                assert len(config.keys()) == 2
+            else:
+                evaluation_recipe = TEQuantizationRecipe.parse_from_config(
+                    config['evaluation_recipe']
+                )
+                assert len(config.keys()) == 3
+            return TEQuantizationParams(
+                training_recipe=training_recipe, evaluation_recipe=evaluation_recipe
+            )
+        else:
+            raise NotImplementedError(f"Unhandled configuration type {config_type}")
+
+
+def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+    if FP8GlobalStateManager.is_fp8_enabled():
+        if not qrecipe.override_quantized_autocast:
+            return nullcontext()
+    else:
+        if not qrecipe.override_nonquantized_autocast:
+            return nullcontext()
+
+    if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
+        # Force BF16 for this layer and override autocast
+        return fp8_autocast(enabled=False)
+    else:
+        amax_group = None
+        if model_parallel_is_initialized():
+            amax_group = get_amax_reduction_group(
+                with_context_parallel=True, tp_only_amax_red=qrecipe.tp_only_amax_red
+            )
+        if (
+            qrecipe.fp8_quantization_recipe == Fp8Recipe.custom
+            or qrecipe.fp4_quantization_recipe == Fp4Recipe.custom
+        ):
+            from megatron.core.fp8_utils import _get_custom_recipe
+
+            assert qrecipe.custom_recipe_factory is not None
+            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+        elif qrecipe.fp8_quantization_recipe is not None:
+            if qrecipe.fp8_format == "e4m3":
+                fp8_format = te.common.recipe.Format.E4M3
+            elif qrecipe.fp8_format == "hybrid":
+                fp8_format = te.common.recipe.Format.HYBRID
+            else:
+                raise ValueError(f"Unhandled fp8_format {qrecipe.fp8_format}")
+
+            if qrecipe.fp8_quantization_recipe == Fp8Recipe.tensorwise:
+                quant_recipe = te.common.recipe.Float8CurrentScaling(fp8_format=fp8_format)
+            elif qrecipe.fp8_quantization_recipe == Fp8Recipe.blockwise:
+                quant_recipe = te.common.recipe.Float8BlockScaling(fp8_format=fp8_format)
+            elif qrecipe.fp8_quantization_recipe == Fp8Recipe.mxfp8:
+                quant_recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=fp8_format)
+            else:
+                raise ValueError(f"Unhandled fp8 recipe: {qrecipe.fp8_quantization_recipe}")
+        else:
+            # Fp4 configured.
+            if qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
+                quant_recipe = te.common.recipe.NVFP4BlockScaling()
+            else:
+                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp8_quantization_recipe}")
+
+        return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
+
+
+def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+    if qparams is None:
+        return nullcontext()
+    elif not training and qparams.evaluation_recipe is not None:
+        return _get_fp8_autocast_for_quant_recipe(qparams.evaluation_recipe)
+    else:
+        return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
+
+
+def _get_should_context_be_quantized_recipe(
+    qrecipe: TEQuantizationRecipe, is_original_context_quantized: bool
+):
+    if is_original_context_quantized:
+        if not qrecipe.override_quantized_autocast:
+            return is_original_context_quantized
+    else:
+        if not qrecipe.override_nonquantized_autocast:
+            return is_original_context_quantized
+    if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
+        # Force BF16 for this layer and override autocast
+        return False
+    else:
+        return True
+
+
+def _get_should_context_be_quantized_params(
+    qparams: TEQuantizationParams | None, training: bool, is_context_quantized: bool
+):
+    if qparams is None:
+        return is_context_quantized
+    elif not training and qparams.evaluation_recipe is not None:
+        return _get_should_context_be_quantized_recipe(
+            qparams.evaluation_recipe, is_context_quantized
+        )
+    else:
+        return _get_should_context_be_quantized_recipe(
+            qparams.training_recipe, is_context_quantized
+        )
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -311,7 +534,7 @@ class TELinear(te.pytorch.Linear):
             )
 
         if is_te_min_version("0.8.0"):
-            if self.config.tp_comm_overlap:
+            if self.config.tp_comm_overlap and parallel_mode != "duplicated":
                 if is_te_min_version("1.5.0"):
                     # Use old overlap flags if they were supplied instead
                     extra_kwargs["ub_overlap_ag"] = (
@@ -406,6 +629,7 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=te_parallel_mode,
             **extra_kwargs,
         )
+        self.te_quant_params: Optional[TEQuantizationParams] = None
 
         for param in self.parameters():
             if is_expert:
@@ -422,12 +646,28 @@ class TELinear(te.pytorch.Linear):
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
 
+    def finish_init(self, quantization_config: QuantizationConfig):
+        """Post-init of quantization override"""
+        if quantization_config is None:
+            self.te_quant_params = None
+        else:
+            self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+
+    def will_execute_quantized(self, is_context_quantized: bool) -> bool:
+        """Returns whether the module is configured to execute quantized."""
+        return _get_should_context_be_quantized_params(
+            self.te_quant_params, self.training, is_context_quantized
+        )
+
     def forward(self, x):
         """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+
+        with quant_context:
+            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
@@ -593,6 +833,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
             **extra_kwargs,
         )
+        self.te_quant_params: Optional[TEQuantizationParams] = None
 
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, self.tp_size)
@@ -618,12 +859,29 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
 
+    def finish_init(self, quantization_config: QuantizationConfig):
+        """Post-init of quantization override"""
+        if quantization_config is None:
+            self.te_quant_params = None
+        else:
+            self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+
+    def will_execute_quantized(self, is_context_quantized: bool) -> bool:
+        """Returns whether the module is configured to execute quantized."""
+        return _get_should_context_be_quantized_params(
+            self.te_quant_params, self.training, is_context_quantized
+        )
+
     def forward(self, x):
         """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+
+        with quant_context:
+            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
@@ -878,6 +1136,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         softmax_scale: Optional[float] = None,
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
+        num_splits: Optional[int] = None,
         cp_comm_type: str = "p2p",
         pg_collection: ProcessGroupCollection = None,
     ):
@@ -890,6 +1149,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.config = config
         self.te_forward_mask_type = False
         self.qkv_format: str = "sbhd"
+        # Default to 1 split when batch-invariant mode is enabled, unless explicitly overridden
+        self.num_splits: Optional[int] = (
+            1 if (num_splits is None and self.config.batch_invariant_mode) else num_splits
+        )
 
         if self.config.apply_query_key_layer_scaling != bool(
             int(os.getenv("NVTE_APPLY_QK_LAYER_SCALING", "0"))
@@ -1054,6 +1317,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attn_mask_type: AttnMaskType,
         attention_bias: Tensor = None,
         packed_seq_params: PackedSeqParams = None,
+        num_splits: Optional[int] = None,
     ):
         """Forward."""
         if packed_seq_params is not None:
@@ -1075,6 +1339,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
+
+        # Default to constructor-provided num_splits unless explicitly overridden
+        if num_splits is None:
+            num_splits = self.num_splits
+        if num_splits is not None:
+            assert is_te_min_version("2.10.0"), (
+                f"Transformer-Engine v{get_te_version()} must be >= 2.10.0 to support" "num_splits."
+            )
+
         packed_seq_kwargs = (
             {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
             if packed_seq_params is not None
@@ -1107,15 +1380,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     attn_mask_type = AttnMaskType.padding_causal
                 elif attn_mask_type == AttnMaskType.no_mask:
                     attn_mask_type = AttnMaskType.padding
-            core_attn_out = super().forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type.name,
-                **attention_bias_kwargs,
-                **packed_seq_kwargs,
+            _fa_kwargs = dict(
+                attn_mask_type=attn_mask_type.name, **attention_bias_kwargs, **packed_seq_kwargs
             )
+            if num_splits is not None:
+                _fa_kwargs["num_splits"] = num_splits
+
+            core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
             if self.config.qk_clip or self.config.log_max_attention_logit:
                 # qk-clip is only supported in TE 2.9.0 and later
@@ -1133,9 +1404,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     )
 
         else:
-            core_attn_out = super().forward(
-                query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs
-            )
+            _fa_kwargs = dict(**attention_bias_kwargs, **packed_seq_kwargs)
+            if num_splits is not None:
+                _fa_kwargs["num_splits"] = num_splits
+            core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
         return core_attn_out
 
@@ -1252,7 +1524,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 parallel_mode=parallel_mode,
                 **extra_kwargs,
             )
-
+            self.te_quant_params: Optional[TEQuantizationParams] = None
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
 
@@ -1346,12 +1618,28 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
 
+        def finish_init(self, quantization_config: QuantizationConfig):
+            """Post-init of quantization override"""
+            if quantization_config is None:
+                self.te_quant_params = None
+            else:
+                self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+
+        def will_execute_quantized(self, is_context_quantized: bool) -> bool:
+            """Returns whether the module is configured to execute quantized."""
+            return _get_should_context_be_quantized_params(
+                self.te_quant_params, self.training, is_context_quantized
+            )
+
         def forward(self, x, m_splits):
             """Forward."""
             _is_first_microbatch = (
                 None if self.disable_parameter_transpose_cache else self.is_first_microbatch
             )
-            out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+            quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+
+            with quant_context:
+                out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
