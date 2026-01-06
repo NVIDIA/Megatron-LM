@@ -1277,7 +1277,7 @@ class MoETransformerLayer(TransformerLayer):
                 if attr_name in self.token_dispatcher_attrs:
                     self.token_dispatcher_attrs[attr_name].copy_(attr)
                 else:
-                        self.token_dispatcher_attrs[attr_name] = attr.detach()
+                    self.token_dispatcher_attrs[attr_name] = attr.detach()
 
         return residual, *router_outputs
 
