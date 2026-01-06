@@ -925,7 +925,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Build model.
     def build_model():
 
-        # Setup stream for model building/ddp initialization
         if (
             get_pg_size(pg_collection.pp) > 1
             and args.virtual_pipeline_model_parallel_size is not None
@@ -1101,7 +1100,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # End of setup_stream
     # Critical: ensure side-stream work completes before touching params on default stream
     torch.cuda.current_stream().wait_stream(setup_stream)
-    
+
     return model
 
 
