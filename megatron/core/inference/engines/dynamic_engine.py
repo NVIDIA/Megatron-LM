@@ -946,7 +946,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if evict_request_ids is not None:
 
             evict_request_ids = evict_request_ids.tolist()
-            
+
             # Insert into waiting_request_ids after any chunk prefill request.
             if self.context.chunked_prefill_request_id != -1:
                 raise Exception(

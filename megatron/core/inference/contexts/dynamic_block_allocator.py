@@ -26,10 +26,10 @@ class BlockAllocator:
         self.context = context
 
         self.total_count = total_count
-        self.total_avail = total_count - 1 # -1 for dummy_block_idx (see below)
+        self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
         self.paused_count = paused_count
-        self.active_count = total_count - paused_count -1 # -1 for dummy_block_idx
-        assert self.active_count >= 1 # ensures paused_count < total_count - 1
+        self.active_count = total_count - paused_count - 1  # -1 for dummy_block_idx
+        assert self.active_count >= 1  # ensures paused_count < total_count - 1
         self.dummy_block_idx = self.total_count - 1
 
         # Initialize block pool as a "stack" data structure

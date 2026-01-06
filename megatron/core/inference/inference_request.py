@@ -486,7 +486,7 @@ class DynamicInferenceRequestRecord:
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
-        except TypeError as e: # generally means r.generated_text is None
+        except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
 
         # Merged request.

@@ -397,13 +397,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Initialize block allocator.
         buffer_size_bytes = int(buffer_size_gb * 1024**3)
         paused_buffer_size_bytes = (
-            0
-            if paused_buffer_size_gb is None else
-            int(paused_buffer_size_gb * 1024**3)
+            0 if paused_buffer_size_gb is None else int(paused_buffer_size_gb * 1024**3)
         )
-        block_count = buffer_size_bytes // (
-            self.block_size_bytes + mamba_states_memory_per_request
-        )
+        block_count = buffer_size_bytes // (self.block_size_bytes + mamba_states_memory_per_request)
         paused_block_count = paused_buffer_size_bytes // (
             self.block_size_bytes + mamba_states_memory_per_request
         )
@@ -426,9 +422,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.block_allocator = BlockAllocator(
             context=self,
             total_count=(
-                block_count
-                if self.unified_memory_level == 0 else
-                block_count + paused_block_count
+                block_count if self.unified_memory_level == 0 else block_count + paused_block_count
             ),
             paused_count=paused_block_count,
         )
@@ -1500,8 +1494,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         request_can_be_added = (
-            self.total_request_count < self.max_requests
-            and self.paused_request_count == 0
+            self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
@@ -1770,9 +1763,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return active_request_count, resume_request_count, newly_paused_request_ids
 
     def evict_overflow_paused_requests(
-        self,
-        active_request_count: int,
-        next_tokens: torch.Tensor,
+        self, active_request_count: int, next_tokens: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Evict requests that overflow the paused buffer.
 
@@ -1786,8 +1777,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Overflow paused block count.
         overflow_paused_block_count = (
-            self.block_allocator.get_paused_used()
-            - self.block_allocator.paused_count
+            self.block_allocator.get_paused_used() - self.block_allocator.paused_count
         )
 
         # Nothing to evict?
@@ -1826,9 +1816,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         evict_start_idx = self.paused_request_count - evict_request_count
         evict_end_idx = self.paused_request_count
         evict_request_idxs = torch.arange(
-            evict_start_idx,
-            evict_end_idx,
-            device=torch.cuda.current_device(),
+            evict_start_idx, evict_end_idx, device=torch.cuda.current_device()
         )
         evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
 
@@ -1881,7 +1869,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count -= evict_request_count
 
         # Reset unused block ids.
-        evict_slice = slice(self.total_request_count, self.total_request_count + evict_request_count)
+        evict_slice = slice(
+            self.total_request_count, self.total_request_count + evict_request_count
+        )
         self.request_to_kv_block_ids[evict_slice] = -1
         if self.is_hybrid_model:
             self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
@@ -2082,11 +2072,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 6.a. First, resume temporarily paused requests.
         active_request_count, resume_request_count, newly_paused_request_ids = (
-            self.resume_paused_requests(
-                active_request_count,
-                newly_paused_request_ids,
-                next_tokens,
-            )
+            self.resume_paused_requests(active_request_count, newly_paused_request_ids, next_tokens)
         )
 
         # 6.b. Evict requests that overflow the paused buffer.
@@ -2094,11 +2080,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 6.c. Resume any additional requests.
         active_request_count, resume_request_count, newly_paused_request_ids = (
-            self.resume_paused_requests(
-                active_request_count,
-                newly_paused_request_ids,
-                next_tokens,
-            )
+            self.resume_paused_requests(active_request_count, newly_paused_request_ids, next_tokens)
         )
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
@@ -2172,8 +2154,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         return {
-            "newly_paused_request_ids" : newly_paused_request_ids,
-            "evict_request_ids" : evict_request_ids,
+            "newly_paused_request_ids": newly_paused_request_ids,
+            "evict_request_ids": evict_request_ids,
         }
 
     def calculate_log_probs(
