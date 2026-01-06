@@ -78,9 +78,7 @@ class TestDynamicContext:
             use_cuda_graphs_for_non_decode_steps=True,
             buffer_size_gb=buffer_size_gb,
             paused_buffer_size_gb=(
-                0.2 * buffer_size_gb
-                if paused_buffer_size_gb is None else
-                paused_buffer_size_gb
+                0.2 * buffer_size_gb if paused_buffer_size_gb is None else paused_buffer_size_gb
             ),
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
