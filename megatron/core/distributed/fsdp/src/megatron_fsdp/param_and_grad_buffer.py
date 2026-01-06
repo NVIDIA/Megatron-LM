@@ -2048,7 +2048,7 @@ class ParamAndGradBuffer:
         # Specifically, replace the Torch module's parameter data with tensors
         # whose memory managed by the model weight buffer, and store a shard
         # of all the parameters across ranks in the model weight buffer.
-        for group_id, group in enumerate(self.parameter_groups):
+        for group in self.parameter_groups:
             wbuf = group.model_weight_buffer
             if wbuf:
                 with self.mem_alloc_context():
