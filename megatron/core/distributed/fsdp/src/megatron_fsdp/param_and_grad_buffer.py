@@ -2451,7 +2451,7 @@ class ParamAndGradBuffer:
         or "no_shard" is utilized.
         """
         dist_main_weight = {}
-        for group_id, pg in enumerate(self.parameter_groups):
+        for pg in self.parameter_groups:
             wbuf = pg.model_weight_buffer
             tbuf = pg.transpose_weight_buffer
             mbuf = pg.main_weight_buffer
