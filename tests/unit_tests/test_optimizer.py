@@ -602,7 +602,7 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
 
 class QKLayerNormModel(nn.Module):
     """A model with q_layernorm, k_layernorm, regular layernorm and bias parameters
-    to test the 'apply_wd_to_qk_layernorm' no_weight_decay_cond option.
+    to test the 'apply_wd_to_qk_layernorm' no_weight_decay_cond_type option.
     """
 
     def __init__(self, hidden_size=64):
@@ -618,7 +618,7 @@ class QKLayerNormModel(nn.Module):
 
 def test_no_weight_decay_cond_apply_wd_to_qk_layernorm():
     """
-    Test that no_weight_decay_cond='apply_wd_to_qk_layernorm' correctly assigns
+    Test that no_weight_decay_cond_type='apply_wd_to_qk_layernorm' correctly assigns
     wd_mult=1.0 to q_layernorm and k_layernorm parameters while other 1D params
     (bias, regular layernorm) have wd_mult=0.0.
 
@@ -639,13 +639,13 @@ def test_no_weight_decay_cond_apply_wd_to_qk_layernorm():
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
 
-    # Create optimizer config with no_weight_decay_cond='apply_wd_to_qk_layernorm'
+    # Create optimizer config with no_weight_decay_cond_type='apply_wd_to_qk_layernorm'
     optimizer_config = OptimizerConfig(
         optimizer='adam',
         lr=0.01,
         bf16=True,
         use_distributed_optimizer=False,
-        no_weight_decay_cond='apply_wd_to_qk_layernorm',
+        no_weight_decay_cond_type_type='apply_wd_to_qk_layernorm',
     )
 
     # Build optimizer
@@ -668,4 +668,4 @@ def test_no_weight_decay_cond_apply_wd_to_qk_layernorm():
     #              k_layernorm.bias, linear.weight = 5 params
     # wd_mult=0.0: regular_layernorm.weight, linear.bias = 2 params
     assert wd_mult_1_count == 5, f"Expected 5 params with wd_mult=1.0, but got {wd_mult_1_count}"
-    assert wd_mult_0_count == 2, f"Expected 3 params with wd_mult=0.0, but got {wd_mult_0_count}"
+    assert wd_mult_0_count == 2, f"Expected 2 params with wd_mult=0.0, but got {wd_mult_0_count}"
