@@ -860,7 +860,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.cuda_sync_point = point
 
     def _maybe_dtoh_and_synchronize(
-        self, point: str, tokens_per_expert: torch.Tensor = None
+        self, point: str, tokens_per_expert: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Move all possible GPU tensors to CPU and make a synchronization at the expected point.
@@ -1430,7 +1430,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
     def token_dispatch(
         self,
         hidden_states: torch.Tensor,
-        probs: torch.Tensor = None,
+        probs: Optional[torch.Tensor] = None,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ):
