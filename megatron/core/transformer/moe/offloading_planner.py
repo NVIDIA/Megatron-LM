@@ -623,6 +623,7 @@ def generate_random_expert_offloading_map(num_home_experts, num_spare_experts):
     offloading_map[selected_home_experts, torch.arange(num_spare_experts)] = True
     return offloading_map
 
+@torch.compile
 def gen_offloading_plan(
     map_token_to_expert: torch.Tensor,
     probs_routing: torch.Tensor,

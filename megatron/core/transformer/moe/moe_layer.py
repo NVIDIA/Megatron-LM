@@ -362,13 +362,19 @@ class MoELayer(BaseMoELayer):
                     spare_expert_per_ep_rank=self.config.moe_num_echo_experts // self.ep_group.size(),
                 )
             else:
+                num_spare_experts_per_ep_rank = self.config.moe_num_echo_experts // self.ep_group.size()
+                if num_spare_experts_per_ep_rank == 1:
+                    assignment_algorithm = "approx_bin_packing"
+                else:
+                    assignment_algorithm = "one_shot_greedy"
                 rerouting_map, rerouted_probs, expert_offloading_map = gen_offloading_plan(
                     routing_map,
                     probs,
                     tokens_per_expert_per_ep_rank,
                     self.ep_group.rank(),
                     num_ep_ranks=self.ep_group.size(),
-                    num_spare_experts_per_ep_rank=self.config.moe_num_echo_experts // self.ep_group.size(),
+                    num_spare_experts_per_ep_rank=num_spare_experts_per_ep_rank,
+                    assignment_algorithm=assignment_algorithm,
                 )
             if self.config.moe_echo_dump_dir is not None:
                 GLOBAL_MOE_ROUTING_TRACKER.set_rank_info(self.ep_group)
