@@ -357,7 +357,6 @@ Memory optimization is critical for large-scale MoE training, as MoE models main
 
 | Optimization | Description | Config |
 |--------------|-------------|--------|
-| **FP8 Activation** | Stores linear layer inputs in FP8 instead of BF16, reducing activation memory by ~50% | `--fp8` |
 | **Fine-grained Recomputation** | Selectively recomputes specific modules (e.g., `mla_up_proj`, `layernorm`, `moe_act`) instead of full layers | `--recompute-granularity selective --recompute-modules mla_up_proj layernorm moe_act` |
 | **Fine-grained Activation Offloading** | Offloads activations to CPU memory, overlapping D2H/H2D transfers with computation | See `docs/source/api-guide/fine_grained_activation_offloading.md` |
 | **Precision-aware Optimizer** | Stores optimizer states (exp_avg, exp_avg_sq) in BF16 instead of FP32, reducing optimizer memory by 50% | `--use-precision-aware-optimizer --exp-avg-dtype bf16 --exp-avg-sq-dtype bf16` |
@@ -392,12 +391,48 @@ For more details, see `docs/source/api-guide/fine_grained_activation_offloading.
 
 ### Communication Optimization
 
-EP communication (All-to-All) can consume 30-40% of training time without optimization. These features hide or reduce communication overhead.
+Distributed training introduces communication overhead from various parallelism strategies. Megatron Core supports overlapping communication with computation to hide latency and improve throughput.
+
+#### Data Parallel (DP) Communication Overlap
+
+With distributed optimizer, DP introduces **reduce-scatter** (gradients) and **all-gather** (parameters) communications, chunked by Transformer layer granularity.
 
 | Optimization | Description | Config |
 |--------------|-------------|--------|
-| **EP A2A Overlap** | Overlaps EP All-to-All communication with computation by merging FWD-BWD passes of adjacent microbatches | `--moe-ep-a2a-overlap` |
+| **Gradient Reduce Overlap** | Overlaps gradient reduce-scatter with backward computation | `--overlap-grad-reduce` |
+| **Param Gather Overlap** | Overlaps parameter all-gather with forward computation | `--overlap-param-gather` |
+| **BF16 Gradient Reduce** | Reduces gradients in BF16 instead of FP32 for better performance | `--grad-reduce-in-fp32 false` (via mixed precision config) |
+| **FP8 Param Gather** | Conducts parameter all-gather in FP8, reducing overhead by 50% | `--fp8-param-gather` |
+
+#### Tensor Parallel (TP) Communication Overlap
+
+TP with sequence parallelism introduces activation all-gather and reduce-scatter operations. Communications are overlapped in **bulk** (no dependency) or **pipelined** (with dependency) fashion.
+
+| Optimization | Description | Config |
+|--------------|-------------|--------|
+| **TP Comm Overlap** | Enables bulk and pipelined TP communication overlap | `--tp-comm-overlap` |
+
+> **Requirements**: `tensor_model_parallel_size >= 2` and `--sequence-parallel`
+
+#### Pipeline Parallel (PP) Communication Overlap
+
+PP introduces P2P activation sends/receives between pipeline stages. Overlap is automatic in the 1F1B pipelining phase when VPP is enabled.
+
+| Optimization | Description | Config |
+|--------------|-------------|--------|
+| **P2P Comm Overlap** | Overlaps PP P2P communications with non-dependent computations | `--overlap-p2p-comm` (auto-enabled with VPP) |
+| **VPP for Better Overlap** | Increases overlap opportunities by reducing layers per virtual stage | `--num-layers-per-virtual-pipeline-stage` |
+
+#### Expert Parallel (EP) Communication Overlap
+
+EP All-to-All can consume 30-40% of training time without optimization. These features hide or reduce EP communication overhead.
+
+| Optimization | Description | Config |
+|--------------|-------------|--------|
+| **EP A2A Overlap** | Overlaps All-to-All with computation by merging FWD-BWD passes of adjacent microbatches | `--overlap-moe-expert-parallel-comm --delay-wgrad-compute` |
 | **Shared Expert Overlap** | Runs shared expert computation concurrently with EP token transfer | `--moe-shared-expert-overlap` |
+
+> **Requirements for EP A2A Overlap**: `expert_model_parallel_size > 1`, CUDA_DEVICE_MAX_CONNECTIONS > 1.
 
 ### Compute Optimization
 
