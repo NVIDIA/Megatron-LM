@@ -46,11 +46,11 @@ You should receive a response within 2 business days.
 
 ### I need help, who should I ping?
 
-Use `@megatron-oncall`.
+Use [@megatron-oncall](https://github.com/orgs/NVIDIA/teams/megatron-oncall).
 
 ### If my issue or PR isn't getting attention, what should I do?
 
-After 2 business days, use `@megatron-oncall`.
+After 2 business days, tag the user [@megatron-oncall](https://github.com/orgs/NVIDIA/teams/megatron-oncall).
 
 ### Is there a policy for issues and PRs that haven't been touched in X days? Should they be closed?
 
