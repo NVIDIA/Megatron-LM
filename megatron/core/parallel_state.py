@@ -12,7 +12,7 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
-from .utils import GlobalMemoryBuffer, is_torch_min_version
+from .utils import GlobalMemoryBuffer, GlobalSymmetricMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,10 @@ _DATA_PARALLEL_GLOBAL_RANKS = None
 # the first local rank in the tensor model parallel group
 _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
 
+# A list of global ranks for each expert model parallel group to ease calculation of
+# the first local rank in the expert model parallel group
+_EXPERT_MODEL_PARALLEL_RANKS = None
+
 # A list of global ranks for each model parallel group to ease calculation of
 # the first local rank in the model parallel group
 _MODEL_PARALLEL_GLOBAL_RANKS = None
@@ -134,6 +138,9 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
+
+# Global symmetric memory buffer for inference
+_GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
 # List of all process groups
 # Used for updating the timeout for all process groups
@@ -1159,7 +1166,7 @@ def initialize_model_parallel(
 
     ### Expert-related parallel groups initialization
     # Build the expert model parallel group
-    global _EXPERT_MODEL_PARALLEL_GROUP
+    global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
     for ranks in expert_decoder_rank_generator.get_ranks('ep'):
         group = create_group(
@@ -1170,6 +1177,7 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
+            _EXPERT_MODEL_PARALLEL_RANKS = ranks
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
@@ -1777,6 +1785,15 @@ def get_expert_model_parallel_group(check_initialized=True):
     return _EXPERT_MODEL_PARALLEL_GROUP
 
 
+def get_expert_model_parallel_src_rank():
+    """Calculate the global rank corresponding to the first local rank
+    in the expert model parallel group."""
+    assert (
+        _EXPERT_MODEL_PARALLEL_RANKS is not None
+    ), "Expert model parallel group is not initialized"
+    return _EXPERT_MODEL_PARALLEL_RANKS[0]
+
+
 def get_expert_model_parallel_world_size():
     """Return world size for the expert-model-parallel group."""
     if _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE is not None:
@@ -1981,16 +1998,41 @@ def _set_global_memory_buffer():
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
 
+def _set_global_symmetric_memory_buffer():
+    """Initialize global buffer."""
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is None, "global memory buffer is already initialized"
+
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = GlobalSymmetricMemoryBuffer(
+        size_in_mb=256,  # todo: set from an argument?
+        process_group=get_tensor_model_parallel_group(),
+    )
+
+
 def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""
     assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
     return _GLOBAL_MEMORY_BUFFER
 
 
+def get_global_symmetric_memory_buffer():
+    """Return the global GlobalSymmetricMemoryBuffer object"""
+    assert (
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER is not None
+    ), "global symmetric memory buffer is not initialized"
+    return _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+
+
 def destroy_global_memory_buffer():
     """Sets the global memory buffer to None"""
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
+
+
+def destroy_global_symmetric_memory_buffer():
+    """Sets the global symmetric memory buffer to None"""
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
 
 def get_all_ranks():
@@ -2067,6 +2109,9 @@ def destroy_model_parallel():
 
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
+
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
     global _DATA_PARALLEL_GROUP_GLOO
     if (

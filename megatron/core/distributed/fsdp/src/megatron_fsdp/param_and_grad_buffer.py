@@ -31,7 +31,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 import torch
 from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.distributed.tensor.device_mesh import _mesh_resources
 
 from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
 from .utils import (
@@ -1567,6 +1566,7 @@ class ParamAndGradBuffer:
             reset_parameters_for_meta_device_init_module
         )
         self.ubr_groups = None
+        self.already_registered = False
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
@@ -1670,6 +1670,10 @@ class ParamAndGradBuffer:
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
 
             if NCCL_ALLOCATOR == "MCORE":
+                if self.ddp_config.fsdp_manual_registration:
+                    return functools.partial(
+                        nccl_allocator.MemPoolAllocatorWithoutRegistration, NCCL_MEMORY_POOL
+                    )
                 if len(groups) == 1:
                     # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
@@ -1686,6 +1690,12 @@ class ParamAndGradBuffer:
                         symmetric=symmetric,
                     )
             elif NCCL_ALLOCATOR == "APEX":
+                if self.ddp_config.fsdp_manual_registration:
+                    logging.warning(
+                        "FSDP manual registration is not supported for APEX NCCL allocator."
+                        "falling back to default registration. "
+                        "Please use Megatron Core NCCL allocator for manual registration."
+                    )
                 if symmetric:
                     logging.warning(
                         "Symmetric registration is not supported for APEX NCCL allocator."
@@ -1708,6 +1718,39 @@ class ParamAndGradBuffer:
             return mem_alloc_context
         else:
             return nullcontext
+
+    def manual_buffer_registration(self):
+        """
+        Manually register the FSDP communication buffers to NCCL user buffer.
+        """
+        assert self.ddp_config.nccl_ub, "NCCL UBR is not enabled"
+        assert self.ddp_config.fsdp_double_buffer, "FSDP double buffer is not enabled"
+        assert self.ddp_config.fsdp_manual_registration, "FSDP manual registration is not enabled"
+        assert not self.already_registered, "Mem pool is already registered"
+
+        self.already_registered = True
+
+        global NCCL_MEMORY_POOL
+        torch.cuda.synchronize()
+        torch.distributed.barrier(async_op=False)
+        torch.cuda.synchronize()
+
+        for group in self.ubr_groups:
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    f"[MCORE][FSDP][Manual REG] Registering mem pool to group {group},"
+                    f"group.group_desc:{group.group_desc}, group.size(): {group.size()}"
+                )
+            nccl_allocator.register_mem_pool(
+                NCCL_MEMORY_POOL,
+                group,
+                symmetric=not self.ddp_config.disable_symmetric_registration,
+            )
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
+                    f"group.group_desc:{group.group_desc}, group.size(): {group.size()}"
+                )
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
@@ -3577,20 +3620,6 @@ def _get_fsdp_tensor_spec(
     if isinstance(param, DTensor) and cast(DTensor, param)._spec.num_shards > 1:
         # Retrieve original DTensorSpec (for TP).
         dtensor_spec = cast(DTensor, param)._spec
-        dtensor_mesh = getattr(dtensor_spec, "mesh", None)
-
-        # Validate that the DTensor root mesh is identical to the Megatron-FSDP device mesh.
-        megatron_fsdp_global_mesh = dist_index.get_root_mesh(is_expert_parallel=is_expert_param)
-        dtensor_global_mesh = _mesh_resources.get_root_mesh(dtensor_mesh)
-        # FIXME(boxiangw): add or megatron_fsdp_global_mesh != dtensor_global_mesh:
-        # _mesh_resources.get_root_mesh(dtensor_mesh) is not getting the correct root mesh
-        if dtensor_global_mesh is None:
-            raise ValueError(
-                f"When utilizing DTensor-based modules with Megatron-FSDP, the DTensor root "
-                f"device mesh must be identical to the Megatron-FSDP root device mesh.\n"
-                f"DTensor Root Mesh: {dtensor_global_mesh} / Megatron-FSDP "
-                f"Root Mesh: {megatron_fsdp_global_mesh}"
-            )
 
         # Get the placements for the parameter.
         assert len(dtensor_spec.placements) == 1, (
@@ -3778,7 +3807,7 @@ def make_fsdp_dtensor(
                 device_mesh=tp_mesh,
                 placements=placements,
                 run_check=run_check,
-                shape=global_shape,
+                shape=tuple(global_shape),
                 stride=torch.empty(global_shape).stride(),
             )
 
