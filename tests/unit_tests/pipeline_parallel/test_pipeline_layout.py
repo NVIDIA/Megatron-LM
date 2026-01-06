@@ -253,6 +253,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         micro_batch_size=1,
         forward_only=True,
     )
+    losses_reduced.pop()  # Empty bins not required for this test
 
     optimizer = None
     opt_param_scheduler = None
