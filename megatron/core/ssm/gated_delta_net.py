@@ -246,7 +246,7 @@ class GatedDeltaNet(MegatronModule):
                     dtype=self.config.params_dtype,
                     device=torch.cuda.current_device(),
                 ).uniform_(*self.A_init_range)
-                self.A_log.data.copy_(A)
+                self.A_log.data.copy_(torch.log(A))
 
     def forward(
         self,
