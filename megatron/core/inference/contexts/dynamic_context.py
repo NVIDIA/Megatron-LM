@@ -1797,12 +1797,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Overflow paused block count.
         paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
         paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-        valid_paused_request_count = min(
-            torch.nonzero(
-                paused_block_counts_cumsum < self.block_allocator.paused_count
-            ).numel() + 1, # allow up to one paused request to overflow into active buffer
-            self.paused_request_count,
-        )
+        valid_paused_request_count = torch.nonzero(
+            paused_block_counts_cumsum <= self.block_allocator.paused_count
+        ).numel()
         overflow_paused_request_count = self.paused_request_count - valid_paused_request_count
 
         # Nothing to evict? (Similar to checking overflow_paused_block_count
@@ -1815,14 +1812,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # counted from the right-most paused requests.
         paused_block_counts = paused_block_counts[-overflow_paused_request_count:].flip(dims=[0])
         paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-        paused_block_counts_cumsum = paused_block_counts_cumsum.tolist()
-
-        evict_request_count = None
-        for idx, block_count in enumerate(paused_block_counts_cumsum):
-            if block_count >= len(paused_block_counts_cumsum) - idx - 1:
-                evict_request_count = idx + 1
-                break
-        assert evict_request_count is not None
+        remaining_paused_request_counts = torch.arange(
+            overflow_paused_request_count - 1,
+            -1,
+            -1,
+            dtype=paused_block_counts_cumsum.dtype,
+            device=torch.cuda.current_device(),
+        )
+        net_block_counts = paused_block_counts_cumsum - remaining_paused_request_counts
+        evict_request_count = torch.nonzero(net_block_counts >= 0)[0].item() + 1
 
         # Eviction index range.
         evict_start_idx = self.paused_request_count - evict_request_count
