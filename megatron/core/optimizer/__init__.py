@@ -496,11 +496,17 @@ def get_megatron_optimizer(
         'optimizer',
         'optimizer_cpu_offload',
     ]
-    for field_name in fields_to_check_for_consistency:
-        field = getattr(config, field_name, None)
-        if config_overrides is not None:
-            all_configs = list(config_overrides.values())
-            assert all([getattr(x, field_name, None) == field for x in all_configs])
+    if config_overrides is not None:
+        for field_name in fields_to_check_for_consistency:
+            base_field = getattr(config, field_name, None)
+            all_config_overrides = list(config_overrides.values())
+            for config_override in all_config_overrides:
+                if field_name in config_override:
+                    field = config_override[field_name]
+                    if field != base_field:
+                        raise ValueError(
+                            f"Field {field_name} should not be overriden in a config override."
+                        )
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
