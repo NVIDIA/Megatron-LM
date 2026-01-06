@@ -65,7 +65,7 @@ def collect_train_test_metrics(
             "mtp_1 loss",
             "load_balancing_loss",
             "seq_load_balancing_loss",
-            "global_load_balancing_loss"
+            "global_load_balancing_loss",
         ]
     }
 
