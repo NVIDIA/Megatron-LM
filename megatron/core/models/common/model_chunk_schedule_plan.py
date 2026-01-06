@@ -87,6 +87,7 @@ class TransformerLayerSchedulePlan:
         self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
 
     def release_state(self):
+        """Release reference, this helps avoid memory leak."""
         if hasattr(self, 'attn') and self.attn is not None:
             del self.attn
             self.attn = None
