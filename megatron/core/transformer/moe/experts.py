@@ -896,7 +896,6 @@ class TEGroupedMLP(MegatronModule):
                 bias_parallel,
                 name="expert_fc1",
                 forced_released_tensors=[permuted_local_hidden_states],
-                delay_offload=self.config.delay_offload_until_cuda_graph,
             )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
@@ -978,7 +977,6 @@ class TEGroupedMLP(MegatronModule):
                 output,
                 name="moe_act",
                 forced_released_tensors=[fc1_output],
-                delay_offload=self.config.delay_offload_until_cuda_graph,
             )
 
         # upad and concat the output
