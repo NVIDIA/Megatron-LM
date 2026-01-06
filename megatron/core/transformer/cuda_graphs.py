@@ -340,9 +340,6 @@ class _CudagraphGlobalRecord:
             return
 
         # Otherwise, create all the recorded cudagraphs.
-        if torch.distributed.get_rank() == 0:
-            logging.getLogger(__name__).info(f"Creating {len(cls.cudagraph_record)} CUDA graphs")
-
         has_te_modules = False
         if HAVE_TE_GRAPHS:
             for g in cls.cudagraph_record:
@@ -350,9 +347,20 @@ class _CudagraphGlobalRecord:
                 has_te_modules = has_te_modules or any(
                     [isinstance(m, TransformerEngineBaseModule) for m in base_module.modules()]
                 )
-        else:
-            if torch.distributed.get_rank() == 0:
-                logging.warning(
+
+        if torch.distributed.get_rank() == 0:
+            time_start = time.time()
+            mem_stats_start = torch.cuda.memory_stats()
+
+            progress_bar = enumerate(cls.cudagraph_record)
+            if HAVE_TQDM:
+                progress_bar = tqdm(
+                    progress_bar, "create cuda graphs", total=len(cls.cudagraph_record)
+                )
+
+            logger.info(f"Creating {len(cls.cudagraph_record)} CUDA graphs")
+            if not HAVE_TE_GRAPHS:
+                logger.warning(
                     "Transformer Engine was not detected while capturing training cudagraphs."
                     "As a result cudagraph memory overhead may significantly increase as "
                     "Transformer Engine's weak reference feature is used on cudagraph input and "
@@ -369,6 +377,8 @@ class _CudagraphGlobalRecord:
         if has_te_modules:
             te_set_capture_start()
 
+        global bwd_buffer_reuse_ref_count, fwd_buffer_reuse_ref_count
+
         def format_mem_bytes(mem_bytes):
             for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
                 suffix_bytes = 1024**power
@@ -376,30 +386,17 @@ class _CudagraphGlobalRecord:
                     return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
             return "%d bytes" % mem_bytes
 
-        time_start = time.time()
-        mem_stats_start = torch.cuda.memory_stats()
-
-        global bwd_buffer_reuse_ref_count, fwd_buffer_reuse_ref_count
-
-        progress_bar = enumerate(cls.cudagraph_record)
-        if HAVE_TQDM:
-            progress_bar = tqdm(
-                progress_bar,
-                "create cuda graphs",
-                total=len(cls.cudagraph_record),
-                disable=torch.distributed.get_rank() != 0,
-            )
-
         for g_idx, g in progress_bar:
-            mem_stats = torch.cuda.memory_stats()
-            progress_str = "create cuda graphs | mem: alloc %s, res %s" % (
-                format_mem_bytes(mem_stats["allocated_bytes.all.current"]),
-                format_mem_bytes(mem_stats["reserved_bytes.all.current"]),
-            )
-            if HAVE_TQDM:
-                progress_bar.set_description(progress_str)
-            elif g_idx % 100 == 0 or g_idx == len(cls.cudagraph_record) - 1:
-                logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
+            if torch.distributed.get_rank() == 0:
+                mem_stats = torch.cuda.memory_stats()
+                progress_str = "create cuda graphs | mem: alloc %s, res %s" % (
+                    format_mem_bytes(mem_stats["allocated_bytes.all.current"]),
+                    format_mem_bytes(mem_stats["reserved_bytes.all.current"]),
+                )
+                if HAVE_TQDM:
+                    progress_bar.set_description(progress_str)
+                elif g_idx % 100 == 0 or g_idx == len(cls.cudagraph_record) - 1:
+                    logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
 
             runner, graph_type = g[0:2]
             if graph_type == 'fwd':
@@ -409,31 +406,32 @@ class _CudagraphGlobalRecord:
                 assert fwd_buffer_reuse_ref_count == 0
                 runner.create_bwd_graph()
 
-        # Memory usage.
-        time_end = time.time()
-        mem_stats_end = torch.cuda.memory_stats()
-        capture_stats = {
-            "time": time_end - time_start,
-            "allocated_bytes": (
-                mem_stats_end["allocated_bytes.all.current"]
-                - mem_stats_start["allocated_bytes.all.current"]
-            ),
-            "reserved_bytes": (
-                mem_stats_end["reserved_bytes.all.current"]
-                - mem_stats_start["reserved_bytes.all.current"]
-            ),
-        }
+        if torch.distributed.get_rank() == 0:
+            # Memory usage.
+            time_end = time.time()
+            mem_stats_end = torch.cuda.memory_stats()
+            capture_stats = {
+                "time": time_end - time_start,
+                "allocated_bytes": (
+                    mem_stats_end["allocated_bytes.all.current"]
+                    - mem_stats_start["allocated_bytes.all.current"]
+                ),
+                "reserved_bytes": (
+                    mem_stats_end["reserved_bytes.all.current"]
+                    - mem_stats_start["reserved_bytes.all.current"]
+                ),
+            }
 
-        logger.info(
-            "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
-            "allocated %s, reserved %s."
-            % (
-                len(cls.cudagraph_record),
-                capture_stats["time"],
-                format_mem_bytes(capture_stats["allocated_bytes"]),
-                format_mem_bytes(capture_stats["reserved_bytes"]),
+            logger.info(
+                "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
+                "allocated %s, reserved %s."
+                % (
+                    len(cls.cudagraph_record),
+                    capture_stats["time"],
+                    format_mem_bytes(capture_stats["allocated_bytes"]),
+                    format_mem_bytes(capture_stats["reserved_bytes"]),
+                )
             )
-        )
 
         # Mark cuda graphs as created.
         for g in cls.cudagraph_record:
