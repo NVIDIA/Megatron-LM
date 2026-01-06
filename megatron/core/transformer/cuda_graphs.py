@@ -326,7 +326,6 @@ class _CudagraphGlobalRecord:
     def create_cudagraphs(cls):
         """Iterate through 'cudagraph_record' creating graphs in the order in which
         they were recorded."""
-
         # Cudagraphs have already been created, check that no cudagraphed modules ran in eager mode
         if cls.cudagraph_created:
             assert len(cls.cudagraph_record) == 0, (
@@ -348,11 +347,11 @@ class _CudagraphGlobalRecord:
                     [isinstance(m, TransformerEngineBaseModule) for m in base_module.modules()]
                 )
 
-        if torch.distributed.get_rank() == 0:
-            time_start = time.time()
-            mem_stats_start = torch.cuda.memory_stats()
+        progress_bar = enumerate(cls.cudagraph_record)
+        time_start = time.time()
+        mem_stats_start = torch.cuda.memory_stats()
 
-            progress_bar = enumerate(cls.cudagraph_record)
+        if torch.distributed.get_rank() == 0:
             if HAVE_TQDM:
                 progress_bar = tqdm(
                     progress_bar, "create cuda graphs", total=len(cls.cudagraph_record)
@@ -406,22 +405,22 @@ class _CudagraphGlobalRecord:
                 assert fwd_buffer_reuse_ref_count == 0
                 runner.create_bwd_graph()
 
-        if torch.distributed.get_rank() == 0:
-            # Memory usage.
-            time_end = time.time()
-            mem_stats_end = torch.cuda.memory_stats()
-            capture_stats = {
-                "time": time_end - time_start,
-                "allocated_bytes": (
-                    mem_stats_end["allocated_bytes.all.current"]
-                    - mem_stats_start["allocated_bytes.all.current"]
-                ),
-                "reserved_bytes": (
-                    mem_stats_end["reserved_bytes.all.current"]
-                    - mem_stats_start["reserved_bytes.all.current"]
-                ),
-            }
+        # Memory usage.
+        time_end = time.time()
+        mem_stats_end = torch.cuda.memory_stats()
+        capture_stats = {
+            "time": time_end - time_start,
+            "allocated_bytes": (
+                mem_stats_end["allocated_bytes.all.current"]
+                - mem_stats_start["allocated_bytes.all.current"]
+            ),
+            "reserved_bytes": (
+                mem_stats_end["reserved_bytes.all.current"]
+                - mem_stats_start["reserved_bytes.all.current"]
+            ),
+        }
 
+        if torch.distributed.get_rank() == 0:
             logger.info(
                 "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
                 "allocated %s, reserved %s."
