@@ -19,6 +19,7 @@ from megatron.core.optimizer import (
     ParamKey,
     ParamPredicate,
     _get_param_groups,
+    check_config_overrides_consistency,
     get_megatron_optimizer,
 )
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
@@ -101,7 +102,9 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
     """Test that the default overrides are applied to the parameter groups."""
     net = Net()
     # NOTE: to get legacy default overrides, supply None.
-    param_groups = _get_param_groups([net], OptimizerConfig(optimizer='adam', lr=0.01), None)
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, None)
+    param_groups = _get_param_groups([net], opt_config, None)
     assert len(param_groups) == 2
     pg0, pg1 = param_groups
     wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
@@ -120,9 +123,9 @@ def test_get_param_groups_with_overrides(mock_get_world_size):
             predicate=ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1),
         ): ParamGroupOverride(wd_mult=0.0)
     }
-    param_groups = _get_param_groups(
-        [net], OptimizerConfig(optimizer='adam', lr=0.01), config_overrides
-    )
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups = _get_param_groups([net], opt_config, config_overrides)
     assert len(param_groups) == 2
     p_set = set(net.parameters())
 
@@ -156,9 +159,9 @@ def test_get_param_groups_multiple_matches(mock_get_world_size):
             predicate=ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1),
         ): ParamGroupOverride(min_lr=1e-4, wd_mult=0.0)
     }
-    param_groups2 = _get_param_groups(
-        [net], OptimizerConfig(optimizer='adam', lr=0.01), config_overrides
-    )
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups2 = _get_param_groups([net], opt_config, config_overrides)
     assert len(param_groups) == 2
     assert param_groups == param_groups2
 
@@ -177,9 +180,9 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
         ParamKey(name="*conv*"): ParamGroupOverride(wd_mult=0.0),
         ParamKey(name="*conv1*"): ParamGroupOverride(min_lr=10, max_lr=20),
     }
-    param_groups = _get_param_groups(
-        [net], OptimizerConfig(optimizer='adam', lr=0.01), config_overrides
-    )
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups = _get_param_groups([net], opt_config, config_overrides)
     assert len(param_groups) == 3
     p_set = set(net.parameters())
     assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params']) | set(
