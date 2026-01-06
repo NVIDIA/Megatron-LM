@@ -1,12 +1,16 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from typing import cast
+
 import pytest
 import torch
 
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.ssm.mamba_block import MambaStackSubmodules
+from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
+from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -36,7 +40,9 @@ class TestMambaMixer:
             num_attention_heads=1,
             use_cpu_initialization=True,
         )
-        modules = mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
+        stack_submodules = cast(MambaStackSubmodules, mamba_stack_spec.submodules)
+        layer_submodules = cast(MambaLayerSubmodules, stack_submodules.mamba_layer.submodules)
+        modules = cast(MambaMixerSubmodules, layer_submodules.mixer.submodules)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         mixer = MambaMixer(
             transformer_config,
@@ -119,7 +125,9 @@ class TestMambaMixerErrorChecks:
             use_cpu_initialization=True,
             mamba_num_groups=ngroups,
         )
-        submodules = mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
+        stack_submodules = cast(MambaStackSubmodules, mamba_stack_spec.submodules)
+        layer_submodules = cast(MambaLayerSubmodules, stack_submodules.mamba_layer.submodules)
+        submodules = cast(MambaMixerSubmodules, layer_submodules.mixer.submodules)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         with pytest.raises(AssertionError, match=expected_error_message):
             MambaMixer(

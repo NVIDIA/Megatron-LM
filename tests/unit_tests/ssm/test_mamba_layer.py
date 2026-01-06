@@ -1,11 +1,14 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from typing import cast
+
 import pytest
 import torch
 
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.ssm.mamba_block import MambaStackSubmodules
+from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -25,7 +28,8 @@ class TestMambaLayer:
             num_attention_heads=1,
             use_cpu_initialization=True,
         )
-        modules = mamba_stack_spec.submodules.mamba_layer.submodules
+        stack_submodules = cast(MambaStackSubmodules, mamba_stack_spec.submodules)
+        modules = cast(MambaLayerSubmodules, stack_submodules.mamba_layer.submodules)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         self.layer = MambaLayer(transformer_config, modules, pg_collection=pg_collection)
 
