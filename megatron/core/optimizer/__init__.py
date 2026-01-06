@@ -467,6 +467,33 @@ def _get_megatron_optimizer_based_on_param_groups(
     return optimizer
 
 
+def check_config_overrides_consistency(
+    config: OptimizerConfig, config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]]
+):
+    """Check if the config overrides are consistent with the config."""
+
+    # TODO: Remove `optimizer` from this eventually (e.g., if we use Muon for some layers and
+    # Adam for other layers). This would need some more refactoring to work though (param_groups
+    # filtered by optimizer passed into _get_megatron_optimizer_based_on_param_groups).
+    if config_overrides is not None:
+        fields_to_check_for_consistency = [
+            'overlap_param_gather_with_optimizer_step',
+            'optimizer',
+            'optimizer_cpu_offload',
+        ]
+        for field_name in fields_to_check_for_consistency:
+            base_field = getattr(config, field_name, None)
+            all_config_overrides = list(config_overrides.values())
+            for config_override in all_config_overrides:
+                if field_name in config_override:
+                    field = config_override[field_name]
+                    if field != base_field:
+                        raise ValueError(
+                            f"Field {field_name} should not be overriden in a config override."
+                        )
+    return True
+
+
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -496,25 +523,7 @@ def get_megatron_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
-    # TODO: Remove `optimizer` from this eventually (e.g., if we use Muon for some layers and
-    # Adam for other layers). This would need some more refactoring to work though (param_groups
-    # filtered by optimizer passed into _get_megatron_optimizer_based_on_param_groups).
-    fields_to_check_for_consistency = [
-        'overlap_param_gather_with_optimizer_step',
-        'optimizer',
-        'optimizer_cpu_offload',
-    ]
-    if config_overrides is not None:
-        for field_name in fields_to_check_for_consistency:
-            base_field = getattr(config, field_name, None)
-            all_config_overrides = list(config_overrides.values())
-            for config_override in all_config_overrides:
-                if field_name in config_override:
-                    field = config_override[field_name]
-                    if field != base_field:
-                        raise ValueError(
-                            f"Field {field_name} should not be overriden in a config override."
-                        )
+    check_config_overrides_consistency(config, config_overrides)
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
