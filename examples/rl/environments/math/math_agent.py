@@ -25,7 +25,7 @@ class MathAgent(RewardOnlyAgent):
     def __init__(self,
         format_reward: float = 0.0,
         answer_format: str = "tagged",
-        assistant_prefix: str = "Assistant: Let me solve this step by step.\n<think>",
+        assistant_suffix: str = "Assistant: Let me solve this step by step.\n<think>",
         chat_mode: bool = False,
         negative_reward: float = 0.0,
         partial_end_reward: float = 0.0,
@@ -36,8 +36,8 @@ class MathAgent(RewardOnlyAgent):
                 even if the answer is incorrect or is missing the end-of-text token.
             answer_format (str): Which answer format is expected: "tagged" for <answer> tags,
                 or "boxed" for \boxed{} LaTeX formatting.
-            assistant_prefix (str): The prefix string included in the prompt, typically to
-                guide the assistant's output format and "persona".
+            assistant_suffix (str): The suffix string included in the assistant's response, typically to
+                guide the assistant's output format and "persona". For example, "Let me solve this step by step."
             chat_mode (bool): If True, agent operates in a chat (conversational) context.
             negative_reward (float): Reward assigned for a clearly incorrect or unparseable answer.
             partial_end_reward (float): Reward when the answer is correct but an expected end token is not matched exactly.
@@ -49,7 +49,7 @@ class MathAgent(RewardOnlyAgent):
 
         self.format_reward = format_reward
         self.answer_format = answer_format
-        self.assistant_prefix = assistant_prefix
+        self.assistant_suffix = assistant_suffix
         self.chat_mode = chat_mode
         self.negative_reward = negative_reward
         self.partial_end_reward = partial_end_reward
@@ -141,5 +141,5 @@ class MathAgent(RewardOnlyAgent):
     The question will be a word math problem. Show your work in <think> </think> tags. 
     {answer_format}
     User: {kwargs[problem_key]}
-    {self.assistant_prefix}"""
+    {self.assistant_suffix}"""
         return prefix
