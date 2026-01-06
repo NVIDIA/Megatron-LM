@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
