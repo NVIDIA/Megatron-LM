@@ -14,10 +14,6 @@ from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional
-# >>>
-# pip install termcolor
-from termcolor import colored
-# <<<
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -559,13 +555,6 @@ def main():
 
             # ---- Print each unique output ----
             for output_text, output_request_idxs in output_map.items():
-                # >>>
-                evicted = False
-                for idx in output_request_idxs:
-                    for event in requests[idx].events:
-                        if event.type.name == "EVICT":
-                            evicted = True
-                # <<<
                 if output_text is not None:
                     # Use hash of prompt + generated text in case engine was
                     # suspended and resumed, which misaligns boundary between
@@ -579,11 +568,7 @@ def main():
                     o_hash = "--"
                     o_len = 0
                     escaped_output_text = "--"
-                # >>>
-                # print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
-                # +++
-                print(colored(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}{', ******** EVICTED ********' if evicted else ''}] {escaped_output_text}", "blue" if evicted else "white"))
-                # <<<
+                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
                 text_hashes.append(o_hash)
 
         # Write results to JSON. Primarily used for functional testing.
