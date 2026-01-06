@@ -2,7 +2,6 @@
 
 import copy
 import dataclasses
-from typing import cast
 
 import pytest
 import torch
@@ -12,7 +11,6 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodu
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed

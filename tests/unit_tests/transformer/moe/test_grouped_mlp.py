@@ -1,12 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-from typing import cast
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
+    get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.transformer.module import Float16Module
@@ -14,7 +13,6 @@ from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import parse_args
 from megatron.training.initialize import _set_random_seed
@@ -71,11 +69,8 @@ class TestParallelGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_local_spec(self.num_experts, moe_grouped_gemm=False)
-        self.sequential_mlp = MoELayer(
-            tf_config,
-            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
-        )
+        submodules = get_gpt_layer_local_submodules(self.num_experts, moe_grouped_gemm=False)
+        self.sequential_mlp = MoELayer(tf_config, submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
         self.args.bf16 = True
@@ -266,11 +261,8 @@ class TestTEGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_local_spec(self.num_experts, moe_grouped_gemm=False)
-        self.sequential_mlp = MoELayer(
-            tf_config,
-            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
-        )
+        submodules = get_gpt_layer_local_submodules(self.num_experts, moe_grouped_gemm=False)
+        self.sequential_mlp = MoELayer(tf_config, submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
         self.args.bf16 = True
