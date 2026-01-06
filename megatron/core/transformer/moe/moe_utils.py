@@ -120,12 +120,13 @@ def switch_load_balancing_loss_func(
     return aux_loss
 
 
-def z_loss_func(logits, z_loss_coeff):
+def z_loss_func(logits: torch.Tensor, z_loss_coeff: float):
     """Encourages the router's logits to remain small to enhance stability.
     Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
 
     Args:
         logits (torch.Tensor): The logits of the router.
+        z_loss_coeff (float): The coefficient for the z-loss.
 
     Returns:
         torch.Tensor: The logits after applying the z-loss.
