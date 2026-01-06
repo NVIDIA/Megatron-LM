@@ -161,7 +161,7 @@ def _get_param_groups(
             # TODO: Make sure there is a way to support old no_weight_decay_func functionality
             # and default_skip_embedding_weight_decay:
             #     or (default_skip_embedding_weight_decay and "embedding" in name)
-            no_wd_cond_fn = _get_no_wd_cond_fn(config.no_weight_decay_cond)
+            no_wd_cond_fn = _get_no_wd_cond_fn(config.no_weight_decay_cond_type)
             no_wd = no_wd_cond_fn(name, param)
             if not no_wd:
                 wd_mult = 1.0

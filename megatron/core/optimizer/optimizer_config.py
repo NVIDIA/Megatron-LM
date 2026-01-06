@@ -40,7 +40,7 @@ class OptimizerConfig:
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
 
-    no_weight_decay_cond: Optional[str] = None
+    no_weight_decay_cond_type: Optional[str] = None
     """Condition for whether a parameter should not perform weight decay.
        Supported conditions:
        - None (default): apply weight decay to 1D weights, biases,
