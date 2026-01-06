@@ -929,7 +929,11 @@ class FSDPDistributedIndex:
             self.hsdp_outer_dp_shard
         ), "get_logical_hybrid_fsdp_rank is only valid when full-shard hybrid FSDP is enabled."
 
-        _hybrid_fsdp_group_name = "_hybrid_fsdp_group_ranks" if not is_expert_parallel else "_hybrid_fsdp_expt_group_ranks"
+        _hybrid_fsdp_group_name = (
+            "_hybrid_fsdp_group_ranks"
+            if not is_expert_parallel
+            else "_hybrid_fsdp_expt_group_ranks"
+        )
 
         if not hasattr(self, _hybrid_fsdp_group_name):
             dp_world_size = self.get_dp_group(is_expert_parallel).size()
@@ -944,7 +948,9 @@ class FSDPDistributedIndex:
             setattr(self, _hybrid_fsdp_group_name, mesh.tolist())
 
         # Find the index for the current rank in the hybrid group
-        return getattr(self, _hybrid_fsdp_group_name).index(self.get_dp_group(is_expert_parallel).rank())
+        return getattr(self, _hybrid_fsdp_group_name).index(
+            self.get_dp_group(is_expert_parallel).rank()
+        )
 
 
 class GlobalMemoryBuffer:
