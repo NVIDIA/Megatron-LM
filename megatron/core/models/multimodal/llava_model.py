@@ -2,7 +2,7 @@
 import logging
 from collections import namedtuple
 from functools import partial
-from typing import List, Optional
+from typing import List, Optional, cast
 
 import torch
 
@@ -17,8 +17,10 @@ from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import deprecate_inference_params, log_single_rank
 
 try:
@@ -158,9 +160,14 @@ class LLaVAModel(MegatronModule):
         self.context_parallel_lm = language_transformer_config.context_parallel_size
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
             if not language_model_type.startswith('nemotron5-hybrid'):
-                attn_module = language_transformer_layer_spec.submodules.self_attention
+                transformer_layer_submodules = cast(
+                    TransformerLayerSubmodules, language_transformer_layer_spec.submodules
+                )
+                self_attention_submodules = cast(
+                    SelfAttentionSubmodules, transformer_layer_submodules.self_attention.submodules
+                )
                 assert (
-                    attn_module.submodules.core_attention == TEDotProductAttention and HAVE_TE
+                    self_attention_submodules.core_attention == TEDotProductAttention and HAVE_TE
                 ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
             if self.context_parallel_lm > 1:
                 self.cp_group = self.pg_collection.cp
