@@ -1,7 +1,7 @@
 # What does this PR do ?
 <!-- Add a one line overview of what this PR aims to accomplish. -->
 
-:warning: For major changes (either in lines of code or in its impact), please make sure to first share discuss a design-doc with the team.  
+:warning: For major changes (either in lines of code or in its impact), please make sure to first share a design doc with the team. If you're unsure what's the best way to do so, contact the @megatron-oncall.
 
 ## Contribution process
 
@@ -30,6 +30,8 @@ The following process is enforced via the CODEOWNERS file for changes into `mega
 
 <details>
 <summary>For MRs into `main` branch</summary>
+
+Feel free to message or comment the @megatron-oncall to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
 
 #### (Step 1): Add PR label `Expert Review`
 
