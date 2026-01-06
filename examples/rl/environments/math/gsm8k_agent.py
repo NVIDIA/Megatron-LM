@@ -26,7 +26,7 @@ class GSM8KAgent(MathAgent):
     def __init__(self,
         answer_format: str = "boxed",
         chat_mode: bool = False,
-        assistant_prefix: str = "Assistant: Let me solve this step by step.\n<think>",
+        assistant_suffix: str = "Assistant: Let me solve this step by step.\n<think>",
         format_reward: float = 0.0,
         negative_reward: float = 0.0,
         partial_end_reward: float = 0.0,
@@ -34,7 +34,7 @@ class GSM8KAgent(MathAgent):
         super().__init__(
             answer_format=answer_format,
             chat_mode=chat_mode,
-            assistant_prefix=assistant_prefix,
+            assistant_suffix=assistant_suffix,
             format_reward=format_reward,
             negative_reward=negative_reward,
             partial_end_reward=partial_end_reward,
