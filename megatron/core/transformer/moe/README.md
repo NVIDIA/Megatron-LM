@@ -1,7 +1,6 @@
 # Megatron Core MoE
 
-TODO: add a summary of the latest features and architectures.
-Megatron-Core MoE provides comprehensive parallelism strategies for Mixture-of-Experts models, seamlessly integrating Expert Parallelism with tensor, data, sequence, and pipeline parallelism.
+Megatron Core MoE is a production-ready framework for training large-scale Mixture-of-Experts models, providing the foundational architecture, performance optimizations, and best practices that guide MoE framework development across the industry.
 
 ## What's New
 For latest features and architectures, please refer to the [MCore dev roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729).
@@ -222,26 +221,54 @@ For very large MoE models like DeepSeek-V3, the EP communication may exceed the 
 | **Key factor** | CP efficiency depends on overlapping communication with computation |
 | **Config** | Set `--context-parallel-size` to partition sequences across GPUs |
 
-### Step 3: Enable Performance Features based on your profiling bottlenecks
-* Bottlenecked on Memory
-- 如果显存压力特别大，导致不得不开full recompute或者开特别大的并行维度，可以尝试使用overhead更小的memory优化方案，比如
-    - selective recompute, 
-    - activation offloading, 
-    - optimizer offloading等，请查看对应的文档。
-* Bottlenecked on Communication Optimization
-- 如果发现通信成为瓶颈，可以分析通信的瓶颈在哪里，然后尝试启用对应的
-    - DP communication overlap, before 
-    - TP communication
-    - EP communication
-    - PP communication overlap
-* Bottlenecked on CPU Overhead
-    - 如果发现在timeline中，GPU kernel的launch在等待CPU导致bubble特别多，说明CPU overhead比较大
-        * Disable GC
-        * 开启partial cuda graph
-        * 尝试减小TP并行或者增大micro batch size
-* slow compuation 
-    * 确保下列的fusion已开启: --moe-router-fusion, --moe-grouped-gemm, --moe-permute-fusion
-    * 尝试使用更低精度的计算来加速，比如FP8
+### Step 3: Enable Performance Features Based on Profiling Bottlenecks
+
+After establishing a working parallel configuration, profile your training to identify bottlenecks and apply targeted optimizations.
+
+#### Memory Bottleneck
+
+**Symptom**: Forced to use full recomputation or excessively large parallelism degrees to avoid OOM.
+
+**Solutions**:
+| Optimization | Overhead | Config | Reference |
+|--------------|----------|--------|---------|
+| Selective Recomputation | Low | `--recompute-granularity selective --recompute-modules ...` | [Fine-grained Recomputation](#fine-grained-recomputation) |
+| Activation Offloading | Medium | `--fine-grained-activation-offloading --offload-modules ...` | [Fine-grained Activation Offloading](#fine-grained-activation-offloading) |
+| Optimizer Offloading | Medium | `--optimizer-cpu-offload` | --- |
+
+#### Communication Bottleneck
+
+**Symptom**: Profiling shows significant time spent in collective operations.
+
+**Solutions**: Identify which communication is the bottleneck and enable corresponding overlap:
+| Communication Type | Overlap Config |
+|--------------------|----------------|
+| DP gradient reduce | `--overlap-grad-reduce` |
+| DP param gather    | `--overlap-param-gather` |
+| TP communication   | `--tp-comm-overlap` |
+| EP All-to-All      | `--overlap-moe-expert-parallel-comm --delay-wgrad-compute` |
+| PP send/recv       | Enable VPP with `--num-layers-per-virtual-pipeline-stage` |
+
+#### CPU Overhead Bottleneck
+
+**Symptom**: Nsight Systems timeline shows gaps between GPU kernels where CPU cannot launch kernels fast enough.
+
+**Solutions**:
+| Optimization | Config |
+|--------------|--------|
+| Disable Python GC | `--manual-gc --manual-gc-interval 100` |
+| Enable CUDA Graphs | `--cuda-graph-impl transformer_engine --cuda-graph-scope attn moe_router moe_preprocess` |
+| Reduce kernel launches | Decrease TP size or increase micro-batch size |
+
+#### Computation Bottleneck
+
+**Symptom**: GPU utilization is low despite no communication or CPU bottlenecks.
+
+**Solutions**:
+| Optimization | Config |
+|--------------|--------|
+| Enable kernel fusions | `--moe-router-fusion --moe-grouped-gemm --moe-permute-fusion` |
+| Use FP8 precision | `--fp8-format e4m3 --fp8-recipe blockwise` |
 
 
 ## Feature Documentation
@@ -334,8 +361,9 @@ Memory optimization is critical for large-scale MoE training, as MoE models main
 | **Fine-grained Recomputation** | Selectively recomputes specific modules (e.g., `mla_up_proj`, `layernorm`, `moe_act`) instead of full layers | `--recompute-granularity selective --recompute-modules mla_up_proj layernorm moe_act` |
 | **Fine-grained Activation Offloading** | Offloads activations to CPU memory, overlapping D2H/H2D transfers with computation | See `docs/source/api-guide/fine_grained_activation_offloading.md` |
 | **Precision-aware Optimizer** | Stores optimizer states (exp_avg, exp_avg_sq) in BF16 instead of FP32, reducing optimizer memory by 50% | `--use-precision-aware-optimizer --exp-avg-dtype bf16 --exp-avg-sq-dtype bf16` |
+| **Optimizer Offloading** | Offloads optimizer states to CPU memory. | `--optimizer-cpu-offload` |
 
-#### Checkpointing / Recomputation
+#### Fine-grained Recomputation
 A new output-discarding checkpointing method is also supported. This method discards the output memory of certain submodules during the forward pass and recomputes them during the backward pass, which can save memory compared to standard checkpointing. This can be enabled for specific submodules using the `--recompute-granularity selective --recompute-modules [submodule1, submodule2, ...]` argument. The supported submodules are:
 
 * `moe_act`: Recompute the GroupedMLP activation function.
@@ -346,18 +374,21 @@ A new output-discarding checkpointing method is also supported. This method disc
 * `moe`: Recompute the MoE layer submodule (uses standard checkpointing rather than output-discarding).
 
 #### Fine-grained Activation Offloading
-Offload the input activation at the granularity of modules
+
+Unlike recomputation (which trades compute for memory), offloading trades **GPU-CPU bandwidth for memory**: activations are transferred to CPU during forward pass and retrieved during backward pass. The key is hiding transfer latency behind computation using asynchronous D2H/H2D transfers.
+
+**Key Features:**
+- **Module-level granularity**: Target specific modules rather than entire layers
+- **Computation-offloading overlap**: Asynchronous transfers via independent CUDA streams
+- **Compatible with PP/VPP**: Works with pipeline parallelism and fine-grained recomputation
 
 **Usage**
 ```bash
-# Enable fine-grained activation offloading
 --fine-grained-activation-offloading
-
-# Specify which modules are going to offload its input
-# Choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
---offload-modules expert_fc1
+--offload-modules expert_fc1 moe_act # Choices: attn_norm, core_attn, attn_proj, mlp_norm, expert_fc1, moe_act
 ```
-For more details, please refer to the ```docs/source/api-guide/fine_grained_activation_offloading.md```
+
+For more details, see `docs/source/api-guide/fine_grained_activation_offloading.md`
 
 ### Communication Optimization
 
@@ -446,8 +477,9 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 |----------|-------------|---------|
 | --num-experts | Number of Experts in MoE | None |
 | --expert-model-parallel-size | Degree of expert model parallelism | 1 |
-| --moe-ffn-hidden-size | MoE FFN hidden size | None |
-| --expert-tensor-parallel-size | Expert layer tensor parallelism | Same as TP |
+| --moe-ffn-hidden-size | MoE FFN hidden size | FFN hidden size of the dense model |
+| --expert-tensor-parallel-size | Expert layer tensor parallelism | Same as TP(Recommeded to set to 1 for fine-grained MoE models) |
+| --moe-layer-freq | MoE layer frequency pattern | 1 |
 
 ### Router Arguments
 | Argument | Description | Default |
@@ -500,7 +532,6 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 ### Miscellaneous
 | Argument | Description | Default |
 |----------|-------------|---------|
-| --moe-layer-freq | MoE layer frequency pattern | 1 |
 | --moe-per-layer-logging | Per-layer logging | False |
 | --moe-router-force-load-balancing | Force load balancing (experimental) | False |
 
