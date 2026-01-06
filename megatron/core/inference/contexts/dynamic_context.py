@@ -214,10 +214,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             if `unified_memory_level` >= 1, then CPU memory is additionally
             utilized, resulting in a total buffer size of `buffer_size_gb +
             paused_buffer_size_gb`.
-        paused_buffer_size_gb (float): Portion of buffer reserved for paused
-            requests. Active requests are paused when there are not enough active
-            blocks available to continue generating a request. The total buffer
-            size (active + paused) depends on `unified_memory_level` (uvm):
+        paused_buffer_size_gb (float | None): Portion of buffer reserved for
+            paused requests. Active requests are paused when there are not enough
+            active blocks available to continue generating a request. The total
+            buffer size (active + paused) depends on `unified_memory_level` (uvm):
             - uvm 0: buffer_size_gb (paused buffer is inclusive)
             - uvm 1: buffer_size_gb + paused_buffer_size_gb
         max_requests (int): Max number of active requests to use for
@@ -264,7 +264,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_attention_heads: int,
         max_sequence_length: int,
         buffer_size_gb: float,
-        paused_buffer_size_gb: float,
+        paused_buffer_size_gb: float | None = None,
         max_requests: int = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         block_size_tokens: int = 256,
