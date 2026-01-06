@@ -407,12 +407,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                             "recompute.",
                         )
                         return False
-                    if (
-                        CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope
-                        and self.config.moe_token_dispatcher_type == "alltoall"
+                    if CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope and (
+                        self.config.moe_token_dispatcher_type == "alltoall"
+                        or self.config.moe_latent_size
                     ):
                         # Only when capturing the preprocess part and using alltoall token
-                        # dispatcher can we make the pre-mlp layernorm recomputation.
+                        # dispatcher or latent MoE can we make the pre-mlp layernorm recomputation.
                         # Because in other cases the layernorm output returns directly as one of the
                         # outputs of the cudagraph, which will be allocated a static buffer, thus
                         # not able to be released.
@@ -421,8 +421,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                         logger,
                         logging.WARNING,
                         "pre_mlp_layernorm recompute is only supported with moe router + "
-                        "preprocess cudagraph will alltoall token dispatcher. Disabling "
-                        "pre_mlp_layernorm recompute.",
+                        "preprocess cudagraph will alltoall token dispatcher or latent MoE. "
+                        "Disabling pre_mlp_layernorm recompute.",
                     )
                     return False
 
