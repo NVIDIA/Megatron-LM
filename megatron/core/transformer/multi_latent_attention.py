@@ -243,13 +243,20 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        query, key, value = self.get_query_key_value_tensors(
-            hidden_states,
-            key_value_states,
-            position_ids,
-            packed_seq_params,
-            inference_context=inference_context,
-        )
+        if self.offload_qkv_linear:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="qkv_linear")
+        with get_fine_grained_offloading_context(self.offload_qkv_linear):
+            query, key, value = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                position_ids,
+                packed_seq_params,
+                inference_context=inference_context,
+            )
+        if self.offload_qkv_linear:
+            (query, key, value) = fine_grained_offloading_group_commit(
+                query, key, value, name="qkv_linear", forced_released_tensors=[hidden_states]
+            )
 
         # ===================================================
         # Adjust key, value for inference

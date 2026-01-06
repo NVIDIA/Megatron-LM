@@ -1236,7 +1236,10 @@ def validate_args(args, defaults={}):
 
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
-        if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
+        if (
+            "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
+            and not args.te_rng_tracker
+        ):
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
         assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
@@ -2357,7 +2360,7 @@ def _add_training_args(parser):
                        help='Enable fine-grained activation offloading.')
     group.add_argument('--offload-modules', nargs='*', type=str, default=[],
                        help='The submodules to offload its input. Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
-    group.add_argument('--min-offloaded-tensor-size', type=int, default=1024*1024,
+    group.add_argument('--min-offloaded-tensor-size', type=int, default=10*1024*1024,
                        help='The minimum size of the tensor to be offloaded.')
     return parser
 
