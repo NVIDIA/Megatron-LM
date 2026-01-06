@@ -34,7 +34,6 @@ from torch import _C
 from torch.cuda import _lazy_call, _lazy_init
 from torch.cuda import device as device_ctx_manager
 from torch.distributed import DeviceMesh, ProcessGroup
-from torch.distributed.device_mesh import _mesh_resources
 
 logger = logging.getLogger(__name__)
 
@@ -150,27 +149,50 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
     return HAVE_TE_FP8_TENSOR_CLASS and isinstance(tensor, FP8_TENSOR_CLASS)
 
 
-def get_mesh_names(device_mesh: Optional[DeviceMesh] = None) -> list[str]:
+def get_mesh_names(
+    device_mesh: Optional[DeviceMesh] = None, only_submesh_dims: bool = False
+) -> list[str]:
     """
-    Get all the sub-mesh names in the DeviceMesh.
+    Get all the sub-mesh ("dp", "cp", etc.) and flattened-mesh ("dp_cp", etc.) names
+    in the DeviceMesh. When only_submesh_dims=True, only checks for sub-mesh dimensions.
     """
     if device_mesh is None:
         # Device mesh does not exist.
         return []
-    # Order of the returned list of mesh dimension names must match the order / index
-    # of the root mesh dimension names followed by children / flattened sub-meshes:
-    # [<root mesh dimension names>, <child mesh dimension names>]
-    mesh_dim_names = (
+
+    # Sub-mesh dimension names.
+    submesh_dim_names = (
         list(device_mesh.mesh_dim_names) if device_mesh.mesh_dim_names is not None else []
     )
-    submesh_dim_names = [
-        submesh_dim_name
-        for child_mesh, root_mesh in _mesh_resources.child_to_root_mapping.items()
-        for submesh_dim_name in (child_mesh.mesh_dim_names or [])
-        # Add flattened or other unaccounted for children of the root mesh.
-        if root_mesh == device_mesh and submesh_dim_name not in mesh_dim_names
-    ]
-    return mesh_dim_names + submesh_dim_names
+
+    # Flattened mesh dimension names.
+    try:
+        # Retrieve all flattened meshes associated with DeviceMesh.
+        # The flattened DeviceMesh are all located in the _flatten_mapping
+        # dictionary of the root DeviceMesh.
+        flatten_mesh_names = [
+            flat_dim
+            for flat_dim, flat_mesh in device_mesh._get_root_mesh()._flatten_mapping.items()
+        ]
+    except AttributeError:
+        # Fallback to the DeviceMesh global state to retrieve flattened
+        # meshes associated with the DeviceMesh.
+        from torch.distributed.device_mesh import _mesh_resources
+
+        flatten_mesh_names = [
+            child_mesh_dim_name
+            for child_mesh, root_mesh in _mesh_resources.child_to_root_mapping.items()
+            for child_mesh_dim_name in (child_mesh.mesh_dim_names or [])
+            if root_mesh == device_mesh and child_mesh_dim_name not in submesh_dim_names
+        ]
+
+    # Order of the returned list of mesh dimension names must match the index
+    # of the root mesh dimension names followed by flattened sub-meshes:
+    # [<root mesh dimension names>, <flattened mesh dimension names>]
+    if only_submesh_dims:
+        return submesh_dim_names
+    else:
+        return submesh_dim_names + flatten_mesh_names
 
 
 def contains_submesh(
@@ -733,16 +755,14 @@ class FSDPDistributedIndex:
         )
 
         """
-        Store a persistent reference to the core device meshes that back Megatron-FSDP.
-        This is necessary because _MeshEnv (_mesh_resources) may not persist:
-            - _mesh_resources.child_to_root_mapping
-            - _mesh_resources.root_to_flatten_mapping
-            - _mesh_resources.flatten_name_to_root_dims
-            - ...
-        during Torch Autograd, so child and flattened sub-meshes may be cleared.
-        For example, this breaks Megatron-FSDP when self.dp_shard_dim is the flattened
-        sub-mesh of the DP and CP root mesh dimensions.
-        FIXME(@cspades): Identify the root cause of this behavior.
+        Megatron-FSDP is responsible for storing all required DeviceMesh
+        as per best practices recommended by the DeviceMesh API.
+
+        NOTE(@cspades): In PyTorch 2.11, retrieving flattened mesh dimensions
+        will be impossible via the device_mesh[...] API. We will require all
+        users to correctly _unflatten() their DeviceMesh such that all
+        dimensions used by Megatron-FSDP are sub-meshes of the DeviceMesh.
+        contains_submesh(...) -> get_mesh_names(only_submesh_dims=True).
         """
         self.mesh_library = {}
 
@@ -864,6 +884,9 @@ class FSDPDistributedIndex:
 
     def get_root_mesh(self, is_expert_parallel: bool = False) -> DeviceMesh:
         """Get the device mesh."""
+        # NOTE(@cspades): This is FSDPDistributedIndex's root mesh, NOT the actual
+        # root mesh that the DeviceMesh or expert DeviceMesh was un-flattened from.
+        # To get the root mesh, use: DeviceMesh._get_root_mesh().
         if is_expert_parallel:
             return self.expt_device_mesh
         return self.device_mesh

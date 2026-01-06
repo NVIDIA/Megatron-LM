@@ -28,7 +28,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
-    from megatron.core.extensions.transformer_engine import te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 
     HAVE_TE = True
 except ImportError:
@@ -125,9 +125,37 @@ class MoELayer(BaseMoELayer):
             and "shared_experts" in config.recompute_modules
         )
 
-        # Initialize router
-        self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
         self.tp_group = pg_collection.tp
+
+        # Initialize router.
+        self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+
+        # Initialize latent projections.
+        if self.config.moe_latent_size:
+            assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
+            self.fc1_latent_proj = TELinear(
+                self.config.hidden_size,
+                self.config.moe_latent_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
+            self.fc2_latent_proj = TELinear(
+                self.config.moe_latent_size,
+                self.config.hidden_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
+
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
@@ -197,6 +225,12 @@ class MoELayer(BaseMoELayer):
         dispatcher. The original hidden states are returned as a residual connection.
         """
         residual = hidden_states
+        # Project the hidden_states from hidden dimension down to latent dimenion.
+        if self.config.moe_latent_size:
+            assert (
+                not self.shared_expert_overlap
+            ), "Shared expert overlap not supported when MoE latent projections are used."
+            hidden_states, _ = self.fc1_latent_proj(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
@@ -266,6 +300,10 @@ class MoELayer(BaseMoELayer):
         """
         output = self.token_dispatcher.token_combine(output)
         output = self.token_dispatcher.combine_postprocess(output)
+        # Project the output back from latent dimension to hidden dimension after combine
+        # in latent dimension.
+        if self.config.moe_latent_size:
+            output, _ = self.fc2_latent_proj(output)
         if shared_expert_output is not None:
             output = output + shared_expert_output
         return output
@@ -307,7 +345,9 @@ class MoELayer(BaseMoELayer):
 
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
+            assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
             output = self.combine(output, shared_expert_output)
+
             return output, mlp_bias
 
         if self.moe_layer_recompute:
