@@ -7,10 +7,8 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.initialize import _set_random_seed
