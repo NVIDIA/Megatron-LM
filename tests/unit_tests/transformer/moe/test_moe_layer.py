@@ -6,7 +6,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
-    get_gpt_layer_local_spec,
+    get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -73,13 +73,10 @@ class TestMoELayerInit:
             moe_grouped_gemm=grouped_gemm,
             add_bias_linear=False,
         )
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        transformer_layer_submodules = get_gpt_layer_local_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
         )
-        moe_layer = MoELayer(
-            self.transformer_config,
-            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
-        )
+        moe_layer = MoELayer(self.transformer_config, transformer_layer_submodules.mlp.submodules)
         Utils.destroy_model_parallel()
 
     @pytest.mark.skip(
@@ -235,14 +232,11 @@ class TestMoELayerFP16:
             params_dtype=torch.float16,
         )
 
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        submodules = get_gpt_layer_local_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
 
-        moe_layer = MoELayer(
-            transformer_config,
-            cast(TransformerLayerSubmodules, transformer_layer_spec.submodules).mlp.submodules,
-        ).cuda()
+        moe_layer = MoELayer(transformer_config, submodules.mlp.submodules).cuda()
 
         hidden_states = torch.randn(
             sequence_length,
