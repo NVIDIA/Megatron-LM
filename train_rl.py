@@ -12,19 +12,24 @@ from mamba_builders import mamba_builder
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
-    create_packed_seq_params_for_bin,
     get_logprobs,
     get_rl_runtime_state,
+    load_packed_data_by_index,
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
 
 stimer = StragglerDetector()
+
+import logging
+
+logging.basicConfig(level=logging.INFO, force=True)
 
 
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
@@ -189,7 +194,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         data_iterator : Input data iterator
         model (GPTModel): The GPT Model
     """
-
+    runtime_state = get_rl_runtime_state()
     args = get_args()
     timers = get_timers()
 
@@ -199,70 +204,24 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         batch_data = next(data_iterator)
     timers('batch-generator').stop()
 
-    seq_starts = None
-    seq_lengths = None
-    attention_mask = None
-    packed_seq_params = None
-    packed_seq_len = 0
-
     if args.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
-        bin_idx = bin_tensor.item()
 
-        # Get packing context (should always be available in packed mode)
-        runtime_state = get_rl_runtime_state()
-        packing_context = runtime_state.packing_context
+        (
+            tokens,
+            advantages,
+            old_logprobs,
+            loss_mask,
+            position_ids,
+            ref_logprobs,
+            inference_logprobs,
+            seq_starts,
+            seq_lengths,
+            seq_indices,
+            packed_seq_params,
+        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, args.rl_inference_logprobs_is_correction)
 
-        idx = slice(bin_idx, bin_idx + 1)
-        # Extract packed data for this bin (already on GPU)
-        tokens = packing_context['packed_trajs'][idx]
-        position_ids = packing_context['packed_position_ids'][idx]
-        attention_mask = (
-            packing_context['packed_attention_mask'][idx]
-            if packing_context['packed_attention_mask'] is not None
-            else None
-        )
-        old_logprobs = packing_context['old_logprobs'][idx]
-        ref_logprobs = packing_context['ref_logprobs'][idx]
-        loss_mask = packing_context['packed_loss_mask'][idx, 1:]
-
-        # Get sequence-level data for this bin
-        packing_info = packing_context['packing_info']
-        seq_starts = packing_info['seq_starts'][bin_idx]
-        seq_indices = packing_info['bin_seq_indices'][bin_idx]
-
-        # Handle empty bins (used for padding to ensure all ranks have same iterations)
-        if not seq_indices:
-            seq_lengths = []
-            advantages = torch.tensor([], device='cuda')
-        else:
-            seq_lengths = [packing_info['seq_lengths'][idx] for idx in seq_indices]
-            advantages = packing_context['bin_advantages'][bin_idx]
-
-        # Extract packed inference_logprobs if available
-        if (
-            'packed_inference_logprobs' in packing_context
-            and args.rl_inference_logprobs_is_correction
-        ):
-            inference_logprobs = packing_context['packed_inference_logprobs'][idx]
-        else:
-            inference_logprobs = None
-
-        # Get cached PackedSeqParams for proper attention masking in Transformer Engine
-        # These were pre-computed in prepare_data_for_update to avoid repeated tensor allocations
-        if 'cached_packed_seq_params' in packing_context:
-            packed_seq_params, packed_seq_len = packing_context['cached_packed_seq_params'][bin_idx]
-        else:
-            packed_seq_params = create_packed_seq_params_for_bin(
-                packing_info=packing_info,
-                bin_idx=bin_idx,
-                bin_size=args.rl_sequence_packing_bin_size,
-                device=tokens.device,
-            )
-            packed_seq_len = packed_seq_params.cu_seqlens_q[-1].item() if packed_seq_params is not None else 0
-
-        runtime_state = get_rl_runtime_state()
         runtime_state.increment_sequences(len(seq_indices))
     else:
         # Extract unpacked data
@@ -276,6 +235,10 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             inference_logprobs,
         ) = batch_data
 
+        seq_starts = None
+        seq_lengths = None
+        packed_seq_params = None
+
         # Move to CUDA
         tokens = tokens.cuda()
         position_ids = position_ids.cuda()
@@ -287,7 +250,6 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
         )
 
-        runtime_state = get_rl_runtime_state()
         runtime_state.increment_sequences(tokens.shape[0])
 
     # Common logic for both paths
@@ -305,32 +267,42 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
-        current_logprobs = get_logprobs(
-            model_to_use, tokens, position_ids, attention_mask, no_grad=False,
-            packed_seq_params=packed_seq_params,
-            packed_seq_len=packed_seq_len
+        logprobs_or_hidden_states = get_logprobs(
+            model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
         )
 
-        # Calculate loss using unified function
-        loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
-            calculate_grpo_loss(
-                current_logprobs=current_logprobs,
-                old_logprobs=old_logprobs,
-                ref_logprobs=ref_logprobs,
-                advantages=advantages,
-                clamp_eps_lower=args.grpo_clamp_eps_lower,
-                clamp_eps_upper=args.grpo_clamp_eps_upper,
-                kl_beta=args.grpo_kl_beta,
-                entropy_weight=args.grpo_entropy_term_weight,
-                inference_logprobs=inference_logprobs,
-                is_truncation_coef=args.rl_importance_sampling_truncation_coef,
-                seq_starts=seq_starts,
-                seq_lengths=seq_lengths,
+        if not is_pipeline_last_stage():
+            output_tensor = logprobs_or_hidden_states
+            kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+                None,
+                None,
+                None,
+                None,
+                None,
             )
-        )
+        else:
+            # Calculate loss using unified function
+            current_logprobs = logprobs_or_hidden_states
+            loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+                calculate_grpo_loss(
+                    current_logprobs=current_logprobs,
+                    old_logprobs=old_logprobs,
+                    ref_logprobs=ref_logprobs,
+                    advantages=advantages,
+                    clamp_eps_lower=args.grpo_clamp_eps_lower,
+                    clamp_eps_upper=args.grpo_clamp_eps_upper,
+                    kl_beta=args.grpo_kl_beta,
+                    entropy_weight=args.grpo_entropy_term_weight,
+                    inference_logprobs=inference_logprobs,
+                    is_truncation_coef=args.rl_importance_sampling_truncation_coef,
+                    seq_starts=seq_starts,
+                    seq_lengths=seq_lengths,
+                )
+            )
+            output_tensor = loss
 
     # loss_mask will not be applied to 0th token as we do not have a logprob for it.
-    return loss, partial(
+    return output_tensor, partial(
         loss_func,
         loss_mask,
         kl_term,
@@ -392,7 +364,9 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    def _model_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+    def _model_builder(
+        args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
+    ):
         if getattr(args, "is_hybrid_model", False):
             return mamba_builder(
                 args,
@@ -417,5 +391,5 @@ if __name__ == "__main__":
         partial(model_provider, _model_builder),
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={}, 
+        args_defaults={},
     )
