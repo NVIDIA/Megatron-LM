@@ -3,6 +3,7 @@
 import gc
 import inspect
 import logging
+import math
 import os
 import time
 from collections import defaultdict
@@ -1422,6 +1423,9 @@ class TECudaGraphHelper:
         self.optimizers = optimizers
         self.num_model_chunks = len(model)
 
+        # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
+        self.num_microbatches = None
+
         # Get callables with captureable layers.
         self.chunks_with_decoder = []
         self.num_layers_per_chunk = []
@@ -1557,12 +1561,12 @@ class TECudaGraphHelper:
             order
         ), "num_model_chunks must match the max chunk id in order."
         assert (
-            get_num_microbatches() == len(order) // self.num_model_chunks // 2
+            self.num_microbatches == len(order) // self.num_model_chunks // 2
         ), "num_microbatches must match the number of microbatches in order."
 
         # Generate sample arguments and keyword arguments for capturing.
-        sample_args = [None] * (len(self.flattened_callables) * get_num_microbatches())
-        sample_kwargs = [None] * (len(self.flattened_callables) * get_num_microbatches())
+        sample_args = [None] * (len(self.flattened_callables) * self.num_microbatches)
+        sample_kwargs = [None] * (len(self.flattened_callables) * self.num_microbatches)
 
         rotary_pos_emb_cache = {}
 
@@ -1648,7 +1652,7 @@ class TECudaGraphHelper:
                 if model_chunk_idx not in fwd_sample_queues:
                     fwd_sample_queues[model_chunk_idx] = []
 
-                sample_start_idx = (prefix_num_layers[model_chunk_idx] * get_num_microbatches()) + (
+                sample_start_idx = (prefix_num_layers[model_chunk_idx] * self.num_microbatches) + (
                     fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
                 )
                 for layer_idx, layer in enumerate(self.callables_per_chunk[model_chunk_idx]):
@@ -1746,14 +1750,23 @@ class TECudaGraphHelper:
             get_schedule_table,
         )
 
+        # If PP is not enabled, we only need to capture one microbatch.
+        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
+            assert (
+                self.num_model_chunks == 1
+            ), "If PP is not enabled, there should be only one model chunk."
+            self.num_microbatches = 1
+        else:
+            self.num_microbatches = get_num_microbatches()
+
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
-            get_num_microbatches(),
+            self.num_microbatches,
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
             False,
         )
         schedule_table = get_schedule_table(
-            get_num_microbatches(),
+            self.num_microbatches,
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
         )
@@ -1773,11 +1786,24 @@ class TECudaGraphHelper:
 
         def get_make_graphed_callables_kwargs():
             kwargs = {
-                'num_warmup_iters': 11,
                 'allow_unused_input': True,
                 '_order': order,
                 'retain_graph_in_backward': self.config.cuda_graph_retain_backward_graph,
             }
+
+            # Calculate the number of warmup iterations per layer per microbatch inside TE
+            # make_graphed_callables(). There are two rules:
+            # 1. There should be at least 1 warmup iteration per layer per microbatch inside TE
+            # make_graphed_callables().
+            # 2. There should be at least 10 warmup iterations per layer, counting the MCore warmup
+            # steps before going into this capture routine.
+            kwargs['num_warmup_iters'] = max(
+                1,
+                math.ceil(
+                    (10 - self.config.cuda_graph_warmup_steps * get_num_microbatches())
+                    / self.num_microbatches
+                ),
+            )
 
             if is_te_min_version("2.6.0"):
                 # Starting from TE 2.6.0, make_graphed_callables() accepts different number
@@ -1840,6 +1866,8 @@ class TECudaGraphHelper:
         torch.distributed.barrier()
         gc.collect()
         torch.cuda.empty_cache()
+        if FREEZE_GC:
+            gc.freeze()
 
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
@@ -1867,6 +1895,9 @@ class TECudaGraphHelper:
             optimizer.zero_grad()
         clear_aux_losses_tracker()
         reset_model_temporary_tensors(self.config, self.model)
+
+        if FREEZE_GC:
+            gc.unfreeze()
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1887,10 +1918,10 @@ class TECudaGraphHelper:
         for layers in self.callables_per_chunk:
             for layer_number, layer in enumerate(layers):
                 layer.cuda_graphs = []
-                for batch_number in range(get_num_microbatches()):
+                for batch_number in range(self.num_microbatches):
                     layer.cuda_graphs.append(
                         graphs[
-                            num_layers_accumulated * get_num_microbatches()
+                            num_layers_accumulated * self.num_microbatches
                             + batch_number * len(layers)
                             + layer_number
                         ]

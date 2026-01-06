@@ -631,7 +631,10 @@ class TestTECudaGraphHelper:
 
         # Basic checks
         num_graphable_layers = len(cuda_graph_helper.flattened_callables)
-        expected_length = num_graphable_layers * num_microbatches
+        if pp_size > 1:
+            expected_length = num_graphable_layers * num_microbatches
+        else:
+            expected_length = num_graphable_layers
         assert len(sample_args) == expected_length, (
             f"sample_args length mismatch: expected {expected_length}, " f"got {len(sample_args)}"
         )
@@ -750,7 +753,8 @@ class TestTECudaGraphHelper:
             )
 
             # We tested with a large number of microbatches, so we should see some buffer reuse.
-            assert max_reuse > 1, "Expected some buffer reuse"
+            if pp_size > 1:
+                assert max_reuse > 1, "Expected some buffer reuse"
 
         # Verify that make_graphed_callables_kwargs contains expected keys
         assert (
@@ -766,17 +770,21 @@ class TestTECudaGraphHelper:
         # Verify the order in kwargs matches expectations
         order = make_graphed_callables_kwargs['_order']
         num_model_chunks = cuda_graph_helper.num_model_chunks
-        expected_order_length = num_microbatches * num_model_chunks * 2
+        forward_count = sum(1 for chunk_id in order if chunk_id > 0)
+        if pp_size > 1:
+            # Verify that all forward passes in order have corresponding entries in sample_args
+            assert forward_count == num_microbatches * num_model_chunks, (
+                f"Forward count mismatch: expected {num_microbatches * num_model_chunks}, "
+                f"got {forward_count}"
+            )
+            expected_order_length = num_microbatches * num_model_chunks * 2
+        else:
+            assert num_model_chunks == 1, "Expected only one model chunk for pp_size == 1"
+            assert forward_count == 1, "Expected only one forward pass for pp_size == 1"
+            expected_order_length = 2
         assert (
             len(order) == expected_order_length
         ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
-
-        # Verify that all forward passes in order have corresponding entries in sample_args
-        forward_count = sum(1 for chunk_id in order if chunk_id > 0)
-        assert forward_count == num_microbatches * num_model_chunks, (
-            f"Forward count mismatch: expected {num_microbatches * num_model_chunks}, "
-            f"got {forward_count}"
-        )
 
 
 def is_deep_ep_available():
