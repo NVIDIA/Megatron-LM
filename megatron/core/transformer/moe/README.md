@@ -452,11 +452,9 @@ FP8 training provides benefits across all three performance walls:
 
 | Wall | FP8 Benefit | Impact |
 |------|-------------|--------|
-| **Memory** | 50% activation reduction | Stores linear layer inputs in FP8 instead of BF16 |
-| **Memory** | Eliminate BF16 weight copies | Native FP8 casts directly from FP32 to FP8 |
-| **Communication** | 50% EP dispatch volume | Dispatches tokens in FP8 instead of BF16 |
-| **Communication** | 50% parameter all-gather | With FP8 primary weights (except MXFP8) |
 | **Compute** | Faster Tensor Core GEMMs | FP8 ops on Hopper/Blackwell are faster than BF16 |
+| **Memory** | 50% activation reduction | Stores linear layer inputs in FP8 instead of BF16 |
+| **Communication** | 50% parameter all-gather | With FP8 primary weights (except MXFP8) |
 
 #### FP8 Recipes
 
