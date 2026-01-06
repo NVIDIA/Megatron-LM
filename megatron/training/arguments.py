@@ -3287,6 +3287,8 @@ def _add_moe_args(parser):
                        help='Overlap the EP A2A communication by batch-level overlapping in 1f1b stage.')
     group.add_argument('--delay-wgrad-compute', action='store_true',
                        help='Delay the wgrad compute for batch-level overlapping')
+    group.add_argument('--ep-overlap-early-attn-memory-release', action='store_true',
+                       help='Release the memory of the attention module early in EP overlap.')
 
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
