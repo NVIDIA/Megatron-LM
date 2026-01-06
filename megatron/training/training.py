@@ -75,7 +75,6 @@ from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyS
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
 
 from megatron.core.optimizer.qk_clip import clip_qk
 
@@ -640,11 +639,6 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
-    if args.batch_invariant_mode:
-        print_rank_0("Enabling batch invariant mode globally",flush=True)
-        enable_batch_invariant_mode()
-
-
     if args.log_progress:
         append_to_progress_log("Starting job")
 
@@ -1055,8 +1049,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
             kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['average_in_collective'] = args.ddp_average_in_collective
-            if args.use_megatron_fsdp and args.use_precision_aware_optimizer:
-                kwargs["preserve_fp32_weights"] = False
             ddp_config = DistributedDataParallelConfig(**kwargs)
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
