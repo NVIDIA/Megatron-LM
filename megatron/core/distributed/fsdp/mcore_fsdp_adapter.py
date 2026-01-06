@@ -232,6 +232,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 hybrid_fsdp_group = pg_collection.dp_cp
                 # This has not been tested yet.
                 expt_dp_group = getattr(pg_collection, 'intra_expt_dp', None)
+                hybrid_fsdp_expt_group = getattr(pg_collection, 'expt_dp', None)
                 ep_group = getattr(pg_collection, 'ep', None)
             else:
                 dp_cp_group = pg_collection.dp_cp
