@@ -798,9 +798,7 @@ def reduce_aux_losses_tracker_across_ranks(
             # does not have 'dp' attribute, do it manually.
             if not tracker[name].get('reduce_group_has_dp', False):
                 torch.distributed.all_reduce(
-                    values,
-                    group=dp_group,
-                    op=torch.distributed.ReduceOp.AVG,
+                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
                 )
         if tracker[name].get('avg_group') is not None:
             torch.distributed.all_reduce(
