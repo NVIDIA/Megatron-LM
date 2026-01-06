@@ -1355,10 +1355,15 @@ class DynamicInferenceEngine(AbstractEngine):
     # `megatron-core` 0.16, `step_modern()` will be renamed to `step()`.
     step = step_legacy
 
-    def generate(
-        self, prompts: List[str], sampling_params: Optional[SamplingParams] = SamplingParams()
+    async def async_generate(
+        self,
+        prompts: List[str],
+        sampling_params: Optional[SamplingParams] = SamplingParams(),
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> List[DynamicInferenceRequest]:
-        """Generates completions for a static list of prompts."""
+        """Async generates completions for a static list of prompts."""
+        self._loop = get_asyncio_loop(loop)
 
         for prompt in prompts:
             request_id = int(next(self.request_counter))
@@ -1366,13 +1371,32 @@ class DynamicInferenceEngine(AbstractEngine):
 
         finished_request_records_list = []
         while self.has_unfinished_requests():
-            result = self.step_modern()
+            result = await self.async_step()
             finished_request_records_list.extend(result["finished_request_records"])
 
         # Ensure requests are returned in the same order they were passed in.
         finished_request_records_list.sort(key=lambda r: r.request_id)
 
         return finished_request_records_list
+
+    def generate(
+        self, prompts: List[str], sampling_params: Optional[SamplingParams] = SamplingParams()
+    ) -> List[DynamicInferenceRequest]:
+        """Generates completions for a static list of prompts."""
+        # Check if we're inside an event loop.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(
+                "The `generate` method cannot be called from an async context. "
+                "Please call the `async_generate` method instead."
+            )
+
+        return self._loop.run_until_complete(
+            self.async_generate(prompts, sampling_params, loop=self._loop)
+        )
 
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.

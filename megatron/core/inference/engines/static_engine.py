@@ -338,6 +338,36 @@ class StaticInferenceEngine(AbstractEngine):
                 inference_requests=inference_requests,
             )
 
+    async def async_generate(
+        self,
+        prompts: Optional[List[str]] = None,
+        add_BOS: bool = False,
+        encoder_prompts: Optional[List[str]] = None,
+        common_inference_params: Optional[SamplingParams] = None,
+        sampling_params: Optional[SamplingParams] = None,
+        inference_requests: Optional[List[InferenceRequest]] = None,
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> List[InferenceRequest]:
+        """Asynchronous version of the generate function."""
+        loop = get_asyncio_loop(loop)
+
+        if not self.legacy:
+            return await self.dynamic_engine.async_generate(
+                prompts=prompts,
+                add_BOS=add_BOS,
+                encoder_prompts=encoder_prompts,
+                common_inference_params=common_inference_params,
+                sampling_params=sampling_params,
+                inference_requests=inference_requests,
+                loop=loop,
+            )
+        else:
+            raise RuntimeError(
+                "Asynchronous generation is not supported for the legacy static engine. "
+                "Please use non-legacy mode for asynchronous generation."
+            )
+
     def run_engine(self):
         """Main functionality to run inference
 
