@@ -924,7 +924,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Build model.
     def build_model():
-
         if (
             get_pg_size(pg_collection.pp) > 1
             and args.virtual_pipeline_model_parallel_size is not None
