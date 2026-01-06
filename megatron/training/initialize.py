@@ -71,12 +71,13 @@ def initialize_megatron(
         args.exit_on_missing_checkpoint = True
 
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
-        assert args.load is not None, "--use-checkpoint-args requires --load argument"
+        assert args.load is not None or args.pretrained_checkpoint is not None, "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
         assert args.non_persistent_ckpt_type != "local", (
             "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
             "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
             "before initializing LocalCheckpointManager."
         )
+        load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
         load_args_from_checkpoint(args)
 
     if args.async_save and args.use_persistent_ckpt_worker:
@@ -346,6 +347,12 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
+        if args.fake_process_group:
+            assert is_torch_min_version("2.3.0"), "Fake process group is only supported with PyTorch 2.3.0 and above."
+            from torch.testing._internal.distributed.fake_pg import FakeStore
+            store = FakeStore()
+            init_process_group_kwargs['backend'] = 'fake'
+            init_process_group_kwargs['store'] = store
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)

@@ -80,10 +80,21 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                 continue
             assert is_not_tp_duplicate
             if not getattr(param, 'allreduce', True):
-                # TODO: Implement memory optimization for MoE parameters.
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
-                moe_params_data.append(param.data.float() if args.bf16 else param.data)
+                if args.bf16:
+                    if not force_create_fp32_copy and hasattr(param, 'main_param'):
+                        if getattr(param, 'main_param_sharded', False):
+                            if param.main_param is not None:
+                                sharded_params_data.append(param.main_param)
+                        else:
+                            moe_params_data.append(param.main_param)
+                    else:
+                        # Fallback to original logic of making a fp32 copy of the
+                        # parameter if `.main_param` attribute is not available.
+                        moe_params_data.append(param.data.float())
+                else:
+                    moe_params_data.append(param.data)
             else:
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
@@ -410,7 +421,7 @@ def is_last_rank():
 
 def print_rank_last(message):
     """If distributed is initialized, print only on last rank."""
-    if torch.distributed.is_initialized():
+    if torch.distributed.is_initialized() and torch.distributed.get_backend() != 'fake':
         if is_last_rank():
             print(message, flush=True)
     else:

@@ -7,6 +7,7 @@ import math
 import os
 import pickle
 import sys
+import warnings
 import torch
 from argparse import ArgumentParser
 from collections import defaultdict
@@ -55,20 +56,7 @@ from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 
 from megatron.core.utils import configure_nvtx_profiling
-
-import json
-
-from examples.inference.gpt.utils import (
-    Request,
-    add_common_inference_args,
-    build_dynamic_engine_setup_prefix,
-    build_requests,
-    get_curr_time,
-)
-from megatron.training.checkpointing import load_checkpoint
-
-from model_provider import model_provider
-from gpt_builders import gpt_builder
+import logging
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -167,7 +155,7 @@ def get_inference_context(
         max_sequence_length = args.inference_max_seq_length
 
     metrics_writer = None
-    if args.inference_wandb_logging_step_interval > 0:
+    if args.inference_logging_step_interval > 0 and args.inference_wandb_logging:
         metrics_writer = get_wandb_writer()
 
     # Inference context.
@@ -186,8 +174,10 @@ def get_inference_context(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
@@ -196,6 +186,8 @@ def get_inference_context(
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
+        cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
     )
 
@@ -278,7 +270,7 @@ def run_inference(
     total_output_tokens = 0
     attempted_step_count = 0
     if args.cuda_graph_impl == "local":
-        cuda_graph_request_count_map = {r:0 for r in engine.context.cuda_graph_request_counts}
+        cuda_graph_request_count_map = {}
     else:
         cuda_graph_request_count_map = None
 
@@ -320,7 +312,7 @@ def run_inference(
         # Step inference engine (i.e., generate a token for each active request).
         # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
         try:
-            result = engine.step_modern(verbose=True)
+            result = engine.step_modern()
         except EngineSuspendedError as e:
             result = e
             pass # ignore error in order to call 'engine.resume()' below.
@@ -354,7 +346,7 @@ def run_inference(
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
         if args.cuda_graph_impl == "local" and cuda_graph_request_count is not None:
-            cuda_graph_request_count_map[cuda_graph_request_count] += 1
+            cuda_graph_request_count_map[cuda_graph_request_count] = cuda_graph_request_count_map.get(cuda_graph_request_count, 0) + 1
 
         # Update requests.
         active_request_ids = result["active_request_ids"]
@@ -370,7 +362,7 @@ def run_inference(
             output_start = get_curr_time()
             for finished_request_record in finished_request_records:
 
-                finished_request = finished_request_record.merge(engine.controller.tokenizer)
+                finished_request = finished_request_record.merge()
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
@@ -379,7 +371,7 @@ def run_inference(
                 request.request_id = finished_request.request_id
 
                 # Update prompt, in case engine has been suspended and resumed.
-                request.prompt_tokens = finished_request.prompt_tokens
+                request.prompt_tokens = finished_request.prompt_tokens.tolist()
                 request.prompt_text = finished_request.prompt
 
                 # Get output tokens and text.
@@ -389,15 +381,27 @@ def run_inference(
 
                 # Log probs.
                 if finished_request.sampling_params.return_log_probs:
-                    request.log_probs = (
+                    if not finished_request.prompt_log_probs:
+                        finished_request.prompt_log_probs = []
+                    request.prompt_log_probs = finished_request.prompt_log_probs
+                    request.generated_log_probs = finished_request.generated_log_probs
+                    request.logprobs = (
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
+                if finished_request.sampling_params.top_n_logprobs > 0:
+                    request.generated_top_n_logprobs = finished_request.generated_top_n_logprobs
+                if not finished_request.sampling_params.skip_prompt_log_probs:
+                    request.prompt_top_n_logprobs = finished_request.prompt_top_n_logprobs
                 num_requests_finished += 1
             output_times.append(get_curr_time() - output_start)
 
         # Check if all requests are finished.
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
+
+    # Resume engine (NOOP if not suspended).
+    if engine.is_suspended:
+        engine.resume()
 
     return {
         "step_times" : step_times,
@@ -421,6 +425,10 @@ def main():
     if os.environ.get("NSIGHT_PREFIX"):
         torch.cuda.cudart().cudaProfilerStart()
     
+    level_str = os.getenv("LOG_LEVEL", "INFO").upper() 
+    level = getattr(logging, level_str, logging.INFO) 
+    logging.basicConfig(level=level, force=True)
+
     configure_nvtx_profiling(True)
 
     args = get_args()
@@ -434,10 +442,13 @@ def main():
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
+        skip_prompt_log_probs=args.skip_prompt_log_probs,
         return_log_probs=args.return_log_probs,
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
-    )
+        top_n_logprobs=args.top_n_logprobs,
+        stop_words=args.stop_words,
+    ) 
 
     model = get_model()
 
@@ -471,7 +482,7 @@ def main():
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=not args.disable_chunked_prefill,
-        inference_logging_step_interval=args.inference_wandb_logging_step_interval,
+        inference_logging_step_interval=args.inference_logging_step_interval,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
@@ -482,6 +493,11 @@ def main():
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
     for _ in range(args.inference_repeat_n):
+
+        # Reset engine.
+        engine.reset()
+
+        # Trial.
         t = get_curr_time()
         result = run_inference(requests, engine)
         step_times = result["step_times"]
@@ -553,6 +569,7 @@ def main():
             # Write every 'n' requests, plus the final request.
             for i, req in enumerate(requests):
                 if i % args.output_every_n_results == 0 or i == len(requests) - 1:
+                    print(f' Attributes of request {i}: {req.__dict__}')
                     result_dict = {
                         "input_prompt": req.prompt_text,
                         "generated_text": req.output_text,
@@ -560,15 +577,20 @@ def main():
                         "latency": req.time_end - req.time_start,
                         "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
                         "step_count" : engine.step_count,
+                        "top_n_logprobs" : getattr(req, 'generated_top_n_logprobs', None),
+                        "prompt_top_n_logprobs" : getattr(req, 'prompt_top_n_logprobs', None),
                     }
                     if req.sampling_params.return_log_probs:
-                        response_logprobs = req.log_probs
-                        result_dict["logprobs"] = response_logprobs
+                        result_dict["prompt_logprobs"] = getattr(req, 'prompt_log_probs', None)
+                        result_dict["generated_logprobs"] = getattr(req, 'generated_log_probs', None)
+                        result_dict["logprobs"] = getattr(req, 'logprobs', None)
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric
-            json_results["throughput"] = throughputs
+            if args.record_throughput:
+                json_results["throughput"] = throughputs
 
+            print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=1)
 
@@ -608,11 +630,11 @@ def main():
         )
         print(
             f"{setup_prefix} … "
-            f"throughput: {throughput:.3f} tok/s",
+            f"throughput: {throughput:.3f} tok/s … ",
             f"total time: {total_time:.3f}s … "
             f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
             f"steps: {engine.step_count:d} … "
-            f"capture {capture_str} … "
+            f"capture {capture_str}"
         )
         print("~~~")
 
