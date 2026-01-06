@@ -17,6 +17,9 @@ from typing import Dict, List, Tuple, Optional
 # >>>
 # pip install termcolor
 from termcolor import colored
+from lutil import pax as _pax
+import builtins
+builtins.pax = _pax
 # <<<
 
 sys.path.append(
@@ -119,23 +122,18 @@ def get_model() -> MegatronModule:
         partial(model_provider, model_builder),
         wrap_with_ddp=False
     )
-    # >>>
-    # from lutil import pax
-    # pax("model", {
-    #     "model / module" : model[0].module,
-    #     "params" : sum(t.numel() for t in model[0].parameters()),
-    # })
-    # <<<
 
-    # Load checkpoint.
-    assert args.load is not None
-    args.exit_on_missing_checkpoint = True
-    load_checkpoint(
-        ddp_model=model,
-        optimizer=None,
-        opt_param_scheduler=None,
-        strict=not args.inference_ckpt_non_strict,
-    )
+    # >>>
+    # # Load checkpoint.
+    # assert args.load is not None
+    # args.exit_on_missing_checkpoint = True
+    # load_checkpoint(
+    #     ddp_model=model,
+    #     optimizer=None,
+    #     opt_param_scheduler=None,
+    #     strict=not args.inference_ckpt_non_strict,
+    # )
+    # <<<
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"
@@ -469,10 +467,6 @@ def main():
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
-    # >>>
-    # from lutil import pax
-    # pax("requests")
-    # <<<
     context = get_inference_context(
         requests,
         sampling_params,

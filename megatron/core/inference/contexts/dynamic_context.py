@@ -1499,13 +1499,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Check if the request can be added to the context.
         """
+        # >>>
+        # request_can_be_added = (
+        #     self.total_request_count - self.paused_request_count < self.max_requests
+        # )
+        # request_tokens_can_be_added = (
+        #     self.active_token_count + req.remaining_prompt_length <= self.max_tokens
+        #     and self.paused_request_count == 0
+        # )
+        # +++
         request_can_be_added = (
-            self.total_request_count - self.paused_request_count < self.max_requests
+            self.total_request_count < self.max_requests
+            and self.paused_request_count == 0
         )
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
-            and self.paused_request_count == 0
         )
+        # <<<
         blocks = math.ceil(
             (req.remaining_prompt_length + req.finished_chunk_token_count) / self.block_size_tokens
         ) - math.ceil(req.finished_chunk_token_count / self.block_size_tokens)
@@ -1574,6 +1584,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             current_id = self.total_request_count
 
         if current_id >= self.max_requests:
+            # >>>
+            # pax({
+            #     "availability" : self.check_availability(req),
+            #     "max_requests" : self.max_requests,
+            #     "total_request_count" : self.total_request_count,
+            #     "paused_request_count" : self.paused_request_count,
+            # }, "is_chunked_prefill, current_id")
+            # <<<
             raise RequestOverflowError(req.request_id)
 
         if self.active_token_count + chunk_length > self.max_tokens:

@@ -1023,6 +1023,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self.schedule_non_chunked_prefill()
 
     def schedule_non_chunked_prefill(self):
+        # >>>
+        raise Exception("hi.")
+        # <<<
         """
         Perform the same original scheduling logic for non-chunked runs
         """
@@ -1043,6 +1046,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 break
 
     def schedule_chunked_prefill(self):
+        # >>>
+        # raise Exception("hi.")
+        # <<<
         """
         This function schedules chunked prefill requests.
         Invariant:
@@ -1078,7 +1084,14 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
                     self.context.chunked_prefill_request_id = -1
-                    self.context.add_request(req)
+                    # >>>
+                    # self.context.add_request(req)
+                    # +++
+                    try:
+                        self.context.add_request(req)
+                    except Exception as e:
+                        pax("req, e")
+                    # <<<
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
