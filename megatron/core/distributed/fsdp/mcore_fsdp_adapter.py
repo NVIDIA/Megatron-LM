@@ -251,7 +251,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         if enable_hsdp:
             if expt_dp_group is not None:
-                expt_mesh = _get_hsdp_tp_mesh(outer_fsdp_group, expt_dp_group, expt_tp_group, ep_size=ep_group.size())
+                expt_mesh = _get_hsdp_tp_mesh(
+                    outer_fsdp_group, expt_dp_group, expt_tp_group, ep_size=ep_group.size()
+                )
                 expt_device_mesh = DeviceMesh.from_group(
                     [outer_fsdp_group, expt_dp_group, expt_tp_group],
                     device_type="cuda",
@@ -274,7 +276,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 tp_dim="tp",
                 hybrid_fsdp_group=hybrid_fsdp_group,
                 hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
-                expt_device_mesh=expt_device_mesh
+                expt_device_mesh=expt_device_mesh,
             )
         else:
             if ep_group is not None:
@@ -385,7 +387,10 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
     assert (
         len(dp_tp_meshes) == 1
     ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
-    assert len(dp_tp_meshes[0].reshape(-1).tolist()) == outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size(), (
+    assert (
+        len(dp_tp_meshes[0].reshape(-1).tolist())
+        == outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()
+    ), (
         f"[Megatron-FSDP] DP-TP mesh size {len(dp_tp_meshes[0].reshape(-1).tolist())} "
         f"does not match expected size {outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()}."
     )
