@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from typing import Literal, Optional
+from typing import Literal, Optional, cast
 
 import torch
 from torch import Tensor
@@ -15,6 +15,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import (
     DotProductAttention as MCoreDotProductAttention,
 )
@@ -22,10 +23,10 @@ from megatron.core.transformer.enums import AttnBackend, AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import get_linear_layer
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, is_te_min_version
 from megatron.core.utils import get_te_version as _get_te_version
-from megatron.core.utils import is_te_min_version
 
 
 def get_te_version():
@@ -187,20 +188,21 @@ class BertModel(LanguageModule):
         """
         attention_backend = self.config.attention_backend
         attn_mask_dimensions = None
+        transformer_layer_submodules = cast(
+            TransformerLayerSubmodules, self.transformer_layer_spec.submodules
+        )
+        self_attention_submodules = cast(
+            SelfAttentionSubmodules, transformer_layer_submodules.self_attention.submodules
+        )
         # For local layer spec we just use b1ss
-        if (
-            self.transformer_layer_spec.submodules.self_attention.submodules.core_attention
-            == MCoreDotProductAttention
-        ):
+        if self_attention_submodules.core_attention == MCoreDotProductAttention:
             assert attention_backend in [
                 AttnBackend.local,
                 AttnBackend.auto,
             ], f'Expected AttnBackend to be local or auto while using mcore self attention, but found {attention_backend}. Set --attn-backend to local or dont use MCore SelfAttention submodule in layer specs'
             attn_mask_dimensions = "b1ss"
         else:
-            attn_mask_type = self.transformer_layer_spec.submodules.self_attention.params[
-                'attn_mask_type'
-            ]
+            attn_mask_type = transformer_layer_submodules.self_attention.params['attn_mask_type']
             # For TE >= 1.10 (We always use padding mask and use b11s)
             if is_te_min_version("1.10.0"):
                 attn_mask_dimensions = "b11s"
@@ -208,9 +210,9 @@ class BertModel(LanguageModule):
                     warnings.warn(
                         f'For TE versions >= 1.10 , flash/fused/unfused support padding mask. Setting attention mask from {attn_mask_type} to padding'
                     )
-                    self.transformer_layer_spec.submodules.self_attention.params[
-                        'attn_mask_type'
-                    ] = AttnMaskType.padding
+                    transformer_layer_submodules.self_attention.params['attn_mask_type'] = (
+                        AttnMaskType.padding
+                    )
             # For 1.7 >= TE < 1.10 flash and fused path use padding mask with b11s and unfused path uses arbitrary mask with b1ss
             elif is_te_min_version("1.7.0"):
                 if attention_backend in [AttnBackend.flash, AttnBackend.fused, AttnBackend.auto]:
@@ -220,9 +222,9 @@ class BertModel(LanguageModule):
                         warnings.warn(
                             f'For TE versions >= 1.7 but < 1.10 , unfused path supports only arbitrary mask. Setting attention mask from {attn_mask_type} to arbitray'
                         )
-                        self.transformer_layer_spec.submodules.self_attention.params[
-                            'attn_mask_type'
-                        ] = AttnMaskType.arbitrary
+                        transformer_layer_submodules.self_attention.params['attn_mask_type'] = (
+                            AttnMaskType.arbitrary
+                        )
                     attn_mask_dimensions = "b1ss"
             # For TE < 1.7 we only support unfused attention with b1ss and padding mask
             else:

@@ -3,7 +3,7 @@
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Union, cast
 
 import torch
 from torch import Tensor
@@ -25,6 +25,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import (
     get_pg_rank,
     is_torch_min_version,
@@ -546,7 +547,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
 
-        self_attention_spec = self.submodules.transformer_layer.submodules.self_attention
+        self_attention_spec = cast(
+            TransformerLayerSubmodules, self.submodules.transformer_layer.submodules
+        ).self_attention
         attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
         assert attn_mask_type in SUPPORTED_ATTN_MASK, (
             f"Multi-Token Prediction (MTP) is not jet supported with "
