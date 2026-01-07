@@ -176,4 +176,4 @@ jobs:
         run: |
           ls -al dist/
           pip install twine
-          twine upload -r $TWINE_REPOSITORY -u $TWINE_USERNAME -p $TWINE_PASSWORD dist/
+          twine upload -r $TWINE_REPOSITORY -u $TWINE_USERNAME -p $TWINE_PASSWORD dist/*
