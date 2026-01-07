@@ -233,6 +233,9 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
     from megatron.core.transformer.transformer_block import get_num_layers_to_build
     from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
+    if not hasattr(base_module, "layer_number"):
+        return True, True
+
     # find all first/last layers of this PP stage
     first_layer_numbers = []
     last_layer_numbers = []
