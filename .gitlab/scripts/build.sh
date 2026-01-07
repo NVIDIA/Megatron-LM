@@ -23,14 +23,14 @@ ADDITIONAL_PARAMS=()
 if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" == "dev" ]]; then
     ADDITIONAL_PARAMS+=("--pull")
     ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main,mode=max")
-    ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_COMMIT_BRANCH}")
+    ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_COMMIT_BRANCH}-${PLATFORM}")
 elif [[ -n "$CI_MERGE_REQUEST_IID" ]]; then
     ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID},mode=max")
-    ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_MERGE_REQUEST_IID}")
+    ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_MERGE_REQUEST_IID}-${PLATFORM}")
 fi
 
 if [[ "$CI_COMMIT_BRANCH" == "ci-nightly" ]]; then
-    ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
+    ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly-${PLATFORM}")
 fi
 
 if [[ -n "$TE_GIT_REF" ]]; then
@@ -46,7 +46,7 @@ DOCKER_BUILDKIT=1 docker build \
     --secret id=LOGGER_INDEX_URL \
     --target $STAGE \
     -f docker/$FILE \
-    -t ${IMAGE}:${CI_PIPELINE_ID} \
+    -t ${IMAGE}:${CI_PIPELINE_ID}-${PLATFORM} \
     --builder=container \
     --build-arg JET_API_VERSION=$JET_API_VERSION \
     --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID} \
