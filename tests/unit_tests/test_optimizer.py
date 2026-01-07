@@ -634,7 +634,7 @@ def test_no_weight_decay_cond_apply_wd_to_qk_layernorm():
         lr=0.01,
         bf16=True,
         use_distributed_optimizer=False,
-        no_weight_decay_cond_type_type='apply_wd_to_qk_layernorm',
+        no_weight_decay_cond_type='apply_wd_to_qk_layernorm',
     )
 
     # Build optimizer
