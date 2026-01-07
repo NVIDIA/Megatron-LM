@@ -86,6 +86,7 @@ test:build_nemo_image:
     IMAGE: CI_NEMO_IMAGE
     FILE: Dockerfile.ci.nemo
     BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
+    PLATFORM: amd64
   rules:
     - if: $FUNCTIONAL_TEST == "yes" || $INTEGRATION_TEST == "yes" || $CI_COMMIT_BRANCH == "ci-rebuild-mcore-nemo-image"
       when: on_success
