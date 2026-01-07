@@ -402,7 +402,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # TODO: Add parameter to control fraction of memory assigned to KV cache
         # versus Mamba state.
         block_count = buffer_size_bytes // (self.block_size_bytes + mamba_states_memory_per_request)
-        block_count = max(2, block_count) # need >= 1 active block + 1 dummy block
+        block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
         paused_block_count = paused_buffer_size_bytes // (
             self.block_size_bytes + mamba_states_memory_per_request
         )
