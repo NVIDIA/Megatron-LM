@@ -435,8 +435,14 @@ class _FileBinReader(_BinReader):
         bin_path (str): The path to the data (.bin) file.
     """
 
-    def __init__(self, bin_path: str) -> None:
+    def __init__(
+        self, bin_path: str, num_max_retries: int = 3, sleep_duration_start: int = 10
+    ) -> None:
         self._bin_path = bin_path
+        # Retry-specific parameters. With default arguments, sleep for 10, 20, 40 seconds
+        # between retries.
+        self.num_max_retries = num_max_retries
+        self.sleep_duration_start = sleep_duration_start
 
     def read(self, dtype: Type[numpy.number], count: int, offset: int) -> numpy.ndarray:
         """Read bytes into a numpy array.
@@ -467,25 +473,23 @@ class _FileBinReader(_BinReader):
                     bin_buffer_file.readinto(sequence)
             return sequence
 
-        NUM_MAX_RETRIES = 3
-        SLEEP_DURATION_START = 10  # Sleep for 10, 20, 40 seconds between retries.
-        sleep_duration = SLEEP_DURATION_START
-        for i in range(NUM_MAX_RETRIES + 1):
+        sleep_duration = self.sleep_duration_start
+        for i in range(self.num_max_retries + 1):
             try:
                 return _read()
             except Exception as e:
                 time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-                if i == NUM_MAX_RETRIES:
+                if i == self.num_max_retries:
                     logger.warning(
-                        f"[{time_str}] {NUM_MAX_RETRIES+1} total tries to read data item failed; "
-                        f"going to abort and re-raise exception \"{e}\"..."
+                        f"[{time_str}] {self.num_max_retries+1} total tries to read data item "
+                        f"failed; going to abort and re-raise exception \"{e}\"..."
                     )
                     # Re-raise exception if in last iteration of for loop.
                     raise e
                 logger.warning(
-                    f"[{time_str}] Attempt {i+1}/{NUM_MAX_RETRIES+1} to read data item failed "
-                    f"with exception \"{e}\"; going to sleep for {sleep_duration} seconds and "
-                    "then re-try..."
+                    f"[{time_str}] Attempt {i+1}/{self.num_max_retries+1} to read data item "
+                    f"failed with exception \"{e}\"; going to sleep for {sleep_duration} "
+                    "seconds and then re-try..."
                 )
                 time.sleep(sleep_duration)
                 sleep_duration = sleep_duration * 2
