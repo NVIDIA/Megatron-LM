@@ -67,7 +67,7 @@ jobs:
 
           if [ "$PUBLISH_DRYRUN" = "true" ]; then
             PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" $ROOTDIR/package_info.py)
-            sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev2026010746'" $ROOTDIR/package_info.py
+            sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" $ROOTDIR/package_info.py
           fi
 
           pushd $BUILD_DIR
