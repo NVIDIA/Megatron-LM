@@ -824,7 +824,7 @@ class DataParallelBuffer:
         item_index_map: Optional[Dict[int, TensorItemIndex]] = None,
         bucket_index: Optional[BucketIndex] = None,
         shard_bucket_index: Optional[ShardBucketIndex] = None,
-        use_nvfp4_packed_shape: bool = False,
+        use_nvfp4_raw_data: bool = False,
     ) -> None:
         self.ddp_config = ddp_config
         self.params = params
@@ -854,6 +854,7 @@ class DataParallelBuffer:
         self.is_transpose_buffer = is_transpose_buffer
         self.gradient_scaling_factor = gradient_scaling_factor
         self.mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
+        self.use_nvfp4_raw_data = use_nvfp4_raw_data
 
         # Setup the item index map, bucket index, and shard bucket index from
         # the provided arguments, or build them if not provided.
@@ -872,9 +873,6 @@ class DataParallelBuffer:
             self.shard_bucket_index = shard_bucket_index
         else:
             data_shapes = [to_local_if_dtensor(p).shape for p in self.params]
-            if use_nvfp4_packed_shape:
-                data_shapes = [get_nvfp4_rowwise_packed_shape(s) for s in data_shapes]
-
             # Build the data parallel buffer index, which contains information
             # on where each parameter / gradient tensor will be stored in this
             # distributed buffer.
@@ -889,6 +887,31 @@ class DataParallelBuffer:
                     chunk_size_factor=chunk_size_factor,
                 )
             )
+            if use_nvfp4_raw_data:
+                # Adjust the bucket and shard sizes to account for NVFP4 storage.
+                nvfp4_size_scale = 0.5  # NVFP4 uses 0.5 bytes per element.
+                for item_id in self.item_index_map:
+                    item_index = self.item_index_map[item_id]
+                    self.item_index_map[item_id] = TensorItemIndex(
+                        global_data_index=int(item_index.global_data_index * nvfp4_size_scale),
+                        size=int(item_index.size * nvfp4_size_scale),
+                        item_id=item_index.item_id,
+                        bucket_id=item_index.bucket_id,
+                        shape=get_nvfp4_rowwise_packed_shape(item_index.shape),
+                    )
+                self.bucket_index = BucketIndex(
+                    bucket_id=self.bucket_index.bucket_id,
+                    global_data_index=0,
+                    size=int(self.bucket_index.size * nvfp4_size_scale),
+                    items=list(self.item_index_map[item_id].values()),
+                )
+                self.shard_bucket_index = ShardBucketIndex(
+                    bucket_id=self.shard_bucket_index.bucket_id,
+                    global_data_index=int(self.shard_bucket_index.global_data_index * nvfp4_size_scale),
+                    local_data_index=int(self.shard_bucket_index.local_data_index * nvfp4_size_scale),
+                    bucket_data_index=int(self.shard_bucket_index.bucket_data_index * nvfp4_size_scale),
+                    size=int(self.shard_bucket_index.size * nvfp4_size_scale),
+                )
 
         self.data_size = (
             self.bucket_index.size if not is_data_distributed else self.shard_bucket_index.size
@@ -1785,8 +1808,54 @@ class ParamAndGradBuffer:
         Perform bucket grouping consistency checks on the weight buffer,
         main weight buffer, and gradient buffer.
         """
-        # TODO: implement consistency checks
-        pass
+        def assert_param_list_equal(
+            list1: List[torch.nn.Parameter], list2: List[torch.nn.Parameter],
+        ):
+            assert len(list1) == len(
+                list2
+            ), "Parameter lists must have the same number of parameters."
+            for p1, p2 in zip(list1, list2):
+                assert p1 is p2, (
+                    "Parameter lists must have the same parameters in the same order."
+                )
+
+        def assert_dp_buffer_index_equal(
+            buf1: DataParallelBuffer, buf2: DataParallelBuffer,
+        ):
+            k1, k2 = set(buf1.item_index_map), set(buf2.item_index_map)
+            assert k1 == k2, (
+                "Buffer must have the same item index keys."
+                f" Got {k1} and {k2}."
+            )
+            for k in sorted(k1):
+                v1, v2 = buf1.item_index_map[k], buf2.item_index_map[k]
+                assert v1 == v2, (
+                    f"Item index map for item ID {k} differs between buffers."
+                    f" Got {v1} and {v2}."
+                )
+
+        for group in self.parameter_groups:
+            wbuf = group.model_weight_buffer
+            mbuf = group.main_weight_buffer
+            gbuf = group.main_grad_buffer
+            if mbuf and gbuf:
+                assert_param_list_equal(mbuf.params, gbuf.params)
+                assert_dp_buffer_index_equal(mbuf, gbuf)
+            if wbuf and (mbuf or gbuf):
+                ref_buf = mbuf if mbuf else gbuf
+                assert_param_list_equal(wbuf.params, ref_buf.params)
+                if wbuf.use_nvfp4_raw_data:
+                    for item_id, param in enumerate(wbuf.params):
+                        name = self.param_to_name[param]
+                        w_data = wbuf.get_item(item_id, shard_only=True)
+                        ref_data = ref_buf.get_item(item_id, shard_only=True)
+                        assert w_data.numel() * 2 == ref_data.numel(), (
+                            "When using nvfp4 raw data in weight buffer, the number of elements of "
+                            "the weight buffer item shard should be half of that of "
+                            "the main weight/grad buffer item shard."
+                            f" Got {w_data.numel()} vs {ref_data.numel()} for item ID {item_id} (param name: {name})."
+                            f" {wbuf.item_index_map[item_id]}, {ref_buf.item_index_map[item_id]}"
+                        )
 
     def _init_each_parameter_group_buffers(self, meta_device_param_dtype):
         """
@@ -1910,7 +1979,7 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
-                    use_nvfp4_packed_shape=(param_dtype == "nvfp4"),
+                    use_nvfp4_raw_data=(param_dtype == "nvfp4"),
                     **main_buf_extra_kwargs,
                 )
                 if should_create_transpose_weight_buffer:
@@ -2513,6 +2582,9 @@ class ParamAndGradBuffer:
                 # NOTE: megatron_fsdp_slice is used to solve the SwiGLU TP dist-ckpt problem in
                 # MCore.
                 mbuf = pg.model_weight_buffer
+                # NVFP4 use main weight buffer
+                if mbuf and mbuf.use_nvfp4_raw_data:
+                    mbuf = pg.main_weight_buffer
                 if mbuf:
                     _start, _end = mbuf._get_item_slice_in_shard(item_id)
                     setattr(dist_param, "megatron_fsdp_slice", slice(_start, _end))
@@ -2691,7 +2763,8 @@ class ParamAndGradBuffer:
                     else:
                         shard_fp32_from_fp8.append(main_weight)
                         shard_offsets_in_fp8.append(
-                            wbuf.locate_item_in_global_item(item_id, shard_only=use_wbuf_shard)[0])
+                            mbuf.locate_item_in_global_item(item_id, shard_only=use_wbuf_shard)[0]
+                        )
                         bucket = wbuf.fetch_bucket(set_param_data=True)
                         b_model_param = wbuf.get_item_from_bucket(
                             bucket,
