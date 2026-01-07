@@ -50,12 +50,6 @@ def add_convert_args(parser):
         help='Chosing between different speculative decoding algorithms. Default is None.',
     )
     group.add_argument(
-        '--export-num-medusa-heads',
-        type=int,
-        default=0,
-        help='Number of Medusa heads for speculative decoding.',
-    )
-    group.add_argument(
         "--eagle-config", type=str, default=None, help="EAGLE architecture config. If not given, " \
         "a default config will be use. If provided, it will overwrite the default config."
     )

@@ -119,15 +119,20 @@ def get_dynamic_inference_engine(
 
     mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
-    # DynamicInferenceContext must use the inference model's TP size, not the
-    # training TP size from global args. The inference model may have a custom
-    # ProcessGroupCollection with a different TP size.
+    # DynamicInferenceContext must use the inference model's TP / PP size, not the
+    # training TP / PP size from global args. The inference model may have a custom
+    # ProcessGroupCollection with a different TP / PP size.
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
     tp_group = getattr(pg_collection, 'tp', None) if pg_collection is not None else None
     if tp_group is not None:
         inference_tp_size = get_pg_size(tp_group)
     else:
         inference_tp_size = args.tensor_model_parallel_size
+    pp_group = getattr(pg_collection, 'pp', None) if pg_collection is not None else None
+    if pp_group is not None:
+        inference_pp_size = get_pg_size(pp_group)
+    else:
+        inference_pp_size = args.pipeline_model_parallel_size
 
     # Inference context.
     inference_context = DynamicInferenceContext(
@@ -146,6 +151,7 @@ def get_dynamic_inference_engine(
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=inference_tp_size,
+        pipeline_model_parallel_size=inference_pp_size,
         materialize_only_last_token_logits=True,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
@@ -200,6 +206,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         assert self._client is not None, "Client is not initialized"
 
         tokenizer = get_tokenizer()
+        args = get_args()
 
         sampling_params = SamplingParams(
             num_tokens_to_generate=None,
@@ -210,7 +217,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             termination_id=self._inference_engine.controller.tokenizer.eod,
             return_log_probs=True,
             skip_prompt_log_probs=True,
-            add_BOS=tokenizer.bos is not None,
+            add_BOS=(not args.rl_skip_bos_token and tokenizer.bos is not None),
         )
         requests = [
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)

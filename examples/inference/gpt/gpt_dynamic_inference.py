@@ -26,6 +26,7 @@ from examples.inference.gpt.utils import (
     build_dynamic_engine_setup_prefix,
     build_requests,
     get_curr_time,
+    get_global_peak_memory_stats_bytes,
 )
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -61,7 +62,6 @@ import logging
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
-
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -177,6 +177,7 @@ def get_inference_context(
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
@@ -436,6 +437,10 @@ def main():
     else:
         tokenizer = build_tokenizer(args)
 
+    # Reset peak memory stats so functional tests measure this run and not
+    # whatever happened earlier during initialization.
+    torch.cuda.reset_peak_memory_stats()
+
     # Sampling params.
     sampling_params = SamplingParams(
         temperature=args.temperature,
@@ -446,6 +451,7 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         top_n_logprobs=args.top_n_logprobs,
+        stop_words=args.stop_words,
     ) 
 
     model = get_model()
@@ -495,6 +501,8 @@ def main():
         # Reset engine.
         engine.reset()
 
+        torch.cuda.reset_peak_memory_stats()
+
         # Trial.
         t = get_curr_time()
         result = run_inference(requests, engine)
@@ -514,8 +522,9 @@ def main():
             f"request.state == '{request.state}' != 'finished'."
         )
 
-    # Print unique prompts + outputs.
+    peak_mem_stats = get_global_peak_memory_stats_bytes()
 
+    # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
         def escape_str(s):
             return s.replace("\n", "\\n")
@@ -587,6 +596,9 @@ def main():
             # Track system-level throughput as a test / debug metric
             if args.record_throughput:
                 json_results["throughput"] = throughputs
+            # Attach peak memory metrics; the functional test only validates these
+            # if the fields exist in the golden values.
+            json_results.update(peak_mem_stats)
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
