@@ -67,7 +67,7 @@ jobs:
 
           if [ "$PUBLISH_DRYRUN" = "true" ]; then
             PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" $ROOTDIR/package_info.py)
-            sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev2026010742'" $ROOTDIR/package_info.py
+            sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev2026010744'" $ROOTDIR/package_info.py
           fi
 
           pushd $BUILD_DIR
@@ -176,4 +176,9 @@ jobs:
         run: |
           ls -al dist/
           pip install twine
-          twine upload -r $TWINE_REPOSITORY -u $TWINE_USERNAME -p $TWINE_PASSWORD dist/*
+          twine upload \
+            --verbose \
+            -r $TWINE_REPOSITORY \
+            -u $TWINE_USERNAME \
+            -p $TWINE_PASSWORD \
+            dist/*
