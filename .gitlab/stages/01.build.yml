@@ -9,20 +9,20 @@
   extends: [.build_rules, .dind_rules]
   stage: build
   tags:
-    - arch/amd64
+    - arch/${PLATFORM}
     - origin/jet-fleet
     - env/prod
     - ${TAG}
   services:
     - name: docker:24.0.5-dind
       variables:
-        HEALTHCHECK_TCP_PORT: '2376'
+        HEALTHCHECK_TCP_PORT: "2376"
   timeout: 180m
   variables:
     DOCKER_HOST: tcp://docker:2376
-    DOCKER_TLS_CERTDIR: '/certs'
+    DOCKER_TLS_CERTDIR: "/certs"
     DOCKER_TLS_VERIFY: 1
-    DOCKER_CERT_PATH: '$DOCKER_TLS_CERTDIR/client'
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
     TAG: purpose/builder-large
     STAGE: jet
     MCORE_BACKWARDS_REF: core_r0.14.0
@@ -56,13 +56,26 @@ test:build_image:
         FILE: Dockerfile.ci.dev
         IMAGE_TYPE: lts
         BASE_IMAGE: nvcr.io/nvidia/pytorch:25.09-py3
+        PLATFORM: amd64
+      - IMAGE: CI_MCORE_LTS_IMAGE
+        FILE: Dockerfile.ci.dev
+        IMAGE_TYPE: lts
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.09-py3
+        PLATFORM: arm64
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
         IMAGE_TYPE: dev
         BASE_IMAGE: nvcr.io/nvidia/pytorch:25.11-py3
+        PLATFORM: amd64
+      - IMAGE: CI_MCORE_DEV_IMAGE
+        FILE: Dockerfile.ci.dev
+        IMAGE_TYPE: dev
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.11-py3
+        PLATFORM: arm64
       - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10
+        PLATFORM: amd64
 
 test:build_nemo_image:
   extends: [.build_image]
