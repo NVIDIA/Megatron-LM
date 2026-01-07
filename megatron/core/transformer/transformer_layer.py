@@ -974,9 +974,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # and should be skipped here.
             if self.config.overlap_moe_expert_parallel_comm:
                 probs, routing_map = self.mlp.route(hidden_states)
-                hidden_states, probs = self.mlp.preprocess(
-                    hidden_states, probs, routing_map
-                )
+                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 nvtx_range_pop(suffix="mlp")
                 return residual, hidden_states, probs, shared_expert_output
             mlp_output_with_bias = self.mlp(hidden_states)
@@ -994,9 +992,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states = self.pre_mlp_layernorm(residual)
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
                 probs, routing_map = self.mlp.route(hidden_states)
-                hidden_states, probs = self.mlp.preprocess(
-                    hidden_states, probs, routing_map
-                )
+                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 return residual, hidden_states, probs, shared_expert_output
 
             # CUDA Graph does not capture the MLP/MoE part at all.
