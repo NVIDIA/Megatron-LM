@@ -12,7 +12,7 @@
     - arch/${PLATFORM}
     - origin/jet-fleet
     - env/prod
-    - ${TAG}
+    - purpose/builder-large
   services:
     - name: docker:24.0.5-dind
       variables:
@@ -47,7 +47,7 @@
     reports:
       dotenv: build.env
 
-test:build_image:
+test:pre_build_image:
   extends: [.build_image]
   parallel:
     matrix:
@@ -56,30 +56,29 @@ test:build_image:
         IMAGE_TYPE: lts
         BASE_IMAGE: nvcr.io/nvidia/pytorch:25.09-py3
         PLATFORM: amd64
-        TAG: purpose/builder-large
       - IMAGE: CI_MCORE_LTS_IMAGE
         FILE: Dockerfile.ci.dev
         IMAGE_TYPE: lts
         BASE_IMAGE: nvcr.io/nvidia/pytorch:25.09-py3
         PLATFORM: arm64
-        TAG: purpose/builder-small
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
         IMAGE_TYPE: dev
         BASE_IMAGE: nvcr.io/nvidia/pytorch:25.11-py3
         PLATFORM: amd64
-        TAG: purpose/builder-large
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
         IMAGE_TYPE: dev
         BASE_IMAGE: nvcr.io/nvidia/pytorch:25.11-py3
         PLATFORM: arm64
-        TAG: purpose/builder-small
       - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10
         PLATFORM: amd64
-        TAG: purpose/builder-small
+      - IMAGE: UTILITY_IMAGE
+        FILE: Dockerfile.linting
+        BASE_IMAGE: python:3.10
+        PLATFORM: arm64
 
 test:build_nemo_image:
   extends: [.build_image]
@@ -90,3 +89,44 @@ test:build_nemo_image:
   rules:
     - if: $FUNCTIONAL_TEST == "yes" || $INTEGRATION_TEST == "yes" || $CI_COMMIT_BRANCH == "ci-rebuild-mcore-nemo-image"
       when: on_success
+
+test:build_image:
+  needs: [test:pre_build_image]
+  parallel:
+    matrix:
+      - IMAGE: CI_MCORE_LTS_IMAGE
+      - IMAGE: CI_MCORE_DEV_IMAGE
+      - IMAGE: UTILITY_IMAGE
+  stage: build
+  tags:
+    - arch/${PLATFORM}
+    - origin/jet-fleet
+    - env/prod
+    - purpose/builder-large
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2376"
+  timeout: 180m
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+    STAGE: jet
+    MCORE_BACKWARDS_REF: core_r0.14.0
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 90Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 90Gi
+    SHARED_PATH: /builds/$CI_PROJECT_PATH/shared
+  script:
+    - | 
+      set -x
+      
+      env
+      eval "IMAGE=\$$IMAGE"
+
+      docker manifest create ${IMAGE}:${CI_PIPELINE_ID} \
+        ${IMAGE}:${CI_PIPELINE_ID}-amd64 \
+        ${IMAGE}:${CI_PIPELINE_ID}-arm64
+
+      docker manifest push ${IMAGE}:${CI_PIPELINE_ID}
