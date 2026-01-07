@@ -26,6 +26,7 @@ from examples.inference.gpt.utils import (
     build_dynamic_engine_setup_prefix,
     build_requests,
     get_curr_time,
+    get_global_peak_memory_stats_bytes,
 )
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -61,7 +62,6 @@ import logging
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
-
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -437,6 +437,10 @@ def main():
     else:
         tokenizer = build_tokenizer(args)
 
+    # Reset peak memory stats so functional tests measure this run and not
+    # whatever happened earlier during initialization.
+    torch.cuda.reset_peak_memory_stats()
+
     # Sampling params.
     sampling_params = SamplingParams(
         temperature=args.temperature,
@@ -497,6 +501,8 @@ def main():
         # Reset engine.
         engine.reset()
 
+        torch.cuda.reset_peak_memory_stats()
+
         # Trial.
         t = get_curr_time()
         result = run_inference(requests, engine)
@@ -516,8 +522,9 @@ def main():
             f"request.state == '{request.state}' != 'finished'."
         )
 
-    # Print unique prompts + outputs.
+    peak_mem_stats = get_global_peak_memory_stats_bytes()
 
+    # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
         def escape_str(s):
             return s.replace("\n", "\\n")
@@ -589,6 +596,9 @@ def main():
             # Track system-level throughput as a test / debug metric
             if args.record_throughput:
                 json_results["throughput"] = throughputs
+            # Attach peak memory metrics; the functional test only validates these
+            # if the fields exist in the golden values.
+            json_results.update(peak_mem_stats)
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
