@@ -742,28 +742,22 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 f"current using_buffer: {self.using_buffer} \n"
                 f"current idle_buffer: {self.idle_buffer}"
             )
-            # Synchronization is required before the allocation for the user buffer
-            if mem_alloc_context is not None and mem_alloc_context != nullcontext:
-                # Check if a new buffer allocation is required
-                if (
-                    self.allocation_tracker.get((buffer_name, dtype), None) is None
-                    or self.allocation_tracker[(buffer_name, dtype)] < size
-                ):
-                    # Requires synchronization for new buffer allocation
-                    self.allocation_tracker[(buffer_name, dtype)] = size
-                    torch.cuda.synchronize()
-            return Bucket(
-                data=get_global_memory_buffer().get_tensor(
-                    [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
-                )
+        else:
+            buffer_name = f"{self.name}_not_fit_in_fixed_pool_{bucket_id}_{size}_{dtype}_{device}"
+        
+        if mem_alloc_context is not None and mem_alloc_context != nullcontext:
+            # Check if a new buffer allocation is required
+            if (
+                self.allocation_tracker.get((buffer_name, dtype), None) is None
+                or self.allocation_tracker[(buffer_name, dtype)] < size
+            ):
+                # Requires synchronization for new buffer allocation
+                self.allocation_tracker[(buffer_name, dtype)] = size
+                torch.cuda.synchronize()
+        return Bucket(
+            data=get_global_memory_buffer().get_tensor(
+                [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
             )
-
-        # If the bucket is not eligible for fixed pool buffering, or no buffer is available,
-        # fall back to dynamic allocation via the backup allocator. This means that we
-        # will do dynamic memory allocation.
-        logging.debug(f"[FSDP] Using backup allocator for {bucket_id} {fsdp_unit_id}")
-        return self.backup_allocator.allocate(
-            bucket_id=bucket_id, size=size, dtype=dtype, device=device
         )
 
     def _get_gbuf_name(self, buf_group_id: int, bucket_index: int):
