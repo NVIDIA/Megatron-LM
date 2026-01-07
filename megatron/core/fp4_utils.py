@@ -87,7 +87,7 @@ if HAVE_TE:
             if config.fp4_recipe == Fp4Recipe.nvfp4:
                 try:
                     fp4_recipe = transformer_engine.common.recipe.NVFP4BlockScaling(
-                        fp8_dpa=config.fp8_dot_product_attention,
+                        fp8_dpa=config.fp8_dot_product_attention
                     )
                 except AttributeError:
                     raise ValueError(
