@@ -1423,7 +1423,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             sharded_state_dict = {}
             num_gemms = self.num_gemms
             if self.config.moe_enable_echo:
-                num_gemms = self.config.moe_num_echo_experts // self.config.expert_model_parallel_size
+                num_gemms = self.config.num_moe_experts // self.config.expert_model_parallel_size
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
             num_global_experts = get_expert_model_parallel_world_size() * num_gemms
             local_expert_indices_offset = get_expert_model_parallel_rank() * num_gemms
