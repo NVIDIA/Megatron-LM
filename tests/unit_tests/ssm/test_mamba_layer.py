@@ -1,7 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import cast
-
 import pytest
 import torch
 
@@ -28,10 +26,14 @@ class TestMambaLayer:
             num_attention_heads=1,
             use_cpu_initialization=True,
         )
-        stack_submodules = cast(MambaStackSubmodules, mamba_stack_spec.submodules)
-        modules = cast(MambaLayerSubmodules, stack_submodules.mamba_layer.submodules)
+        assert isinstance(mamba_stack_spec.submodules, MambaStackSubmodules)
+        assert isinstance(mamba_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        self.layer = MambaLayer(transformer_config, modules, pg_collection=pg_collection)
+        self.layer = MambaLayer(
+            transformer_config,
+            mamba_stack_spec.submodules.mamba_layer.submodules,
+            pg_collection=pg_collection,
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

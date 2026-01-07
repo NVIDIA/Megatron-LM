@@ -2,7 +2,7 @@
 import logging
 from collections import namedtuple
 from functools import partial
-from typing import List, Optional, cast
+from typing import List, Optional
 
 import torch
 
@@ -160,14 +160,17 @@ class LLaVAModel(MegatronModule):
         self.context_parallel_lm = language_transformer_config.context_parallel_size
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
             if not language_model_type.startswith('nemotron5-hybrid'):
-                transformer_layer_submodules = cast(
-                    TransformerLayerSubmodules, language_transformer_layer_spec.submodules
+                assert isinstance(
+                    language_transformer_layer_spec.submodules, TransformerLayerSubmodules
                 )
-                self_attention_submodules = cast(
-                    SelfAttentionSubmodules, transformer_layer_submodules.self_attention.submodules
+                assert isinstance(
+                    language_transformer_layer_spec.submodules.self_attention.submodules,
+                    SelfAttentionSubmodules,
                 )
                 assert (
-                    self_attention_submodules.core_attention == TEDotProductAttention and HAVE_TE
+                    language_transformer_layer_spec.submodules.self_attention.submodules.core_attention
+                    == TEDotProductAttention
+                    and HAVE_TE
                 ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
             if self.context_parallel_lm > 1:
                 self.cp_group = self.pg_collection.cp

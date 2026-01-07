@@ -3,7 +3,6 @@
 import gc
 import os
 import sys
-from typing import cast
 
 import pytest
 import torch
@@ -329,9 +328,8 @@ class TestLLaVACudaGraph:
         # Get layer specs
         language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
         vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
-        vision_projection_spec = deepcopy(
-            cast(TransformerLayerSubmodules, language_layer_spec.submodules).mlp.submodules
-        )
+        assert isinstance(language_layer_spec.submodules, TransformerLayerSubmodules)
+        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
         # Set vision model type
         vision_config.vision_model_type = "clip"

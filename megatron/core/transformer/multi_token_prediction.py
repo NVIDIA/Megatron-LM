@@ -624,9 +624,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
 
-        self_attention_spec = cast(
-            TransformerLayerSubmodules, self.submodules.transformer_layer.submodules
-        ).self_attention
+        assert isinstance(self.submodules.transformer_layer.submodules, TransformerLayerSubmodules)
+
+        self_attention_spec = self.submodules.transformer_layer.submodules.self_attention
         attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
         assert attn_mask_type in SUPPORTED_ATTN_MASK, (
             f"Multi-Token Prediction (MTP) is not jet supported with "

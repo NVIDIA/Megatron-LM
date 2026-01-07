@@ -4,7 +4,6 @@ import os
 from functools import partial
 from importlib.metadata import version
 from inspect import signature
-from typing import cast
 from unittest import mock
 
 import pytest
@@ -100,12 +99,10 @@ def make_test_packed_seq_params_with_padding(
 
 
 def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
-    submodules = cast(
-        MLASelfAttentionSubmodules,
-        get_gpt_layer_with_transformer_engine_submodules(
-            multi_latent_attention=True
-        ).self_attention.submodules,
-    )
+    submodules = get_gpt_layer_with_transformer_engine_submodules(
+        multi_latent_attention=True
+    ).self_attention.submodules
+    assert isinstance(submodules, MLASelfAttentionSubmodules)
     if linear_qkv_down_proj is not None:
         submodules.linear_q_down_proj = linear_qkv_down_proj
         submodules.linear_kv_down_proj = linear_qkv_down_proj
