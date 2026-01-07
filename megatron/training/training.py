@@ -53,6 +53,8 @@ from .log_handler import CustomHandler
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
 
+_LEGACY_TRAIN_START_TIME = time.time() # NOTE(asolergi-nv): Legacy timestamp
+
 import torch
 
 try:
@@ -682,9 +684,7 @@ def pretrain(
         store=store,
     )
 
-    # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
-    print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
-    print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
+    timestamp_after_initialize_megatron = time.time()
 
     args = get_args()
     timers = get_timers()
@@ -695,13 +695,25 @@ def pretrain(
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
 
+    timestamp_after_set_jit_fusion_options = time.time()
+
     # Adjust the startup time so it reflects the global minimum.
     # This will be closer to what scheduler will see (outside of
-    # image ... launches.
-    global _TRAIN_START_TIME
-    start_time_tensor = torch.tensor([_TRAIN_START_TIME], dtype=torch.double, device='cuda')
+    # image ... launches).
+    program_start = _STARTUP_TIMESTAMPS.get('program_start')
+    main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
+    pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
+
+    if _STARTUP_TIMESTAMPS['program_start'] is not None:
+        program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
+        torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
+        program_start_global = program_start_global.item()
+        set_startup_timestamps(program_start=program_start_global)
+
+    global _LEGACY_TRAIN_START_TIME
+    start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
     torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
-    program_start_global = start_time_tensor.item()
+    _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
 
     # Capture megatron init end time (matches original time.time() placement)
     megatron_init_end = time.time()
@@ -711,24 +723,28 @@ def pretrain(
     app_metrics['app_model_init_start_time'] = round(program_start_global * 1000.0)
 
     # Print basic megatron init time (using global min start)
+    # NOTE(asolergi-nv): This is not entirely accurate, but we keep it for backwards compatibility.
     print_rank_0(
-        'time to initialize megatron (seconds): {:.3f}'.format(megatron_init_end - program_start_global)
+        'time to initialize megatron (seconds): {:.3f}'.format(megatron_init_end - _LEGACY_TRAIN_START_TIME)
     )
 
-    # Report startup timing deltas with min/max across ranks using timers infrastructure
-    # Only if startup timestamps were set by the entry script
-    program_start = _STARTUP_TIMESTAMPS.get('program_start')
-    main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
-    pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
+    # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
+    print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
+    print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
 
     if program_start is not None and main_entry is not None and pretrain_entry is not None:
         # Inject startup deltas into timers
         startup_timers = {
-            'startup-program-entry-spread': program_start - program_start_global,
-            'startup-library-setup': main_entry - program_start,
-            'startup-program-setup': pretrain_entry - main_entry,
-            'startup-megatron-init': megatron_init_end - pretrain_entry,
-            'startup-megatron-init-global': megatron_init_end - program_start_global,
+            'startup-program-entry-spread': program_start - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
+            'startup-library-setup': main_entry - program_start, # Local library imports
+            'startup-program-setup': pretrain_entry - main_entry, # Local __main__ entry to pretrain entry
+            'startup-in-process-setup': timestamp_after_inprocess_setup - pretrain_entry, # Local in-process setup
+            'startup-in-job-setup': timestamp_after_in_job_setup - timestamp_after_inprocess_setup, # Local in-job setup
+            'startup-initialize-megatron': timestamp_after_initialize_megatron - timestamp_after_in_job_setup, # Local initialize megatron
+            'startup-set-jit-fusion-options': timestamp_after_set_jit_fusion_options - timestamp_after_initialize_megatron, # Local set JIT fusion options
+            'all-reduce-start-timestamps-tensor': megatron_init_end - timestamp_after_set_jit_fusion_options, # 2x All-reduce, first collective call
+            'startup-megatron-init-local': megatron_init_end - pretrain_entry, # Local megatron init
+            'startup-megatron-init-global': megatron_init_end - program_start_global, # Local megatron init vs the global earliest program start timestamp
         }
         for name, delta in startup_timers.items():
             timers(name, log_level=0).set_elapsed(delta)
@@ -743,9 +759,6 @@ def pretrain(
         for name, ts in startup_timestamps.items():
             ts_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')
             print_rank_0(f'[{name}] datetime: {ts_str}')
-
-    # Update _TRAIN_START_TIME to global min for use elsewhere
-    _TRAIN_START_TIME = program_start_global
 
     print_datetime('after megatron is initialized')
     app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
