@@ -1007,9 +1007,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
 
-
-
-
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
     #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
     #               from the current fp8 param) to its amax_history. The below function will correct
@@ -1064,9 +1061,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
-        # Setup stream for model building/ddp initialization. The side-stream may be necessary for
-        #  cuda graph capture support with DDP, but we sync it with the current stream to avoid race
-        #  conditions.
+        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
+        #  capture support with DDP, but we sync it with the current stream to avoid races.
         ddp_stream = torch.cuda.Stream()
         # Wait for the default stream to complete before starting ddp_stream
         ddp_stream.wait_stream(torch.cuda.current_stream())
