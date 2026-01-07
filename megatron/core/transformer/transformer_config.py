@@ -461,7 +461,7 @@ class TransformerConfig(ModelParallelConfig):
     in the hidden_states gradient."""
 
     moe_shared_expert_gate: bool = False
-    """Enable gate for shared expert."""
+    """Enable gate for shared expert. Only effective when moe-shared-expert-intermediate-size is set."""
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
