@@ -74,7 +74,6 @@ class BertModel(LanguageModule):
         seq_len_interpolation_factor: Optional[float] = None,
         add_binary_head=True,
         return_embeddings=False,
-        pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
