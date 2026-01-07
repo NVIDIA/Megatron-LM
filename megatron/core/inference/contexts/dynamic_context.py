@@ -1743,7 +1743,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.paused_request_count > 0:
             active_block_count_avail = self.block_allocator.get_active_avail()
             paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
+            # Flip counts before cumsum, since paused requests are resumed from
+            # the right-most index, so we must count resumed blocks starting from
+            # the right side.
             paused_block_counts = paused_block_counts.flip(dims=[0])
+            # Add +1 to all block counts, since any time a paused request is
+            # resumed, it will be starting a new memory block. For background,
+            # pausing happens after a request has generated the final token of a
+            # memory block (i.e., token 256 of that block), which means the very
+            # next token (whenever that request gets unpaused) will be in a new
+            # block. So, when we resume a paused request, we have to account for
+            # the fact that it will need an extra block beyond the ones that it
+            # has already used.
             paused_block_counts += 1  # +1 for newly added block
             paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
             resume_request_count = min(
