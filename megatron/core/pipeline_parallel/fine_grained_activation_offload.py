@@ -526,7 +526,7 @@ class PipelineOffloadManager:
         # Dump the offload information
         total_tensor_count = {}
         total_offload_bytes = {}
-        for chunk in self._cached_chunks_backward:
+        for chunk in self._cached_chunks_forward:
             for group in chunk.offload_groups:
                 if group.offload:
                     if group._name not in total_tensor_count:
@@ -535,6 +535,10 @@ class PipelineOffloadManager:
                     if group._name not in total_offload_bytes:
                         total_offload_bytes[group._name] = 0
                     total_offload_bytes[group._name] += group.total_offload_bytes
+            # Stop statistics at the first backward chunk after which 1F1B is running,
+            # where the memory cost will not increase anymore.
+            if chunk is self._cached_chunks_backward[0]:
+                break
         print_offload_summary_table(total_offload_bytes)
 
     def push(self, handler):
@@ -732,7 +736,7 @@ class ChunkOffloadHandler:
         self._groups_to_reload = []
         self._tensor_count_current_group = 0
         self._max_group_size = 0
-
+        self._reloading_group = []
         # Counter for special torch tensor types (FakeTensor, FunctionalTensor)
         self.torch_tensor_count = 0
         self.d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
@@ -748,6 +752,7 @@ class ChunkOffloadHandler:
         self._groups_to_offload = []
         self._groups_to_reload = []
         self._tensor_count_current_group = 0
+        self._reloading_group = []
 
     def is_empty_chunk(self, name=None):
         """Check if this chunk has no tensors to manage."""
@@ -884,6 +889,7 @@ class ChunkOffloadHandler:
                     group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)
         self._groups_to_reload.pop()
+        self._reloading_group.append(group_to_reload)
         torch.cuda.nvtx.range_pop()
 
     def pre_reload_last_layer(self):
@@ -966,9 +972,12 @@ class ChunkOffloadHandler:
         cur_backward_chunk = PipelineOffloadManager.get_instance().cur_backward_chunk()
         assert cur_backward_chunk is self, f"Chunk mismatch {cur_backward_chunk} {self}"
         # Wait for reload to complete before using tensors
-        if not is_graph_capturing() and len(self._groups_to_reload) > 0:
-            group_to_reload = self._groups_to_reload[-1]
-            group_to_reload.wait_reload_event(torch.cuda.current_stream())
+        if not is_graph_capturing() and len(self._reloading_group) > 0:
+            for reloading_group in self._reloading_group:
+                if reloading_group._name == name:
+                    reloading_group.wait_reload_event(torch.cuda.current_stream())
+                    self._reloading_group.remove(reloading_group)
+                    break
 
     def on_group_start_forward(self, name):
         """
