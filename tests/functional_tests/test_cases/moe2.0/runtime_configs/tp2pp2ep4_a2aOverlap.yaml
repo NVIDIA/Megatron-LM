@@ -6,6 +6,8 @@ ENV_VARS:
   NCCL_NVLS_ENABLE: 0
   PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
+  NCCL_ALGO: ^NVLS
+  CUBLAS_WORKSPACE_CONFIG: ":4096:8"
 
 MODEL_ARGS:
   # Transformer Engine args
@@ -27,18 +29,14 @@ MODEL_ARGS:
   # MoE training related args
   --moe-grouped-gemm: true
   --moe-token-dispatcher-type: alltoall
-  --moe-permute-fusion: true
-  --save-interval: 25
   # A2A communication overlap args
   --overlap-moe-expert-parallel-comm: true
   --delay-wgrad-compute: true
   # Add mixed precision args
   --bf16: true
-  --exit-interval: 50
   # kernel fusion related args
-  --no-rope-fusion: true
-  --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: native
+  --moe-permute-fusion: true
+  --moe-router-fusion: true
   # MISC
   --manual-gc: true
   --manual-gc-interval: 100

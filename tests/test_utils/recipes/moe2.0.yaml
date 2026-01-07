@@ -72,14 +72,14 @@ products:
       - model_config: dsv3_proxy
         runtime_config: tp1pp1ep8
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [dsv3_tp2pp2ep4]
     products:
       - model_config: dsv3_proxy
         runtime_config: tp2pp2ep4
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   # FP8 training test
   - test_case: [dsv3_tp2pp2ep4_fp8]
@@ -87,7 +87,7 @@ products:
       - model_config: dsv3_proxy
         runtime_config: tp2pp2ep4_fp8
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   # Scoped CUDA graphs test
   - test_case: [dsv3_tp2pp2ep4_cudagraph]
@@ -95,7 +95,7 @@ products:
       - model_config: dsv3_proxy
         runtime_config: tp2pp2ep4_cudagraph
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   # Fine-grained activation offloading test
   - test_case: [dsv3_tp2pp2ep4_offloading]
@@ -103,7 +103,7 @@ products:
       - model_config: dsv3_proxy
         runtime_config: tp2pp2ep4_offloading
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   # A2A communication overlap test
   - test_case: [dsv3_tp2pp2ep4_a2aOverlap]
@@ -111,7 +111,15 @@ products:
       - model_config: dsv3_proxy
         runtime_config: tp2pp2ep4_a2aOverlap
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  # Context parallelism test
+  - test_case: [dsv3_tp2pp2ep4_cp2]
+    products:
+      - model_config: dsv3_proxy 
+        runtime_config: tp2pp2ep4_cp2
+        environment: [dev]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
 
   ###########################
@@ -122,30 +130,30 @@ products:
       - model_config: qwen3_proxy
         runtime_config: tp1pp1ep8
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [qwen3_tp2pp2ep4]
     products:
       - model_config: qwen3_proxy
         runtime_config: tp2pp2ep4
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   # Muon optimizer with allgather dispatcher test
-  - test_case: [qwen3_tp1pp1ep8_muon]
+  - test_case: [qwen3_tp2pp1ep8_muon]
     products:
       - model_config: qwen3_proxy
-        runtime_config: tp1pp1ep8_muon
+        runtime_config: tp2pp1ep8_muon
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   # Context parallelism test
-  - test_case: [qwen3_tp2pp2ep4_cp]
+  - test_case: [qwen3_tp2pp2ep4_cp2]
     products:
       - model_config: qwen3_proxy
-        runtime_config: tp2pp2ep4_cp
+        runtime_config: tp2pp2ep4_cp2
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
 
   ###########################
@@ -157,5 +165,5 @@ products:
       - model_config: qwen3next_proxy
         runtime_config: tp2pp2ep4
         environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]

@@ -29,7 +29,6 @@ MODEL_ARGS:
   --ffn-hidden-size: 4096
   # Add MoE args
   --num-experts: 32
-  --moe-layer-freq: ([0]*1+[1]*15)
   --moe-ffn-hidden-size: 1024
   --moe-shared-expert-intermediate-size: 1024
   --moe-router-load-balancing-type: global_aux_loss
@@ -56,9 +55,10 @@ MODEL_ARGS:
   --init-method-std: 0.02
   # Training args
   --global-batch-size: 32
-  --train-iters: 50
-  --exit-duration-in-mins: 230
+  --train-iters: 100
+  --save-interval: 50
   --no-check-for-nan-in-loss-and-grad: true
+  --deterministic-mode: true
 
 METRICS:
   - "lm loss"

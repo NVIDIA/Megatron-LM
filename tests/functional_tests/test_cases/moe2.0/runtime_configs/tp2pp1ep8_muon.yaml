@@ -5,6 +5,8 @@ ENV_VARS:
   NCCL_NVLS_ENABLE: 0
   PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
+  NCCL_ALGO: ^NVLS
+  CUBLAS_WORKSPACE_CONFIG: ":4096:8"
 
 MODEL_ARGS:
   # Transformer Engine args
@@ -12,30 +14,28 @@ MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 2
-  --pipeline-model-parallel-size: 2
-  --expert-model-parallel-size: 2
-  --context-parallel-size: 2
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 8
+  --context-parallel-size: 1
   --expert-tensor-parallel-size: 1
-  --use-distributed-optimizer: true
-  --overlap-grad-reduce: true
-  --overlap-param-gather: true
+  # NOTE: Muon optimizer does not support distributed optimizer
+  # --use-distributed-optimizer: true
   --use-mcore-models: true
   --sequence-parallel: true
   --micro-batch-size: 4
   # MoE training related args
   --moe-grouped-gemm: true
-  --moe-token-dispatcher-type: alltoall
-  --moe-permute-fusion: true
-  --save-interval: 25
+  --moe-token-dispatcher-type: allgather
+  # Muon optimizer args
+  --optimizer: muon
+  --muon-momentum: 0.9
+  --muon-extra-scale-factor: 0.2
+  --muon-scale-mode: spectral
+  --use-checkpoint-opt_param-scheduler: true
   # Add mixed precision args
   --bf16: true
-  --exit-interval: 50
-  # kernel fusion related args
-  --no-rope-fusion: true
-  --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: native
   # MISC
   --manual-gc: true
   --manual-gc-interval: 100
-TEST_TYPE: resume-ckpt
+TEST_TYPE: regular
 
