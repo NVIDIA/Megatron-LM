@@ -1,0 +1,153 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+TEST_TYPE: frozen-start
+MODE: rl
+MODEL_ARGS:
+  # Tokenizer settings
+  --tiktoken-pattern: v2
+  --tokenizer-type: TikTokenizer
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+
+  # Model architecture (nemotron6_3b_moe from unit test)
+  --use-mcore-models: true
+  --is-hybrid-model: true
+  --model-provider: mamba
+  --num-layers: 52
+  --hidden-size: 2688
+  --ffn-hidden-size: 1856
+  --num-attention-heads: 32
+  --num-query-groups: 2
+  --group-query-attention: true
+  --kv-channels: 128
+  --position-embedding-type: none
+  --add-position-embedding: true
+  --use-rotary-position-embeddings: false
+  --add-bias-linear: false
+  --add-qkv-bias: false
+  --squared-relu: true
+  --untie-embeddings-and-output-weights: true
+  --normalization: RMSNorm
+  --apply-query-key-layer-scaling: false
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+
+  # Hybrid/Mamba settings
+  --hybrid-override-pattern: MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME
+  --spec: megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
+  --mamba-state-dim: 128
+  --mamba-head-dim: 64
+  --mamba-num-groups: 8
+  --mamba-num-heads: 64
+
+  # MoE settings
+  --num-experts: 128
+  --moe-layer-freq: 1
+  --moe-ffn-hidden-size: 1856
+  --moe-router-topk: 6
+  --moe-router-pre-softmax: false
+  --moe-grouped-gemm: true
+  --moe-shared-expert-intermediate-size: 3712
+  --moe-router-score-function: sigmoid
+  --moe-router-enable-expert-bias: true
+  --moe-router-topk-scaling-factor: 2.5
+  --moe-aux-loss-coeff: 0.0
+  --moe-router-dtype: fp64
+  --moe-token-dispatcher-type: alltoall
+
+  # Parallelism
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 4
+  --expert-tensor-parallel-size: 1
+  --sequence-parallel: true
+
+  # Checkpoint settings
+  --load: ${CHECKPOINT_LOAD_PATH}/model/nemotron6/3b_hybrid_moe/checkpoints/phase2_lc_reinit_emb/
+  --auto-detect-ckpt-format: true
+  --ckpt-format: torch_dist
+  --no-load-optim: true
+  --use-checkpoint-args: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --dist-ckpt-strictness: log_unexpected
+
+  # Sequence settings
+  --seq-length: 1024
+  --max-position-embeddings: 1024
+  --inference-max-seq-length: 1024
+  --max-tokens-to-oom: 3600000
+
+  # Batch settings
+  --micro-batch-size: 1
+  --global-batch-size: 16
+
+  # Training settings
+  --bf16: true
+  --transformer-impl: transformer_engine
+  --attention-backend: flash
+  --no-create-attention-mask-in-dataloader: true
+  --distributed-backend: nccl
+  --seed: 42
+
+  # Deterministic mode for reproducibility
+  --deterministic-mode: true
+  --no-gradient-accumulation-fusion: true
+
+  # Logging
+  --log-interval: 1
+  --log-progress: true
+  --log-throughput: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --tensorboard-log-interval: 1
+  --timing-log-level: 1
+  --timing-log-option: minmax
+  --straggler-minmax-count: 16
+
+  # GRPO settings
+  --calculate-per-token-loss: true
+  --rl-use-sequence-packing: true
+  --rl-sequence-packing-algo: fifo
+  --rl-offload-optimizer-during-inference: true
+  --langrl-inference-server-type: inplace_megatron
+  --cuda-graph-impl: local
+  --grpo-group-size: 2
+  --grpo-prompts-per-step: 8
+  --grpo-iterations: 1
+  --grpo-clamp-eps-lower: 0.2
+  --grpo-clamp-eps-upper: 0.2
+  --grpo-kl-beta: 0.0
+  --grpo-entropy-term-weight: 0.0
+  --langrl-env-config: tests/functional_tests/test_cases/moe/hybrid_moe_grpo_tp2_pp1_ep4_3b_throughputtest_losscheck/env_config.yaml
+  --rl-partial-rollouts: true
+  --perform-rl-step: true
+
+  # Optimizer settings
+  --lr: 0.000001
+  --lr-warmup-samples: 0
+  --clip-grad: 1.0
+  --finetune: true
+
+  # Training duration
+  --train-samples: 48828125
+  --exit-interval: 50
+  --save-interval: 1000000
+  --eval-interval: 1000000
+
+  # Memory settings
+  --empty-unused-memory-level: 2
+  --inference-logging-step-interval: 1
+
+  # Mock data for testing
+  --mock-data: true
+METRICS:
+  - "lm loss"
+  - "iteration-time"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
