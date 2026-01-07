@@ -88,6 +88,30 @@ def _matches(param: torch.nn.Parameter, param_name: str, param_key: ParamKey) ->
     return False
 
 
+def _get_no_wd_cond_fn(no_weight_decay_cond_type):
+    """Get the no weight decay condition function."""
+
+    if no_weight_decay_cond_type == 'apply_wd_to_qk_layernorm':
+
+        def no_wd_cond_fn(name, param):
+            if "q_layernorm" in name or "k_layernorm" in name:
+                """Applies weight decay to qk layernorm as a special case"""
+                no_wd = False
+            else:
+                no_wd = name.endswith(".bias") or len(param.shape) == 1
+            return no_wd
+
+    elif no_weight_decay_cond_type is None:
+
+        def no_wd_cond_fn(name, param):
+            return name.endswith(".bias") or len(param.shape) == 1
+
+    else:
+        raise ValueError(f"Unknown no_weight_decay_cond_type: {no_weight_decay_cond_type}")
+
+    return no_wd_cond_fn
+
+
 def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
@@ -137,7 +161,8 @@ def _get_param_groups(
             # TODO: Make sure there is a way to support old no_weight_decay_func functionality
             # and default_skip_embedding_weight_decay:
             #     or (default_skip_embedding_weight_decay and "embedding" in name)
-            no_wd = name.endswith(".bias") or len(param.shape) == 1
+            no_wd_cond_fn = _get_no_wd_cond_fn(config.no_weight_decay_cond_type)
+            no_wd = no_wd_cond_fn(name, param)
             if not no_wd:
                 wd_mult = 1.0
             else:
@@ -173,12 +198,12 @@ def _get_param_groups(
     for key in params_key:
         wd_mult, is_expert_parallel, _ = key
         params = params_map[key] if key in params_map else []
-        config, uses_default_config = None, True
+        param_config, uses_default_config = None, True
         if key not in configs_map:
             assert params == []
         else:
-            config, uses_default_config = configs_map[key]
-            assert config is not None
+            param_config, uses_default_config = configs_map[key]
+            assert param_config is not None
 
         # TODO: Remove "backwards compatible" fields below eventually.
         param_group = {
@@ -191,9 +216,9 @@ def _get_param_groups(
         }
 
         # Stick relevant fields into param_group from config object.
-        if config is not None:
-            param_group['max_lr'] = config.lr
-            param_group['min_lr'] = config.min_lr
+        if param_config is not None:
+            param_group['max_lr'] = param_config.lr
+            param_group['min_lr'] = param_config.min_lr
             # TODO: Add other relevant arguments (e.g., weight decay, optimizer)
             # here as well.
         param_groups.append(param_group)
