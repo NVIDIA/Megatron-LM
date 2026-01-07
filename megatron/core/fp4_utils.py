@@ -73,7 +73,7 @@ def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
     the CUDA graph).
 
     Paper link: https://arxiv.org/pdf/2509.25149
-    Scaling factor layout CuBLAS: https://docs.nvidia.com/cuda/cublas/#d-block-scaling-factors-layout
+    Scaling factor layout: https://docs.nvidia.com/cuda/cublas/#d-block-scaling-factors-layout
     TE NVFP4 Grouped Quantization: https://github.com/NVIDIA/TransformerEngine/pull/2411
     """
     # pylint: disable=unused-argument
