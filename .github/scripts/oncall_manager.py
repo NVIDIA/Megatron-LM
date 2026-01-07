@@ -55,7 +55,7 @@ def get_team_members(org, team_slug):
     url = f"{GITHUB_API_URL}/orgs/{org}/teams/{team_slug}/members"
     headers = get_headers()
     
-    members = []
+    members = set()
     page = 1
     while True:
         resp = requests.get(f"{url}?per_page=100&page={page}", headers=headers)
@@ -67,7 +67,7 @@ def get_team_members(org, team_slug):
         if not data:
             break
             
-        members.extend([m['login'] for m in data])
+        members.update([m['login'] for m in data])
         if len(data) < 100:
             break
         page += 1
@@ -112,7 +112,7 @@ def update_active_oncall_team(org, new_oncall):
 
     # 3. Remove everyone else
     for member in current_members:
-        if member != new_oncall:
+        if member not in [new_oncall, 'svcnvidia-nemo-ci']:
             url = f"{GITHUB_API_URL}/orgs/{org}/teams/{ACTIVE_ONCALL_TEAM_SLUG}/memberships/{member}"
             resp = requests.delete(url, headers=get_headers())
             if resp.status_code == 204:
@@ -182,6 +182,9 @@ def ensure_schedule_filled(schedule, repo_owner):
     if not members:
         print(f"Warning: No team members found in {ROTATION_TEAM_SLUG}.")
         return
+    if 'svcnvidia-nemo-ci' in members:
+        members.remove('svcnvidia-nemo-ci')
+    members = list(members)
 
     members.sort() # Deterministic order
     

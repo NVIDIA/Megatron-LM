@@ -36,6 +36,7 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import get_asyncio_loop, log_single_rank
 from megatron.rl.sequence_packing_utils import (
@@ -237,7 +238,7 @@ def align_unpacked_inference_logprobs(
     return padded_inference_logprobs
 
 
-def get_agent(args):
+def get_agent(args, parallel_generation_tasks: int | None = None):
     """Get an agent based on environment configuration.
 
     If args.langrl_env_config is provided, uses weighted environment selection.
@@ -246,7 +247,10 @@ def get_agent(args):
     with open(args.langrl_env_config, 'r') as f:
         config = yaml.safe_load(f)
 
-    return WeightedMultiTask.from_config(config)
+    return WeightedMultiTask.from_config(
+        config,
+        parallel_generation_tasks=parallel_generation_tasks,
+    )
 
 
 _INFERENCE_INTERFACE = None
@@ -294,7 +298,7 @@ _ROLLOUT_GENERATOR = None
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
     if not args.rl_partial_rollouts or _ROLLOUT_GENERATOR is None:
-        agent = get_agent(args)
+        agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
         # Collect Rollouts
         request = GroupedRolloutRequest(
             num_groups=-1 if args.rl_partial_rollouts else n_prompts,
@@ -328,7 +332,7 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     assert (
-        n_prompts % mpu.get_expert_data_parallel_world_size() == 0
+        n_prompts % mpu.get_data_parallel_world_size() == 0
     ), "n_prompts must be divisible by data_parallel_world_size"
 
     with nvtx_range("rollout-collection"):
@@ -862,11 +866,13 @@ def prepare_data_for_update(
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
-        if (expert_data_parallel_world_size := mpu.get_expert_data_parallel_world_size()) > 0:
-            data_split_size = len(rollouts) // expert_data_parallel_world_size
+        # Note :- For EP, do not use the expert data parallel group here. Always 
+        # use the regular data parallel group. 
+        if (data_parallel_world_size := mpu.get_data_parallel_world_size()) > 0:
+            data_split_size = len(rollouts) // data_parallel_world_size
             data_split_range = (
-                mpu.get_expert_data_parallel_rank() * data_split_size,
-                (mpu.get_expert_data_parallel_rank() + 1) * data_split_size,
+                mpu.get_data_parallel_rank() * data_split_size,
+                (mpu.get_data_parallel_rank() + 1) * data_split_size,
             )
             rollouts = rollouts[data_split_range[0] : data_split_range[1]]
             # First we calculate them on a global level and then we split and recalculate on a local level.
@@ -931,7 +937,7 @@ def prepare_data_for_update(
 
             # Wrap forward_backward_func for Full iteration CUDA graph
             forward_backward_func = get_forward_backward_func()
-            if args.enable_cuda_graph and args.cuda_graph_scope == "full_iteration":
+            if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
                 forward_backward_func = FullCudaGraphWrapper(
                     forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
                 )

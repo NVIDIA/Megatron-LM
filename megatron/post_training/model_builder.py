@@ -24,6 +24,8 @@ from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 
+from megatron.post_training.utils import print_distributed_quant_summary
+
 
 def count_parameters_in_layer(model, layer_name):
     num_params = 0
@@ -334,5 +336,6 @@ def modelopt_gpt_mamba_builder(
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
         # Also remove KD mode state to prevent issues with re-conversion after restore.
         mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
-
+    
+    print_distributed_quant_summary(model)
     return model
