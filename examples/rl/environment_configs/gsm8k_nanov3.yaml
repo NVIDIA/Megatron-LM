@@ -2,5 +2,9 @@
   agent_args:
     answer_format: "boxed"
     format_reward: 0.5
+    assistant_suffix: "Assistant: "
+    chat_mode: true
+    negative_reward: 0.0
+    partial_end_reward: 0.75
   weight: 1.0
   evaluation_only: false
