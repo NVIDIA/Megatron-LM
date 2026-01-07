@@ -57,8 +57,17 @@ class ParameterMetadata:
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
 
-    # Canonicalization for EP per-expert params
+    # Canonical name for matching parameters across models with different EP configurations.
+    # Under Expert Parallelism (EP), each rank owns a subset of experts with local indices
+    # (e.g., rank 1 has "weight0" locally, but it's actually global expert 4). The raw param
+    # name can't be used to match across source/destination because the same local name refers
+    # to different global experts on different ranks. resolved_name remaps local expert indices
+    # to global indices (e.g., "layer.experts.weight0" on rank 1 → "layer.experts.weight4"),
+    # enabling the resharding planner to correctly look up and match expert parameters across
+    # models regardless of how EP is configured. For non-EP params, resolved_name == name.
     resolved_name: Optional[str] = None
+    # The global expert index this parameter belongs to (e.g., 4 for global expert 4).
+    # Computed alongside resolved_name; None for non-EP or fused expert tensors.
     global_expert_index: Optional[int] = None
 
 

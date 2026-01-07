@@ -34,6 +34,7 @@ try:
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
+from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
@@ -57,9 +58,6 @@ from megatron.core.utils import (
     get_pg_rank,
     StragglerDetector,
 )
-from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.process_groups_config import ProcessGroupCollection
-
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.pipeline_parallel.utils import (
@@ -732,62 +730,14 @@ def pretrain(
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
-        pg_collection = None
         if args.rl_inference_tensor_model_parallel_size is not None:
-            print_rank_0(f"Setting tensor model parallel size to {args.rl_inference_tensor_model_parallel_size} for inference model")
-            # Build custom process groups for inference with a different TP size, keeping CP and PP the same as training
-            tp_size = args.rl_inference_tensor_model_parallel_size
-            #TODO(peter): Get these from args when we want to support other parallelism changes
-            cp_size = mpu.get_context_parallel_world_size()
-            pp_size = mpu.get_pipeline_model_parallel_world_size()
-            ep_size = mpu.get_expert_model_parallel_world_size()
-            dp_size = args.world_size // (tp_size * cp_size * pp_size)
-            assert dp_size >= 1 and (tp_size * cp_size * pp_size * dp_size) == args.world_size, \
-                "World size must be divisible by tp*cp*pp for inference PG layout"
-            # Default mpu order is 'tp-cp-ep-dp-pp', unless use_tp_pp_dp_mapping is set.
-            grid_order = 'tp-cp-ep-pp-dp' if args.use_tp_pp_dp_mapping else 'tp-cp-ep-dp-pp'
-            if args.use_tp_pp_dp_mapping:
-                # Order: tp-cp-ep-pp-dp (pp before dp)
-                grid = HyperCommGrid([tp_size, cp_size, ep_size, pp_size, dp_size], ["tp", "cp", "ep", "pp", "dp"])
-            else:
-                # Order: tp-cp-ep-dp-pp (dp before pp) - this is the default
-                grid = HyperCommGrid([tp_size, cp_size, ep_size, dp_size, pp_size], ["tp", "cp", "ep", "dp", "pp"])
-            tp_group = grid.create_pg("tp")
-            cp_group = grid.create_pg("cp")
-            pp_group = grid.create_pg("pp")
-            ep_group = grid.create_pg("ep")
-            dp_group = grid.create_pg("dp")
-            # Composite groups required by MoE/router and some utilities
-            tp_cp_group = grid.create_pg(["tp", "cp"])
-            mp_group = grid.create_pg(["tp", "cp", "ep", "pp"])
-            tp_ep_group = grid.create_pg(["tp", "ep"])
-            tp_ep_pp_group = grid.create_pg(["tp", "ep", "pp"])
-            dp_cp_group = grid.create_pg(["cp", "dp"])
-            tp_dp_cp_group = grid.create_pg(["tp", "cp", "dp"])
-            embd_group_ranks = mpu.default_embedding_ranks(
-                torch.distributed.get_process_group_ranks(pp_group)
+            print_rank_0(
+                f"Setting tensor model parallel size to {args.rl_inference_tensor_model_parallel_size} for inference model"
             )
-            embd_group = torch.distributed.new_group(ranks=embd_group_ranks)
-            pos_embd_group_ranks = mpu.default_position_embedding_ranks(
-                torch.distributed.get_process_group_ranks(pp_group)
-            )
-            pos_embd_group = torch.distributed.new_group(ranks=pos_embd_group_ranks)
-            inference_pg_collection = ProcessGroupCollection(
-                tp=tp_group,
-                cp=cp_group,
-                pp=pp_group,
-                ep=ep_group,
-                embd=embd_group,
-                pos_embd=pos_embd_group,
-                dp=dp_group,
-                tp_cp=tp_cp_group,
-                mp=mp_group,
-                expt_tp=tp_group,
-                expt_dp=dp_group,
-                tp_ep=tp_ep_group,
-                tp_ep_pp=tp_ep_pp_group,
-                dp_cp=dp_cp_group,
-                tp_dp_cp=tp_dp_cp_group,
+            inference_pg_collection = build_inference_pg_collection(
+                tp_size=args.rl_inference_tensor_model_parallel_size,
+                world_size=args.world_size,
+                use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
             )
 
             # Build an isolated inference config so training config remains unchanged
@@ -814,16 +764,6 @@ def pretrain(
                 )
             inference_model[0].eval()
 
-            # If requested, immediately prefetch weights to CPU to keep them off GPU when idle.
-            if (
-                uvm_mempool is not None
-                and args.rl_offload_inference_model_weights_when_idle
-            ):
-                inference_core = unwrap_model(inference_model[0])
-                advise_managed_module_parameters_preferred_location(inference_core, device=-1, include_buffers=True)
-                nbytes = prefetch_managed_module_parameters(inference_core, device=-1, include_buffers=True)
-                torch.cuda.synchronize()
-                print_rank_0(f"[Rank 0] initially offloaded {nbytes / 1024**2:.2f} MB of separate RL inference model weights to CPU (other ranks may vary)")
 
 
     # Data stuff.
