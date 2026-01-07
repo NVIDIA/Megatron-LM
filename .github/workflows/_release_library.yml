@@ -93,6 +93,7 @@ jobs:
           SRC_DIR: ''
           PYPROJECT_NAME: 'megatron.core'
         run: |
+          set +u
           cd ${{ github.run_id }}
 
           PACKAGE_INFO_FILE="$SRC_DIR${PYPROJECT_NAME//.//}/package_info.py"
@@ -131,6 +132,8 @@ jobs:
           SRC_DIR: 'megatron/core/distributed/fsdp/src/'
           PYPROJECT_NAME: 'megatron_fsdp'
         run: |
+          set +u
+          
           cd ${{ github.run_id }}
 
           PACKAGE_INFO_FILE="$SRC_DIR${PYPROJECT_NAME//.//}/package_info.py"
