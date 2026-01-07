@@ -53,6 +53,7 @@ DOCKER_BUILDKIT=1 docker build \
     --cache-from type=registry,ref=${IMAGE}-buildcache:dev \
     --cache-from type=registry,ref=${IMAGE}-buildcache:main \
     --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
+    --provenance=false \
     --push \
     --progress plain \
     ${ADDITIONAL_PARAMS[@]} .
