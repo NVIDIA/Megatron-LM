@@ -111,6 +111,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
+                enable_fine_grained_param_gather_hook=(
+                    config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
+                ),
             ),
         )
         self.param_and_grad_buffer = self.module.param_and_grad_buffer
@@ -123,6 +126,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.broadcast_params = self.module.broadcast_params
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
+        self.module.config = config
 
         self.sync_rng_states_across_tp_group()
 

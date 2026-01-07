@@ -5,6 +5,9 @@ ENV_VARS:
   NCCL_NVLS_ENABLE: 0
   PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
+  NVTE_FUSED_ATTN: 0
+  NCCL_ALGO: ^NVLS
+  CUBLAS_WORKSPACE_CONFIG: ':4096:8'
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
@@ -29,8 +32,6 @@ MODEL_ARGS:
   --exit-duration-in-mins: 230
   --no-check-for-nan-in-loss-and-grad: true
   --no-rope-fusion: true
-  --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: native
   --manual-gc: true
   --manual-gc-interval: 100
   --recompute-granularity: selective
