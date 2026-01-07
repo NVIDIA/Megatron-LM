@@ -8,7 +8,8 @@ assignees: ''
 ---
 
 **Describe the regression**
-A clear and concise description of what the regression is.
+A clear and concise description of what the regression is. Tag the [@megatron-oncall](https://github.com/orgs/NVIDIA/teams/megatron-oncall) 
+to get oncall's attention to this issue.
 
 **To Reproduce**
 Steps to reproduce the behavior. The easier it is to reproduce the faster it will get maintainer attention.

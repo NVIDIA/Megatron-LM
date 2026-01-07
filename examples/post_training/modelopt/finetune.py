@@ -8,8 +8,6 @@ import sys
 from functools import partial
 from typing import Any, Dict, Optional
 
-import jsonlines
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 import datasets
@@ -110,13 +108,21 @@ class SFTDataset(torch.utils.data.Dataset):
         "Open-Orca/OpenOrca": "{{ messages['question'] + ' ' + messages['response'] + ' ' }}",
     }
 
+    @classmethod
+    def _wildcard_get(cls, directory: Dict[str, Any], name: str, default_value=None):
+        ret = default_value
+        for key, val in directory.items():
+            if key in name:
+                ret = val
+                break
+        return ret
+
     def __init__(
         self,
         num_packed_samples: int,
-        data_path: Optional[str],
+        hf_dataset: str,
         tokenizer: transformers.PreTrainedTokenizerBase,
         seq_length: int,
-        hf_dataset: Optional[str] = None,
         num_shards: int = 1,
         shard_index: int = 0,
     ):
@@ -129,20 +135,20 @@ class SFTDataset(torch.utils.data.Dataset):
         until the packed dataset has sufficient length.
 
         Args:
-            data_path: Path to the json or jsonl file
             num_packed_samples: total number of packed samples (cyclic access)
-            tokenizer: hf tokenizer
+            hf_dataset: Huggingface dataset name or local path
+            tokenizer: Huggingface PreTrainedTokenizer instance
             seq_length: max sequence length
-            hf_dataset: not supported yet
+            num_shards: number of shards for distributed training
+            shard_index: shard index for distributed training
         """
         if not isinstance(tokenizer, transformers.PreTrainedTokenizerBase):
             raise ValueError("SFTDataset only supports transformers.PreTrainedTokenizerBase!")
 
         self.num_packed_samples = num_packed_samples
-        self.data_path = data_path
+        self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.seq_length = seq_length
-        self.hf_dataset = hf_dataset
         self.data_transformation = lambda data: data
         self.num_shards = num_shards
         self.shard_index = shard_index
@@ -155,42 +161,32 @@ class SFTDataset(torch.utils.data.Dataset):
             REMOVE_THINK_CHAT_TEMPLATE, ""
         )
 
-        if data_path is not None:
-            if data_path.endswith(".json"):
-                self._raw_samples = json.load(open(data_path))
-            elif data_path.endswith(".jsonl"):
-                with jsonlines.open(data_path, mode='r') as reader:
-                    self._raw_samples = [obj for obj in reader]
-            else:
-                raise ValueError("data_path must be json or jsonl")
-        elif self.hf_dataset is not None:
-            hf_dataset_kwargs = SFTDataset.hf_dataset_to_kwargs.get(
-                self.hf_dataset, {"split": "train"}
-            )
-            self._raw_samples = datasets.load_dataset(self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs)
-            self._raw_samples = self._raw_samples.shard(
-                num_shards=self.num_shards, index=shard_index
-            )
+        hf_dataset_kwargs = SFTDataset.hf_dataset_to_kwargs.get(
+            self.hf_dataset, {"split": "train"}
+        )
+        self._raw_samples = datasets.load_dataset(self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs)
+        self._raw_samples = self._raw_samples.shard(
+            num_shards=self.num_shards, index=shard_index
+        )
 
-            print(
-                "Rank {:3}/{:3} creates SFT data shard {:3}/{:3} with {:10} raw samples".format(
-                    torch.distributed.get_rank(),
-                    torch.distributed.get_world_size(),
-                    self.shard_index,
-                    self.num_shards,
-                    len(self._raw_samples),
-                ),
-                flush=True,
-            )
-
-        else:
-            raise ValueError("Either hf_dataset or data_path must be provided!")
+        print(
+            "Rank {:3}/{:3} creates SFT data shard {:3}/{:3} with {:10} raw samples".format(
+                torch.distributed.get_rank(),
+                torch.distributed.get_world_size(),
+                self.shard_index,
+                self.num_shards,
+                len(self._raw_samples),
+            ),
+            flush=True,
+        )
 
         if self.tokenizer.chat_template is None:
             self.tokenizer.chat_template = SFTDataset.hf_dataset_to_prompt_template
         elif self.hf_dataset is not None:
-            self.data_transformation = SFTDataset.hf_dataset_to_conversation.get(
-                self.hf_dataset, lambda data: data
+            self.data_transformation = SFTDataset._wildcard_get(
+                SFTDataset.hf_dataset_to_conversation,
+                self.hf_dataset,
+                default_value=lambda data: data,
             )
 
         if self.tokenizer.chat_template is None:
@@ -361,23 +357,17 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
         print_rank_0("> finished creating offline SFT datasets ...")
     else:
         kwargs = {
+            "hf_dataset": args.finetune_hf_dataset,
             "tokenizer": tokenizer._tokenizer,
             "seq_length": args.seq_length,
             # Optional kwargs
-            "hf_dataset": args.finetune_hf_dataset,
             "num_shards": mpu.get_expert_data_parallel_world_size(),
             "shard_index": mpu.get_expert_data_parallel_rank(),
         }
 
-        data_path = [
-            args.train_data_path[0] if args.train_data_path else None,
-            args.valid_data_path[0] if args.valid_data_path else None,
-            args.test_data_path[0] if args.test_data_path else None,
-        ]
-
-        train_ds = SFTDataset(train_val_test_num_samples[0], data_path[0], **kwargs)
-        valid_ds = SFTDataset(train_val_test_num_samples[1], data_path[1], **kwargs)
-        test_ds = SFTDataset(train_val_test_num_samples[2], data_path[2], **kwargs)
+        train_ds = SFTDataset(train_val_test_num_samples[0], **kwargs)
+        valid_ds = SFTDataset(train_val_test_num_samples[1], **kwargs)
+        test_ds = SFTDataset(train_val_test_num_samples[2], **kwargs)
 
         print_rank_0("> finished creating SFT datasets ...")
 
