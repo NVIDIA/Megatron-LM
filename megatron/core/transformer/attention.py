@@ -23,9 +23,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import (
-    all_gather_last_dim_from_tensor_parallel_region,
-)
+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -417,9 +415,7 @@ class Attention(MegatronModule, ABC):
         ), "Virtual pipeline parallelism is not supported for inference"
 
         # Import here to avoid circular imports
-        from megatron.core.transformer.transformer_layer import (
-            get_transformer_layer_offset,
-        )
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
         return get_transformer_layer_offset(
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
