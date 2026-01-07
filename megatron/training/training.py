@@ -12,7 +12,7 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import torch.distributed
 
@@ -64,6 +64,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
+from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -1172,17 +1173,9 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     else:
         raise ValueError("Invalid optimizer type!")
 
-    # Construct the appropriate config_overrides object.
-    # TODO: add more logic here as needed down the road.
-    if args.decoupled_lr is not None:
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        decoupled_optimizer_config = copy.deepcopy(config)
-        decoupled_optimizer_config.lr = args.decoupled_lr
-        if args.decoupled_min_lr is not None:
-            decoupled_optimizer_config.min_lr = args.decoupled_min_lr
-        config_overrides = {decoupled_param_key: decoupled_optimizer_config}
-    else:
-        config_overrides = None
+    # Construct the appropriate config_overrides object. This default handles many cases, but
+    #  can be added to as needed by the user, or replaced entirely with a custom override.
+    config_overrides = get_standard_config_overrides(args.decoupled_lr, args.decoupled_min_lr)
 
     return config, config_overrides
 

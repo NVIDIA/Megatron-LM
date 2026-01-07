@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 from datetime import timedelta
 
@@ -27,8 +28,8 @@ class TestModel(torch.nn.Module):
 
 class Utils:
 
-    world_size = int(os.environ['WORLD_SIZE'])
-    rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    rank = int(os.environ.get('LOCAL_RANK', '0'))
     inited = False
     store = None
 
