@@ -200,21 +200,6 @@ class MegatronOptimizer(ABC):
     def clip_grad_norm(self, clip_grad: float) -> float:
         """Compute and return grad norm, also clip grads."""
         params = self.get_parameters()
-
-        # Gradient clipping in Megatron-FSDP can be achieved using torch built-in functions.
-        if self.config.mfsdp_use_torch_native_grad_clip:
-            mfsdp_param_count = sum(
-                1 for param in params if getattr(param, "__fsdp_param__", False)
-            )
-            assert mfsdp_param_count in [
-                0,
-                len(params),
-            ], "Either all or none of the parameters should be FSDP parameters."
-            if mfsdp_param_count == len(params):
-                # All parameters are FSDP parameters, so we skip clipping here
-                # as FSDP will handle it internally.
-                return torch.nn.utils.clip_grad_norm_(params, clip_grad).item()
-
         if params:
             grads_for_norm = self.get_main_grads_for_grad_norm()
         else:

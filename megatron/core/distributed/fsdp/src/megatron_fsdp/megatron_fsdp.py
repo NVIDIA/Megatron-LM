@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.import functools
 
+import functools
 import importlib
 import logging
 from contextlib import contextmanager
@@ -20,8 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
-from .fsdp_hook_utils import register_backward_hook, register_post_backward_hook
 from .utils import FSDPDistributedIndex
 
 logger = logging.getLogger(__name__)
@@ -406,10 +407,6 @@ class MegatronFSDP(torch.nn.Module):
         if self.data_parallel_sharding_strategy == "no_shard":
             return
 
-        # Ensure parameters are replaced with raw parameters.
-        self._replace_param_with_raw_if_needed()
-
-        # All-gather the parameters.
         ag_pipeline = self.all_gather_pipeline
         # Only all-gather HSDP buffer parameters in the beginning of a new optimization
         # step cycle, or on every step if model_auto_sync is enabled, i.e. update
@@ -625,6 +622,57 @@ class MegatronFSDP(torch.nn.Module):
             )
             return args, kwargs
 
+        def _register_post_backward_hook(
+            post_backward_hook: callable,
+            module: nn.Module,
+            args: Tuple[Any, ...],
+            kwargs: Dict[str, Any],
+        ):
+            """
+            Pre-forward hook utilized to attach a gradient reduction post-backward
+            hook to the module.
+            """
+            # Register the backward function to reduce gradients after the backward pass.
+            # And for optim_grads_params, we need to release the parameters after the backward pass.
+            if not torch.is_grad_enabled():
+                return args, kwargs
+
+            # Preprocess the input arguments.
+            args_list, args_spec = tree_flatten(args)
+            kwargs_list, kwargs_spec = tree_flatten(kwargs)
+            args_kwargs_list = list(args_list) + list(kwargs_list)
+            inp_tensor_indices: List[int] = []
+            inp_tensors: List[torch.Tensor] = []
+            for i, obj in enumerate(args_kwargs_list):
+                if torch.is_tensor(obj) and obj.requires_grad:
+                    inp_tensor_indices.append(i)
+                    inp_tensors.append(obj)
+
+            if len(inp_tensors) == 0:
+                return args, kwargs
+
+            """
+            Bootstrapped identity autograd function that attaches a post-backward
+            "hook" to the module to trigger model resharding / deallocation and
+            gradient reduce-scatter immediately after the module backward pass has
+            completed to deallocate this layer's model and gradient memory before
+            the subsequent backward pass.
+            """
+            inp_tensors = RegisterFSDPBackwardFunction.apply(
+                functools.partial(post_backward_hook, module), *inp_tensors
+            )
+
+            # Post-process the input arguments for input into the module.
+            for inp_tensor_idx, inp_tensor in zip(inp_tensor_indices, inp_tensors):
+                args_kwargs_list[inp_tensor_idx] = inp_tensor
+            args_list = args_kwargs_list[: len(args_list)]
+            kwargs_list = args_kwargs_list[len(args_list) :]
+            args = tree_unflatten(args_list, args_spec)
+            kwargs = tree_unflatten(kwargs_list, kwargs_spec)
+
+            # Return original input to the module forward pass.
+            return args, kwargs
+
         def _root_post_backward(*unused):
             # Make sure all the gradients are handled.
             for param in self._params_require_handle_grad:
@@ -736,6 +784,39 @@ class MegatronFSDP(torch.nn.Module):
         def _release_module_fp8_transpose_cache(module: nn.Module, *unused):
             release_params_fp8_transpose_cache(module.parameters(recurse=False))
 
+        def create_custom_backward_hook(module, custom_backward_handler):
+            """
+            Creates a custom backward hook via attaching a gradient-triggered hook
+            to the output tensor(s) of a module during a post-forward hook.
+            """
+
+            def forward_hook(_module, inputs, output):
+                # Replace the output to avoid the output tensor being the same as
+                # the input tensor, which makes it impossible to identify which
+                # layer's output it is. Using view_as to make it does not cause
+                # additional memory consumption.
+                output = tree_map(lambda t: t.view_as(t) if torch.is_tensor(t) else t, output)
+
+                output_list = []
+
+                # Post-process forward output.
+                if isinstance(output, torch.Tensor):
+                    output_list = [output]
+                elif isinstance(output, (tuple, list)):
+                    output_list = [t for t in output if isinstance(t, torch.Tensor)]
+
+                # Register pre-backward hook on the output tensor(s). This hook
+                # will trigger immediately after the gradients of the output
+                # tensor(s) have been computed.
+                torch.autograd.graph.register_multi_grad_hook(
+                    output_list, lambda grads: custom_backward_handler(_module, grads), mode="any"
+                )
+                return output
+
+            # Register the post-forward hook that attaches the custom backward hook
+            # on the output tensor(s).
+            return module.register_forward_hook(forward_hook)
+
         fsdp_modules = []
         for name, module in root_module.named_modules():
             # Skip if the module is already registered in fsdp_modules.
@@ -765,7 +846,7 @@ class MegatronFSDP(torch.nn.Module):
                 # immediately before the backward pass via attaching a gradient-triggered
                 # hook to the output tensor(s) of a module during a post-forward hook.
                 self.backward_pre_hooks[f"all-gather module {name} parameters"] = (
-                    register_backward_hook(module, _pre_backward)
+                    create_custom_backward_hook(module, _pre_backward)
                 )
             elif (
                 not self.ddp_config.keep_fp8_transpose_cache
@@ -783,7 +864,10 @@ class MegatronFSDP(torch.nn.Module):
             # reduce-scatter gradients immediately after the module backward pass
             # has completed to conserve memory for the subsequent backward pass.
             self.forward_pre_hooks[f"module {name} register post-backward hook"] = (
-                register_post_backward_hook(module, _post_backward)
+                module.register_forward_pre_hook(
+                    functools.partial(_register_post_backward_hook, _post_backward),
+                    with_kwargs=True,
+                )
             )
 
         # Register root module pre- and post-backward hooks in cases where the
@@ -797,10 +881,12 @@ class MegatronFSDP(torch.nn.Module):
             # to the backward pass.
             # Furthermore, add a gradient-triggered post-backward hook to reduce-scatter
             # leftover gradients.
-            self.backward_pre_hooks[f"{name} _root_pre_backward"] = register_backward_hook(
+            self.backward_pre_hooks[f"{name} _root_pre_backward"] = create_custom_backward_hook(
                 module, _root_pre_backward
             )
-        self._root_pre_backward_hook_handle = register_backward_hook(module, _root_pre_backward)
+        self._root_pre_backward_hook_handle = create_custom_backward_hook(
+            module, _root_pre_backward
+        )
 
         # Register post load state_dict hook to ensure that the module parameters
         # are properly updated.
@@ -1097,6 +1183,30 @@ class MegatronFSDP(torch.nn.Module):
             # Call the forward pass of the wrapped module.
             output = self.module.forward(*inputs, **kwargs)
             return output
+
+
+class RegisterFSDPBackwardFunction(torch.autograd.Function):
+    """
+    Register a backward function that will be called after the backward pass
+    of the model. This function is used to release the parameters after the
+    backward pass.
+    """
+
+    @staticmethod
+    def forward(ctx, post_backward, *inputs: torch.Tensor):
+        """
+        Forward pass of the RegisterFSDPBackwardFunction function.
+        """
+        ctx.post_backward = post_backward
+        return inputs
+
+    @staticmethod
+    def backward(ctx, *grads: torch.Tensor):
+        """
+        Backward pass of the RegisterFSDPBackwardFunction function.
+        """
+        ctx.post_backward()
+        return (None,) + grads
 
 
 def _replace_module_parameter(module, name, new_param):
