@@ -5,6 +5,8 @@ ENV_VARS:
   NCCL_NVLS_ENABLE: 0
   PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
+  NCCL_ALGO: ^NVLS
+  CUBLAS_WORKSPACE_CONFIG: ":4096:8"
 
 MODEL_ARGS:
   # Transformer Engine args
@@ -17,7 +19,7 @@ MODEL_ARGS:
   --context-parallel-size: 1
   --expert-tensor-parallel-size: 1
   --use-distributed-optimizer: true
-  # NOTE: overlap-grad-reduce and overlap-param-gather require TE >= 2.9.0 with offloading
+  # NOTE: uncomment if TE >= 2.9.0
   # --overlap-grad-reduce: true
   # --overlap-param-gather: true
   --use-mcore-models: true
@@ -26,8 +28,6 @@ MODEL_ARGS:
   # MoE training related args
   --moe-grouped-gemm: true
   --moe-token-dispatcher-type: alltoall
-  --moe-permute-fusion: true
-  --save-interval: 25
   # Fine-grained activation offloading args
   --recompute-granularity: selective
   --recompute-modules: "[layernorm mla_up_proj mlp moe_act]"
@@ -35,13 +35,10 @@ MODEL_ARGS:
   --offload-modules: "[expert_fc1 moe_act attn_norm mlp_norm qkv_linear core_attn attn_proj]"
   # Add mixed precision args
   --bf16: true
-  --exit-interval: 50
   # kernel fusion related args
-  --no-rope-fusion: true
-  --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: native
+  --moe-permute-fusion: true
+  --moe-router-fusion: true
   # MISC
   --manual-gc: true
   --manual-gc-interval: 100
 TEST_TYPE: resume-ckpt
-

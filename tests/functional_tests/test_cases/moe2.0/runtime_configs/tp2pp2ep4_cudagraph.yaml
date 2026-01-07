@@ -6,6 +6,8 @@ ENV_VARS:
   NCCL_NVLS_ENABLE: 0
   PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
+  NCCL_ALGO: ^NVLS
+  CUBLAS_WORKSPACE_CONFIG: ":4096:8"
 
 MODEL_ARGS:
   # Transformer Engine args
@@ -27,24 +29,20 @@ MODEL_ARGS:
   # MoE training related args
   --moe-grouped-gemm: true
   --moe-token-dispatcher-type: alltoall
-  --moe-permute-fusion: true
-  --save-interval: 25
   # CUDA Graph args
   --cuda-graph-impl: transformer_engine
   --cuda-graph-scope: "[attn mlp moe_router moe_preprocess]"
-  --cuda-graph-warmup-steps: 0
+  --cuda-graph-warmup-steps: 1
   --te-rng-tracker: true
   # Add mixed precision args
   --bf16: true
   --fp8-format: hybrid
   --fp8-recipe: blockwise
   --first-last-layers-bf16: true
-  --exit-interval: 50
   # kernel fusion related args
-  --no-rope-fusion: true
-  --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: native
-  # Selective recompute for moe_act (required for scoped cuda graph)
+  --moe-permute-fusion: true
+  --moe-router-fusion: true
+  # Selective recompute for moe_act
   --recompute-granularity: selective
   --recompute-modules: "[moe_act]"
   # MISC
