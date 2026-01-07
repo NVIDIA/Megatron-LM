@@ -180,11 +180,11 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_scoped_cudagraph]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+  # - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_scoped_cudagraph]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100] # Flaky, non-determinism
   #######################################################################
   # Super important mr, mr-github tests that run for both DEV and LTS per mr, mr-github       #
   #######################################################################
