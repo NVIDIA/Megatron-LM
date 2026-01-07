@@ -2,8 +2,6 @@
 
 """Specs for Retro encoder."""
 
-from typing import cast
-
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -185,11 +183,10 @@ def get_retro_encoder_block_spec(
     )
     for submodules in (gpt_layer_submodules, retro_layer_submodules):
         submodules.self_attention.params["attn_mask_type"] = AttnMaskType.padding
-        cast(SelfAttentionSubmodules, submodules.self_attention.submodules).core_attention = (
-            ModuleSpec(
-                module=TEDotProductAttention if use_transformer_engine else DotProductAttention,
-                params={"attention_dropout": config.retro_encoder_attention_dropout},
-            )
+        assert isinstance(submodules.self_attention.submodules, SelfAttentionSubmodules)
+        submodules.self_attention.submodules.core_attention = ModuleSpec(
+            module=TEDotProductAttention if use_transformer_engine else DotProductAttention,
+            params={"attention_dropout": config.retro_encoder_attention_dropout},
         )
     gpt_layer_spec = ModuleSpec(
         module=TransformerLayer,

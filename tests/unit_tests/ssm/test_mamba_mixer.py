@@ -1,7 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import cast
-
 import pytest
 import torch
 
@@ -40,13 +38,16 @@ class TestMambaMixer:
             num_attention_heads=1,
             use_cpu_initialization=True,
         )
-        stack_submodules = cast(MambaStackSubmodules, mamba_stack_spec.submodules)
-        layer_submodules = cast(MambaLayerSubmodules, stack_submodules.mamba_layer.submodules)
-        modules = cast(MambaMixerSubmodules, layer_submodules.mixer.submodules)
+        assert isinstance(mamba_stack_spec.submodules, MambaStackSubmodules)
+        assert isinstance(mamba_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
+        assert isinstance(
+            mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            MambaMixerSubmodules,
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         mixer = MambaMixer(
             transformer_config,
-            modules,
+            mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
             transformer_config.hidden_size,
             layer_number=1,
             use_mem_eff_path=use_mem_eff_path,
@@ -125,14 +126,17 @@ class TestMambaMixerErrorChecks:
             use_cpu_initialization=True,
             mamba_num_groups=ngroups,
         )
-        stack_submodules = cast(MambaStackSubmodules, mamba_stack_spec.submodules)
-        layer_submodules = cast(MambaLayerSubmodules, stack_submodules.mamba_layer.submodules)
-        submodules = cast(MambaMixerSubmodules, layer_submodules.mixer.submodules)
+        assert isinstance(mamba_stack_spec.submodules, MambaStackSubmodules)
+        assert isinstance(mamba_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
+        assert isinstance(
+            mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            MambaMixerSubmodules,
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         with pytest.raises(AssertionError, match=expected_error_message):
             MambaMixer(
                 transformer_config,
-                submodules,
+                mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
                 transformer_config.hidden_size,
                 pg_collection=pg_collection,
             )
