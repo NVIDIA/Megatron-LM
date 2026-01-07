@@ -66,7 +66,6 @@ class GroupedMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts: int,
@@ -514,7 +513,6 @@ class TEGroupedMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts,
@@ -790,7 +788,6 @@ class SequentialMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts,
