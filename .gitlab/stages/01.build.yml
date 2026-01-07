@@ -99,7 +99,7 @@ test:build_image:
       - IMAGE: UTILITY_IMAGE
   stage: build
   tags:
-    - arch/${PLATFORM}
+    - arch/amd64
     - origin/jet-fleet
     - env/prod
     - purpose/builder-large
