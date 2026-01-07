@@ -60,6 +60,7 @@ jobs:
     with:
       dry-run: true
       ref: ${{ inputs.release-ref }}
+      no-publish: true
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
