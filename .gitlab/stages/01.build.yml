@@ -92,6 +92,7 @@ test:build_nemo_image:
 
 test:build_image:
   needs: [test:pre_build_image]
+  extends: [.build_rules, .dind_rules]
   parallel:
     matrix:
       - IMAGE: CI_MCORE_LTS_IMAGE
