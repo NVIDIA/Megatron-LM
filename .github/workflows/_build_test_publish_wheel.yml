@@ -173,6 +173,7 @@ jobs:
           TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
           TWINE_REPOSITORY: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'pypi' || 'testpypi' }}
+          PLATFORM: ${{ matrix.PLATFORM }}
         run: |
 
           # Delete sdist for arm64 since we already upload it with amd64.
