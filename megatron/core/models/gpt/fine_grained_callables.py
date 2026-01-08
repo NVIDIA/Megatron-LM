@@ -65,6 +65,7 @@ def should_free_input(name, is_moe, enable_deepep, enable_hybridep):
     free_input_nodes = {
         "mlp": not enable_hybridep,
         "moe_combine": True,
+        "post_combine": enable_deepep,
         # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
         # and probs before dispatch A2A and it's not needed anymore after the forward pass
         # For DeepEP and HybridEP dispatcher mode, they are both needed in backward pass
