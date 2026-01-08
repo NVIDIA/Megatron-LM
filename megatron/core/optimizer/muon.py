@@ -3,12 +3,13 @@
 """Megatron muon optimizer wrapper to handle tensor-parallel."""
 
 import logging
-from typing import Any, Callable, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core import parallel_state
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank
@@ -21,7 +22,7 @@ from .optimizer import (
     FP32Optimizer,
     MegatronOptimizer,
 )
-from .optimizer_config import OptimizerConfig
+from .optimizer_config import OptimizerConfig, ParamKey
 
 try:
     from emerging_optimizers.orthogonalized_optimizers import (
@@ -166,12 +167,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 def get_megatron_muon_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
-    no_weight_decay_cond: Optional[Callable] = None,
-    scale_lr_cond: Optional[Callable] = None,
-    lr_mult: float = 1.0,
-    use_gloo_process_groups: bool = True,
     layer_wise_distributed_optimizer: bool = False,
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
+    use_gloo_process_groups: bool = True,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    dump_param_to_param_group_map: Optional[str] = None,
 ) -> MegatronOptimizer:
     """This function is used to get the muon optimizer for the model chunks.
     It is used to get the muon optimizer for the model chunks.
@@ -179,16 +179,15 @@ def get_megatron_muon_optimizer(
     Args:
         config (OptimizerConfig): optimizer configuration object.
         model_chunks (List[MegatronModule]): model chunks to get optimizer for.
-        no_weight_decay_cond (func, optional): function to determine whether a parameter
-            should not perform weight decay. Defaults to None.
-        scale_lr_cond (func, optional): function to determine whether a parameter
-            should have a scaled learning rate. Defaults to None.
-        lr_mult (float, optional): learning rate multiplier for parameters that
-            satisfy scale_lr_cond. Defaults to 1.0.
-        use_gloo_process_groups (bool): if false, disable use of Gloo process groups
-            in underlying Megatron optimizers.
         layer_wise_distributed_optimizer (bool): if true, use layer-wise distributed optimizer.
             Defaults to False.
+        config_overrides (Optional[Dict[ParamKey, OptimizerConfig]]): optional dictionary of
+            optimizer configuration objects to override default optimizer behavior for different
+            subsets of parameters (identified by ParamKey).
+        use_gloo_process_groups (bool): if false, disable use of Gloo process groups
+            in underlying Megatron optimizers.
+        pg_collection: Optional unified process group for distributed training.
+        dump_param_to_param_group_map (Optional[str]): path to dump parameter to param group map.
     """
     assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
 
@@ -246,16 +245,7 @@ def get_megatron_muon_optimizer(
     for param in nonlinear_params:
         param.requires_grad = False
 
-    linear_param_groups = _get_param_groups(
-        model_chunks,
-        no_weight_decay_cond,
-        scale_lr_cond,
-        lr_mult,
-        lr=config.lr,
-        min_lr=config.min_lr,
-        decoupled_lr=config.decoupled_lr,
-        decoupled_min_lr=config.decoupled_min_lr,
-    )
+    linear_param_groups = _get_param_groups(model_chunks, config, config_overrides)
 
     optimizer = TensorParallelMuon(
         linear_param_groups,
@@ -331,7 +321,11 @@ def get_megatron_muon_optimizer(
 
     # call original get. linear params will be skipped since they're freezed
     chained_adam = get_megatron_optimizer(
-        config, model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult, use_gloo_process_groups
+        config,
+        model_chunks,
+        config_overrides=config_overrides,
+        use_gloo_process_groups=use_gloo_process_groups,
+        dump_param_to_param_group_map=dump_param_to_param_group_map,
     )
 
     # unfreeze everything

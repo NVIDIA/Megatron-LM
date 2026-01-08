@@ -61,6 +61,7 @@ class MambaLayer(GraphableMegatronModule):
         layer_number: int = 1,
         residual_in_fp32=False,
         pg_collection: ProcessGroupCollection = None,
+        pp_layer_offset: int = 0,
     ):
         """Initialize Mamba Layer."""
         super().__init__(config)
@@ -77,6 +78,7 @@ class MambaLayer(GraphableMegatronModule):
             d_model=self.config.hidden_size,
             layer_number=layer_number,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
         )
         self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
         self.mamba_bda = build_module(submodules.mamba_bda)
@@ -174,11 +176,11 @@ class MambaLayer(GraphableMegatronModule):
         # Training and validation mode CUDA graphs
         if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
             return True
-        # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
         elif not self.training and (
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
-            and kwargs['inference_context'].is_decode_only()
+            and kwargs.get('inference_context') is not None
         ):
-            return True
+            using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+            return using_cuda_graph
         return False
