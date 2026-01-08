@@ -74,7 +74,7 @@ dev = [
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
-    "multi-storage-client~=0.27",
+    "multi-storage-client~=0.36; sys_platform != 'win32'",
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
