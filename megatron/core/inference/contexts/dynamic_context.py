@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -464,28 +464,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
 
-        # Attention metadata initialization (tensors are now handled by MHAMetadata classes)
-
-        self.num_prefill_requests = 0
-        self.graph_attn_metadata = {}
-        self.non_graph_attn_metadata = {}
-        self.active_attn_metadata = None
-
-        self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
-            block_count_total=self.block_allocator.total_count,
-            max_kv_block_count=self.max_kv_block_count,
-            max_requests=self.max_total_requests,
-            block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
-        )
-
-        self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
-            block_count_total=self.block_allocator.total_count,
-            max_kv_block_count=self.max_kv_block_count,
-            max_requests=self.max_total_requests,
-            block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
-        )
+        # FlashInfer.
+        if use_flashinfer_fused_rope is True:
+            assert HAVE_FLASHINFER, "flashinfer is not installed"
+        elif use_flashinfer_fused_rope is None:
+            use_flashinfer_fused_rope = HAVE_FLASHINFER
+        self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
 
         # CUDA graph config list
         is_expert_parallel = parallel_state.get_expert_model_parallel_world_size() > 1
@@ -507,12 +491,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
 
-        # FlashInfer.
-        if use_flashinfer_fused_rope is True:
-            assert HAVE_FLASHINFER, "flashinfer is not installed"
-        elif use_flashinfer_fused_rope is None:
-            use_flashinfer_fused_rope = HAVE_FLASHINFER
-        self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
+        # Attention metadata initialization (padding is now handled by MHAMetadata classes)
+        self.num_prefill_requests = 0
+        self.graph_attn_metadata = {}
+        self.non_graph_attn_metadata = {}
+        self.active_attn_metadata = None
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
@@ -600,6 +583,28 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
+        # Static tensor addresses of active slices to enable fast inference kernels.
+        self.active_request_metadata: Dict[str, Tensor] = {}
+        for label, _, on_gpu in self.request_metadata_types:
+            if on_gpu:
+                tensor = torch.empty_like(self.request_metadata[label])
+            else:
+                tensor = torch.empty_like(
+                    self.request_metadata[label], device="cpu", pin_memory=True
+                )
+            self.active_request_metadata[label] = tensor
+
+        self.active_request_ids = torch.empty_like(self.request_ids, dtype=torch.int64)
+        self.active_request_query_lengths = torch.empty_like(self.request_query_lengths)
+        self.active_request_output_lengths = torch.empty_like(self.request_output_lengths)
+        self.active_request_kv_length_offsets = torch.empty_like(self.request_kv_length_offsets)
+        self.active_request_to_kv_block_ids = torch.empty_like(self.request_to_kv_block_ids)
+
+        self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
+        self.cu_active_request_query_lengths = torch.empty_like(self.request_query_lengths)
+        self.active_sequence_lengths = torch.empty_like(self.request_query_lengths)
+        self.cu_active_sequence_lengths = torch.empty_like(self.request_query_lengths)
+
         # Memory buffer.
         def allocate_memory_buffer():
             """Allocate the memory buffer. This function is called below within
@@ -663,7 +668,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             allocate_mamba_states()
 
         # Reset attention and Mamba state.
-        self.reset_attention_state()
+        self.reset_attention_state(is_init=True)
         self.reset_mamba_state()
 
     def deallocate_all_tensors(self):
@@ -832,19 +837,79 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_attn_metadata["mha_metadata"].state_data["max_seqlen_k"],
         )
 
-    def get_active_sequence_lengths(self) -> Tensor:
-        """Total sequence length (query + key) for active requests."""
-        lengths = self.request_kv_length_offsets + self.request_query_lengths
-        lengths = lengths[self.paused_request_count : self.total_request_count]
-        return lengths
-
-    def get_max_sequence_lengths(self) -> Tensor:
-        """Maximum sequence length for active requests."""
-        return self.request_output_lengths[self.paused_request_count : self.total_request_count]
-
     def get_active_request_count(self):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
+
+    def build_active_slices(self, batch_size: int):
+        """Build the active slices of specific tensors. This is run on every forward step.
+
+        If the context is reordered to active -> paused -> finished, this can be graphed.
+        """
+        padded_slice = slice(self.paused_request_count, self.paused_request_count + batch_size)
+
+        # Request metadata all needs to be sliced.
+        for label, _, _ in self.request_metadata_types:
+            self.active_request_metadata[label][:batch_size].copy_(
+                self.request_metadata[label][padded_slice], non_blocking=True
+            )
+
+        # The following tensor slices are used in various kernels.
+        self.active_request_ids[:batch_size].copy_(self.request_ids[padded_slice])
+        self.active_request_query_lengths[:batch_size].copy_(
+            self.request_query_lengths[padded_slice]
+        )
+        self.active_request_output_lengths[:batch_size].copy_(
+            self.request_output_lengths[padded_slice]
+        )
+        self.active_request_kv_length_offsets[:batch_size].copy_(
+            self.request_kv_length_offsets[padded_slice]
+        )
+        self.active_request_to_kv_block_ids[:batch_size].copy_(
+            self.request_to_kv_block_ids[padded_slice]
+        )
+
+        self.active_request_output_lengths[:batch_size].copy_(
+            self.request_output_lengths[padded_slice]
+        )
+        self.active_request_kv_length_offsets[:batch_size].copy_(
+            self.request_kv_length_offsets[padded_slice]
+        )
+        self.active_request_to_kv_block_ids[:batch_size].copy_(
+            self.request_to_kv_block_ids[padded_slice]
+        )
+
+        graph_scratch_space = torch.cumsum(self.active_request_query_lengths[:batch_size], dim=0)
+        self.active_request_last_token_idxs[:batch_size].copy_(graph_scratch_space - 1)
+        graph_scratch_space[-1] = 0
+        self.cu_active_request_query_lengths[:batch_size].copy_(graph_scratch_space.roll(1, 0))
+
+        self.active_sequence_lengths[:batch_size].copy_(
+            (self.active_request_query_lengths + self.active_request_kv_length_offsets)[:batch_size]
+        )
+        graph_scratch_space = torch.cumsum(self.active_sequence_lengths[:batch_size], dim=0)
+        graph_scratch_space[-1] = 0
+        self.cu_active_sequence_lengths[:batch_size].copy_(graph_scratch_space.roll(1, 0))
+
+    def pad_active_slices(self):
+        """Pad the active slices of specific tensors."""
+        # Some tensors need to be padded at the token level.
+        padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
+
+        self.token_to_block_idx[padding_token_slice] = self.block_allocator.dummy_block_idx
+        self.token_to_local_position_within_kv_block[padding_token_slice] = 0
+        self.token_to_position_in_request[padding_token_slice] = 0
+
+        # Other tensors need to be padded at the request level.
+        padding_request_slice = slice(
+            self.total_request_count - self.paused_request_count,
+            self.padded_active_request_count,
+        )
+
+        self.active_attn_metadata["mha_metadata"].update(
+            batch_dimensions=self.attn_dimensions,
+            padded_batch_dimensions=self.padded_batch_dimensions
+        )
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1035,8 +1100,38 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         return key
 
-    def reset_attention_state(self) -> None:
-        """Reset state used within attention, after each step."""
+    def reset_attention_state(self, *, is_init: bool = False) -> None:
+        """Reset state used within attention, after each step.
+
+        Args:
+            is_init (bool): True if this is being called from `__init__()`.
+        """
+        if is_init:
+            self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
+                block_count_total=self.block_allocator.total_count,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_total_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+                query_lengths_buf=self.active_request_query_lengths,
+                cu_query_seq_lengths_buf=self.cu_active_request_query_lengths,
+                kv_seq_lengths_buf=self.active_sequence_lengths,
+                cu_kv_seq_lengths_buf=self.cu_active_sequence_lengths,
+                block_table_buf=self.active_request_to_kv_block_ids,
+            )
+
+            self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
+                block_count_total=self.block_allocator.total_count,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_total_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+                query_lengths_buf=self.active_request_query_lengths,
+                cu_query_seq_lengths_buf=self.cu_active_request_query_lengths,
+                kv_seq_lengths_buf=self.active_sequence_lengths,
+                cu_kv_seq_lengths_buf=self.cu_active_sequence_lengths,
+                block_table_buf=self.active_request_to_kv_block_ids,
+            )
         # Attention metadata reset is now handled by MHAMetadata.reset()
         for attn_metadata in self.non_graph_attn_metadata.values():
             attn_metadata.reset()
@@ -1314,28 +1409,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        # Update token position indexes.
-        self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
-            self.block_allocator.dummy_block_idx
-        )
-        self.token_to_local_position_within_kv_block[
-            self.active_token_count : self.padded_active_token_count
-        ] = 0
-        self.token_to_position_in_request[
-            self.active_token_count : self.padded_active_token_count
-        ] = 0
+        self.build_active_slices(self.padded_active_request_count)
+        batch_size = self.total_request_count - self.paused_request_count
 
         self.active_attn_metadata = (
             self.graph_attn_metadata
             if self.using_cuda_graph_this_step()
             else self.non_graph_attn_metadata
         )
-
-        # Update cu_query_seq_lengths, max_seqlen_q.
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        query_lengths_view = self.request_query_lengths[active_slice]
-        request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
-        request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
@@ -1350,14 +1431,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     decode_req_count=adjusted_decode_req_count,
                     has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
                 )
+        self.attn_dimensions = attn_dimensions
 
-        self.active_attn_metadata["mha_metadata"].update(
-            request_query_lengths=query_lengths_view,
-            request_kv_length_offsets=request_kv_length_offsets_view,
-            request_to_kv_block_ids=request_to_kv_block_ids_view,
-            batch_dimensions=attn_dimensions,
-            padded_batch_dimensions=self.padded_batch_dimensions,
-        )
+        # Correctly pad to padded active token count.
+        self.pad_active_slices()
 
         if self.is_hybrid_model:
             active_mamba_indices_view = self.mamba_metadata.request_to_mamba_state_idx[active_slice]
@@ -1469,18 +1546,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"padded_active_token_count ({self.padded_active_token_count})."
         )
 
-        # Last token logits.
-        logits = logits.squeeze(0)
-        last_token_idxs = (
-            torch.cumsum(
-                self.request_query_lengths[self.paused_request_count : self.total_request_count],
-                dim=0,
-            )
-            - 1
-        )
-        last_token_logits = logits[last_token_idxs, :]
-
-        return last_token_logits
+        active_request_count = self.total_request_count - self.paused_request_count
+        return logits.squeeze(0)[self.active_request_last_token_idxs[:active_request_count], :]
 
     def check_availability(self, req: DynamicInferenceRequest) -> (bool, bool, bool):
         """
@@ -2001,76 +2068,206 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return newly_paused_request_ids
 
-    def calculate_log_probs(
-        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> Tuple[List[List[float]], Tensor]:
-        """Calculate log probs for all active requests and return them.
+    def select_log_prob_indices(
+        self, request_indices: Tensor, request_query_lengths: Tensor, active_mask: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Helper method for the log_prob calculation.
 
-        TODO: @wdykas support top-n log probs.
+        This method selects the logits that are relevant for the log_prob calculation,
+        and returns all indices necessary for the tensorized log_prob calculation.
+
+        Args:
+            request_indices (Tensor): A boolean map indicating which requests to include.
+            request_query_lengths (Tensor): self.request_query_lengths.
+            active_mask (Tensor): A boolean map indicating which requests are active.
+
+        Returns a Callable which, when invoked, return a Tuple composed of the following:
+            logit_indices (Tensor): Indices of logits corresponding to active requests,
+                masked by request_indices if provided.
+            masked_lengths (Tensor): Number of active tokens per request,
+                masked by request_indices if provided.
+            masked_ends (Tensor): End indices of active tokens per request,
+                masked by request_indices if provided.
+            masked_tokens (Tensor): Sampled token ID for all active tokens,
+                masked by request_indices if provided.
+                Note that this only provides real data for prefill requests. That is because
+                the final index of each request in this Tensor is dummy data: since sampling
+                has not yet taken place, there is no way to get the real token ID.
+                This is a 1D flattened tensor in the same manner as logit_indices.
+        """
+        # Get the cumulative lengths of all selected requests.
+        masked_lengths = request_query_lengths[request_indices]
+        cu_masked_lengths = masked_lengths.cumsum(0)
+
+        # Also get the relevant cumulative lengths of all requests.
+        cu_query_lengths = request_query_lengths.cumsum(0)
+        masked_ends = cu_query_lengths[request_indices] - 1
+
+        # Then create a tensor reflecting the indices of all selected tokens.
+        logit_indices_offset = torch.repeat_interleave(
+            masked_ends - cu_query_lengths, masked_lengths
+        )
+        logit_indices_range = torch.cumsum(torch.ones_like(logit_indices_offset), dim=0)
+        logit_indices = logit_indices_offset + logit_indices_range
+
+        # We shift the active token window left by one to remove the first prompt token for
+        # prefill requests and then set the token ids explicitly for the newly generated tokens.
+        # This is necessary because we calculate the log probs before updating the request metadata.
+        masked_tokens = self.token_to_input_ids[logit_indices].roll(-1, 0)
+
+        return (logit_indices, masked_lengths, masked_ends, masked_tokens)
+
+    def graphable_calculate_log_probs(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        logits_indices: Tensor,
+        masked_ends: Tensor,
+        masked_tokens: Tensor,
+        log_probs: Tensor,
+    ):
+        """Calculate log probs for all active requests and return them.
 
         Args:
             logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
             new_tokens (Tensor): The newly sampled tokens.
-            only_last_token_logits (bool): If set, the logits are from only the last token in each request
+            logits_indices (Tensor): Indices of logits corresponding to active requests.
+            masked_ends (Tensor): End indices of active tokens per request.
+            masked_tokens (Tensor): Sampled token ID for all active tokens.
+            log_probs (Tensor): A tensor in which to store the result.
+        """
+        masked_tokens[masked_ends] = new_tokens
+        selected_logits_squeezed = logits.squeeze(0)[logits_indices, masked_tokens].float()
+        log_probs[logits_indices, masked_tokens] = F.log_softmax(selected_logits_squeezed, dim=-1)
+
+    def calculate_log_probs(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        only_last_token_logits: Optional[bool] = False,
+        request_indices: Optional[Tensor] = None,
+        log_probs: Optional[Tensor] = None,
+    ) -> Tuple[List[List[float]], Tensor]:
+        """Calculate log probs for all active requests and return them.
+
+        Args:
+            logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
+            new_tokens (Tensor): The newly sampled tokens.
+            only_last_token_logits (bool): If set, logits are from the last token of each request.
+            request_indices (Optional[Tensor]): A boolean map indicating which requests to include.
+            log_probs (Optional[Tensor]): A tensor in which to store the result.
 
         Returns:
             List of lists where each inner list contains log probs for a request in the
             same order as the active requests (from paused_request_count to total_request_count).
             log_probs (Tensor): Used to compute top n logprobs later if required.
         """
+        if request_indices is None:
+            request_indices = torch.ones(
+                self.total_request_count, device=logits.device, dtype=torch.bool
+            )
+        if log_probs is None:
+            log_probs = torch.empty(
+                (logits.size(1), logits.size(2)), device=logits.device, dtype=torch.float32
+            )
 
-        # Calculate log_probs (sequence_length x vocab_size)
-        logits_squeezed = logits.squeeze(0).float()
+        active_mask = (
+            torch.arange(self.total_request_count, device=logits.device)
+            >= self.paused_request_count
+        )
+        (logit_indices, masked_lengths, masked_ends, masked_tokens) = self.select_log_prob_indices(
+            request_indices, self.request_query_lengths, active_mask
+        )
 
-        if only_last_token_logits or self.is_decode_only():
-            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
-            selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.tolist()], log_probs
-
-        log_probs = F.log_softmax(logits_squeezed, dim=-1)
-        # Get the selected token ids for all tokens.
-        # We shift the active token window left by one to remove the first prompt token for
-        # prefill requests and then set the token ids explicitly for the newly generated tokens.
-        # This is necessary because we calculate the log probs *before* updating the request metadata.
-        #
-        # Example (decode & prefill mix):
-        #
-        #   active_query_lengths: [ 1 | 1 | 2 | 5 ]
-        #
-        #   new_tokens          : [ 52 | 12 | 3 | 86 ]
-        #
-        #   seq_idx             : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
-        #
-        #   new_token_idx       : [ 0 | 1 | 3 | 8 ]
-        #
-        #   active_token_ids before left shift:
-        #                       : [ 31 | 75 | 45 16 | 90 12 72 24 88 ]
-        #
-        #   active_token_ids after shift:
-        #                       : [ XX | XX | 16 XX | 12 72 24 88 XX ]   (XX = undefined)
-        #
-        #   active_token_ids[new_token_idx] = new_tokens
-        #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
-        active_token_ids = self.token_to_input_ids[: self.active_token_count].roll(-1, 0)
-        active_query_lengths = self.request_query_lengths[
-            self.paused_request_count : self.total_request_count
-        ]
-        new_token_idx = active_query_lengths.cumsum(0) - 1
-        active_token_ids[new_token_idx] = new_tokens
-
-        # Extract the log probs for only the selected tokens.
-        # (sequence_length x vocab_size) -> (sequence_length)
-        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        selected_log_probs = log_probs[seq_idx, active_token_ids]
+        self.graphable_calculate_log_probs(
+            logits, new_tokens, logit_indices, masked_ends, masked_tokens, log_probs
+        )
 
         # Split the log probs across request boundaries
-        selected_log_probs_list = selected_log_probs.cpu().split(
-            active_query_lengths.tolist(), dim=0
-        )
+        selected_log_probs = log_probs[logit_indices, masked_tokens]
+        selected_log_probs_list = selected_log_probs.cpu().split(masked_lengths.tolist(), dim=0)
 
         # Convert each log prob tensor into a list
         return [lp.tolist() for lp in selected_log_probs_list], log_probs
+
+        ### REWRITE THE ABOVE STEPS IN SERIES HERE FOR CLARITY ###
+        # Step zero, slice by active.
+        active_request_mask = request_mask[padded_active_slice] # graph by req cnt
+        active_query_lengths = self.request_query_lengths[padded_active_slice] # graph by req cnt
+        last_token_idxs = active_query_lengths.cumsum(dim=0) - 1 # graph by req cnt
+
+        # First, get the index count.
+        cnt = active_request_mask.sum() # non-graph
+        # Enqueue some other kernels in the meanwhile, and then come back to pad it.
+        if cnt.item() == 0: # CPU
+            return # skip logprob calculation based on cnt
+        padded_cnt = cnt.item() + 0 # CPU
+
+        # We can now get graphable indices.
+        active_request_indices = torch.nonzero_static(
+            active_request_mask, # req cnt
+            size=padded_cnt, # req* cnt
+        ).squeeze(1) # straddles graphs
+
+        # Now starts the meat of it.
+        if only_last_token_logits or self.is_decode_only():
+            logits_indices = last_token_idxs[ # req cnt
+                active_request_indices # req* cnt
+            ] # straddles graphs
+            selected_tokens = sampled_tokens[ # req cnt
+                :padded_cnt # req* cnt
+            ] # straddles graphs
+            selected_logits_squeezed = logits[:padded_active_request_count].squeeze(0)[ # req cnt
+                logits_indices, # req* cnt
+            ].float() # straddles graphs
+            log_probs[
+                logits_indices, # req* cnt
+                selected_tokens, # req* cnt
+            ] = F.log_softmax(
+                selected_logits_squeezed, # req* cnt
+                dim=-1,
+            ) # req* cnt
+        else:
+            masked_lengths = active_query_lengths[ # req cnt
+                active_request_indices # req* cnt
+            ]
+            cu_masked_lengths = masked_lengths.cumsum(0) # req* cnt
+
+            masked_ends = last_token_idxs[ # req cnt
+                active_request_indices # req* cnt
+            ]
+            # We need the number of selected tokens to put into output_size for repeat_interleave
+            selected_token_cnt = masked_lengths.sum() # non-graph
+            # We need to wait a while after this.
+
+            logit_indices_offset = torch.repeat_interleave(
+                masked_ends - cu_masked_lengths, # req* cnt
+                masked_lengths, # req* cnt
+                output_size=selected_token_cnt.item(), # tok* cnt
+            ) # straddles graphs; let's decide this is entirely CPU
+            logits_indices_range = torch.arange(
+                selected_token_cnt.item(), # tok* cnt
+                device=logits.device,
+            ) # tok* cnt
+            logit_indices = logit_indices_offset + logits_indices_range # tok* cnt
+
+            selected_tokens = self.token_to_input_ids[ # static
+                logit_indices # tok* cnt
+            ].roll(-1, 0) # tok* cnt
+
+            selected_tokens[ # tok* cnt
+                masked_ends # req* cnt
+            ] = new_tokens # req* cnt
+            selected_logits_squeezed = logits[:padded_active_token_count].squeeze(0)[ # tok cnt
+                logit_indices, # tok* cnt
+            ].float() # straddles graphs
+            log_probs[
+                logit_indices, # tok* cnt
+                selected_tokens, # tok* cnt
+            ] = F.log_softmax(
+                selected_logits_squeezed, # tok* cnt
+                dim=-1,
+            ) # tok* cnt
 
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.
