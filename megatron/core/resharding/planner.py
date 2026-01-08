@@ -150,13 +150,13 @@ def _plan_multi_dim_lcm(
     return ops
 
 
-def _plan_dp_recv(
+def _finalize_dp_transfers(
     param_name: str,
     src_metadata: ParameterMetadata,
     dst_metadata: ParameterMetadata,
     my_global_rank: int,
 ) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
-    """Plan receiver-side transfer for a parameter that is not TP-sharded.
+    """Return receiver-side transfer for a parameter that is not TP-sharded.
 
     This is reached when we cannot build a TP sharding descriptor for the parameter
     (i.e., it is effectively replicated with respect to sharding).  We use this when the
@@ -203,7 +203,7 @@ def _determine_source_ranks_for_dst_param(
             my_global_rank=my_global_rank,
         )
     # DP / replicated fallback
-    return _plan_dp_recv(param_name, src_metadata, dst_metadata, my_global_rank)
+    return _finalize_dp_transfers(param_name, src_metadata, dst_metadata, my_global_rank)
 
 
 def build_centralized_reshard_plan(
