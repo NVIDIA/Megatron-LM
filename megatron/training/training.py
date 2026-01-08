@@ -58,9 +58,6 @@ from megatron.core.utils import (
     get_pg_rank,
     StragglerDetector,
 )
-from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.process_groups_config import ProcessGroupCollection
-
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.pipeline_parallel.utils import (
@@ -81,6 +78,7 @@ from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyS
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
+
 from megatron.core.optimizer.qk_clip import clip_qk
 
 try:
