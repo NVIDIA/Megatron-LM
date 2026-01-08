@@ -12,6 +12,8 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.utils import get_pg_size
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -264,6 +266,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
         pipeline_model_parallel_size: Optional[int] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         cache_mla_latent: bool = False,
         kv_lora_rank: Optional[int] = None,
         qk_pos_emb_head_dim: Optional[int] = None,
@@ -300,16 +303,34 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         if tensor_model_parallel_size is None:
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            if pg_collection is not None and getattr(pg_collection, "tp", None) is not None:
+                tp_size = get_pg_size(pg_collection.tp)
+            else:
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
         else:
             tp_size = tensor_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
         if pipeline_model_parallel_size is None:
-            pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+            if pg_collection is not None and getattr(pg_collection, "pp", None) is not None:
+                pp_size = get_pg_size(pg_collection.pp)
+            else:
+                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         else:
             pp_size = pipeline_model_parallel_size
+
+        # Cache the PP group we should use for PP collectives inside the context.
+        # If the model provides a pg_collection with a pp group, prefer it.
+        # Otherwise:
+        # - for PP=1 we don't need a PP group at all
+        # - for PP>1 we require Megatron parallel_state to be initialized
+        if pg_collection is not None and getattr(pg_collection, "pp", None) is not None:
+            self.pipeline_parallel_group = pg_collection.pp
+        elif pp_size > 1:
+            self.pipeline_parallel_group = parallel_state.get_pipeline_model_parallel_group()
+        else:
+            self.pipeline_parallel_group = None
 
         # Mamba states.
         self.is_hybrid_model = mamba_inference_state_config is not None
@@ -405,7 +426,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             torch.distributed.all_reduce(
                 block_count_total_tensor,
                 op=torch.distributed.ReduceOp.MIN,
-                group=parallel_state.get_pipeline_model_parallel_group(),
+                group=self.pipeline_parallel_group,
             )
             block_count_total = block_count_total_tensor.item()
 

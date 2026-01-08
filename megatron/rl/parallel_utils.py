@@ -14,12 +14,12 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 
 
 def build_inference_pg_collection(
-    tp_size: int,
     world_size: int,
-    use_tp_pp_dp_mapping: bool = False,
-    cp_size: Optional[int] = None,
+    tp_size: Optional[int] = None,
     pp_size: Optional[int] = None,
+    cp_size: Optional[int] = None,
     ep_size: Optional[int] = None,
+    use_tp_pp_dp_mapping: bool = False,
 ) -> ProcessGroupCollection:
     """
     Build a ProcessGroupCollection for an RL inference model with custom parallelism settings.
@@ -29,11 +29,11 @@ def build_inference_pg_collection(
     and composite groups) using HyperCommGrid.
 
     Args:
-        tp_size: Tensor model parallel size for the inference model.
         world_size: Total world size (number of ranks).
+        tp_size: Tensor model parallel size for the inference model. Defaults to current MPU value if None.
+        pp_size: Pipeline parallel size. Defaults to current MPU value if None.
         use_tp_pp_dp_mapping: If True, use 'tp-cp-ep-pp-dp' order; otherwise 'tp-cp-ep-dp-pp'.
         cp_size: Context parallel size. Defaults to current MPU value if None.
-        pp_size: Pipeline parallel size. Defaults to current MPU value if None.
         ep_size: Expert parallel size. Defaults to current MPU value if None.
 
     Returns:
@@ -43,6 +43,8 @@ def build_inference_pg_collection(
         AssertionError: If world size is not divisible by tp*cp*pp.
     """
     # Use current MPU values as defaults
+    if tp_size is None:
+        tp_size = mpu.get_tensor_model_parallel_world_size()
     if cp_size is None:
         cp_size = mpu.get_context_parallel_world_size()
     if pp_size is None:
