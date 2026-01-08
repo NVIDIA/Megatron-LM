@@ -270,8 +270,8 @@ class MultiLatentAttention(Attention):
                     f"{self.config.experimental_attention_variant}"
                 )
         if self.offload_qkv_linear:
-            (query, key, value) = fine_grained_offloading_group_commit(
-                query, key, value, name="qkv_linear", forced_released_tensors=[hidden_states]
+            query = fine_grained_offloading_group_commit(
+                query, name="qkv_linear", forced_released_tensors=[hidden_states]
             )
 
         # ===================================================
@@ -353,7 +353,7 @@ class MultiLatentAttention(Attention):
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
             if self.offload_core_attention and self.training:
-                (core_attn_out,) = fine_grained_offloading_group_commit(
+                core_attn_out = fine_grained_offloading_group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
 
@@ -386,8 +386,8 @@ class MultiLatentAttention(Attention):
         with get_fine_grained_offloading_context(self.offload_attn_proj):
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output, bias = fine_grained_offloading_group_commit(
-                output, bias, name="attn_proj", forced_released_tensors=[core_attn_out]
+            output = fine_grained_offloading_group_commit(
+                output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
 
         return output, bias

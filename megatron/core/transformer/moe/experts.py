@@ -740,9 +740,8 @@ class TEGroupedMLP(MegatronModule):
                 permuted_local_hidden_states, tokens_per_expert
             )
         if self.offload_expert_fc1:
-            fc1_output, bias_parallel = fine_grained_offloading_group_commit(
+            fc1_output = fine_grained_offloading_group_commit(
                 fc1_output,
-                bias_parallel,
                 name="expert_fc1",
                 forced_released_tensors=[permuted_local_hidden_states],
                 delay_offload=self.config.delay_offload_until_cuda_graph,
@@ -823,7 +822,7 @@ class TEGroupedMLP(MegatronModule):
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         if self.offload_moe_act:
-            (output,) = fine_grained_offloading_group_commit(
+            output = fine_grained_offloading_group_commit(
                 output,
                 name="moe_act",
                 forced_released_tensors=[fc1_output],

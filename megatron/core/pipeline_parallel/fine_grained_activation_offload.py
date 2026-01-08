@@ -392,6 +392,12 @@ class PipelineOffloadManager:
             cls.OFFLOAD_MGR = PipelineOffloadManager()
         return cls.OFFLOAD_MGR
 
+    @classmethod
+    def reset_instance(cls):
+        """Reset the singleton instance of PipelineOffloadManager."""
+        cls.OFFLOAD_MGR = None
+        cls.OFFLOAD_MGR = PipelineOffloadManager()
+
     def __init__(self):
         """Initialize the manager with queues and dedicated CUDA streams."""
         # Queue to store chunk handlers for backward pass
@@ -461,6 +467,16 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_forward:
             chunk.reset()
         self._delayed_offload_groups = []
+
+    @property
+    def offload_summary_bytes(self) -> Dict[str, int]:
+        """Offload summary bytes per group collected after warmup."""
+        return self._offload_summary_bytes
+
+    @property
+    def offload_summary_total_bytes(self) -> int:
+        """Total offloaded bytes collected after warmup."""
+        return self._offload_summary_total_bytes
 
     def flush(self):
         """Flush all staged chunks to the backward queue in reverse order."""
@@ -539,6 +555,9 @@ class PipelineOffloadManager:
             # where the memory cost will not increase anymore.
             if chunk is self._cached_chunks_backward[0]:
                 break
+        # Cache summary for downstream consumers (e.g., unit tests).
+        self._offload_summary_bytes = dict(total_offload_bytes)
+        self._offload_summary_total_bytes = int(sum(total_offload_bytes.values()))
         print_offload_summary_table(total_offload_bytes)
 
     def push(self, handler):
@@ -1033,22 +1052,17 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, *args):
+    def forward(ctx, tensor, cur_forward_chunk, name, forced_released_tensors, delay_offload):
         # pylint: disable=missing-function-docstring
         debug_rank("FineGrainedOffloadingGroupCommitFunction forward")
 
-        delay_offload = args[-1]
-        forced_released_tensors = args[-2]
-        name = args[-3]
-        cpu_offload_handler = args[-4]
-        tensor = args[:-4]
         if delay_offload:
             PipelineOffloadManager.get_instance().push_offload_groups(
-                cpu_offload_handler.on_group_commit_forward, forced_released_tensors
+                cur_forward_chunk.on_group_commit_forward, forced_released_tensors
             )
         else:
-            cpu_offload_handler.on_group_commit_forward(forced_released_tensors)
-        ctx.cpu_offload_handler = cpu_offload_handler
+            cur_forward_chunk.on_group_commit_forward(forced_released_tensors)
+        ctx.cpu_offload_handler = cur_forward_chunk
         ctx.name = name
         return tensor
 
@@ -1063,7 +1077,7 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
 
 
 def fine_grained_offloading_group_commit(
-    *tensor, name, forced_released_tensors=[], delay_offload=False
+    tensor, name, forced_released_tensors=None, delay_offload=False
 ):
     """
     Specify the tensors to be released after offloading.
@@ -1071,11 +1085,37 @@ def fine_grained_offloading_group_commit(
     The tensors will be untyped_storage().resize_(0) after offloading.
     Note: specify the tensors only when they are not automatically released by torch gc.
     """
+    # Be permissive: callers may pass a tuple/list of outputs (e.g., (q, k, v)).
+    # We only need to insert a single identity op into the autograd graph; applying
+    # it to the first tensor output is sufficient and keeps callers' code minimal.
+    if forced_released_tensors is None:
+        forced_released_tensors = []
+    if isinstance(tensor, tuple):
+        if len(tensor) == 0:
+            return tensor
+        committed0 = fine_grained_offloading_group_commit(
+            tensor[0],
+            name=name,
+            forced_released_tensors=forced_released_tensors,
+            delay_offload=delay_offload,
+        )
+        return (committed0,) + tensor[1:]
+    if isinstance(tensor, list):
+        if len(tensor) == 0:
+            return tensor
+        committed0 = fine_grained_offloading_group_commit(
+            tensor[0],
+            name=name,
+            forced_released_tensors=forced_released_tensors,
+            delay_offload=delay_offload,
+        )
+        return [committed0] + tensor[1:]
+
     cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
     if cur_forward_chunk is None:
         return tensor
     return FineGrainedOffloadingGroupCommitFunction.apply(
-        *tensor, cur_forward_chunk, name, forced_released_tensors, delay_offload
+        tensor, cur_forward_chunk, name, forced_released_tensors, delay_offload
     )
 
 
@@ -1166,3 +1206,7 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
 def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> torch.Tensor:
     """Record the backward event for cuda graph capture."""
     return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
+
+def fine_grained_offloading_reset_instance():
+    """Reset the singleton instance of PipelineOffloadManager."""
+    PipelineOffloadManager.reset_instance()
