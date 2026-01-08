@@ -12,7 +12,7 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import torch.distributed
 
@@ -64,6 +64,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
+from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -75,7 +76,6 @@ from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyS
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
 
 from megatron.core.optimizer.qk_clip import clip_qk
 
@@ -650,7 +650,6 @@ def pretrain(
         print_rank_0("Enabling batch invariant mode globally",flush=True)
         enable_batch_invariant_mode()
 
-
     if args.log_progress:
         append_to_progress_log("Starting job")
 
@@ -966,6 +965,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model.model_type = model_type
         return model
 
+
     if args.init_model_with_meta_device:
         with torch.device('meta'):
             model = build_model()
@@ -1015,11 +1015,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
-        #for model_module in model:
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
-
-
-
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
     #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
@@ -1075,8 +1071,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
-
-        with torch.cuda.stream(torch.cuda.Stream()):
+        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
+        #  capture support with DDP, but we sync it with the current stream to avoid races.
+        ddp_stream = torch.cuda.Stream()
+        # Wait for the default stream to complete before starting ddp_stream
+        ddp_stream.wait_stream(torch.cuda.current_stream())
+        # Make ddp_stream start after whatever the default stream already queued
+        with torch.cuda.stream(ddp_stream):
             model = [
                 DP(
                     config=config,
@@ -1089,6 +1090,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
+        # End of setup_stream
+        # Critical: ensure side-stream work completes before touching params on default stream
+        torch.cuda.current_stream().wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
@@ -1173,17 +1177,9 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     else:
         raise ValueError("Invalid optimizer type!")
 
-    # Construct the appropriate config_overrides object.
-    # TODO: add more logic here as needed down the road.
-    if args.decoupled_lr is not None:
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        decoupled_optimizer_config = copy.deepcopy(config)
-        decoupled_optimizer_config.lr = args.decoupled_lr
-        if args.decoupled_min_lr is not None:
-            decoupled_optimizer_config.min_lr = args.decoupled_min_lr
-        config_overrides = {decoupled_param_key: decoupled_optimizer_config}
-    else:
-        config_overrides = None
+    # Construct the appropriate config_overrides object. This default handles many cases, but
+    #  can be added to as needed by the user, or replaced entirely with a custom override.
+    config_overrides = get_standard_config_overrides(args.decoupled_lr, args.decoupled_min_lr)
 
     return config, config_overrides
 
