@@ -435,7 +435,7 @@ def benchmark_fused_loss_forward():
 
     print("\n" + "=" * 95)
 
-def benchmark_fused_loss_backward_tensor_parallel():
+def benchmark_fused_loss_forward_tensor_parallel():
     from tests.unit_tests.test_utilities import Utils
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
@@ -962,7 +962,7 @@ def main():
         any_run = True
 
     if args.forward_tensor_parallel:
-        benchmark_fused_loss_backward_tensor_parallel()
+        benchmark_fused_loss_forward_tensor_parallel()
         any_run = True
 
     if args.autograd:
