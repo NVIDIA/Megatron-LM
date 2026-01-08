@@ -156,7 +156,15 @@ def _plan_dp_recv(
     dst_metadata: ParameterMetadata,
     my_global_rank: int,
 ) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
-    """Plan DP transfer for a replicated (non-TP) parameter (receiver side)."""
+    """Plan receiver-side transfer for a parameter that is not TP-sharded.
+
+    This is reached when we cannot build a TP sharding descriptor for the parameter
+    (i.e., it is effectively replicated with respect to sharding).  We use this when the
+    destination and source mode have no TP or the parameter is replicted on all ranks
+    such as layernorm. If the source and destination DP groups match, we return a local
+    full-tensor copy; otherwise we pick a source rank from the source DP group in a
+    deterministic round-robin manner based on the receiver's index in its destination DP group.
+    """
     dst_dp_ranks = dst_metadata.data_parallel_group_ranks
     src_dp_ranks = src_metadata.data_parallel_group_ranks
     if my_global_rank not in dst_dp_ranks:
@@ -255,6 +263,14 @@ def build_centralized_reshard_plan(
         # NVSHMEM can build schedule.
         next_task_id = 0
 
+        # Pipeline-parallel (PP) "mapping" is handled implicitly.
+        # Each rank contributes metadata only for the parameters it actually owns
+        # (i.e., the module partitioning for its PP stage). When PP sizes differ
+        # between source and destination, we don't compute an explicit stage-to-stage
+        # mapping here; instead, we iterate destination ranks and plan copies for the
+        # parameters present on those ranks. Any source rank that has the same logical
+        # parameter (matched by resolved_name) can serve as a sender (with DP balancing),
+        # and TP slicing is applied when applicable.
         for dst_rank in range(world_size):
             dst_rank_params = dst_param_metadata_by_rank.get(dst_rank, {})
             for resolved_name, dst_metadata in dst_rank_params.items():
