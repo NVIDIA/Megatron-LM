@@ -9,7 +9,8 @@ assignees: ''
 
 **Describe the bug**
 
-A clear and concise description of what the bug is.
+A clear and concise description of what the bug is. Tag the [@megatron-oncall](https://github.com/orgs/NVIDIA/teams/megatron-oncall) 
+to get oncall's attention to this issue.
 
 **Steps/Code to reproduce bug**
 
@@ -25,4 +26,4 @@ A clear and concise description of what you expected to happen.
 
 **Additional context**
 
-Add any other context about the problem here.
+Add any other context about the problem here. 
