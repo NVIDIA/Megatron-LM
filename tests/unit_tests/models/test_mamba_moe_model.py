@@ -251,6 +251,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "wgrad_deferral_limit": 0,
     "window_attn_skip_freq": None,
     "window_size": None,
+    "fine_grained_activation_offloading": False,
+    "min_offloaded_tensor_size": 1024 * 1024,
+    "offload_modules": [],
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
@@ -414,9 +417,6 @@ class TestMambaMoEModel:
         args.te_rng_tracker = True
         args.tensor_model_parallel_size = 2
         args.vocab_size = 131072
-        args.fine_grained_activation_offloading = False
-        args.min_offloaded_tensor_size = 1024 * 1024
-        args.offload_modules = []
 
         validate_args(args)
         set_global_variables(args, False)
