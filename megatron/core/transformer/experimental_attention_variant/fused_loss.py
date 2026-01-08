@@ -640,8 +640,8 @@ def _fwd_fused_indexer_loss_kernel(
             sk_strides = tl.arange(0, BLOCK_SK)
             # leave all threads to topk parallelism
             for sq_i in tl.range(BLOCK_SQ):
-                sq_i_offs = sq_block_id * BLOCK_SQ + sq_i
-                sq_i_valid = sq_i_offs < Sq
+                sq_i_offs = Sq_offset + sq_block_id * BLOCK_SQ + sq_i
+                sq_i_valid = (sq_i_offs < Sq) & (sq_i_offs < Sq_offset + ASq)
 
                 for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
                     topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -755,8 +755,8 @@ def _fwd_fused_indexer_loss_kernel(
             sk_strides = tl.arange(0, BLOCK_SK)
             # leave all threads to topk parallelism
             for sq_i in tl.range(BLOCK_SQ):
-                sq_i_offs = sq_block_id * BLOCK_SQ + sq_i
-                sq_i_valid = sq_i_offs < Sq
+                sq_i_offs = Sq_offset + sq_block_id * BLOCK_SQ + sq_i
+                sq_i_valid = (sq_i_offs < Sq) & (sq_i_offs < Sq_offset + ASq)
 
                 for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
                     topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -868,20 +868,11 @@ def fwd_fused_indexer_loss(
 
     # Clamp topk to valid range
     topk = min(topk, Sk)
-
-    # # Output tensor
-    # topk_indices = torch.empty((B, Sq, topk), dtype=torch.int64, device=q.device)
     
     # TopK could be 2048
-    # BLOCK_SK = 128
-    # BLOCK_SK = max(BLOCK_SK, topk)
-    # BLOCK_SQ = (16 * 128) // BLOCK_SK # 16
-    # BLOCK_D  = max(16, (128 * 64) // BLOCK_SK) # 64
     BLOCK_SK = 64
     BLOCK_SQ = 16
     BLOCK_D = 64
-
-    num_sq_blocks = (Sq + BLOCK_SQ - 1) // BLOCK_SQ
     
     # Handle mask strides
     if mask is not None:
@@ -979,9 +970,9 @@ def fwd_fused_indexer_loss(
 
     # TopK could be 2048
     BLOCK_TOPK = min(2048, topk)
-    BLOCK_SK = 128
+    BLOCK_SK = 64
     BLOCK_SQ = 16
-    BLOCK_D  = 128
+    BLOCK_D  = 64
 
     out_loss = torch.empty((B, ASq), dtype=torch.float32, device=q.device)
     attn_num_sq_blocks = (ASq + BLOCK_SQ - 1) // BLOCK_SQ
@@ -1559,7 +1550,6 @@ def bwd_fused_indexer_loss(
         Attn_Query_ptr=query,
         Attn_Key_ptr=key,
         Topk_Idx_ptr=topk_indices,
-        Index_Mask_ptr=index_mask,
         Grad_Q_ptr=grad_q,
         Grad_W_ptr=grad_weights,
         Grad_K_ptr=grad_k,
@@ -1584,8 +1574,6 @@ def bwd_fused_indexer_loss(
         stride_tb=topk_indices.stride(0),
         stride_ts=topk_indices.stride(1),
         stride_tk=topk_indices.stride(2),
-        stride_imsq=index_mask.stride(0),
-        stride_imsk=index_mask.stride(1),
         stride_gqs=grad_q.stride(0),
         stride_gqb=grad_q.stride(1),
         stride_gqh=grad_q.stride(2),
