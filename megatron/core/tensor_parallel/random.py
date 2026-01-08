@@ -512,7 +512,11 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         """Backward pass."""
         inputs = ctx.detached_args
         outputs = ctx.outputs
-        torch.autograd.backward(outputs, args)
+        outputs_with_grad = []
+        for output in outputs:
+            if torch.is_tensor(output) and output.requires_grad:
+                outputs_with_grad.append(output)
+        torch.autograd.backward(outputs_with_grad, args)
         ctx.outputs = None
         ctx.inputs = None
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)

@@ -1637,8 +1637,7 @@ class MoEElasticExpertMetadata(DispatchMetadata):
     """
     Metadata for the Elastic expert dispatcher.
     """
-
-    pass
+    handle = None
 
 
 class MoEElasticExpertDispatcher:
@@ -1820,9 +1819,10 @@ class MoESyncFreeElasticExpertDispatcher:
         """
 
         # Reshape expert weights to tokens to prevent each weight too large to dispatch.
-        dispatched_expert_weights = HybridEPExpertDispatch.apply(
+        dispatched_expert_weights, metadata.handle = HybridEPExpertDispatch.apply(
             metadata.routing_map, # routing_map
             self.ep_group, # group
+            metadata.handle, # handle
             self.num_local_echo_experts, # num_local_experts
             self.config.moe_hybridep_num_sms, # num_sms_dispatch_api
             self.config.moe_hybridep_num_sms, # num_sms_combine_api

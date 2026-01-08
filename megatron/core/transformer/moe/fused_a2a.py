@@ -460,7 +460,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
     expert_dispatch_buffer = None
 
     @staticmethod
-    def forward(ctx, routing_map, group, num_local_echo_experts, num_sms_dispatch_api, num_sms_combine_api, num_dispatched_weights, weight_chunk_size, *expert_weights):
+    def forward(ctx, routing_map, group, handle, num_local_echo_experts, num_sms_dispatch_api, num_sms_combine_api, num_dispatched_weights, weight_chunk_size, *expert_weights):
         '''
         Forward pass of fused dispatch of the HybridEP backend
         '''
@@ -525,28 +525,40 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         if fp8_dispatch:
             assert scale_tensor.dtype == torch.float32
             assert weight_tensor.shape[1] // scale_tensor.shape[1] == 128
-        # Process the dispatch
-        (
-            dispatched_weight,
-            _,
-            dispatched_scaling_factor,
-            tokens_per_expert,
-            handle,
-        ) = HybridEPExpertDispatch.expert_dispatch_buffer.dispatch_with_permute(
-            hidden=weight_tensor,
-            routing_map=routing_map,
-            probs=None,
-            scaling_factor=scale_tensor,
-            pad_multiple=None,
-            num_permuted_tokens=num_dispatched_weights * num_chunks_per_weight,
-            non_blocking=non_blocking,
-        )
+        if handle is None:
+            # Process the dispatch
+            (
+                dispatched_weight,
+                _,
+                dispatched_scaling_factor,
+                tokens_per_expert,
+                handle,
+            ) = HybridEPExpertDispatch.expert_dispatch_buffer.dispatch_with_permute(
+                hidden=weight_tensor,
+                routing_map=routing_map,
+                probs=None,
+                scaling_factor=scale_tensor,
+                pad_multiple=None,
+                num_permuted_tokens=num_dispatched_weights * num_chunks_per_weight,
+                non_blocking=non_blocking,
+            )
+        else:
+            (
+                dispatched_weight, 
+                _, 
+                dispatched_scaling_factor, 
+                tokens_per_expert, 
+                handle 
+            ) = HybridEPExpertDispatch.expert_dispatch_buffer.dispatch_with_permute(
+                hidden=weight_tensor,
+                scaling_factor=scale_tensor,
+                handle=handle,
+                pad_multiple=None,
+                num_permuted_tokens=num_dispatched_weights * num_chunks_per_weight,
+            )
+
 
         ctx.handle = handle
-        if non_blocking:
-            ctx.num_permuted_tokens = tokens_per_expert.sum()
-        else:
-            ctx.num_permuted_tokens = num_dispatched_weights * num_chunks_per_weight
 
         # Wrap the data into quantized tensor
         if fp8_dispatch:
@@ -587,7 +599,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         ctx.fp8_dispatch = fp8_dispatch
         ctx.num_local_echo_experts = num_local_echo_experts
         ctx.num_local_home_experts = num_local_home_experts
-        return tuple(dispatched_weight_list)
+        return tuple(dispatched_weight_list), handle
     
     @staticmethod
     def backward(ctx, *grad_expert_weights):
@@ -612,7 +624,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         # Extract grad for each expert
         weight_grad_list = [weight_grad.reshape(weight_shape) for weight_grad in combined_expert_grad.chunk(ctx.num_local_home_experts, dim=0)]
 
-        return None, None, None, None, None, None, None, *weight_grad_list
+        return None, None, None, None, None, None, None, None, *weight_grad_list
 
 if HAVE_HYBRIDEP:
 
