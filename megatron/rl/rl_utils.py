@@ -4,6 +4,7 @@ import gc
 
 # Keep this to make the env registered.
 import itertools
+import json
 import logging
 import math
 import pickle
@@ -36,6 +37,7 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.inference.unified_memory import (
@@ -431,9 +433,10 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args={
-                'temperature': args.grpo_default_temperature,
+                'temperature': args.rl_default_temperature,
                 'max_tokens': args.inference_max_seq_length,
-                'top_p': args.grpo_default_top_p,
+                'top_p': args.rl_default_top_p,
+                'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
         )
@@ -466,7 +469,7 @@ def get_environment_rollouts(
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
         swap_model_weights(model, inference_model, args.refit_method)
-        if args.rl_verify_model_weights_swap and args.curr_iteration == 0:
+        if args.rl_verify_model_weights_swap:
             verify_model_weights_swap(
                 train_model=model,
                 inference_model=inference_model,
@@ -942,9 +945,14 @@ def prepare_trajectories(
         inference_logprobs = None
 
     # Some sanity checks regarding the tokenization
-    assert (
-        tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
-    ), "First token should be bos"
+    if not args.rl_skip_bos_token:
+        assert (
+            tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
+        ), "First token should be bos"
+    else:
+        assert (
+            tokenizer.bos is None or (trajs[:, 0] != tokenizer.bos).all()
+        ), "First token should not be bos"  
     assert (
         tokenizer.bos is None or (trajs[:, 1] != tokenizer.bos).all()
     ), "Second token should not be bos"
@@ -1096,7 +1104,7 @@ def prepare_data_for_update(
 
             # Wrap forward_backward_func for Full iteration CUDA graph
             forward_backward_func = get_forward_backward_func()
-            if args.enable_cuda_graph and args.cuda_graph_scope == "full_iteration":
+            if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
                 forward_backward_func = FullCudaGraphWrapper(
                     forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
                 )
@@ -1377,9 +1385,10 @@ def evaluate_and_print_results_rl(
                     validation=True,
                     rank_info=None,
                     generation_args={
-                        'temperature': args.grpo_default_temperature,
+                        'temperature': args.rl_default_temperature,
                         'max_tokens': args.seq_length,
-                        'top_p': args.grpo_default_top_p,
+                        'top_p': args.rl_default_top_p,
+                        'top_k': args.rl_default_top_k,
                     },
                 )
                 evaluation_responses = loop.run_until_complete(agent.run_evaluation(request))

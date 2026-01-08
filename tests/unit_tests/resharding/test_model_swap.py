@@ -152,6 +152,7 @@ def _set_pg_collection(module, tp_group, dp_group):
         (1, 1, 1, 2, 2, 1, None),  # TP1,PP1 -> TP2,PP2
         (2, 1, 1, 1, 2, 1, None),  # TP2,PP1 -> TP1,PP2
         (1, 2, 1, 2, 1, 1, None),  # TP1,PP2 -> TP2,PP1
+        (1, 2, 1, 2, 4, 1, None),  # TP1,PP2 -> TP2,PP4
         (1, 1, 2, 1, 1, 4, 4),  # EP2 -> EP4
         (1, 1, 2, 1, 1, 1, 4),  # EP2 -> EP1
         (1, 1, 1, 1, 1, 2, 4),
