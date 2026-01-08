@@ -13,7 +13,7 @@ MODEL_ARGS:
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/
   --auto-detect-ckpt-format: true
   --max-tokens-to-oom: 3600000
-  --inference-max-seq-length: 4096
+  --inference-max-seq-length: 1024
   --attention-backend: flash
   --mock-data: true
   --micro-batch-size: 1
@@ -47,7 +47,6 @@ MODEL_ARGS:
   --seed: 42
   --calculate-per-token-loss: true
   --rl-use-sequence-packing: true
-  --rl-sequence-packing-bin-size: 8192
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
   --timing-log-level: 1
@@ -62,7 +61,7 @@ MODEL_ARGS:
   --grpo-clamp-eps-upper: 0.2
   --grpo-kl-beta: 0.0
   --grpo-entropy-term-weight: 0.0
-  --langrl-env-config: examples/rl/environment_configs/countdown.yaml
+  --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest/env_config.yaml
   --rl-partial-rollouts: true
   --lr: 0.000001
   --lr-warmup-samples: 0
@@ -76,5 +75,6 @@ MODEL_ARGS:
   --save-interval: 1000000
   --eval-interval: 1000000
   --finetune: true
+  --inference-logging-step-interval: 1
   --rl-inference-tensor-model-parallel-size: 2
   --refit-method: gloo

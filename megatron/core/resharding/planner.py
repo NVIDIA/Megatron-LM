@@ -46,12 +46,12 @@ def _build_descriptors_for_param(
         src_local = src_metadata.shape[tp_dim]
         dst_local = dst_metadata.shape[tp_dim]
         if src_world * src_local != dst_world * dst_local:
-            # Not truly TP-sharded for this param; let DP handle it
-            logger.debug(
-                f"Skipping TP descriptor for {dst_metadata.name} dim{tp_dim}: "
-                f"src_world*src_local={src_world}*{src_local} != {dst_world}*{dst_local}"
+            raise RuntimeError(
+                f"Cannot build TP descriptor for {dst_metadata.name} dim{tp_dim}: "
+                f"src_world*src_local={src_world}*{src_local} != {dst_world}*{dst_local}. "
+                "This usually means the param is marked TP but is effectively replicated on that "
+                "dim or partition_dim/metadata is inconsistent between source and destination."
             )
-            return descriptors
 
         descriptors.append(
             ShardingDescriptor(
@@ -150,13 +150,21 @@ def _plan_multi_dim_lcm(
     return ops
 
 
-def _plan_dp_recv(
+def _finalize_dp_transfers(
     param_name: str,
     src_metadata: ParameterMetadata,
     dst_metadata: ParameterMetadata,
     my_global_rank: int,
 ) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
-    """Plan DP transfer for a replicated (non-TP) parameter (receiver side)."""
+    """Return receiver-side transfer for a parameter that is not TP-sharded.
+
+    This is reached when we cannot build a TP sharding descriptor for the parameter
+    (i.e., it is effectively replicated with respect to sharding).  We use this when the
+    destination and source mode have no TP or the parameter is replicted on all ranks
+    such as layernorm. If the source and destination DP groups match, we return a local
+    full-tensor copy; otherwise we pick a source rank from the source DP group in a
+    deterministic round-robin manner based on the receiver's index in its destination DP group.
+    """
     dst_dp_ranks = dst_metadata.data_parallel_group_ranks
     src_dp_ranks = src_metadata.data_parallel_group_ranks
     if my_global_rank not in dst_dp_ranks:
@@ -184,16 +192,6 @@ def _determine_source_ranks_for_dst_param(
 ) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
     """Route to dimension-specific planner based on parameter sharding type."""
 
-    # PP filtering (simple, symmetric)
-    src_pp_ranks = src_metadata.pipeline_parallel_group_ranks
-    dst_pp_ranks = dst_metadata.pipeline_parallel_group_ranks
-    if len(dst_pp_ranks) > 1 and my_global_rank not in dst_pp_ranks:
-        return []
-    if len(src_pp_ranks) > 1 and len(dst_pp_ranks) > 1:
-        my_dst_pp_rank = _get_rank_in_group(my_global_rank, dst_pp_ranks)
-        if my_dst_pp_rank >= len(src_pp_ranks):
-            return []
-
     # Regular TP/DP planning with EP-resolved metadata
     descriptors = _build_descriptors_for_param(src_metadata=src_metadata, dst_metadata=dst_metadata)
     if descriptors:
@@ -205,7 +203,7 @@ def _determine_source_ranks_for_dst_param(
             my_global_rank=my_global_rank,
         )
     # DP / replicated fallback
-    return _plan_dp_recv(param_name, src_metadata, dst_metadata, my_global_rank)
+    return _finalize_dp_transfers(param_name, src_metadata, dst_metadata, my_global_rank)
 
 
 def build_centralized_reshard_plan(
@@ -228,11 +226,15 @@ def build_centralized_reshard_plan(
     my_dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
 
     my_src_metadata = [
-        extract_param_metadata(p, name, my_global_rank, src_pg, num_experts=num_experts)
+        extract_param_metadata(
+            p, name, my_global_rank, src_pg, num_experts=num_experts, module=src_module
+        )
         for name, p in my_src_params.items()
     ]
     my_dst_metadata = [
-        extract_param_metadata(p, name, my_global_rank, dst_pg, num_experts=num_experts)
+        extract_param_metadata(
+            p, name, my_global_rank, dst_pg, num_experts=num_experts, module=dst_module
+        )
         for name, p in my_dst_params.items()
     ]
 
@@ -265,6 +267,14 @@ def build_centralized_reshard_plan(
         # NVSHMEM can build schedule.
         next_task_id = 0
 
+        # Pipeline-parallel (PP) "mapping" is handled implicitly.
+        # Each rank contributes metadata only for the parameters it actually owns
+        # (i.e., the module partitioning for its PP stage). When PP sizes differ
+        # between source and destination, we don't compute an explicit stage-to-stage
+        # mapping here; instead, we iterate destination ranks and plan copies for the
+        # parameters present on those ranks. Any source rank that has the same logical
+        # parameter (matched by resolved_name) can serve as a sender (with DP balancing),
+        # and TP slicing is applied when applicable.
         for dst_rank in range(world_size):
             dst_rank_params = dst_param_metadata_by_rank.get(dst_rank, {})
             for resolved_name, dst_metadata in dst_rank_params.items():
