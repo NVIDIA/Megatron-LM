@@ -36,6 +36,7 @@ def add_mmlu_args(parser):
     group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
     group.add_argument("--lower-bound", type=float, default=None)
     group.add_argument("--no-subject-prompt", action="store_true", help="Use empty prompt instead of subject-based prompt.")
+    group.add_argument("--mmlu-dataset", type=str, default="cais/mmlu", help="The default dataset to use is cais/mmlu from the HG hub.")
     group.add_argument("--cache-dir", type=str, default=None)
     add_modelopt_args(parser)
     return parser
@@ -173,15 +174,19 @@ if __name__ == "__main__":
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
-    mtq.fold_weight(unwrapped_model) # speed up quantization
+    # Fold the scalars into weight for speedup.
+    # [TODO]: fold_weight current assumes all weight_quantizer has weight allocated;
+    # however, this is not the case when share_embeddings_and_output_weights is False.
+    if not getattr(unwrapped_model, "share_embeddings_and_output_weights", False):
+        mtq.fold_weight(unwrapped_model)
 
     all_subjects = get_all_subjects()
 
     all_correct = {}
 
     for subject in all_subjects:
-        test_data = datasets.load_dataset("cais/mmlu", subject, split="test")
-        dev_data = datasets.load_dataset("cais/mmlu", subject, split="dev")
+        test_data = datasets.load_dataset(args.mmlu_dataset, subject, split="test")
+        dev_data = datasets.load_dataset(args.mmlu_dataset, subject, split="dev")
 
         correct = []
         for idx, test_example in enumerate(test_data):

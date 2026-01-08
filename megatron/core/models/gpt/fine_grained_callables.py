@@ -19,6 +19,7 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.utils import internal_api
 
 
 def weak_method(method):
@@ -52,19 +53,29 @@ def should_free_input(name, is_moe, config):
     # For dense layers [attn, fake, mlp, fake], the input is needed during backward pass
     if not is_moe:
         return False
+    enable_deepep = (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "deepep"
+    )
+    enable_hybridep = (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+    )
     # Define which nodes should free input memory
     # Since we split the computing graph into multiple nodes, we can manually control
     # when and how to free the input memory.
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
     free_input_nodes = {
-        "mlp": True,
+        "mlp": not enable_hybridep,
         "moe_combine": True,
-        # For non-deepep mode, the input is the un-dispatched tokens and probs before dispatch A2A
-        # and it's not needed anymore after the forward pass. If moe_preprocess is in cuda graph
-        # scope, tokens and probs are fixed size tensors, so they cannot be freed.
-        # For deepep mode, they are both needed in backward pass, so they cannot be freed.
-        "moe_dispatch": config.moe_token_dispatcher_type == "alltoall"
+        # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
+        # and probs before dispatch A2A and it's not needed anymore after the forward pass
+        # For DeepEP and HybridEP dispatcher mode, they are both needed in backward pass
+        # and cannot be freed.
+        # If moe_preprocess is in cuda graph scope, tokens and probs are fixed size tensors,
+        # so they cannot be freed.
+        "moe_dispatch": not (enable_deepep or enable_hybridep)
         and (CudaGraphScope.moe_preprocess not in config.cuda_graph_scope),
     }
 
@@ -281,7 +292,13 @@ class TransformerLayerNode(ScheduleNode):
         detached_grad = tuple([e.grad for e in self.detached])
         grads = output_grad + detached_grad
         self.default_backward_func(outputs + self.before_detached, grads)
-        self._release_state()
+        # release the output grad memory after backward finishes,
+        # except when delay_wgrad_comptue is enabled, the grad should be
+        # kept until all modules' backward_dw has been invoked.
+        if self.delay_wgrad_compute:
+            self.output_grads = grads
+            self.delay_grads_release = len(self.bwd_dw_callables) > 0
+
         # return grads for record stream
         return grads
 
@@ -292,9 +309,17 @@ class TransformerLayerNode(ScheduleNode):
         with torch.cuda.nvtx.range(f"{self.name} wgrad"):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
+
+        # the output grad memory is last used in wgrad compute, should be safe to release.
+        assert self.delay_grads_release, "output grad memory should be valid before wgrad."
+        if self.manual_release_grads:
+            for tensor in self.output_grads:
+                tensor.untyped_storage().resize_(0)
+        self.output_grads = None
+
         self.bwd_dw_callables = None
 
-    def _release_state(self):
+    def __del__(self):
         # Release reference as early as possible, this helps avoid memory leak.
         self.before_detached = None
         self.detached = None
@@ -334,6 +359,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     enable_deepep = (
         layer.config.moe_token_dispatcher_type == "flex"
         and layer.config.moe_flex_dispatcher_backend == "deepep"
+    )
+    enable_hybridep = (
+        layer.config.moe_token_dispatcher_type == "flex"
+        and layer.config.moe_flex_dispatcher_backend == "hybridep"
     )
 
     class _BackwardDWWrapper:
@@ -451,7 +480,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep:
+        if enable_deepep or enable_hybridep:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
@@ -467,7 +496,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep:
+        if enable_deepep or enable_hybridep:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs

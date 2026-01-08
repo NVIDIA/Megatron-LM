@@ -1680,6 +1680,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            if self.mtp_num_layers == 1:
+                assert self.pipeline_model_parallel_size > 1, (
+                    'Pipeline model parallel size must be larger than 1 '
+                    'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
+                )
 
             if self.cuda_graph_impl != "none":
                 assert (
@@ -1704,6 +1709,12 @@ class TransformerConfig(ModelParallelConfig):
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
                     'partial cuda graph'
                 )
+
+        if self.ep_overlap_early_attn_memory_release:
+            assert self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be enabled when enabling '
+                'ep_overlap_early_attn_memory_release'
+            )
 
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
