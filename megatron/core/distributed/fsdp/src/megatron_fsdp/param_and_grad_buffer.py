@@ -101,6 +101,15 @@ except ImportError:
 
 NCCL_MEMORY_POOL = None
 
+try:
+    from megatron.core.distributed.reduce_scatter_with_fp32_accumulation import (
+        reduce_scatter_with_fp32_accumulation,
+    )
+
+    HAVE_MEGATRON_CORE = True
+except ImportError:
+    HAVE_MEGATRON_CORE = False
+
 
 def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:
     """Alternate to ``assert`` when in the backward context to print the error
@@ -903,7 +912,7 @@ class DataParallelBuffer:
                     bucket_id=self.bucket_index.bucket_id,
                     global_data_index=0,
                     size=int(self.bucket_index.size * nvfp4_size_scale),
-                    items=list(self.item_index_map[item_id].values()),
+                    items=list(self.item_index_map.values()),
                 )
                 self.shard_bucket_index = ShardBucketIndex(
                     bucket_id=self.shard_bucket_index.bucket_id,
@@ -3155,6 +3164,11 @@ class GradReducePipeline:
         )
         reduce_scatter_stream.wait_stream(current_stream)
 
+        if self.buffer.ddp_config.reduce_scatter_with_fp32_accumulation and HAVE_MEGATRON_CORE:
+            reduce_scatter_func = reduce_scatter_with_fp32_accumulation
+        else:
+            reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+
         dp_group = self.get_fsdp_buffer(bucket_group[0]).data_parallel_group
         with torch.cuda.stream(reduce_scatter_stream):
             with _coalescing_manager(dp_group):
@@ -3188,9 +3202,9 @@ class GradReducePipeline:
                         if not self.buffer.ddp_config.fsdp_double_buffer:
                             grad_shard = torch.empty_like(grad_shard)
                         # Reduce-scatter gradients on the FSDP group.
-                        torch.distributed.reduce_scatter_tensor(
-                            output=grad_shard,
-                            input=bucket.data,
+                        reduce_scatter_func(
+                            grad_shard,
+                            bucket.data,
                             op=reduce_op,
                             group=gbuf.data_parallel_group,
                         )
