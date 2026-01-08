@@ -1262,7 +1262,10 @@ def validate_args(args, defaults={}):
 
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
-        if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
+        if (
+            "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
+            and not args.te_rng_tracker
+        ):
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
         assert (
