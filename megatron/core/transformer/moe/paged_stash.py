@@ -540,9 +540,6 @@ class PagedStashManager:
         self.current_microbatch = None
         self.current_schedule_index = None
 
-        # Track max tokens needed per vp_stage, dtype, and hidden_size
-        self.max_tokens_per_vp_stage = None
-        self.temp_tokens_per_vp_stage = None
         # Track max tokens needed across all vp_stages grouped by dtype and hidden_size
         self.max_tokens_across_vp_stages = None
         self.temp_tokens_across_vp_stages = None
@@ -688,12 +685,13 @@ class PagedStashManager:
         assert self.vp_size is not None
         if layer_no is None:
             # forward pass
-            layer_no = self.current_layer[vp_stage - 1]
-            self.current_layer[vp_stage - 1] += 1
-            microbatch_no = self.current_microbatch[vp_stage - 1]
+            vp_stage_index = vp_stage - 1
+            layer_no = self.current_layer[vp_stage_index]
+            self.current_layer[vp_stage_index] += 1
+            microbatch_no = self.current_microbatch[vp_stage_index]
             if self._last_layer:
-                self.current_layer[vp_stage - 1] = 1
-                self.current_microbatch[vp_stage - 1] += 1
+                self.current_layer[vp_stage_index] = 1
+                self.current_microbatch[vp_stage_index] += 1
 
         if self.status == 'capture':
             self._pp_schedule.append(self.get_schedule_layer(vp_stage, layer_no, microbatch_no))
@@ -704,8 +702,6 @@ class PagedStashManager:
         assert actual == expected, f"schedule {actual} != {expected}"
 
         return layer_no, microbatch_no
-        # self._pp_schedule.append(vp_size)
-        # self._pp_schedule.append(vp_stage)
 
     def on_save_for_backward(self, tensor: torch.Tensor) -> Any:
         """
@@ -744,20 +740,6 @@ class PagedStashManager:
             else:
                 hidden_size = tensor.shape[1] if tensor.ndim > 1 else tensor.numel()
 
-            if dtype not in self.temp_tokens_per_vp_stage[self.current_vp_stage]:
-                self.temp_tokens_per_vp_stage[self.current_vp_stage][dtype] = {}
-                self.max_tokens_per_vp_stage[self.current_vp_stage][dtype] = {}
-            if hidden_size not in self.temp_tokens_per_vp_stage[self.current_vp_stage][dtype]:
-                self.temp_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size] = 0
-                self.max_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size] = 0
-
-            self.temp_tokens_per_vp_stage[self.current_vp_stage][dtype][
-                hidden_size
-            ] += self.num_tokens
-            self.max_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size] = max(
-                self.max_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size],
-                self.temp_tokens_per_vp_stage[self.current_vp_stage][dtype][hidden_size],
-            )
             if (dtype, hidden_size) not in self.temp_tokens_across_vp_stages:
                 self.temp_tokens_across_vp_stages[dtype, hidden_size] = 0
                 self.max_tokens_across_vp_stages[dtype, hidden_size] = 0
@@ -809,15 +791,13 @@ class PagedStashManager:
         if isinstance(saved_state, (PagedTensor)):
             if self.status == 'capture':
                 num_tokens = saved_state.num_tokens_tensor.item()
-                self.temp_tokens_per_vp_stage[saved_state.vp_stage][saved_state.dtype][
-                    saved_state.hidden_size
-                ] -= num_tokens
-                self.temp_tokens_across_vp_stages[
-                    saved_state.dtype, saved_state.hidden_size
-                ] -= num_tokens
                 # Pad the tensor to the max number of tokens
                 npad = self.max_num_tokens - num_tokens
                 pad = ()
+                # check if the tensor is 2D
+                assert (
+                    saved_state._tensor.ndim == 2
+                ), f"saved_state._tensor.ndim is not 2 {saved_state._tensor.ndim}"
                 for _ in range(saved_state._tensor.ndim - 1):
                     pad = pad + (0, 0)
                 pad = pad + (0, npad)
@@ -866,7 +846,7 @@ class PagedStashContext:
         return result
 
 
-def paged_stash_group_start(tensor, name=None):
+def paged_stash_group_start(tensor):
     """Mark the start of a layer group and prepare for stash/reload."""
     rank = torch.distributed.get_rank()
     stash_manager = PagedStashManager.get_instance()
@@ -908,9 +888,6 @@ def paged_stash_init_chunk_handler(vp_size, vp_stage):
         stash_manager.vp_size = vp_size
     else:
         stash_manager.vp_size = 1
-    if stash_manager.max_tokens_per_vp_stage is None:
-        stash_manager.max_tokens_per_vp_stage = [{} for _ in range(stash_manager.vp_size)]
-        stash_manager.temp_tokens_per_vp_stage = [{} for _ in range(stash_manager.vp_size)]
     if stash_manager.max_tokens_across_vp_stages is None:
         stash_manager.max_tokens_across_vp_stages = {}
         stash_manager.temp_tokens_across_vp_stages = {}
