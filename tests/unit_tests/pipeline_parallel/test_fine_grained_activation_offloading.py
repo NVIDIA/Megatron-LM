@@ -2,20 +2,19 @@
 
 import gc
 import os
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
-from contextlib import nullcontext
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig, MLATransformerConfig
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.transformer.enums import AttnBackend
-
 
 # Tolerance for memory expectation check (GPU allocator jitter etc).
 EPSILON = 0.30
@@ -72,7 +71,7 @@ def _build_gpt_model(
             moe_grouped_gemm=num_experts is not None,
             moe_use_legacy_grouped_gemm=False,
             multi_latent_attention=is_mla,
-            ),
+        ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
     ).bfloat16()
@@ -80,10 +79,7 @@ def _build_gpt_model(
 
 
 def _make_gpt_inputs(
-    *,
-    seq_length: int,
-    micro_batch_size: int,
-    device: torch.device,
+    *, seq_length: int, micro_batch_size: int, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     data = list(range(seq_length))
     input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device)
@@ -120,9 +116,7 @@ def _run_one_iter_and_capture(
     #         p.grad = None
 
     torch.cuda.reset_peak_memory_stats()
-    logits = model(
-        input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
-    )
+    logits = model(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask)
     loss = logits.float().sum()
     loss.backward()
     torch.cuda.synchronize()
@@ -131,7 +125,7 @@ def _run_one_iter_and_capture(
     # capture all gradients for correctness
     grads: Dict[str, torch.Tensor] = {}
     for name, p in model.named_parameters():
-        grads[name] = (p.grad.detach().float().cpu() if p.grad is not None else None)
+        grads[name] = p.grad.detach().float().cpu() if p.grad is not None else None
 
     return logits.detach().float().cpu(), grads, peak_bytes
 
@@ -188,6 +182,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     )
 
     from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
+
     off.fine_grained_offloading_reset_instance()
 
     try:
@@ -307,6 +302,8 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
                 f"saved={saved_mib:.2f}MiB expected~={expected_offload_mib:.2f}MiB "
                 f"(rel_err={rel_err:.2f})"
             )
-            print(f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB")
+            print(
+                f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB"
+            )
     finally:
         Utils.destroy_model_parallel()

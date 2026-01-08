@@ -790,8 +790,12 @@ class ChunkOffloadHandler:
             f"------finish_all_groups {self} {self._max_group_size} {self._offloaded_group_index}"
         )
         # TODO: check if this is correct
-        # Mark it as finished when all groups are finished and there are no groups to offload or reload
-        if len(self._groups_to_reload) == 0 and len(self._groups_to_offload) == 0 and self._offloaded_group_index > 0:
+        # Mark it as finished when there are no groups to offload or reload
+        if (
+            len(self._groups_to_reload) == 0
+            and len(self._groups_to_offload) == 0
+            and self._offloaded_group_index > 0
+        ):
             return True
         assert name is not None, "Name is required"
         for group in self.offload_groups[self._offloaded_group_index :]:
@@ -1206,6 +1210,7 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
 def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> torch.Tensor:
     """Record the backward event for cuda graph capture."""
     return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
+
 
 def fine_grained_offloading_reset_instance():
     """Reset the singleton instance of PipelineOffloadManager."""
