@@ -281,7 +281,7 @@ class TransformerLayerSchedulePlan:
                     f_input = f_layer.moe_dispatch.forward(f_input)
 
         if b_layer is not None:
-                b_grad = b_layer.mlp.backward(b_grad)
+            b_grad = b_layer.mlp.backward(b_grad)
 
         if not early_comm_launch:
             if f_layer is not None:
