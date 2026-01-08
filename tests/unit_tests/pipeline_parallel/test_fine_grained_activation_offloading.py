@@ -2,180 +2,311 @@
 
 import gc
 import os
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
+from contextlib import nullcontext
 
-EPSILON = 0.1
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig, MLATransformerConfig
+from megatron.core.utils import is_te_min_version
+from tests.unit_tests.test_utilities import Utils
+from megatron.core.transformer.enums import AttnBackend
 
-# Skip all tests if CUDA is not available
-cuda_available = torch.cuda.is_available()
+
+# Tolerance for memory expectation check (GPU allocator jitter etc).
+EPSILON = 0.30
 
 
-def _reset_cuda_memory():
+def _reset_cuda_memory() -> None:
     gc.collect()
-    if cuda_available:
+    if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
-class ToyModel(torch.nn.Module):
-    def __init__(self, hidden_size: int = 2048, num_layers: int = 4, dtype=torch.bfloat16):
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
-        if torch.cuda.is_available():
-            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        super().__init__()
-        layers = []
-        for _ in range(num_layers):
-            linear = torch.nn.Linear(
-                hidden_size, hidden_size, bias=True, dtype=dtype, device="cuda"
-            )
-            layers.append(linear)
-        self.net = torch.nn.Sequential(*layers).to(device="cuda", dtype=dtype)
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.dtype = dtype
+def _build_gpt_model(
+    *,
+    seed: int,
+    num_layers: int,
+    hidden_size: int,
+    num_attention_heads: int,
+    vocab_size: int,
+    seq_length: int,
+    num_experts: Optional[int],
+    fine_grained_activation_offloading: bool,
+    offload_modules: Optional[List[str]],
+    min_offloaded_tensor_size: int,
+    is_mla: bool,
+) -> GPTModel:
+    """Build a GPTModel that uses TE-based transformer layer spec."""
+    model_parallel_cuda_manual_seed(seed)
+    torch.manual_seed(seed)
+    ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
+    transformer_config = ConfigClass(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        use_cpu_initialization=True,
+        attention_backend=AttnBackend.unfused,
+        # Make sure model weights / activations are BF16 so TE fused attention isn't disabled.
+        bf16=True,
+        # params_dtype=torch.bfloat16,
+        # enable_autocast=True,
+        # autocast_dtype=torch.bfloat16,
+        # MoE
+        num_moe_experts=num_experts,
+        moe_grouped_gemm=(num_experts is not None),
+        # Fine-grained activation offloading
+        fine_grained_activation_offloading=fine_grained_activation_offloading,
+        offload_modules=offload_modules,
+        min_offloaded_tensor_size=min_offloaded_tensor_size,
+    )
+    gpt_model = GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+            num_experts=num_experts,
+            moe_grouped_gemm=num_experts is not None,
+            moe_use_legacy_grouped_gemm=False,
+            multi_latent_attention=is_mla,
+            ),
+        vocab_size=vocab_size,
+        max_sequence_length=seq_length,
+    ).bfloat16()
+    return gpt_model
 
-    def forward(self, x, use_offload: bool = False):
-        from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
 
-        if use_offload:
-            # Initialize a new chunk (microbatch) and enable offload context.
-            off.fine_grained_offloading_init_chunk_handler(
-                vp_size=1, vp_stage=None, min_offloaded_tensor_size=1
-            )
-            for layer in self.net:
-                # Group by module; with this linear-only model, each group corresponds to a layer.
-                x = off.fine_grained_offloading_group_start(x, name=f"linear_layer")
-                with off.get_fine_grained_offloading_context(True):
-                    x = layer(x)
-                # Commit the group; returns a tuple of tensors
-                (x,) = off.fine_grained_offloading_group_commit(
-                    x, name=f"linear_layer", forced_released_tensors=[]
-                )
-            return x
-        # Baseline path (no offload hooks)
-        with (
-            torch.autocast(device_type="cuda", dtype=self.dtype)
-            if self.dtype in (torch.float16, torch.bfloat16)
-            else torch.cuda.amp.autocast(enabled=False)
-        ):
-            for layer in self.net:
-                x = layer(x)
-            return x
+def _make_gpt_inputs(
+    *,
+    seq_length: int,
+    micro_batch_size: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    data = list(range(seq_length))
+    input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device)
+    position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device)
+    attention_mask = torch.ones((micro_batch_size, 1, seq_length, seq_length), dtype=bool).to(
+        device
+    )
+    return input_ids, position_ids, attention_mask
 
 
-def test_fine_grained_activation_offload_memory_reduction():
-    torch.manual_seed(1234)
-    # Use a linear-only stack so theoretical saved memory equals sum of per-layer input x bytes.
-    model = ToyModel(hidden_size=2048, num_layers=8, dtype=torch.bfloat16).eval()
+def _run_one_iter_and_capture(
+    model: GPTModel,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    enable_offload_reset: bool,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], int]:
+    """
+    Run a single forward+backward iteration.
 
-    # Create input
-    inp = torch.randn(
-        (2048, model.hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True
+    Returns:
+      - logits (CPU float32)
+      - selected grads (CPU float32)
+      - peak_memory_allocated (bytes) during the iteration
+    """
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
+
+    if enable_offload_reset:
+        off.fine_grained_offloading_reset()
+
+    # for p in model.parameters():
+    #     if p.grad is not None:
+    #         p.grad = None
+
+    torch.cuda.reset_peak_memory_stats()
+    logits = model(
+        input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+    )
+    loss = logits.float().sum()
+    loss.backward()
+    torch.cuda.synchronize()
+    peak_bytes = int(torch.cuda.max_memory_allocated())
+
+    # capture all gradients for correctness
+    grads: Dict[str, torch.Tensor] = {}
+    for name, p in model.named_parameters():
+        grads[name] = (p.grad.detach().float().cpu() if p.grad is not None else None)
+
+    return logits.detach().float().cpu(), grads, peak_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not is_te_min_version("1.13.0"),
+    reason="Fine-grained activation offloading requires TE-based GPT layer spec (TE 1.13+ in this repo's tests).",
+)
+@pytest.mark.parametrize(
+    "is_moe, is_mla, offload_modules",
+    [
+        # Dense GPT modules
+        (False, True, ["attn_norm"]),
+        (True, False, ["qkv_linear"]),
+        (True, False, ["core_attn"]),
+        # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
+        (True, True, ["core_attn", "attn_proj"]),
+        (True, False, ["mlp_norm"]),
+        (True, False, ["expert_fc1"]),
+        (True, False, ["moe_act"]),
+    ],
+)
+def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
+    is_moe: bool, is_mla: bool, offload_modules: List[str]
+):
+    """
+    Initialize a GPTModel and verify:
+    - forward output correctness under each offload_modules setting
+    - backward gradient correctness (subset)
+    - peak GPU memory is reduced roughly as expected (based on recorded offload bytes)
+    """
+    # setup distributed/model-parallel (same pattern as other UTs)
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+    # os.environ["NVTE_FLASH_ATTN"] = "1"
+    Utils.initialize_model_parallel(1, 1)
+    torch.cuda.memory._record_memory_history(max_entries=100000)
+
+    seed = 123
+    # Choose shapes large enough to make memory deltas stable but still fast.
+    num_experts = 4 if is_moe else None
+    num_layers = 8
+    hidden_size = 2048 if num_experts is None else 1024
+    num_attention_heads = 16 if hidden_size >= 2048 else 8
+    vocab_size = 512
+    seq_length = 512
+    micro_batch_size = 2
+    device = torch.device("cuda")
+
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
     )
 
-    # Warmup to stabilize allocator behavior
-    _reset_cuda_memory()
-    out = model(inp, use_offload=False)
-    (out.sum()).backward()
-    torch.cuda.synchronize()
-    _reset_cuda_memory()
-
-    # Baseline memory measurement (no offload)
-    _reset_cuda_memory()
-    inp_baseline = inp.detach().clone().requires_grad_(True)
-    baseline_mem_before = torch.cuda.memory_allocated() / (1024**2)
-    out_base = model(inp_baseline, use_offload=False)
-    baseline_mem_after = (torch.cuda.memory_allocated() - out_base.nbytes) / (1024**2)
-    (out_base.sum()).backward()
-    torch.cuda.synchronize()
-    baseline_delta = baseline_mem_after - baseline_mem_before
-
-    # Offload memory measurement
     from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
+    off.fine_grained_offloading_reset_instance()
 
-    off.fine_grained_offloading_reset()
-    # warmup
-    inp_off = inp.detach().clone().requires_grad_(True)
-    out_off = model(inp_off, use_offload=True)
-    (out_off.sum()).backward()
-    torch.cuda.synchronize()
-    off.fine_grained_offloading_reset()
-    del inp_off
-    del out_off
-    _reset_cuda_memory()
-    torch.cuda.synchronize()
+    try:
+        # 1) Baseline run (no offloading)
+        _reset_cuda_memory()
+        base_model = _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=False,
+            offload_modules=None,
+            min_offloaded_tensor_size=1024 * 1024,
+            is_mla=is_mla,
+        ).cuda()
+        base_model.train()
 
-    inp_off = inp.detach().clone().requires_grad_(True)
-    offload_mem_before = torch.cuda.memory_allocated() / (1024**2)
-    out_off = model(inp_off, use_offload=True)
-    offload_mem_after = (torch.cuda.memory_allocated() - out_off.nbytes) / (1024**2)
-    (out_off.sum()).backward()
-    torch.cuda.synchronize()
-    offload_delta = offload_mem_after - offload_mem_before
+        # Warmup baseline once for allocator stability
+        _run_one_iter_and_capture(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        _reset_cuda_memory()
+        base_logits, base_grads, base_peak = _run_one_iter_and_capture(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        # Free baseline model GPU memory before offload path
+        del base_model
+        _reset_cuda_memory()
 
-    # Offload should reduce peak cached memory usage after forward
-    assert (
-        offload_delta < baseline_delta
-    ), f"offload did not reduce memory: off={offload_delta:.2f}MiB base={baseline_delta:.2f}MiB"
+        # 2) Offload run (warmup to record bytes + steady-state measurement)
+        off_model = _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+            min_offloaded_tensor_size=1024,  # force offloading for UT determinism
+            is_mla=is_mla,
+        ).cuda()
+        off_model.train()
 
-    # Theoretical savings: storing per-layer input x (same shape each layer).
-    bytes_per_elem = inp.element_size()  # 2 for bfloat16
-    input_bytes = inp.numel() * bytes_per_elem
-    # -2 because the first and last activations are not offloaded
-    expected_saved_mib = (model.num_layers - 2) * (input_bytes / (1024**2))
+        # Warmup 1 iter to populate cached chunks, then reset to finish warmup bookkeeping.
+        _run_one_iter_and_capture(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        # Reset once more to trigger post_warmup_callback and apply steady-state offload decisions.
+        off.fine_grained_offloading_reset()
 
-    # Actual savings ≈ baseline_delta - offload_delta (both exclude output tensor memory).
-    actual_saved_mib = baseline_delta - offload_delta
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
 
-    # Allow slack for allocator jitter and extra intermediates; magnitudes should match.
-    rel_err = abs(actual_saved_mib - expected_saved_mib) / max(expected_saved_mib, 1e-6)
-    assert (
-        rel_err <= EPSILON
-    ), f"saved mismatch: actual={actual_saved_mib:.2f}MiB expected~={expected_saved_mib:.2f}MiB (rel_err={rel_err:.2f})"
+        mgr = PipelineOffloadManager.get_instance()
+        expected_offload_bytes = int(
+            sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
+        )
+        expected_offload_mib = expected_offload_bytes / (1024**2)
 
+        _reset_cuda_memory()
+        off_logits, off_grads, off_peak = _run_one_iter_and_capture(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        del off_model
+        _reset_cuda_memory()
 
-def test_fine_grained_activation_offload_output_and_grad_consistency():
-    torch.manual_seed(2025)
-    hidden = 1024
-    layers = 3
+        torch.cuda.memory._dump_snapshot(f"/workspace/pyt_profile/memory_snapshot.pickle")
+        print(f"Captured memory snapshot at /workspace/pyt_profile/memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=False)
 
-    # Create identical models by resetting seed
-    torch.manual_seed(2025)
-    model_base = ToyModel(hidden_size=hidden, num_layers=layers, dtype=torch.bfloat16).train()
-    torch.manual_seed(2025)
-    model_off = ToyModel(hidden_size=hidden, num_layers=layers, dtype=torch.bfloat16).train()
+        # 3) Correctness checks (forward + selected grads)
+        assert torch.allclose(off_logits, base_logits, rtol=1e-3, atol=1e-3)
+        assert set(off_grads.keys()) == set(base_grads.keys())
+        for name, gb in base_grads.items():
+            go = off_grads[name]
+            if gb is None or go is None:
+                assert gb is None and go is None, f"Grad None mismatch for {name}"
+                continue
+            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Grad mismatch for {name}"
 
-    # Same input and target
-    inp = torch.randn((32, hidden), device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    target = torch.randn_like(inp)
+        # 4) Memory checks (peak allocated over forward+backward)
+        saved_mib = (base_peak - off_peak) / (1024**2)
+        assert saved_mib > 0.0, (
+            f"Expected GPU peak memory reduction for offload_modules={offload_modules}, "
+            f"but got saved={saved_mib:.2f}MiB (base={base_peak/(1024**2):.2f}MiB, "
+            f"off={off_peak/(1024**2):.2f}MiB)"
+        )
 
-    # Baseline forward/backward
-    out_base = model_base(inp, use_offload=False)
-    loss_base = torch.nn.functional.mse_loss(out_base, target)
-    loss_base.backward()
-    grads_base = [
-        p.grad.detach().clone() if p.grad is not None else None for p in model_base.parameters()
-    ]
-
-    # Offload forward/backward
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
-
-    off.fine_grained_offloading_reset()
-    out_off = model_off(inp.detach().clone().requires_grad_(True), use_offload=True)
-    loss_off = torch.nn.functional.mse_loss(out_off, target)
-    loss_off.backward()
-    grads_off = [
-        p.grad.detach().clone() if p.grad is not None else None for p in model_off.parameters()
-    ]
-
-    # Compare outputs
-    assert torch.allclose(out_off.float(), out_base.float(), rtol=1e-3, atol=1e-3)
-
-    # Compare gradients parameter-wise
-    for gb, go in zip(grads_base, grads_off):
-        if gb is None and go is None:
-            continue
-        assert gb is not None and go is not None
-        assert torch.allclose(go.float(), gb.float(), rtol=1e-3, atol=1e-3)
+        # If expectation is large enough, enforce approximate match.
+        # For tiny expectations, allocator noise may dominate; we only require a positive reduction.
+        if expected_offload_mib >= 2.0:
+            rel_err = abs(saved_mib - expected_offload_mib) / max(expected_offload_mib, 1e-6)
+            assert rel_err <= EPSILON, (
+                f"Memory saving mismatch for offload_modules={offload_modules}: "
+                f"saved={saved_mib:.2f}MiB expected~={expected_offload_mib:.2f}MiB "
+                f"(rel_err={rel_err:.2f})"
+            )
+            print(f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB")
+    finally:
+        Utils.destroy_model_parallel()

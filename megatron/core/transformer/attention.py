@@ -830,7 +830,8 @@ class Attention(MegatronModule, ABC):
                 hidden_states, key_value_states, split_qkv=split_qkv
             )
         if self.offload_qkv_linear:
-            (qkv_output,) = fine_grained_offloading_group_commit(
+            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+            qkv_output = fine_grained_offloading_group_commit(
                 qkv_output, name="qkv_linear", forced_released_tensors=[]
             )
         attn_mask_type = self.attn_mask_type
@@ -1018,7 +1019,7 @@ class Attention(MegatronModule, ABC):
                     core_attn_out[inference_context.padding_slice] = 0.0
 
             if self.offload_core_attention and self.training:
-                (core_attn_out,) = fine_grained_offloading_group_commit(
+                core_attn_out = fine_grained_offloading_group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -1038,8 +1039,8 @@ class Attention(MegatronModule, ABC):
         with get_fine_grained_offloading_context(self.offload_attn_proj):
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output, bias = fine_grained_offloading_group_commit(
-                output, bias, name="attn_proj", forced_released_tensors=[core_attn_out]
+            output = fine_grained_offloading_group_commit(
+                output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
         nvtx_range_pop(suffix="linear_proj")
 

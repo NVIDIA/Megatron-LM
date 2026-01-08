@@ -607,7 +607,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="self_attn_bda")
 
         if self.offload_attn_norm:
-            (hidden_states,) = fine_grained_offloading_group_commit(
+            hidden_states = fine_grained_offloading_group_commit(
                 hidden_states, name="attn_norm", forced_released_tensors=[residual]
             )
 
@@ -649,7 +649,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
 
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_commit,
             fine_grained_offloading_group_start,
             get_fine_grained_offloading_context,
         )
@@ -779,7 +778,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
         nvtx_range_pop(suffix="mlp_bda")
         if self.offload_mlp_norm:
-            (hidden_states,) = fine_grained_offloading_group_commit(
+            hidden_states = fine_grained_offloading_group_commit(
                 hidden_states, name="mlp_norm", forced_released_tensors=[residual]
             )
 
