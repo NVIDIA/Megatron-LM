@@ -43,7 +43,7 @@ jobs:
           # Token to read org team members. Needs read:org scope.
           GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
           # Slack token for updating the Slack usergroup
-          SLACK_TOKEN: ${{ secrets.SLACK_TOKEN }}
+          SLACK_TOKEN: ${{ secrets.ONCALL_SLACK_TOKEN }}
         run: |
           pip install --no-cache-dir uv slack-sdk
           uv run python .github/scripts/oncall_manager.py rotate
