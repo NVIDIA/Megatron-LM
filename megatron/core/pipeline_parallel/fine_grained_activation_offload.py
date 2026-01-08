@@ -1211,6 +1211,7 @@ def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> 
     """Record the backward event for cuda graph capture."""
     return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
 
+
 def fine_grained_offloading_reset_instance():
     """Reset the singleton instance of PipelineOffloadManager."""
     PipelineOffloadManager.reset_instance()

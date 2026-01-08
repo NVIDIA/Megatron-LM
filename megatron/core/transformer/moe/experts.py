@@ -722,7 +722,9 @@ class TEGroupedMLP(MegatronModule):
             )
         if self.offload_expert_fc1:
             fc1_output = fine_grained_offloading_group_commit(
-                fc1_output, name="expert_fc1", forced_released_tensors=[permuted_local_hidden_states]
+                fc1_output,
+                name="expert_fc1",
+                forced_released_tensors=[permuted_local_hidden_states],
             )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
