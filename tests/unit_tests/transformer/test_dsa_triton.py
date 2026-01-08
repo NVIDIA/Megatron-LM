@@ -965,7 +965,7 @@ def main():
         benchmark_fused_loss_backward_tensor_parallel()
         any_run = True
 
-    if args.end_to_end:
+    if args.autograd:
         test_fused_dsa_indexer_loss_autograd()
         any_run = True
 

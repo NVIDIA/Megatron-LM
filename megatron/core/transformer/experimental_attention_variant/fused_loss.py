@@ -13,6 +13,7 @@ import tilelang
 import tilelang.language as T
 
 # TODO: just for accuracy check, remove it later
+@torch.no_grad()
 def fused_qk_topk_native(q, weights, k, mask, index_topk):
     index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
 
