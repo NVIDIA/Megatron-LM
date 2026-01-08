@@ -1544,8 +1544,10 @@ def forward_backward_pipelining_with_interleaving(
     send_next_wait_handle = None
     send_prev_wait_handle = None
     recv_next_wait_handles = []
+
     for k in range(num_warmup_microbatches):
         cur_model_chunk_id = get_model_chunk_id(k, forward=True)
+
         if config.overlap_p2p_comm_warmup_flush:
             if (
                 not (
