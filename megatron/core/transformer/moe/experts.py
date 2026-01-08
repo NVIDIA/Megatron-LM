@@ -714,9 +714,7 @@ class TEGroupedMLP(MegatronModule):
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
         ) as permuted_local_hidden_states:
             if self.config.moe_paged_stash:
-                permuted_local_hidden_states = paged_stash_group_start(
-                    permuted_local_hidden_states, name="expert_fc1"
-                )
+                permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
             if self.moe_paged_stash_expert_fc1:
                 offload_context = get_paged_stash_context(
                     name="expert_fc1",
