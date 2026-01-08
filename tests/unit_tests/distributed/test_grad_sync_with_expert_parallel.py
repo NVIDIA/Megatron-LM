@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 import contextlib
 from typing import Optional
 
@@ -169,15 +171,20 @@ def test_grad_sync(
         )
         != 0
     ):
-        # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/data_parallel_word_size
-        # When average_in_collective=False, the grad data is always first scaled by 1/data_parallel_word_size and then summed by AR/RS
-        # when use_distributed_optimizer=True, only for rank=0 param_and_grad_buffer.grad_data[0] is updated, for other ranks
-        # another shard of grad_data is updated while param_and_grad_buffer.grad_data[0] is unchanged (=1/data_parallel_word_size)
+        # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to
+        # 1/data_parallel_word_size.
+        # When average_in_collective=False, the grad data is always first scaled by
+        # 1/data_parallel_word_size and then summed by AR/RS.
+        # When use_distributed_optimizer=True, only for rank=0,
+        # param_and_grad_buffer.grad_data[0] is updated. For other ranks another shard of
+        # grad_data is updated while param_and_grad_buffer.grad_data[0] is unchanged
+        # (=1/data_parallel_word_size).
         non_ep_expected_grad_data_value_after_collective /= (
             parallel_state.get_data_parallel_world_size()
         )
     if ep_size > 1:
-        # For MoE models with exper parallelism, each expert will receive tokens from EPxETP times batches, such that the expert gradient will be EPxETP times after backward,
+        # For MoE models with exper parallelism, each expert will receive tokens from EPxETP
+        # times batches, such that the expert gradient will be EPxETP times after backward,
         # and the expected gradient after collective should be 1.0 as same as dense params.
         ep_param_and_grad_buffer.grad_data.data.fill_(float(ep_size * etp_size))
         ep_expected_grad_data_value_after_collective = 1
@@ -186,67 +193,76 @@ def test_grad_sync(
             and (not average_in_collective)
             and parallel_state.get_expert_data_parallel_rank(partial_expert_data_parallel=True) != 0
         ):
-            # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/EDP
-            # When average_in_collective=False, the grad data is always first scaled by expert_data_parallel_size and then summed by AR/RS
-            # after SUM collective in expert_data_group, the scale will be 1.0.
+            # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/EDP.
+            # When average_in_collective=False, the grad data is always first scaled by
+            # expert_data_parallel_size and then summed by AR/RS.
+            # After SUM collective in expert_data_group, the scale will be 1.0.
             ep_expected_grad_data_value_after_collective /= (
                 parallel_state.get_expert_data_parallel_world_size()
             )
 
     params = list(model.parameters())
     map_bucket_to_last_param_idx = {}
-    for i, param in enumerate(params):
-        if not (param in param_to_bucket_group):
-            # it means this parameter is not on this device, skip
-            continue
-        bucket_group = param_to_bucket_group[param]
-        if bucket_group in map_bucket_to_last_param_idx:
-            param_idx = map_bucket_to_last_param_idx[bucket_group] + 1
-        else:
-            param_idx = 0
-        map_bucket_to_last_param_idx[bucket_group] = param_idx
-
-        register_grad_sync_context = (
-            contextlib.nullcontext() if overlap_grad_reduce else pytest.raises(AssertionError)
-        )
-        finish_grad_sync_context = contextlib.nullcontext()
-        if (
-            param_idx < (len(bucket_group.params) - 1)
-            and overlap_grad_reduce
-            and num_distributed_optimizer_instances == 1
-        ):
-            # Can't finish grad sync until all params have been registered ready.
-            finish_grad_sync_context = pytest.raises(AssertionError)
-
-        with register_grad_sync_context:
-            bucket_group.register_grad_ready(param)
-        with finish_grad_sync_context:
-            # When overlap_grad_reduce is True, this should throw an assertion error until all
-            # params in the model have registered their grad above.
-            # When overlap_grad_reduce is False, the collective is forced through.
-            bucket_group.finish_grad_sync()
-
-        if bucket_group in non_ep_bucket_groups:
-            expected_grad_data_value = non_ep_expected_grad_data_value_after_collective
-        else:
-            expected_grad_data_value = ep_expected_grad_data_value_after_collective
-        # Before gradient sync, the gradient value should keep original.
-        if overlap_grad_reduce and param_idx < (len(bucket_group.params) - 1):
-            if bucket_group in non_ep_bucket_groups:
-                expected_grad_data_value = 1
+    for iteration in range(2):
+        for i, param in enumerate(params):
+            if not (param in param_to_bucket_group):
+                # it means this parameter is not on this device, skip
+                continue
+            bucket_group = param_to_bucket_group[param]
+            if bucket_group in map_bucket_to_last_param_idx:
+                param_idx = map_bucket_to_last_param_idx[bucket_group] + 1
             else:
-                expected_grad_data_value = ep_size * etp_size
+                param_idx = 0
+            map_bucket_to_last_param_idx[bucket_group] = param_idx
 
-        if bucket_group in non_ep_bucket_groups:
-            assert non_ep_param_and_grad_buffer.grad_data[0] == expected_grad_data_value
-        else:
-            assert ep_param_and_grad_buffer.grad_data[0] == expected_grad_data_value
+            register_grad_sync_context = (
+                contextlib.nullcontext() if overlap_grad_reduce else pytest.raises(AssertionError)
+            )
+            finish_grad_sync_context = contextlib.nullcontext()
+            if (
+                param_idx < (len(bucket_group.params) - 1)
+                and overlap_grad_reduce
+                and num_distributed_optimizer_instances == 1
+            ):
+                # Can't finish grad sync until all params have been registered ready.
+                finish_grad_sync_context = pytest.raises(AssertionError)
 
-        if not overlap_grad_reduce:
-            # Reset grad_data for subsequent collectives.
+            with register_grad_sync_context:
+                bucket_group.register_grad_ready(param)
+            # Don't call finish_grad_sync() multiple times in the first iteration when
+            # golden_per_param_grad_ready_counts is being populated.
+            if iteration == 0 and i < (len(params) - 1):
+                continue
+            with finish_grad_sync_context:
+                # When overlap_grad_reduce is True, this should throw an assertion error until all
+                # params in the model have registered their grad above.
+                # When overlap_grad_reduce is False, the collective is forced through.
+                bucket_group.finish_grad_sync()
+
             if bucket_group in non_ep_bucket_groups:
-                non_ep_param_and_grad_buffer.grad_data.data.fill_(1.0)
+                expected_grad_data_value = non_ep_expected_grad_data_value_after_collective
             else:
-                ep_param_and_grad_buffer.grad_data.data.fill_(float(ep_size * etp_size))
+                expected_grad_data_value = ep_expected_grad_data_value_after_collective
+            # Before gradient sync, the gradient value should keep original.
+            if overlap_grad_reduce and param_idx < (len(bucket_group.params) - 1):
+                if bucket_group in non_ep_bucket_groups:
+                    expected_grad_data_value = 1
+                else:
+                    expected_grad_data_value = ep_size * etp_size
+
+            if bucket_group in non_ep_bucket_groups:
+                assert non_ep_param_and_grad_buffer.grad_data[0] == expected_grad_data_value
+            else:
+                assert ep_param_and_grad_buffer.grad_data[0] == expected_grad_data_value
+
+            if not overlap_grad_reduce:
+                # Reset grad_data for subsequent collectives.
+                if bucket_group in non_ep_bucket_groups:
+                    non_ep_param_and_grad_buffer.grad_data.data.fill_(1.0)
+                else:
+                    ep_param_and_grad_buffer.grad_data.data.fill_(float(ep_size * etp_size))
+
+        # Call reset to set .is_first_batch to False.
+        bucket_group.reset()
 
     Utils.destroy_model_parallel()
