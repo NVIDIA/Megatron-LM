@@ -414,6 +414,9 @@ class TestMambaMoEModel:
         args.te_rng_tracker = True
         args.tensor_model_parallel_size = 2
         args.vocab_size = 131072
+        args.fine_grained_activation_offloading = False
+        args.min_offloaded_tensor_size = 1024 * 1024
+        args.offload_modules = []
 
         validate_args(args)
         set_global_variables(args, False)
