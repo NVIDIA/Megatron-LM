@@ -46,12 +46,12 @@ def _build_descriptors_for_param(
         src_local = src_metadata.shape[tp_dim]
         dst_local = dst_metadata.shape[tp_dim]
         if src_world * src_local != dst_world * dst_local:
-            # Not truly TP-sharded for this param; let DP handle it
-            logger.debug(
-                f"Skipping TP descriptor for {dst_metadata.name} dim{tp_dim}: "
-                f"src_world*src_local={src_world}*{src_local} != {dst_world}*{dst_local}"
+            raise RuntimeError(
+                f"Cannot build TP descriptor for {dst_metadata.name} dim{tp_dim}: "
+                f"src_world*src_local={src_world}*{src_local} != {dst_world}*{dst_local}. "
+                "This usually means the param is marked TP but is effectively replicated on that "
+                "dim or partition_dim/metadata is inconsistent between source and destination."
             )
-            return descriptors
 
         descriptors.append(
             ShardingDescriptor(
@@ -183,16 +183,6 @@ def _determine_source_ranks_for_dst_param(
     my_global_rank: int,
 ) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
     """Route to dimension-specific planner based on parameter sharding type."""
-
-    # PP filtering (simple, symmetric)
-    src_pp_ranks = src_metadata.pipeline_parallel_group_ranks
-    dst_pp_ranks = dst_metadata.pipeline_parallel_group_ranks
-    if len(dst_pp_ranks) > 1 and my_global_rank not in dst_pp_ranks:
-        return []
-    if len(src_pp_ranks) > 1 and len(dst_pp_ranks) > 1:
-        my_dst_pp_rank = _get_rank_in_group(my_global_rank, dst_pp_ranks)
-        if my_dst_pp_rank >= len(src_pp_ranks):
-            return []
 
     # Regular TP/DP planning with EP-resolved metadata
     descriptors = _build_descriptors_for_param(src_metadata=src_metadata, dst_metadata=dst_metadata)
