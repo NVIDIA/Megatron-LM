@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 GITHUB_API_URL = "https://api.github.com"
 SCHEDULE_FILE = ".github/oncall_schedule.json"
 ROTATION_TEAM_SLUG = "mcore-oncall-rotation"
-ACTIVE_ONCALL_TEAM_SLUG = "megatron-oncall"
+ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
 TARGET_WEEKS = 12
 
 def get_headers():
