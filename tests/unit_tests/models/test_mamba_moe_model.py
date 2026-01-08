@@ -252,7 +252,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "window_attn_skip_freq": None,
     "window_size": None,
     "fine_grained_activation_offloading": False,
-    "min_offloaded_tensor_size": 1024 * 1024,
+    "min_offloaded_tensor_size": 10 * 1024 * 1024,
     "offload_modules": [],
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
