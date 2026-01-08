@@ -145,6 +145,10 @@ from .global_vars import (
     get_one_logger,
     get_tokenizer,
     get_energy_monitor,
+    set_model,
+    set_optimizer,
+    set_opt_param_scheduler,
+    set_data_iterators,
 )
 from . import one_logger_utils
 
@@ -156,12 +160,21 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
 
 def destroy_global_state():
+    import gc
+
     destroy_global_vars()
     destroy_num_microbatches_calculator()
     destroy_global_memory_buffer()
     destroy_global_symmetric_memory_buffer()
     destroy_model_parallel()
     destroy_rerun_state_machine()
+
+    # Force garbage collection to free memory
+    gc.collect()
+
+    # Clear CUDA cache to release GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def print_datetime(string):
@@ -718,6 +731,12 @@ def pretrain(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
 
+    # Store model, optimizer, and scheduler globally for cleanup on restart
+    if args.inprocess_restart:
+        set_model(model)
+        set_optimizer(optimizer)
+        set_opt_param_scheduler(opt_param_scheduler)
+
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
@@ -750,6 +769,10 @@ def pretrain(
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+
+    # Store data iterators globally for cleanup on restart
+    if args.inprocess_restart:
+        set_data_iterators(train_data_iterator, valid_data_iterator, test_data_iterator)
 
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(

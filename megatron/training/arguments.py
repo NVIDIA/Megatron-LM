@@ -1867,7 +1867,8 @@ def _add_inprocess_restart_args(parser):
                        'The remaining ranks from the allocation are set aside '
                        'as warm reserve.')
     group.add_argument('--inprocess-empty-cuda-cache', action='store_true',
-                       help='Release all unoccupied cached GPU memory on every in-process restart.')
+                       help='(Deprecated) GPU memory is now automatically released on every in-process restart. '
+                       'This flag is kept for backwards compatibility but has no effect.')
     return parser
 
 def _add_one_logger_args(parser):
