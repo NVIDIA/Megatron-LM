@@ -176,10 +176,7 @@ def assign_ep_resolved_name_inplace(
 
 
 def assign_resolved_name_inplace(
-    meta: ParameterMetadata,
-    *,
-    module: torch.nn.Module | None = None,
-    base_name: str | None = None,
+    meta: ParameterMetadata, *, module: torch.nn.Module | None = None, base_name: str | None = None
 ) -> None:
     """Set `meta.resolved_name` so the planner can match the same weights across models.
 
@@ -232,7 +229,7 @@ def _resolve_global_layer_number_in_name(name: str, module: torch.nn.Module) -> 
         prefix_map = _build_layer_module_prefix_map(module)
         setattr(module, '_reshard_layer_module_prefix_map', prefix_map)
 
-    #TODO(Peter): Do we need a fallback here?
+    # TODO(Peter): Do we need a fallback here?
     if not prefix_map:
         return name
 
