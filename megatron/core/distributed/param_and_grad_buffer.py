@@ -364,6 +364,11 @@ class _ParamAndGradBucketGroup:
         communication call. When ddp_config.overlap_grad_reduce is set to False, makes
         synchronous call.
         """
+        if self.is_first_batch and self.grad_reduce_handle is not None:
+            # Make this start_grad_sync call a no-op if in first batch and collective has
+            # already been dispatched.
+            return
+
         assert (
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
