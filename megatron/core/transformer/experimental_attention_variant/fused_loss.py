@@ -1607,13 +1607,14 @@ def bwd_fused_indexer_loss(
 
 class FusedDSAIndexerLoss(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, weights, k, query, key, softmax_scale, topk, loss_coeff, sparse_loss):
+    def forward(ctx, q, weights, k, query, key, softmax_scale, topk, loss_coeff, mask, sparse_loss):
         """
         Fused forward: index_scores never materialized in full.
         """
         # Run fused Triton kernel
-        topk_indices, loss = fwd_fused_indexer_loss(
-            q, weights, k, query, key, softmax_scale, topk, loss_coeff, sparse_loss
+        # TODO: remove accuracy_check
+        topk_indices, loss, _ = fwd_fused_indexer_loss(
+            q, weights, k, query, key, topk, softmax_scale, loss_coeff, mask, sparse_loss=sparse_loss, accuracy_check=True,
         )
         
         # Save for backward (recomputation strategy)
@@ -1633,8 +1634,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
 
         grad_q , grad_weights, grad_k = bwd_fused_indexer_loss(
             q, weights, k, query, key, topk_indices, 
-            ctx.softmax_scale, ctx.loss_coeff * grad_loss, ctx.sparse_loss
+            ctx.softmax_scale, ctx.loss_coeff, ctx.sparse_loss, grad_loss
         )
         
         # query and key are detached in forward, so return None for their gradients
-        return grad_q, grad_weights, grad_k, None, None, None, None, None, None
+        return grad_q, grad_weights, grad_k, None, None, None, None, None, None, None

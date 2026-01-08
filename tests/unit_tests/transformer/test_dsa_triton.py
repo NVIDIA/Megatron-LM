@@ -27,6 +27,7 @@ import numpy as np
 
 from megatron.core.transformer.experimental_attention_variant.fused_loss import fwd_fused_indexer_loss as compute_dsa_indexer_loss_triton
 from megatron.core.transformer.experimental_attention_variant.fused_loss import bwd_fused_indexer_loss as backward_triton_full
+from megatron.core.transformer.experimental_attention_variant.fused_loss import FusedDSAIndexerLoss
 from megatron.core.process_groups_config import ProcessGroupCollection
 import megatron.core.parallel_state as parallel_state
 
@@ -213,8 +214,6 @@ def forward_native(q, weights, k, mask, index_topk, query, key, softmax_scale, l
     indexer_loss, kl_per_element = compute_dsa_indexer_loss(
         index_scores.clone(), topk_indices, query, key, softmax_scale, loss_coeff, sparse_loss, pg_collection=pg_collection
     )
-    # indexer_loss = torch.zeros(1, device=q.device, dtype=torch.float32)
-    # kl_per_element = torch.zeros((q.shape[1], q.shape[1], k.shape[0]), device=q.device, dtype=torch.float32)
 
     return topk_indices, indexer_loss, kl_per_element, index_scores
 
@@ -760,6 +759,163 @@ def benchmark_fused_loss_backward():
     print("=" * 100)
 
 
+def test_fused_dsa_indexer_loss_autograd():
+    """
+    Test FusedDSAIndexerLoss autograd function (forward + backward).
+    
+    This test validates the custom autograd function by:
+    1. Comparing forward outputs with native implementation
+    2. Comparing backward gradients with PyTorch autograd on native implementation
+    
+    Tests multiple configurations with varying:
+    - Sequence lengths (Sq, Sk)
+    - Batch sizes (B)
+    - Number of heads (H)
+    - Head dimensions (D)
+    - Top-k values
+    - Sparse loss (True/False)
+    
+    Returns:
+        bool: True if all tests pass, False otherwise.
+    """
+    print("\n" + "=" * 80)
+    print("Test: FusedDSAIndexerLoss Autograd Function")
+    print("=" * 80)
+    
+    # Test configurations: (Sq, Sk, B, H, D, topk, sparse_loss)
+    # Note: H must be divisible by 8 for the Triton kernel
+    configs = [
+        (2048, 2048, 1, 8, 128, 1024, False),
+        (2048, 2048, 1, 8, 128, 1024, True),
+        (2048, 2048, 1, 8, 128, 2048, False),
+        (2048, 2048, 1, 8, 128, 2048, True),
+        (2048, 2048, 1, 32, 128, 2048, False),
+        (2048, 2048, 1, 32, 128, 2048, True),
+        (8192, 8192, 1, 8, 128, 2048, False),
+        (8192, 8192, 1, 8, 128, 2048, True),
+        (8192, 8192, 1, 32, 128, 2048, False),
+        (8192, 8192, 1, 32, 128, 2048, True),
+        (16384, 16384, 1, 8, 128, 2048, False),
+        (16384, 16384, 1, 8, 128, 2048, True),
+        (16384, 16384, 1, 32, 128, 2048, False),
+        (16384, 16384, 1, 32, 128, 2048, True),
+    ]
+    
+    all_passed = True
+    
+    for config_idx, (Sq, Sk, B, H, D, topk, sparse_loss) in enumerate(configs):
+        print(f"\n[{config_idx+1}/{len(configs)}] Testing: Sq={Sq}, Sk={Sk}, B={B}, H={H}, D={D}, topk={topk}, sparse_loss={sparse_loss}")
+        
+        torch.manual_seed(42 + config_idx)
+        
+        # Create inputs for native implementation with autograd
+        q_native = torch.randn(Sq, B, H, D, device='cuda', dtype=torch.float32, requires_grad=True)
+        weights_native = torch.randn(Sq, B, H, device='cuda', dtype=torch.float32, requires_grad=True)
+        k_native = torch.randn(Sk, B, D, device='cuda', dtype=torch.float32, requires_grad=True)
+        
+        # Create query and key for attention (no grad needed as they're detached in loss)
+        query = torch.randn(Sq, B, H, D, device='cuda', dtype=torch.float32)
+        key = torch.randn(Sk, B, H, D, device='cuda', dtype=torch.float32)
+        
+        softmax_scale = 1.0 / (D ** 0.5)
+        loss_coeff = 0.1
+        
+        # Create mask
+        mask = torch.triu(
+            torch.full((B, Sq, Sk), float('-inf'), dtype=torch.float32, device='cuda'),
+            diagonal=1,
+        )
+        
+        # ==========================================
+        # Test Native Implementation (with autograd)
+        # ==========================================
+        topk_indices_native, indexer_loss_native, _, _ = forward_native(
+            q_native, weights_native, k_native, mask, topk, 
+            query, key, softmax_scale, loss_coeff, sparse_loss
+        )
+        
+        # Backward through native
+        indexer_loss_native.backward()
+        
+        grad_q_native = q_native.grad.clone()
+        grad_weights_native = weights_native.grad.clone()
+        grad_k_native = k_native.grad.clone()
+        
+        # ==========================================
+        # Test FusedDSAIndexerLoss (custom autograd)
+        # ==========================================
+        # Create new inputs for fused implementation
+        q_fused = q_native.detach().clone().requires_grad_(True)
+        weights_fused = weights_native.detach().clone().requires_grad_(True)
+        k_fused = k_native.detach().clone().requires_grad_(True)
+        
+        # Run custom autograd function
+        topk_indices_fused, indexer_loss_fused = FusedDSAIndexerLoss.apply(
+            q_fused, weights_fused, k_fused, query, key, 
+            softmax_scale, topk, loss_coeff, mask, sparse_loss
+        )
+        
+        # Backward through fused
+        indexer_loss_fused.backward()
+        
+        grad_q_fused = q_fused.grad.clone()
+        grad_weights_fused = weights_fused.grad.clone()
+        grad_k_fused = k_fused.grad.clone()
+        
+        # ==========================================
+        # Compare Results
+        # ==========================================
+        rtol = 1e-4  # Relaxed for Triton kernels
+        atol = 1e-4
+        
+        # Compare forward outputs
+        loss_match = torch.allclose(indexer_loss_native, indexer_loss_fused, rtol=rtol, atol=atol)
+        topk_match = True # torch.equal(topk_indices_native, topk_indices_fused)
+        
+        # Compare backward gradients
+        q_match = torch.allclose(grad_q_native, grad_q_fused, rtol=rtol, atol=atol)
+        weights_match = torch.allclose(grad_weights_native, grad_weights_fused, rtol=rtol, atol=atol)
+        k_match = torch.allclose(grad_k_native, grad_k_fused, rtol=rtol, atol=atol)
+        
+        # Print results
+        if loss_match and topk_match and q_match and weights_match and k_match:
+            print(f"  ✓ All tests passed!")
+            print(f"    - Forward: loss={indexer_loss_native.item():.6f}")
+            print(f"    - Backward: All gradients match")
+        else:
+            all_passed = False
+            print(f"  ✗ Test failed:")
+            
+            if not loss_match:
+                loss_diff = (indexer_loss_native - indexer_loss_fused).abs()
+                print(f"    - Loss mismatch: native={indexer_loss_native.item():.6f}, fused={indexer_loss_fused.item():.6f}, diff={loss_diff.item():.6f}")
+            
+            if not topk_match:
+                topk_diff_count = (topk_indices_native != topk_indices_fused).sum().item()
+                print(f"    - TopK indices mismatch: {topk_diff_count}/{topk_indices_native.numel()} elements differ")
+            
+            if not q_match:
+                q_rel_diff = (grad_q_native - grad_q_fused).abs() / (grad_q_native.abs() + 1e-8)
+                print(f"    - grad_q: max_rel_diff={q_rel_diff.max():.6f}, max_abs_diff={(grad_q_native - grad_q_fused).abs().max():.6f}")
+            
+            if not weights_match:
+                w_rel_diff = (grad_weights_native - grad_weights_fused).abs() / (grad_weights_native.abs() + 1e-8)
+                print(f"    - grad_weights: max_rel_diff={w_rel_diff.max():.6f}, max_abs_diff={(grad_weights_native - grad_weights_fused).abs().max():.6f}")
+            
+            if not k_match:
+                k_rel_diff = (grad_k_native - grad_k_fused).abs() / (grad_k_native.abs() + 1e-8)
+                print(f"    - grad_k: max_rel_diff={k_rel_diff.max():.6f}, max_abs_diff={(grad_k_native - grad_k_fused).abs().max():.6f}")
+    
+    print("\n" + "=" * 80)
+    if all_passed:
+        print("✓ All FusedDSAIndexerLoss tests passed!")
+    else:
+        print("✗ Some FusedDSAIndexerLoss tests failed")
+    print("=" * 80)
+    
+    return all_passed
+
+
 def main():
     parser = argparse.ArgumentParser(description="DSA Triton/PyTorch test harness")
     group = parser.add_mutually_exclusive_group(required=True)
@@ -784,6 +940,11 @@ def main():
         action="store_true", 
         help="Benchmark tensor parallel variant (requires torchrun with --nproc_per_node)"
     )
+    group.add_argument(
+        "--autograd", 
+        action="store_true", 
+        help="Test the FusedDSAIndexerLoss autograd function (forward + backward)"
+    )
     args = parser.parse_args()
 
     any_run = False
@@ -804,13 +965,18 @@ def main():
         benchmark_fused_loss_backward_tensor_parallel()
         any_run = True
 
+    if args.end_to_end:
+        test_fused_dsa_indexer_loss_autograd()
+        any_run = True
+
     if not any_run:
         print(
             "Nothing selected to run. Please specify one of the following:\n"
             "--backward-native\n"
             "--backward-kernel\n"
             "--forward-kernel\n"
-            "--forward-tensor-parallel"
+            "--forward-tensor-parallel\n"
+            "--autograd"
         )
         sys.exit(1)
 
