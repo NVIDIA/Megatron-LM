@@ -635,30 +635,34 @@ def _fwd_fused_indexer_loss_kernel(
             index_scores = tl.where((sq_valid[:, None] & sk_valid[None, :]), index_scores, float("-inf"))
 
         if SPARSE_LOSS:
+            sparse_mask = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
             sq_strides = tl.arange(0, BLOCK_SQ)
             sk_strides = tl.arange(0, BLOCK_SK)
+            # leave all threads to topk parallelism
+            for sq_i in tl.range(BLOCK_SQ):
+                sq_i_offs = sq_block_id * BLOCK_SQ + sq_i
+                sq_i_valid = sq_i_offs < Sq
 
-            tl.store(Index_Mask_ptr + sq_strides[:, None] * stride_imsq + sk_strides[None, :] * stride_imsk, float("-inf"))
+                for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
+                    topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+                    topk_valid = topk_off < TopK
+                    
+                    topk_indices = tl.load(
+                        Topk_Idx_ptr + b * stride_tb + sq_i_offs * stride_ts + topk_off * stride_tk,
+                        mask=sq_i_valid & topk_valid,
+                        other=-1
+                    )
+                    
+                    for sk_j in tl.range(BLOCK_SK):
+                        if sk_start + sk_j < Sk:
+                            sk_j_offs = sk_start + sk_j
 
-            for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
-                topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
-                topk_valid = topk_off < TopK
-
-                topk_indices = tl.load(Topk_Idx_ptr + b * stride_tb + sq[:, None] * stride_ts + topk_off[None, :] * stride_tk, mask=sq_valid[:, None] & topk_valid[None, :], other=0)  # [BLOCK_SQ, BLOCK_TOPK]
-
-                topk_indices_norm = topk_indices - sk_start
-                topk_idx_valid = (topk_indices_norm >= 0) & (topk_indices_norm < BLOCK_SK)
-                # addr = topk_indices + sq_strides
-                topk_indices_ptrs = topk_indices_norm * stride_imsk + sq_strides[:, None] * stride_imsq
-                # index_mask: [BLOCK_SQ, BLOCK_SK]
-                # tl.store(Index_Mask_ptr + topk_indices_ptrs, 0.0, mask=sq_valid[:, None] & topk_valid[None, :] & topk_idx_valid)
-                tl.atomic_max(Index_Mask_ptr + topk_indices_ptrs, 0.0, mask=topk_idx_valid & sq_valid[:, None] & topk_valid[None, :])
-
-            tl.debug_barrier()
-
-            index_mask = tl.load(Index_Mask_ptr + sq_strides[:, None] * stride_imsq + sk_strides[None, :] * stride_imsk, mask=sq_valid[:, None] & sk_valid[None, :], other=0.0)
-
-            index_scores += index_mask
+                            ij_mask = tl.sum(topk_indices == sk_j_offs) > 0
+                            
+                            sparse_mask = tl.where(sq_i_valid & (sq_strides[:, None] == sq_i) & (sk_strides[None, :] == sk_j), ij_mask + sparse_mask, sparse_mask)
+            
+            sparse_mask = tl.where(sparse_mask > 0, 0.0, float("-inf"))
+            index_scores = index_scores + sparse_mask
         
         # first pass for index softmax
         m1_i_1 = m1_i
@@ -697,7 +701,7 @@ def _fwd_fused_indexer_loss_kernel(
         attn_scores += casual_mask[None, :, :]
 
         if SPARSE_LOSS:
-            attn_scores += index_mask[None, :, :]
+            attn_scores += sparse_mask[None, :, :]
 
         m_i_1 = m_i
         m_i = tl.maximum(m_i, tl.max(attn_scores, axis=-1))
@@ -746,30 +750,34 @@ def _fwd_fused_indexer_loss_kernel(
             index_scores = tl.where((sq_valid[:, None] & sk_valid[None, :]), index_scores, float("-inf"))
 
         if SPARSE_LOSS:
+            sparse_mask = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
             sq_strides = tl.arange(0, BLOCK_SQ)
             sk_strides = tl.arange(0, BLOCK_SK)
+            # leave all threads to topk parallelism
+            for sq_i in tl.range(BLOCK_SQ):
+                sq_i_offs = sq_block_id * BLOCK_SQ + sq_i
+                sq_i_valid = sq_i_offs < Sq
 
-            tl.store(Index_Mask_ptr + sq_strides[:, None] * stride_imsq + sk_strides[None, :] * stride_imsk, float("-inf"))
+                for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
+                    topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+                    topk_valid = topk_off < TopK
+                    
+                    topk_indices = tl.load(
+                        Topk_Idx_ptr + b * stride_tb + sq_i_offs * stride_ts + topk_off * stride_tk,
+                        mask=sq_i_valid & topk_valid,
+                        other=-1
+                    )
+                    
+                    for sk_j in tl.range(BLOCK_SK):
+                        if sk_start + sk_j < Sk:
+                            sk_j_offs = sk_start + sk_j
 
-            for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
-                topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
-                topk_valid = topk_off < TopK
-
-                topk_indices = tl.load(Topk_Idx_ptr + b * stride_tb + sq[:, None] * stride_ts + topk_off[None, :] * stride_tk, mask=sq_valid[:, None] & topk_valid[None, :], other=0)  # [BLOCK_SQ, BLOCK_TOPK]
-
-                topk_indices_norm = topk_indices - sk_start
-                topk_idx_valid = (topk_indices_norm >= 0) & (topk_indices_norm < BLOCK_SK)
-                # addr = topk_indices + sq_strides
-                topk_indices_ptrs = topk_indices_norm * stride_imsk + sq_strides[:, None] * stride_imsq
-                # index_mask: [BLOCK_SQ, BLOCK_SK]
-                # tl.store(Index_Mask_ptr + topk_indices_ptrs, 0.0, mask=sq_valid[:, None] & topk_valid[None, :] & topk_idx_valid)
-                tl.atomic_max(Index_Mask_ptr + topk_indices_ptrs, 0.0, mask=topk_idx_valid & sq_valid[:, None] & topk_valid[None, :])
-
-            tl.debug_barrier()
-
-            index_mask = tl.load(Index_Mask_ptr + sq_strides[:, None] * stride_imsq + sk_strides[None, :] * stride_imsk, mask=sq_valid[:, None] & sk_valid[None, :], other=0.0)
-
-            index_scores += index_mask
+                            ij_mask = tl.sum(topk_indices == sk_j_offs) > 0
+                            
+                            sparse_mask = tl.where(sq_i_valid & (sq_strides[:, None] == sq_i) & (sk_strides[None, :] == sk_j), ij_mask + sparse_mask, sparse_mask)
+            
+            sparse_mask = tl.where(sparse_mask > 0, 0.0, float("-inf"))
+            index_scores = index_scores + sparse_mask
 
         # compute loss
         h_ids = tl.arange(0, AH)
@@ -802,7 +810,7 @@ def _fwd_fused_indexer_loss_kernel(
         attn_scores += casual_mask[None, :, :]
 
         if SPARSE_LOSS:
-            attn_scores += index_mask[None, :, :]
+            attn_scores += sparse_mask[None, :, :]
 
         # softmax
         softmax_attn_i = tl.exp(attn_scores - m_i[:, :, None]) / d_i[:, :, None]
@@ -970,9 +978,9 @@ def fwd_fused_indexer_loss(
     assert topk_indices.max() < Sk
 
     # TopK could be 2048
-    BLOCK_TOPK = min(128, topk)
+    BLOCK_TOPK = min(2048, topk)
     BLOCK_SK = 128
-    BLOCK_SQ = (128 * 128) // (BLOCK_SK * BLOCK_TOPK)# 16
+    BLOCK_SQ = 16
     BLOCK_D  = 128
 
     out_loss = torch.empty((B, ASq), dtype=torch.float32, device=q.device)
@@ -1070,7 +1078,6 @@ def _bwd_fused_indexer_loss_kernel(
     Attn_Query_ptr,
     Attn_Key_ptr,
     Topk_Idx_ptr,
-    Index_Mask_ptr, # [BLOCK_SQ, BLOCK_SK]
     Grad_Q_ptr,
     Grad_W_ptr,
     Grad_K_ptr,
@@ -1101,9 +1108,6 @@ def _bwd_fused_indexer_loss_kernel(
     stride_tb,
     stride_ts,
     stride_tk,
-    # Index mask strides: [BLOCK_SQ, Sk]
-    stride_imsq,
-    stride_imsk,
     # Grad Q strides: [Sq, B, H, D]
     stride_gqs,
     stride_gqb,
@@ -1164,7 +1168,7 @@ def _bwd_fused_indexer_loss_kernel(
     for sk_start in tl.range(0, causal_sk, BLOCK_SK):
         sk_offs = sk_start + tl.arange(0, BLOCK_SK)
         sk_valid = sk_offs < Sk
-        
+
         # Compute index_scores
         index_scores = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
         for h in tl.range(H):
@@ -1192,30 +1196,32 @@ def _bwd_fused_indexer_loss_kernel(
         
         # Apply sparse loss mask if enabled
         if SPARSE_LOSS:
+            sparse_mask = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
             sq_strides = tl.arange(0, BLOCK_SQ)
             sk_strides = tl.arange(0, BLOCK_SK)
+            for sq_i in tl.range(BLOCK_SQ):
+                sq_i_offs = sq_block_id * BLOCK_SQ + sq_i
+                sq_i_valid = sq_i_offs < Sq
 
-            tl.store(Index_Mask_ptr + sq_strides[:, None] * stride_imsq + sk_strides[None, :] * stride_imsk, float("-inf"))
+                for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
+                    topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+                    topk_valid = topk_off < TopK
+                    
+                    topk_indices = tl.load(
+                        Topk_Idx_ptr + b * stride_tb + sq_i_offs * stride_ts + topk_off * stride_tk,
+                        mask=sq_i_valid & topk_valid,
+                        other=-1
+                    )
+                    
+                    for sk_j in tl.range(BLOCK_SK):
+                        if sk_start + sk_j < Sk:
+                            sk_j_offs = sk_start + sk_j
 
-            # scatter topk indices
-            for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
-                topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
-                topk_valid = topk_off < TopK
-
-                topk_indices = tl.load(Topk_Idx_ptr + b * stride_tb + sq[:, None] * stride_ts + topk_off[None, :] * stride_tk, mask=sq_valid[:, None] & topk_valid[None, :], other=0)  # [BLOCK_SQ, BLOCK_TOPK]
-
-                topk_indices_norm = topk_indices - sk_start
-                topk_idx_valid = (topk_indices_norm >= 0) & (topk_indices_norm < BLOCK_SK)
-                # addr = topk_indices + sq_strides
-                topk_indices_ptrs = topk_indices_norm * stride_imsk + sq_strides[:, None] * stride_imsq
-                # index_mask: [BLOCK_SQ, BLOCK_SK]
-                # tl.store(Index_Mask_ptr + topk_indices_ptrs, 0.0, mask=sq_valid[:, None] & topk_valid[None, :] & topk_idx_valid)
-                tl.atomic_max(Index_Mask_ptr + topk_indices_ptrs, 0.0, mask=topk_idx_valid & sq_valid[:, None] & topk_valid[None, :])
-
-            tl.debug_barrier()
-
-            sparse_mask = tl.load(Index_Mask_ptr + sq_strides[:, None] * stride_imsq + sk_strides[None, :] * stride_imsk, mask=sq_valid[:, None] & sk_valid[None, :], other=0.0)
+                            ij_mask = tl.sum(topk_indices == sk_j_offs) > 0
+                            
+                            sparse_mask = tl.where((sq_strides[:, None] == sq_i) & (sk_strides[None, :] == sk_j), ij_mask + sparse_mask, sparse_mask)
             
+            sparse_mask = tl.where(sparse_mask > 0, 0.0, float("-inf"))
             index_scores = index_scores + sparse_mask
         
         m1_i_1 = m1_i
@@ -1283,30 +1289,32 @@ def _bwd_fused_indexer_loss_kernel(
         
         # Apply sparse loss mask if enabled
         if SPARSE_LOSS:
+            sparse_mask = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
             sq_strides = tl.arange(0, BLOCK_SQ)
             sk_strides = tl.arange(0, BLOCK_SK)
+            for sq_i in tl.range(BLOCK_SQ):
+                sq_i_offs = sq_block_id * BLOCK_SQ + sq_i
+                sq_i_valid = sq_i_offs < Sq
 
-            tl.store(Index_Mask_ptr + sq_strides[:, None] * stride_imsq + sk_strides[None, :] * stride_imsk, float("-inf"))
+                for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
+                    topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+                    topk_valid = topk_off < TopK
+                    
+                    topk_indices = tl.load(
+                        Topk_Idx_ptr + b * stride_tb + sq_i_offs * stride_ts + topk_off * stride_tk,
+                        mask=sq_i_valid & topk_valid,
+                        other=-1
+                    )
+                    
+                    for sk_j in tl.range(BLOCK_SK):
+                        if sk_start + sk_j < Sk:
+                            sk_j_offs = sk_start + sk_j
 
-            # scatter topk indices
-            for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
-                topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
-                topk_valid = topk_off < TopK
-
-                topk_indices = tl.load(Topk_Idx_ptr + b * stride_tb + sq[:, None] * stride_ts + topk_off[None, :] * stride_tk, mask=sq_valid[:, None] & topk_valid[None, :], other=0)  # [BLOCK_SQ, BLOCK_TOPK]
-
-                topk_indices_norm = topk_indices - sk_start
-                topk_idx_valid = (topk_indices_norm >= 0) & (topk_indices_norm < BLOCK_SK)
-                # addr = topk_indices + sq_strides
-                topk_indices_ptrs = topk_indices_norm * stride_imsk + sq_strides[:, None] * stride_imsq
-                # index_mask: [BLOCK_SQ, BLOCK_SK]
-                # tl.store(Index_Mask_ptr + topk_indices_ptrs, 0.0, mask=sq_valid[:, None] & topk_valid[None, :] & topk_idx_valid)
-                tl.atomic_max(Index_Mask_ptr + topk_indices_ptrs, 0.0, mask=topk_idx_valid & sq_valid[:, None] & topk_valid[None, :])
-
-            tl.debug_barrier()
-
-            sparse_mask = tl.load(Index_Mask_ptr + sq_strides[:, None] * stride_imsq + sk_strides[None, :] * stride_imsk, mask=sq_valid[:, None] & sk_valid[None, :], other=0.0)
+                            ij_mask = tl.sum(topk_indices == sk_j_offs) > 0
+                            
+                            sparse_mask = tl.where((sq_strides[:, None] == sq_i) & (sk_strides[None, :] == sk_j), ij_mask + sparse_mask, sparse_mask)
             
+            sparse_mask = tl.where(sparse_mask > 0, 0.0, float("-inf"))
             index_scores = index_scores + sparse_mask
         
         # Recompute attention scores
@@ -1379,30 +1387,33 @@ def _bwd_fused_indexer_loss_kernel(
         
         # Apply sparse loss mask if enabled
         if SPARSE_LOSS:
+            sparse_mask = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
             sq_strides = tl.arange(0, BLOCK_SQ)
             sk_strides = tl.arange(0, BLOCK_SK)
+            # leave all threads to topk parallelism
+            for sq_i in tl.range(BLOCK_SQ):
+                sq_i_offs = sq_block_id * BLOCK_SQ + sq_i
+                sq_i_valid = sq_i_offs < Sq
 
-            tl.store(Index_Mask_ptr + sq_strides[:, None] * stride_imsq + sk_strides[None, :] * stride_imsk, float("-inf"))
+                for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
+                    topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+                    topk_valid = topk_off < TopK
+                    
+                    topk_indices = tl.load(
+                        Topk_Idx_ptr + b * stride_tb + sq_i_offs * stride_ts + topk_off * stride_tk,
+                        mask=sq_i_valid & topk_valid,
+                        other=-1
+                    )
+                    
+                    for sk_j in tl.range(BLOCK_SK):
+                        if sk_start + sk_j < Sk:
+                            sk_j_offs = sk_start + sk_j
 
-            # scatter topk indices
-            for topk_i in tl.range(tl.cdiv(TopK, BLOCK_TOPK)):
-                topk_off = topk_i * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
-                topk_valid = topk_off < TopK
-
-                topk_indices = tl.load(Topk_Idx_ptr + b * stride_tb + sq[:, None] * stride_ts + topk_off[None, :] * stride_tk, mask=sq_valid[:, None] & topk_valid[None, :], other=0)  # [BLOCK_SQ, BLOCK_TOPK]
-
-                topk_indices_norm = topk_indices - sk_start
-                topk_idx_valid = (topk_indices_norm >= 0) & (topk_indices_norm < BLOCK_SK)
-                # addr = topk_indices + sq_strides
-                topk_indices_ptrs = topk_indices_norm * stride_imsk + sq_strides[:, None] * stride_imsq
-                # index_mask: [BLOCK_SQ, BLOCK_SK]
-                # tl.store(Index_Mask_ptr + topk_indices_ptrs, 0.0, mask=sq_valid[:, None] & topk_valid[None, :] & topk_idx_valid)
-                tl.atomic_max(Index_Mask_ptr + topk_indices_ptrs, 0.0, mask=topk_idx_valid & sq_valid[:, None] & topk_valid[None, :])
-
-            tl.debug_barrier()
-
-            sparse_mask = tl.load(Index_Mask_ptr + sq_strides[:, None] * stride_imsq + sk_strides[None, :] * stride_imsk, mask=sq_valid[:, None] & sk_valid[None, :], other=0.0)
+                            ij_mask = tl.sum(topk_indices == sk_j_offs) > 0
+                            
+                            sparse_mask = tl.where(sq_i_valid & (sq_strides[:, None] == sq_i) & (sk_strides[None, :] == sk_j), ij_mask + sparse_mask, sparse_mask)
             
+            sparse_mask = tl.where(sparse_mask > 0, 0.0, float("-inf"))
             index_scores = index_scores + sparse_mask
         
         # Recompute attention scores
@@ -1533,14 +1544,13 @@ def bwd_fused_indexer_loss(
     grad_weights = torch.zeros_like(weights, dtype=torch.float32)
     num_sq_blocks = triton.cdiv(sq, BLOCK_SQ)
     grad_k = torch.zeros(b, sk, d, device=q.device, dtype=torch.float32)
-    index_mask = torch.zeros([BLOCK_SQ, BLOCK_SK], device=q.device, dtype=torch.float32)
 
     grid1 = (b, num_sq_blocks)
     grad_loss_scale = grad_loss.item() * loss_coeff / (b * sq)
     
     # Get topk
     topk = topk_indices.size(-1)
-    BLOCK_TOPK = 8
+    BLOCK_TOPK = min(topk, 2048)
     
     _bwd_fused_indexer_loss_kernel[grid1](
         Q_ptr=q,

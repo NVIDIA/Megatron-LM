@@ -422,6 +422,8 @@ def benchmark_fused_loss_forward():
             
             metrics_collection.append((Sq, Sk, B, H, D, topk, sparse_str, pytorch_time, triton_time, speedup, match))
 
+            print(f"[Sq={Sq}, Sk={Sk}, B={B}, H={H}, D={D}, topk={topk}, sparse_loss={sparse_loss}] completes.")
+
     print("\n" + "=" * 80)
     print("Benchmark: DSA Indexer (TopK + Loss) - PyTorch vs Triton")
     print("=" * 80)
