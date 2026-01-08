@@ -496,14 +496,10 @@ class FSDPDistributedIndex:
         # AG group comes from parallel_state, not the mesh
         # the purpose of this independent group is to overlap all-gather and gradient reduction.
         self.fsdp_group_ag = None
-        if HAVE_MEGATRON_CORE:
-            self.fsdp_group_ag = (
-                parallel_state.get_data_parallel_group(
+        if HAVE_MEGATRON_CORE and parallel_state.has_separate_all_gather_group():
+            self.fsdp_group_ag = parallel_state.get_data_parallel_group(
                         with_context_parallel=True,
                         independent_all_gather=True
-                    )
-                if parallel_state.has_separate_all_gather_group()
-                else None
             )
         # Retrieve the outer-FSDP process group from the DeviceMesh.
         self.outer_fsdp_group = (
