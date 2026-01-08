@@ -26,7 +26,7 @@ from slack_sdk.errors import SlackApiError
 GITHUB_API_URL = "https://api.github.com"
 SCHEDULE_FILE = ".github/oncall_schedule.json"
 ROTATION_TEAM_SLUG = "mcore-oncall-rotation"
-ACTIVE_ONCALL_TEAM_SLUG = "megatron-oncall"
+ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
 SLACK_USERGROUP_HANDLE = "mcore-oncall"
 TARGET_WEEKS = 12
 
@@ -83,34 +83,62 @@ def get_team_members(org, team_slug):
     return members
 
 def get_user_email(username):
-    """Get user's email from GitHub, prioritizing @nvidia.com emails."""
+    """Get user's email from GitHub, prioritizing @nvidia.com emails.
+    
+    Checks in order:
+    1. Public profile email
+    2. Recent commits in the repository
+    """
     if username in _email_cache:
         return _email_cache[username]
     
     headers = get_headers()
+    public_email = None
     
     try:
-        # Try to get user's public profile
+        # 1. Try to get user's public profile email first
         resp = requests.get(f"{GITHUB_API_URL}/users/{username}", headers=headers)
         if resp.status_code == 200:
             user_data = resp.json()
             email = user_data.get('email')
-            if email and email.endswith("@nvidia.com"):
-                _email_cache[username] = email
-                return email
-            # Store non-nvidia email as fallback
-            public_email = email if email and not email.endswith("@users.noreply.github.com") else None
-        else:
-            public_email = None
+            if email and not email.endswith("@users.noreply.github.com"):
+                if email.endswith("@nvidia.com"):
+                    _email_cache[username] = email
+                    return email
+                # Store non-nvidia email as fallback
+                public_email = email
         
-        # If no nvidia email found, use public email or generate fallback
+        # 2. Check recent commits in the repository for @nvidia.com email
+        repo_env = os.environ.get("GITHUB_REPOSITORY", "NVIDIA/Megatron-LM")
+        commits_url = f"{GITHUB_API_URL}/repos/{repo_env}/commits?author={username}&per_page=10"
+        resp = requests.get(commits_url, headers=headers)
+        
+        if resp.status_code == 200:
+            commits = resp.json()
+            for commit in commits:
+                # Get email from commit author
+                commit_data = commit.get('commit', {})
+                author_data = commit_data.get('author', {})
+                email = author_data.get('email')
+                
+                if email and not email.endswith("@users.noreply.github.com"):
+                    if email.endswith("@nvidia.com"):
+                        _email_cache[username] = email
+                        print(f"Found @nvidia.com email for {username} from commits: {email}")
+                        return email
+                    elif public_email is None:
+                        public_email = email
+        
+        # 3. Use public email if found, otherwise fallback
         if public_email:
             _email_cache[username] = public_email
+            print(f"Using public email for {username}: {public_email}")
             return public_email
         
         # Fallback to noreply email
         fallback = f"{username}@users.noreply.github.com"
         _email_cache[username] = fallback
+        print(f"Warning: No email found for {username}, using fallback: {fallback}")
         return fallback
         
     except Exception as e:
