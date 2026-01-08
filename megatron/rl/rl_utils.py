@@ -39,6 +39,11 @@ from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.inference.unified_memory import (
+    advise_managed_module_parameters_preferred_location,
+    prefetch_managed_module_parameters,
+)
 from megatron.core.utils import get_asyncio_loop, log_single_rank
 from megatron.rl.sequence_packing_utils import (
     get_microbatch_dataloader,
@@ -72,7 +77,14 @@ from megatron.training.global_vars import (
     get_wandb_writer,
 )
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
-from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range
+from megatron.training.utils import (
+    get_ltor_masks_and_position_ids,
+    get_nvtx_range,
+    print_rank_0,
+    unwrap_model,
+)
+from megatron.core.utils import get_pg_size, get_attr_wrapped_model
+from megatron.core.process_groups_config import ProcessGroupCollection
 from wandb import wandb_run
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
@@ -82,6 +94,121 @@ logger = logging.getLogger(__name__)
 
 # Global variable to store packing context for forward_step
 _GLOBAL_PACKING_CONTEXT = None
+
+
+def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool) -> None:
+    """Prefetch RL *separate inference model* weights to CPU/GPU (UVM-only path).
+
+    Gated only by user args; this assumes the separate inference model was allocated with UVM when enabled.
+    """
+    args = get_args()
+    if not args.rl_offload_inference_model_weights_when_idle:
+        return
+    if args.rl_inference_model_unified_memory_level != 1:
+        return
+
+    device = -1 if to_cpu else int(torch.cuda.current_device())
+    advise_managed_module_parameters_preferred_location(model_core, device=device, include_buffers=True)
+    nbytes = prefetch_managed_module_parameters(model_core, device=device, include_buffers=True)
+    # Ensure pages are resident before we enter CUDA-graph capture / inference, or before training continues.
+    torch.cuda.synchronize()
+
+    if to_cpu:
+        print_rank_0(f"[Rank 0] offloaded {nbytes / 1024**2:.2f} MB of separate RL inference model weights to CPU (other ranks may vary)")
+    else:
+        print_rank_0(f"[Rank 0] prefetched {nbytes / 1024**2:.2f} MB of separate RL inference model weights to GPU (other ranks may vary)")
+
+
+def verify_model_weights_swap(
+    train_model: LanguageModule,
+    inference_model: LanguageModule,
+    seq_len: int = 8,
+    batch_size: int = 2,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+) -> None:
+    """Verify that the inference model produces the same forward pass outputs
+    as the training model after the weights have been swapped.
+
+    This function should be called after swap_model_weights to ensure the weight
+    transfer was successful. It runs a forward pass on both models and asserts
+    the outputs match.  This is meant for debugging purposes only.
+
+    Args:
+        train_model: The training model (source of weights).
+        inference_model: The inference model (target of weights).
+        seq_len: Sequence length for test input.
+        batch_size: Batch size for test input.
+        atol: Absolute tolerance for comparing outputs.
+        rtol: Relative tolerance for comparing outputs.
+
+    Raises:
+        AssertionError: If forward pass outputs do not match within tolerance.
+    """
+    args = get_args()
+
+    # Unwrap models to get the core module
+    train_lm = train_model[0] if isinstance(train_model, (list, tuple)) else train_model
+    inf_lm = inference_model[0] if isinstance(inference_model, (list, tuple)) else inference_model
+
+    train_core = unwrap_model(train_lm)
+    inf_core = unwrap_model(inf_lm)
+
+    actual_vocab_size = getattr(args, 'padded_vocab_size', 128256)
+    actual_seq_len = min(seq_len, getattr(args, 'seq_length', seq_len))
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    # Generate deterministic test input - same across ALL ranks
+    torch.manual_seed(1234)
+    test_tokens = torch.randint(
+        low=0, high=actual_vocab_size, size=(batch_size, actual_seq_len),
+        device=device, dtype=torch.long
+    )
+    test_position_ids = (
+        torch.arange(actual_seq_len, device=device, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+    test_attention_mask = torch.ones(
+        (batch_size, 1, actual_seq_len, actual_seq_len), device=device, dtype=torch.bool
+    )
+
+    # Save and restore training state
+    train_was_training = train_core.training
+    inf_was_training = inf_core.training
+
+    train_core.eval()
+    inf_core.eval()
+
+    try:
+        with torch.no_grad():
+            train_output = train_lm(
+                test_tokens, test_position_ids, test_attention_mask,
+                runtime_gather_output=True
+            )
+
+            inf_output = inf_lm(
+                test_tokens, test_position_ids, test_attention_mask,
+                runtime_gather_output=True
+            )
+
+        # Only check on ranks that have output (last PP stage)
+        if train_output is not None and inf_output is not None:
+            assert train_output.shape == inf_output.shape, (
+                f"Output shape mismatch: train={train_output.shape}, infer={inf_output.shape}"
+            )
+            
+            max_diff = (train_output - inf_output).abs().max().item()
+            assert torch.allclose(train_output, inf_output, atol=atol, rtol=rtol), (
+                f"Forward pass outputs do not match: max_diff={max_diff:.6e}, atol={atol}, rtol={rtol}"
+            )
+
+    finally:
+        # Restore training state
+        if train_was_training:
+            train_core.train()
+        if inf_was_training:
+            inf_core.train()
 
 GroupedRollouts = list[list[TokenRollout | Rollout]]
 
@@ -318,12 +445,13 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
 
 
 def get_environment_rollouts(
-    model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
+    model: LanguageModule, inference_model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
 ):
     """Sample environment rollouts from an LLM.
 
     Args:
         model: Model to sample from.
+        inference_model: Inference model to use for inference.
         n_prompts: Number of prompts to sample for across *all* data parallel workers.
         samples_per_group: Amount of trajectories per prompt.
 
@@ -333,14 +461,33 @@ def get_environment_rollouts(
     args = get_args()
     nvtx_range = get_nvtx_range()
 
+    # If we have seperate training and inference models we to refit weights from the training model to the inference model.
+    if inference_model is not None:
+        # If the separate inference model weights were prefetched to CPU while idle, bring them
+        # back to GPU before refit/copy and before any CUDA-graph'd inference.
+        with nvtx_range("prefetch-inference-model-weights-to-gpu"):
+            inf_core = unwrap_model(inference_model[0])
+            _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
+        swap_model_weights(model, inference_model, args.refit_method)
+        if args.rl_verify_model_weights_swap:
+            verify_model_weights_swap(
+                train_model=model,
+                inference_model=inference_model,
+                atol=.1,
+                rtol=5e-4,
+            )
+    else:
+        inference_model = model
+
+    inference_pg_collection = get_attr_wrapped_model(inference_model[0], "pg_collection")
     assert (
-        n_prompts % mpu.get_data_parallel_world_size() == 0
+        n_prompts % get_pg_size(inference_pg_collection.ep) == 0
     ), "n_prompts must be divisible by data_parallel_world_size"
 
     with nvtx_range("rollout-collection"):
         loop = get_asyncio_loop()
         with megatron_rl_inference_mode(
-            model,
+            inference_model,
             optimizer,
             args.cuda_graph_impl,
             args.rl_reset_cuda_graphs,
@@ -384,7 +531,7 @@ def get_environment_rollouts(
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
 
-    if lang_rl_log_dir and rank == get_tensor_model_parallel_src_rank():
+    if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
             lang_rl_log_dir
             + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
@@ -839,8 +986,21 @@ def prepare_data_for_update(
     args = get_args()
     wandb_writer = get_wandb_writer()
     tb_writer = get_tensorboard_writer()
-    nvtx_range = get_nvtx_range()                
+    nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
+
+    # RL policy updates + logprob computations should run eagerly; only rollout generation
+    # (inference engine) should use CUDA graphs until training cuda-graphs MR goes in. 
+    # In the single-model case this is naturally handled by `megatron_rl_inference_mode` 
+    # toggling graphs on/off around inference. In the refit case (separate inference_model),
+    # we must explicitly keep the training model (this `model`) with CUDA graphs disabled,
+    # otherwise training/logprobs can get cudagraphed.
+    if args.cuda_graph_impl != "none":
+        lang_module = (
+            model[0].module.module if hasattr(model[0].module, "module") else model[0].module
+        )
+        toggle_cuda_graphs(lang_module, "none", reset_cuda_graphs=False)
+
     model = model[0]
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
@@ -1120,6 +1280,7 @@ def prepare_data_for_update(
 
 def get_rollout_data_iterator(
     model: LanguageModule,
+    inference_model: LanguageModule | None,
     optimizer: MegatronOptimizer,
     iteration: int,
     ref_state_dict: Dict[str, torch.Tensor],
@@ -1129,7 +1290,7 @@ def get_rollout_data_iterator(
     tokenizer = get_tokenizer()
 
     buffered_rollouts = get_environment_rollouts(
-        model, optimizer, args.grpo_prompts_per_step, args.grpo_group_size
+        model, inference_model, optimizer, args.grpo_prompts_per_step, args.grpo_group_size
     )
     buffered_rollouts = prepare_data_for_update(model, ref_state_dict, buffered_rollouts, tokenizer)
 
@@ -1138,6 +1299,7 @@ def get_rollout_data_iterator(
 
 def setup_grpo_data_iterator(
     model: LanguageModule,
+    inference_model: LanguageModule | None,
     optimizer: MegatronOptimizer,
     iteration: int,
     ref_state_dict: Dict[str, torch.Tensor],
@@ -1159,13 +1321,18 @@ def setup_grpo_data_iterator(
     args = get_args()
     runtime_state = get_rl_runtime_state()
 
+    if inference_model is not None:
+        inference_pg_collection = unwrap_model(inference_model[0]).pg_collection
+    else:
+        inference_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
     # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
     if (
         buffered_rollouts is None or
         iteration == runtime_state.last_collection_iteration + 
         (args.grpo_iterations * runtime_state.global_batches_per_collection)
     ):
-        train_data_iterator = get_rollout_data_iterator(model, optimizer, iteration, ref_state_dict)
+        train_data_iterator = get_rollout_data_iterator(model,inference_model, optimizer, iteration, ref_state_dict)
         runtime_state.reset_iteration_counters(iteration)
     else:
         train_data_iterator = buffered_rollouts
@@ -1414,6 +1581,11 @@ def megatron_rl_inference_mode(
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
 
     lang_module.eval()
+    # If this is a separate RL inference model allocated with UVM, ensure weights are resident on GPU
+    # before any CUDA-graph capture/replay or inference.
+    with nvtx_range("prefetch-inference-model-weights-to-gpu"):
+        model_core = unwrap_model(model[0])
+        _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
     # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
@@ -1480,6 +1652,11 @@ def megatron_rl_inference_mode(
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none":
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
+
+        # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
+        # GPU memory during training.
+        with nvtx_range("prefetch-inference-model-weights-to-cpu"):
+            _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):
