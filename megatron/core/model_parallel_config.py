@@ -80,12 +80,15 @@ class ModelParallelConfig:
     When enabling hybrid_context_parallel, sft_sequence_packing must be true.
     """
 
-    hybrid_context_parallel_scheduler: str = 'balanced'
+    hybrid_context_parallel_scheduler: str = 'default_hybrid_cp'
     """
     Scheduler for hybrid context parallel.
-    balanced: balanced scheduler for hybrid context parallel which provided by MCore.
-    only_packing_no_scheduling: scheduling is already handled by the data sampler,
+    default_hybrid_cp: default hybrid-cp scheduler for hybrid context parallel 
+    which provided by MCore.
+    empty_scheduler_with_packing: scheduling is already handled by the data sampler,
     this scheduler only performs packing.
+    empty_scheduler_no_packing: scheduling and packing are already handled by the data sampler,
+    this scheduler only returns the batch.
     """
 
     sft_sequence_packing: bool = False
@@ -458,7 +461,10 @@ class ModelParallelConfig:
                     "sequence parallelism must be used"
                 )
 
-        if self.microbatch_group_size_per_vp_stage is None:
+        if (
+            self.microbatch_group_size_per_vp_stage is None
+            and self.virtual_pipeline_model_parallel_size is not None
+        ):
             self.microbatch_group_size_per_vp_stage = self.pipeline_model_parallel_size
 
         if self.overlap_p2p_comm_warmup_flush:
@@ -467,6 +473,8 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
+        if self.hybrid_context_parallel and not self.sft_sequence_packing:
+            raise ValueError("Hybrid context parallel requires sequence packing to be enabled")
         if self.sft_sequence_packing:
             # TODO: remove this after we fix the convergence issue with TE < 2.9.
             if not (

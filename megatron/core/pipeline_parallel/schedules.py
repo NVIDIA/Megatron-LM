@@ -520,25 +520,34 @@ def wrap_iterator_helper(
 ):
     """Warp data iterator for sequence packing if needed."""
     if config.sft_sequence_packing:
-        num_total_tokens_this_GB, sequence_square_sum_this_GB = None, None
+        num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch = None, None
         if config.hybrid_context_parallel:
-            if config.hybrid_context_parallel_scheduler == 'balanced':
+            if config.hybrid_context_parallel_scheduler == 'default_hybrid_cp':
                 (
                     data_iterator,
                     num_microbatches,
-                    num_total_tokens_this_GB,
-                    sequence_square_sum_this_GB,
+                    num_total_tokens_this_global_batch,
+                    sequence_square_sum_this_global_batch,
                 ) = wrap_dataloader(
-                    data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
+                    data_iterator, config, PackingScheduler.DEFAULT_HYBRID_CP, pg_collection=None
                 )
-            elif config.hybrid_context_parallel_scheduler == 'only_packing_no_scheduling':
+            elif config.hybrid_context_parallel_scheduler == 'empty_scheduler_with_packing':
                 (
                     data_iterator,
                     num_microbatches,
-                    num_total_tokens_this_GB,
-                    sequence_square_sum_this_GB,
+                    num_total_tokens_this_global_batch,
+                    sequence_square_sum_this_global_batch,
                 ) = wrap_dataloader(
-                    data_iterator, config, PackingScheduler.EMPTY, pg_collection=None
+                    data_iterator, config, PackingScheduler.EMPTY_PACKING, pg_collection=None
+                )
+            elif config.hybrid_context_parallel_scheduler == 'empty_scheduler_no_packing':
+                (
+                    data_iterator,
+                    num_microbatches,
+                    num_total_tokens_this_global_batch,
+                    sequence_square_sum_this_global_batch,
+                ) = wrap_dataloader(
+                    data_iterator, config, PackingScheduler.EMPTY_NO_PACKING, pg_collection=None
                 )
             else:
                 raise ValueError(
@@ -554,8 +563,8 @@ def wrap_iterator_helper(
                 (
                     data_iterator,
                     num_microbatches,
-                    num_total_tokens_this_GB,
-                    sequence_square_sum_this_GB,
+                    num_total_tokens_this_global_batch,
+                    sequence_square_sum_this_global_batch,
                 ) = wrap_dataloader(
                     data_iterator,
                     config,
@@ -565,8 +574,8 @@ def wrap_iterator_helper(
         return (
             data_iterator,
             num_microbatches,
-            num_total_tokens_this_GB,
-            sequence_square_sum_this_GB,
+            num_total_tokens_this_global_batch,
+            sequence_square_sum_this_global_batch,
         )
     else:
         return data_iterator, num_microbatches, None, None
@@ -654,9 +663,12 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
-    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
-        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
-    )
+    (
+        data_iterator,
+        num_microbatches,
+        num_total_tokens_this_global_batch,
+        sequence_square_sum_this_global_batch,
+    ) = wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
@@ -739,7 +751,9 @@ def forward_backward_no_pipelining(
         create_cudagraphs()
 
     if config.sft_sequence_packing:
-        forward_data_store.append([num_total_tokens_this_GB, sequence_square_sum_this_GB])
+        forward_data_store.append(
+            [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
+        )
 
     return forward_data_store
 
@@ -1097,9 +1111,12 @@ def forward_backward_pipelining_with_interleaving(
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
-    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
-        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
-    )
+    (
+        data_iterator,
+        num_microbatches,
+        num_total_tokens_this_global_batch,
+        sequence_square_sum_this_global_batch,
+    ) = wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2121,7 +2138,9 @@ def forward_backward_pipelining_with_interleaving(
     nvtx_range_pop(suffix="misc")
 
     if config.sft_sequence_packing:
-        forward_data_store.append([num_total_tokens_this_GB, sequence_square_sum_this_GB])
+        forward_data_store.append(
+            [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
+        )
 
     return forward_data_store
 
@@ -2240,9 +2259,12 @@ def forward_backward_pipelining_without_interleaving(
             "provide none or provide all the process groups"
         )
 
-    data_iterator, num_microbatches, num_total_tokens_this_GB, sequence_square_sum_this_GB = (
-        wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
-    )
+    (
+        data_iterator,
+        num_microbatches,
+        num_total_tokens_this_global_batch,
+        sequence_square_sum_this_global_batch,
+    ) = wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2514,6 +2536,8 @@ def forward_backward_pipelining_without_interleaving(
         create_cudagraphs()
 
     if config.sft_sequence_packing:
-        forward_data_store.append([num_total_tokens_this_GB, sequence_square_sum_this_GB])
+        forward_data_store.append(
+            [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
+        )
 
     return forward_data_store
