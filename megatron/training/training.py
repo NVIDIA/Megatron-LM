@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import sys
+from contextlib import nullcontext
 from typing import Any, Optional, Dict
 
 import torch.distributed
@@ -33,6 +34,7 @@ try:
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
+from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
@@ -110,6 +112,7 @@ from megatron.core.parallel_state import (
     destroy_model_parallel,
     update_pg_timeout
 )
+from megatron.core.inference.unified_memory import create_unified_mempool
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
@@ -717,6 +720,45 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
 
+    # Build a separate inference model for RL if requested.
+    inference_model = None
+    if args.perform_rl_step:
+        if args.rl_inference_tensor_model_parallel_size is not None:
+            print_rank_0(
+                f"Setting tensor model parallel size to {args.rl_inference_tensor_model_parallel_size} for inference model"
+            )
+            inference_pg_collection = build_inference_pg_collection(
+                tp_size=args.rl_inference_tensor_model_parallel_size,
+                world_size=args.world_size,
+                use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+            )
+
+            # Build an isolated inference config so training config remains unchanged
+            inference_config = copy.deepcopy(config)
+            inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
+
+            # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
+            # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
+            uvm_mempool = None
+            uvm_level = args.rl_inference_model_unified_memory_level
+            if uvm_level and uvm_level > 0:
+                uvm_mempool = create_unified_mempool()
+
+            mempool_ctx = (
+                torch.cuda.use_mem_pool(uvm_mempool) if uvm_mempool is not None else nullcontext()
+            )
+            with mempool_ctx:
+                inference_model = get_model(
+                    model_provider,
+                    model_type,
+                    wrap_with_ddp=False,
+                    pg_collection=inference_pg_collection,
+                    config=inference_config,
+                )
+            inference_model[0].eval()
+
+
+
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
@@ -791,6 +833,7 @@ def pretrain(
                 config,
                 checkpointing_context,
                 non_loss_data_func,
+                inference_model,
             )
 
         print_datetime('after training is done')
@@ -2070,6 +2113,7 @@ def train(
     config,
     checkpointing_context,
     non_loss_data_func,
+    inference_model=None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
@@ -2407,7 +2451,7 @@ def train(
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
                 train_data_iterator = rl_utils.setup_grpo_data_iterator(
-                    model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                    model, inference_model, optimizer, iteration, ref_state_dict, buffered_rollouts
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
