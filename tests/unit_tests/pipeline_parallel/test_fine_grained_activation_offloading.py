@@ -164,7 +164,6 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     os.environ.pop("NVTE_UNFUSED_ATTN", None)
     # os.environ["NVTE_FLASH_ATTN"] = "1"
     Utils.initialize_model_parallel(1, 1)
-    torch.cuda.memory._record_memory_history(max_entries=100000)
 
     seed = 123
     # Choose shapes large enough to make memory deltas stable but still fast.
@@ -270,10 +269,6 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         )
         del off_model
         _reset_cuda_memory()
-
-        torch.cuda.memory._dump_snapshot(f"/workspace/pyt_profile/memory_snapshot.pickle")
-        print(f"Captured memory snapshot at /workspace/pyt_profile/memory_snapshot.pickle")
-        torch.cuda.memory._record_memory_history(enabled=False)
 
         # 3) Correctness checks (forward + selected grads)
         assert torch.allclose(off_logits, base_logits, rtol=1e-3, atol=1e-3)
