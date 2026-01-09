@@ -16,20 +16,21 @@ class BlockAllocator:
 
     Args:
         context (DynamicInferenceContext): Dynamic inference context.
-        total_count (int): Total number of blocks in the buffer.
-        paused_count (int): Number of paused blocks in the buffer. Must be less
-            than `total_count`.
+        active_count (int): Total number of active blocks available in the buffer.
+            The full buffer size is 2*active_count, to accommodate an equal-size
+            space for paused requests that live on the CPU.
     """
 
-    def __init__(self, context: "DynamicInferenceContext", total_count: int, paused_count: int):
+    def __init__(self, context: "DynamicInferenceContext", total_count: int):
 
         self.context = context
 
-        self.total_count = total_count
-        self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
-        self.paused_count = paused_count
-        self.active_count = total_count - paused_count - 1  # -1 for dummy_block_idx
-        assert self.active_count >= 1  # ensures paused_count < total_count - 1
+        active_count = (total_count - 1) // 2  # -1 for dummy_block_idx (see below)
+        active_count = max(1, active_count)  # need at least one block
+        self.total_count = 2 * active_count + 1  # +1 for dummy_block_idx
+        self.total_avail = self.total_count - 1  # -1 for dummy_block_idx
+        self.active_count = active_count
+        self.paused_count = self.total_count - self.active_count - 1  # -1 for dummy_block_idx
         self.dummy_block_idx = self.total_count - 1
 
         # Initialize block pool as a "stack" data structure
@@ -39,14 +40,9 @@ class BlockAllocator:
 
     def __str__(self):
         return (
-            f"using: total {self.get_total_used()}/{self.total_count - 1}"
-            f"; active {self.get_active_used()}/{self.active_count}"
-            f"; paused {self.get_paused_used()}/{self.paused_count}"
+            f"total avail {self.total_avail} / {self.total_count - 1}"
+            f"; active {self.active_count}"
         )
-
-    def get_total_used(self):
-        """Compute number of total blocks used."""
-        return self.total_count - self.total_avail - 1
 
     def get_active_used(self):
         """Compute number of active blocks used."""
@@ -81,7 +77,7 @@ class BlockAllocator:
         Return:
             (bool) Is memory available?
         """
-        return self.total_avail >= num_blocks
+        return self.get_active_avail() >= num_blocks
 
     def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
         """Allocate memory blocks if available, else return None.

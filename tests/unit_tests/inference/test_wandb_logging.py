@@ -85,7 +85,8 @@ class TestInferenceWandbLogging:
         assert 'block_count_avail' in stats
         assert 'active_token_count' in stats
         assert 'total_request_count' in stats
-        assert 'max_requests' in stats
+        assert 'max_total_requests' in stats
+        assert 'max_active_requests' in stats
 
         # Verify values for empty context
         assert stats['allocated_blocks'] == 0
@@ -132,8 +133,10 @@ class TestInferenceWandbLogging:
         assert stats_after['total_blocks'] > 0
 
         # Verify that max_requests remains constant
-        assert stats_after['max_requests'] == stats['max_requests']
-        assert stats_after['max_requests'] > 0
+        assert stats_after['max_total_requests'] == stats['max_total_requests']
+        assert stats_after['max_total_requests'] > 0
+        assert stats_after['max_active_requests'] == stats['max_active_requests']
+        assert stats_after['max_active_requests'] > 0
 
         # Verify block availability decreased after allocation
         assert stats_after['block_count_avail'] < stats['block_count_avail']
@@ -177,7 +180,8 @@ class TestInferenceWandbLogging:
             'block_count_avail',
             'active_token_count',
             'total_request_count',
-            'max_requests',
+            'max_total_requests',
+            'max_active_requests',
         ]
 
         for field in int_fields:
