@@ -132,10 +132,6 @@ def _run_one_iter_and_capture(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
-@pytest.mark.skipif(
-    not is_te_min_version("1.13.0"),
-    reason="Fine-grained activation offloading requires TE-based GPT layer spec (TE 1.13+ in this repo's tests).",
-)
 @pytest.mark.parametrize(
     "is_moe, is_mla, offload_modules",
     [
@@ -310,8 +306,8 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.skipif(
-    not is_te_min_version("1.13.0"),
-    reason="Requires TE-based GPT layer spec (TE 1.13+ in this repo's tests).",
+    not is_te_min_version("1.9.0.dev0"),
+    reason="EP A2A overlap requires TE 1.9.0.dev0+ in this repo's tests.",
 )
 @pytest.mark.parametrize(
     "dispatcher_backend, is_mla, offload_modules",
