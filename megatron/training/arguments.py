@@ -393,6 +393,14 @@ def validate_args(args, defaults={}):
         assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
             "Cannot use both partial-rollouts and remove-kv-cache-during-training"
 
+        assert not (
+            args.rl_offload_inference_model_weights_when_idle
+            and args.rl_inference_model_unified_memory_level != 1
+        ), (
+            "--rl-offload-inference-model-weights-when-idle requires "
+            "--rl-inference-model-unified-memory-level=1."
+        )
+
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -2058,10 +2066,6 @@ def _add_rl_args(parser):
                        help="Entropy term weight in GRPO loss.")
     group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
                        help="Filter groups with same reward.")
-    group.add_argument('--grpo-default-temperature', type=float, default=1.0,
-                       help="Default temperature for model inference.")
-    group.add_argument('--grpo-default-top-p', type=float, default=0,
-                       help="Default top-p for model inference.")
     group.add_argument('--langrl-inference-server-type', type=str,
                        choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
                        help="Type of inference server to use.")
@@ -2070,6 +2074,12 @@ def _add_rl_args(parser):
     group.add_argument('--langrl-external-server', action=argparse.BooleanOptionalAction, required=False, default=False)
     group.add_argument('--langrl-env-config', type=str, default=None,
                        help="Path to YAML config file for RL environment configuration.")
+    group.add_argument('--rl-default-temperature', type=float, default=1.0,
+                       help="Default temperature for model inference.")
+    group.add_argument('--rl-default-top-p', type=float, default=0,
+                       help="Default top-p for model inference.")
+    group.add_argument('--rl-default-top-k', type=int, default=-1,
+                       help="Default top-k for model inference.")
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
     group.add_argument('--rl-offload-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
@@ -2095,8 +2105,45 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
+                       help='Degree of tensor model parallelism for inference for RL.')     
+    group.add_argument(
+        '--rl-inference-model-unified-memory-level',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            'Allocate the separate RL inference model parameters from a unified virtual memory (UVM) '
+            'CUDA mempool. Level 0 disables UVM (default). Level 1 enables UVM allocation so the '
+            'inference model weights can be prefetched to CPU when idle while keeping CUDA-graph-safe '
+            'device pointers.'
+        ),
+    )
+    group.add_argument(
+        '--rl-offload-inference-model-weights-when-idle',
+        action=argparse.BooleanOptionalAction,
+        required=False,
+        default=False,
+        help=(
+            'When using a separate RL inference model with UVM-enabled parameters, prefetch its weights '
+            'to CPU when not doing rollout inference, and prefetch back to GPU right before inference. '
+            'Requires --rl-inference-model-unified-memory-level=1.'
+        ),
+    )
+    group.add_argument('--refit-method', type=str, default='gloo',
+                       choices=['nccl', 'gloo'],
+                       help=('Method to refit the model weights between training and inference models during RL. '
+                             'nccl: use NCCLCopyService to refit using NCCL; '
+                             'gloo: use GlooCopyService over CPU; '
+                             ))
+    group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
+                       help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
+                       'the first swap of model weights.')
+
     group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
                         help='Number of parallel generation tasks for RL inference.')
+    group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                        help='Skip BOS token at the beginning of the sequences. Default is False.')
     return parser
 
 def _add_training_args(parser):
@@ -3287,6 +3334,8 @@ def _add_moe_args(parser):
                        help='Overlap the EP A2A communication by batch-level overlapping in 1f1b stage.')
     group.add_argument('--delay-wgrad-compute', action='store_true',
                        help='Delay the wgrad compute for batch-level overlapping')
+    group.add_argument('--ep-overlap-early-attn-memory-release', action='store_true',
+                       help='Release the memory of the attention module early in EP overlap.')
 
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '

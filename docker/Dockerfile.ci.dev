@@ -1,3 +1,4 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # syntax=docker/dockerfile:1.3-labs
 
 ARG FROM_IMAGE_NAME
@@ -55,7 +56,7 @@ EOF
 COPY docker/patches/deepep.patch /workspace/deepep.patch
 RUN bash -ex <<"EOF"
     cd /workspace
-    uv pip install nvidia-nvshmem-cu13
+    uv pip install nvidia-nvshmem-cu13==3.4.5
     pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
         ln -s libnvshmem_host.so.3 libnvshmem_host.so
     popd
@@ -89,6 +90,6 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
     uv pip install --no-cache-dir --upgrade $LOGGER_INDEX_URL "one-logger"
     uv pip install --no-cache-dir --upgrade "setuptools<80.0.0"
-    uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=3.0" 
+    uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=4.0" 
 EOF
 ###
