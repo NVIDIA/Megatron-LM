@@ -1,13 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+
 import pytest
-
-from packaging.version import Version
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig

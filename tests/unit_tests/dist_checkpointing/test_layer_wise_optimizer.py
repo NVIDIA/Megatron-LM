@@ -10,7 +10,9 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.dict_utils import nested_values
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
 )
