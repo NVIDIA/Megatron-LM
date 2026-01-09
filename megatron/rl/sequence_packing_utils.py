@@ -470,7 +470,7 @@ def create_packed_seq_params_for_bin(
 
     # Build cumulative sequence lengths for actual sequences
     # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
-    cu_seqlens_list = np.append(np.cumsum([0] + seq_lengths_in_bin), bin_size)
+    cu_seqlens_list = np.cumsum([0] + seq_lengths_in_bin)
 
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
 
