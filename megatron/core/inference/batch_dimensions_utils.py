@@ -285,6 +285,7 @@ class CUDAGraphBatchDimensionBuilder:
         max_tokens: int,
         max_sequence_length: int,
         use_cuda_graphs_for_non_decode_steps: bool,
+        can_use_cuda_graphs_with_chunked_prefill: bool = True,
     ) -> Tuple[List[InferenceBatchDimensions], Optional[List[int]]]:
         """
         Generate CUDA graph batch dimensions.

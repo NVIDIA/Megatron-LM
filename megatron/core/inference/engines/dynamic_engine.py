@@ -1058,6 +1058,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
+                    self.context.has_explicit_chunked_prefill_req = (
+                        self.context.is_hybrid_model
+                        and self.context.chunked_prefill_request_id == req.request_id
+                    )
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
@@ -1068,7 +1072,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue
-                    can_schedule = True
+                    can_schedule = not self.context.is_hybrid_model
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
@@ -1076,6 +1080,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
+                    self.context.has_explicit_chunked_prefill_req = self.context.is_hybrid_model
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
                     req.finished_chunk_token_count += chunk_length
                     # Still have tokens to prefill, so we break and keep the
