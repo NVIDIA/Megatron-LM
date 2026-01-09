@@ -305,7 +305,9 @@ def assert_config_matches_golden(cfg: Any) -> None:
                 "to maintain backwards compatibility.\n"
             )
 
-        guidance_parts.append("Please contact NV-username @jbarker if you are unsure how to proceed.\n")
+        guidance_parts.append(
+            "Please contact NV-username @jbarker if you are unsure how to proceed.\n"
+        )
 
         header = "Mamba MoE config drift detected!\n" "═" * 60 + "".join(guidance_parts)
         parts = [header]
