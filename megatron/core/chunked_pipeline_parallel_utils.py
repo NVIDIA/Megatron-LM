@@ -1,12 +1,37 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type
 
 import torch
 
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+class KVCache:
+    '''Abstract class of KV cache for chunked pipeline model parallel.'''
+
+    @abstractmethod
+    def forward_with_kv_cache(self, *args, **kwargs):
+        '''Forward pass with KV cache.'''
+        raise NotImplementedError
+
+
+class KVCachePool:
+    def __init__(self, config: TransformerConfig):
+        self.config = config
+        self.kv_cache_pool = {}
+
+    def get_kv_cache(self, layer_idx: int, kv_cache_cls: Type[KVCache]) -> KVCache:
+        if layer_idx not in self.kv_cache_pool:
+            self.kv_cache_pool[layer_idx] = kv_cache_cls(self.config)
+        assert isinstance(self.kv_cache_pool[layer_idx], kv_cache_cls), (
+            f"Expected KV cache of type {kv_cache_cls}, "
+            f"but got {type(self.kv_cache_pool[layer_idx])}."
+        )
+        return self.kv_cache_pool[layer_idx]
 
 
 @dataclass
@@ -16,7 +41,7 @@ class ChunkedPipelineParallelParams:
     micro_batch_idx: int
     span_idx_in_micro: int
     spans: List[int]
-    kv_cache: Optional[Dict[str, torch.Tensor]] = None
+    kv_cache_pool: KVCachePool
 
     def __hash__(self):
         return hash((self.micro_batch_idx, self.span_idx_in_micro, len(self.spans)))
@@ -37,6 +62,7 @@ class ChunkedPipelineParallelDataIterator:
         self.current_span_idx = -1
         self.current_seq_length = None
         self.current_split_span = None
+        self.current_kv_cache_pool = None
 
     def __next__(self):
         assert (
@@ -58,6 +84,8 @@ class ChunkedPipelineParallelDataIterator:
             )
             self.count += 1
             self.current_span_idx = 0
+            # Initialize the KV cache pool for the current micro batch
+            self.current_kv_cache_pool = KVCachePool(self.config)
 
             # Split the input tensors into chunks
             new_seq_length = tokens.size(1)
@@ -90,6 +118,8 @@ class ChunkedPipelineParallelDataIterator:
         if self.current_span_idx == -1 or self.current_span_idx + 1 == self.chunked_pp_splits:
             self.count += 1
             self.current_span_idx = 0
+            # Initialize the KV cache pool for the current micro batch
+            self.current_kv_cache_pool = KVCachePool(self.config)
         else:
             self.current_span_idx += 1
 
@@ -102,6 +132,7 @@ class ChunkedPipelineParallelDataIterator:
             micro_batch_idx=self.count - 1,
             span_idx_in_micro=self.current_span_idx,
             spans=self.current_split_span,
+            kv_cache_pool=self.current_kv_cache_pool,
         )
 
 
