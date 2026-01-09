@@ -57,18 +57,19 @@ Provide the pretrained checkpoint path through variable `${HF_MODEL_CKPT}` and p
 Hugging Face-Like quantized checkpoint for TensorRT-LLM, vLLM, or SGLang deployement,
 provide `${EXPORT_DIR}` to `export.sh`.
 
-> **📙 NOTE:** ModelOpt supports different quantization formats. By default, we simulate the
-> low-precision numerical behavior (fake-quant) which can be run on GPUs with compute > 80.
+> **📙 NOTE:** ModelOpt supports different quantization formats which are listed in the [ModelOpt quant configs](https://github.com/NVIDIA/Model-Optimizer/blob/7971fff05882da7eae16eae6bc927d1481dcd63f/modelopt/torch/quantization/config.py#L626).
+> The quant config is specified by the full config name in all-caps, e.g. NVFP4_DEFAULT_CFG.
+> By default, we simulate the low-precision numerical behavior (fake-quant) which can be run on GPUs with compute > 80.
 > Real low-precision paramters (e.g. `E4M3` or `E2M1`)
 > and low-precision compute (e.g. `FP8Linear`) are also supported depending on GPU compute capability.
-> **See [Adanvanced Topics](./ADVANCED.md) for details**.
+> **See [Advanced Topics](./ADVANCED.md) for details**.
 
 ```sh
 \
     TP=1 \
     HF_MODEL_CKPT=<pretrained_model_name_or_path> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct_quant \
-    ./quantize.sh meta-llama/Llama-3.2-1B-Instruct nvfp4
+    ./quantize.sh meta-llama/Llama-3.2-1B-Instruct NVFP4_DEFAULT_CFG 
 
 \
     PP=1 \
@@ -77,6 +78,8 @@ provide `${EXPORT_DIR}` to `export.sh`.
     EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
     ./export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
+
+For KV cache quantization, add a flag like `MLM_EXTRA_ARGS=--export-kv-cache-quant fp8` while specifying your desired KV cache precision (see `quantize.py` `KV_QUANT_CFG_CHOICES`).
 
 ### ⭐ Online BF16 EAGLE3 Training
 
@@ -100,7 +103,7 @@ deployment.
     ./export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
 
-See [Adanvanced Topics](./ADVANCED.md) for a `moonshotai/Kimi-K2-Instruct` EAGLE3 training example using `slurm`.
+See [Advanced Topics](./ADVANCED.md) for a `moonshotai/Kimi-K2-Instruct` EAGLE3 training example using `slurm`.
 
 ### ⭐ Offline BF16 EAGLE3 Training
 Unlike online EAGLE3 training, offline workflow precomputes target model `hidden_states` and dumps to disk.
