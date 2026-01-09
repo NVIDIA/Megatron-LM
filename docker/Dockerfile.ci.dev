@@ -60,7 +60,7 @@ RUN bash -ex <<"EOF"
         ln -s libnvshmem_host.so.3 libnvshmem_host.so
     popd
 
-    git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+    git clone --branch hybrid-ep https://github.com/Autumn1998/DeepEP.git
     pushd DeepEP
         git checkout df375b40f24e5c495e2db36e808125266661652c
         patch -p1 < /workspace/deepep.patch
