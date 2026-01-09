@@ -1,13 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed
-from functools import partial
 
 from megatron.core import mpu, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
@@ -172,7 +172,7 @@ def create_args():
     args.world_size = 8
     args.seq_length = 8192
     args.max_position_embeddings = 8192
-    args.max_seqlen_per_dp_cp_rank = None
+    args.max_seqlen_per_cp_rank = None
     args.variable_seq_lengths = False
     args.moe_token_dispatcher_type = "allgather"
 
@@ -209,7 +209,7 @@ def initialize_gpt_model(
             args, "hybrid_context_parallel_scheduler", "balanced"
         ),
         sft_sequence_packing=getattr(args, "sft_sequence_packing", False),
-        max_seqlen_per_dp_cp_rank=getattr(args, "max_seqlen_per_dp_cp_rank", None),
+        max_seqlen_per_cp_rank=getattr(args, "max_seqlen_per_cp_rank", None),
         virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         hidden_dropout=args.hidden_dropout,
         attention_dropout=args.attention_dropout,
@@ -284,19 +284,19 @@ def get_data_iterator(args):
     Args:
         args: args namespace
     """
-    from megatron.training.datasets.sft_dataset import MockSFTDataset, MockSFTLowLevelDataset
+    from megatron.core.datasets.blended_megatron_dataset_builder import (
+        BlendedMegatronDatasetBuilder,
+    )
     from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+    from megatron.training import get_tokenizer
+    from megatron.training.datasets.sft_dataset import MockSFTDataset, MockSFTLowLevelDataset
+    from megatron.training.training import build_train_valid_test_data_iterators
     from megatron.training.utils import (
         get_batch_on_this_cp_rank,
         get_batch_on_this_tp_rank,
         get_blend_and_blend_per_split,
         is_first_or_last_pipeline_stage,
     )
-    from megatron.core.datasets.blended_megatron_dataset_builder import (
-        BlendedMegatronDatasetBuilder,
-    )
-    from megatron.training import get_tokenizer
-    from megatron.training.training import build_train_valid_test_data_iterators
     from pretrain_gpt import is_dataset_built_on_rank, train_valid_test_datasets_provider
 
     blend, blend_per_split = get_blend_and_blend_per_split(args)
@@ -468,9 +468,9 @@ def dummy_forward_func(
         )
         args.moe_token_dispatcher_type = "alltoall"
         if is_hybrid_context_parallel:
-            args.max_seqlen_per_dp_cp_rank = args.seq_length // args.data_parallel_size
+            args.max_seqlen_per_cp_rank = args.seq_length // args.data_parallel_size
         else:
-            args.max_seqlen_per_dp_cp_rank = args.seq_length // args.context_parallel_size
+            args.max_seqlen_per_cp_rank = args.seq_length // args.context_parallel_size
 
     set_global_variables(args)
     # set_args(args)

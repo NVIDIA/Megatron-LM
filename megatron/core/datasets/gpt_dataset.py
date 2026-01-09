@@ -70,8 +70,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     sft_mock_dataset_config_json: Optional[str] = None
     """This config provides the necessary information for the mock dataset."""
 
-    sft_sequence_packing: bool = False
-    """Option to enable sequence packing for SFT training."""
+    sequence_packing: bool = False
+    """Option to enable sequence packing for training."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""

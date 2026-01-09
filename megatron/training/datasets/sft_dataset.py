@@ -104,7 +104,7 @@ class SFTDataset(MegatronDataset):
         return seq_len_padded
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sft_sequence_packing = self.config.sft_sequence_packing
+        sequence_packing = self.config.sequence_packing
         tokenizer = self.config.tokenizer
         max_seq_len = self.config.sequence_length
 
@@ -122,7 +122,7 @@ class SFTDataset(MegatronDataset):
         # if use sequence packing, pad according to get_padding_size
         # else pad to max_seq_len
         num_tokens = len(tokens) + force_eod_length
-        if sft_sequence_packing:
+        if sequence_packing:
             padding_len = self.get_padding_size(num_tokens) - num_tokens
         else:
             padding_len = max_seq_len - num_tokens
@@ -159,7 +159,7 @@ class SFTDataset(MegatronDataset):
                 'position_ids': position_ids,
             }
 
-        if sft_sequence_packing:
+        if sequence_packing:
             # sequence packing need both original sequence length and padded length
             ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
             ret['padded_seq_len'] = torch.tensor(seq_len, dtype=torch.int32, device=tokens.device)
@@ -263,7 +263,7 @@ class MockSFTDataset(SFTDataset):
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sft_sequence_packing = self.config.sft_sequence_packing
+        sequence_packing = self.config.sequence_packing
         tokenizer = self.config.tokenizer
         max_seq_len = self.config.sequence_length
 
@@ -281,7 +281,7 @@ class MockSFTDataset(SFTDataset):
 
         # padding
         num_tokens = len(tokens) + force_eod_length
-        if sft_sequence_packing:
+        if sequence_packing:
             padding_len = self.get_padding_size(num_tokens) - num_tokens
         else:
             padding_len = max_seq_len - num_tokens
@@ -318,7 +318,7 @@ class MockSFTDataset(SFTDataset):
                 'position_ids': position_ids,
             }
 
-        if sft_sequence_packing:
+        if sequence_packing:
             # sequence packing need both original sequence length and padded length
             ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
             ret['padded_seq_len'] = torch.tensor(seq_len, dtype=torch.int32, device=tokens.device)
