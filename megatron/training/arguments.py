@@ -1563,14 +1563,7 @@ def _add_inference_args(parser):
                        'If the UVM level is 0, then only GPU memory is used and '
                        'the total memory equals `buffer_size_gb`. If the UVM '
                        'level is 1, then additional memory is utilized on the '
-                       'CPU and the total memory equals `buffer_size_gb + '
-                       'paused_buffer_size_gb`.')
-    group.add_argument('--inference-dynamic-batching-paused-buffer-size-gb',
-                       type=float, default=None,
-                       help='Amount of memory reserved for paused requests in '
-                       'the dynamic inference context. Active requests are '
-                       'paused when there are not enough active blocks available '
-                       'to continue generating a request.')
+                       'CPU and the total memory equals `2 * buffer_size_gb`.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '

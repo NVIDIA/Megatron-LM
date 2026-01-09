@@ -580,7 +580,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.requests[request_id].record.checkpoint()
+            self.requests[request_id].record.suspend()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -797,7 +797,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self,
         request_ids: torch.Tensor,
         finished_request_ids: torch.Tensor,
-        evict_request_ids: torch.Tensor | None,
         step_time: float,
         sample: torch.Tensor,
         log_probs: torch.Tensor,
@@ -809,7 +808,6 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             request_ids (torch.Tensor): A list of request_ids
             finished_request_ids (torch.Tensor): A list of finished request ids
-            evict_request_ids (torch.Tensor | None): A list of evicted request ids.
             step_time (float): The latency of the last step
             sample: (torch.Tensor): The newly generated tokens for each request
             log_probs: (List): Log probs for each request
@@ -941,23 +939,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
-
-        # Handle evicted requests.
-        if evict_request_ids is not None:
-
-            evict_request_ids = evict_request_ids.tolist()
-
-            # Insert into waiting_request_ids after any chunk prefill request.
-            if self.context.chunked_prefill_request_id != -1:
-                raise Exception(
-                    "TODO: Insert into waiting_request_ids after chunked prefill request."
-                )
-            self.waiting_request_ids.extendleft(evict_request_ids)
-
-            # Checkpoint requests (i.e., prompt += generations) + add eviction event.
-            for request_id in evict_request_ids:
-                self.requests[request_id].record.checkpoint()
-                self.get_request(request_id).add_event_evict()
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
@@ -1124,7 +1105,7 @@ class DynamicInferenceEngine(AbstractEngine):
         is_decode_only = self.context.is_decode_only()
         pre_step_context_state = {
             "is_decode_only": is_decode_only,
-            "max_requests": self.context.max_requests,
+            "max_active_requests": self.context.max_active_requests,
             "total_request_count": self.context.total_request_count,
             "paused_request_count": self.context.paused_request_count,
             "active_token_count": self.context.active_token_count,
@@ -1193,9 +1174,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if step_result is not None:
             active_request_ids = step_result["active_request_ids"]
+            newly_paused_request_ids = step_result["newly_paused_request_ids"]
             finished_request_ids = step_result["finished_request_ids"]
-            newly_paused_request_ids = step_result.get("newly_paused_request_ids")
-            evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
@@ -1212,7 +1192,6 @@ class DynamicInferenceEngine(AbstractEngine):
             (active_request_ids, finished_request_records) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
-                evict_request_ids,
                 step_time,
                 sample,
                 log_probs,
@@ -1288,7 +1267,7 @@ class DynamicInferenceEngine(AbstractEngine):
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f%s ... "
-                "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
+                "reqs: a %d/%d, p %d, w %d, f %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
@@ -1309,11 +1288,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     ),
                     context_state["total_request_count"] - context_state["paused_request_count"],
-                    context_state["max_requests"],
+                    context_state["max_active_requests"],
                     context_state["paused_request_count"],
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
-                    0 if evict_request_ids is None else evict_request_ids.numel(),
                     context_state["total_active_used_blocks"],
                     context_state["total_active_block_count"],
                     context_state["total_paused_used_blocks"],
