@@ -19,7 +19,7 @@ from tests.unit_tests.test_utilities import Utils
 # Tolerance for memory expectation check (GPU allocator jitter etc).
 EPSILON = 0.30
 EPSILON_A2A = 0.30
-DELTA = 20 # MiB
+DELTA = 20  # MiB
 
 
 def _reset_cuda_memory() -> None:
@@ -323,12 +323,20 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         ("alltoall", False, ["expert_fc1"]),
         ("alltoall", False, ["moe_act"]),
         ("alltoall", False, ["mlp_norm", "expert_fc1", "moe_act"]),
-        ("alltoall", True, ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"]),
-        ("alltoall", False, ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"]),
+        (
+            "alltoall",
+            True,
+            ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
+        ),
+        (
+            "alltoall",
+            False,
+            ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"],
+        ),
     ],
 )
 def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
-    dispatcher_backend: str, is_mla: bool, offload_modules: List[str],
+    dispatcher_backend: str, is_mla: bool, offload_modules: List[str]
 ):
     """
     Compatibility test for:
@@ -339,8 +347,10 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
     The EP A2A overlap initialization pattern is aligned with
     `tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py`.
     """
+    from megatron.core.models.common.model_chunk_schedule_plan import (
+        TransformerModelChunkSchedulePlan,
+    )
     from megatron.core.pipeline_parallel.utils import set_streams
-    from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
     from tests.unit_tests.a2a_overlap.utils import deterministic_mode
 
     # EP overlap requires distributed initialization with EP groups.
@@ -353,7 +363,9 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
     seed = 123
     num_experts = 8  # must be divisible by ep_size
     if num_experts % ep_size != 0:
-        pytest.skip(f"Skipping: num_moe_experts={num_experts} must be divisible by ep_size={ep_size}.")
+        pytest.skip(
+            f"Skipping: num_moe_experts={num_experts} must be divisible by ep_size={ep_size}."
+        )
 
     # Small shapes to keep this compatibility test fast.
     num_layers = 8
@@ -369,8 +381,8 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
     def _make_schedule_inputs() -> Dict[str, torch.Tensor]:
         data = list(range(seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device)
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(
-            device
+        position_ids = (
+            torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device)
         )
         attention_mask = torch.ones((micro_batch_size, 1, seq_length, seq_length), dtype=bool).to(
             device
@@ -393,7 +405,9 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
         for name, p in model.named_parameters():
             p.data.copy_(params[name])
 
-    def _build_overlap_moe_gpt(*, enable_offload: bool, is_mla: bool, dispatcher_backend: str) -> GPTModel:
+    def _build_overlap_moe_gpt(
+        *, enable_offload: bool, is_mla: bool, dispatcher_backend: str
+    ) -> GPTModel:
         model_parallel_cuda_manual_seed(seed)
         torch.manual_seed(seed)
         ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
@@ -484,7 +498,9 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
         with deterministic_mode():
             # Baseline: EP overlap on, offload off.
             _reset_cuda_memory()
-            base_model = _build_overlap_moe_gpt(enable_offload=False, is_mla=is_mla, dispatcher_backend=dispatcher_backend)
+            base_model = _build_overlap_moe_gpt(
+                enable_offload=False, is_mla=is_mla, dispatcher_backend=dispatcher_backend
+            )
             base_model.train()
             base_params = _capture_params(base_model)
             # Warmup once for allocator stability / graph caching
@@ -497,7 +513,9 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             _reset_cuda_memory()
 
             # Offload: EP overlap on, fine-grained offload on.
-            off_model = _build_overlap_moe_gpt(enable_offload=True, is_mla=is_mla, dispatcher_backend=dispatcher_backend)
+            off_model = _build_overlap_moe_gpt(
+                enable_offload=True, is_mla=is_mla, dispatcher_backend=dispatcher_backend
+            )
             _restore_params(off_model, base_params)
             off_model.train()
             # Warmup once to populate cached chunks, then reset to apply steady-state offload decisions.
@@ -531,7 +549,9 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
                 if gb is None or go is None:
                     assert gb is None and go is None, f"Grad None mismatch for {name}"
                     continue
-                assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Rank {torch.distributed.get_rank()}: Grad mismatch for {name}"
+                assert torch.allclose(
+                    go, gb, rtol=1e-3, atol=1e-3
+                ), f"Rank {torch.distributed.get_rank()}: Grad mismatch for {name}"
 
             # Memory checks (peak allocated during the scheduled 1F1B run)
             saved_mib = (base_peak - off_peak) / (1024**2)
@@ -549,9 +569,9 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
                 )
                 if abs_err > DELTA:
                     assert rel_err <= EPSILON_A2A, (
-                    f"Memory saving mismatch for offload_modules={offload_modules}: "
-                    f"saved={saved_mib:.2f}MiB expected~={expected_offload_mib:.2f}MiB "
-                    f"(rel_err={rel_err:.2f}, abs_err={abs_err:.2f})"
-                )
+                        f"Memory saving mismatch for offload_modules={offload_modules}: "
+                        f"saved={saved_mib:.2f}MiB expected~={expected_offload_mib:.2f}MiB "
+                        f"(rel_err={rel_err:.2f}, abs_err={abs_err:.2f})"
+                    )
     finally:
         Utils.destroy_model_parallel()
