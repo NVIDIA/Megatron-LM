@@ -783,3 +783,77 @@ else:
             "prepare_model_for_fp8_inference requires Transformer Engine to be installed. "
             "Please install transformer-engine to use FP8 inference."
         )
+
+
+if HAVE_TE:
+    from functools import lru_cache
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
+        Float8BlockQuantizer,
+        Float8BlockwiseQTensor,
+    )
+
+    @lru_cache(maxsize=None)
+    def _get_fp8_quantizer(recipe, all_gather_usage=False):
+        if recipe == Fp8Recipe.blockwise:
+            return Float8BlockQuantizer(
+                fp8_dtype=tex.DType.kFloat8E4M3,
+                rowwise=True,
+                columnwise=False,
+                amax_epsilon=1e-10,
+                force_pow_2_scales=True,
+                block_scaling_dim=1,
+                all_gather_usage=all_gather_usage,
+            )
+
+        return None
+
+    def fp8_quantize(recipe: Fp8Recipe, x: torch.Tensor, all_gather_usage=False):
+        q = _get_fp8_quantizer(recipe, all_gather_usage)
+        if q is None:
+            return x
+
+        quantized_tensor = q(x)
+        if recipe == Fp8Recipe.blockwise:
+            if quantized_tensor._data_format == tex.Float8BlockScaleTensorFormat.COMPACT:
+                return (quantized_tensor._rowwise_data, quantized_tensor._rowwise_scale_inv)
+            else:
+                return (
+                    quantized_tensor._rowwise_data,
+                    quantized_tensor._rowwise_scale_inv.T.contiguous(),
+                )
+
+        return x
+
+    def make_fp8_tensor(recipe: Fp8Recipe, x: torch.Tensor, x_scale: torch.Tensor):
+        q = _get_fp8_quantizer(recipe)
+        if q is None:
+            return None
+
+        if recipe == Fp8Recipe.blockwise:
+            # To accelerate fp8flow and reduce redundant cases of T.contiguous()
+            # scale_inv use COMPACT
+            return Float8BlockwiseQTensor(
+                shape=x.shape,
+                dtype=torch.bfloat16,
+                rowwise_data=x.view(torch.uint8),
+                rowwise_scale_inv=x_scale,
+                columnwise_data=None,
+                columnwise_scale_inv=None,
+                fp8_dtype=tex.DType.kFloat8E4M3,
+                quantizer=q,
+                is_2D_scaled=False,
+                requires_grad=x.requires_grad,
+                data_format=tex.Float8BlockScaleTensorFormat.GEMM_READY,
+            )
+        return None
+
+else:
+
+    def fp8_quantize(recipe: Fp8Recipe, x: torch.Tensor, all_gather_usage=False):
+        """Transformer Engine not available: passthrough tensor."""
+        return x
+
+    def make_fp8_tensor(recipe: Fp8Recipe, x: torch.Tensor, x_scale: torch.Tensor):
+        """Transformer Engine not available: no FP8 tensor wrapper."""
+        return None
