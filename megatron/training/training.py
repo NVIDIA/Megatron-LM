@@ -2570,6 +2570,8 @@ def train(
             args.global_batch_size,
             args.micro_batch_size,
             mpu.get_data_parallel_world_size(),
+            args.step_batch_size_schedule,
+            args.seq_length,
             args.decrease_batch_size_if_needed
         )
         print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
