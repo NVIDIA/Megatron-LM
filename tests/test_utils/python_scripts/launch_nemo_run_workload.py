@@ -115,6 +115,7 @@ def main(
             "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
             "N_REPEAT": "1",
             "CLUSTER": "dgxh100_dgxc",
+            "NCCL_DEBUG": "INFO",
         },
         packager=run.Packager(),
         volumes=artifacts,

@@ -16,13 +16,13 @@
   services:
     - name: docker:24.0.5-dind
       variables:
-        HEALTHCHECK_TCP_PORT: "2376"
+        HEALTHCHECK_TCP_PORT: '2376'
   timeout: 180m
   variables:
     DOCKER_HOST: tcp://docker:2376
-    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_CERTDIR: '/certs'
     DOCKER_TLS_VERIFY: 1
-    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+    DOCKER_CERT_PATH: '$DOCKER_TLS_CERTDIR/client'
     TAG: purpose/builder-large
     STAGE: jet
     MCORE_BACKWARDS_REF: core_r0.14.0
@@ -59,7 +59,7 @@ test:build_image:
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
         IMAGE_TYPE: dev
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.09-py3
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.11-py3
       - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10
