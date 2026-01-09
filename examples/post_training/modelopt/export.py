@@ -90,6 +90,7 @@ if __name__ == "__main__":
         "export_extra_modules": export_extra_modules,
         "dtype": torch.bfloat16,
         "export_dir": args.export_dir,
+        "moe_router_dtype": unwrapped_model.config.moe_router_dtype,
     }
     if modelopt_version_at_least("0.41.0"):
         export_kwargs.update({"trust_remote_code": args.trust_remote_code})
