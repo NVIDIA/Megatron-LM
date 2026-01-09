@@ -301,6 +301,11 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             )
             output_tensor = loss
 
+    if runtime_state.packing_context:
+        num_empty_bins = runtime_state.packing_context.stats['total_empty_bins']
+    else:
+        num_empty_bins = None
+
     # loss_mask will not be applied to 0th token as we do not have a logprob for it.
     return output_tensor, partial(
         loss_func,
@@ -310,7 +315,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         entropy_term,
         truncated_from_above,
         truncated_from_below,
-    )
+    ), num_empty_bins
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

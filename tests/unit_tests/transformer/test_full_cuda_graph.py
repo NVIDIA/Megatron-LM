@@ -37,7 +37,7 @@ def test_forward_backward_func_with_full_cuda_graph(mocker):
         def loss_func(output_tensor):
             return rank, {'loss_reduced': rank}
 
-        return model(dummy_data), loss_func
+        return model(dummy_data), loss_func, None
 
     model = torch.nn.Linear(4, 1)
 

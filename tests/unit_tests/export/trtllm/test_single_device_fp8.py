@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from functools import partial
 
 import pytest
@@ -99,7 +101,7 @@ def _forward_step_func(data_iterator, model):
     loss_mask = data['loss_mask'].to(DEVICE)
     output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 
-    return output_tensor, partial(_loss_func, loss_mask)
+    return output_tensor, partial(_loss_func, loss_mask), None
 
 
 class TestTRTLLMSingleDeviceConverterFP8:

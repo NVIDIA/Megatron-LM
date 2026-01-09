@@ -2012,6 +2012,8 @@ def _add_logging_args(parser):
                        help='Path to save the wandb results locally.')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
+    group.add_argument('--log-tokens-per-second', default=False, action="store_true",
+                       help='Whether to log tokens per second.')
     return parser
 
 

@@ -1467,9 +1467,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
+    num_empty_bins = 0
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
         loss_reduced = {}
+
+        num_empty_bins = losses_reduced.pop()
 
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
@@ -1511,8 +1514,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            num_empty_bins
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit, num_empty_bins
 
 
 def training_log(
@@ -1527,6 +1531,7 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    num_empty_bins,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1798,6 +1803,8 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
+        if args.log_tokens_per_second:
+            log_string += f' tokens per second: {((batch_size - num_empty_bins) * args.seq_length) / elapsed_time_per_iteration}'
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
@@ -2467,6 +2474,7 @@ def train(
             grad_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            num_empty_bins
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
@@ -2582,6 +2590,7 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            num_empty_bins
         )
 
         # Evaluation.
@@ -2763,6 +2772,9 @@ def evaluate(
                 torch.cuda.empty_cache()
 
             if mpu.is_pipeline_last_stage(ignore_virtual=True):
+
+                _ = loss_dicts.pop()
+
                 # Reduce across processes.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:

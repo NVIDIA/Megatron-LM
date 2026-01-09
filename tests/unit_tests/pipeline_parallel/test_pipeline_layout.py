@@ -224,7 +224,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
             loss = output_tensor.sum()
             return output_tensor, loss
 
-        return output_tensor, loss_func
+        return output_tensor, loss_func, None
 
     iteration = 123
     layer_spec_fn = get_gpt_decoder_block_spec if is_moe else gpt_te_spec
@@ -253,6 +253,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         micro_batch_size=1,
         forward_only=True,
     )
+    losses_reduced.pop()  # Empty bins not required for this test
 
     optimizer = None
     opt_param_scheduler = None
@@ -292,6 +293,8 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
             micro_batch_size=1,
             forward_only=True,
         )
+
+        losses_reduced_baseline.pop()  # Empty bins not required for this test
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             for loss, loss_baseline in zip(losses_reduced, losses_reduced_baseline):
