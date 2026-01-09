@@ -12,9 +12,7 @@ from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
-)
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
+    get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
@@ -101,7 +99,7 @@ def initialize_real_model(
             transformer_config, use_transformer_engine=True, vp_stage=vp_stage
         )
     else:
-        layer_spec = gpt_te_spec(multi_latent_attention=is_mla)
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(multi_latent_attention=is_mla)
     this_model = GPTModel(
         config=transformer_config,
         transformer_layer_spec=layer_spec,
