@@ -1260,6 +1260,7 @@ def setup_model_and_optimizer(
                 use_gloo_process_groups=args.enable_gloo_process_groups,
                 layer_wise_distributed_optimizer='dist' in config.optimizer,
             )
+        opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
