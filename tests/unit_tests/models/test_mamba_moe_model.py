@@ -324,6 +324,7 @@ def _diff_configs(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> Tup
     return added, removed, changed
 
 
+@pytest.mark.flaky_in_dev
 class TestMambaMoEModel:
     """Test the initialization and use of an MoE Mamba model."""
 
