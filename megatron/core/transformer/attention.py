@@ -33,9 +33,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
-from megatron.core.transformer.chunked_pipeline_parallel_attention import (
-    AttentionFuncionWithChunkedPipelineParallel,
-)
+from megatron.core.transformer.attention_chunked import ChunkedKVCacheForAttention
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -170,7 +168,6 @@ class Attention(MegatronModule, ABC):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
-        self.kv_cache_pool = defaultdict(dict)
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -1013,20 +1010,19 @@ class Attention(MegatronModule, ABC):
                         f"but got {self.config.offload_modules=}."
                     )
 
-                    chunked_pp_params = copy.copy(chunked_pp_params)
-                    chunked_pp_params.kv_cache = self.kv_cache_pool[
-                        chunked_pp_params.micro_batch_idx
-                    ]
-                    core_attn_out = AttentionFuncionWithChunkedPipelineParallel.apply(
-                        self.core_attention,
-                        chunked_pp_params,
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        attn_mask_type,
-                        attention_bias,
-                        packed_seq_params,
+                    kv_cache = chunked_pp_params.kv_cache_pool.get_kv_cache(
+                        layer_idx=self.layer_number, kv_cache_cls=ChunkedKVCacheForAttention
+                    )
+                    core_attn_out = kv_cache.forward_with_kv_cache(
+                        module=self.core_attention,
+                        chunked_pp_params=chunked_pp_params,
+                        query=query,
+                        key=key,
+                        value=value,
+                        attention_mask=attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
                     )
                 else:
                     with get_fine_grained_offloading_context(self.offload_core_attention):
