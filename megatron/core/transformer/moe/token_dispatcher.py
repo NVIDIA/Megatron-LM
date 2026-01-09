@@ -67,6 +67,8 @@ class MoETokenDispatcher:
         """
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
+        # Whether to use NCCL stream for A2A communication, otherwise default stream is used.
+        self.use_nccl_stream = False  # Will be set to True when shared_experts is set.
 
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
@@ -203,6 +205,7 @@ class MoETokenDispatcher:
         """Set shared expert to the dispatcher."""
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
+        self.use_nccl_stream = True
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -659,15 +662,33 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of tokens and probabilities after All-to-All.
         """
+        # Make sure the shared experts fc1 is overlapped with dispatch A2A
+        # when CUDA_DEVICE_MAX_CONNECTIONS>1.
+        if self.shared_experts is not None:
+            self.shared_experts.wait_current_stream()
         # Perform expert parallel AlltoAll communication
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
         global_input_tokens = all_to_all(
-            self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
+            self.ep_group,
+            permutated_local_input_tokens,
+            self.output_splits,
+            self.input_splits,
+            use_nccl_stream=self.use_nccl_stream,
         )
+        # Move the shared experts fc1 right after the tokens A2A, to prevent the probs A2A
+        # block the launch of fc1 GEMM when CUDA_DEVICE_MAX_CONNECTIONS=1.
+        # Forward launch order: tokens A2A -> shared experts fc1 -> probs A2A
+        # Backward launch order: probs A2A -> tokens A2A -> shared experts fc1
+        if self.shared_experts is not None:
+            self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
         global_probs = all_to_all(
-            self.ep_group, permuted_probs, self.output_splits, self.input_splits
+            self.ep_group,
+            permuted_probs,
+            self.output_splits,
+            self.input_splits,
+            use_nccl_stream=self.use_nccl_stream,
         )
 
         return global_input_tokens, global_probs
@@ -685,9 +706,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of processed tokens, token counts per expert, and processed probabilities.
         """
-        if self.shared_experts is not None:
-            self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
-
         if self.tp_size > 1:
             if self.output_splits_tp is None:
                 output_split_sizes = None
@@ -805,11 +823,22 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             Tokens after the All-to-All communication for combining.
         """
+        # Make sure the shared experts fc2 is not overlapped with routed experts fc1
+        # when CUDA_DEVICE_MAX_CONNECTIONS>1.
+        if self.shared_experts is not None:
+            self.shared_experts.wait_current_stream()
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
         permutated_local_input_tokens = all_to_all(
-            self.ep_group, hidden_states, self.input_splits, self.output_splits
+            self.ep_group,
+            hidden_states,
+            self.input_splits,
+            self.output_splits,
+            use_nccl_stream=self.use_nccl_stream,
         )
+        if self.shared_experts is not None:
+            self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
+            self.shared_experts.post_forward_comm()
         return permutated_local_input_tokens
 
     def combine_postprocess(self, permutated_local_input_tokens):
@@ -825,9 +854,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
-        if self.shared_experts is not None:
-            self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
-            self.shared_experts.post_forward_comm()
 
         # Unpermutation 1: AlltoAll output to output
         output = unpermute(
@@ -841,6 +867,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
+        # Manually release the metadata to avoid memory leak.
+        self.probs = None
+        self.routing_map = None
 
         # Add shared experts output
         if self.shared_experts is not None:
@@ -1246,6 +1275,9 @@ class _DeepepManager(_DispatchManager):
         )
         # Release the handle after combine operation
         self.handle = None
+        # Manually release the metadata to avoid memory leak.
+        self.dispatched_indices = None
+        self.dispatched_probs = None
         return hidden_states
 
     def _pad_routing_map(
@@ -1368,11 +1400,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 "--moe-flex-dispatcher-backend=hybridep"
             )
 
-    def set_shared_experts(self, shared_experts):
-        raise NotImplementedError(
-            "Shared expert overlap is not supported in Flex Token Dispatcher."
-        )
-
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
         Initialize the routing map and probs to a unified format covering the TPxEP group.
@@ -1451,10 +1478,16 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of dispatched tokens and probabilities.
         """
-        return (
-            self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
-            self._comm_manager.dispatched_probs,
+        if self.shared_experts is not None:
+            self.shared_experts.wait_current_stream()
+        dispatched_hidden_states = self._comm_manager.dispatch(
+            hidden_states, async_finish, allocate_on_comm_stream
         )
+        if self.shared_experts is not None:
+            self.shared_experts.pre_forward_comm(hidden_states, wait_current_stream=False)
+            self.shared_experts.linear_fc1_forward_and_act(dispatched_hidden_states)
+
+        return dispatched_hidden_states, self._comm_manager.dispatched_probs
 
     def dispatch_postprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Converts dispatched tokens to a per-expert format for expert processing.
@@ -1502,6 +1535,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             Combined tokens after fused un-permutation and communication.
         """
+        # Make sure the shared experts fc2 is not overlapped with routed experts GEMM
+        # when CUDA_DEVICE_MAX_CONNECTIONS>1.
+        if self.shared_experts is not None:
+            self.shared_experts.wait_current_stream()
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
@@ -1517,4 +1554,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
+        if self.shared_experts is not None:
+            self.shared_experts.linear_fc2_forward(hidden_states)
+            self.shared_experts.post_forward_comm()
+            hidden_states += self.shared_experts.get_output()
         return hidden_states.view(self.hidden_shape)
