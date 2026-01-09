@@ -463,6 +463,10 @@ class TransformerConfig(ModelParallelConfig):
     different orders to the hidden_states, causing minor numerical differences
     in the hidden_states gradient."""
 
+    moe_shared_expert_gate: bool = False
+    """Enable gate for shared expert. Only effective when 
+    moe-shared-expert-intermediate-size is set."""
+
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared experts execute before the router."""
