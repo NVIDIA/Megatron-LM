@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.inference.contexts.attention_context.mamba_metadata import (
     MambaInferenceStateConfig,
 )
@@ -73,7 +74,7 @@ class TestDynamicContext:
             num_attention_heads=num_attention_heads,
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
-            use_cuda_graphs_for_non_decode_steps=not is_hybrid_model,
+            use_cuda_graphs_for_non_decode_steps=True,
             buffer_size_gb=buffer_size_gb,
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
@@ -102,13 +103,15 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
+            rounder=64,
         )
 
         if not is_hybrid_model:
             assert dynamic_context.block_allocator.total_count == 491
             assert dynamic_context.block_allocator.active_count == 245
             assert dynamic_context.max_total_requests == 490
-            assert dynamic_context.max_active_requests == 245
+            # We make max_active_requests divisible by the REQUEST_ROUNDER.
+            assert dynamic_context.max_active_requests == 192
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_metadata is None
@@ -116,7 +119,7 @@ class TestDynamicContext:
             assert dynamic_context.block_allocator.total_count == 555
             assert dynamic_context.block_allocator.active_count == 277
             assert dynamic_context.max_total_requests == 554
-            assert dynamic_context.max_active_requests == 277
+            assert dynamic_context.max_active_requests == 256
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_metadata is not None
@@ -507,9 +510,8 @@ class TestDynamicContext:
             torch.tensor([2, 1], device='cuda', dtype=torch.int32),
         )
 
-        termination_idx = DynamicInferenceRequest.get_metadata_labels()["termination_id"]
         assert torch.equal(
-            dynamic_context.request_metadata[:2, termination_idx],
+            dynamic_context.request_metadata["termination_id"][:2],
             torch.tensor([7.0, 8.0], device='cuda'),
         )
 
@@ -1197,3 +1199,51 @@ class TestDynamicContext:
                 )
 
                 current_global_token_offset += expected_len
+
+    @pytest.mark.internal
+    def test_pipeline_parallel_uneven_layers(self):
+        """
+        Test that DynamicInferenceContext synchronizes the total block count across
+        pipeline stages when they have unequal layer counts.
+        """
+        pp_size = 2
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=pp_size)
+
+        rank = parallel_state.get_pipeline_model_parallel_rank()
+
+        if rank == 0:
+            local_num_layers = 12
+        else:
+            local_num_layers = 4
+
+        context = DynamicInferenceContext(
+            params_dtype=torch.float32,
+            num_layers=local_num_layers,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            max_tokens=1024,
+            pipeline_model_parallel_size=pp_size,
+            tensor_model_parallel_size=1,
+            unified_memory_level=0,
+        )
+
+        # Collect the total block counts on each rank
+        local_total_blocks = torch.tensor(
+            [context.block_allocator.total_count], device='cuda', dtype=torch.long
+        )
+        gathered_block_counts = [torch.zeros_like(local_total_blocks) for _ in range(pp_size)]
+        torch.distributed.all_gather(
+            gathered_block_counts,
+            local_total_blocks,
+            group=parallel_state.get_pipeline_model_parallel_group(),
+        )
+        all_counts = [t.item() for t in gathered_block_counts]
+
+        # Verify that there is only 1 unique value across all ranks
+        unique_counts = set(all_counts)
+        assert (
+            len(unique_counts) == 1
+        ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"

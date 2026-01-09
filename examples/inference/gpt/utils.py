@@ -67,12 +67,6 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help='Return the top n logprobs for the generated tokens and their corresponding token as a dictionary',
     )
     group.add_argument(
-        "--return-prompt-top-n-logprobs",
-        action='store_true',
-        default=False,
-        help='Return the top n logprobs for the prompt tokens and their corresponding token as a dictionary',
-    )
-    group.add_argument(
         "--incoming-requests-per-step",
         type=int, default=None,
         help="Add a deterministic number of requests per step. This arg is "
@@ -109,6 +103,15 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help='Skip prompt log probs.',
     )
     group.add_argument(
+        "--stop-words",
+        metavar='WORD',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Stop words to terminate generation. Each word should be quoted and '
+        'separated by space. Example: --stop-words "\\n\\n" "END" "###"',
+    )
+    group.add_argument(
         "--output-path",
         type=str,
         default=None,
@@ -140,6 +143,13 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action='store_true',
         default=False,
         help='Use flashinfer fused rope implementation.',
+    )
+    group.add_argument(
+        "--no-record-throughput",
+        action='store_false',
+        dest="record_throughput",
+        help="Disable throughput recording in --output-file"
+        
     )
 
     return parser
@@ -433,3 +443,17 @@ def build_dynamic_engine_setup_prefix(
     ]
 
     return " | ".join(parts)
+
+
+def get_global_peak_memory_stats_bytes() -> dict:
+    """Peak allocated CUDA memory aggregated across ranks (MAX), in bytes.
+
+    Uses `torch.cuda.max_memory_allocated()` and assumes peak stats were reset
+    before the benchmark run.
+    """
+    peak_alloc = int(torch.cuda.max_memory_allocated())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        t = torch.tensor([peak_alloc], device="cuda", dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+        peak_alloc = int(t[0].item())
+    return {"mem-max-allocated-bytes": peak_alloc}
