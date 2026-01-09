@@ -477,7 +477,7 @@ def create_packed_seq_params_for_bin(
     # Pad cu_seqlens to bin_size by repeating the last value (creates zero-length ghost sequences)
     # This ensures a fixed tensor size for CUDA graph compatibility
     if len(cu_seqlens) < bin_size:
-        out = cu_seqlens.new_full((bin_size,), bin_size)
+        out = cu_seqlens.new_full((bin_size,), cu_seqlens[-1])
         out[:len(cu_seqlens)] = cu_seqlens
         cu_seqlens = out
 
