@@ -2326,7 +2326,7 @@ def _add_rerun_machine_args(parser):
 
 
 def _add_initialization_args(parser):
-    from megatron.training.config import RNGConfig
+    from megatron.training.common_config import RNGConfig
 
     rng_factory = ArgumentGroupFactory(RNGConfig)
     group = rng_factory.build_group(parser, "RNG and initialization")
