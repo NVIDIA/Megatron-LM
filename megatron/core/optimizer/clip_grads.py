@@ -143,14 +143,19 @@ def clip_grad_by_total_norm_fp32(
     total_norm: float,
     use_decoupled_grad: bool = False,
 ):
-    """Clips gradients in-place based on a pre-calculated total norm.
+    """Clips the gradients of an iterable of parameters in FP32 by total norm.
+
+    Note that the gradients are modified in-place.
 
     Args:
-        parameters (Union[List[torch.Tensor], torch.Tensor]): Tensors to clip.
-        max_norm (Union[int, float]): Maximum allowed norm.
+        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of 
+            Tensors or a single Tensor that will have gradients normalized.
+        max_norm (Union[int, float]): The maximum permissible total norm 
+            of the gradients.
         total_norm (float): The current total norm of the gradients.
-        use_decoupled_grad (bool, optional): If True, clips 'decoupled_grad' 
-            instead of 'grad'. Defaults to False.
+        use_decoupled_grad (bool, optional): Whether to read from the 
+            '.decoupled_grad' attribute instead of the standard '.grad'. 
+            Defaults to False.
     """
     # Grads.
     params = []
