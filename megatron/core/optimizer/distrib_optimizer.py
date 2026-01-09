@@ -1255,16 +1255,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             dtype_state = {}
             assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
+                buffer_numel = self.buffers[gbuf_idx].numel
                 buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
                 # Create coalesced tensors for all state related to parameters in this buffer.
                 world_tensors = {}
                 if data_parallel_rank == 0 or return_on_all_ranks:
                     world_tensors = {
                         key: torch.zeros(
-                            (buffer_numel_unpadded,), dtype=torch.float32, device="cpu"
+                            (buffer_numel,), dtype=torch.float32, device="cpu"
                         )
                         for key in ("param", "exp_avg", "exp_avg_sq")
                     }
+                    world_tensors["numel"] = buffer_numel
                     world_tensors["numel_unpadded"] = buffer_numel_unpadded
 
                 if not empty_data:
@@ -1728,30 +1730,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     tensors = {}
                     for state_key in world_tensor_keys:
-                        if state_key == 'step' or state_key == 'numel_unpadded':
+                        if state_key == 'step' or state_key == 'numel' or state_key == 'numel_unpadded':
                             # The optimizer state of STEP is handled
                             # specifically and is read from param_groups.
-                            # Numel unpadded is not needed.
+                            # numel and numel_unpadded are not needed.
                             continue
                         state_ten = world_tensors[state_key][param_world_start:param_world_end]
-                        missing_elems_num = (param_world_end - param_world_start) - len(state_ten)
 
-                        if missing_elems_num > 0:
-                            # `state_ten` is shorter than the slice which means the world_tensor
-                            # is shorter than `param_world_end` - this is a bug in the param ranges
-                            # logic. Here we can only pad this with zeros as a workaround.
-                            # TODO: this assert shouldn't hold and indicates a bug, see issue #504
-                            assert param_world_end > buffer.numel_unpadded
-
-                            logger.warning(
-                                f"'{sharded_metadata.key}' param range exceeds"
-                                f" unpadded buffer by {missing_elems_num} elements."
-                                f" It will be padded with zeros which can lead to"
-                                f" data corruption."
-                            )
-                            state_ten = torch.nn.functional.pad(state_ten, (0, missing_elems_num))
-
-                        assert len(state_ten) == param_world_end - param_world_start, (
+                        assert len(state_ten) == (param_world_end - param_world_start), (
                             len(state_ten),
                             param_world_end - param_world_start,
                         )
