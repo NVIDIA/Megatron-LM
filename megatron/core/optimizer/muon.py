@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional
 import torch
 from torch.optim.optimizer import ParamsT
 
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank
@@ -164,7 +165,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 def get_megatron_muon_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
-    config_overrides: Optional[Dict[ParamKey, OptimizerConfig]] = None,
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
     use_gloo_process_groups: bool = True,
     layer_wise_distributed_optimizer: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
