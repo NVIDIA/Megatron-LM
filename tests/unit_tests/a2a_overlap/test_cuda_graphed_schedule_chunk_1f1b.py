@@ -71,11 +71,14 @@ class TestPartialCudaGraphedA2AOverlap:
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        self.delete_cuda_graphs()
+
+        gc.collect()
+
+    def delete_cuda_graphs(self):
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
             self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
-
-        gc.collect()
 
     def model_provider(
         self,
@@ -325,6 +328,8 @@ class TestPartialCudaGraphedA2AOverlap:
             loss_list = self._run_1f1b_helper(
                 gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps
             )
+
+        self.delete_cuda_graphs()
 
         return loss_list
 
