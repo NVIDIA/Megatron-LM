@@ -52,7 +52,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
-        **kwargs
+        **kwargs,
     ):
         super(HybridDeviceOptimizer, self).__init__(
             params,
