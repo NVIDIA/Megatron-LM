@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, ContextManager, Literal, Optional
 
 import torch
@@ -69,8 +69,10 @@ class ModelParallelConfig:
     ###################
     # Initialization
     ###################
-    perform_initialization: bool = True
-    """If true, weights are initialized. This option can be useful when you know you are going to
+    perform_initialization: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-initialization"]}}
+    )
+    """Controls weights initialization. This option can be useful when you know you are going to
        load values from a checkpoint.
     """
 
@@ -156,8 +158,11 @@ class ModelParallelConfig:
     async_tensor_model_parallel_allreduce: bool = False
     """NOTE: Deprecated. This flag is ignored."""
 
-    use_te_rng_tracker: bool = False
+    use_te_rng_tracker: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--te-rng-tracker"]}}
+    )
     """If true, uses RNG state tracker in TransformerEngine if exists.
+    Required for CUDA graphs support.
     """
 
     tp_comm_overlap: bool = False
@@ -167,22 +172,22 @@ class ModelParallelConfig:
     """
 
     tp_comm_bulk_wgrad: bool = True
-    """If true, allows All-Gather overlap with Bprop activation gradient GEMM. Don't care if
+    """Controls All-Gather overlap with Bprop activation gradient GEMM. Don't care if
        tp_comm_overlap is False.
     """
 
     tp_comm_bulk_dgrad: bool = True
-    """If true, allows Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't care if
+    """Controls Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't care if
        tp_comm_overlap is False.
     """
 
     tp_comm_overlap_ag: bool = True
-    """If true, allows All-Gather overlap with GEMM by pipelining the GEMM and All-Gather.
+    """Controls All-Gather overlap with GEMM by pipelining the GEMM and All-Gather.
        Don't care if tp_comm_overlap is False.
     """
 
     tp_comm_overlap_rs: bool = True
-    """If true, allows Reduce-Scatter overlap with GEMM by pipelining the GEMM and Reduce-Scatter.
+    """Controls Reduce-Scatter overlap with GEMM by pipelining the GEMM and Reduce-Scatter.
        Don't care if tp_comm_overlap is False.
     """
 
@@ -193,7 +198,7 @@ class ModelParallelConfig:
 
     tp_comm_split_ag: bool = True
     """Deprecated from TransformerEngine v1.6.0.
-       If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
+       Controls All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
        splits. Don't care if tp_comm_overlap is False.
     """
 
@@ -205,7 +210,7 @@ class ModelParallelConfig:
 
     tp_comm_split_rs: bool = True
     """Deprecated from TransformerEngine v1.6.0.
-       If true, allows Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and
+       Controls Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and
        Reduce-Scatter splits. Don't care if tp_comm_overlap is False.
     """
 
@@ -308,13 +313,21 @@ class ModelParallelConfig:
        Defaults to 0, which means all micro-batches are deferred.
     """
 
-    overlap_p2p_comm_warmup_flush: bool = False
+    overlap_p2p_comm_warmup_flush: bool = field(
+        default=False,
+        metadata={"argparse_meta": {"arg_names": ["--overlap-p2p-communication-warmup-flush"]}},
+    )
     """If true, overlap communication and computation in warm up and flush phase.
        Only valid when overlap_p2p_comm is True and batch_p2p_comm is False. 
        Defaults to False.
     """
 
-    microbatch_group_size_per_vp_stage: Optional[int] = None
+    microbatch_group_size_per_vp_stage: Optional[int] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {"arg_names": ["--microbatch-group-size-per-virtual-pipeline-stage"]}
+        },
+    )
     """This value specifies the number of micro-batches that are executed 
        at a time for a given virtual stage (both forward and backward).
        Default (in __post_init__() method below) to pipeline_parallel_size 
@@ -357,8 +370,11 @@ class ModelParallelConfig:
     ###################
     # Timing
     ###################
-    barrier_with_L1_time: bool = True
-    """If true, use barrier with level 1 time measurements. It is up to the user to make sure
+    barrier_with_L1_time: bool = field(
+        default=True,
+        metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}},
+    )
+    """Controls barrier with level 1 time measurements. It is up to the user to make sure
        calling barrier with their timers will not result in hangs. This can happen if for example
        the user adds a level 1 timer that is not called by all ranks.
     """
