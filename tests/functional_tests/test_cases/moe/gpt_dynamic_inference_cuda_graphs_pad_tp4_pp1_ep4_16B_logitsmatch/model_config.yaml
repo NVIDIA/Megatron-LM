@@ -81,6 +81,8 @@ MODEL_ARGS:
   --incoming-requests-per-sec: -1
   --inference-repeat-n: 8
   --inference-dynamic-batching-buffer-size-gb: 20
+  --inference-dynamic-batching-num-cuda-graphs: 1 
+  --inference-dynamic-batching-max-requests: 8
 METRICS:
   - "generated_tokens"
   - "logprobs"
