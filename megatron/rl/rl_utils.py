@@ -1670,6 +1670,7 @@ def megatron_rl_inference_mode(
 
 
 def rl_inference_interface_shutdown():
+    global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_INFERENCE_INTERFACE.kill())
