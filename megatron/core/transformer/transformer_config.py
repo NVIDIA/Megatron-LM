@@ -1798,13 +1798,13 @@ class TransformerConfig(ModelParallelConfig):
                 self.context_parallel_size == 1
             ), "Currently context parallelism is not supported by DSAttention!"
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
-        
+
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
                 "inference_fuse_tp_communication is only supported "
                 "for inference_optimized transformer implementation."
             )
-        
+
         if self.batch_invariant_mode:
             assert (
                 self.attention_backend == AttnBackend.flash
