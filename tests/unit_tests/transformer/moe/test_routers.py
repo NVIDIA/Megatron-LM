@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from typing import cast
+
 import pytest
 import torch
 
@@ -47,7 +49,7 @@ class TestTop2Router:
         self.sequential_mlp = MoELayer(
             self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
         )
-        self.router = self.sequential_mlp.router
+        self.router = cast(Router, self.sequential_mlp.router)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -271,7 +273,7 @@ class TestGroupLimitedRouter:
         self.moe_layer = MoELayer(
             self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
         ).cuda()
-        self.router = self.moe_layer.router
+        self.router = cast(Router, self.moe_layer.router)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -378,7 +380,7 @@ class TestAuxLossFreeTop2Router:
         self.moe_layer = MoELayer(
             self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
         )
-        self.router = self.moe_layer.router
+        self.router = cast(Router, self.moe_layer.router)
         assert self.router.expert_bias is not None
         assert self.router.local_tokens_per_expert is not None
 

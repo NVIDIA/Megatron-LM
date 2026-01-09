@@ -18,6 +18,7 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestContainer
@@ -51,7 +52,7 @@ class AuxlossTestContainer(MoEModelTestContainer):
     def aux_loss_test(self, input, baseline_grad, loss_name):
         partitioned_input = self.partition_input(input)
         moe_layer = self.moe_layer
-        probs, indices = moe_layer.router(partitioned_input)
+        probs, indices = apply_module(moe_layer.router)(partitioned_input)
         probs.sum().mul_(0).backward()
         aux_loss_grad = partitioned_input.grad
         torch.distributed.barrier()
@@ -62,7 +63,7 @@ class AuxlossTestContainer(MoEModelTestContainer):
         clear_aux_losses_tracker()
 
         with torch.no_grad():
-            probs, indices = moe_layer.router(partitioned_input)
+            probs, indices = apply_module(moe_layer.router)(partitioned_input)
             loss = get_moe_layer_wise_logging_tracker()[loss_name]['values']
             assert loss == 0, "Loss should be 0"
             clear_aux_losses_tracker()
@@ -84,7 +85,7 @@ class TestAuxLoss:
         moe_layer = baseline_container.moe_layer
         self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).cuda()
         self.input.requires_grad = True
-        probs, indices = moe_layer.router(self.input)
+        probs, indices = apply_module(moe_layer.router)(self.input)
         probs.sum().mul_(0).backward()  # zero out the main gradients
         self.baseline_grad = self.input.grad
         self.input.grad = None
@@ -148,7 +149,7 @@ class TestSeqAuxLoss:
         moe_layer = baseline_container.moe_layer
         self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).cuda()
         self.input.requires_grad = True
-        probs, indices = moe_layer.router(self.input)
+        probs, indices = apply_module(moe_layer.router)(self.input)
         probs.sum().mul_(0).backward()  # zero out the main gradients
         self.baseline_grad = self.input.grad
         self.input.grad = None
