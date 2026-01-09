@@ -1605,13 +1605,16 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
             if self.cuda_graph_impl == "local":
-                assert not self.cuda_graph_scope or self.cuda_graph_scope == [
-                    CudaGraphScope.full_iteration
-                ], (
-                    "For local cuda graph implementation, the only valid value for "
-                    "cuda_graph_scope is full_iteration, or an empty list to denote layerwise "
-                    "graphs. To use other scopes, use cuda_graph_impl=transformer_engine."
-                )
+                # local impl doesn't currently distinguish between moe_preproocess or moe_router
+                # so just set both if either is specified.
+                if (
+                    CudaGraphScope.moe_router in self.cuda_graph_scope
+                    or CudaGraphScope.moe_preprocess in self.cuda_graph_scope
+                ):
+                    if CudaGraphScope.moe_router not in self.cuda_graph_scope:
+                        self.cuda_graph_scope.append(CudaGraphScope.moe_router)
+                    if CudaGraphScope.moe_preprocess not in self.cuda_graph_scope:
+                        self.cuda_graph_scope.append(CudaGraphScope.moe_preprocess)
 
             if self.cuda_graph_impl == "transformer_engine":
                 assert CudaGraphScope.full_iteration not in self.cuda_graph_scope, (
@@ -1669,7 +1672,9 @@ class TransformerConfig(ModelParallelConfig):
                     ):
                         assert (
                             CudaGraphScope.moe_router not in self.cuda_graph_scope
-                        ), "moe recompute is not supported with moe_router CUDA graph."
+                        ), "moe recompute is not supported with moe_router CUDA graph with: "
+                        "--cuda-graph-impl transformer_engine."
+
                     # Graphed recompute module doesn't accept random number.
                     if (
                         not self.cuda_graph_scope

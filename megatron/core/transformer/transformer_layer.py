@@ -755,7 +755,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # tensors are in parallel execution paths and they all need pre_mlp_layernorm to be
                 # recomputed in backward pass. For example, the router path and the shared expert
                 # path. So only register in one path is risky.
-                for tensor in mlp_output_with_bias[1:]:
+                for tensor in mlp_output_with_bias:
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
         else:
@@ -1083,7 +1083,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
 
+            # If we early returned, layernorm recompute hooks were attached to the output buffer
+            # of the cudagraph, so disable the recompute hooks inside _forward_post_mlp
+            recompute_pre_mlp_layernorms = self.recompute_pre_mlp_layernorm
+            self.recompute_pre_mlp_layernorm = False
+
             output = self._forward_post_mlp(mlp_output_with_bias, residual)
+
+            recompute_pre_mlp_layernorms = self.recompute_pre_mlp_layernorm
+            self.recompute_pre_mlp_layernorm = recompute_pre_mlp_layernorms
+
         else:
             # If EP overlap is enabled, needs to return same outputs as submodule.attn
             if self.config.overlap_moe_expert_parallel_comm:
@@ -1236,17 +1245,19 @@ class MoETransformerLayer(TransformerLayer):
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-        self.moe_layer_recompute = (
-            self.config.recompute_granularity == 'selective'
-            and "moe" in self.config.recompute_modules
-            and self.config.cuda_graph_impl == "local"
-        )
-
         if (
             not self.config.cuda_graph_scope
             or CudaGraphScope.moe_router in self.config.cuda_graph_scope
             or CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope
         ):
+
+            # full MoE layer recompute with partial_cudagraphs. If not partial cudagraphs, MoE
+            # layer recompute is handled by the moe_layer.MoELayer class
+            self.moe_layer_recompute = (
+                self.config.recompute_granularity == 'selective'
+                and "moe" in self.config.recompute_modules
+                and self.config.cuda_graph_impl == "local"
+            )
 
             self.use_partial_cudagraphs = True
             self.cudagraph_manager_router = CudaGraphManager(
@@ -1255,6 +1266,7 @@ class MoETransformerLayer(TransformerLayer):
             self.cudagraph_manager_postprocess = CudaGraphManager(
                 self.config, self, function_name="_forward_mlp_postprocess"
             )
+
         elif CudaGraphScope.moe in self.config.cuda_graph_scope:
             self.cudagraph_manager = CudaGraphManager(config)
 
