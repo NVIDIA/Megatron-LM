@@ -45,6 +45,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
         "_value_": 1,
     },
     "attention_dropout": 0.0,
+    "attention_output_gate": False,
     "attention_softmax_in_fp32": False,
     "autocast_dtype": "torch.bfloat16",
     "barrier_with_L1_time": True,
@@ -170,6 +171,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk": 6,
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
+    "moe_shared_expert_gate": False,
     "moe_shared_expert_intermediate_size": 3712,
     "moe_shared_expert_overlap": False,
     "moe_token_dispatcher_type": "alltoall",
@@ -324,7 +326,6 @@ def _diff_configs(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> Tup
     return added, removed, changed
 
 
-@pytest.mark.flaky_in_dev
 class TestMambaMoEModel:
     """Test the initialization and use of an MoE Mamba model."""
 
