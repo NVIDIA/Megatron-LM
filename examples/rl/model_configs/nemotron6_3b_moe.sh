@@ -2,6 +2,7 @@
 TP=${TP:-2}
 PP=${PP:-1}
 EP=${EP:-32}
+ETP=${ETP:-1}
 NODES_REQUIRED=${NODES_REQUIRED:-4}
 LLM="nemotron6_3b_moe"
 
@@ -64,11 +65,10 @@ MODEL_OPTIONS="\
   --rl-skip-bos-token \
   --no-rl-use-sequence-packing \
   --rl-partial-rollouts \
-  --rl-offload-optimizer-during-inference \
   --moe-pad-experts-for-cuda-graph-inference \
+  --moe-permute-fusion \
   --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
-  --inference-dynamic-batching-num-cuda-graphs 2 \
   --decode-only-cuda-graphs \
   --cuda-graph-impl local \
   --cuda-graph-scope full \
@@ -104,7 +104,7 @@ MODEL_OPTIONS="\
   --tensor-model-parallel-size $TP  \
   --pipeline-model-parallel-size $PP  \
   --expert-model-parallel-size $EP \
-  --expert-tensor-parallel-size 1 \
+  --expert-tensor-parallel-size $ETP \
   --weight-decay 0.01 \
   --clip-grad 1.0 \
   --tiktoken-pattern v2 \
@@ -125,4 +125,5 @@ MODEL_OPTIONS="\
   --lr-warmup-init 0.3e-7 \
   --no-load-optim \
   --no-load-rng \
+  --bf16 \
   "

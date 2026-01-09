@@ -856,17 +856,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         attention_layer_number = self.layer_map[layer_number - 1]
 
-        if triton_append_key_value_cache is not None and not self.cache_mla_latent:
-            # currently does not support MLA latent cache
-            return triton_append_key_value_cache(
-                layer_number=attention_layer_number,
-                key=key,
-                value=value,
-                memory_buffer=self.memory_buffer,
-                padded_active_token_count=self.padded_active_token_count,
-                token_to_block_idx=self.token_to_block_idx,
-                token_to_local_position_within_kv_block=self.token_to_local_position_within_kv_block,
-            )
+        # if triton_append_key_value_cache is not None and not self.cache_mla_latent:
+        #     # currently does not support MLA latent cache
+        #     return triton_append_key_value_cache(
+        #         layer_number=attention_layer_number,
+        #         key=key,
+        #         value=value,
+        #         memory_buffer=self.memory_buffer,
+        #         padded_active_token_count=self.padded_active_token_count,
+        #         token_to_block_idx=self.token_to_block_idx,
+        #         token_to_local_position_within_kv_block=self.token_to_local_position_within_kv_block,
+        #     )
 
         block_idx = self.token_to_block_idx[: self.padded_active_token_count]
         local_kv_seq_idx = self.token_to_local_position_within_kv_block[

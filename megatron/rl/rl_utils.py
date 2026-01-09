@@ -347,6 +347,7 @@ def get_environment_rollouts(
             args.rl_offload_optimizer_during_inference,
             args.rl_offload_kv_cache_during_training,
             args.rl_remove_kv_cache_during_training,
+
         ) as inference_interface:
 
             with nvtx_range("inference-setup"):
@@ -1033,9 +1034,9 @@ def prepare_data_for_update(
                 # logprobs are [b, seq, h] now.
                 model.load_state_dict(cur_st_dict)
 
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+            # torch.cuda.synchronize()
+            # gc.collect()
+            # torch.cuda.empty_cache()
 
 
         if args.rl_use_sequence_packing:

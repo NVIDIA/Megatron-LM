@@ -9,6 +9,7 @@ export NCCL_DEBUG=WARN
 
 
 
+    # --rl-offload-optimizer-during-inference \
 COMMON_OPTIONS="\
     --tensor-model-parallel-size $TP  \
     --pipeline-model-parallel-size $PP  \
@@ -16,8 +17,7 @@ COMMON_OPTIONS="\
     --transformer-impl transformer_engine \
     --${PRECISION:-bf16} \
     --te-rng-tracker \
-    --rl-offload-optimizer-during-inference \
-    --inference-dynamic-batching-buffer-size-gb 20 \
+    --inference-dynamic-batching-buffer-size-gb 10 \
     --data-parallel-random-init \
     --attention-backend flash \
     --timing-log-level 1 \
