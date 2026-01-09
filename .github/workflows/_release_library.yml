@@ -75,7 +75,7 @@ jobs:
       )
       && !cancelled()
     outputs:
-      release-version: ${{ needs.bump-version-mcore.outputs.release-version }}
+      release-version: ${{ steps.bump-version-mcore.outputs.release-version }}
     env:
       IS_DRY_RUN: ${{ inputs.dry-run }}
     steps:
@@ -133,7 +133,7 @@ jobs:
           PYPROJECT_NAME: 'megatron_fsdp'
         run: |
           set +u
-          
+
           cd ${{ github.run_id }}
 
           PACKAGE_INFO_FILE="$SRC_DIR${PYPROJECT_NAME//.//}/package_info.py"
