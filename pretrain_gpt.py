@@ -2,6 +2,10 @@
 
 """Pretrain and SFT GPT."""
 
+# Capture the true program start time BEFORE any heavy imports
+import time
+_PROGRAM_START_TIME = time.time()
+
 import json
 from functools import partial
 from typing import List, Optional, Tuple
@@ -17,7 +21,15 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
-from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
+from megatron.training import (
+    get_args,
+    get_timers,
+    get_tokenizer,
+    inprocess_restart,
+    pretrain,
+    print_rank_0,
+    set_startup_timestamps,
+)
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
@@ -259,6 +271,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
 
 if __name__ == "__main__":
+    # Timestamp right after entering __main__ block (after all imports/library setup)
+    _MAIN_ENTRY_TIME = time.time()
+
+    # Register startup timestamps for timing report in pretrain()
+    set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
