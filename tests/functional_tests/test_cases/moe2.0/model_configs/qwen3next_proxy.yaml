@@ -15,7 +15,7 @@ MODEL_ARGS:
   --max-position-embeddings: 4096
   --make-vocab-size-divisible-by: 3232
   --untie-embeddings-and-output-weights: true
-  # Add attention related args
+  # Add attention related args (GQA)
   --num-attention-heads: 16
   --group-query-attention: true
   --num-query-groups: 4
@@ -24,6 +24,14 @@ MODEL_ARGS:
   --position-embedding-type: rope
   --rotary-percent: 1.0
   --rotary-base: 1000000
+  # Gated Delta Net (Linear Attention) args
+  --experimental-attention-variant: gated_delta_net
+  --linear-attention-freq: 3
+  --linear-conv-kernel-dim: 4
+  --linear-key-head-dim: 128
+  --linear-value-head-dim: 128
+  --linear-num-key-heads: 16
+  --linear-num-value-heads: 32
   # Add MLP related args
   --swiglu: true
   --ffn-hidden-size: 4096
@@ -66,3 +74,4 @@ METRICS:
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
   - "load_balancing_loss"
+

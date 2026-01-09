@@ -15,20 +15,24 @@ MODEL_ARGS:
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 2
-  --num-virtual-stages-per-pipeline-rank: 4
   --expert-model-parallel-size: 4
   --context-parallel-size: 1
   --expert-tensor-parallel-size: 1
   --use-distributed-optimizer: true
-  --overlap-grad-reduce: true
-  --overlap-param-gather: true
+  # NOTE: uncomment if TE >= 2.9.0
+  # --overlap-grad-reduce: true
+  # --overlap-param-gather: true
   --use-mcore-models: true
   --sequence-parallel: true
-  --micro-batch-size: 4
+  --micro-batch-size: 1
   # MoE training related args
   --moe-grouped-gemm: true
-  --moe-token-dispatcher-type: flex 
-  --moe-flex-dispatcher-backend: deepep
+  --moe-token-dispatcher-type: alltoall
+  # Fine-grained activation offloading args
+  --recompute-granularity: selective
+  --recompute-modules: "[layernorm mla_up_proj mlp moe_act]"
+  --fine-grained-activation-offloading: true
+  --offload-modules: "[expert_fc1 moe_act attn_norm mlp_norm qkv_linear core_attn attn_proj]"
   # Add mixed precision args
   --bf16: true
   # kernel fusion related args
