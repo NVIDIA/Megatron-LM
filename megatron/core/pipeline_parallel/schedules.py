@@ -519,64 +519,21 @@ def wrap_iterator_helper(
     pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Warp data iterator for sequence packing if needed."""
-    if config.sft_sequence_packing:
+    if config.sequence_packing:
         num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch = None, None
-        if config.hybrid_context_parallel:
-            if config.hybrid_context_parallel_scheduler == 'default_hybrid_cp':
-                (
-                    data_iterator,
-                    num_microbatches,
-                    num_total_tokens_this_global_batch,
-                    sequence_square_sum_this_global_batch,
-                ) = wrap_dataloader(
-                    data_iterator, config, PackingScheduler.DEFAULT_HYBRID_CP, pg_collection=None
-                )
-            elif config.hybrid_context_parallel_scheduler == 'empty_scheduler_with_packing':
-                (
-                    data_iterator,
-                    num_microbatches,
-                    num_total_tokens_this_global_batch,
-                    sequence_square_sum_this_global_batch,
-                ) = wrap_dataloader(
-                    data_iterator, config, PackingScheduler.EMPTY_PACKING, pg_collection=None
-                )
-            elif config.hybrid_context_parallel_scheduler == 'empty_scheduler_no_packing':
-                (
-                    data_iterator,
-                    num_microbatches,
-                    num_total_tokens_this_global_batch,
-                    sequence_square_sum_this_global_batch,
-                ) = wrap_dataloader(
-                    data_iterator, config, PackingScheduler.EMPTY_NO_PACKING, pg_collection=None
-                )
-            else:
-                raise ValueError(
-                    f"Invalid hybrid context parallel scheduler: \
-                    {config.hybrid_context_parallel_scheduler}"
-                )
-        else:
-            if config.balanced_sequence_packing:
-                # enable balanced sequence packing scheduler, will be implemented later
-                pass
-            else:
-                # naive sequence packing scheduler
-                (
-                    data_iterator,
-                    num_microbatches,
-                    num_total_tokens_this_global_batch,
-                    sequence_square_sum_this_global_batch,
-                ) = wrap_dataloader(
-                    data_iterator,
-                    config,
-                    PackingScheduler.NAIVE_SEQUENCE_PACKING,
-                    pg_collection=None,
-                )
-        return (
-            data_iterator,
-            num_microbatches,
-            num_total_tokens_this_global_batch,
-            sequence_square_sum_this_global_batch,
-        )
+        scheduler_type_map = {
+            'default_hybrid_cp': PackingScheduler.DEFAULT_HYBRID_CP,
+            'empty_scheduler_with_packing': PackingScheduler.EMPTY_PACKING,
+            'empty_scheduler_no_packing': PackingScheduler.EMPTY_NO_PACKING,
+            'naive_sequence_packing': PackingScheduler.NAIVE_SEQUENCE_PACKING,
+        }
+        if config.sequence_packing_scheduler not in scheduler_type_map:
+            raise ValueError(
+                f"Invalid sequence packing scheduler: \
+                {config.sequence_packing_scheduler}"
+            )
+        scheduler_type = scheduler_type_map[config.sequence_packing_scheduler]
+        return wrap_dataloader(data_iterator, config, scheduler_type, pg_collection=None)
     else:
         return data_iterator, num_microbatches, None, None
 
@@ -750,7 +707,7 @@ def forward_backward_no_pipelining(
     ):
         create_cudagraphs()
 
-    if config.sft_sequence_packing:
+    if config.sequence_packing:
         forward_data_store.append(
             [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
         )
@@ -1202,17 +1159,14 @@ def forward_backward_pipelining_with_interleaving(
     # If the final micro-batch group has fewer micro-batches than pipeline-parallel size,
     # the pipeline will have dependency bubbles.
     final_microbatch_group_size = num_microbatches % config.microbatch_group_size_per_vp_stage
-    if not config.sft_sequence_packing:
-        # sft sequence packing allows num_microbatches to change dynamically,
-        # we don't need to check this
-        if 0 < final_microbatch_group_size < pipeline_parallel_size:
-            msg = 'The remainder of M (the total micro-batches) divided by N (number of '
-            msg += 'contiguous micro-batches in a virtual pipeline stage) should be 0, '
-            msg += 'or larger than or equal to the pipeline-parallel size, but it is '
-            msg += f'{final_microbatch_group_size}. '
-            msg += 'Otherwise, it introduces dependency bubbles in the pipeline '
-            msg += 'and reduces throughput.'
-            raise RuntimeError(msg)
+    if 0 < final_microbatch_group_size < pipeline_parallel_size:
+        msg = 'The remainder of M (the total micro-batches) divided by N (number of '
+        msg += 'contiguous micro-batches in a virtual pipeline stage) should be 0, '
+        msg += 'or larger than or equal to the pipeline-parallel size, but it is '
+        msg += f'{final_microbatch_group_size}. '
+        msg += 'Otherwise, it introduces dependency bubbles in the pipeline '
+        msg += 'and reduces throughput.'
+        raise RuntimeError(msg)
 
     model_type = get_model_type(model[0])
 
@@ -2137,7 +2091,7 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
-    if config.sft_sequence_packing:
+    if config.sequence_packing:
         forward_data_store.append(
             [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
         )
@@ -2535,7 +2489,7 @@ def forward_backward_pipelining_without_interleaving(
     ):
         create_cudagraphs()
 
-    if config.sft_sequence_packing:
+    if config.sequence_packing:
         forward_data_store.append(
             [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
         )

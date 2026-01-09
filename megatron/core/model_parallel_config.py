@@ -63,45 +63,38 @@ class ModelParallelConfig:
        type.
     """
 
-    max_seqlen_per_dp_cp_rank: Optional[int] = None
+    max_seqlen_per_cp_rank: Optional[int] = None
     """
     Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using sft_sequence_packing.
+    each rank when using sequence_packing.
     """
 
     hybrid_context_parallel: bool = False
     """
     If true, enables hybrid context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
-    When enabling hybrid_context_parallel, sft_sequence_packing must be true.
+    Please set max_seqlen_per_cp_rank when using hybrid_context_parallel.
+    When enabling hybrid_context_parallel, sequence_packing must be true.
     """
 
-    hybrid_context_parallel_scheduler: str = 'default_hybrid_cp'
+    sequence_packing_scheduler: Optional[str] = None
     """
-    Scheduler for hybrid context parallel.
-    default_hybrid_cp: default hybrid-cp scheduler for hybrid context parallel 
-    which provided by MCore.
+    Scheduler for sequence packing and hybrid context parallel.
+    naive_sequence_packing: default naive sequence packing scheduler(just THD, no Hybrid-CP, this 
+    is just for comparison with default hybrid-cp scheduler, not recommended for production)
+    default_hybrid_cp: default hybrid-cp scheduler for hybrid context parallel provided by MCore.
     empty_scheduler_with_packing: scheduling is already handled by the data sampler,
     this scheduler only performs packing.
     empty_scheduler_no_packing: scheduling and packing are already handled by the data sampler,
     this scheduler only returns the batch.
     """
 
-    sft_sequence_packing: bool = False
+    sequence_packing: bool = False
     """
     If true, enables sft sequence packing.
-    """
-
-    balanced_sequence_packing: bool = False
-    """
-    If true, enables balanced sequence packing.
-    This is used to pack samples with variable sequence lengths into a single sample
-    such that each packed sample has similar total sequence lengths.
-    This is useful to improve the efficiency of sequence packing.
     """
 
     expert_model_parallel_size: int = 1
@@ -461,10 +454,7 @@ class ModelParallelConfig:
                     "sequence parallelism must be used"
                 )
 
-        if (
-            self.microbatch_group_size_per_vp_stage is None
-            and self.virtual_pipeline_model_parallel_size is not None
-        ):
+        if self.microbatch_group_size_per_vp_stage is None:
             self.microbatch_group_size_per_vp_stage = self.pipeline_model_parallel_size
 
         if self.overlap_p2p_comm_warmup_flush:
@@ -473,9 +463,13 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
-        if self.hybrid_context_parallel and not self.sft_sequence_packing:
+        if self.hybrid_context_parallel and not self.sequence_packing:
             raise ValueError("Hybrid context parallel requires sequence packing to be enabled")
-        if self.sft_sequence_packing:
+        if self.sequence_packing:
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
             # TODO: remove this after we fix the convergence issue with TE < 2.9.
             if not (
                 is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")

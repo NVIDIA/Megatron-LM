@@ -10,8 +10,10 @@ import numpy as np
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
+from megatron.core.utils import is_te_min_version, tex
 
 
 class PackingScheduler(enum.Enum):
@@ -37,7 +39,7 @@ def wrap_dataloader(
 
     Args:
         data_iterator: The original data_iterator to wrap around
-        config: The config object containing the max_seqlen_per_dp_cp_rank
+        config: The config object containing the max_seqlen_per_cp_rank
         dp_cp_group: Data parallel context parallel group.
     """
 
@@ -289,7 +291,7 @@ def wrap_dataloader(
 
     def _pack_sequences(
         samples: List,
-        partner_cp_size: torch.Tensor,
+        local_cp_size: torch.Tensor,
         padded_lengths: torch.Tensor,
         original_lengths: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
@@ -308,9 +310,9 @@ def wrap_dataloader(
         new_sample["labels"] = labels
         new_sample["loss_mask"] = loss_mask
         new_sample["position_ids"] = position_ids
-        if partner_cp_size is not None:
+        if local_cp_size is not None:
             # Accept either a Python int or a CUDA scalar tensor; keep as a scalar tensor on GPU.
-            new_sample["local_cp_size"] = partner_cp_size.to(device=dev, dtype=torch.int32)
+            new_sample["local_cp_size"] = local_cp_size.to(device=dev, dtype=torch.int32)
 
         padded_lengths = padded_lengths.to(
             device=dev, dtype=torch.int32, non_blocking=True
@@ -338,7 +340,7 @@ def wrap_dataloader(
     def _build_packed_microbatches(
         grouped_samples: List[List[Dict[str, torch.Tensor]]],
         scheduler_type: PackingScheduler,
-        partner_cp_sizes_gpu: Optional[torch.Tensor],
+        local_cp_sizes_gpu: Optional[torch.Tensor],
     ) -> List[Dict[str, torch.Tensor]]:
         """
         Build packed samples for each microbatch given a pre-built list of `samples` per microbatch.
@@ -348,7 +350,7 @@ def wrap_dataloader(
                 (list[sample]) for that microbatch, where `sample` is the dict returned by
                 `dataset.__getitem__`.
             scheduler_type: packing scheduler.
-            partner_cp_sizes_gpu: CUDA int32 tensor of shape [num_micro_batches]
+            local_cp_sizes_gpu: CUDA int32 tensor of shape [num_micro_batches]
             when DEFAULT_HYBRID_CP, otherwise None.
 
         Returns:
@@ -376,8 +378,8 @@ def wrap_dataloader(
             lo = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
 
             if scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP:
-                assert partner_cp_sizes_gpu is not None
-                partner_cp_arg = partner_cp_sizes_gpu[i]
+                assert local_cp_sizes_gpu is not None
+                partner_cp_arg = local_cp_sizes_gpu[i]
             else:
                 partner_cp_arg = None
 
@@ -421,11 +423,16 @@ def wrap_dataloader(
     dev = torch.cuda.current_device()
 
     scheduler = scheduler_map[scheduler_type](
-        config.max_seqlen_per_dp_cp_rank,
+        config.max_seqlen_per_cp_rank,
         parallel_state.get_context_parallel_world_size(),
         parallel_state.get_data_parallel_world_size(),
         # When VPP is enabled, align num_micro_batches to this multiple.
-        config.microbatch_group_size_per_vp_stage,
+        (
+            None
+            if config.virtual_pipeline_model_parallel_size is None
+            else config.microbatch_group_size_per_vp_stage
+        ),
+        config.hybrid_context_parallel,
     )
     if (
         config.virtual_pipeline_model_parallel_size is not None
@@ -464,12 +471,12 @@ def wrap_dataloader(
             for samples in batch_all:
                 # In EMPTY scheduler, scheduler has already selected the grouping and
                 # provides `local_cp_size` for each packed group.
-                partner_cp_size = samples[0]["local_cp_size"]
-                # Convert partner_cp_size to a python int for FLOPs accounting
-                partner_cp_size_int = (
-                    int(partner_cp_size.item())
-                    if isinstance(partner_cp_size, torch.Tensor)
-                    else int(partner_cp_size)
+                local_cp_size = samples[0]["local_cp_size"]
+                # Convert local_cp_size to a python int for FLOPs accounting
+                local_cp_size_int = (
+                    int(local_cp_size.item())
+                    if isinstance(local_cp_size, torch.Tensor)
+                    else int(local_cp_size)
                 )
 
                 # Build per-sub-sample length tensors on GPU so `_pack_sequences` can compute
@@ -482,14 +489,14 @@ def wrap_dataloader(
                 )
 
                 new_sample = _pack_sequences(
-                    samples, partner_cp_size, padded_lengths, original_lengths
+                    samples, local_cp_size, padded_lengths, original_lengths
                 )
                 new_samples.append(new_sample)
                 for sample in samples:
                     n = sample["tokens"].numel()
-                    # tokens.numel() is a python int (no D2H). partner_cp_size_int is python int.
-                    num_total_tokens += n / partner_cp_size_int
-                    sequence_square_sum += n**2 / partner_cp_size_int
+                    # tokens.numel() is a python int (no D2H). local_cp_size_int is python int.
+                    num_total_tokens += n / local_cp_size_int
+                    sequence_square_sum += n**2 / local_cp_size_int
             # allreduce to get the total number of microbatches
             flops_info_to_broadcast_this_hdp_group = torch.tensor(
                 [num_total_tokens, sequence_square_sum], dtype=torch.float32, device=dev
@@ -552,13 +559,13 @@ def wrap_dataloader(
             hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
             num_micro_batches = len(sample_id_groups)
 
-            # partner_cp_sizes_gpu is computed outside and passed in for DEFAULT_HYBRID_CP.
+            # local_cp_sizes_gpu is computed outside and passed in for DEFAULT_HYBRID_CP.
             if scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP:
                 # One H2D total
-                partner_cp_sizes_cpu: List[int] = []
+                local_cp_sizes_cpu: List[int] = []
                 for i in range(num_micro_batches):
                     sample_ids_this_group = sample_id_groups[i][hdp_rank]
-                    partner_cp_sizes_cpu.append(
+                    local_cp_sizes_cpu.append(
                         len(
                             [
                                 1
@@ -567,11 +574,9 @@ def wrap_dataloader(
                             ]
                         )
                     )
-                partner_cp_sizes_gpu = torch.tensor(
-                    partner_cp_sizes_cpu, dtype=torch.int32, device=dev
-                )
+                local_cp_sizes_gpu = torch.tensor(local_cp_sizes_cpu, dtype=torch.int32, device=dev)
             else:
-                partner_cp_sizes_gpu = None
+                local_cp_sizes_gpu = None
 
             grouped_samples = [
                 [batch[sub_sample_id] for sub_sample_id in sample_id_groups[i][hdp_rank]]
@@ -581,7 +586,7 @@ def wrap_dataloader(
             new_samples = _build_packed_microbatches(
                 grouped_samples=grouped_samples,
                 scheduler_type=scheduler_type,
-                partner_cp_sizes_gpu=partner_cp_sizes_gpu,
+                local_cp_sizes_gpu=local_cp_sizes_gpu,
             )
 
             # calculate this two values for tflops calculation
@@ -738,15 +743,23 @@ class BaseScheduler:
 
     def __init__(
         self,
-        max_seqlen_per_dp_cp_rank: Optional[int],
+        max_seqlen_per_cp_rank: Optional[int],
         cp_size: int,
         dp_size: int,
         microbatch_group_size_per_vp_stage: Optional[int],
+        hybrid_context_parallel: bool = False,
     ):
-        self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
+        self.max_seqlen_per_cp_rank = max_seqlen_per_cp_rank
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
+        self.hybrid_context_parallel = hybrid_context_parallel
+
+    def check_require_sample_keys(self, batch: List[Dict]):
+        """
+        Required per-(sub)sample fields expected by the scheduler.
+        """
+        raise NotImplementedError
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         """
@@ -764,10 +777,19 @@ class EmptyPackingScheduler(BaseScheduler):
     """
 
     def __init__(
-        self, max_seqlen_per_dp_cp_rank, cp_size, dp_size, microbatch_group_size_per_vp_stage
+        self,
+        max_seqlen_per_cp_rank,
+        cp_size,
+        dp_size,
+        microbatch_group_size_per_vp_stage,
+        hybrid_context_parallel: bool = False,
     ):
         super().__init__(
-            max_seqlen_per_dp_cp_rank, cp_size, dp_size, microbatch_group_size_per_vp_stage
+            max_seqlen_per_cp_rank,
+            cp_size,
+            dp_size,
+            microbatch_group_size_per_vp_stage,
+            hybrid_context_parallel=hybrid_context_parallel,
         )
 
     def check_require_sample_keys(self, batch: List[Dict]):
@@ -786,7 +808,8 @@ class EmptyPackingScheduler(BaseScheduler):
         sequence, used to build `cu_seqlens` for variable-length attention.
         - padded_seq_len[torch.Tensor]: Scalar int32 tensor length after padding/truncation,
         used to build `cu_seqlens_padded` and for max_seqlen computation.
-        - partner_cp_size[int]: size of the partner CP, used to build `local_cp_size`.
+        - local_cp_size[torch.Tensor]: Scalar int32 tensor of the partner CP size, used to build
+        `local_cp_size` for Hybrid-CP.
         - num_micro_batches_left[int]: number of microbatches left to be fetched.
         """
         required_keys = [
@@ -796,7 +819,7 @@ class EmptyPackingScheduler(BaseScheduler):
             "position_ids",
             "original_seq_len",
             "padded_seq_len",
-            "partner_cp_size",
+            "local_cp_size",
             "num_micro_batches_left",
         ]
 
@@ -810,6 +833,10 @@ class EmptyPackingScheduler(BaseScheduler):
         for key in required_keys:
             if key not in batch[0]:
                 return False
+        if "local_cp_size" in batch[0]:
+            assert (
+                self.hybrid_context_parallel
+            ), "local_cp_size is only supported when using hybrid context parallel"
         return True
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
@@ -826,10 +853,19 @@ class EmptyNoPackingScheduler(BaseScheduler):
     """
 
     def __init__(
-        self, max_seqlen_per_dp_cp_rank, cp_size, dp_size, microbatch_group_size_per_vp_stage
+        self,
+        max_seqlen_per_cp_rank,
+        cp_size,
+        dp_size,
+        microbatch_group_size_per_vp_stage,
+        hybrid_context_parallel: bool = False,
     ):
         super().__init__(
-            max_seqlen_per_dp_cp_rank, cp_size, dp_size, microbatch_group_size_per_vp_stage
+            max_seqlen_per_cp_rank,
+            cp_size,
+            dp_size,
+            microbatch_group_size_per_vp_stage,
+            hybrid_context_parallel=hybrid_context_parallel,
         )
 
     def check_require_sample_keys(self, batch: List[Dict]):
@@ -850,9 +886,10 @@ class EmptyNoPackingScheduler(BaseScheduler):
         - cu_seqlens_padded[torch.Tensor]: 1D int32 tensor of cumulative (prefix-sum) padded
         sequence lengths, shape [num_seqs + 1], with cu_seqlens_padded[0] = 0.
         Used for packed layouts where each sequence occupies `padded_seq_len` tokens.
-        - max_seqlen[int]: Maximum sequence length in the microbatch
-        (typically the max of padded lengths);
-        - partner_cp_size[int]: size of the partner CP, used to build `local_cp_size`.
+        - max_seqlen[torch.Tensor]: Scalar int32 tensor of the maximum sequence length in
+        the microbatch (typically the max of padded lengths).
+        - local_cp_size[torch.Tensor]: Scalar int32 tensor of the local_cp_size CP size, used to
+        build `local_cp_size`.
         - num_micro_batches_left[int]: number of microbatches left to be fetched.
         - num_total_tokens_this_global_batch[float]: total number of tokens in the global batch.
         Used for tflops calculation.
@@ -867,7 +904,7 @@ class EmptyNoPackingScheduler(BaseScheduler):
             "cu_seqlens",
             "cu_seqlens_padded",
             "max_seqlen",
-            "partner_cp_size",
+            "local_cp_size",
             "num_micro_batches_left",
             "num_total_tokens_this_global_batch",
             "sequence_square_sum_this_global_batch",
@@ -879,6 +916,12 @@ class EmptyNoPackingScheduler(BaseScheduler):
         for key in required_keys:
             if key not in batch[0]:
                 return False
+
+        if "local_cp_size" in batch[0]:
+            assert (
+                self.hybrid_context_parallel
+            ), "local_cp_size is only supported when using hybrid context parallel"
+
         return True
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
@@ -897,12 +940,21 @@ class NaiveSequencePackingScheduler(BaseScheduler):
     """
 
     def __init__(
-        self, max_seqlen_per_dp_cp_rank, cp_size, dp_size, microbatch_group_size_per_vp_stage
+        self,
+        max_seqlen_per_cp_rank,
+        cp_size,
+        dp_size,
+        microbatch_group_size_per_vp_stage,
+        hybrid_context_parallel: bool = False,
     ):
         super().__init__(
-            max_seqlen_per_dp_cp_rank, cp_size, dp_size, microbatch_group_size_per_vp_stage
+            max_seqlen_per_cp_rank,
+            cp_size,
+            dp_size,
+            microbatch_group_size_per_vp_stage,
+            hybrid_context_parallel=hybrid_context_parallel,
         )
-        self.max_seq_len_all_ranks = self.max_seqlen_per_dp_cp_rank * self.cp_size
+        self.max_seq_len_all_ranks = self.max_seqlen_per_cp_rank * self.cp_size
 
     def check_require_sample_keys(self, batch: List[Dict]):
         """
@@ -948,16 +1000,21 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         sum_seqlen = 0
         single_microbatch = []
 
+        # debugmtl
         for i in range(len(sample_id_seqlens)):
-            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
-                single_microbatch.append(i)
-                sum_seqlen += sample_id_seqlens[i][1]
-            else:
-                packed_id_groups.append(single_microbatch)
-                single_microbatch = [i]
-                sum_seqlen = sample_id_seqlens[i][1]
-        if len(single_microbatch) > 0:
+            single_microbatch = [i]
             packed_id_groups.append(single_microbatch)
+
+        # for i in range(len(sample_id_seqlens)):
+        #     if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
+        #         single_microbatch.append(i)
+        #         sum_seqlen += sample_id_seqlens[i][1]
+        #     else:
+        #         packed_id_groups.append(single_microbatch)
+        #         single_microbatch = [i]
+        #         sum_seqlen = sample_id_seqlens[i][1]
+        # if len(single_microbatch) > 0:
+        #     packed_id_groups.append(single_microbatch)
 
         # we want the number of packed sequences to be multiple of dp_size
         # so we move few samples from previous microbatch
@@ -1000,12 +1057,21 @@ class DefaultHybridCPscheduler(BaseScheduler):
     """
 
     def __init__(
-        self, max_seqlen_per_dp_cp_rank, cp_size, dp_size, microbatch_group_size_per_vp_stage
+        self,
+        max_seqlen_per_cp_rank,
+        cp_size,
+        dp_size,
+        microbatch_group_size_per_vp_stage,
+        hybrid_context_parallel: bool = False,
     ):
         super().__init__(
-            max_seqlen_per_dp_cp_rank, cp_size, dp_size, microbatch_group_size_per_vp_stage
+            max_seqlen_per_cp_rank,
+            cp_size,
+            dp_size,
+            microbatch_group_size_per_vp_stage,
+            hybrid_context_parallel=hybrid_context_parallel,
         )
-        self.max_seq_len_per_rank = self.max_seqlen_per_dp_cp_rank
+        self.max_seq_len_per_rank = self.max_seqlen_per_cp_rank
         self.total_hdp_gpus = self.dp_size * self.cp_size
 
     def check_require_sample_keys(self, batch: List[Dict]):
@@ -1603,3 +1669,153 @@ class DefaultHybridCPscheduler(BaseScheduler):
             sample_id_groups = self.align_sample_id_groups(sample_id_groups)
 
         return sample_id_groups
+
+
+def get_batch_on_this_rank_for_sequence_packing(
+    data_iterator,
+    mtp_on_this_rank: bool = False,
+    vp_stage: Optional[int] = None,
+    hybrid_context_parallel: bool = False,
+):
+    """
+    Get a batch of data for sequence packing.
+    Args:
+        data_iterator (Iterator): The data iterator to get the batch from.
+        mtp_on_this_rank (bool): Whether to use multi-token prediction.
+        vp_stage (Optional[int]): The stage of the pipeline.
+        hybrid_context_parallel (bool): Whether to use hybrid context parallel.
+    Returns:
+        Dict[str, Any]: A batch of data for sequence packing.
+    """
+
+    def _broadcast_to_tp_group(item):
+        if item is not None:
+            torch.distributed.broadcast(
+                item,
+                parallel_state.get_tensor_model_parallel_src_rank(),
+                group=parallel_state.get_tensor_model_parallel_group(),
+            )
+
+    batch = None
+    seq_len = None
+    is_tp_rank_0 = parallel_state.get_tensor_model_parallel_rank() == 0
+    is_first_stage = parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
+    is_last_stage = parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
+    is_first_or_last_stage = is_first_stage or is_last_stage
+    dev = torch.cuda.current_device()
+    # partioning the batch into multiple chunks for context parallelism
+    if is_tp_rank_0:
+        assert data_iterator is not None
+        batch = next(data_iterator)
+
+        if "local_cp_size" in batch:
+            cp_size = batch["local_cp_size"].item()
+            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=cp_size)
+            cp_rank = torch.distributed.get_rank(group=cp_group)
+            assert cp_group.size() == cp_size
+        else:
+            cp_size = parallel_state.get_context_parallel_world_size()
+            cp_rank = parallel_state.get_context_parallel_rank()
+            cp_group = None
+
+        if cp_size > 1 and is_first_or_last_stage:
+            assert tex is not None and is_te_min_version("1.10.0"), (
+                "Please update Transformer Engine to >= 1.10 to use "
+                "Context Parallel with THD format data"
+            )
+            batch_keys = []
+            if is_first_stage:
+                batch_keys += ['tokens', 'position_ids']
+            if is_last_stage:
+                batch_keys += ['labels', 'loss_mask']
+
+            for key in batch_keys:
+                batch[key] = batch[key].unsqueeze(0)
+            size = batch['tokens'].size(1)
+            # TODO(tailaim): Transformer Engine has a bug here:
+            # we must treat cu_seqlens_padded as cu_seqlens to get the correct result.
+            # Revert this workaround once TE fixes the issue.
+            cu_seqlens_padded = batch["cu_seqlens_padded"]
+            index = tex.thd_get_partitioned_indices(cu_seqlens_padded, size, cp_size, cp_rank)
+            for key in batch_keys:
+                batch[key] = batch[key].index_select(1, index)
+
+        if is_first_or_last_stage:
+            seq_len_tensor = torch.tensor(batch['tokens'].shape[0], dtype=torch.int32, device=dev)
+            _broadcast_to_tp_group(seq_len_tensor)
+
+        cu_seqlens_size_tensor = torch.empty(
+            batch["cu_seqlens_padded"].numel(), dtype=torch.int32, device=dev
+        )
+        _broadcast_to_tp_group(cu_seqlens_size)
+    else:
+        if is_first_or_last_stage:
+            seq_len_tensor = torch.tensor(0, dtype=torch.int32, device=dev)
+            _broadcast_to_tp_group(seq_len_tensor)
+            seq_len = seq_len_tensor.item()
+
+        cu_seqlens_size_tensor = torch.empty(0, dtype=torch.int32, device=dev)
+        _broadcast_to_tp_group(cu_seqlens_size_tensor)
+        cu_seqlens_size = cu_seqlens_size_tensor.item()
+
+    def _pop_or_empty(key: str, shape, dtype: torch.dtype):
+        return batch.pop(key) if is_tp_rank_0 else torch.empty(shape, dtype=dtype, device=dev)
+
+    if is_first_stage or mtp_on_this_rank:
+        tokens = _pop_or_empty("tokens", seq_len, torch.int64)
+        position_ids = _pop_or_empty("position_ids", seq_len, torch.int64)
+        attention_mask = _pop_or_empty("attention_mask", (1, 1, seq_len, seq_len), torch.bool)
+    else:
+        tokens = position_ids = attention_mask = None
+
+    if is_last_stage:
+        labels = _pop_or_empty("labels", seq_len, torch.int64)
+        loss_mask = _pop_or_empty("loss_mask", seq_len, torch.float32)
+    else:
+        labels = loss_mask = None
+
+    cu_seqlens = _pop_or_empty("cu_seqlens", cu_seqlens_size, torch.int32)
+    cu_seqlens_padded = _pop_or_empty("cu_seqlens_padded", cu_seqlens_size, torch.int32)
+    max_seqlen = _pop_or_empty("max_seqlen", 1, torch.int32)
+    local_cp_size = (
+        _pop_or_empty("local_cp_size", 1, torch.int32) if hybrid_context_parallel else None
+    )
+
+    _broadcast_to_tp_group(tokens)
+    _broadcast_to_tp_group(position_ids)
+    _broadcast_to_tp_group(labels)
+    _broadcast_to_tp_group(loss_mask)
+    _broadcast_to_tp_group(attention_mask)
+    _broadcast_to_tp_group(cu_seqlens)
+    _broadcast_to_tp_group(cu_seqlens_padded)
+    _broadcast_to_tp_group(max_seqlen)
+    _broadcast_to_tp_group(local_cp_size)
+
+    local_cp_size_cpu = local_cp_size.item() if hybrid_context_parallel else None
+    cp_group = (
+        parallel_state.get_hybrid_data_context_parallel_groups(group_size=local_cp_size_cpu)
+        if hybrid_context_parallel
+        else parallel_state.get_context_parallel_group()
+    )
+
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max_seqlen.item(),
+        max_seqlen_kv=max_seqlen.item(),
+        local_cp_size=local_cp_size.item() if local_cp_size is not None else None,
+        cp_group=cp_group,
+    )
+
+    batch = {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+
+    return (*batch.values(), packed_seq_params)

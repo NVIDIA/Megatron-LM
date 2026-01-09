@@ -1417,7 +1417,6 @@ def setup_model_and_optimizer(
 
 
 def dummy_train_step(data_iterator):
-    # TODO(tailaim): this need to be modified
     """Single dummy training step."""
     num_microbatches = get_num_microbatches()
     rerun_state_machine = get_rerun_state_machine()
@@ -1481,7 +1480,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
     
-    if args.sft_sequence_packing:
+    if args.sequence_packing:
         num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch = losses_reduced.pop()
     else:
         sequence_square_sum_this_global_batch = args.seq_length ** 2 * args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -2194,7 +2193,7 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
-    
+
     if getattr(args, 'perform_rl_step', False):
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
 
@@ -2510,6 +2509,8 @@ def train(
 
         # Completely skip iteration if needed.
         if iteration in args.iterations_to_skip:
+            # TODO(tailaim): this need to be modified
+            assert not args.sequence_packing, "Sequence packing is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
@@ -2878,8 +2879,6 @@ def evaluate(
                                 group=mpu.get_data_parallel_group(with_context_parallel=True)
                             )
                             total_loss_dict[key] += val
-                             
-
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()
                         total_loss_dict[key][0] += val
