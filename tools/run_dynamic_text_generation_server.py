@@ -13,7 +13,7 @@ from examples.inference.gpt.gpt_dynamic_inference import (
     get_model,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.text_generation_server import run_flask_server
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server import run_flask_server
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_mamba_inference_state_config_from_model, trace_async_exceptions
 from megatron.post_training.arguments import add_modelopt_args
