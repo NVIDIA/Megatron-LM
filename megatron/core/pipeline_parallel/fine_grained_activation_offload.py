@@ -973,7 +973,8 @@ class ChunkOffloadHandler:
         else:
             # Pre-load the last layer of the next backward chunk to hide latency
             next_backward_chunk = PipelineOffloadManager.get_instance().front()
-            if next_backward_chunk is not None:
+            if next_backward_chunk is not None \
+                and next_backward_chunk._offloaded_group_index == next_backward_chunk._max_group_size:
                 next_backward_chunk.pre_reload_last_layer()
 
     def on_group_commit_backward(self, name):
@@ -1031,7 +1032,7 @@ class ChunkOffloadHandler:
         """
         if not self.do_offload:
             return
-        debug_rank("--on_group_start_backward")
+        debug_rank(f"--on_group_start_backward {self}")
         # Wait for compute to finish before starting reload
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_reload()
