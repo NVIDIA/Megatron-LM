@@ -216,6 +216,7 @@ def forward_step_calc_loss(
     forward_data_store,
     cp_group_size=None,
     is_last_stage=None,
+    do_not_average_loss=False,
 ):
     """Calculate the loss and number of tokens for forward_step()"""
 
@@ -246,7 +247,7 @@ def forward_step_calc_loss(
             outputs = loss_func(output_tensor)
             if len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs
-                if not config.calculate_per_token_loss:
+                if not config.calculate_per_token_loss and not do_not_average_loss:
                     # Protect against division by zero when all tokens are masked
                     #   in a microbatch.
                     output_tensor /= torch.clamp(num_tokens, min=1)
@@ -255,8 +256,9 @@ def forward_step_calc_loss(
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
                 assert len(outputs) == 2
                 output_tensor, loss_reduced = outputs
-                output_tensor *= cp_group_size
-                output_tensor /= num_microbatches
+                if not do_not_average_loss:
+                    output_tensor *= cp_group_size
+                    output_tensor /= num_microbatches
             forward_data_store.append(loss_reduced)
         else:
             data = loss_func(output_tensor, non_loss_data=True)
@@ -313,6 +315,7 @@ def forward_step(
     current_microbatch=None,
     vp_stage=None,
     is_last_stage=True,
+    do_not_average_loss=False,
 ):
     """Forward step for passed-in model.
 
@@ -381,6 +384,11 @@ def forward_step(
             Whether it is the last stage. Defaults to True.
             Also considering virtual stages.
             In case of PP/VPP, is_last_stage/is_vp_last_stage.
+        do_not_average_loss (bool, optional):
+            Whether to not average the loss.
+            You may handle loss averaging yourself in your loss function, in which case,
+            you should avoid the loss averaging over microbatches done here.
+            Defaults to False.
 
     Returns:
         Tensor or list[Tensor]: The output object(s) from the forward step.
@@ -426,6 +434,7 @@ def forward_step(
         forward_data_store,
         cp_group_size,
         is_last_stage,
+        do_not_average_loss=do_not_average_loss,
     )
 
     if unwrap_output_tensor:
@@ -520,6 +529,7 @@ def forward_backward_no_pipelining(
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
     p2p_communicator: Optional[P2PCommunicator] = None,  # unused
     pg_collection: Optional[ProcessGroupCollection] = None,
+    do_not_average_loss: bool = False,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
 
@@ -616,6 +626,7 @@ def forward_backward_no_pipelining(
                     collect_non_loss_data,
                     is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
                     current_microbatch=i,
+                    do_not_average_loss=do_not_average_loss,
                 )
                 total_num_tokens += num_tokens
                 if not forward_only:
@@ -638,6 +649,7 @@ def forward_backward_no_pipelining(
                 first_val_step, forward_only, num_microbatches == 1
             ),
             current_microbatch=num_microbatches - 1,
+            do_not_average_loss=do_not_average_loss,
         )
 
         total_num_tokens += num_tokens
@@ -833,6 +845,7 @@ def forward_backward_pipelining_with_interleaving(
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    do_not_average_loss: bool = False,
 ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -1237,6 +1250,7 @@ def forward_backward_pipelining_with_interleaving(
             current_microbatch=microbatch_id,
             vp_stage=model_chunk_id,
             is_last_stage=_is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group),
+            do_not_average_loss=do_not_average_loss,
         )
 
         forward_step_helper_postprocess(model_chunk_id, output_tensor, num_tokens)
@@ -1973,6 +1987,7 @@ def forward_backward_pipelining_without_interleaving(
     adjust_tensor_shapes_fn: Optional[Callable] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    do_not_average_loss: bool = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
@@ -2158,6 +2173,7 @@ def forward_backward_pipelining_without_interleaving(
             is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
             current_microbatch=i,
             is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
+            do_not_average_loss=do_not_average_loss,
         )
         p2p_communicator.send_forward(output_tensor, is_pp_last_stage(p2p_communicator.pp_group))
         total_num_tokens += num_tokens
@@ -2203,6 +2219,7 @@ def forward_backward_pipelining_without_interleaving(
             ),
             current_microbatch=i + num_warmup_microbatches,
             is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
+            do_not_average_loss=do_not_average_loss,
         )
         total_num_tokens += num_tokens
 

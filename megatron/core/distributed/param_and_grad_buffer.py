@@ -619,6 +619,7 @@ class _ParamAndGradBuffer:
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
+        self.param_data_cpu = None # for offloading params to cpu
 
         def _pad(number_to_be_padded: int, divisor: int) -> int:
             return int(math.ceil(number_to_be_padded / divisor) * divisor)
@@ -788,6 +789,7 @@ class _ParamAndGradBuffer:
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
+        self.grad_data_size = 0
 
         # Finally, map param.data and param.main_grad fields to buffers.
         bucket_params = []
@@ -939,6 +941,32 @@ class _ParamAndGradBuffer:
         """
         self.grad_data.zero_()
 
+    def offload_to_cpu(self, move_params: bool = True, move_grads: bool = True):
+        """
+        Offload the buffers to CPU.
+        """
+        if move_grads and self.grad_data is not None and self.grad_data.storage().size() > 0:
+            self.grad_data_size = self.grad_data.storage().size()
+            self.grad_data.storage().resize_(0)
+        if move_params and self.param_data is not None and self.param_data.storage().size() > 0:
+            self.param_data_size = self.param_data.storage().size()
+            if self.param_data_cpu is not None:
+                self.param_data_cpu.copy_(self.param_data, non_blocking=True)
+            else:
+                self.param_data_cpu = self.param_data.cpu().pin_memory()
+            self.param_data.storage().resize_(0)
+
+    def reload_from_cpu(self, move_params: bool = True, move_grads: bool = True):
+        """
+        Reload the buffers from CPU.
+        """
+        if move_params and self.param_data is not None and self.param_data_cpu is not None and self.param_data.storage().size() == 0:
+            self.param_data.storage().resize_(self.param_data_size)
+            self.param_data.copy_(self.param_data_cpu, non_blocking=True)
+        if move_grads and self.grad_data is not None and self.grad_data_size > 0:
+            self.grad_data.storage().resize_(self.grad_data_size)
+            self.grad_data.zero_()
+            self.grad_data_size = 0
 
 def partition_buckets(
     buffers: List[_ParamAndGradBuffer], force_single_bucket_group: bool = False
