@@ -234,6 +234,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Request state.
         self.request_counter = Counter()
         self.finished_request_count = 0
+        self.evicted_request_count = 0
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
@@ -823,6 +824,8 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
         self.finished_request_count += len(finished_request_ids)
+        if evict_request_ids is not None:
+            self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
@@ -1157,6 +1160,7 @@ class DynamicInferenceEngine(AbstractEngine):
         post_step_context_state = {
             "waiting_request_count": len(self.waiting_request_ids),
             "finished_request_count": self.finished_request_count,
+            "evicted_request_count": self.evicted_request_count,
             "kv_stats": kvcache_util_stats,
             "padded_active_token_count": self.context.padded_active_token_count,
             "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
@@ -1313,7 +1317,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     context_state["paused_request_count"],
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
-                    0 if evict_request_ids is None else evict_request_ids.numel(),
+                    context_state["evicted_request_count"],
                     context_state["total_active_used_blocks"],
                     context_state["total_active_block_count"],
                     context_state["total_paused_used_blocks"],

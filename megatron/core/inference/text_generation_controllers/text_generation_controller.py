@@ -41,6 +41,12 @@ except ImportError:
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 
+# >>>
+from lutil import pax as _pax
+import builtins
+builtins.pax = _pax
+# <<<
+
 
 # pylint: disable=line-too-long
 class TextGenerationController:
@@ -624,6 +630,9 @@ class TextGenerationController:
                     bucket[0].append(i)
 
             # Store the buckets and their equivalence class representatives.
+            # >>>
+            # pax(bucket_map)
+            # <<<
             self._torch_sampling_buckets = (
                 (indices, temp[rep], top_k[rep], top_p[rep]) for indices, rep in bucket_map.values()
             )
@@ -651,6 +660,9 @@ class TextGenerationController:
             token_list = []
             indices_list = []
 
+            # >>>
+            # pax({"torch_sampling_buckets": list(self._torch_sampling_buckets)})
+            # <<<
             for indices, temp, top_k, top_p in self._torch_sampling_buckets:
                 token_list.append(
                     self._torch_sampling_func(last_token_logits[indices, :], temp, top_k, top_p)
