@@ -206,6 +206,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         assert self._client is not None, "Client is not initialized"
 
         tokenizer = get_tokenizer()
+        args = get_args()
 
         sampling_params = SamplingParams(
             num_tokens_to_generate=None,
@@ -216,7 +217,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             termination_id=self._inference_engine.controller.tokenizer.eod,
             return_log_probs=True,
             skip_prompt_log_probs=True,
-            add_BOS=tokenizer.bos is not None,
+            add_BOS=(not args.rl_skip_bos_token and tokenizer.bos is not None),
         )
         requests = [
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)

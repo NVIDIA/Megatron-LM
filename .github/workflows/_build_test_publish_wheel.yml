@@ -157,7 +157,7 @@ jobs:
           - PACKAGE: megatron-core
             PLATFORM: amd64
           - PACKAGE: megatron-fsdp
-            IMAGE: quay.io/pypa/manylinux_2_28_x86_64
+            PLATFORM: amd64
     env:
       PACKAGE: ${{ matrix.PACKAGE }}
     steps:
@@ -173,7 +173,19 @@ jobs:
           TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
           TWINE_REPOSITORY: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'pypi' || 'testpypi' }}
+          PLATFORM: ${{ matrix.PLATFORM }}
         run: |
-          ls -al dist/$PACKAGE*
+
+          # Delete sdist for arm64 since we already upload it with amd64.
+          if [ "$PLATFORM" == "arm64" ]; then
+            rm dist/*.tar.gz
+          fi
+
+          ls -al dist/
           pip install twine
-          twine upload -r $TWINE_REPOSITORY -u $TWINE_USERNAME -p $TWINE_PASSWORD dist/$PACKAGE*
+          twine upload \
+            --verbose \
+            -r $TWINE_REPOSITORY \
+            -u $TWINE_USERNAME \
+            -p $TWINE_PASSWORD \
+            dist/*

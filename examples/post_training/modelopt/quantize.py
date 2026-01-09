@@ -84,6 +84,9 @@ def add_text_generate_ptq_args(parser):
         "--calib-size", type=int, default=512, help="Samples to use for ptq calibration."
     )
     group.add_argument(
+        "--calib-dataset", type=str, default="abisee/cnn_dailymail", help="The default clibration dataset is cnn_dailymail from HF hub."
+    )
+    group.add_argument(
         "--prompts",
         type=str,
         default=("Hello!|Born in California, Soyer trained as a"),
@@ -258,7 +261,8 @@ def get_modelopt_torch_quantization_config():
 
 def get_calib_dataloader(calib_size=512, max_sequence_length=512):
     """Return a dataloader for calibration."""
-    dataset = load_dataset("cnn_dailymail", name="3.0.0", split="train")
+    args = get_args()
+    dataset = load_dataset(args.calib_dataset, name="3.0.0", split="train")
     text_column = "article"
 
     calib_size = min(len(dataset), calib_size)

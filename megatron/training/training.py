@@ -12,7 +12,8 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Optional
+from contextlib import nullcontext
+from typing import Any, Optional, Dict
 
 import torch.distributed
 
@@ -33,6 +34,7 @@ try:
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
+from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
@@ -64,6 +66,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
+from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -75,7 +78,6 @@ from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyS
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
 
 from megatron.core.optimizer.qk_clip import clip_qk
 
@@ -110,6 +112,7 @@ from megatron.core.parallel_state import (
     destroy_model_parallel,
     update_pg_timeout
 )
+from megatron.core.inference.unified_memory import create_unified_mempool
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
@@ -640,11 +643,6 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
-    if args.batch_invariant_mode:
-        print_rank_0("Enabling batch invariant mode globally",flush=True)
-        enable_batch_invariant_mode()
-
-
     if args.log_progress:
         append_to_progress_log("Starting job")
 
@@ -722,6 +720,45 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
 
+    # Build a separate inference model for RL if requested.
+    inference_model = None
+    if args.perform_rl_step:
+        if args.rl_inference_tensor_model_parallel_size is not None:
+            print_rank_0(
+                f"Setting tensor model parallel size to {args.rl_inference_tensor_model_parallel_size} for inference model"
+            )
+            inference_pg_collection = build_inference_pg_collection(
+                tp_size=args.rl_inference_tensor_model_parallel_size,
+                world_size=args.world_size,
+                use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+            )
+
+            # Build an isolated inference config so training config remains unchanged
+            inference_config = copy.deepcopy(config)
+            inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
+
+            # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
+            # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
+            uvm_mempool = None
+            uvm_level = args.rl_inference_model_unified_memory_level
+            if uvm_level and uvm_level > 0:
+                uvm_mempool = create_unified_mempool()
+
+            mempool_ctx = (
+                torch.cuda.use_mem_pool(uvm_mempool) if uvm_mempool is not None else nullcontext()
+            )
+            with mempool_ctx:
+                inference_model = get_model(
+                    model_provider,
+                    model_type,
+                    wrap_with_ddp=False,
+                    pg_collection=inference_pg_collection,
+                    config=inference_config,
+                )
+            inference_model[0].eval()
+
+
+
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
@@ -796,6 +833,7 @@ def pretrain(
                 config,
                 checkpointing_context,
                 non_loss_data_func,
+                inference_model,
             )
 
         print_datetime('after training is done')
@@ -960,6 +998,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model.model_type = model_type
         return model
 
+
     if args.init_model_with_meta_device:
         with torch.device('meta'):
             model = build_model()
@@ -1009,11 +1048,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
-        #for model_module in model:
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
-
-
-
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
     #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
@@ -1055,8 +1090,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
             kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['average_in_collective'] = args.ddp_average_in_collective
-            if args.use_megatron_fsdp and args.use_precision_aware_optimizer:
-                kwargs["preserve_fp32_weights"] = False
             ddp_config = DistributedDataParallelConfig(**kwargs)
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
@@ -1071,8 +1104,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
-
-        with torch.cuda.stream(torch.cuda.Stream()):
+        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
+        #  capture support with DDP, but we sync it with the current stream to avoid races.
+        ddp_stream = torch.cuda.Stream()
+        # Wait for the default stream to complete before starting ddp_stream
+        ddp_stream.wait_stream(torch.cuda.current_stream())
+        # Make ddp_stream start after whatever the default stream already queued
+        with torch.cuda.stream(ddp_stream):
             model = [
                 DP(
                     config=config,
@@ -1085,6 +1123,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
+        # End of setup_stream
+        # Critical: ensure side-stream work completes before touching params on default stream
+        torch.cuda.current_stream().wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
@@ -1169,17 +1210,9 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     else:
         raise ValueError("Invalid optimizer type!")
 
-    # Construct the appropriate config_overrides object.
-    # TODO: add more logic here as needed down the road.
-    if args.decoupled_lr is not None:
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        decoupled_optimizer_config = copy.deepcopy(config)
-        decoupled_optimizer_config.lr = args.decoupled_lr
-        if args.decoupled_min_lr is not None:
-            decoupled_optimizer_config.min_lr = args.decoupled_min_lr
-        config_overrides = {decoupled_param_key: decoupled_optimizer_config}
-    else:
-        config_overrides = None
+    # Construct the appropriate config_overrides object. This default handles many cases, but
+    #  can be added to as needed by the user, or replaced entirely with a custom override.
+    config_overrides = get_standard_config_overrides(args.decoupled_lr, args.decoupled_min_lr)
 
     return config, config_overrides
 
@@ -2080,6 +2113,7 @@ def train(
     config,
     checkpointing_context,
     non_loss_data_func,
+    inference_model=None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
@@ -2417,7 +2451,7 @@ def train(
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
                 train_data_iterator = rl_utils.setup_grpo_data_iterator(
-                    model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                    model, inference_model, optimizer, iteration, ref_state_dict, buffered_rollouts
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.

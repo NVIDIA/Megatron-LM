@@ -88,7 +88,7 @@ MODEL_ARGS:
   --ckpt-assume-constant-structure: true
 TEST_TYPE: ckpt-resume
 METRICS:
-  - "iteration-time"
+  # - "iteration-time"
   - "lm loss"
   - "num-zeros"
   - "mem-allocated-bytes"

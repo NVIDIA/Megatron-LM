@@ -60,6 +60,7 @@ jobs:
     with:
       dry-run: true
       ref: ${{ inputs.release-ref }}
+      no-publish: true
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
@@ -74,7 +75,7 @@ jobs:
       )
       && !cancelled()
     outputs:
-      version: ${{ needs.bump-version-mcore.outputs.release-version }}
+      release-version: ${{ needs.bump-version-mcore.outputs.release-version }}
     env:
       IS_DRY_RUN: ${{ inputs.dry-run }}
     steps:
@@ -92,6 +93,7 @@ jobs:
           SRC_DIR: ''
           PYPROJECT_NAME: 'megatron.core'
         run: |
+          set +u
           cd ${{ github.run_id }}
 
           PACKAGE_INFO_FILE="$SRC_DIR${PYPROJECT_NAME//.//}/package_info.py"
@@ -101,7 +103,7 @@ jobs:
           PATCH=$(cat $PACKAGE_INFO_FILE | awk '/^PATCH = /' | awk -F"= " '{print $2}')
           PRERELEASE=$(cat $PACKAGE_INFO_FILE | awk '/^PRE_RELEASE = /' | awk -F"= " '{print $2}' | tr -d '"' | tr -d "'")
 
-          echo "release-version=$MAJOR.$MINOR.$NEXT_PATCH$NEXT_PRERELEASE" | tee -a "$GITHUB_OUTPUT"
+          echo "release-version=$MAJOR.$MINOR.$PATCH$PRERELEASE" | tee -a "$GITHUB_OUTPUT"
 
           if [[ "$PRERELEASE" != "" ]]; then
             if [[ "$PRERELEASE" == *rc* ]]; then
@@ -130,6 +132,8 @@ jobs:
           SRC_DIR: 'megatron/core/distributed/fsdp/src/'
           PYPROJECT_NAME: 'megatron_fsdp'
         run: |
+          set +u
+          
           cd ${{ github.run_id }}
 
           PACKAGE_INFO_FILE="$SRC_DIR${PYPROJECT_NAME//.//}/package_info.py"

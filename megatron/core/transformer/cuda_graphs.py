@@ -1911,7 +1911,12 @@ class TECudaGraphHelper:
 
         # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
         sample_args, kwargs = self._get_cuda_graph_input_data()
-        graphs = make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
+        if self.config.sequence_parallel:
+            rng_context = get_cuda_rng_tracker().fork()
+        else:
+            rng_context = nullcontext()
+        with rng_context:
+            graphs = make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
 
         # Push the captured graphs to the corresponding TransformerBlock.
         num_layers_accumulated = 0
