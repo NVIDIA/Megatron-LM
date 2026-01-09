@@ -1480,11 +1480,6 @@ def _add_transformer_engine_args(parser):
                        help='Keep the compute param in fp4 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp4.',
                        dest='fp4_param')
-    group.add_argument('--te-rng-tracker', action='store_true', default=False,
-                       help='Use the Transformer Engine version of the random number generator. '
-                            'Required for CUDA graphs support.')
-    group.add_argument('--inference-rng-tracker', action='store_true', default=False,
-                       help='Use a random number generator configured for inference.')
     group.add_argument('--te-precision-config-file', default=None,
                        help='Configuration file to select per-module precision overrides. '
                        'See TransformerEngineMixedPrecision.md')
@@ -2423,14 +2418,11 @@ def _add_rerun_machine_args(parser):
 
 
 def _add_initialization_args(parser):
-    group = parser.add_argument_group(title='initialization')
+    from megatron.training.common_config import RNGConfig
 
-    group.add_argument('--seed', type=int, default=1234,
-                       help='Random seed used for python, numpy, '
-                       'pytorch, and cuda.')
-    group.add_argument('--data-parallel-random-init', action='store_true',
-                       help='Enable random initialization of params '
-                       'across data parallel ranks')
+    rng_factory = ArgumentGroupFactory(RNGConfig)
+    group = rng_factory.build_group(parser, "RNG and initialization")
+
     group.add_argument('--init-method-std', type=float, default=0.02,
                        help='Standard deviation of the zero mean normal '
                        'distribution used for weight initialization.')
