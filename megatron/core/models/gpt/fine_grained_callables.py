@@ -454,7 +454,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         residual = node.layer_state.residual
 
-        output = layer.mlp.combine(output, shared_expert_output)
+        output = layer.mlp.combine(output)
+        output = layer.mlp.postprocess(output, shared_expert_output)
+
         mlp_output_with_bias = (output, None)
 
         with layer.bias_dropout_add_exec_handler():
