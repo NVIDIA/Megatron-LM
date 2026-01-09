@@ -1,11 +1,8 @@
 import torch
 import pytest
 
-from megatron.core.transformer.moe.moe_utils import (
-    RouterReplay,
-    RouterReplayAction,
-    topk_routing_with_score_function,
-)
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
 
 
 def setup_function():
