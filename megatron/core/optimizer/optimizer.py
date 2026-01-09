@@ -137,14 +137,12 @@ class MegatronOptimizer(ABC):
         return params
 
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
-        """
-        Collects gradients for norm calculation, filtering duplicates.
+        
+        """Collects gradients for norm calculation, filtering duplicates.
 
-        This method identifies which gradients should be used to compute the 
-        global gradient norm. It filters out parameters based on:
-          - The gradient must not be None.
-          - The parameter must not be shared (to avoid double-counting).
-          - The parameter must not be a tensor-parallel duplicate.
+        This method filters parameters based on whether the gradient is not None, 
+        the parameter is not shared (to avoid double-counting gradients), and 
+        the parameter is not a replica due to tensor model parallelism.
 
         Returns:
             List[torch.Tensor]: A list of gradient tensors filtered for norm calculation.
