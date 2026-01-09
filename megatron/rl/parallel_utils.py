@@ -52,9 +52,9 @@ def build_inference_pg_collection(
     if ep_size is None:
         ep_size = mpu.get_expert_model_parallel_world_size()
 
-    dp_size = world_size // (tp_size * cp_size * pp_size)
-    assert dp_size >= 1 and (tp_size * cp_size * pp_size * dp_size) == world_size, \
-        "World size must be divisible by tp*cp*pp for inference PG layout"
+    dp_size = world_size // (tp_size * cp_size * ep_size * pp_size)
+    assert dp_size >= 1 and (tp_size * cp_size * ep_size * pp_size * dp_size) == world_size, \
+        "World size must be divisible by tp*cp*ep*pp for inference PG layout"
 
     # Build process group grid with appropriate dimension ordering
     if use_tp_pp_dp_mapping:
@@ -85,16 +85,26 @@ def build_inference_pg_collection(
     dp_cp_group = grid.create_pg(["cp", "dp"])
     tp_dp_cp_group = grid.create_pg(["tp", "cp", "dp"])
 
-    # Create embedding groups
-    embd_group_ranks = mpu.default_embedding_ranks(
-        torch.distributed.get_process_group_ranks(pp_group)
-    )
-    embd_group = torch.distributed.new_group(ranks=embd_group_ranks)
+    # Create embedding groups.
+    # We must iterate over all PP groups (in a deterministic order) and create groups
+    # for each, matching how MCore parallel_state.initialize_model_parallel() does it.
+    rank = torch.distributed.get_rank()
+    embd_group = None
+    pos_embd_group = None
 
-    pos_embd_group_ranks = mpu.default_position_embedding_ranks(
-        torch.distributed.get_process_group_ranks(pp_group)
-    )
-    pos_embd_group = torch.distributed.new_group(ranks=pos_embd_group_ranks)
+    # Recompute the PP rank enumeration deterministically from the grid so that every rank
+    # creates embedding groups in the same order.
+    pp_rank_enum = grid.get_rank_enum("pp")
+    for pp_ranks in pp_rank_enum:
+        embd_ranks = mpu.default_embedding_ranks(pp_ranks)
+        group = torch.distributed.new_group(ranks=embd_ranks)
+        if rank in embd_ranks:
+            embd_group = group
+
+        pos_embd_ranks = mpu.default_position_embedding_ranks(pp_ranks)
+        group = torch.distributed.new_group(ranks=pos_embd_ranks)
+        if rank in pos_embd_ranks:
+            pos_embd_group = group
 
     return ProcessGroupCollection(
         tp=tp_group,
