@@ -174,7 +174,6 @@ def get_inference_context(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
-        paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
@@ -370,7 +369,6 @@ def run_inference(
                 request.time_end = get_curr_time()
                 request.state = "finished"
                 request.request_id = finished_request.request_id
-                request.events = finished_request.events
 
                 # Update prompt, in case engine has been suspended and resumed.
                 request.prompt_tokens = finished_request.prompt_tokens.tolist()
@@ -545,7 +543,7 @@ def main():
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
-            print(f"\n{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
 
             # ---- Group all outputs for this prompt ----
             output_map = defaultdict(list)
