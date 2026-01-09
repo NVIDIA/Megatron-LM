@@ -2077,7 +2077,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
+    from megatron.training.training_config import TrainingConfig
 
     train_factory = ArgumentGroupFactory(TrainingConfig)
     group = train_factory.build_group(parser, "training")
@@ -2373,7 +2373,7 @@ def _add_initialization_args(parser):
 
 
 def _add_learning_rate_args(parser):
-    from megatron.training.config import SchedulerConfig
+    from megatron.training.training_config import SchedulerConfig
 
     sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=["no_weight_decay_cond_type"])
     group = sched_factory.build_group(parser, title="learning rate and weight decay")
@@ -2759,7 +2759,7 @@ def _add_distributed_args(parser):
 
 
 def _add_validation_args(parser):
-    from megatron.training.config import ValidationConfig
+    from megatron.training.training_config import ValidationConfig
 
     val_factory = ArgumentGroupFactory(ValidationConfig)
     group = val_factory.build_group(parser, "validation")
