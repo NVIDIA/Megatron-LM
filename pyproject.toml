@@ -86,6 +86,7 @@ dev = [
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
+    "emerging_optimizers",
 ]
 
 lts = [
@@ -105,6 +106,7 @@ lts = [
     "onnxscript",
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
+    "emerging_optimizers",
 ]
 
 [dependency-groups]
@@ -148,7 +150,6 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-emerging_optimizers = ["emerging_optimizers"]
 no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
 
 [tool.uv]
