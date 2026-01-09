@@ -195,7 +195,10 @@ class MoELayer(BaseMoELayer):
         # Initialize shared experts
         if self.use_shared_expert:
             self.shared_experts = build_module(
-                self.submodules.shared_experts, config=self.config, pg_collection=pg_collection
+                self.submodules.shared_experts,
+                config=self.config,
+                pg_collection=pg_collection,
+                gate=self.config.moe_shared_expert_gate,
             )
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)

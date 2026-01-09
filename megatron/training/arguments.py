@@ -393,6 +393,14 @@ def validate_args(args, defaults={}):
         assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
             "Cannot use both partial-rollouts and remove-kv-cache-during-training"
 
+        assert not (
+            args.rl_offload_inference_model_weights_when_idle
+            and args.rl_inference_model_unified_memory_level != 1
+        ), (
+            "--rl-offload-inference-model-weights-when-idle requires "
+            "--rl-inference-model-unified-memory-level=1."
+        )
+
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -722,6 +730,9 @@ def validate_args(args, defaults={}):
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP"
         assert args.nccl_ub, "FSDP manual registration is only supported with nccl-ub option"
+
+        if args.use_megatron_fsdp:
+            args.reuse_grad_buf_for_mxfp8_param_ag = False
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1251,7 +1262,10 @@ def validate_args(args, defaults={}):
 
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
-        if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
+        if (
+            "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
+            and not args.te_rng_tracker
+        ):
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
         assert (
@@ -1693,6 +1707,8 @@ def _add_network_size_args(parser):
     group.add_argument('--group-query-attention', action='store_true',
                           help='Use group-query attention.')
     group.add_argument('--num-query-groups', type=int, default=1)
+    group.add_argument('--attention-output-gate', action='store_true',
+                       help='Whether to apply output gate to the attention.')
     group.add_argument('--softmax-type', type=str, default='vanilla',
                        choices=['learnable', 'vanilla', 'off-by-one'],
                        help='Type of softmax to use for the attention. Supports both a fixed offset and '
@@ -2097,6 +2113,41 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
+                       help='Degree of tensor model parallelism for inference for RL.')     
+    group.add_argument(
+        '--rl-inference-model-unified-memory-level',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            'Allocate the separate RL inference model parameters from a unified virtual memory (UVM) '
+            'CUDA mempool. Level 0 disables UVM (default). Level 1 enables UVM allocation so the '
+            'inference model weights can be prefetched to CPU when idle while keeping CUDA-graph-safe '
+            'device pointers.'
+        ),
+    )
+    group.add_argument(
+        '--rl-offload-inference-model-weights-when-idle',
+        action=argparse.BooleanOptionalAction,
+        required=False,
+        default=False,
+        help=(
+            'When using a separate RL inference model with UVM-enabled parameters, prefetch its weights '
+            'to CPU when not doing rollout inference, and prefetch back to GPU right before inference. '
+            'Requires --rl-inference-model-unified-memory-level=1.'
+        ),
+    )
+    group.add_argument('--refit-method', type=str, default='gloo',
+                       choices=['nccl', 'gloo'],
+                       help=('Method to refit the model weights between training and inference models during RL. '
+                             'nccl: use NCCLCopyService to refit using NCCL; '
+                             'gloo: use GlooCopyService over CPU; '
+                             ))
+    group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
+                       help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
+                       'the first swap of model weights.')
+
     group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
                         help='Number of parallel generation tasks for RL inference.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
@@ -3172,7 +3223,7 @@ def _add_moe_args(parser):
                             '- A string containing a Python list expression that defines a custom pattern, e.g.: '
                             '"([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
                             'where 1 indicates an expert layer and 0 indicates a dense layer. '
-                            'Examples: "([0]+[1]*23)": 1 dense layer followed by 23 experts layers, '
+                            'Examples: "([0]+[1]*23)": 1 dense layer followed by 23 expert layers, '
                             '"([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.')
     group.add_argument('--moe-ffn-hidden-size', type=int, default=None,
                        help='The hidden size of each expert\'s feed-forward network (ffn). '
@@ -3187,6 +3238,8 @@ def _add_moe_args(parser):
                        'This makes the gradients from the router and the shared experts added in '
                        'different orders to the hidden_states, causing minor numerical differences '
                        'in the hidden_states gradient.')
+    group.add_argument('--moe-shared-expert-gate', action='store_true',
+                       help='Enable gate for shared expert. Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-shared-expert-overlap', action='store_true',
                        help='Enable overlapping between shared expert computations and dispatcher communications. '
                        'Without this, the shared experts execute before the router. '
