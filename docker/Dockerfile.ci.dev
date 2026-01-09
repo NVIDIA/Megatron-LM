@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 # syntax=docker/dockerfile:1.3-labs
 
 ARG FROM_IMAGE_NAME
@@ -60,9 +62,9 @@ RUN bash -ex <<"EOF"
         ln -s libnvshmem_host.so.3 libnvshmem_host.so
     popd
 
-    git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+    git clone --branch hybrid-ep https://github.com/Autumn1998/DeepEP.git
     pushd DeepEP
-        git checkout 1dddd194c26911c35b4f53a148617dd73de0ffc9
+        git checkout df375b40f24e5c495e2db36e808125266661652c
         patch -p1 < /workspace/deepep.patch
     popd
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.
@@ -90,6 +92,6 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
     uv pip install --no-cache-dir --upgrade $LOGGER_INDEX_URL "one-logger"
     uv pip install --no-cache-dir --upgrade "setuptools<80.0.0"
-    uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=3.0" 
+    uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=4.0" 
 EOF
 ###
