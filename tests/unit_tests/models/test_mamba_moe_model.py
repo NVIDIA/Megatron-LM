@@ -277,10 +277,39 @@ def assert_config_matches_golden(cfg: Any) -> None:
     added = [k for k in added if k not in ALLOW_ADDED_FIELDS]
 
     if added or removed or changed:
-        header = (
-            "Mamba MoE config drift detected | "
-            f"added={sorted(added)} | removed={sorted(removed)} | changed={sorted(changed)}"
+        # Build actionable guidance for each type of drift
+        guidance_parts = []
+
+        if added:
+            guidance_parts.append(
+                f"\n\n[ADDED ARGS]: {sorted(added)}\n"
+                "  → Update GOLDEN_CONFIG in this test file to include the new arg(s) with "
+                "their default value(s).\n"
+                "  ⚠️  CAUTION: Review any logic associated with new args to ensure it doesn't "
+                "silently affect downstream model configs or behavior.\n"
+            )
+
+        if changed:
+            guidance_parts.append(
+                f"\n\n[CHANGED DEFAULTS]: {sorted(changed)}\n"
+                "  → Please don't change the default values of existing args unless "
+                "it is absolutely necessary for a bug fix.\n"
+                "  → If you must change the default value, please update the GOLDEN_CONFIG "
+                "in this test file to reflect the new default value.\n"
+            )
+
+        if removed:
+            guidance_parts.append(
+                f"\n\n[REMOVED ARGS]: {sorted(removed)}\n"
+                "  → Do NOT remove args directly. Instead, deprecate them with a warning message "
+                "to maintain backwards compatibility.\n"
+            )
+
+        guidance_parts.append(
+            "Please contact NV-username @jbarker if you are unsure how to proceed.\n"
         )
+
+        header = "Mamba MoE config drift detected!\n" "═" * 60 + "".join(guidance_parts)
         parts = [header]
         if changed:
             formatted = {k: {"expected": golden[k], "actual": current[k]} for k in sorted(changed)}
