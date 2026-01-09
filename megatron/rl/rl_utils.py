@@ -631,8 +631,6 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 )
             model.config.flash_decode = flash_decode
 
-        # RL inference/training models always carry a pg_collection. The pp group may be None,
-        # which is treated as PP=1 (i.e., every rank is the last stage).
         pg_collection = get_attr_wrapped_model(model, "pg_collection")
         pp_group = pg_collection.pp
 
@@ -1141,7 +1139,6 @@ def prepare_data_for_update(
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
             )
 
-            # The model always has a pg_collection. The pp group may be None, which we treat as PP=1.
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
