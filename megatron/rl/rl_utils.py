@@ -634,9 +634,9 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
         # RL inference/training models always carry a pg_collection. The pp group may be None,
         # which is treated as PP=1 (i.e., every rank is the last stage).
         pg_collection = get_attr_wrapped_model(model, "pg_collection")
-        pp_group = getattr(pg_collection, "pp", None)
+        pp_group = pg_collection.pp
 
-        if pp_group is not None and not is_pp_last_stage(pp_group):
+        if not is_pp_last_stage(pp_group):
             return logits_or_hidden_states
         else:
             logits = logits_or_hidden_states
@@ -1143,7 +1143,7 @@ def prepare_data_for_update(
 
             # The model always has a pg_collection. The pp group may be None, which we treat as PP=1.
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
-            pp_group = getattr(pg_collection, "pp", None)
+            pp_group = pg_collection.pp
 
             def _compute_logprobs_batch():
                 """Compute logprobs for all batches in the data loader."""
@@ -1161,10 +1161,10 @@ def prepare_data_for_update(
                         forward_only=True,
                         adjust_tensor_shapes_fn=None,
                     )
-                    if pp_group is None or is_pp_last_stage(pp_group):
+                    if is_pp_last_stage(pp_group):
                         logprobs_list.append(output_tensor[0].detach())
 
-                if pp_group is None or is_pp_last_stage(pp_group):
+                if is_pp_last_stage(pp_group):
                     logprobs = torch.concat(logprobs_list, dim=0)
                     assert logprobs.dtype == dtype
                 else:
@@ -1176,7 +1176,7 @@ def prepare_data_for_update(
                     )
 
                 # Only PP>1 needs a broadcast from the last stage; for PP=1 the output is already local.
-                if pp_group is not None and get_pg_size(pp_group) > 1:
+                if get_pg_size(pp_group) > 1:
                     dist.broadcast(logprobs, src=get_pp_last_rank(pp_group), group=pp_group)
                 return logprobs.cpu()
 
@@ -1676,6 +1676,7 @@ def rl_inference_interface_shutdown():
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_INFERENCE_INTERFACE.kill())
+        _INFERENCE_INTERFACE = None
     else:
         logger.warning("No inference interface to shutdown. This should not happen.")
 

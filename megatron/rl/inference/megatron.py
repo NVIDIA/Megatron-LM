@@ -81,7 +81,7 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
 
     inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
-    pp_group = getattr(pg_collection, "pp", None)
+    pp_group = pg_collection.pp
     text_generation_controller = SimpleTextGenerationController(
         inference_wrapped_model=inference_wrapped_model,
         tokenizer=tokenizer,

@@ -229,7 +229,6 @@ def _resolve_global_layer_number_in_name(name: str, module: torch.nn.Module) -> 
         prefix_map = _build_layer_module_prefix_map(module)
         setattr(module, '_reshard_layer_module_prefix_map', prefix_map)
 
-    # TODO(Peter): Do we need a fallback here?
     if not prefix_map:
         return name
 

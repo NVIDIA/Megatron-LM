@@ -302,20 +302,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         if tensor_model_parallel_size is None:
-            if pg_collection is not None and getattr(pg_collection, "tp", None) is not None:
-                tp_size = get_pg_size(pg_collection.tp)
-            else:
-                tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            tp_size = (
+                get_pg_size(pg_collection.tp)
+                if pg_collection is not None
+                else parallel_state.get_tensor_model_parallel_world_size()
+            )
         else:
             tp_size = tensor_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
         if pipeline_model_parallel_size is None:
-            if pg_collection is not None and getattr(pg_collection, "pp", None) is not None:
-                pp_size = get_pg_size(pg_collection.pp)
-            else:
-                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+            pp_size = (
+                get_pg_size(pg_collection.pp)
+                if pg_collection is not None
+                else parallel_state.get_pipeline_model_parallel_world_size()
+            )
         else:
             pp_size = pipeline_model_parallel_size
 
@@ -324,7 +326,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Otherwise:
         # - for PP=1 we don't need a PP group at all
         # - for PP>1 we require Megatron parallel_state to be initialized
-        if pg_collection is not None and getattr(pg_collection, "pp", None) is not None:
+        if pg_collection is not None and get_pg_size(pg_collection.pp) > 1:
             self.pipeline_parallel_group = pg_collection.pp
         elif pp_size > 1:
             self.pipeline_parallel_group = parallel_state.get_pipeline_model_parallel_group()

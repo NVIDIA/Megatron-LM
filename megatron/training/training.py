@@ -874,7 +874,9 @@ def pretrain(
         prefix = f'iteration {iteration} on validation set'
         if getattr(args, 'perform_rl_step', False):
             rl_utils.evaluate_and_print_results_rl(
-                valid_data_iterator, model, optimizer,
+                valid_data_iterator,
+                inference_model if inference_model is not None else model,
+                optimizer,
                 iteration, write_to_tensorboard=not args.skip_train
             )
         else:
@@ -2609,7 +2611,10 @@ def train(
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
             if getattr(args, 'perform_rl_step', False):
-                rl_utils.evaluate_and_print_results_rl(valid_data_iterator, model, optimizer,
+                rl_utils.evaluate_and_print_results_rl(
+                    valid_data_iterator,
+                    inference_model if inference_model is not None else model,
+                    optimizer,
                                        iteration, write_to_tensorboard=True)
             else:
                 evaluate_and_print_results(prefix, forward_step_func,
