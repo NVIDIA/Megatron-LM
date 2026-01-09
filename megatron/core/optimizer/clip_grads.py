@@ -55,19 +55,22 @@ def get_grad_norm_fp32(
 ) -> float:
     """Calculate the p-norm of gradients in FP32 precision.
 
-    This function handles model-parallel parameters and ensures that norms are 
-    properly reduced across the specified process group.
+    This function is adapted from `torch.nn.utils.clip_grad.clip_grad_norm_` 
+    and extends it with functionality to handle model-parallel parameters. 
+    It ensures that the norm is correctly computed and reduced across 
+    the specified process group (typically the model-parallel group for 
+    non-distributed optimizers or the entire world for distributed optimizers).
 
     Args:
-        grads_for_norm (Union[List[torch.Tensor], torch.Tensor]): Gradient tensors 
-            to be used for calculating the norm.
-        norm_type (Union[int, float]): Type of the used p-norm. Can be 'inf' 
-            for infinity norm. Defaults to 2.
-        grad_stats_parallel_group (ProcessGroup, optional): Process group for 
-            reducing the grad norms.
+        grads_for_norm (Union[List[torch.Tensor], torch.Tensor]): An iterable 
+            of Tensors or a single Tensor used to calculate the gradient norm.
+        norm_type (Union[int, float]): The type of the p-norm to use. Can be 
+            'inf' for infinity norm. Defaults to 2.
+        grad_stats_parallel_group (ProcessGroup, optional): The process group 
+            used for reducing gradient statistics (e.g., norms and zero counts).
 
     Returns:
-        float: Total norm of the parameters (viewed as a single vector).
+        float: The total norm of the parameters, treated as a single vector.
     """
 
     if isinstance(grads_for_norm, torch.Tensor):
@@ -178,18 +181,25 @@ def count_zeros_fp32(
     grad_stats_parallel_group: torch.distributed.ProcessGroup,
     use_decoupled_grad: bool = False,
 ) -> float:
-    """Counts the number of zeros in gradients associated with the passed-in list of
-    parameters.
+    """Counts the number of zero values in the gradients of the given parameters.
+
+    The count is performed in FP32. This method filters parameters to ensure 
+    gradients are not double-counted by checking if the gradient is not None, 
+    the parameter is not shared, and the parameter is not a replica due 
+    to tensor model parallelism. It also handles parameters managed by 
+    Megatron FSDP specifically.
 
     Args:
-        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
-            single Tensor that will have the number of zeros in its corresponding
-            gradient counted.
-        grad_stats_parallel_group (group): Process group for reducing the num_zeros count. This is
-            generally the model-parallel group for non-distributed optimizers, and the entire
-            world for the distributed optimizer.
-        use_decoupled_grad (bool, optional) whether to read grad from ".grad" or ".decoupled_grad",
-            default value is False.
+        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of 
+            Tensors or a single Tensor whose gradients will be checked for zeros.
+        grad_stats_parallel_group (ProcessGroup): The process group used for 
+            reducing the zero count across distributed ranks.
+        use_decoupled_grad (bool, optional): If True, reads from the 
+            '.decoupled_grad' attribute instead of the standard '.grad'. 
+            Defaults to False.
+
+    Returns:
+        float: The total number of zeros in the gradients across the process group.
     """
 
     if isinstance(parameters, torch.Tensor):

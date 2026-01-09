@@ -121,27 +121,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         Build mapping from param reference to grad buffer shard ranges.
 
-        This method builds a mapping from parameter references to grad
-        buffer shard ranges, specific to each data-parallel (DP) rank's
-        set of 'owned' parameters. Each grad buffer (padded to be an even
-        multiple of DP-world-size) is conceptually divided into DP-world-size
-        contiguous regions, where each DP rank 'owns' a contiguous region.
-        Ownership in this sense means DP rank is responsible for reducing
-        the relevant subset of grads, and updating the relevant subset of
-        params.
-
-        This conceptual partitioning of the grad buffer does NOT respect
-        parameter boundaries, and as such it is assumed that each created
-        range references a shard (or subset) of the full parameter. It is
-        easiest to think of each DP rank as operating (i.e., reducing,
-        gathering) purely on views into the grad buffer, for all model-to-
-        main & main-to-model operations.
-
-        This method creates four ranges:
-        - The param's range within the entire grad buffer (i.e., world index).
-        - The param's range within the relevant grad bucket's buffer.
-        - The param's range within the DP rank's local view of the grad buffer.
-        - The param's range within itself (i.e., its shard).
+        Each grad buffer is conceptually divided into DP-world-size contiguous 
+        regions, where each DP rank 'owns' a region. This method creates 
+        mappings for four specific ranges:
+            - The param's range within the entire grad buffer (world index).
+            - The param's range within the relevant grad bucket's buffer.
+            - The param's range within the DP rank's local view of the grad buffer.
+            - The param's range within itself (its shard).
         """
 
         # Param range map.
@@ -470,23 +456,36 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_group_idx: int,
         distributed_optimizer_instance_id: int,
     ):
-        """
-        Initializes the distributed optimizer for FP16, BF16, and FP32.
+        """Initializes the distributed optimizer for FP16, BF16, and FP32.
 
-        This method establishes the core mapping between parameter/gradient buffers, 
-        individual parameters, and shard ranges.
+        The steps in this method create the core mapping between param and grad 
+        buffers, parameters, and parameter shard ranges, that is needed for 
+        converting between model param indexes and main parameter shard indexes. 
+        This method also updates the optimizer parameter groups with the 
+        newly created shards.
 
         Args:
-            optimizer (torch.optim.Optimizer): The base optimizer (e.g., Adam).
+            optimizer (torch.optim.Optimizer): Base optimizer such as Adam or SGD.
             config (OptimizerConfig): Configuration object for the optimizer.
-            grad_scaler (MegatronGradScaler): Scaler for gradient values.
-            init_state_fn (Callable, optional): Function to initialize state.
-            model_chunks (List[MegatronModule]): List of model segments to optimize.
-            per_model_buffers (Dict): Buffers managing contiguous gradients and parameters.
-            data_parallel_group (ProcessGroup): Group used to all-gather parameters.
-            data_parallel_group_gloo (ProcessGroup, optional): Gloo group for checkpointing.
-            data_parallel_group_idx (int): Global index within the data-parallel group.
-            distributed_optimizer_instance_id (int): Unique identifier for this instance.
+            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that 
+                this can be None for BF16 training if no loss scale is used. 
+                For FP16, a grad scaler is always required.
+            init_state_fn (Callable, optional): Function to initialize state in 
+                the optimizer.
+            model_chunks (List[MegatronModule]): List of model chunks to optimize.
+            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The 
+                implementation of the distributed optimizer is centered on using 
+                a contiguous buffer for communicating grads & params between 
+                the model state and the optimizer state. For a detailed 
+                description, see `docs/source/distrib_optimizer.md`.
+            data_parallel_group (ProcessGroup): Data-parallel group used to 
+                all-gather params after optimizer.step().
+            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel 
+                group used specifically for checkpoint loading and saving.
+            data_parallel_group_idx (int): Index in the data-parallel group 
+                used by distributed checkpointing logic.
+            distributed_optimizer_instance_id (int): Unique identifier for the 
+                distributed optimizer instance.
         """
 
         if has_config_logger_enabled(config):

@@ -59,20 +59,26 @@ class ConstantGradScaler(MegatronGradScaler):
 
 
 class DynamicGradScaler(MegatronGradScaler):
-    """
-    Grad scaler that dynamically adjusts the scale factor during training.
+    """Gradient scaler with a dynamic scale factor adjusted during training.
 
-    Reduces the loss scale if consecutive iterations produce non-finite gradients 
-    (NaN/Inf). Increases the loss scale if gradients remain finite for a 
-    specified interval.
+    This class implements a loss scaling strategy to prevent numerical underflow 
+    during mixed-precision training. It reduces the loss scale by a 
+    `backoff_factor` if a `hysteresis` number of NaNs/Infs are detected in 
+    consecutive iterations. Conversely, it increases the loss scale by a 
+    `growth_factor` if no non-finite gradients are seen for a specified 
+    `growth_interval` of iterations.
 
     Args:
-        initial_scale (float): Initial loss scale value.
-        min_scale (float): Minimum permissible loss scale.
-        growth_factor (float): Multiplier for increasing the scale. Must be > 1.
-        backoff_factor (float): Multiplier for decreasing the scale. Must be < 1.
-        growth_interval (int): Iterations without NaNs before increasing scale.
-        hysteresis (int): Consecutive iterations with NaNs before decreasing scale.
+        initial_scale (float): The starting value for the loss scale.
+        min_scale (float): The lower bound for the loss scale.
+        growth_factor (float): The multiplier used to increase the scale when 
+            gradients are stable. Must be greater than 1.0.
+        backoff_factor (float): The multiplier used to decrease the scale when 
+            non-finite gradients are detected. Must be between 0.0 and 1.0.
+        growth_interval (int): The number of consecutive stable iterations 
+            required before increasing the scale.
+        hysteresis (int): The number of consecutive non-finite iterations 
+            required before decreasing the scale.
     """
 
     def __init__(
