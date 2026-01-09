@@ -1,3 +1,6 @@
+#!/bin/bash
+set -e
+
 MLM_MODEL_CFG=$1
 
 # Bash coloring
@@ -78,7 +81,7 @@ if [ -z ${LAUNCH_SCRIPT} ]; then
     LAUNCH_SCRIPT="torchrun --nproc_per_node=$((ETP * EP * PP * CP * DP))"
 fi
 
-# Install TensorRT Model Optimizer if haven't.
+# Install Model Optimizer if haven't.
 if [ -z ${MLM_SKIP_INSTALL} ]; then
     pip install -r ${SCRIPT_DIR}/requirements.txt
 fi
