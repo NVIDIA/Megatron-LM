@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
 from dataclasses import dataclass, field
@@ -96,7 +96,6 @@ class OptimizerConfig:
     ##############
     # General
     ##############
-
     lr: Optional[float] = None
     """Initial learning rate. Depending on decay style and initial warmup, the learning rate at each
        iteration would be different.
@@ -197,6 +196,32 @@ class OptimizerConfig:
     # SGD.
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
+
+    # Muon
+    muon_momentum: float = 0.95
+    """The momentum used by the internal SGD."""
+
+    muon_split_qkv: bool = True
+    """Whether to split QKV parameters for Muon optimizer."""
+
+    muon_use_nesterov: bool = False
+    """Whether to use Nesterov-style momentum in the internal SGD."""
+
+    muon_scale_mode: str = "spectral"
+    """The mode to use for the scale factor. Defaults to "spectral"."""
+
+    muon_fp32_matmul_prec: str = "medium"
+    """The precision to use for the fp32 matmul. Defaults to "medium"."""
+
+    muon_num_ns_steps: int = 5
+    """The number of iteration steps to use in the Newton-Schulz iteration."""
+
+    muon_tp_mode: str = "blockwise"
+    """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
+
+    muon_extra_scale_factor: float = 1.0
+    """Additional scale factor for the muon update."""
+
 
     #######################
     # Distributed optimizer
@@ -341,6 +366,38 @@ class OptimizerConfig:
             assert (
                 self.exp_avg_sq_dtype == torch.float32
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
+
+
+@dataclass
+class MuonOptimizerConfig(OptimizerConfig):
+    """Muon optimizer configuration object."""
+
+    optimizer: str = 'muon'
+    """Optimizer name."""
+
+    muon_momentum: float = 0.95
+    """The momentum used by the internal SGD."""
+
+    muon_split_qkv: bool = True
+    """Whether to split QKV parameters for Muon optimizer."""
+
+    muon_use_nesterov: bool = False
+    """Whether to use Nesterov-style momentum in the internal SGD."""
+
+    muon_scale_mode: str = "spectral"
+    """The mode to use for the scale factor. Defaults to "spectral"."""
+
+    muon_fp32_matmul_prec: str = "medium"
+    """The precision to use for the fp32 matmul. Defaults to "medium"."""
+
+    muon_num_ns_steps: int = 5
+    """The number of iteration steps to use in the Newton-Schulz iteration."""
+
+    muon_tp_mode: str = "blockwise"
+    """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
+
+    muon_extra_scale_factor: float = 1.0
+    """Additional scale factor for the muon update."""
 
 
 @dataclass
