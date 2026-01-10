@@ -80,6 +80,33 @@ def make_viewless(e):
     return e
 
 
+def set_ideal_affinity_for_current_gpu():
+    """Set CPU affinity for the current GPU to optimize host-device transfers."""
+    import uuid
+
+    try:
+        import cuda.bindings.driver as cuda_driver
+        import cuda.bindings.runtime as cuda_runtime
+    except:
+        try:
+            import cuda.cuda as cuda_driver
+            import cuda.cudart as cuda_runtime
+        except:
+            raise RuntimeError("Please install cuda-python to enable GPU affinity setting")
+    import pynvml
+
+    # Get current CUDA device ID
+    err, device_id = cuda_runtime.cudaGetDevice()
+    assert err == cuda_runtime.cudaError_t.cudaSuccess
+    # Get device UUID
+    err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id)
+    assert err == cuda_driver.CUresult.CUDA_SUCCESS
+    # Set CPU affinity based on GPU's NUMA node
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
+    pynvml.nvmlDeviceSetCpuAffinity(handle)
+
+
 @contextmanager
 def stream_acquire_context(stream, event):
     """Stream acquire context"""
