@@ -1815,7 +1815,7 @@ def _add_network_size_args(parser):
 
 
 def _add_straggler_detector_args(parser):
-    from megatron.training.config import StragglerDetectionConfig
+    from megatron.training.resilience_config import StragglerDetectionConfig
 
     straggler_factory = ArgumentGroupFactory(StragglerDetectionConfig)
     group = straggler_factory.build_group(parser, "straggler")
