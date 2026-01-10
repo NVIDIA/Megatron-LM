@@ -334,7 +334,7 @@ Megatron-FSDP natively supports mixed-precision activations and parameter shardi
 - Within the [`transformer_engine.pytorch.quantized_model_init(recipe: transformer_engine.common.recipe.Recipe)`](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.quantized_model_init) context, TransformerEngine native modules (e.g. [`transformer_engine.pytorch.TransformerLayer`](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.TransformerLayer)) have their parameters converted based on the recipe.
     - Requires FP8 model activations, i.e. `transformer_engine.pytorch.autocast`.
 
-```
+```python
 # FP8 Recipe
 fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
     fp8_format=transformer_engine.common.recipe.Format.HYBRID,
