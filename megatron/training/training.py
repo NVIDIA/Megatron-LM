@@ -723,19 +723,30 @@ def pretrain(
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
-        if args.rl_inference_tensor_model_parallel_size is not None:
+        if (
+            args.rl_inference_tensor_model_parallel_size is not None
+            or args.rl_inference_pipeline_model_parallel_size is not None
+        ):
             print_rank_0(
-                f"Setting tensor model parallel size to {args.rl_inference_tensor_model_parallel_size} for inference model"
+                "Building separate RL inference model with custom parallelism: "
+                f"TP={args.rl_inference_tensor_model_parallel_size}, "
+                f"PP={args.rl_inference_pipeline_model_parallel_size}"
             )
             inference_pg_collection = build_inference_pg_collection(
+                args.world_size,
                 tp_size=args.rl_inference_tensor_model_parallel_size,
-                world_size=args.world_size,
+                pp_size=args.rl_inference_pipeline_model_parallel_size,
                 use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
             )
 
             # Build an isolated inference config so training config remains unchanged
             inference_config = copy.deepcopy(config)
-            inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
+            if args.rl_inference_tensor_model_parallel_size is not None:
+                inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
+            if args.rl_inference_pipeline_model_parallel_size is not None:
+                inference_config.pipeline_model_parallel_size = (
+                    args.rl_inference_pipeline_model_parallel_size
+                )
 
             # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
             # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
@@ -863,7 +874,9 @@ def pretrain(
         prefix = f'iteration {iteration} on validation set'
         if getattr(args, 'perform_rl_step', False):
             rl_utils.evaluate_and_print_results_rl(
-                valid_data_iterator, model, optimizer,
+                valid_data_iterator,
+                inference_model if inference_model is not None else model,
+                optimizer,
                 iteration, write_to_tensorboard=not args.skip_train
             )
         else:
@@ -2598,7 +2611,10 @@ def train(
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
             if getattr(args, 'perform_rl_step', False):
-                rl_utils.evaluate_and_print_results_rl(valid_data_iterator, model, optimizer,
+                rl_utils.evaluate_and_print_results_rl(
+                    valid_data_iterator,
+                    inference_model if inference_model is not None else model,
+                    optimizer,
                                        iteration, write_to_tensorboard=True)
             else:
                 evaluate_and_print_results(prefix, forward_step_func,

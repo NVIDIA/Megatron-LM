@@ -226,11 +226,15 @@ def build_centralized_reshard_plan(
     my_dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
 
     my_src_metadata = [
-        extract_param_metadata(p, name, my_global_rank, src_pg, num_experts=num_experts)
+        extract_param_metadata(
+            p, name, my_global_rank, src_pg, num_experts=num_experts, module=src_module
+        )
         for name, p in my_src_params.items()
     ]
     my_dst_metadata = [
-        extract_param_metadata(p, name, my_global_rank, dst_pg, num_experts=num_experts)
+        extract_param_metadata(
+            p, name, my_global_rank, dst_pg, num_experts=num_experts, module=dst_module
+        )
         for name, p in my_dst_params.items()
     ]
 

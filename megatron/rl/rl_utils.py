@@ -27,14 +27,8 @@ from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.optimizer import MegatronOptimizer
-from megatron.core.parallel_state import (
-    get_pipeline_model_parallel_group,
-    get_pipeline_model_parallel_last_rank,
-    get_tensor_model_parallel_src_rank,
-    get_tensor_model_parallel_world_size,
-    is_pipeline_last_stage,
-)
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
@@ -89,6 +83,7 @@ from wandb import wandb_run
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -636,7 +631,10 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 )
             model.config.flash_decode = flash_decode
 
-        if not is_pipeline_last_stage():
+        pg_collection = get_attr_wrapped_model(model, "pg_collection")
+        pp_group = pg_collection.pp
+
+        if not is_pp_last_stage(pp_group):
             return logits_or_hidden_states
         else:
             logits = logits_or_hidden_states
@@ -1141,6 +1139,9 @@ def prepare_data_for_update(
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
             )
 
+            pg_collection = get_attr_wrapped_model(model, "pg_collection")
+            pp_group = pg_collection.pp
+
             def _compute_logprobs_batch():
                 """Compute logprobs for all batches in the data loader."""
                 logprobs_list = []
@@ -1157,10 +1158,10 @@ def prepare_data_for_update(
                         forward_only=True,
                         adjust_tensor_shapes_fn=None,
                     )
-                    if is_pipeline_last_stage():
+                    if is_pp_last_stage(pp_group):
                         logprobs_list.append(output_tensor[0].detach())
 
-                if is_pipeline_last_stage():
+                if is_pp_last_stage(pp_group):
                     logprobs = torch.concat(logprobs_list, dim=0)
                     assert logprobs.dtype == dtype
                 else:
@@ -1171,11 +1172,9 @@ def prepare_data_for_update(
                         device=torch.cuda.current_device(),
                     )
 
-                dist.broadcast(
-                    logprobs,
-                    src=get_pipeline_model_parallel_last_rank(),
-                    group=get_pipeline_model_parallel_group(),
-                )
+                # Only PP>1 needs a broadcast from the last stage; for PP=1 the output is already local.
+                if get_pg_size(pp_group) > 1:
+                    dist.broadcast(logprobs, src=get_pp_last_rank(pp_group), group=pp_group)
                 return logprobs.cpu()
 
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
@@ -1671,9 +1670,11 @@ def megatron_rl_inference_mode(
 
 
 def rl_inference_interface_shutdown():
+    global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_INFERENCE_INTERFACE.kill())
+        _INFERENCE_INTERFACE = None
     else:
         logger.warning("No inference interface to shutdown. This should not happen.")
 
