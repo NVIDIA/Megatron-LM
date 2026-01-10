@@ -233,25 +233,27 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     Args:
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
     """
+    train_ds, valid_ds, test_ds = None, None, None
     args = get_args()
+    if not args.dataloader_fast_cache_load or is_dataset_built_on_rank(vp_stage=vp_stage):
 
-    config = core_gpt_dataset_config_from_args(args)
+        config = core_gpt_dataset_config_from_args(args)
 
-    if args.sft:
-        dataset_type = SFTDataset
-    else:
-        if args.mock_data:
-            dataset_type = MockGPTDataset
-        elif args.fim_data:
-            dataset_type = GPTFIMDataset
+        if args.sft:
+            dataset_type = SFTDataset
         else:
-            dataset_type = GPTDataset
+            if args.mock_data:
+                dataset_type = MockGPTDataset
+            elif args.fim_data:
+                dataset_type = GPTFIMDataset
+            else:
+                dataset_type = GPTDataset
 
-    print_rank_0("> building train, validation, and test datasets for GPT ...")
+        print_rank_0("> building train, validation, and test datasets for GPT ...")
 
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
-    ).build()
+        train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+            dataset_type, train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
+        ).build()
 
     print_rank_0("> finished creating GPT datasets ...")
 
