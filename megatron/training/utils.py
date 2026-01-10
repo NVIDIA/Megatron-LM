@@ -282,6 +282,7 @@ def report_memory(name):
     string += ' | max allocated: {}'.format(torch.cuda.max_memory_allocated() / mega_bytes)
     string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
     string += ' | max reserved: {}'.format(torch.cuda.max_memory_reserved() / mega_bytes)
+    string += ' | device usage: {}'.format(torch.cuda.device_memory_used() / mega_bytes)
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
