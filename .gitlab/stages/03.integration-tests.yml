@@ -43,6 +43,7 @@ integration:configure:
     - |
       A100_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo $CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
       H100_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo $CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+      GB200_CLUSTER=$([[ "$CLUSTER_GB200" != "" ]] && echo $CLUSTER_GB200 || echo $DEFAULT_GB200_CLUSTER)
     - |
       ARGS=(
         "--scope $INTEGRATION_TEST_SCOPE"
@@ -88,12 +89,30 @@ integration:configure:
         --platform dgx_h100 \
         --cluster $H100_CLUSTER \
         --output-path "functional-test-job-lts-H100.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_gb2100 \
+        --cluster $GB200_CLUSTER \
+        --output-path "functional-test-job-lts-GB200.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_gb200 \
+        --cluster $GB200_CLUSTER \
+        --output-path "functional-test-job-lts-GB200.yaml"
   artifacts:
     paths:
       - functional-test-job-lts-A100.yaml
       - functional-test-job-lts-H100.yaml
       - functional-test-job-dev-H100.yaml
       - functional-test-job-dev-A100.yaml
+      - functional-test-job-lts-GB200.yaml
+      - functional-test-job-dev-GB200.yaml
       - tests/test_utils/local_recipes
 
 .integration_run:
@@ -132,6 +151,12 @@ integration:run_lts_dgx_h100:
     ENVIRONMENT: lts
     CLUSTER: H100
 
+integration:run_lts_dgx_gb200:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: GB200
+
 integration:run_dev_dgx_a100:
   extends: [.integration_run]
   variables:
@@ -143,3 +168,9 @@ integration:run_dev_dgx_h100:
   variables:
     ENVIRONMENT: dev
     CLUSTER: H100
+
+integration:run_dev_dgx_gb200:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: GB200
