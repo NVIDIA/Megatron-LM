@@ -145,10 +145,14 @@ class TransformerConfig(ModelParallelConfig):
     apply_residual_connection_post_layernorm: bool = False
     """If True, uses the original BERT residule connection ordering."""
 
-    layernorm_epsilon: float = 1e-5
-    """Epsilon value for any LayerNorm operations."""
+    layernorm_epsilon: float = field(
+        default=1e-5, metadata={"argparse_meta": {"arg_names": ["--norm-epsilon"]}}
+    )
+    """Epsilon value for any LayerNorm/RMSNorm operations."""
 
-    layernorm_zero_centered_gamma: bool = False
+    layernorm_zero_centered_gamma: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--apply-layernorm-1p"]}}
+    )
     """If set to True, the LayerNorm is adjusted to center the gamma values around 0. This improves
     numerical stability."""
 
