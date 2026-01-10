@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 import contextlib
 import math
 from typing import Optional
@@ -164,7 +166,6 @@ def test_bucket_sizes(
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 @pytest.mark.parametrize("average_in_collective", [False, True])
 @pytest.mark.parametrize("num_distributed_optimizer_instances", [1, 2])
-# @pytest.mark.flaky
 def test_grad_sync(
     use_distributed_optimizer: bool,
     overlap_grad_reduce: bool,
@@ -216,36 +217,44 @@ def test_grad_sync(
         expected_grad_data_value_after_collective /= parallel_state.get_data_parallel_world_size()
 
     params = list(model.parameters())
-    for i, param in enumerate(params):
-        assert param in param_to_bucket_group
-        bucket_group = param_to_bucket_group[param]
-        register_grad_sync_context = (
-            contextlib.nullcontext() if overlap_grad_reduce else pytest.raises(AssertionError)
-        )
-        finish_grad_sync_context = contextlib.nullcontext()
-        if (
-            i < (len(params) - 1)
-            and overlap_grad_reduce
-            and num_distributed_optimizer_instances == 1
-        ):
-            # Can't finish grad sync until all params have been registered ready.
-            finish_grad_sync_context = pytest.raises(AssertionError)
+    for iteration in range(2):
+        for i, param in enumerate(params):
+            assert param in param_to_bucket_group
+            bucket_group = param_to_bucket_group[param]
+            register_grad_sync_context = (
+                contextlib.nullcontext() if overlap_grad_reduce else pytest.raises(AssertionError)
+            )
+            finish_grad_sync_context = contextlib.nullcontext()
+            if (
+                i < (len(params) - 1)
+                and overlap_grad_reduce
+                and num_distributed_optimizer_instances == 1
+            ):
+                # Can't finish grad sync until all params have been registered ready.
+                finish_grad_sync_context = pytest.raises(AssertionError)
 
-        with register_grad_sync_context:
-            bucket_group.register_grad_ready(param)
-        with finish_grad_sync_context:
-            # When overlap_grad_reduce is True, this should throw an assertion error until all
-            # params in the model have registered their grad above.
-            # When overlap_grad_reduce is False, the collective is forced through.
-            bucket_group.finish_grad_sync()
+            with register_grad_sync_context:
+                bucket_group.register_grad_ready(param)
+            # Don't call finish_grad_sync() multiple times in the first iteration when
+            # golden_per_param_grad_ready_counts is being populated.
+            if iteration == 0 and i < (len(params) - 1):
+                continue
+            with finish_grad_sync_context:
+                # When overlap_grad_reduce is True, this should throw an assertion error until all
+                # params in the model have registered their grad above.
+                # When overlap_grad_reduce is False, the collective is forced through.
+                bucket_group.finish_grad_sync()
 
-        expected_grad_data_value = expected_grad_data_value_after_collective
-        if overlap_grad_reduce and i < (len(params) - 1):
-            expected_grad_data_value = 1
-        assert param_and_grad_buffer.grad_data[0] == expected_grad_data_value
+            expected_grad_data_value = expected_grad_data_value_after_collective
+            if overlap_grad_reduce and i < (len(params) - 1):
+                expected_grad_data_value = 1
+            assert param_and_grad_buffer.grad_data[0] == expected_grad_data_value
 
-        if not overlap_grad_reduce:
-            # Reset grad_data for subsequent collectives.
-            param_and_grad_buffer.grad_data.data.fill_(1.0)
+            if not overlap_grad_reduce:
+                # Reset grad_data for subsequent collectives.
+                param_and_grad_buffer.grad_data.data.fill_(1.0)
+
+        # Call reset to set .is_first_batch to False.
+        bucket_group.reset()
 
     Utils.destroy_model_parallel()
