@@ -38,7 +38,7 @@ from .combined_1f1b import (
 Shape = Union[List[int], torch.Size]
 
 
-def get_forward_backward_func():
+def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
 
@@ -121,10 +121,18 @@ def get_forward_backward_func():
         respective list of shapes. Thus it is not used in the other forward-backward functions
         which have different shape handling.
 
+    Args:
+        pp_size (Optional[int]): Pipeline model parallel size to use.
+        vp_size (Optional[int]): Virtual pipeline model parallel size to use.
+            If both pp_size and vp_size are None, both values fall back to parallel_state.
+            Otherwise, provided values are used as-is and None is treated as an explicit input.
     """
-    pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
-    if pipeline_model_parallel_size > 1:
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+    if pp_size is None and vp_size is None:
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+    if pp_size > 1:
+        if vp_size is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
         else:
             forward_backward_func = forward_backward_pipelining_without_interleaving
@@ -510,6 +518,7 @@ def forward_backward_no_pipelining(
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
+    p2p_communicator: Optional[P2PCommunicator] = None,  # unused
     pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
