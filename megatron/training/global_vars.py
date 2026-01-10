@@ -22,6 +22,12 @@ _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
+_GLOBAL_MODEL = None
+_GLOBAL_OPTIMIZER = None
+_GLOBAL_OPT_PARAM_SCHEDULER = None
+_GLOBAL_TRAIN_DATA_ITERATOR = None
+_GLOBAL_VALID_DATA_ITERATOR = None
+_GLOBAL_TEST_DATA_ITERATOR = None
 
 def get_args():
     """Return arguments."""
@@ -147,6 +153,32 @@ def unset_global_variables():
 def set_args(args):
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = args
+
+
+def set_model(model):
+    """Set model."""
+    global _GLOBAL_MODEL
+    _GLOBAL_MODEL = model
+
+
+def set_optimizer(optimizer):
+    """Set optimizer."""
+    global _GLOBAL_OPTIMIZER
+    _GLOBAL_OPTIMIZER = optimizer
+
+
+def set_opt_param_scheduler(opt_param_scheduler):
+    """Set learning rate scheduler."""
+    global _GLOBAL_OPT_PARAM_SCHEDULER
+    _GLOBAL_OPT_PARAM_SCHEDULER = opt_param_scheduler
+
+
+def set_data_iterators(train_data_iterator, valid_data_iterator, test_data_iterator):
+    """Set data iterators."""
+    global _GLOBAL_TRAIN_DATA_ITERATOR, _GLOBAL_VALID_DATA_ITERATOR, _GLOBAL_TEST_DATA_ITERATOR
+    _GLOBAL_TRAIN_DATA_ITERATOR = train_data_iterator
+    _GLOBAL_VALID_DATA_ITERATOR = valid_data_iterator
+    _GLOBAL_TEST_DATA_ITERATOR = test_data_iterator
 
 
 def _build_tokenizer(args):
@@ -306,3 +338,32 @@ def destroy_global_vars():
 
     global _GLOBAL_SIGNAL_HANDLER
     _GLOBAL_SIGNAL_HANDLER = None
+
+    global _GLOBAL_MODEL
+    global _GLOBAL_OPTIMIZER
+    global _GLOBAL_OPT_PARAM_SCHEDULER
+    global _GLOBAL_TRAIN_DATA_ITERATOR
+    global _GLOBAL_VALID_DATA_ITERATOR
+    global _GLOBAL_TEST_DATA_ITERATOR
+
+    # Explicitly delete model, optimizer, and data iterators to free GPU memory
+    # Check if not None before deleting to avoid errors
+    if _GLOBAL_MODEL is not None:
+        del _GLOBAL_MODEL
+    if _GLOBAL_OPTIMIZER is not None:
+        del _GLOBAL_OPTIMIZER
+    if _GLOBAL_OPT_PARAM_SCHEDULER is not None:
+        del _GLOBAL_OPT_PARAM_SCHEDULER
+    if _GLOBAL_TRAIN_DATA_ITERATOR is not None:
+        del _GLOBAL_TRAIN_DATA_ITERATOR
+    if _GLOBAL_VALID_DATA_ITERATOR is not None:
+        del _GLOBAL_VALID_DATA_ITERATOR
+    if _GLOBAL_TEST_DATA_ITERATOR is not None:
+        del _GLOBAL_TEST_DATA_ITERATOR
+
+    _GLOBAL_MODEL = None
+    _GLOBAL_OPTIMIZER = None
+    _GLOBAL_OPT_PARAM_SCHEDULER = None
+    _GLOBAL_TRAIN_DATA_ITERATOR = None
+    _GLOBAL_VALID_DATA_ITERATOR = None
+    _GLOBAL_TEST_DATA_ITERATOR = None
