@@ -93,6 +93,6 @@ class InferenceInterfaceServer(InferenceInterfaceClient, ReturnsRaw, ReturnsToke
         if isinstance(self._inference_interface, InferenceServer):
             await self._inference_interface.suspend()
 
-    def resume(self):
+    async def resume(self):
         if isinstance(self._inference_interface, InferenceServer):
-            self._inference_interface.resume()
+            await self._inference_interface.resume()
