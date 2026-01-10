@@ -24,6 +24,13 @@ from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGl
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import nvshmem.core
+
+    has_nvshmem = True
+except Exception:
+    has_nvshmem = False
+
 
 def _build_pg_collection(
     tp_size: int, pp_size: int = None, ep_size: int = 1
@@ -116,7 +123,20 @@ def _set_pg_collection(module, tp_group, dp_group):
     return module
 
 
-@pytest.mark.parametrize("refit_backend", ["nccl", "gloo"])
+@pytest.mark.parametrize(
+    "refit_backend",
+    [
+        pytest.param(
+            "nvshmem",
+            marks=pytest.mark.skipif(
+                not has_nvshmem,
+                reason="nvshmem.core is not available (NVSHMEM Python bindings not installed)",
+            ),
+        ),
+        "nccl",
+        "gloo",
+    ],
+)
 @pytest.mark.parametrize(
     "src_tp,src_pp,src_ep,dst_tp,dst_pp,dst_ep,num_experts",
     [
