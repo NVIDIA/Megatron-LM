@@ -186,7 +186,7 @@ class TestLayerWiseOptimizer:
             for name, param in model[0].named_parameters():
                 assert torch.allclose(param.data, original_params[name])
 
-    #TODO(@boxiangw): add PP=4 back and fix the test
+    # TODO(@boxiangw): add PP=4 back and fix the test
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2])
     @pytest.mark.parametrize('bf16', [True, False])
@@ -315,7 +315,7 @@ class TestLayerWiseOptimizer:
             num_zeros = optimizer.count_zeros()
             assert num_zeros >= 0
 
-    #TODO(@boxiangw): add PP=4 back
+    # TODO(@boxiangw): add PP=4 back and fix the test
     @pytest.mark.parametrize('src_tp', [1, 2, 4])
     @pytest.mark.parametrize('src_pp', [1, 2])
     @pytest.mark.parametrize('dest_tp', [1, 2, 4])
