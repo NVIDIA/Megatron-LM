@@ -225,25 +225,16 @@ def ensure_schedule_filled(schedule, repo_owner):
         print(f"Appended: {new_entry}")
 
 def assign_reviewer(pr_number):
-    """Assigns the current oncall as the reviewer for the PR."""
-    schedule = load_schedule()
-    if not schedule:
-        print("Error: Schedule is empty. Cannot assign reviewer.")
-        sys.exit(1)
-        
-    current_entry = schedule[0]
-    current_oncall = current_entry['user']
-    print(f"Current oncall: {current_oncall} (Since {current_entry['date']})")
-    
+    """Assigns the mcore-oncall team as the reviewer for the PR."""
     owner, repo = get_repo_info()
     url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{pr_number}/requested_reviewers"
     
-    # We can assign the user directly
-    data = {"reviewers": [current_oncall]}
+    # Assign the oncall team as reviewer
+    data = {"team_reviewers": [ACTIVE_ONCALL_TEAM_SLUG]}
     resp = requests.post(url, headers=get_headers(), json=data)
     
     if resp.status_code in [201, 200]:
-        print(f"Successfully requested review from {current_oncall}")
+        print(f"Successfully requested review from team NVIDIA/{ACTIVE_ONCALL_TEAM_SLUG}")
     else:
         print(f"Failed to request review: {resp.status_code} {resp.text}")
         sys.exit(1)
