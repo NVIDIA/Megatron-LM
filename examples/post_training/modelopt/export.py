@@ -88,4 +88,5 @@ if __name__ == "__main__":
         export_extra_modules=export_extra_modules,
         dtype=torch.bfloat16,
         export_dir=args.export_dir,
+        moe_router_dtype=unwrapped_model.config.moe_router_dtype,
     )

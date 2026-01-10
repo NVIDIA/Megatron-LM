@@ -2,6 +2,7 @@
 
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.post_training.modelopt.layers import Norm
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -83,9 +84,23 @@ def get_mamba_stack_modelopt_spec(
         ),
     )
 
+    moe_layer = ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            pre_mlp_layernorm=Norm,
+            mlp=get_moe_module_spec(
+                use_te=False, num_experts=8, moe_grouped_gemm=False  # Can be anything non None
+            ),
+            mlp_bda=get_bias_dropout_add,
+        ),
+    )
+
     return ModuleSpec(
         module=MambaStack,
         submodules=MambaStackSubmodules(
-            mamba_layer=mamba_layer, attention_layer=attention_layer, mlp_layer=mlp_layer
+            mamba_layer=mamba_layer,
+            attention_layer=attention_layer,
+            mlp_layer=mlp_layer,
+            moe_layer=moe_layer,
         ),
     )
