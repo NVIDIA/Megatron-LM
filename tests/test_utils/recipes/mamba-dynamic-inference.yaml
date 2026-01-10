@@ -59,3 +59,8 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m_chunked_prefill]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
