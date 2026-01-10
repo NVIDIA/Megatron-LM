@@ -7,6 +7,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_inference_spec,
     get_gpt_mtp_block_spec,
+    get_gpt_decoder_layer_specs,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -69,7 +70,12 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
                 transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
             else:
-                transformer_layer_spec_for_mtp = transformer_layer_spec
+                # Define the decoder block spec
+                decoder_layer_specs = get_gpt_decoder_layer_specs(
+                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
+                )
+                transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
+            # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
             mtp_block_spec = get_gpt_mtp_block_spec(
                 config,
                 transformer_layer_spec_for_mtp,
@@ -101,12 +107,12 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
 
 def _get_transformer_layer_spec(use_te, config):
     """Get transformer layer specification based on configuration.
-
+    
     Args:
         use_te (bool): Whether to use Transformer Engine
         args: Training arguments
         config: Model configuration
-
+        
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
