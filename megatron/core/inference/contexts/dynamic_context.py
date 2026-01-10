@@ -1739,9 +1739,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
-        elif self.has_explicit_chunked_prefill_req:
-            # We just completed the last chunk of a prefill request, so we need to reset the flag.
-            self.has_explicit_chunked_prefill_req = False
+        self.has_explicit_chunked_prefill_req = False
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
@@ -1777,7 +1775,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset Mamba state.
             self.reset_mamba_state()
-
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -1848,9 +1845,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if self.chunked_prefill_request_id != -1:
                 # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-                active_requests_requiring_new_block[self.get_index_of_chunked_prefill_request()] = (
-                    0  # chunked prefill should not be paused
-                )
+                active_requests_requiring_new_block[
+                    self.get_index_of_chunked_prefill_request() - self.paused_request_count
+                ] = 0  # chunked prefill should not be paused
 
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()
