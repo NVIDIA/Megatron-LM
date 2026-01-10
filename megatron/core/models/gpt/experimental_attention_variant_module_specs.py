@@ -87,26 +87,49 @@ def get_dsa_module_spec_for_backend(
             mlp_bda=get_bias_dropout_add,
         ),
     )
+from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.transformer.spec_utils import ModuleSpec
+
+
+def is_linear_attention_variant(experimental_attention_variant: str) -> bool:
+    """Check if the experimental attention variant is a linear attention variant."""
+    linear_attention_variants = ["gated_delta_net"]
+    return experimental_attention_variant in linear_attention_variants
+
+
+def get_gated_delta_net_module_spec_for_backend(
+    backend: BackendSpecProvider, normalization: Optional[str] = None
+) -> ModuleSpec:
+    """Helper function to get module spec for Linear Attention"""
+    rms_norm = normalization == "RMSNorm"
+    attention = ModuleSpec(
+        module=GatedDeltaNet,
+        submodules=GatedDeltaNetSubmodules(
+            in_proj=backend.column_parallel_layer_norm_linear(),
+            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+            out_proj=backend.row_parallel_linear(),
+        ),
+        metainfo={"fuse_input_layernorm": True},
+    )
+    return attention
 
 
 def get_experimental_attention_variant_module_spec_for_backend(
     backend: BackendSpecProvider,
+    sharded_state_dict_keys_map: dict,
     experimental_attention_variant: Optional[str] = None,
     qk_layernorm: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
-    num_experts: Optional[int] = None,
-    mlp: Optional[ModuleSpec] = None,
+    mla_down_proj_use_column_parallel: Optional[bool] = False,
+    normalization: Optional[str] = None,
+    fallback_to_eager_attn: Optional[bool] = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for Attention"""
-    if experimental_attention_variant == "dsa":
-        return get_dsa_module_spec_for_backend(
-            backend=backend,
-            qk_layernorm=qk_layernorm,
-            qk_l2_norm=qk_l2_norm,
-            multi_latent_attention=multi_latent_attention,
-            num_experts=num_experts,
-            mlp=mlp,
+    if experimental_attention_variant == "gated_delta_net":
+        return get_gated_delta_net_module_spec_for_backend(
+            backend=backend, normalization=normalization
         )
     else:
         raise ValueError(
