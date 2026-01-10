@@ -1181,6 +1181,18 @@ def update_train_iters(args):
     if args.rampup_batch_size is None:
         args.train_iters = args.train_samples // args.global_batch_size
 
+    elif args.step_batch_size_schedule is not None:
+        # Sample based training with step batch size schedule.
+        iterations = 0
+        consumed_samples = 0
+        while consumed_samples < args.train_samples:
+            update_num_microbatches(consumed_samples, consistency_check=False)
+            consumed_samples += get_current_global_batch_size()
+            iterations += 1
+        # Reset
+        update_num_microbatches(0, consistency_check=False)
+        args.train_iters = iterations
+
     else:
         # Sample based training with rampup batch size.
         iterations = 0
