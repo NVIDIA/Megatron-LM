@@ -2019,13 +2019,6 @@ def _add_regularization_args(parser):
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
-    group.add_argument('--start-weight-decay', type=float,
-                       help='Initial weight decay coefficient for L2 regularization.')
-    group.add_argument('--end-weight-decay', type=float,
-                       help='End of run weight decay coefficient for L2 regularization.')
-    group.add_argument('--weight-decay-incr-style', type=str, default='constant',
-                       choices=['constant', 'linear', 'cosine'],
-                       help='Weight decay increment function.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
@@ -2150,7 +2143,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
+    from megatron.training.training_config import TrainingConfig
 
     train_factory = ArgumentGroupFactory(TrainingConfig)
     group = train_factory.build_group(parser, "training")
@@ -2431,59 +2424,21 @@ def _add_initialization_args(parser):
 
 
 def _add_learning_rate_args(parser):
-    group = parser.add_argument_group(title='learning rate')
+    from megatron.training.training_config import SchedulerConfig
+
+    sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=["no_weight_decay_cond_type"])
+    group = sched_factory.build_group(parser, title="learning rate and weight decay")
 
     group.add_argument('--lr', type=float, default=None,
                        help='Initial learning rate. Depending on decay style '
                        'and initial warmup, the learning rate at each '
                        'iteration would be different.')
-    group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine', 'inverse-square-root', 'WSD'],
-                       help='Learning rate decay function.')
-    group.add_argument('--lr-wsd-decay-style', type=str, default='exponential',
-                       choices=['exponential', 'linear', 'cosine', 'minus_sqrt'],
-                       help='Decay style for the annealing phase of WSD'),
-    group.add_argument('--lr-decay-iters', type=int, default=None,
-                       help='number of iterations to decay learning rate over,'
-                       ' If None defaults to `--train-iters`')
-    group.add_argument('--lr-decay-samples', type=int, default=None,
-                       help='number of samples to decay learning rate over,'
-                       ' If None defaults to `--train-samples`')
-    group.add_argument('--lr-wsd-decay-samples', type=int, default=None,
-                       help='number of samples for the annealing phase in the wsd schedule')
-    group.add_argument('--lr-wsd-decay-iters', type=int, default=None,
-                       help='number of iterations for the annealing phase in the wsd schedule')
-    group.add_argument('--lr-warmup-fraction', type=float, default=None,
-                       help='fraction of lr-warmup-(iters/samples) to use '
-                       'for warmup (as a float)')
-    group.add_argument('--lr-warmup-iters', type=int, default=0,
-                       help='number of iterations to linearly warmup '
-                       'learning rate over.')
-    group.add_argument('--lr-warmup-samples', type=int, default=0,
-                       help='number of samples to linearly warmup '
-                       'learning rate over.')
-    group.add_argument('--lr-warmup-init', type=float, default=0.0,
-                       help='Initial value for learning rate warmup. The '
-                       'scheduler starts warmup from this value.')
     group.add_argument('--warmup', type=int, default=None,
                        help='Old lr warmup argument, do not use. Use one of the'
                        '--lr-warmup-* arguments above')
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minimum value for learning rate. The scheduler'
                        'clip values below this threshold.')
-    group.add_argument('--override-opt_param-scheduler', '--override-opt-param-scheduler',
-                       action='store_true',
-                       help='Reset the values of the scheduler (learning rate,'
-                       'warmup iterations, minimum learning rate, maximum '
-                       'number of iterations, and decay style from input '
-                       'arguments and ignore values from checkpoints. Note'
-                       'that all the above values will be reset.')
-    group.add_argument('--use-checkpoint-opt_param-scheduler', '--use-checkpoint-opt-param-scheduler',
-                       action='store_true',
-                       help='Use checkpoint to set the values of the scheduler '
-                       '(learning rate, warmup iterations, minimum learning '
-                       'rate, maximum number of iterations, and decay style '
-                       'from checkpoint and ignore input arguments.')
     group.add_argument('--decoupled-lr', type=float, default=None,
                        help='Separate learning rate for the input and output layer')
     group.add_argument('--decoupled-min-lr', type=float, default=None,
@@ -2858,7 +2813,7 @@ def _add_distributed_args(parser):
 
 
 def _add_validation_args(parser):
-    from megatron.training.config import ValidationConfig
+    from megatron.training.training_config import ValidationConfig
 
     val_factory = ArgumentGroupFactory(ValidationConfig)
     group = val_factory.build_group(parser, "validation")
