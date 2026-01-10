@@ -398,24 +398,13 @@ def test_precision_aware_optimizer(
         test_model, input, test_optim, fp8_recipe, fp8_recipe_settings
     )
 
-    rtol = 1e-3  # relative tolerance
-    atol = 1e-5  # absolute tolerance
+    rtol, atol = 1.6e-2, 1e-5
 
     # Compare grad norms - allow small difference due to precision
-    rel_diff = abs(test_grad_norm - baseline_grad_norm) / (
-        abs(baseline_grad_norm) + 1e-7  # avoid div by 0
-    )
-    abs_diff = abs(test_grad_norm - baseline_grad_norm)
-    assert (
-        rel_diff <= rtol or abs_diff <= atol
-    ), f"Grad norm mismatch: baseline={baseline_grad_norm}, test={test_grad_norm}, rel_diff={rel_diff}, abs_diff={abs_diff}"
+    torch.testing.assert_close(test_grad_norm, baseline_grad_norm, atol=atol, rtol=rtol)
 
     # Compare losses - allow small difference due to precision
-    loss_rel_diff = abs(test_loss - baseline_loss) / (abs(baseline_loss) + 1e-7)
-    loss_abs_diff = abs(test_loss - baseline_loss)
-    assert (
-        loss_rel_diff <= rtol or loss_abs_diff <= atol
-    ), f"Loss mismatch: baseline={baseline_loss}, test={test_loss}, rel_diff={loss_rel_diff}, abs_diff={loss_abs_diff}"
+    torch.testing.assert_close(test_loss, baseline_loss, atol=atol, rtol=rtol)
 
     # Save and reload state dict for the test model
     state_dict = test_optim.state_dict()

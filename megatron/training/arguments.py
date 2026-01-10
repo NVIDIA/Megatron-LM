@@ -70,6 +70,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
+    parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
@@ -320,10 +321,35 @@ def moe_freq_type(x):
       This allows defining arbitrary patterns of expert and dense layers.
       The pattern length must match the total number of transformer layers.
       Examples:
-          "([0]+[1]*23)": 1 dense layer followed by 23 experts layers
+          "([0]+[1]*23)": 1 dense layer followed by 23 expert layers
           "([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.
     """
     if isinstance(x, int):
+        return x
+    assert isinstance(x, str)
+    if '[' in x:
+        # it's a custom pattern
+        return _eval_pattern(x)
+    else:
+        # it's a single int but in str
+        return int(x)
+
+def la_freq_type(x):
+    """Frequency between LA (linear attention) layers and SDPA (scaled dot-product attention) layers.
+
+    Accepts either:
+    - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
+    - A string "N": Same as above, but provided as a string
+    - A string containing a Python list expression that defines a custom pattern, e.g.:
+      "([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0]
+      where 1 indicates an LA layer and 0 indicates a SDPA layer.
+      This allows defining arbitrary patterns of LA and SDPA layers.
+      The pattern length must match the total number of transformer layers.
+      Examples:
+          "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers
+          "([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.
+    """
+    if x is None or isinstance(x, int):
         return x
     assert isinstance(x, str)
     if '[' in x:
@@ -1217,6 +1243,13 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print('Warning: enabling --no-load-optim when skipping training.')
 
+    # Muon optimizercheck
+    if 'muon' in args.optimizer:
+        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
+        assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
+        assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
+        assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2032,6 +2065,27 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--muon-momentum', type=float, default=0.9,
+                       help='Momentum factor for Muon optimizer')
+    group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
+                       dest='muon_split_qkv',
+                       help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-use-nesterov', action='store_true',
+                       help='Whether to use Nesterov-style momentum in the internal SGD')
+    group.add_argument('--muon-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       help='Scale mode for Muon optimizer')
+    group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
+                       choices=['low', 'medium', 'high'],
+                       help='FP32 matmul precision for Newton-Schulz iteration')
+    group.add_argument('--muon-num-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schulz steps for Muon optimizer')
+    group.add_argument('--muon-tp-mode', type=str, default='blockwise',
+                       choices=['blockwise', 'duplicated', 'distributed'],
+                       help='How to perform NS calculation for tensor model parallel weights')
+    group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
+                       help='Additional scale factor for the muon update')
+
     return parser
 
 
@@ -2320,7 +2374,7 @@ def _add_training_args(parser):
     group.add_argument('--qk-clip-threshold', type=float, default=100,
                        help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
@@ -2384,7 +2438,8 @@ def _add_training_args(parser):
                        'processed in different batch configurations. This is more strict than deterministic-mode '
                        'which only ensures bitwise identical results when the same inputs are processed in the same batch configuration. '
                        'This will significantly affect speed of training and inference as the kernels are not full optimized.')
-
+    group.add_argument('--disable-jit-fuser', action='store_true',
+                       help='Disable the JIT fuser.')
 
     return parser
 
@@ -3312,6 +3367,45 @@ def _add_mla_args(parser):
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
 
+    return parser
+
+def _add_experimental_attention_variant_args(parser):
+    group = parser.add_argument_group(title="experimental_attention_variant")
+    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa'], type=str,
+                       help='Type of attention variant to use. Currently support gated_delta_net and dsa.')
+    # DSA
+    group.add_argument('--dsa-indexer-n-heads', default=None, type=int,
+                       help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
+    group.add_argument('--dsa-indexer-head-dim', default=None, type=int,
+                       help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
+    group.add_argument('--dsa-indexer-topk', default=None, type=int,
+                       help='Number of top-k tokens to select in sparse attention indexer.')
+    group.add_argument('--dsa-indexer-loss-coeff', default=0.0, type=float,
+                       help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
+    group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
+                       help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
+
+
+    # Linear attention
+    group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
+                       help='Frequency between LA (linear attention) layers and'
+                            ' SDPA (scaled dot-product attention) layers. Accepts either: '
+                            '- An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer '
+                            '- A string containing a Python list expression that defines a custom pattern, e.g.: '
+                            '"([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
+                            'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
+                            'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
+                            '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    group.add_argument('--linear-conv-kernel-dim', default=4, type=int,
+                       help='Conv kernel dimension for the gated delta net.')
+    group.add_argument('--linear-key-head-dim', default=128, type=int,
+                       help='Query and key head dimension for the gated delta net.')
+    group.add_argument('--linear-value-head-dim', default=128, type=int,
+                       help='Value and gate head dimension for the gated delta net.')
+    group.add_argument('--linear-num-key-heads', default=16, type=int,
+                       help='Number of query and key heads for the gated delta net.')
+    group.add_argument('--linear-num-value-heads', default=32, type=int,
+                       help='Number of value and gate heads for the gated delta net.')
     return parser
 
 def _add_heterogeneous_args(parser):
