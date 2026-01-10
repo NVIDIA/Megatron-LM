@@ -104,7 +104,7 @@ def initialize_real_model(
             transformer_config, use_transformer_engine=True, vp_stage=vp_stage
         )
     else:
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(multi_latent_attention=is_mla)
+        layer_spec = gpt_te_spec(multi_latent_attention=is_mla)
     this_model = GPTModel(
         config=transformer_config,
         transformer_layer_spec=layer_spec,
