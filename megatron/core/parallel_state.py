@@ -534,7 +534,7 @@ def initialize_model_parallel(
     order: str = "tp-cp-ep-dp-pp",
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
-    create_gloo_process_groups: bool = True,
+    create_gloo_process_groups: bool = False,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
 ) -> None:

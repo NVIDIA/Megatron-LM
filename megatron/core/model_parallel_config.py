@@ -146,8 +146,8 @@ class ModelParallelConfig:
     gradient_accumulation_fusion: bool = False
     """If true, fuses weight gradient accumulation to GEMMs. Requires the custom CUDA extension
        fused_weight_gradient_mlp_cuda module. To use gradient_accumulation_fusion you must install
-       APEX with --cpp_ext and --cuda_ext. For example: "pip install --global-option=\"--cpp_ext\"
-       --global-option=\"--cuda_ext\" ". Note that the extension requires CUDA>=11. Otherwise, you
+       APEX with \"--cpp_ext\" and \"--cuda_ext\". For example: "pip install --global-option=\"--cpp_ext\"
+       --global-option=\"--cuda_ext\" . ". Note that the extension requires CUDA>=11. Otherwise, you
        must turn off gradient accumulation fusion.
     """
 
