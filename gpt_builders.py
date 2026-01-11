@@ -91,6 +91,8 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             rotary_percent=args.rotary_percent,
             rotary_base=args.rotary_base,
             rope_scaling=args.use_rope_scaling,
+            rope_scaling_factor=args.rope_scaling_factor,
+            seq_len_interpolation_factor=args.seq_len_interpolation_factor,
             mtp_block_spec=mtp_block_spec,
             vp_stage=vp_stage,
             pg_collection=pg_collection,

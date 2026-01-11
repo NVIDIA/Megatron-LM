@@ -64,6 +64,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
             add_binary_head=args.bert_binary_head,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             parallel_output=True,
+            seq_len_interpolation_factor=args.seq_len_interpolation_factor,
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage)
