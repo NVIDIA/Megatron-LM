@@ -1479,7 +1479,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
-    
+
     if args.sequence_packing:
         num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch = losses_reduced.pop()
     else:
@@ -2839,8 +2839,10 @@ def evaluate(
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
             )
-            # need to drop first two elements which are total_num_tokens and total_sequence_square_sum
-            loss_dicts = loss_dicts[2:]
+            if args.sequence_packing:
+                # need to drop first two elements which are total_num_tokens and
+                # total_sequence_square_sum
+                loss_dicts = loss_dicts[2:]
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
 

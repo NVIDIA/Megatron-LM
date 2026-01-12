@@ -63,7 +63,7 @@ class ModelParallelConfig:
        type.
     """
 
-    max_seqlen_per_cp_rank: Optional[int] = None
+    max_seqlen_per_dp_cp_rank: Optional[int] = None
     """
     Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
     can handle without overflowing the memory. Typically, a good starting point is to set this
@@ -76,7 +76,7 @@ class ModelParallelConfig:
     """
     If true, enables hybrid context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_cp_rank when using hybrid_context_parallel.
+    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
     When enabling hybrid_context_parallel, sequence_packing must be true.
     """
 

@@ -987,13 +987,13 @@ def validate_args(args, defaults={}):
         if args.hybrid_context_parallel:
             # packed_buffer_size = hdp_size * max_seqlen_per_rank >= single_seq_max_len
             hdp_size = args.world_size // (args.tensor_model_parallel_size * args.pipeline_model_parallel_size)
-            assert hdp_size * args.max_seqlen_per_cp_rank >= args.seq_length, \
-                f'Packed sequence buffer size ({hdp_size * args.max_seqlen_per_cp_rank}) ' \
+            assert hdp_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
+                f'Packed sequence buffer size ({hdp_size * args.max_seqlen_per_dp_cp_rank}) ' \
                 f'must be >= single sequence max length ({args.seq_length})'
         else:
             # packed_buffer_size = cp_size * max_seqlen_per_rank >= single_seq_max_len
-            assert args.context_parallel_size * args.max_seqlen_per_cp_rank >= args.seq_length, \
-                f'Packed sequence buffer size ({args.context_parallel_size * args.max_seqlen_per_cp_rank}) ' \
+            assert args.context_parallel_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
+                f'Packed sequence buffer size ({args.context_parallel_size * args.max_seqlen_per_dp_cp_rank}) ' \
                 f'must be >= single sequence max length ({args.seq_length})'
         
 
@@ -2923,7 +2923,7 @@ def _add_distributed_args(parser):
                        '--hierarchical-context-parallel-sizes 2 4 indicates every two adjacent gpus '
                        'forms the first level of cp groups and the cp ranks with the same odevity '
                        'forms the second level of cp groups.')
-    group.add_argument('--max-seqlen-per-cp-rank', type=int, default=None,
+    group.add_argument('--max-seqlen-per-dp-cp-rank', type=int, default=None,
                        help='Maximum sequence length per CP rank. This is used to calculate the '
                        'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
     group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
