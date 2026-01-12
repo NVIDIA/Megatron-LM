@@ -989,13 +989,7 @@ def prepare_data_for_update(
     nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
 
-    # RL policy updates + logprob computations should run eagerly; only rollout generation
-    # (inference engine) should use CUDA graphs until training cuda-graphs MR goes in. 
-    # In the single-model case this is naturally handled by `megatron_rl_inference_mode` 
-    # toggling graphs on/off around inference. In the refit case (separate inference_model),
-    # we must explicitly keep the training model (this `model`) with CUDA graphs disabled,
-    # otherwise training/logprobs can get cudagraphed.
-    if args.cuda_graph_impl != "none":
+    if args.cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
         lang_module = (
             model[0].module.module if hasattr(model[0].module, "module") else model[0].module
         )
