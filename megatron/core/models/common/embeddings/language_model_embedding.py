@@ -110,6 +110,14 @@ class LanguageModelEmbedding(MegatronModule):
         """
         word_embeddings = self.word_embeddings(input_ids)
         if self.add_position_embedding:
+            # >>>
+            # pax({
+            #     "emb" : self.position_embeddings.weight,
+            #     "ids" : position_ids,
+            #     "min" : position_ids.min().item(),
+            #     "max" : position_ids.max().item(),
+            # })
+            # <<<
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = word_embeddings + position_embeddings
         else:

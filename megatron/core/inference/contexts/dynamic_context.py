@@ -1462,6 +1462,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.token_to_pos_ids[:num_tokens].unsqueeze(0),
         )
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def last_token_logits(self, logits: Tensor) -> Tensor:
         """Last tokens of logits.
 
@@ -1491,6 +1492,42 @@ class DynamicInferenceContext(BaseInferenceContext):
         last_token_logits = logits[last_token_idxs, :]
 
         return last_token_logits
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    # def last_token_logits(self, logits: Tensor) -> Tensor:
+    #     """Last tokens of logits.
+
+    #     Args:
+    #         logits (Tensor): Output logits of forward pass.
+
+    #     Return:
+    #         (Tensor) Last token logits.
+    #     """
+    #     print(f"logits: {logits}.")
+
+    #     # todo: @lmcafee, remove these asserts?
+    #     assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
+    #     assert logits.size(1) == self.padded_active_token_count, (
+    #         f"logits.size(1) ({tuple(logits.shape)}) != "
+    #         f"padded_active_token_count ({self.padded_active_token_count})."
+    #     )
+
+    #     # Last token logits.
+    #     print(f"logits: {logits}.")
+    #     logits = logits.squeeze(0)
+    #     print(f"logits: {logits}.")
+    #     last_token_idxs = (
+    #         torch.cumsum(
+    #             self.request_query_lengths[self.paused_request_count : self.total_request_count],
+    #             dim=0,
+    #         )
+    #         - 1
+    #     )
+    #     print(f"last_token_idxs: {last_token_idxs}.")
+    #     last_token_logits = logits[last_token_idxs, :]
+    #     print(f"last_token_logits: {last_token_logits}.")
+
+    #     return last_token_logits
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def check_availability(self, req: DynamicInferenceRequest) -> (bool, bool, bool):
         """
@@ -2084,17 +2121,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         # We determine how many requests we can resume and resume them
 
         # 6.a. First, resume temporarily paused requests.
-        active_request_count, resume_request_count, newly_paused_request_ids = (
+        active_request_count, resume_request_count_0, newly_paused_request_ids = (
             self.resume_paused_requests(active_request_count, newly_paused_request_ids, next_tokens)
         )
 
-        # 6.b. Evict requests that overflow the paused buffer.
+        # # 6.b. Evict requests that overflow the paused buffer.
         evict_request_ids = self.evict_overflow_paused_requests(active_request_count, next_tokens)
 
         # 6.c. Resume any additional requests.
-        active_request_count, resume_request_count, newly_paused_request_ids = (
+        active_request_count, resume_request_count_1, newly_paused_request_ids = (
             self.resume_paused_requests(active_request_count, newly_paused_request_ids, next_tokens)
         )
+
+        resume_request_count = resume_request_count_0 + resume_request_count_1
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count

@@ -1139,6 +1139,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
+        # >>>
+        import os
+        os.environ["ENGINE_STEP_COUNT"] = str(self.step_count)
+        # <<<
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
         self.step_end_event.synchronize()

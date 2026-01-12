@@ -654,6 +654,12 @@ class TextGenerationController:
             last_token_logits = logits.squeeze(0)
         else:
             last_token_logits = context.last_token_logits(logits)
+        # >>>
+        # print(f"materialize_only_last_token_logits: {context.materialize_only_last_token_logits}.")
+        # print(f"context: {context}.")
+        # print(f"logits: {logits}.")
+        # print(f"last_token_logits: {last_token_logits}.")
+        # <<<
 
         if self._sampling_backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
@@ -664,9 +670,19 @@ class TextGenerationController:
             # pax({"torch_sampling_buckets": list(self._torch_sampling_buckets)})
             # <<<
             for indices, temp, top_k, top_p in self._torch_sampling_buckets:
-                token_list.append(
-                    self._torch_sampling_func(last_token_logits[indices, :], temp, top_k, top_p)
-                )
+                # >>>
+                # token_list.append(
+                #     self._torch_sampling_func(last_token_logits[indices, :], temp, top_k, top_p)
+                # )
+                # +++
+                try:
+                    token_list.append(
+                        self._torch_sampling_func(last_token_logits[indices, :], temp, top_k, top_p)
+                    )
+                except Exception as e:
+                    from lutil import pax
+                    pax("last_token_logits, indices")
+                # <<<
                 indices_list.append(torch.tensor(indices))
 
             # Single write to the output tensor.
