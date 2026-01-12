@@ -407,3 +407,59 @@ def test_compute_packed_inference_logprobs_stats_shape_mismatch():
 
     # Stats should remain None due to shape mismatch
     assert group_stats.mean_piold_to_inf_prob is None
+
+
+def test_create_packed_seq_params_for_bin_padding():
+    # Test packing scenario where bin size is larger than the sum of sequence lengths and padding
+    # is needed at the end.
+
+    bin_size = 16
+    seq_lengths = [5, 3]
+    bin_seq_indices = [list(range(len(seq_lengths)))]
+
+    # Start positions are cumulative sums of previous lengths.
+    seq_starts = {0: [5, 3]}
+
+    packing_info = sequence_packing_utils.PackingInfo(
+        bin_seq_indices=bin_seq_indices,
+        seq_starts=seq_starts,
+        seq_lengths=seq_lengths,
+        seq_to_bin_idx=[0 for _ in seq_lengths],
+        packing_algo="fifo",
+    )
+
+    # Dummy packed_trajs: just need correct shape and device.
+    packed_trajs = torch.zeros((1, bin_size), dtype=torch.long, device='cpu')
+    packed_position_ids = torch.zeros_like(packed_trajs)
+    packed_attention_mask = torch.zeros((1, 1, bin_size, bin_size), dtype=torch.bool, device='cpu')
+    packed_loss_mask = torch.zeros_like(packed_trajs, dtype=torch.float)
+
+    packing_context = sequence_packing_utils.PackingContext(
+        bin_size=bin_size,
+        packer=None,  # not used by create_packed_seq_params
+        packing_info=packing_info,
+        original_generation_masks=torch.zeros((len(seq_lengths), 1), device='cpu'),
+        original_trajs=torch.zeros((len(seq_lengths), 1), device='cpu'),
+        packed_trajs=packed_trajs,
+        packed_position_ids=packed_position_ids,
+        packed_attention_mask=packed_attention_mask,
+        packed_loss_mask=packed_loss_mask,
+        original_inference_logprobs=None,
+        bin_advantages=[],
+        cached_packed_seq_params=[],
+    )
+
+    packed_seq_params = sequence_packing_utils.create_packed_seq_params(packing_context)
+    cuseqlens = packed_seq_params[0].cu_seqlens_q
+
+    # For two sequences of lengths 5 and 3 in a bin of size 16, we expect:
+    # cuseqlens[0] = 0, cuseqlens[1] = 5, cuseqlens[2] = 8  (5 + 3)
+    # and cuseqlens[3:] all equal to 8 (the last real cumulative length), not 16 (the bin size)
+    assert cuseqlens.shape[0] == bin_size
+    assert cuseqlens[0].item() == 0
+    assert cuseqlens[1].item() == 5
+    assert cuseqlens[2].item() == 8
+
+    # All padded tail entries should equal the last real cumulative length (8).
+    tail = cuseqlens[3:]
+    assert torch.all(tail == 8)
