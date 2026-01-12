@@ -26,6 +26,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
@@ -77,10 +78,24 @@ class TextGenerationController:
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
+    def set_stop_word_finished_ids_callback(self, callback):
+        """Set a callback to get request IDs that should be marked as finished due to stop words.
+
+        The callback should have signature: callback(active_request_ids: List[int]) -> Set[int]
+        Returns a set of request IDs from active_request_ids that should be marked as finished.
+
+        Args:
+            callback: Function that returns request IDs to mark as finished.
+        """
+        self._get_stop_word_finished_ids_callback = callback
+
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_total_requests
+
+        # Callback to get request IDs that should be marked as finished due to stop words
+        self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.inference_wrapper_config.params_dtype
@@ -474,13 +489,16 @@ class TextGenerationController:
         return padded_batch_prompt_tokens[:original_batch_size]
 
     def _dynamic_step_context_init(
-        self, construct_graph_dimensions: Optional[InferenceBatchDimensions] = None
+        self,
+        construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
+        is_dummy_forward: bool = False,
     ):
         """Initializes the inference context for dynamic batching.
 
         Args:
             construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use
                 for constructing the cuda graphs.
+            is_dummy_forward (bool): Whether we are running an expert parallel dummy forward pass
 
         Return:
             input_ids (Tensor): The active input IDs.
@@ -501,16 +519,20 @@ class TextGenerationController:
         # for prefill turn off symmetric kernels
         symmetric_ar_type = model_config.symmetric_ar_type
         nccl_all_reduce_for_prefill = inference_wrapper_config.nccl_all_reduce_for_prefill
-        # Turning on/off MoE padding for prefill
+        # Turning on/off MoE padding for cuda-graphs
         moe_pad_experts_for_cuda_graph_inference = (
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
-            if context.is_decode_only():
+            if context.using_cuda_graph_this_step():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
             else:
                 set_decode_expert_padding(unwrapped_model, False)
+
+        # initialize symmetric memory if needed
+        if model_config.transformer_impl == "inference_optimized":
+            context.maybe_initialize_symmetric_memory()
 
         if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
             if context.is_decode_only():
@@ -529,7 +551,9 @@ class TextGenerationController:
                 )
 
         # Get flat tokens, position ids.
-        if construct_graph_dimensions is not None:
+        # If we are running a dummy forward step we want to use the token count agreed upon
+        # by all EP ranks rather than the minimum number of tokens.
+        if construct_graph_dimensions is not None and not is_dummy_forward:
             return context.current_input_and_position_ids(
                 num_warmup_tokens=construct_graph_dimensions.token_count
             )
@@ -648,16 +672,7 @@ class TextGenerationController:
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         return_log_probs = self._request_metadata["return_log_probs"][active_request_slice]
-        skip_prompt = self._request_metadata["skip_prompt_log_probs"][active_request_slice]
         top_n_log_probs = self._request_metadata["top_n_logprobs"][active_request_slice] > 0
-
-        to_check_prompt = (return_log_probs | top_n_log_probs) & ~skip_prompt
-
-        assert not (to_check_prompt.any() and context.materialize_only_last_token_logits), (
-            "Prompt log probs cannot be calculated if only last token logits are materialized. "
-            "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
-            "or skip_prompt_log_probs to True in SamplingParams."
-        )
 
         return return_log_probs.any(), top_n_log_probs.any()
 
@@ -756,6 +771,36 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
+    def dummy_forward(self):
+        """Perform a dummy forward pass. This is used in expert model parallelism
+        on ranks that do not have any real requests."""
+
+        context = self.inference_wrapped_model.inference_context
+        # if no cuda graphs, directly use dummy forward
+        if not context.cuda_graph_batch_dimensions_list:
+            return self.inference_wrapped_model.dummy_forward()
+
+        # attempt to use cuda-graph if possible
+        # here we try to reuse the cuda-graph warmup code to run
+        # a dummy cuda graph.
+        input_ids, position_ids = self._dynamic_step_context_init(
+            # try to use the smallest cuda-graph config for dummy forward
+            construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list),
+            is_dummy_forward=True,
+        )
+
+        # _dynamic_step_context_init tries to find a cuda-graph that is compatible
+        # with all EP ranks. It can also return no match, in which case
+        # we run in eager mode.
+
+        if context.using_cuda_graph_this_step():
+            # we found a cuda-graph to run
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+        else:
+            # fallback to eager dummy forward
+            self.inference_wrapped_model.dummy_forward()
+        context.reset()
+
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
@@ -787,6 +832,16 @@ class TextGenerationController:
             self._sampled_tokens_cuda[:active_request_count]
             != self._request_metadata["termination_id"][active_request_slice]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+
+        # Mark requests as finished if they hit stop words (detected in previous step's post_process_requests)
+        if self._get_stop_word_finished_ids_callback is not None:
+            request_ids_list = active_request_ids.tolist()
+            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+            if stop_word_finished_ids:
+                for idx, request_id in enumerate(request_ids_list):
+                    if request_id in stop_word_finished_ids:
+                        active_request_mask[idx] = 0
+
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -963,7 +1018,7 @@ class TextGenerationController:
         # Check whether CUDA graphs are enabled
         enable_cuda_graph = (
             model_config.cuda_graph_impl == "local"
-            and model_config.cuda_graph_scope != "full_iteration"
+            and CudaGraphScope.full_iteration not in model_config.cuda_graph_scope
         )
 
         # Pad batch tokens if necessary

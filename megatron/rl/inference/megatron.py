@@ -8,7 +8,6 @@ import torch.distributed as dist
 from pydantic import PrivateAttr
 
 from megatron.core import parallel_state
-from megatron.core.utils import get_attr_wrapped_model
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
@@ -25,13 +24,15 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
     SimpleTextGenerationController,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.pipeline_parallel.utils import (
-    is_pp_first_stage,
-    is_pp_last_stage,
+from megatron.core.utils import (
+    get_attr_wrapped_model,
+    get_mamba_inference_state_config_from_model,
+    get_pg_size,
+    log_single_rank,
 )
-from megatron.core.utils import get_mamba_inference_state_config_from_model, log_single_rank, get_pg_size
 from megatron.training import get_wandb_writer
 from megatron.training.global_vars import get_args, get_tokenizer
 
@@ -91,8 +92,12 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
 
 
 ## This code is copied from tools/run_text_generation_server.py
-def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inference_logging_step_interval: int = 0,
-    metrics_writer = None) -> AbstractEngine:
+def get_dynamic_inference_engine(
+    args: Namespace,
+    model: MegatronModule,
+    inference_logging_step_interval: int = 0,
+    metrics_writer = None
+) -> AbstractEngine:
     """Get the relevant backend for running inference.
 
     This function will automatically choose the TRTLLMBackend when possible,
@@ -114,15 +119,20 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
 
     mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
-    # DynamicInferenceContext must use the inference model's TP size, not the
-    # training TP size from global args. The inference model may have a custom
-    # ProcessGroupCollection with a different TP size.
+    # DynamicInferenceContext must use the inference model's TP / PP size, not the
+    # training TP / PP size from global args. The inference model may have a custom
+    # ProcessGroupCollection with a different TP / PP size.
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
     tp_group = getattr(pg_collection, 'tp', None) if pg_collection is not None else None
     if tp_group is not None:
         inference_tp_size = get_pg_size(tp_group)
     else:
         inference_tp_size = args.tensor_model_parallel_size
+    pp_group = getattr(pg_collection, 'pp', None) if pg_collection is not None else None
+    if pp_group is not None:
+        inference_pp_size = get_pg_size(pp_group)
+    else:
+        inference_pp_size = args.pipeline_model_parallel_size
 
     # Inference context.
     inference_context = DynamicInferenceContext(
@@ -134,14 +144,14 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         ),
         max_sequence_length=args.inference_max_seq_length,
         num_cuda_graphs=(
-            args.inference_dynamic_batching_num_cuda_graphs
-            if enable_cuda_graph
-            else None
+            args.inference_dynamic_batching_num_cuda_graphs if enable_cuda_graph else None
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=inference_tp_size,
+        pipeline_model_parallel_size=inference_pp_size,
         materialize_only_last_token_logits=True,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
@@ -156,7 +166,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         persist_cuda_graphs=args.rl_training_cuda_graphs
     )
 
-    inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
+    inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context, pg_collection=pg_collection)
 
     inference_wrapped_model.model_is_pipeline_parallel = not (
         is_pp_first_stage(pg_collection.pp) and is_pp_last_stage(pg_collection.pp)
@@ -169,8 +179,9 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     return DynamicInferenceEngine(
         controller=text_generation_controller,
         context=inference_context,
-        enable_cuda_graph=enable_cuda_graph,
         random_seed=args.seed,
+        track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+        enable_chunked_prefill=not args.disable_chunked_prefill,
         inference_logging_step_interval=inference_logging_step_interval,
         pg_collection=pg_collection,
     )
@@ -196,6 +207,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         assert self._client is not None, "Client is not initialized"
 
         tokenizer = get_tokenizer()
+        args = get_args()
 
         sampling_params = SamplingParams(
             num_tokens_to_generate=None,
@@ -206,15 +218,13 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             termination_id=self._inference_engine.controller.tokenizer.eod,
             return_log_probs=True,
             skip_prompt_log_probs=True,
-            add_BOS=tokenizer.bos is not None,
+            add_BOS=(not args.rl_skip_bos_token and tokenizer.bos is not None),
         )
         requests = [
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)
             for prompt in request.prompt
         ]
-        records = await asyncio.gather(
-            *requests
-        )
+        records = await asyncio.gather(*requests)
         responses = [record[-1] for record in records]
         return [
             InferenceResponse(
@@ -238,21 +248,34 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 logging.WARNING,
                 "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
             )
-        
+
         # Get inference logging configuration from args
-        inference_logging_step_interval = args.inference_wandb_logging_step_interval
-        
+        log_inference_wandb = args.inference_wandb_logging
+        inference_logging_step_interval = args.inference_logging_step_interval
+
         # Get metrics writer if logging is enabled and on the logging rank
         # Use the same rank convention as training (last rank logs)
         metrics_writer = None
-        if inference_logging_step_interval > 0 and args.rank == (args.world_size - 1):
+        if (
+            inference_logging_step_interval > 0
+            and log_inference_wandb
+            and args.rank == (args.world_size - 1)
+        ):
             metrics_writer = get_wandb_writer()
             if metrics_writer is None:
-                log_single_rank(logger, logging.WARNING, "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
-                           "wandb module is available. Inference logging will be disabled.")
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
+                    "wandb module is available. Inference logging will be disabled.",
+                )
 
-        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model, inference_logging_step_interval, metrics_writer)
-        await inference_engine.start_listening_to_data_parallel_coordinator(inference_coordinator_port=41521, launch_inference_coordinator=True)
+        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(
+            args, model, inference_logging_step_interval, metrics_writer
+        )
+        await inference_engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=41521, launch_inference_coordinator=True,
+        )
         if dist.get_rank() == 0:
             # TODO: We have to do this only on the rank 0 process, should be fixed in the future when we have support for multiple inference clients. !2278
             client = InferenceClient(inference_coordinator_port=41521)
@@ -279,5 +302,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             self._client.unpause_engines()
         await self._inference_engine.running.wait()
+
 
 class MegatronChatLocal(ChatInferenceInterface, MegatronLocal): ...

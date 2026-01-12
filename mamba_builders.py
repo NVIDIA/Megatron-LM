@@ -16,6 +16,7 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
 
     if config.transformer_impl == "inference_optimized":
         mamba_stack_spec = mamba_inference_stack_spec 
+        assert not config.inference_fuse_tp_communication, "inference_fuse_tp_communication is not supported for Mamba"
     elif args.spec is not None:
         mamba_stack_spec = import_module(args.spec)
     else:
