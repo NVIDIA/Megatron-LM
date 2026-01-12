@@ -132,6 +132,8 @@ test:build_image:
         ${IMAGE}:${CI_PIPELINE_ID}-arm64
 
       docker manifest push ${IMAGE}:${CI_PIPELINE_ID}
+    - echo "MCORE_MR_COMMIT=$CI_COMMIT_SHA" | tee -a build.env
+    - echo "MCORE_BACKWARDS_COMMIT=$MCORE_BACKWARDS_COMMIT" | tee -a build.env
     - cat build.env
   retry:
     max: 2
