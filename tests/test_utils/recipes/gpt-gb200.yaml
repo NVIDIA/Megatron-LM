@@ -39,10 +39,11 @@ spec:
 
     NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
     export GPUS_PER_NODE={gpus}
+    RUN_ID=$(uuidgen)
 
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
-        "DATA_CACHE_PATH=/workspace/data/cache"
+        "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/cache/$RUN_ID"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
@@ -55,7 +56,13 @@ spec:
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
 
-    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+    set +x 
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}} 
+    exit_code=$?
+    echo "Exit code: $exit_code"
+    rm -rf /lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/cache/$RUN_ID || true
+    set -x
+    exit $exit_code
 
 products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer]
