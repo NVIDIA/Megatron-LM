@@ -19,7 +19,8 @@ RUN bash -ex <<"EOF"
     apt-get install -y --no-install-recommends gettext python3-venv psmisc
     apt-get clean
     python -m venv /opt/jet
-    wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64 -O /usr/local/bin/yq
+    ARCH=$(uname -m)
+    wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${ARCH} -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
