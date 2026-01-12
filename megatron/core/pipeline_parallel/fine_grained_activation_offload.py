@@ -789,8 +789,7 @@ class ChunkOffloadHandler:
     def find_group_with_name(self, name: str, start_index: int = 0):
         """Find the group with the given name starting from the given index."""
         return next(
-            (group for group in self.offload_groups[start_index:] if group._name == name),
-            None,
+            (group for group in self.offload_groups[start_index:] if group._name == name), None
         )
 
     def is_empty_chunk(self, name=None):
@@ -931,8 +930,9 @@ class ChunkOffloadHandler:
             return False
 
         # Check if next backward chunk is this chunk (for last pipeline stage)
-        next_backward_chunk = \
-            PipelineOffloadManager.get_instance().front_backward_chunk(group._name)
+        next_backward_chunk = PipelineOffloadManager.get_instance().front_backward_chunk(
+            group._name
+        )
         if next_backward_chunk is not None and next_backward_chunk is self:
             # Don't offload the last group with the same name if it's about to be used immediately
             if self.find_next_group(group._name) is None:

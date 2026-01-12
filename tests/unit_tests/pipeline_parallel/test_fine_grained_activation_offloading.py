@@ -19,7 +19,7 @@ from tests.unit_tests.test_utilities import Utils
 # Tolerance for memory expectation check (GPU allocator jitter etc).
 EPSILON = 0.30
 EPSILON_A2A = 0.30
-DELTA = 20 # MiB
+DELTA = 20  # MiB
 
 
 def _reset_cuda_memory() -> None:
