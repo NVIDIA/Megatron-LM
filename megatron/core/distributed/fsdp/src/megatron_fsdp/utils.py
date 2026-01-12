@@ -498,8 +498,7 @@ class FSDPDistributedIndex:
         self.fsdp_group_ag = None
         if HAVE_MEGATRON_CORE and parallel_state.has_separate_all_gather_group():
             self.fsdp_group_ag = parallel_state.get_data_parallel_group(
-                        with_context_parallel=True,
-                        independent_all_gather=True
+                with_context_parallel=True, independent_all_gather=True
             )
         # Retrieve the outer-FSDP process group from the DeviceMesh.
         self.outer_fsdp_group = (
@@ -518,6 +517,12 @@ class FSDPDistributedIndex:
             and contains_submesh(self.expt_device_mesh, self.dp_shard_dim)
             else None
         )
+        # Expert AG group for overlap
+        self.expt_fsdp_group_ag = None
+        if HAVE_MEGATRON_CORE and parallel_state.has_separate_expert_all_gather_group():
+            self.expt_fsdp_group_ag = parallel_state.get_expert_data_parallel_group(
+                independent_all_gather=True
+            )
 
         """
         Megatron-FSDP is responsible for storing all required DeviceMesh
@@ -635,9 +640,13 @@ class FSDPDistributedIndex:
             return self.hybrid_fsdp_group
         return self.fsdp_group
 
-    def get_fsdp_group(self, is_expert_parallel: bool = False, independent_all_gather: bool = False) -> ProcessGroup:
+    def get_fsdp_group(
+        self, is_expert_parallel: bool = False, independent_all_gather: bool = False
+    ) -> ProcessGroup:
         """Get the FSDP process group."""
         if is_expert_parallel:
+            if independent_all_gather:
+                return self.expt_fsdp_group_ag
             return self.expt_fsdp_group
         if independent_all_gather:
             return self.fsdp_group_ag

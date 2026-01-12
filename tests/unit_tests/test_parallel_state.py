@@ -533,29 +533,54 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
 def test_separate_all_gather_group():
     """Test separate all-gather group for improved communication overlap."""
     # Test without creating AG group (default)
-    Utils.initialize_model_parallel(
-        context_parallel_size=world_size,
-        create_all_gather_group=False,
-    )
+    Utils.initialize_model_parallel(context_parallel_size=world_size, create_all_gather_group=False)
     assert not ps.has_separate_all_gather_group()
     assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is None
     Utils.destroy_model_parallel()
 
     # Test with creating AG group
-    Utils.initialize_model_parallel(
-        context_parallel_size=world_size,
-        create_all_gather_group=True,
-    )
+    Utils.initialize_model_parallel(context_parallel_size=world_size, create_all_gather_group=True)
     assert ps.has_separate_all_gather_group()
     assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is not None
 
     # Verify it returns the correct group
-    ag_group = ps.get_data_parallel_group(
-        with_context_parallel=True, independent_all_gather=True
-    )
+    ag_group = ps.get_data_parallel_group(with_context_parallel=True, independent_all_gather=True)
     regular_group = ps.get_data_parallel_group(
         with_context_parallel=True, independent_all_gather=False
     )
+    assert ag_group is not None
+    assert regular_group is not None
+    # They should have the same ranks but different communicators
+    ag_ranks = torch.distributed.get_process_group_ranks(ag_group)
+    regular_ranks = torch.distributed.get_process_group_ranks(regular_group)
+    assert ag_ranks == regular_ranks
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize('order', test_parallel_order)
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
+def test_separate_expert_all_gather_group(order):
+    """Test separate all-gather group for expert parallelism to enable communication overlap."""
+    # Test without creating expert AG group (default)
+    Utils.initialize_model_parallel(
+        expert_model_parallel_size=world_size, create_all_gather_group=False, order=order
+    )
+    assert not ps.has_separate_expert_all_gather_group()
+    assert ps._EXPERT_DATA_PARALLEL_GROUP_AG is None
+    Utils.destroy_model_parallel()
+
+    # Test with creating expert AG group
+    Utils.initialize_model_parallel(
+        expert_model_parallel_size=world_size, create_all_gather_group=True, order=order
+    )
+    assert ps.has_separate_expert_all_gather_group()
+    assert ps._EXPERT_DATA_PARALLEL_GROUP_AG is not None
+
+    # Verify it returns the correct group
+    ag_group = ps.get_expert_data_parallel_group(independent_all_gather=True)
+    regular_group = ps.get_expert_data_parallel_group(independent_all_gather=False)
     assert ag_group is not None
     assert regular_group is not None
     # They should have the same ranks but different communicators
