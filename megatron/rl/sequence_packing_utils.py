@@ -470,14 +470,14 @@ def create_packed_seq_params_for_bin(
 
     # Build cumulative sequence lengths for actual sequences
     # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
-    cu_seqlens_list = np.cumsum([0] + seq_lengths_in_bin)
+    cu_seqlens_list = np.append(np.cumsum([0] + seq_lengths_in_bin), bin_size)
 
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
 
     # Pad cu_seqlens to bin_size by repeating the last value (creates zero-length ghost sequences)
     # This ensures a fixed tensor size for CUDA graph compatibility
     if len(cu_seqlens) < bin_size:
-        out = cu_seqlens.new_full((bin_size,), cu_seqlens[-1])
+        out = cu_seqlens.new_full((bin_size,), bin_size)
         out[:len(cu_seqlens)] = cu_seqlens
         cu_seqlens = out
 
