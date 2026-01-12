@@ -805,12 +805,12 @@ class TEGroupedMLP(MegatronModule):
             output = fine_grained_offloading_group_commit(
                 output, name="moe_act", forced_released_tensors=[fc1_output]
             )
+        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
             output = self.quantization_unpadding(output, actual_tokens_per_expert)
 
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
         output_bias = None
 
         return output, output_bias
