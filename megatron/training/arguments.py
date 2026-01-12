@@ -2144,6 +2144,10 @@ def _add_rl_args(parser):
 
 def _add_training_args(parser):
     from megatron.training.training_config import TrainingConfig
+    from megatron.training.common_config import ProfilingConfig
+
+    prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["record_shapes", "nvtx_ranges"])
+    prof_group = prof_factory.build_group(parser, "profiling")
 
     train_factory = ArgumentGroupFactory(TrainingConfig)
     group = train_factory.build_group(parser, "training")
@@ -2205,32 +2209,11 @@ def _add_training_args(parser):
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
-    group.add_argument('--profile', action='store_true',
-                       help='Enable nsys profiling. When using this option, nsys '
-                       'options should be specified in commandline. An example '
-                       'nsys commandline is `nsys profile -s none -t nvtx,cuda '
-                       '-o <path/to/output_file> --force-overwrite true '
-                       '--capture-range=cudaProfilerApi '
-                       '--capture-range-end=stop`.')
-    group.add_argument('--profile-step-start', type=int, default=10,
-                       help='Global step to start profiling.')
-    group.add_argument('--profile-step-end', type=int, default=12,
-                       help='Global step to stop profiling.')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--disable-gloo-process-groups', action='store_false',
                        dest='enable_gloo_process_groups',
                        help='Disables creation and usage of Gloo process groups.')
-    group.add_argument('--use-pytorch-profiler', action='store_true',
-                       help='Use the built-in pytorch profiler. '
-                       'Useful if you wish to view profiles in tensorboard.',
-                       dest='use_pytorch_profiler')
-    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
-                       help='Global ranks to profile.')
-    group.add_argument('--record-memory-history', action="store_true", default=False,
-                       help='Record memory history in last rank.')
-    group.add_argument('--memory-snapshot-path', type=str, default="snapshot.pickle",
-                       help='Specifies where to dump the memory history pickle.')
     group.add_argument('--tp-comm-overlap', action='store_true', help='Enables the '
                        ' overlap of Tensor parallel communication and GEMM kernels.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
