@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import tensor_parallel
