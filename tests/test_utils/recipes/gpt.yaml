@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}_{platforms}'
+  name: "{test_case}_{environment}_{platforms}"
   model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
@@ -465,7 +465,7 @@ products:
         scope: [mr]
       - environment: [dev]
         scope: [mr, mr-github, mr-github-slim]
-        platforms: [dgx_h100, dgx_gb200]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
@@ -479,7 +479,7 @@ products:
         scope: [mr]
       - environment: [dev]
         scope: [mr, mr-github, mr-github-slim]
-        platforms: [dgx_h100, dgx_gb200]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone]
     products:
       - environment: [dev]
