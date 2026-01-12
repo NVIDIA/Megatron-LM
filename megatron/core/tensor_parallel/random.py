@@ -451,9 +451,7 @@ def _get_all_rng_states():
     return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker
 
 
-def _set_all_rng_states(
-    cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker, graph_safe: bool = False
-):
+def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker):
     """Set all the rng states."""
     torch.set_rng_state(cpu_rng_state)
     _set_cuda_rng_state(
@@ -634,9 +632,8 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False, cudagraph_capturable=False):
+    def __init__(self, fp8=False):
         self.fp8 = fp8 is not None
-        self.cudagraph_capturable = cudagraph_capturable
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
@@ -656,7 +653,7 @@ class CheckpointWithoutOutput(object):
 
         self.run_function = run_function
 
-        self.rng_states = _get_all_rng_states(self.cudagraph_capturable)
+        self.rng_states = _get_all_rng_states()
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
