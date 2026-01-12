@@ -142,8 +142,8 @@ def assign_ep_resolved_name_inplace(
     to global indices in `resolved_name` and sets `global_expert_index`.
 
     Effects:
-    - Sets `meta.resolved_name` (defaults to `base_name`/`meta.name` for non-EP).
-    - Sets `meta.global_expert_index` for per-expert parameters; otherwise leaves it as `None`.
+    - Sets meta.resolved_name (defaults to base_name/meta.name for non-EP).
+    - Sets meta.global_expert_index for per-expert parameters; otherwise leaves it as None.
     """
     base = meta.name if base_name is None else base_name
     meta.resolved_name = base
@@ -222,12 +222,12 @@ def _resolve_global_layer_number_in_name(
 ) -> str:
     """Rewrite a parameter name to use global layer indices (PP-aware).
 
-    Given a parameter name like `decoder.layers.0.self_attention...`, this function rewrites
-    the `decoder.layers.0` prefix to the corresponding global layer index using the owning
-    layer module's `layer_number`.
+    Given a parameter name like decoder.layers.0.self_attention..., this function rewrites
+    the decoder.layers.0 prefix to the corresponding global layer index using the owning
+    layer module's layer_number.
 
     Implementation:
-    - Build a `{local_prefix -> global_prefix}` map once (outside the per-parameter loop).
+    - Build a {local_prefix -> global_prefix} map once (outside the per-parameter loop).
     - Perform a longest-prefix match replacement so we only rewrite the module path portion.
     """
     if not layer_module_prefix_map:
