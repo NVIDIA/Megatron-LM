@@ -2062,6 +2062,10 @@ def _add_logging_args(parser):
                        help='Path to save the wandb results locally.')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
+    group.add_argument('--log-overload-factor', action='store_true',
+                       help='If set, log MoE router overload factors to tensorboard: '
+                       'avg_overload_factor, max_overload_factor (load imbalance across EP ranks), '
+                       'and max_cum_overload_factor (peak cumulative tokens ratio for memory analysis).')
     return parser
 
 
@@ -3335,6 +3339,11 @@ def _add_moe_args(parser):
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-router-force-load-balancing', action='store_true',
                        help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
+    group.add_argument('--moe-router-force-biased', type=float, default=None,
+                       help='[Experimental] Apply random bias to router logits with shared seed across all ranks. '
+                       'If positive, generates new random bias each forward pass. '
+                       'If negative, generates bias once per layer and reuses it (abs value is std). '
+                       'This experimental feature is for benchmarking purposes only!')
     group.add_argument('--moe-router-padding-for-quantization', action='store_true',
                        help='Pad the routing_map to make sure the number of tokens each expert received '
                        'is a multiple of 16/32 for FP8/FP4 precision. It is suggested to enable this for '

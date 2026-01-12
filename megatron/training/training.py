@@ -1740,6 +1740,7 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+    overload_dict = {}
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -1763,6 +1764,7 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            overload_dict=overload_dict,
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
@@ -1858,6 +1860,13 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
+        if overload_dict:
+            if "avg_overload_factor" in overload_dict:
+                log_string += f' avg overload factor: {overload_dict["avg_overload_factor"]:.3f} |'
+            if "max_overload_factor" in overload_dict:
+                log_string += f' max overload factor: {overload_dict["max_overload_factor"]:.3f} |'
+            if "max_cum_overload_factor" in overload_dict and overload_dict["max_cum_overload_factor"] is not None:
+                log_string += f' max cum overload factor: {overload_dict["max_cum_overload_factor"]:.3f} |'
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
