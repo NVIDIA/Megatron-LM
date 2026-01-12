@@ -54,7 +54,7 @@ class Encoder(object):
     def initializer(self):
         # Use Encoder class as a container for global data
         if self.args.legacy_tokenizer:
-            tokenizer = build_tokenizer(self.args)
+            Encoder.tokenizer = build_tokenizer(self.args)
         else:
             Encoder.tokenizer = build_new_tokenizer(self.args)
         if self.args.split_sentences:
