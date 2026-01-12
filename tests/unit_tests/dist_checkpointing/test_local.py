@@ -1,4 +1,5 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import filecmp
 import logging
 import shutil
@@ -79,11 +80,10 @@ class TestLocalCheckpointing:
         opt_param_scheduler = None
         rng_state = None
         iteration = None
-        metadata = dict(
-            dp_cp_group=parallel_state.get_data_parallel_group(with_context_parallel=True)
-        )
-        model_sd_kwargs = dict(metadata=metadata)
-        optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space', metadata=metadata)
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        metadata = {'distrib_optim_sharding_type': 'fully_reshardable', 'dp_cp_group': dp_cp_group}
+        model_sd_kwargs = dict(metadata={'dp_cp_group': dp_cp_group})
+        optim_sd_kwargs = dict(metadata=metadata)
         mock_args = parse_args(ignore_unknown_args=True)
         mock_args.no_save_optim = False
         mock_args.no_save_rng = True

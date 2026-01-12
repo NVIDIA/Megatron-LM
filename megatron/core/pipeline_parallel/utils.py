@@ -176,6 +176,7 @@ class ScheduleNode:
         self.free_input = free_input
         self.inputs = None
         self.outputs = None
+        self.manual_grads_release = False
         self.delay_grads_release = False
 
     def default_backward_func(self, outputs, output_grad):
@@ -262,7 +263,7 @@ class ScheduleNode:
                     # to avoid delayed garbage collection. If
                     # delay_grads_release is True, dgrad is last used in
                     # wgrad compute and skip the release here.
-                    if not self.delay_grads_release:
+                    if self.manual_grads_release and not self.delay_grads_release:
                         g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
