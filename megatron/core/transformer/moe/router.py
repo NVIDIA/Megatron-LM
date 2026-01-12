@@ -16,6 +16,7 @@ from megatron.core.transformer.moe.moe_utils import (
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
+    save_overload_factor_to_tracker,
     save_to_aux_losses_tracker,
     sinkhorn,
     switch_load_balancing_loss_func,
@@ -48,6 +49,8 @@ class Router(ABC, MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
+        self.tp_ep_group = pg_collection.tp_ep
+        self.dp_group = pg_collection.dp
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
@@ -665,6 +668,19 @@ class TopKRouter(Router):
             )
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        # Log overload factor if enabled
+        if self.config.log_overload_factor:
+            # Compute num_local_experts from config and EP size
+            ep_size = self.tp_ep_group.size() // self.tp_group.size()
+            num_local_experts = self.config.num_moe_experts // ep_size
+            probs = save_overload_factor_to_tracker(
+                tensor=probs,
+                routing_map=routing_map,
+                layer_number=self.layer_number,
+                num_local_experts=num_local_experts,
+                tp_ep_group=self.tp_ep_group,
+                dp_group=self.dp_group,
+            )
 
         return probs, routing_map
 
