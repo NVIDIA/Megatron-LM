@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -12,7 +13,16 @@ from torch.optim import SGD, Adam
 from transformer_engine.pytorch.fp8 import fp8_autocast
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import (
+    ChainedOptimizer,
+    OptimizerConfig,
+    ParamKey,
+    ParamPredicate,
+    _get_param_groups,
+    check_config_overrides_consistency,
+    get_megatron_optimizer,
+)
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
@@ -24,7 +34,7 @@ try:
     from transformer_engine.pytorch.fp8 import check_fp8_block_scaling_support
 
     fp8_block_scaling_available, reason_for_no_fp8_block_scaling = check_fp8_block_scaling_support()
-    from transformer_engine.common.recipe import Float8BlockScaling, Format
+    from transformer_engine.common.recipe import DelayedScaling, Float8BlockScaling, Format
 except:
     fp8_block_scaling_available = False
     reason_for_no_fp8_block_scaling = "FP8 block scaled GEMM requires Hopper and CUDA >= 12.9."
@@ -52,6 +62,148 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_no_overrides(mock_get_world_size):
+    net = Net()
+    # NOTE: to get no overrides, supply an empty dictionary rather than None.
+    param_groups = _get_param_groups([net], OptimizerConfig(optimizer='adam', lr=0.01), {})
+    assert len(param_groups) == 1
+    pg0 = param_groups[0]
+    assert pg0.keys() == {
+        'params',
+        'is_expert_parallel',
+        'default_config',
+        'wd_mult',
+        'lr_mult',
+        'is_decoupled_lr',
+        'max_lr',
+        'min_lr',
+    }
+    assert pg0['params'] == list(net.parameters())
+    assert pg0['is_expert_parallel'] == False
+    assert pg0['default_config'] == True
+    assert pg0['wd_mult'] == 1.0
+    assert pg0['lr_mult'] == 1.0
+    assert pg0['is_decoupled_lr'] == False
+    assert pg0['max_lr'] == 0.01  # from the optimizer config default for lr
+    assert pg0['min_lr'] is None  # from the optimizer config default.
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_default_overrides(mock_get_world_size):
+    """Test that the default overrides are applied to the parameter groups."""
+    net = Net()
+    # NOTE: to get legacy default overrides, supply None.
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, None)
+    param_groups = _get_param_groups([net], opt_config, None)
+    assert len(param_groups) == 2
+    pg0, pg1 = param_groups
+    wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
+    assert wd_mults == {1.0, 0.0}
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_with_overrides(mock_get_world_size):
+    net = Net()
+    config_overrides = {
+        ParamKey(
+            name="*.bias",
+            predicate=ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1),
+        ): ParamGroupOverride(wd_mult=0.0)
+    }
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups = _get_param_groups([net], opt_config, config_overrides)
+    assert len(param_groups) == 2
+    p_set = set(net.parameters())
+
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params'])
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params'])
+    assert param_groups[0]['wd_mult'] == 0.0 or param_groups[1]['wd_mult'] == 0.0
+    assert param_groups[0]['wd_mult'] == 1.0 or param_groups[1]['wd_mult'] == 1.0
+    assert len(param_groups[0]['params']) > 0 and len(param_groups[1]['params']) > 0
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_multiple_matches(mock_get_world_size):
+    net = Net()
+
+    param_groups = _get_param_groups(
+        [net],
+        OptimizerConfig(optimizer='adam', lr=0.01),
+        {
+            ParamKey(name="*.bias"): ParamGroupOverride(min_lr=1e-4, wd_mult=0.0),
+            ParamKey(
+                predicate=ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1)
+            ): ParamGroupOverride(wd_mult=0.0, min_lr=1e-4),
+        },
+    )
+    config_overrides = {
+        ParamKey(
+            name="*.bias",
+            predicate=ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1),
+        ): ParamGroupOverride(min_lr=1e-4, wd_mult=0.0)
+    }
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups2 = _get_param_groups([net], opt_config, config_overrides)
+    assert len(param_groups) == 2
+    assert param_groups == param_groups2
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_overlapping_matches(mock_get_world_size):
+    """In this test, we see if we can have two matches that create three param groups."""
+    net = Net()
+    # We expect that all convolution parameters will have wd_mult=0.0
+    #  However the conv1 related parameters will additionally have a different LR schedule.
+    #  this should create three param groups (no match, conv1 (both wd_mult=0.0 and LR schedule), conv2 (only wd_mult=0.0))
+    config_overrides = {
+        ParamKey(name="*conv*"): ParamGroupOverride(wd_mult=0.0),
+        ParamKey(name="*conv1*"): ParamGroupOverride(min_lr=10, max_lr=20),
+    }
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups = _get_param_groups([net], opt_config, config_overrides)
+    assert len(param_groups) == 3
+    p_set = set(net.parameters())
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params']) | set(
+        param_groups[2]['params']
+    )
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params']) + len(
+        param_groups[2]['params']
+    )
+    assert (
+        param_groups[0]['wd_mult'] == 1.0
+    ), "We expect the first param group to be the None one, which should have wd_mult=1.0"
+    assert (
+        param_groups[1]['wd_mult'] == 0.0
+    ), "We expect the second param group to be the conv1 one, which should have wd_mult=0.0"
+    assert (
+        param_groups[2]['wd_mult'] == 0.0
+    ), "We expect the third param group to be the conv2 one, which should have wd_mult=0.0"
+    assert param_groups[1]['min_lr'] == 10
+    assert param_groups[1]['max_lr'] == 20
+    assert param_groups[2]['min_lr'] is None
+    assert param_groups[2]['max_lr'] == 0.01
 
 
 def test_chained_optimizer():

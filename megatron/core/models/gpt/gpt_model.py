@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
@@ -21,7 +21,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossAutoScaler,
     MTPLossLoggingHelper,
@@ -33,7 +33,11 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import WrappedTensor, deprecate_inference_params
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    is_using_quantization_scales,
+)
 
 
 class GPTModel(LanguageModule):
@@ -371,7 +375,7 @@ class GPTModel(LanguageModule):
             and (
                 (
                     self.config.cuda_graph_impl == "local"
-                    and self.config.cuda_graph_scope != "full_iteration"
+                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
                 )
                 or self.config.flash_decode
             )
@@ -386,11 +390,19 @@ class GPTModel(LanguageModule):
         else:
             sequence_len_offset = None
 
-        # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
-        # reference held by this caller function, enabling early garbage collection for
-        # inference. Skip wrapping if decoder_input is logged after decoder completion.
-        if in_inference_mode and not has_config_logger_enabled(self.config):
-            decoder_input = WrappedTensor(decoder_input)
+        if in_inference_mode:
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations
+            if inference_context.is_dynamic_batching() and is_using_quantization_scales(
+                self.config
+            ):
+                decoder_input[inference_context.padding_slice] = 0.0
+
+            # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
+            # reference held by this caller function, enabling early garbage collection for
+            # inference. Skip wrapping if decoder_input is logged after decoder completion.
+            if not has_config_logger_enabled(self.config):
+                decoder_input = WrappedTensor(decoder_input)
 
         preproc_output = (
             decoder_input,

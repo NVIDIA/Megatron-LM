@@ -16,11 +16,11 @@ The figures below illustrate the distributed optimizer's sharding scheme, and th
 
 ## Data flow
 
-![Data flow](../images/distrib_optimizer/data_flow.png)
+![Data flow](../../images/distrib_optimizer/data_flow.png)
 
 ## Sharding scheme
 
-![Sharding scheme](../images/distrib_optimizer/sharding_scheme.png)
+![Sharding scheme](../../images/distrib_optimizer/sharding_scheme.png)
 
 ## Key steps
 

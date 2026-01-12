@@ -4,7 +4,7 @@ ARG PIP_CONSTRAINT=
 
 WORKDIR /workspace/nmm-sandbox
 
-RUN pip install jsonlines omegaconf
+RUN pip install omegaconf
 RUN pip install flask flask_restful fire nltk
 RUN pip install tiktoken blobfile
 

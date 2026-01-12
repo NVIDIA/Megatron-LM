@@ -120,6 +120,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
             block_size_tokens=args.inference_dynamic_batching_block_size,
             tensor_model_parallel_size=args.tensor_model_parallel_size,
+            pipeline_model_parallel_size=args.pipeline_model_parallel_size,
             materialize_only_last_token_logits=not args.return_log_probs,
             mamba_inference_state_config=mamba_inference_state_config,
             cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
