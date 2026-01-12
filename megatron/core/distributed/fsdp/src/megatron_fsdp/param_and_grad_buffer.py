@@ -1677,10 +1677,6 @@ class ParamAndGradBuffer:
             if groups is None:
                 # data parallel group is a default group for user buffer registration
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
-                ag_group = self.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True)
-                if ag_group is not None:
-                    # All-gather group used when overlapping all-gather and gradient reduction.
-                    groups.append(ag_group)
 
             if NCCL_ALLOCATOR == "MCORE":
                 if self.ddp_config.fsdp_manual_registration:
