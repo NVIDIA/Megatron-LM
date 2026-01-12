@@ -140,17 +140,18 @@ device_mesh = torch.distributed.device_mesh.init_device_mesh(
 # This sub-mesh can be provided to distributed samplers or dataloaders.
 device_mesh[("dp_outer", "dp_shard")]._flatten("dp")
 # Only required if using CP. Otherwise, just pass dp_shard to FSDP.
-device_mesh[("dp_shard", "cp")]._flatten("dp_shard_cp")
+device_mesh[("dp_shard", "cp")]._flatten("dp_cp")
 # Only required if using HSDP. Otherwise, don't pass hybrid_fsdp_group.
 device_mesh[("dp_outer", "dp_shard", "cp")]._flatten("hsdp")
 hsdp_group = device_mesh["hsdp"].get_group()
-# Initialize DeviceMesh for expert parallel (EP) modules when using HSDP + EP.
+# Initialize DeviceMesh for expert parallel (EP) modules when using FSDP + EP.
 expert_device_mesh = torch.distributed.device_mesh.init_device_mesh(
     "cuda",
     mesh_shape=(dp_outer_size, expt_dp_shard_size, expt_tp_size),
-    mesh_dim_names=("dp_outer", "dp_shard_cp", "tp"),
+    mesh_dim_names=("dp_outer", "dp_cp", "tp"),
 )
-hsdp_expt_group = expert_device_mesh[("dp_outer", "dp_shard_cp")].get_group()
+expert_device_mesh[("dp_outer", "dp_cp")].flatten("hsdp")
+hsdp_expt_group = expert_device_mesh["hsdp"].get_group()
 """
 Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
 class that schedules the sharding lifecycle of the model parameters and gradients
@@ -166,7 +167,7 @@ model = fully_shard_model(
     # Device Mesh
     device_mesh=device_mesh
     # Always required for FSDP or HSDP.
-    dp_shard_dim="dp_shard_cp",
+    dp_shard_dim="dp_cp",
     # Set this required argument to use HSDP instead of FSDP. Otherwise, set this to None.
     dp_outer_dim="dp_outer",
     # Only required for TP-sensitive models (i.e. Megatron-LM / TransformerEngine)
@@ -262,7 +263,7 @@ optimizer.load_state_dict(ckpt_state_dict["optimizer"])
   - `tp_dim` is the name of the sub-mesh used for tensor parallelism (TP), which is required for `(FSDP, TP)`-strided sharding when using Megatron-LM or Torch-native `DTensor` TP.
     - For more information about tensor parallelism, refer to: [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053).
   - `hybrid_fsdp_group` is the `ProcessGroup` which contains all ranks in the flattened `dp_shard_dim` and `dp_outer_dim` sub-meshes utilized to specify the `(DP-Outer, DP-Shard)` sharded mesh coordinates for the weight and gradient buffers. Required for HSDP.
-  - `hybrid_fsdp_expt_group` is the equivalent `ProcessGroup` for Expert Parallel (EP) modules. It also contains all ranks from these flattened sub-meshes to establish the same `(DP-Outer, DP-Shard)` sharding coordinates and is required for combined HSDP + EP.
+  - `hybrid_fsdp_expt_group` defines the data-parallel communication group for expert parameters. It is required for HSDP.
 - `expt_device_mesh` is another [`torch.distributed.DeviceMesh`](https://docs.pytorch.org/docs/stable/distributed.html#devicemesh) tailored for the expert parallel (EP) modules in `MegatronFSDP`.
   - `dp_shard_dim` is the name of the sub-mesh required for FSDP sharding of the EP modules, enabling expert data parallelism (EDP).
   - `tp_dim` is the name of the sub-mesh used for expert tensor parallelism (ETP), which is required for `(FSDP, ETP)`-strided sharding when using Megatron-LM or Torch-native `DTensor` ETP.
