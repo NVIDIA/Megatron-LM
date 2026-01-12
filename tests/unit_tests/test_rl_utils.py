@@ -32,7 +32,6 @@ class MockModel(LanguageModule):
         self.seq = seq
         self.vocab = vocab
         # Minimal pg_collection stub for `rl_utils.get_logprobs()`.
-        # RL models always have a pg_collection; pp may be None (treated as PP=1).
         self.pg_collection = SimpleNamespace(pp=None)
         self.config = TransformerConfig(num_attention_heads=1, num_layers=1)
         self.model_type = ModelType.encoder_or_decoder

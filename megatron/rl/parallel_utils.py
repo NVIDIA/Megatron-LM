@@ -32,9 +32,9 @@ def build_inference_pg_collection(
         world_size: Total world size (number of ranks).
         tp_size: Tensor model parallel size for the inference model. Defaults to current MPU value if None.
         pp_size: Pipeline parallel size. Defaults to current MPU value if None.
-        use_tp_pp_dp_mapping: If True, use 'tp-cp-ep-pp-dp' order; otherwise 'tp-cp-ep-dp-pp'.
         cp_size: Context parallel size. Defaults to current MPU value if None.
         ep_size: Expert parallel size. Defaults to current MPU value if None.
+        use_tp_pp_dp_mapping: If True, use 'tp-cp-ep-pp-dp' order; otherwise 'tp-cp-ep-dp-pp'.
 
     Returns:
         ProcessGroupCollection configured for the inference model.

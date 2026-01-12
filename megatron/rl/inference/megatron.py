@@ -154,8 +154,7 @@ def get_dynamic_inference_engine(
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
-        # TP/PP sizes are derived from the model's pg_collection.
-        pg_collection=pg_collection,
+        pg_collection=pg_collection,  # TP/PP sizes are derived from the model's pg_collection.
         materialize_only_last_token_logits=True,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,

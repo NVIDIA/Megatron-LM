@@ -2119,7 +2119,7 @@ def _add_rl_args(parser):
         '--rl-inference-pipeline-model-parallel-size',
         type=int,
         default=None,
-        help='Degree of pipeline model parallelism for the separate RL inference model.',
+        help='Degree of pipeline model parallelism for inference for RL.',
     )
     group.add_argument(
         '--rl-inference-model-unified-memory-level',

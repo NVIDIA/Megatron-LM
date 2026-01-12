@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -176,27 +176,31 @@ def assign_ep_resolved_name_inplace(
 
 
 def assign_resolved_name_inplace(
-    meta: ParameterMetadata, *, module: torch.nn.Module | None = None, base_name: str | None = None
+    meta: ParameterMetadata,
+    *,
+    layer_module_prefix_map: Mapping[str, str] | None = None,
+    base_name: str | None = None,
 ) -> None:
-    """Set `meta.resolved_name` so the planner can match the same weights across models.
+    """Set meta.resolved_name so the planner can match the same weights across models.
 
-    It rewrites PP layer indices to global layer indices (when `module` is provided) and
-    rewrites EP per-expert indices (`weightK`/`biasK`) to global expert indices.
+    It rewrites PP layer indices to global layer indices (when layer_module_prefix_map is
+    provided) and
+    rewrites EP per-expert indices (weightK/biasK) to global expert indices.
     """
     name = meta.name if base_name is None else base_name
-    if module is not None:
-        name = _resolve_global_layer_number_in_name(name, module)
+    if layer_module_prefix_map:
+        name = _resolve_global_layer_number_in_name(name, layer_module_prefix_map)
     assign_ep_resolved_name_inplace(meta, base_name=name)
 
 
 def _build_layer_module_prefix_map(module: torch.nn.Module) -> dict[str, str]:
-    """Build a mapping `{local_module_prefix -> global_module_prefix}` for PP layer modules.
+    """Build a mapping local_module_prefix -> global_module_prefix for PP layer modules.
 
-    Megatron assigns a *global*, 1-indexed `layer_number` to each transformer layer module at
+    Megatron assigns a global, 1-indexed layer_number to each transformer layer module at
     construction time (including PP/VPP/layout offsets). We convert that to the 0-indexed naming
     convention used in parameter names and build a map such as:
 
-    - `"decoder.layers.0"` → `"decoder.layers.16"`  (if `layer_number == 17`)
+    - "decoder.layers.0" → "decoder.layers.16"  (if layer_number == 17)
     """
     prefix_map: dict[str, str] = {}
     for module_name, submodule in module.named_modules():
@@ -213,7 +217,9 @@ def _build_layer_module_prefix_map(module: torch.nn.Module) -> dict[str, str]:
     return prefix_map
 
 
-def _resolve_global_layer_number_in_name(name: str, module: torch.nn.Module) -> str:
+def _resolve_global_layer_number_in_name(
+    name: str, layer_module_prefix_map: Mapping[str, str]
+) -> str:
     """Rewrite a parameter name to use global layer indices (PP-aware).
 
     Given a parameter name like `decoder.layers.0.self_attention...`, this function rewrites
@@ -221,21 +227,16 @@ def _resolve_global_layer_number_in_name(name: str, module: torch.nn.Module) -> 
     layer module's `layer_number`.
 
     Implementation:
-    - Cache a `{local_prefix -> global_prefix}` map on the root module.
+    - Build a `{local_prefix -> global_prefix}` map once (outside the per-parameter loop).
     - Perform a longest-prefix match replacement so we only rewrite the module path portion.
     """
-    prefix_map = getattr(module, '_reshard_layer_module_prefix_map', None)
-    if prefix_map is None:
-        prefix_map = _build_layer_module_prefix_map(module)
-        setattr(module, '_reshard_layer_module_prefix_map', prefix_map)
-
-    if not prefix_map:
+    if not layer_module_prefix_map:
         return name
 
     parts = name.split('.')
     for i in range(len(parts), 0, -1):
         prefix = '.'.join(parts[:i])
-        mapped = prefix_map.get(prefix)
+        mapped = layer_module_prefix_map.get(prefix)
         if mapped is None:
             continue
         rest = '.'.join(parts[i:])
@@ -249,7 +250,7 @@ def extract_param_metadata(
     owner_rank: int,
     pg_collection,
     num_experts: Optional[int] = None,
-    module: Optional[torch.nn.Module] = None,
+    layer_module_prefix_map: Mapping[str, str] | None = None,
 ) -> ParameterMetadata:
     """Extract metadata from a parameter for cross-rank communication."""
     # TP flags from attributes (set by Megatron linear layers)
@@ -311,7 +312,9 @@ def extract_param_metadata(
         data_parallel_group_ranks=data_parallel_group_ranks,
         pipeline_parallel_group_ranks=pipeline_parallel_group_ranks,
     )
-    assign_resolved_name_inplace(meta, module=module, base_name=param_name)
+    assign_resolved_name_inplace(
+        meta, layer_module_prefix_map=layer_module_prefix_map, base_name=param_name
+    )
 
     return meta
 

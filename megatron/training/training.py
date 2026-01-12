@@ -113,6 +113,7 @@ from megatron.core.parallel_state import (
     update_pg_timeout
 )
 from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.resharding.refit import swap_model_weights
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
@@ -873,9 +874,17 @@ def pretrain(
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
         if getattr(args, 'perform_rl_step', False):
+            rl_eval_model = model
+            if inference_model is not None:
+                inf_core = unwrap_model(inference_model[0])
+                # If separate inference and training models, swap training weights
+                # back to the inference model for RL evaluation.
+                rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
+                swap_model_weights(model, inference_model, args.refit_method)
+                rl_eval_model = inference_model
             rl_utils.evaluate_and_print_results_rl(
                 valid_data_iterator,
-                inference_model if inference_model is not None else model,
+                rl_eval_model,
                 optimizer,
                 iteration, write_to_tensorboard=not args.skip_train
             )
@@ -2611,11 +2620,23 @@ def train(
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
             if getattr(args, 'perform_rl_step', False):
+                rl_eval_model = model
+                # If separate inference and training models, swap training weights
+                # back to the inference model for RL evaluation.
+                if inference_model is not None:
+                    inf_core = unwrap_model(inference_model[0])
+                    rl_utils._maybe_prefetch_separate_inference_model_weights(
+                        inf_core, to_cpu=False
+                    )
+                    swap_model_weights(model, inference_model, args.refit_method)
+                    rl_eval_model = inference_model
                 rl_utils.evaluate_and_print_results_rl(
                     valid_data_iterator,
-                    inference_model if inference_model is not None else model,
+                    rl_eval_model,
                     optimizer,
-                                       iteration, write_to_tensorboard=True)
+                    iteration,
+                    write_to_tensorboard=True,
+                )
             else:
                 evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
