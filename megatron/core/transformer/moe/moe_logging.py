@@ -34,6 +34,7 @@ class _MetricEntry:
     reduce_group: Optional[torch.distributed.ProcessGroup] = None
     avg_group: Optional[torch.distributed.ProcessGroup] = None
     percentiles: Optional[List[float]] = None  # e.g., [0.5, 0.95] for p50, p95
+    reduce_group_has_dp: bool = False  # Whether the reduce group has data parallel ranks
 
 
 class MoEMetricsTracker:
@@ -74,6 +75,7 @@ class MoEMetricsTracker:
         reduce_group: Optional[torch.distributed.ProcessGroup] = None,
         avg_group: Optional[torch.distributed.ProcessGroup] = None,
         percentiles: Optional[List[float]] = None,
+        reduce_group_has_dp: bool = False,
     ) -> None:
         """Record a metric value for a specific layer.
 
@@ -87,6 +89,7 @@ class MoEMetricsTracker:
             reduce_group: Process group for all-reduce operations.
             avg_group: Process group for averaging operations.
             percentiles: List of percentiles to compute (e.g., [0.5, 0.95] for p50, p95).
+            reduce_group_has_dp: Whether the reduce group has data parallel ranks.
         """
         if layer_number is None:
             return
@@ -99,6 +102,7 @@ class MoEMetricsTracker:
         entry.reduce_group = reduce_group
         entry.avg_group = avg_group
         entry.percentiles = percentiles
+        entry.reduce_group_has_dp = reduce_group_has_dp
 
     def track(
         self,
@@ -182,6 +186,7 @@ class MoEMetricsTracker:
 
         Args:
             names: Metric name(s) to reduce. If None, reduces all metrics.
+            pg_collection: Optional process group collection for custom groups.
         """
         names_list = self._resolve_names(names)
         if pg_collection is None:
@@ -202,24 +207,24 @@ class MoEMetricsTracker:
             values = entry.values
 
             # Collect aux losses across PP
-            torch.distributed.all_reduce(
-                values, group=parallel_state.get_pipeline_model_parallel_group()
-            )
+            torch.distributed.all_reduce(values, group=pp_group)
+
             # Reduce aux losses across custom reduce_group
             if entry.reduce_group is not None:
                 torch.distributed.all_reduce(values, group=entry.reduce_group)
+                # Need to conduct reduction across data parallel ranks. When the reduce_group
+                # does not have 'dp' attribute, do it manually.
+                if not entry.reduce_group_has_dp:
+                    torch.distributed.all_reduce(
+                        values,
+                        group=parallel_state.get_data_parallel_group(with_context_parallel=False),
+                        op=torch.distributed.ReduceOp.AVG,
+                    )
+
             # Average aux losses across custom avg_group
             if entry.avg_group is not None:
                 torch.distributed.all_reduce(
                     values, group=entry.avg_group, op=torch.distributed.ReduceOp.AVG
-                )
-            # Average across data parallel ranks
-            # global_load_balancing_loss already uses tp_dp_cp_group in reduce_group
-            if name != "global_load_balancing_loss":
-                torch.distributed.all_reduce(
-                    values,
-                    group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-                    op=torch.distributed.ReduceOp.AVG,
                 )
 
     def get_log_string(self, aggregated: Dict[str, float]) -> str:
@@ -265,6 +270,7 @@ class MoEMetricsTracker:
                 "reduce_group": entry.reduce_group,
                 "avg_group": entry.avg_group,
                 "percentiles": entry.percentiles,
+                "reduce_group_has_dp": entry.reduce_group_has_dp,
             }
             for name, entry in self._metrics.items()
         }
