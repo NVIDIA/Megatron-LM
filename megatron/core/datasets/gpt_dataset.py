@@ -3,7 +3,7 @@
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil
 from typing import Dict, Optional, Tuple
 
@@ -54,6 +54,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """If provided, the sequence and document counts for each dataset. 
        Check --per-dataset-sequences-path
     """
+
+    token_dtype_code: Optional[int] = field(init=False, default=None)
+    """The dtype code for the token ids. 4 for int32, 8 for uint16."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -161,15 +164,17 @@ class GPTDataset(MegatronDataset):
                 ),
             )
         sequences_per_dataset = None
+        token_dtype_code = None
         if config.sequences_per_dataset:
             sequences_per_dataset = config.sequences_per_dataset[dataset_path]
+            token_dtype_code = config.token_dtype_code
         return IndexedDataset(
             dataset_path,
             multimodal=False,
             mmap=config.mmap_bin_files,
             fast_cache_load=config.fast_cache_load,
             sequences_per_dataset=sequences_per_dataset,
-            dtype_code=config.token_dtype_code,
+            dtype_code=token_dtype_code,
         )
 
     def __len__(self) -> int:
