@@ -6,7 +6,7 @@ ETP=${ETP:-1}
 NODES_REQUIRED=${NODES_REQUIRED:-4}
 LLM="nemotron6_3b_moe"
 
-ROOT_DIR="/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6"
+ROOT_DIR="/lustre/fsw/portfolios/llmservice/users/jbarker/workspace/checkpoints/nemotron6"
 
 CHECKPOINT="${ROOT_DIR}/3b_hybrid_moe/checkpoints/phase2_lc_reinit_emb/"
 
