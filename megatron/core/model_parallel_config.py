@@ -147,7 +147,7 @@ class ModelParallelConfig:
     ###################
     # Optimizations
     ###################
-    gradient_accumulation_fusion: bool = False
+    gradient_accumulation_fusion: bool = True
     """If true, fuses weight gradient accumulation to GEMMs. Requires the custom CUDA extension
        fused_weight_gradient_mlp_cuda module. To use gradient_accumulation_fusion you must install
        APEX with --cpp_ext and --cuda_ext. For example: "pip install --global-option=\"--cpp_ext\"
@@ -155,7 +155,7 @@ class ModelParallelConfig:
        must turn off gradient accumulation fusion.
     """
 
-    async_tensor_model_parallel_allreduce: bool = False
+    async_tensor_model_parallel_allreduce: bool = True
     """NOTE: Deprecated. This flag is ignored."""
 
     use_te_rng_tracker: bool = field(
@@ -276,7 +276,9 @@ class ModelParallelConfig:
         should only be set if the sequence length varies by microbatch within a global batch.
     """
 
-    overlap_p2p_comm: bool = False
+    overlap_p2p_comm: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-overlap-p2p-communication"]}}
+    )
     """When True some of the peer to peer communication for pipeline parallelism will overlap with
        computation. Must be False if batch_p2p_comm is true.
     """

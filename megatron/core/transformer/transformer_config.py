@@ -285,7 +285,7 @@ class TransformerConfig(ModelParallelConfig):
     """If true, scale Q * K^T by 1 / layer-number. This improve numeric stability when training with
     fp16. Also sets `attention_softmax_in_fp32` to True."""
 
-    attention_softmax_in_fp32: bool = True
+    attention_softmax_in_fp32: bool = False
     """If True, run attention masking and softmax in fp32. This should be True if
     apply_query_key_layer_scaling is True."""
 
@@ -299,10 +299,10 @@ class TransformerConfig(ModelParallelConfig):
     bias_activation_fusion: bool = False
     """If True, fuses bias addition and the activation function when possible."""
 
-    masked_softmax_fusion: bool = False
-    """If True, uses softmax fusion."""
+    masked_softmax_fusion: bool = True
+    """Controls fusion of query_key_value scaling, masking, and softmax."""
 
-    persist_layer_norm: bool = False
+    persist_layer_norm: bool = True
     """If True, uses the persistent fused layer norm kernel. This kernel only supports a fixed set
     of hidden sizes."""
 
@@ -310,10 +310,12 @@ class TransformerConfig(ModelParallelConfig):
     """If True, and using local layers (not from TransformerEngine), tells Apex to use the memory
     efficient fused LayerNorm kernel. Ignored if not using LayerNorm."""
 
-    bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
+    bias_dropout_fusion: bool = True  # TODO: this should be bias_dropout_add_fusion?
     """If True, uses bias dropout fusion."""
 
-    apply_rope_fusion: bool = False
+    apply_rope_fusion: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-rope-fusion"]}}
+    )
     """If True, use fused RoPE kernel."""
 
     use_fused_weighted_squared_relu: bool = False
@@ -350,7 +352,7 @@ class TransformerConfig(ModelParallelConfig):
     the number of transformer layers to recompute within each pipeline stage.  Must be None for
     'selective' activation checkpointing."""
 
-    distribute_saved_activations: Optional[bool] = None
+    distribute_saved_activations: Optional[bool] = False
     """If True, distribute recomputed activations across the model parallel group."""
 
     recompute_modules: Optional[List[str]] = None
