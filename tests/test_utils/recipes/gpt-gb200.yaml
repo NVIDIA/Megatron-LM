@@ -6,7 +6,7 @@ spec:
   name: "{test_case}_{environment}_{platforms}"
   model: gpt
   build: mcore-pyt-{environment}
-  nodes: 1
+  nodes: 2
   gpus: 4
   n_repeat: 5
   platforms: dgx_a100
