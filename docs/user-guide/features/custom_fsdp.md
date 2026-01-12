@@ -52,7 +52,7 @@ The design of Custom FSDP draws inspiration from PyTorch FSDP [Zhao, Yanli, et a
 
 > When training with FSDP, the GPU memory footprint is smaller than when training with DDP across all workers. This makes the training of some very large models feasible by allowing larger models or batch sizes to fit on device. This comes with the cost of increased communication volume. The communication overhead is reduced by internal optimizations like overlapping communication and computation.
 
-![FSDP workflow](../images/custom_fsdp/FSDP_workflow.png)
+![FSDP workflow](../../images/custom_fsdp/FSDP_workflow.png)
 
 *Notice that the unit processed in workflow here is the “FSDP instance 1: N layers”, where an FSDP instance is the smallest FSDP processing unit (also a PyTorch module), which means that we can safely release this module weights after using it (executing the forward or backward of this module), and there will be no other computations computations relying on these weights. This capability is the foundation of FSDP's layer-by-layer execution and memory-saving strategy. An FSDP instance is also referred to as an **FSDP Unit**.*
 
@@ -76,13 +76,13 @@ In backward path
 
 One way to view FSDP’s sharding is to decompose the DDP gradient all-reduce into reduce-scatter and all-gather. Specifically, during the backward pass, FSDP reduces and scatters gradients, ensuring that each rank possesses a shard of the gradients. Then it updates the corresponding shard of the parameters in the optimizer step. Finally, in the subsequent forward pass, it performs an all-gather operation to collect and combine the updated parameter shards.
 
-![FSDP Allreduce](../images/custom_fsdp/FSDP_Allreduce.png)
+![FSDP Allreduce](../../images/custom_fsdp/FSDP_Allreduce.png)
 
 ### 2. Custom FSDP underlying data structure
 
 To implement the FSDP functionality described above, the custom FSDP is designed with the following Python classes and data structure:
 
-![MCore Custom FSDP Class Diagram](../images/custom_fsdp/MCore_Custom_FSDP_Class_Diagram.png)
+![MCore Custom FSDP Class Diagram](../../images/custom_fsdp/MCore_Custom_FSDP_Class_Diagram.png)
 
 ### 3. The custom FSDP interface: FullyShardedDataParallel
 
