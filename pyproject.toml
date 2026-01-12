@@ -30,7 +30,6 @@ keywords = [
     "gpu",
     "language",
     "learning",
-    "learning",
     "machine",
     "nvidia",
     "pytorch",
@@ -61,7 +60,7 @@ classifiers = [
 
 [project.urls]
 Download = "https://github.com/NVIDIA/Megatron-LM/releases"
-Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
+Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 [project.optional-dependencies]
 mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
@@ -185,7 +184,7 @@ emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizer
 [tool.isort]
 profile = "black"                                                          # black-compatible
 line_length = 100                                                          # should match black parameters
-py_version = 310                                                           # python 3.8 as a target version
+py_version = 310                                                           # python 3.10 as a target version
 known_first_party = ["megatron"]                                           # FIRSTPARTY section
 known_third_party = ["transformer_engine"]                                 # THIRDPARTY section
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
@@ -195,7 +194,7 @@ extend_skip = ["setup.py"]
 [tool.black]
 line_length = 100
 skip_string_normalization = true
-# recongized by future versions, disallows to reformat code with incompatible versions
+# recognized by future versions, disallows to reformat code with incompatible versions
 # Matches NeMO version so people working on both codebases don't need two different version of black installed
 required_version = "24"
 skip_magic_trailing_comma = true

@@ -30,7 +30,6 @@ keywords = [
     "gpu",
     "language",
     "learning",
-    "learning",
     "machine",
     "nvidia",
     "pytorch",
@@ -60,7 +59,7 @@ classifiers = [
 
 [project.urls]
 Download = "https://github.com/NVIDIA/Megatron-LM/releases"
-Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
+Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 
 [tool.uv]
