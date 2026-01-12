@@ -22,7 +22,10 @@ def clip_qk(model, log_max_only=False) -> float:
         for model_chunk in model:
             for transformer_layer in model_chunk.module.module.decoder.layers:
                 if hasattr(transformer_layer.self_attention, 'clip_qk'):
-                    if transformer_layer.self_attention.core_attention.current_max_attn_logits is None:
+                    if (
+                        transformer_layer.self_attention.core_attention.current_max_attn_logits
+                        is None
+                    ):
                         continue
                     torch.distributed.all_reduce(
                         transformer_layer.self_attention.core_attention.current_max_attn_logits,
