@@ -232,25 +232,23 @@ class TestMegatronFsdpFullyShard:
             (2, 2, 1, 2),
         ],
     )
-    @pytest.mark.parametrize("common_args", [
-        {
-            "preserve_fp32_weights": True,
-            "init_model_with_meta_device": True,
-            "torch_compile": True
-        },
-        {
-            "preserve_fp32_weights": False,
-            "init_model_with_meta_device": False,
-            "torch_compile": False
-        }
-    ])
+    @pytest.mark.parametrize(
+        "common_args",
+        [
+            {
+                "preserve_fp32_weights": True,
+                "init_model_with_meta_device": True,
+                "torch_compile": True,
+            },
+            {
+                "preserve_fp32_weights": False,
+                "init_model_with_meta_device": False,
+                "torch_compile": False,
+            },
+        ],
+    )
     def test_fully_shard(
-        self,
-        model_type,
-        dp_shard_strategy,
-        dp_outer_strategy,
-        mesh_dim_config,
-        common_args,
+        self, model_type, dp_shard_strategy, dp_outer_strategy, mesh_dim_config, common_args
     ):
         """
         Test the fully_shard API with different configurations.
