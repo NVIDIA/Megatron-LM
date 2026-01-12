@@ -1,14 +1,12 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-import math
 from contextlib import nullcontext
 from dataclasses import dataclass
-from functools import partial
 from typing import Optional, Tuple, Union
 
 import torch
@@ -23,58 +21,14 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
-from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
-
-
-# https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
-def _init_weights(
-    module,
-    n_layer,
-    initializer_range=0.02,  # Now only used for embedding layer.
-    rescale_prenorm_residual=True,
-    n_residuals_per_layer=1,  # Change to 2 if we have MLP
-):
-    with get_cuda_rng_tracker().fork():
-        if isinstance(module, nn.Linear):
-            if not getattr(module.weight, "_no_reinit", False):
-                nn.init.normal_(module.weight, std=initializer_range)
-            if module.bias is not None:
-                if not getattr(module.bias, "_no_reinit", False):
-                    nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, std=initializer_range)
-
-        for name, p in module.named_parameters():
-            if name in ["conv1d.weight", "out_proj.weight"]:
-                nn.init.kaiming_uniform_(p, a=math.sqrt(5))
-            if name in ["in_proj.weight"]:
-                nn.init.normal_(p, mean=0.0, std=initializer_range)
-
-        if rescale_prenorm_residual:
-            # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
-            #   > A modified initialization which accounts for the accumulation on the
-            #   > residual path with model depth. Scale
-            #   > the weights of residual layers at initialization by a factor of
-            #   > 1/√N where N is the # of residual layers.
-            #   >   -- GPT-2 :: https://openai.com/blog/better-language-models/
-            #
-            # Reference (Megatron-LM):
-            # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/gpt_model.py
-            for name, p in module.named_parameters():
-                if name in ["out_proj.weight", "fc2.weight"]:
-                    # Special Scaled Initialization
-                    nn.init.normal_(
-                        p,
-                        mean=0.0,
-                        std=initializer_range / math.sqrt(n_residuals_per_layer * n_layer),
-                    )
 
 
 @dataclass
@@ -86,6 +40,7 @@ class MambaStackSubmodules:
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
+    moe_layer: Union[ModuleSpec, type] = IdentityOp
 
 
 class MambaStack(MegatronModule):
@@ -139,6 +94,7 @@ class MambaStack(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for MambaStack"
 
         self.pp_group = pg_collection.pp
+        self.tp_group = pg_collection.tp
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -170,6 +126,7 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         residual_in_fp32=residual_in_fp32,
                         layer_number=i + 1 + pp_layer_offset,
+                        pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
@@ -188,6 +145,11 @@ class MambaStack(MegatronModule):
                         layer_number=i + 1,
                         pg_collection=pg_collection,
                     )
+                elif layer_type == LayerSymbols.MOE:
+                    # Transformer layers apply their own pp_layer_offset
+                    layer = build_module(
+                        submodules.moe_layer, config=self.config, layer_number=i + 1
+                    )
                 else:
                     assert False, "unexpected layer_type"
             self.layers.append(layer)
@@ -202,14 +164,6 @@ class MambaStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
-
-        self.apply(
-            partial(
-                _init_weights,
-                n_layer=self.config.num_layers,
-                initializer_range=self.config.init_method_std,
-            )
-        )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
@@ -292,7 +246,7 @@ class MambaStack(MegatronModule):
             (
                 (
                     self.config.cuda_graph_impl == "local"
-                    and self.config.cuda_graph_scope != "full_iteration"
+                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
                 )
                 or self.config.flash_decode
             )
@@ -407,7 +361,11 @@ class MambaStack(MegatronModule):
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, metadata
+                        module,
+                        f'{prefix}{name}.',
+                        sharded_offsets,
+                        metadata,
+                        tp_group=self.tp_group,
                     )
                 )
 

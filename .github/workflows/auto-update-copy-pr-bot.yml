@@ -3,7 +3,7 @@ name: Auto Update Copy PR Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: '0 0 * * *'
 
 jobs:
   auto-update-copy-pr-bot:
@@ -13,6 +13,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.PAT }}
+          ref: main
 
       - name: Fetch list of members in mcore-reviewers team
         shell: bash -euxo pipefail {0}

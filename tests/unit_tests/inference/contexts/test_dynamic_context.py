@@ -5,6 +5,10 @@ import math
 import pytest
 import torch
 
+from megatron.core import parallel_state
+from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -28,6 +32,8 @@ class TestDynamicContext:
 
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
 
+        self.pp_size = pipeline_parallel_size
+
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_parallel_size,
@@ -41,7 +47,7 @@ class TestDynamicContext:
         kv_channels,
         num_attention_heads,
         max_sequence_length,
-        active_buffer_size_gb,
+        buffer_size_gb,
         block_size_tokens,
         max_tokens,
         is_hybrid_model=False,
@@ -50,25 +56,32 @@ class TestDynamicContext:
     ):
         set_rounder(rounder)
 
-        if is_hybrid_model and layer_type_list is None:
-            layer_type_list = [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP]
+        if is_hybrid_model:
+            if layer_type_list is None:
+                layer_type_list = [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP]
+            mamba_conv_states_shape = (544, 4)
+            mamba_ssm_states_shape = (8, 64, 16)
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+            )
+        else:
+            mamba_inference_state_config = None
 
         dynamic_context = DynamicInferenceContext(
             params_dtype=params_dtype,
-            num_layers=num_layers,
+            num_layers=num_layers // self.pp_size,
             kv_channels=kv_channels,
             num_attention_heads=num_attention_heads,
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
-            use_cuda_graphs_for_non_decode_steps=not is_hybrid_model,
-            active_buffer_size_gb=active_buffer_size_gb,
+            use_cuda_graphs_for_non_decode_steps=True,
+            buffer_size_gb=buffer_size_gb,
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=(544, 4),
-            mamba_ssm_states_shape=(8, 64, 16),
+            mamba_inference_state_config=mamba_inference_state_config,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
+            unified_memory_level=0,  # unit tests currently broken with UVM
         )
         return dynamic_context
 
@@ -86,25 +99,27 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
+            rounder=64,
         )
 
         if not is_hybrid_model:
-            assert dynamic_context.block_allocator.total_count == 981
-            assert dynamic_context.block_allocator.active_count == 490
-            assert dynamic_context.max_total_requests == 980
-            assert dynamic_context.max_active_requests == 490
+            assert dynamic_context.block_allocator.total_count == 491
+            assert dynamic_context.block_allocator.active_count == 245
+            assert dynamic_context.max_total_requests == 490
+            # We make max_active_requests divisible by the REQUEST_ROUNDER.
+            assert dynamic_context.max_active_requests == 192
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_metadata is None
         else:
-            assert dynamic_context.block_allocator.total_count == 1111
-            assert dynamic_context.block_allocator.active_count == 555
-            assert dynamic_context.max_total_requests == 1110
-            assert dynamic_context.max_active_requests == 555
+            assert dynamic_context.block_allocator.total_count == 555
+            assert dynamic_context.block_allocator.active_count == 277
+            assert dynamic_context.max_total_requests == 554
+            assert dynamic_context.max_active_requests == 256
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_metadata is not None
@@ -121,7 +136,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
-            active_buffer_size_gb=1.0,
+            buffer_size_gb=1.0,
             block_size_tokens=128,
             max_tokens=None,
         )
@@ -137,7 +152,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
-            active_buffer_size_gb=1.0,
+            buffer_size_gb=1.0,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -161,7 +176,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=128,
-            active_buffer_size_gb=0.01,
+            buffer_size_gb=0.01,
             block_size_tokens=32,
             max_tokens=None,
             rounder=1,
@@ -191,7 +206,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
-            active_buffer_size_gb=0.1,
+            buffer_size_gb=0.1,
             block_size_tokens=128,
             max_tokens=200,  # setting low, but >= context.max_active_requests.
             rounder=1,
@@ -220,7 +235,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=128,
-            active_buffer_size_gb=1.0,
+            buffer_size_gb=1.0,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -280,8 +295,6 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
         if is_hybrid_model:
             assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_idx == -1)
-            assert torch.all(dynamic_context.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
     @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
@@ -293,16 +306,16 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
 
         if is_hybrid_model:
-            expected_memory_blocks = [1106, 1107, 1108, 1109]
+            expected_memory_blocks = [550, 551, 552, 553]
         else:
-            expected_memory_blocks = [976, 977, 978, 979]
+            expected_memory_blocks = [486, 487, 488, 489]
         expected_block_count_avail = expected_memory_blocks[0]
 
         assert (
@@ -342,7 +355,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -366,7 +379,7 @@ class TestDynamicContext:
         assert dynamic_context.request_kv_length_offsets[0] == 0
         assert dynamic_context.request_kv_block_counts[0] == 2
         assert dynamic_context.request_last_kv_block_id[0].item() == (
-            1109 if is_hybrid_model else 979
+            553 if is_hybrid_model else 489
         )
         assert dynamic_context.request_last_kv_block_offset[0].item() == 15
         assert torch.all(
@@ -405,6 +418,159 @@ class TestDynamicContext:
         )
 
     @pytest.mark.internal
+    def test_add_dummy_requests_parallel_populates_state(self):
+        self._setup_model_parallel_group(1, 1)
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=16,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.01,
+            block_size_tokens=4,
+            max_tokens=None,
+        )
+
+        requests = [
+            DynamicInferenceRequest(
+                request_id=100,
+                prompt_tokens=torch.arange(0, 3, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=2, termination_id=7),
+            ),
+            DynamicInferenceRequest(
+                request_id=101,
+                prompt_tokens=torch.arange(3, 9, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=8),
+            ),
+        ]
+
+        lengths = [req.remaining_prompt_length for req in requests]
+        total_tokens = sum(lengths)
+        block_avail_before = dynamic_context.block_allocator.total_avail
+
+        dynamic_context.add_dummy_requests_parallel(requests, count_as_prefill=False)
+
+        assert dynamic_context.active_token_count == total_tokens
+        assert dynamic_context.total_request_count == len(requests)
+        assert dynamic_context.num_prefill_requests == 0
+        assert dynamic_context.block_allocator.total_avail == block_avail_before
+
+        expected_tokens = torch.cat(
+            [torch.arange(0, 3, device='cuda'), torch.arange(3, 9, device='cuda')]
+        )
+        assert torch.equal(dynamic_context.token_to_input_ids[:total_tokens], expected_tokens)
+
+        expected_positions = torch.tensor(
+            [0, 1, 2, 0, 1, 2, 3, 4, 5], device='cuda', dtype=torch.long
+        )
+        assert torch.equal(
+            dynamic_context.token_to_position_in_request[:total_tokens], expected_positions
+        )
+        assert torch.equal(dynamic_context.token_to_pos_ids[:total_tokens], expected_positions)
+
+        expected_request_indices = torch.tensor(
+            [0, 0, 0, 1, 1, 1, 1, 1, 1], device='cuda', dtype=torch.long
+        )
+        assert torch.equal(
+            dynamic_context.token_to_request_idx[:total_tokens], expected_request_indices
+        )
+
+        expected_local = expected_positions % dynamic_context.block_size_tokens
+        assert torch.equal(
+            dynamic_context.token_to_local_position_within_kv_block[:total_tokens], expected_local
+        )
+
+        dummy_block_idx = dynamic_context.block_allocator.dummy_block_idx
+        assert torch.all(dynamic_context.token_to_block_idx[:total_tokens] == dummy_block_idx)
+
+        assert torch.equal(
+            dynamic_context.request_query_lengths[: len(requests)],
+            torch.tensor(lengths, device='cuda', dtype=torch.int32),
+        )
+        assert torch.equal(
+            dynamic_context.request_output_lengths[: len(requests)],
+            torch.tensor([5, 7], device='cuda', dtype=torch.int32),
+        )
+        assert torch.equal(
+            dynamic_context.request_kv_block_counts[: len(requests)],
+            torch.tensor([1, 2], device='cuda', dtype=torch.int32),
+        )
+        assert torch.all(
+            dynamic_context.request_to_kv_block_ids[0, :1] == dummy_block_idx
+        ), "first request should use dummy block"
+        assert torch.all(
+            dynamic_context.request_to_kv_block_ids[1, :2] == dummy_block_idx
+        ), "second request should use dummy blocks"
+        assert torch.all(dynamic_context.request_to_kv_block_ids[:2, 2:] == -1)
+
+        assert torch.all(dynamic_context.request_last_kv_block_id[:2] == dummy_block_idx)
+        assert torch.equal(
+            dynamic_context.request_last_kv_block_offset[:2],
+            torch.tensor([2, 1], device='cuda', dtype=torch.int32),
+        )
+
+        assert torch.equal(
+            dynamic_context.request_metadata["termination_id"][:2],
+            torch.tensor([7.0, 8.0], device='cuda'),
+        )
+
+    @pytest.mark.internal
+    def test_add_dummy_requests_parallel_hybrid_allocates_mamba(self):
+        self._setup_model_parallel_group(1, 1)
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=8,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP, Symbols.ATTENTION],
+        )
+
+        request = DynamicInferenceRequest(
+            request_id=55,
+            prompt_tokens=torch.arange(0, 5, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=9),
+        )
+
+        dynamic_context.add_dummy_requests_parallel([request])
+
+        mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0].item()
+        assert mamba_idx >= 0
+        assert torch.all(dynamic_context.mamba_conv_states[:, mamba_idx] == 0)
+        assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx] == 0)
+
+    @pytest.mark.internal
+    def test_add_dummy_requests_parallel_decode_does_not_count_as_prefill(self):
+        self._setup_model_parallel_group(1, 1)
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=256,
+            buffer_size_gb=0.02,
+            block_size_tokens=4,
+            max_tokens=1_000_000,
+        )
+
+        request = DynamicInferenceRequest(
+            request_id=5,
+            prompt_tokens=torch.arange(0, 1, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=2),
+        )
+
+        dynamic_context.num_prefill_requests = 0
+        dynamic_context.add_dummy_requests_parallel([request], count_as_prefill=False)
+        assert dynamic_context.num_prefill_requests == 0
+
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_update_request(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -415,7 +581,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -438,9 +604,6 @@ class TestDynamicContext:
             active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
         )
         assert dynamic_context.total_request_count == 0
-        if is_hybrid_model:
-            assert torch.all(dynamic_context.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
         # This case would cover all cases
         # 1. Already there will be 2 paused requests
@@ -459,7 +622,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -574,13 +737,13 @@ class TestDynamicContext:
                 dynamic_context.request_to_kv_block_ids[0:10].cpu()
                 == torch.tensor(
                     [
-                        [1099, 1102, -1, -1],
-                        [1100, 1099, -1, -1],
-                        [1104, 1106, -1, -1],
-                        [1105, 1107, -1, -1],
-                        [1103, -1, -1, -1],
-                        [1101, -1, -1, -1],
-                        [1108, -1, -1, -1],
+                        [543, 546, -1, -1],
+                        [544, 543, -1, -1],
+                        [548, 550, -1, -1],
+                        [549, 551, -1, -1],
+                        [547, -1, -1, -1],
+                        [545, -1, -1, -1],
+                        [552, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
@@ -592,13 +755,13 @@ class TestDynamicContext:
                 dynamic_context.request_to_kv_block_ids[0:10].cpu()
                 == torch.tensor(
                     [
-                        [969, 972, -1, -1],
-                        [970, 969, -1, -1],
-                        [974, 976, -1, -1],
-                        [975, 977, -1, -1],
-                        [973, -1, -1, -1],
-                        [971, -1, -1, -1],
-                        [978, -1, -1, -1],
+                        [479, 482, -1, -1],
+                        [480, 479, -1, -1],
+                        [484, 486, -1, -1],
+                        [485, 487, -1, -1],
+                        [483, -1, -1, -1],
+                        [481, -1, -1, -1],
+                        [488, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
@@ -618,7 +781,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -690,7 +853,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -745,11 +908,6 @@ class TestDynamicContext:
         # Verify that all 6 blocks were released by checking the available blocks
         assert dynamic_context.block_allocator.total_avail == initial_available_blocks + 6
 
-        if is_hybrid_model:
-            # All mamba states should be zeroed out
-            assert torch.all(dynamic_context.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states == 0)
-
     @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_mamba_states_cache(self, is_hybrid_model: bool):
@@ -763,7 +921,7 @@ class TestDynamicContext:
                 kv_channels=8,
                 num_attention_heads=2,
                 max_sequence_length=512,
-                active_buffer_size_gb=0.03,
+                buffer_size_gb=0.03,
                 block_size_tokens=128,
                 max_tokens=None,
                 is_hybrid_model=False,
@@ -778,7 +936,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -834,7 +992,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
         )
@@ -888,7 +1046,9 @@ class TestDynamicContext:
         prefill_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
 
         # Call the function for prefill
-        prefill_log_probs = dynamic_context.calculate_log_probs(prefill_logits, prefill_new_tokens)
+        prefill_log_probs, _ = dynamic_context.calculate_log_probs(
+            prefill_logits, prefill_new_tokens
+        )
 
         # Calculate expected prefill log probs for the selected tokens
         expected_prefill_log_probs = (
@@ -926,7 +1086,7 @@ class TestDynamicContext:
             1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
         )
         decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
-        decode_log_probs = dynamic_context.calculate_log_probs(decode_logits, decode_new_tokens)
+        decode_log_probs, _ = dynamic_context.calculate_log_probs(decode_logits, decode_new_tokens)
 
         # Verify the stored decode log probabilities
         expected_decode_log_probs = torch.nn.functional.log_softmax(
@@ -981,7 +1141,7 @@ class TestDynamicContext:
             0, 100, (num_active_requests_mixed_step,), device='cuda'
         ).long()
 
-        mixed_step_log_probs = dynamic_context.calculate_log_probs(
+        mixed_step_log_probs, _ = dynamic_context.calculate_log_probs(
             mixed_step_logits, mixed_step_new_tokens
         )
 
@@ -1041,52 +1201,49 @@ class TestDynamicContext:
                 current_global_token_offset += expected_len
 
     @pytest.mark.internal
-    def test_unified_memory(self):
+    def test_pipeline_parallel_uneven_layers(self):
+        """
+        Test that DynamicInferenceContext synchronizes the total block count across
+        pipeline stages when they have unequal layer counts.
+        """
+        pp_size = 2
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=pp_size)
 
-        from megatron.core.inference.unified_memory import (
-            UnifiedMemoryUnsupportedError,
-            create_unified_mempool,
-        )
+        rank = parallel_state.get_pipeline_model_parallel_rank()
 
-        # Check UVM support.
-        try:
-            create_unified_mempool()
-        except UnifiedMemoryUnsupportedError:
-            pytest.skip("Unified memory not available due to bad environment.")
-
-        # Setup.
-        self._setup_model_parallel_group(1, 1)
-
-        # Compute number of contexts needed to fill GPU memory.
-        gpu_size_gb = (
-            torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024**3
-        )
-        active_buffer_size_gb = 20
-        num_contexts = math.ceil(gpu_size_gb / active_buffer_size_gb) + 1
-
-        # Allocate enough contexts to fill GPU memory.
-        def init_contexts(*, unified_memory_level):
-            contexts = []
-            for i in range(num_contexts):
-                contexts.append(
-                    DynamicInferenceContext(
-                        params_dtype=torch.float32,
-                        num_layers=64,
-                        kv_channels=16,
-                        num_attention_heads=4,
-                        max_sequence_length=512,
-                        active_buffer_size_gb=active_buffer_size_gb,
-                        unified_memory_level=unified_memory_level,
-                    )
-                )
-
-        # Pure GPU memory test should OOM.
-        try:
-            init_contexts(unified_memory_level=0)
-        except torch.OutOfMemoryError:
-            pass
+        if rank == 0:
+            local_num_layers = 12
         else:
-            raise Exception("expected OOM.")
+            local_num_layers = 4
 
-        # Unified memory test should succeed.
-        init_contexts(unified_memory_level=1)
+        context = DynamicInferenceContext(
+            params_dtype=torch.float32,
+            num_layers=local_num_layers,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            max_tokens=1024,
+            pipeline_model_parallel_size=pp_size,
+            tensor_model_parallel_size=1,
+            unified_memory_level=0,
+        )
+
+        # Collect the total block counts on each rank
+        local_total_blocks = torch.tensor(
+            [context.block_allocator.total_count], device='cuda', dtype=torch.long
+        )
+        gathered_block_counts = [torch.zeros_like(local_total_blocks) for _ in range(pp_size)]
+        torch.distributed.all_gather(
+            gathered_block_counts,
+            local_total_blocks,
+            group=parallel_state.get_pipeline_model_parallel_group(),
+        )
+        all_counts = [t.item() for t in gathered_block_counts]
+
+        # Verify that there is only 1 unique value across all ranks
+        unique_counts = set(all_counts)
+        assert (
+            len(unique_counts) == 1
+        ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"

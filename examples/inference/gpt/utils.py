@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import json
 import itertools
 import random
@@ -15,7 +16,6 @@ from megatron.core.inference.contexts.dynamic_context import get_mem_size_str
 from megatron.core.transformer.module import MegatronModule
 
 from megatron.core.inference.sampling_params import SamplingParams
-
 
 
 def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -55,6 +55,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help='Number of tokens to generate for each prompt',
     )
     group.add_argument(
+        "--num-tokens-from-file",
+        action='store_true',
+        default=False,
+        help='Use per-prompt num_tokens_to_generate from prompt file',
+    )
+    group.add_argument(
         "--top-n-logprobs",
         type=int,
         default=0,
@@ -91,6 +97,21 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Model provider",
     )
     group.add_argument(
+        "--skip-prompt-log-probs",
+        action='store_true',
+        default=False,
+        help='Skip prompt log probs.',
+    )
+    group.add_argument(
+        "--stop-words",
+        metavar='WORD',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Stop words to terminate generation. Each word should be quoted and '
+        'separated by space. Example: --stop-words "\\n\\n" "END" "###"',
+    )
+    group.add_argument(
         "--output-path",
         type=str,
         default=None,
@@ -118,16 +139,17 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         'will be used, in order.',
     )
     group.add_argument(
-        "--inference-coordinator-port",
-        type=int,
-        help="This port will be used to setup the inference co-ordinator on node-0",
-        default=12346
-    )
-    group.add_argument(
         "--use-flashinfer-fused-rope",
         action='store_true',
         default=False,
         help='Use flashinfer fused rope implementation.',
+    )
+    group.add_argument(
+        "--no-record-throughput",
+        action='store_false',
+        dest="record_throughput",
+        help="Disable throughput recording in --output-file"
+        
     )
 
     return parser
@@ -177,6 +199,7 @@ class Request:
         self.time_end = None
         self.state = "not-started"
         self.sampling_params: SamplingParams = sampling_params if sampling_params is not None else get_default_sampling_params(tokenizer.eod)
+        self.sampling_params = copy.deepcopy(self.sampling_params)
 
     def __str__(self) -> str:
         return "state '%s'; toffset %.1e; prompt len %d; output len %d; '%s'" % (
@@ -299,9 +322,19 @@ def get_requests_from_file(
     # Load prompts.
     n_prompts = sum(1 for _ in open(args.prompt_file))
     prompts = []
+    if sampling_params is None:
+        sampling_params = get_default_sampling_params(tokenizer.eod)
+    sampling_params_list = []
     with open(args.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
-            prompts.append(json.loads(line)["text"])
+            line_dict = json.loads(line)
+            prompts.append(line_dict["text"])
+
+            sp = copy.deepcopy(sampling_params)
+            if args.num_tokens_from_file:
+                sp.num_tokens_to_generate = line_dict["chatgpt_output_token_length"]
+            sampling_params_list.append(sp)
+
             if len(prompts) == args.prompt_file_num_truncate:
                 break
 
@@ -315,8 +348,8 @@ def get_requests_from_file(
 
     # Init requests.
     requests = [
-        Request(p, t, tokenizer, sampling_params)
-        for p, t in tqdm(zip(prompts, time_offsets), "init requests", total=len(prompts))
+        Request(p, t, tokenizer, sp)
+        for p, t, sp in tqdm(zip(prompts, time_offsets, sampling_params_list), "init requests", total=len(prompts))
     ]
 
     return requests
@@ -369,10 +402,7 @@ def build_dynamic_engine_setup_prefix(
     """
     # CUDA graph config
     if args.cuda_graph_impl == "local":
-        cg_str = (
-            f"graphs {context.cuda_graph_token_counts[0]}:"
-            f"{context.cuda_graph_token_counts[-1]}"
-        )
+        cg_str = f"graphs {len(context.cuda_graph_batch_dimensions_list)}"
     else:
         cg_str = "--"
 
@@ -398,7 +428,7 @@ def build_dynamic_engine_setup_prefix(
 
     # Buffer limits config
     buffer_limits_str = (
-        f"bf: {get_mem_size_str(args.inference_dynamic_batching_active_buffer_size_gb*1024**3)}, "
+        f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
         f"{context.block_allocator.active_count} chunks "
         f"[r {context.max_active_requests}, t {context.max_tokens}]"
     )
@@ -413,3 +443,17 @@ def build_dynamic_engine_setup_prefix(
     ]
 
     return " | ".join(parts)
+
+
+def get_global_peak_memory_stats_bytes() -> dict:
+    """Peak allocated CUDA memory aggregated across ranks (MAX), in bytes.
+
+    Uses `torch.cuda.max_memory_allocated()` and assumes peak stats were reset
+    before the benchmark run.
+    """
+    peak_alloc = int(torch.cuda.max_memory_allocated())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        t = torch.tensor([peak_alloc], device="cuda", dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+        peak_alloc = int(t[0].item())
+    return {"mem-max-allocated-bytes": peak_alloc}
