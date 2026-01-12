@@ -658,6 +658,11 @@ class TransformerConfig(ModelParallelConfig):
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
 
+    log_overload_factor: bool = False
+    """If True, log MoE router overload factors: avg_overload_factor, max_overload_factor
+    (load imbalance across EP ranks), and max_cum_overload_factor (peak cumulative tokens
+    ratio for forward/backward memory analysis)."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
