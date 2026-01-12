@@ -121,9 +121,9 @@ test:build_image:
     KUBERNETES_SERVICE_MEMORY_LIMIT: 90Gi
     SHARED_PATH: /builds/$CI_PROJECT_PATH/shared
   script:
-    - | 
+    - |
       set -x
-      
+
       env
       eval "IMAGE=\$$IMAGE"
 
@@ -132,3 +132,9 @@ test:build_image:
         ${IMAGE}:${CI_PIPELINE_ID}-arm64
 
       docker manifest push ${IMAGE}:${CI_PIPELINE_ID}
+    - cat build.env
+  retry:
+    max: 2
+  artifacts:
+    reports:
+      dotenv: build.env
