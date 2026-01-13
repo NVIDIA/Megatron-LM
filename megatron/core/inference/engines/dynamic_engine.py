@@ -817,6 +817,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
         """
+        torch.cuda.nvtx.range_push("post_process_requests")
         active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
@@ -942,7 +943,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
-
+        torch.cuda.nvtx.range_pop()
         return active_request_ids, finished_request_records
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
@@ -1214,6 +1215,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Detokenize all finished requests (critical for InferenceClient, which
         # doesn't necessarily have the tokenizer).
+        torch.cuda.nvtx.range_push("detokenize_finished_requests")
         for record in finished_request_records:
             for request in record.requests:
                 if request.prompt is None:
@@ -1223,14 +1225,19 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.generated_text = self.controller.tokenizer.detokenize(
                     request.generated_tokens
                 )
+        torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("coordinator_communication")
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
             payload = msgpack.packb(
                 [Headers.ENGINE_REPLY.value, [r.serialize() for r in finished_request_records]],
                 use_bin_type=True,
             )
+            torch.cuda.nvtx.range_push("send_engine_reply")
             self.socket_for_receiving_requests.send(payload)
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
 
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
@@ -1451,7 +1458,9 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
+                torch.cuda.nvtx.range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
+                torch.cuda.nvtx.range_pop()
             elif header == Headers.PAUSE:
                 # Pause thyself.
                 self.received_pause = True
