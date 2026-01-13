@@ -1,5 +1,6 @@
+from typing import Literal, Optional, Tuple, Union
+
 import torch
-from typing import Optional, Literal, Union, Tuple
 
 from megatron.core import tensor_parallel
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
@@ -14,8 +15,10 @@ except:
 
 
 class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    """
+    A module that combines a ColumnParallelLinear layer with fused
+    linear + cross-entropy loss computation over a tensor-parallel vocabulary.
+    """
 
     def forward(
         self,
@@ -29,9 +32,9 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Run either the plain ColumnParallelLinear or fused linear+cross-entropy."""
         if output_cross_entropy_loss:
-            return self._compute_cross_entropy_loss(
+            return self._compute_linear_and_cross_entropy_loss(
                 hidden=input_,
-                weight=weight if weight is None else self.weight,
+                weight=weight if weight is not None else self.weight,
                 labels=labels,
                 reduction=reduction,
                 ignore_index=ignore_index,
@@ -56,12 +59,12 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
             self.config.cross_entropy_loss_fusion
             and self.config.cross_entropy_fusion_impl == 'linear'
         ):
-            assert weight is not None, (
-                "weight cannot be None when using fused linear cross entropy."
-            )
-            assert labels is not None, (
-                "labels cannot be None when using fused linear cross entropy."
-            )
+            assert (
+                weight is not None
+            ), "weight cannot be None when using fused linear cross entropy."
+            assert (
+                labels is not None
+            ), "labels cannot be None when using fused linear cross entropy."
 
             # [b s] => [s b]
             labels = labels.transpose(0, 1).contiguous()
@@ -69,7 +72,7 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
                 hidden,
                 self.weight,
                 labels,
-                sequence_parallel=self.output_layer.sequence_parallel,
+                sequence_parallel=self.sequence_parallel,
                 reduction=reduction,
                 ignore_index=ignore_index,
             )
@@ -83,18 +86,19 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
         return loss
 
     def _compute_cross_entropy_loss(
-        self,
-        labels: torch.Tensor,
-        logits: torch.Tensor,
-    ) -> torch.Tensor:
+        self, labels: torch.Tensor, logits: torch.Tensor
+    ) -> Optional[torch.Tensor]:
         """Compute (possibly fused) vocab-parallel cross-entropy loss."""
+        loss = None
+
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         if self.config.cross_entropy_loss_fusion:
             if self.config.cross_entropy_fusion_impl == 'te':
                 if te_parallel_cross_entropy is not None:
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
-                    # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
+                    # Use is_cg_capturable=True for full iteration CUDA graphs
+                    # to avoid torch.equal checks
                     is_cg_capturable = (
                         hasattr(self.config, 'cuda_graph_scope')
                         and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
@@ -104,8 +108,9 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
 
                         current_version = get_te_version()
                         raise AssertionError(
-                            f"CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, "
-                            f"but found version {current_version}. Please upgrade TransformerEngine "
+                            f"CUDA graph compatible cross entropy requires "
+                            f"TransformerEngine >= 2.7.0, but found version {current_version}. "
+                            "Please upgrade TransformerEngine "
                             f"or set cuda_graph_scope to a value other than 'full_iteration'."
                         )
 

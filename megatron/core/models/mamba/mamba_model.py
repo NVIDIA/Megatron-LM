@@ -4,7 +4,6 @@ from typing import Literal, Optional
 
 from torch import Tensor
 
-from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -15,6 +14,7 @@ from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
@@ -131,7 +131,7 @@ class MambaModel(LanguageModule):
 
         # Output
         if post_process:
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            self.output_layer = LinearCrossEntropyModule(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
@@ -143,17 +143,6 @@ class MambaModel(LanguageModule):
                 and self.share_embeddings_and_output_weights,
                 tp_group=self.pg_collection.tp,
             )
-
-            # The Linear-Cross-Entropy fusion bypasses the output layer during the forward pass.
-            # The output_layer submodule shares its weights with the gpt_model to prevent
-            # issues arising from pre-forward hooks attached to the output layer.
-            if (
-                self.config.cross_entropy_loss_fusion
-                and self.config.cross_entropy_fusion_impl == 'linear'
-            ):
-                self.shared_output_layer_weight = self.output_layer.weight
-            else:
-                self.shared_output_layer_weight = None
 
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
@@ -296,16 +285,12 @@ class MambaModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_output_layer_and_language_model_loss(
-            hidden_states,
-            labels,
-            weight=output_weight if output_weight is not None else self.shared_output_layer_weight,
-            sequence_parallel_enabled=self.output_layer.sequence_parallel,
-            column_parallel_linear=self.output_layer,
-            col_linear_kwargs={
-                "weight": output_weight,
-                "runtime_gather_output": runtime_gather_output,
-            },
+        loss = self.output_layer(
+            output_cross_entropy_loss=True,
+            input_=hidden_states,
+            labels=labels,
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
         )
 
         return loss
