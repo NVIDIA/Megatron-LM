@@ -440,8 +440,11 @@ try:
                     valid_d_logits,
                     weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :],
                     out_dtype=torch.float32,
-                )
-                d_hidden.add_(_delta_hidden.view_as(d_hidden))
+                ).view_as(d_hidden)
+                if split_idx == 0:
+                    d_hidden.copy_(_delta_hidden)
+                else:
+                    d_hidden.add_(_delta_hidden)
                 torch.matmul(
                     valid_d_logits.T,
                     hidden_view,
