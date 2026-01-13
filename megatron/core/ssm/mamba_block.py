@@ -204,6 +204,7 @@ class MambaStack(MegatronModule):
         attention_mask: Tensor,
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,
+        padding_mask=None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
@@ -287,6 +288,7 @@ class MambaStack(MegatronModule):
                             inference_context=inference_context,
                             rotary_pos_emb=rotary_pos_emb,
                             sequence_len_offset=sequence_len_offset,
+                            padding_mask=padding_mask,
                         )
                     else:  # MambaLayer
                         hidden_states = layer(

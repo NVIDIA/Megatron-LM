@@ -182,6 +182,7 @@ class MambaModel(LanguageModule):
         labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
         runtime_gather_output: Optional[bool] = None,
+        padding_mask: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
@@ -253,6 +254,7 @@ class MambaModel(LanguageModule):
             attention_mask=attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            padding_mask=padding_mask,
         )
 
         if not self.post_process:
