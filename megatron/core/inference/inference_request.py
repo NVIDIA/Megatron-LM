@@ -142,14 +142,18 @@ class InferenceRequest:
 
         # Initialize request.
         request = cls(**obj)
-        request.status = None if obj["status"] is None else Status[obj["status"]]
+        request._post_deserialize(obj)
+        return request
+
+    def _post_deserialize(self, obj: dict):
+        self.status = None if obj["status"] is None else Status[obj["status"]]
 
         # Deserialize tensors.
         for k, v in obj.items():
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
-                setattr(request, k, deserialize_tensor(v[1]))
+                setattr(self, k, deserialize_tensor(v[1]))
 
-        return request
+        
 
 
 class DynamicInferenceEventType(Enum):
@@ -265,7 +269,7 @@ class DynamicInferenceRequest(InferenceRequest):
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     latency: Optional[float] = None
-    finished_chunk_token_count = 0
+    finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
     def __post_init__(self):
@@ -318,9 +322,15 @@ class DynamicInferenceRequest(InferenceRequest):
         Returns:
             (DynamicInferenceRequest) Deserialized request.
         """
-        request = super().deserialize(obj)
-        request.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
+        request = cls(**obj)
+        request._post_deserialize(obj)
+        
         return request
+    
+    def _post_deserialize(self, obj):
+        super()._post_deserialize(obj)
+        self.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
+
 
     @property
     def tracked_metadata(self) -> List[Any]:
