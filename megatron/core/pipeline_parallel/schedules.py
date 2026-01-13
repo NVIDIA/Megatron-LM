@@ -283,11 +283,11 @@ def forward_step_calc_loss(
             if config.grad_scale_func is not None
             else torch.ones(1, device=output_tensor.device)
         )
-        # Set the loss scale
+        # Set the loss scale (multiply by cp_group_size to match MoE scaling)
         if config.calculate_per_token_loss:
             MTPLossAutoScaler.set_loss_scale(loss_scale)
         else:
-            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+            MTPLossAutoScaler.set_loss_scale(loss_scale * cp_group_size / num_microbatches)
 
     return output_tensor, num_tokens
 

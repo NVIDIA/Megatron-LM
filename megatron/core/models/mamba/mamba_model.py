@@ -44,7 +44,11 @@ class MambaModel(LanguageModule):
         hybrid_attention_ratio (float, optional): The target ratio of attention
             layers to total layers
         hybrid_mlp_ratio (float, optional): The target ratio of mlp layers to total layers
-        hybrid_override_pattern (str, optional): The hybrid layer pattern to override with
+        hybrid_override_pattern (str, optional): Unified hybrid layer pattern with optional MTP.
+            Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+            Examples:
+                - "M*M*" -> main decoder only, no MTP
+                - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
@@ -74,7 +78,6 @@ class MambaModel(LanguageModule):
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
         hybrid_override_pattern: str = None,
-        mtp_hybrid_override_pattern: str = None,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
@@ -87,7 +90,6 @@ class MambaModel(LanguageModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        mtp_block_spec: Optional[ModuleSpec] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -101,14 +103,24 @@ class MambaModel(LanguageModule):
         self.hybrid_attention_ratio = hybrid_attention_ratio
         self.hybrid_mlp_ratio = hybrid_mlp_ratio
         self.hybrid_override_pattern = hybrid_override_pattern
-        self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
-        self.mtp_block_spec = mtp_block_spec
-        self.mtp_process = mtp_block_spec is not None
+        self.vp_stage = vp_stage
+
+        # Parse unified pattern to extract main and MTP components
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+
+        parsed = parse_hybrid_pattern(hybrid_override_pattern)
+        self.mtp_pattern = parsed.mtp_pattern
+        self.mtp_num_depths = parsed.mtp_num_depths
+
+        # Determine if MTP is needed (based on pattern parsing)
+        self.mtp_process = (
+            self.mtp_pattern is not None and self.mtp_num_depths > 0 and self.post_process
+        )
 
         # Cache for RoPE tensors which do not change between iterations.
         self.rotary_pos_emb_cache = {}
@@ -150,9 +162,23 @@ class MambaModel(LanguageModule):
             pg_collection=self.pg_collection,
         )
 
+        # MTP block (MambaModel creates it, MTP builds its own inner layers)
         if self.mtp_process:
+            from megatron.core.models.mamba.mamba_layer_specs import get_mamba_mtp_block_spec
+
+            mtp_block_spec = get_mamba_mtp_block_spec()
+
+            # Extract mamba_submodules from mamba_stack_spec for MTP to use
+            mamba_submodules = mamba_stack_spec.submodules
+
             self.mtp = MultiTokenPredictionBlock(
-                config=self.config, spec=self.mtp_block_spec, vp_stage=vp_stage, mtp_hybrid_override_pattern=self.mtp_hybrid_override_pattern
+                config=self.config,
+                spec=mtp_block_spec,
+                pg_collection=self.pg_collection,
+                vp_stage=self.vp_stage,
+                mtp_layer_pattern=self.mtp_pattern,
+                mtp_num_depths=self.mtp_num_depths,
+                mamba_submodules=mamba_submodules,
             )
 
         # Output

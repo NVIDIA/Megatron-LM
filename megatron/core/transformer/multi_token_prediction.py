@@ -986,6 +986,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             packed_seq_params=packed_seq_params,
         )
 
+        # Roll RoPE to match rolled positions (position_ids were rolled in _get_embeddings)
+        # After rolling, index i should use RoPE for position i+1
+        if rotary_pos_emb is not None:
+            rotary_pos_emb = torch.roll(rotary_pos_emb, shifts=-1, dims=0)
+        if rotary_pos_cos is not None:
+            rotary_pos_cos = torch.roll(rotary_pos_cos, shifts=-1, dims=0)
+        if rotary_pos_sin is not None:
+            rotary_pos_sin = torch.roll(rotary_pos_sin, shifts=-1, dims=0)
+
         if self.config.recompute_granularity == 'full' and self.training:
             hidden_states = self._checkpointed_forward(
                 self._proj_and_transformer_layer,
@@ -1119,7 +1128,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
         mamba_submodules: Optional["MambaStackSubmodules"] = None,
-        mtp_shared_weights: bool = False,
     ):
         super().__init__(config=config)
         self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
@@ -1131,8 +1139,8 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_num_depths = mtp_num_depths
         self.mamba_submodules = mamba_submodules
-        self.mtp_shared_weights = mtp_shared_weights
 
+        # Use config.mtp_use_repeated_layer for both GPT and Mamba paths
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
 
         vp_size = config.virtual_pipeline_model_parallel_size
@@ -1196,8 +1204,8 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         # New Mamba path: use mtp_layer_pattern and mamba_submodules
         if self.mtp_layer_pattern is not None and self.mamba_submodules is not None:
-            if self.mtp_shared_weights:
-                # Shared weights: build one layer, use it for all depths
+            if self.mtp_use_repeated_layer:
+                # Shared/repeated layer: build one layer, use it for all depths
                 layer_spec = self.submodules.layer_specs[0]
                 shared_layer = build_layer_with_pattern(
                     layer_spec, layer_number=1,

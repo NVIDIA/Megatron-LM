@@ -8,7 +8,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_inference_spec,
     get_gpt_mtp_block_spec,
 )
-from megatron.core.models.mamba.mamba_layer_specs import get_mamba_mtp_block_spec
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
@@ -61,29 +60,22 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
-            if args.mtp_hybrid_override_pattern is not None:
-                # Uses the hybrid model for the MTP module.
-                mtp_mamba_stack_spec = import_module(args.mtp_spec)
-                mtp_block_spec = get_mamba_mtp_block_spec(
-                    config, mtp_mamba_stack_spec, use_transformer_engine=use_te, vp_stage=vp_stage
-                )
+            assert not (config.transformer_impl == "inference_optimized")
+            if (
+                hasattr(transformer_layer_spec, 'layer_specs')
+                and len(transformer_layer_spec.layer_specs) == 0
+            ):
+                # Get the decoder layer spec explicitly if no decoder layer in the last stage,
+                # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
+                transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
             else:
-                assert not (config.transformer_impl == "inference_optimized")
-                if (
-                    hasattr(transformer_layer_spec, 'layer_specs')
-                    and len(transformer_layer_spec.layer_specs) == 0
-                ):
-                    # Get the decoder layer spec explicitly if no decoder layer in the last stage,
-                    # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-                    transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
-                else:
-                    transformer_layer_spec_for_mtp = transformer_layer_spec
-                mtp_block_spec = get_gpt_mtp_block_spec(
-                    config,
-                    transformer_layer_spec_for_mtp,
-                    use_transformer_engine=use_te,
-                    vp_stage=vp_stage,
-                )
+                transformer_layer_spec_for_mtp = transformer_layer_spec
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config,
+                transformer_layer_spec_for_mtp,
+                use_transformer_engine=use_te,
+                vp_stage=vp_stage,
+            )
 
         model = GPTModel(
             config=config,
@@ -102,7 +94,6 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             mtp_block_spec=mtp_block_spec,
             vp_stage=vp_stage,
             pg_collection=pg_collection,
-            mtp_hybrid_override_pattern=args.mtp_hybrid_override_pattern,
         )
 
     return model

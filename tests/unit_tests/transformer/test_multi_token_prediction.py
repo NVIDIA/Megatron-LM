@@ -13,10 +13,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import (
-    get_mamba_mtp_block_spec,
-    mamba_stack_spec,
-)
+from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -711,15 +708,18 @@ class TestMultiTokenPredictionMamba:
         post_process=True,
         **config_kwargs,
     ):
-        """Model provider for Mamba hybrid models with MTP."""
+        """Model provider for Mamba hybrid models with MTP.
+
+        Uses the unified pattern syntax where MTP is configured via hybrid_override_pattern:
+        Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+        Example: "M*M*/M*/M*" = main decoder "M*M*", MTP pattern "M*" with 2 depths
+        """
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
         config = core_transformer_config_from_args(args)
 
-        mtp_block_spec = get_mamba_mtp_block_spec(
-            config=config, spec=mamba_stack_spec, use_transformer_engine=True
-        )
-
+        # MTP is configured via unified pattern in hybrid_override_pattern
+        # MambaModel creates the MTP block internally based on the parsed pattern
         model = MambaModel(
             config=config,
             mamba_stack_spec=mamba_stack_spec,
@@ -730,13 +730,11 @@ class TestMultiTokenPredictionMamba:
             hybrid_attention_ratio=args.hybrid_attention_ratio,
             hybrid_mlp_ratio=args.hybrid_mlp_ratio,
             hybrid_override_pattern=args.hybrid_override_pattern,
-            mtp_hybrid_override_pattern=args.mtp_hybrid_override_pattern,
             fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
             parallel_output=True,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
-            mtp_block_spec=mtp_block_spec,
         )
         return model
 
@@ -776,11 +774,9 @@ class TestMultiTokenPredictionMamba:
         args.bf16 = True
         args.hybrid_attention_ratio = 0.5
         args.hybrid_mlp_ratio = 0.0
-        args.hybrid_override_pattern = "M*M*"
-        args.mtp_hybrid_override_pattern = "M*"
-        args.mtp_num_layers_per_layer = 2
+        # Unified pattern: "main/mtp/mtp" - main decoder "M*M*", MTP pattern "M*" with 2 depths
+        args.hybrid_override_pattern = "M*M*/M*/M*"
         args.spec = "megatron.core.models.mamba.mamba_layer_specs.mamba_stack_spec"
-        args.mtp_spec = "megatron.core.models.mamba.mamba_layer_specs.mamba_stack_spec"
 
         if fp8 is not None:
             args.fp8 = 'e4m3'
