@@ -430,19 +430,25 @@ def create_packed_seq_params(packing_context: PackingContext):
     cached_packed_seq_params = []
     packing_info = packing_context.packing_info
     bin_size = packing_context.bin_size
+    max_sequences_per_bin = packing_context.packer.max_sequences_per_bin
     device = packing_context.packed_trajs.device
     for bin_idx in range(len(packing_context.packed_trajs)):
         params = create_packed_seq_params_for_bin(
             packing_info=packing_info,
             bin_idx=bin_idx,
             bin_size=bin_size,
+            max_sequences_per_bin=max_sequences_per_bin,
             device=device,
         )
         cached_packed_seq_params.append(params)
     return cached_packed_seq_params
 
 def create_packed_seq_params_for_bin(
-    packing_info: PackingInfo, bin_idx: int, bin_size: int, device: torch.device
+    packing_info: PackingInfo,
+    bin_idx: int,
+    bin_size: int,
+    max_sequences_per_bin: int,
+    device: torch.device
 ) -> Optional[PackedSeqParams]:
     """Create PackedSeqParams for a single bin to enable proper attention masking in TE.
 
@@ -454,6 +460,7 @@ def create_packed_seq_params_for_bin(
         packing_info: PackingInfo object containing packing metadata from SequencePacker
         bin_idx: Index of the bin to create params for
         bin_size: Size of the bin (padded sequence length)
+        max_sequences_per_bin: Maximum number of sequences per bin
         device: Device to create tensors on
 
     Returns:
@@ -470,14 +477,14 @@ def create_packed_seq_params_for_bin(
 
     # Build cumulative sequence lengths for actual sequences
     # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
-    cu_seqlens_list = np.cumsum([0] + seq_lengths_in_bin)
+    cu_seqlens_list = np.append(np.cumsum([0] + seq_lengths_in_bin), bin_size)
 
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
 
     # Pad cu_seqlens to bin_size by repeating the last value (creates zero-length ghost sequences)
     # This ensures a fixed tensor size for CUDA graph compatibility
-    if len(cu_seqlens) < bin_size:
-        out = cu_seqlens.new_full((bin_size,), cu_seqlens[-1])
+    if len(cu_seqlens) < max_sequences_per_bin:
+        out = cu_seqlens.new_full((max_sequences_per_bin,), bin_size)
         out[:len(cu_seqlens)] = cu_seqlens
         cu_seqlens = out
 
@@ -1038,6 +1045,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
                 packing_info=packing_info,
                 bin_idx=bin_idx,
                 bin_size=bin_size,
+                max_sequences_per_bin=max_sequences_per_bin,
                 device=packed_trajs.device,
             ) for bin_idx in range(len(packed_trajs))
     ]
