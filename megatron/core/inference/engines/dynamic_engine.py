@@ -818,7 +818,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
         """
-        
+
         active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
@@ -1214,9 +1214,9 @@ class DynamicInferenceEngine(AbstractEngine):
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
         range_pop()
-        
-        # Detokenize all finished requests if not using 
-        # the coordinator. Otherwise, the coordinator will 
+
+        # Detokenize all finished requests if not using
+        # the coordinator. Otherwise, the coordinator will
         # overlap detokenization with the engine.
         if not self.use_coordinator:
             range_push("detokenization")
@@ -1240,7 +1240,6 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             self.socket_for_receiving_requests.send(payload)
             range_pop()
-
 
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
