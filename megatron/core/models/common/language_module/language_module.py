@@ -260,11 +260,11 @@ class LanguageModule(MegatronModule):
         Returns:
             Tensor: During pre processing or MTP process it returns the input embeddings weight while during post processing it returns the final output layers weight
         """
-        if self.pre_process or self.mtp_process:
+        if self.pre_process or getattr(self, 'mtp_process', False):
             # Multi-Token Prediction (MTP) need both embedding layer and output layer.
             # So there will be both embedding layer and output layer in the mtp process stage.
-            # In this case, if share_embeddings_and_output_weights is True, the shared weights
-            # will be stored in embedding layer, and output layer will not have any weight.
+            # When share_embeddings_and_output_weights is True, the embedding weight is the
+            # canonical shared weight and is passed to the output layer during forward.
             assert hasattr(
                 self, 'embedding'
             ), f"embedding is needed in this pipeline stage, but it is not initialized."
