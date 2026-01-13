@@ -23,6 +23,12 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+
+# Type hint imports for Mamba support
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from megatron.core.ssm.mamba_block import MambaStackSubmodules
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -450,6 +456,27 @@ def get_mtp_layer_offset(config: TransformerConfig) -> int:
     return 0
 
 
+class MTPModelLayerContainer(MegatronModule):
+    """Container for MTP inner layers built from a pattern.
+
+    This container wraps the inner layers (e.g., Mamba, Attention layers) built
+    from a pattern string. It provides proper state dict key structure:
+    `mtp_model_layer.layers.{i}.*` for checkpoint compatibility.
+
+    This is used when MTP builds its own layers using the shared layer_builder,
+    instead of receiving a pre-built MambaStack.
+    """
+
+    def __init__(self, layers: torch.nn.ModuleList, config: TransformerConfig):
+        super().__init__(config=config)
+        self.layers = layers
+
+    def set_input_tensor(self, input_tensor: Tensor):
+        """Set input tensor for pipeline parallelism compatibility."""
+        # Inner layers handle their own input tensors
+        pass
+
+
 def get_mtp_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
@@ -539,6 +566,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        # New: For Mamba path - pattern and submodules to build inner layers directly
+        mtp_layer_pattern: Optional[str] = None,
+        mamba_submodules: Optional["MambaStackSubmodules"] = None,
     ):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
@@ -547,26 +577,32 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
         self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
+        self.mtp_layer_pattern = mtp_layer_pattern
 
-        if hasattr(self.submodules.mtp_model_layer.submodules, 'attention_layer'):
-            self_attention_spec = self.submodules.mtp_model_layer.submodules.attention_layer
-            if self_attention_spec.submodules.self_attention is not None:
-                self_attention_spec = self_attention_spec.submodules.self_attention
-                attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
-                assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-                    f"Multi-Token Prediction (MTP) is not yet supported with "
-                    f"{attn_mask_type} attention mask type. "
-                    f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
-                )
-        elif hasattr(self.submodules.mtp_model_layer.submodules, 'self_attention'):
-            self_attention_spec = self.submodules.mtp_model_layer.submodules.self_attention
-            if self_attention_spec is not None:
-                attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
-                assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-                    f"Multi-Token Prediction (MTP) is not yet supported with "
-                    f"{attn_mask_type} attention mask type. "
-                    f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
-                )
+        # Validate attention mask type if using transformer-based inner layers
+        if (
+            self.submodules.mtp_model_layer is not None
+            and hasattr(self.submodules.mtp_model_layer, 'submodules')
+        ):
+            if hasattr(self.submodules.mtp_model_layer.submodules, 'attention_layer'):
+                self_attention_spec = self.submodules.mtp_model_layer.submodules.attention_layer
+                if self_attention_spec.submodules.self_attention is not None:
+                    self_attention_spec = self_attention_spec.submodules.self_attention
+                    attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
+                    assert attn_mask_type in SUPPORTED_ATTN_MASK, (
+                        f"Multi-Token Prediction (MTP) is not yet supported with "
+                        f"{attn_mask_type} attention mask type. "
+                        f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
+                    )
+            elif hasattr(self.submodules.mtp_model_layer.submodules, 'self_attention'):
+                self_attention_spec = self.submodules.mtp_model_layer.submodules.self_attention
+                if self_attention_spec is not None:
+                    attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
+                    assert attn_mask_type in SUPPORTED_ATTN_MASK, (
+                        f"Multi-Token Prediction (MTP) is not yet supported with "
+                        f"{attn_mask_type} attention mask type. "
+                        f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
+                    )
 
         self.enorm = build_module(
             self.submodules.enorm,
@@ -599,8 +635,27 @@ class MultiTokenPredictionLayer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj"
         )
-        if self.config.mtp_num_layers is not None:
+
+        # Build inner layers: three possible paths
+        # 1. New Mamba path: build from pattern using shared layer_builder
+        # 2. Legacy Mamba path: build MambaStack with mtp_hybrid_override_pattern
+        # 3. GPT path: single TransformerLayer
+        if mtp_layer_pattern is not None and mamba_submodules is not None:
+            # New Mamba path: build inner layers from pattern using shared layer_builder
+            from megatron.core.ssm.layer_builder import build_layers_from_pattern
+
+            inner_layers = build_layers_from_pattern(
+                pattern=mtp_layer_pattern,
+                submodules=mamba_submodules,
+                config=config,
+                pg_collection=pg_collection,
+                layer_offset=0,
+                is_mtp_layer=True,
+            )
+            self.mtp_model_layer = MTPModelLayerContainer(inner_layers, config=config)
+        elif self.config.mtp_num_layers is not None:
             if self.mtp_hybrid_override_pattern is not None:
+                # Legacy Mamba path: build MambaStack with override pattern
                 pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
                 # We do not need pre and post process stage for MTP layer, given they are
@@ -620,9 +675,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     is_mtp_layer=True
                 )
             else:
-                # Uses the transformer block spec for MTP layer. This option is only
-                # implemented for the GPT model. In hybrid model, we model transformer
-                # block spec for MTP layers with the hybrid override pattern.
+                # GPT path: Uses the transformer block spec for MTP layer
                 self.mtp_model_layer = build_module(
                     self.submodules.mtp_model_layer,
                     config=self.config,
@@ -747,7 +800,17 @@ class MultiTokenPredictionLayer(MegatronModule):
             # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is
             # True so that the fp8 weight caching can be triggered correctly.
             with transformer_layer_fp8_context:
-                if self.mtp_hybrid_override_pattern is not None:
+                if self.mtp_layer_pattern is not None:
+                    # New Mamba path: run through pattern-based inner layers
+                    hidden_states = self._run_pattern_layers(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        inference_params=inference_params,
+                        packed_seq_params=packed_seq_params,
+                    )
+                elif self.mtp_hybrid_override_pattern is not None:
+                    # Legacy Mamba path: MambaStack with override pattern
                     # Since pre-process is set to False, we need to set the input tensor manually.
                     self.mtp_model_layer.set_input_tensor(hidden_states)
                     hidden_states = self.mtp_model_layer(
@@ -758,6 +821,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         inference_context=context,
                     )
                 else:
+                    # GPT path: single TransformerLayer
                     hidden_states, _ = self.mtp_model_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
@@ -787,6 +851,52 @@ class MultiTokenPredictionLayer(MegatronModule):
         # deallocate_output_tensor() throwing an error, so a viewless tensor is
         # created to prevent this.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        return hidden_states
+
+    def _run_pattern_layers(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        rotary_pos_emb: Optional[torch.Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> torch.Tensor:
+        """Run through pattern-based inner layers (Mamba path).
+
+        This method iterates through the layers in MTPModelLayerContainer,
+        calling each layer with the appropriate interface based on its type.
+
+        Args:
+            hidden_states: Input hidden states [s, b, h]
+            attention_mask: Attention mask tensor
+            rotary_pos_emb: Rotary position embeddings
+            inference_params: Inference parameters
+            packed_seq_params: Packed sequence parameters
+
+        Returns:
+            Output hidden states after processing through all inner layers
+        """
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        for layer_type, layer in zip(self.mtp_layer_pattern, self.mtp_model_layer.layers):
+            if layer_type == Symbols.ATTENTION or isinstance(layer, TransformerLayer):
+                # TransformerLayer (attention or MoE) returns tuple (hidden_states, context)
+                hidden_states, _ = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    inference_params=inference_params,
+                    packed_seq_params=packed_seq_params,
+                )
+            else:
+                # MambaLayer, MLPLayer - return hidden_states directly
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_params,
+                )
 
         return hidden_states
 
@@ -1005,12 +1115,23 @@ class MultiTokenPredictionBlock(MegatronModule):
         vp_stage: Optional[int] = None,
         mtp_hybrid_override_pattern: str = None,
         pg_collection: ProcessGroupCollection = None,
+        # New: For Mamba path with unified pattern syntax
+        mtp_layer_pattern: Optional[str] = None,
+        mtp_num_depths: int = 0,
+        mamba_submodules: Optional["MambaStackSubmodules"] = None,
+        mtp_shared_weights: bool = False,
     ):
         super().__init__(config=config)
         self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
+
+        # Store new parameters for pattern-based layer building
+        self.mtp_layer_pattern = mtp_layer_pattern
+        self.mtp_num_depths = mtp_num_depths
+        self.mamba_submodules = mamba_submodules
+        self.mtp_shared_weights = mtp_shared_weights
 
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
 
@@ -1038,7 +1159,14 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.cp_group = pg_collection.cp
 
     def _build_layers(self, pg_collection):
-        def build_layer(layer_spec, layer_number):
+        # Determine number of depths to build
+        if self.mtp_num_depths > 0:
+            num_depths = self.mtp_num_depths
+        else:
+            num_depths = self.config.mtp_num_layers or len(self.submodules.layer_specs)
+
+        def build_layer_legacy(layer_spec, layer_number):
+            """Build layer using legacy spec-based approach."""
             fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
                 module = build_module(
@@ -1051,18 +1179,57 @@ class MultiTokenPredictionBlock(MegatronModule):
                 )
             return module
 
-        if self.mtp_use_repeated_layer:
+        def build_layer_with_pattern(layer_spec, layer_number, mtp_layer_pattern, mamba_submodules):
+            """Build layer using pattern-based approach (new Mamba path)."""
+            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            with fp8_init_context:
+                module = build_module(
+                    layer_spec,
+                    config=self.config,
+                    layer_number=layer_number,
+                    vp_stage=self.vp_stage,
+                    pg_collection=pg_collection,
+                    mtp_layer_pattern=mtp_layer_pattern,
+                    mamba_submodules=mamba_submodules,
+                )
+            return module
+
+        # New Mamba path: use mtp_layer_pattern and mamba_submodules
+        if self.mtp_layer_pattern is not None and self.mamba_submodules is not None:
+            if self.mtp_shared_weights:
+                # Shared weights: build one layer, use it for all depths
+                layer_spec = self.submodules.layer_specs[0]
+                shared_layer = build_layer_with_pattern(
+                    layer_spec, layer_number=1,
+                    mtp_layer_pattern=self.mtp_layer_pattern,
+                    mamba_submodules=self.mamba_submodules,
+                )
+                self.layers = torch.nn.ModuleList([shared_layer])
+            else:
+                # Non-shared: each depth gets its own layers
+                self.layers = torch.nn.ModuleList([
+                    build_layer_with_pattern(
+                        self.submodules.layer_specs[min(i, len(self.submodules.layer_specs) - 1)],
+                        layer_number=i + 1,
+                        mtp_layer_pattern=self.mtp_layer_pattern,
+                        mamba_submodules=self.mamba_submodules,
+                    )
+                    for i in range(num_depths)
+                ])
+        elif self.mtp_use_repeated_layer:
+            # Legacy repeated layer mode
             assert len(self.submodules.layer_specs) == 1, (
                 f"Repeated MTP mode requires exactly 1 layer spec, got {len(self.submodules.layer_specs)}. "
                 f"The layer will be applied {self.config.mtp_num_layers} times."
             )
             self.layers = torch.nn.ModuleList([
-                build_layer(self.submodules.layer_specs[0], layer_number=1)
+                build_layer_legacy(self.submodules.layer_specs[0], layer_number=1)
             ])
         else:
+            # Legacy mode: build from layer_specs
             self.layers = torch.nn.ModuleList(
                 [
-                    build_layer(layer_spec, i + 1)
+                    build_layer_legacy(layer_spec, i + 1)
                     for i, layer_spec in enumerate(self.submodules.layer_specs)
                 ]
             )
