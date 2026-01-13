@@ -1085,9 +1085,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
             # If we early returned, layernorm recompute hooks were attached to the output buffer
             # of the cudagraph, so disable the recompute hooks inside _forward_post_mlp
+            recompute_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm
             self.recompute_pre_mlp_layernorm = False
-
             output = self._forward_post_mlp(mlp_output_with_bias, residual)
+            self.recompute_pre_mlp_layernorm = recompute_pre_mlp_layernorm
         else:
             # If EP overlap is enabled, needs to return same outputs as submodule.attn
             if self.config.overlap_moe_expert_parallel_comm:

@@ -664,10 +664,11 @@ class CheckpointWithoutOutput(object):
     def _recompute(self, _):
         """Used as a hook to recompute the output."""
 
-        # Handle cudagraphs, do nothing if currently in graph warmup
         from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 
-        if is_graph_warmup():
+        # The recomputation has been triggered already. Just return.
+        # Handle cudagraphs, do nothing if currently in graph warmup
+        if self.ctx is None or is_graph_warmup():
             return
 
         if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
