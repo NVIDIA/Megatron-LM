@@ -824,9 +824,7 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
         self.finished_request_count += len(finished_request_ids)
-        # >>>
         if evict_request_ids is not None:
-        # <<<
             self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
@@ -948,7 +946,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_top_n_logprobs.append(logit_dict)
 
         # Handle evicted requests.
-        if evict_request_ids.numel() > 0:
+        if evict_request_ids is not None and evict_request_ids.numel() > 0:
 
             evict_request_ids = evict_request_ids.tolist()
 
@@ -1202,9 +1200,6 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_ids = step_result["finished_request_ids"]
             newly_paused_request_ids = step_result.get("newly_paused_request_ids")
             evict_request_ids = step_result.get("evict_request_ids")
-            # >>>
-            assert evict_request_ids is not None
-            # <<<
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)

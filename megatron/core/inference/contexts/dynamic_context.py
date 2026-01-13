@@ -1773,10 +1773,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_last_kv_block_offset[
                     self.paused_request_count : (self.paused_request_count + resume_request_count)
                 ]
-                # >>>
-                # == 0
                 == 255
-                # <<<
             ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step."
 
             assert resume_request_count <= self.block_allocator.total_avail
@@ -2129,9 +2126,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_request_count,
             next_tokens,
         )
-        # >>>
-        assert evict_request_ids is not None
-        # <<<
 
         # 6.c. Resume any additional requests.
         active_request_count, newly_paused_request_ids = (
