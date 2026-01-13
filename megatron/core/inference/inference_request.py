@@ -15,7 +15,7 @@ from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import experimental_api
 
 
-def serialize_tensor(tensor: torch.Tensor) -> bytes:
+def serialize_tensor(tensor: torch.Tensor) -> List:
     """Serialize tensor to bytes.
 
     Args:
@@ -24,24 +24,29 @@ def serialize_tensor(tensor: torch.Tensor) -> bytes:
     Returns:
         (bytes) Byte representation of tensor.
     """
-    buffer = io.BytesIO()
-    torch.save(tensor, buffer)
-    buffer.seek(0)
-    tensor_bytes = buffer.read()
-    return tensor_bytes
+    torch.cuda.nvtx.range_push("serialize_tensor")
+    # buffer = io.BytesIO()
+    # torch.save(tensor, buffer)
+    # buffer.seek(0)
+    # tensor_bytes = buffer.read()
+
+    # simply convert tensor into a list 
+    tensor = tensor.cpu().tolist()
+
+    torch.cuda.nvtx.range_pop()
+    return tensor
 
 
-def deserialize_tensor(tensor_bytes: bytes) -> torch.Tensor:
+def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     """Deserialize tensor from bytes.
 
     Args:
-        tensor_bytes (bytes): Byte representation of tensor.
+        tensor_as_list (List): List representation of tensor.
 
     Returns:
         (Tensor) Tensor.
     """
-    buffer = io.BytesIO(tensor_bytes)
-    tensor = torch.load(buffer)
+    tensor = torch.tensor(tensor_as_list)
     return tensor
 
 
@@ -101,15 +106,27 @@ class InferenceRequest:
         """
 
         # Dataclass to dict.
-        obj = asdict(self)
+        torch.cuda.nvtx.range_push("InferenceRequest.serialize")
+        torch.cuda.nvtx.range_push("shallow-dict")
+        #obj = asdict(self)
+        obj = self.__dict__ # shallow dict copy 
+        torch.cuda.nvtx.range_pop()
         obj["status"] = self.status.name if self.status else None
+        obj["sampling_params"] = (
+            self.sampling_params.serialize() if self.sampling_params else None
+        )
+        obj["inference_parameters"] = (
+            self.inference_parameters.serialize() if self.inference_parameters else None
+        )
 
+        torch.cuda.nvtx.range_push("tensor_serialize")
         # Serialize tensors.
         obj = {
             k: (("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor) else v)
             for k, v in obj.items()
         }
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
         return obj
 
     @classmethod
@@ -195,7 +212,10 @@ class DynamicInferenceEvent:
         """
 
         # Dataclass to dict.
+        torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
+        torch.cuda.nvtx.range_push("asdict")
         obj = asdict(self)
+        torch.cuda.nvtx.range_pop()
         obj["type"] = self.type.name
 
         # Serialize payload.
@@ -203,7 +223,7 @@ class DynamicInferenceEvent:
             from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
             obj["payload"] = ContextErrorFactory.serialize(self.payload)
-
+        torch.cuda.nvtx.range_pop()
         return obj
 
     @classmethod
@@ -280,8 +300,12 @@ class DynamicInferenceRequest(InferenceRequest):
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
+        torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
+        torch.cuda.nvtx.range_push("events_serialize")
         obj["events"] = [e.serialize() for e in self.events]
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
         return obj
 
     @classmethod
@@ -508,8 +532,12 @@ class DynamicInferenceRequestRecord:
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
+        torch.cuda.nvtx.range_push("DynamicInferenceRequestRecord.serialize")
+        torch.cuda.nvtx.range_push("asdict")
         obj = asdict(self)
+        torch.cuda.nvtx.range_pop()
         obj["requests"] = [r.serialize() for r in self.requests]
+        torch.cuda.nvtx.range_pop()
         return obj
 
     @classmethod
