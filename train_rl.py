@@ -257,12 +257,14 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
 
+
     if packed_seq_params is None:
         print(f"WHAT DOES THIS INPUT DATA EVEN LOOK LIKE? tokens {tokens} | position_ids: {position_ids}")
         packed_seq_params = get_default_packed_seq_params(
             seq_length=tokens.shape[1],
             device=tokens.device,
         )
+
 
     # Clear RoPE cache to avoid inference tensor errors
     try:

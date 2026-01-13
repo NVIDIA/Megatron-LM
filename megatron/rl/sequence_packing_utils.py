@@ -412,8 +412,12 @@ def get_default_packed_seq_params(seq_length: int, device: torch.device) -> Pack
     Returns:
         PackedSeqParams configured as a single unpacked sequence.
     """
-    # Single sequence spanning the full length = no actual packing
-    cu_seqlens = torch.full((seq_length,), seq_length, dtype=torch.int32, device=device)
+    # print("CREATING FAKE SEQPACK")
+    # Pad with all zero-length sequences indicates to the attention kernel that
+    # cu_seqlens = torch.full((2,), seq_length, dtype=torch.int32, device=device)
+    # cu_seqlens[0] = 0
+    # cu_seqlens = torch.tensor([0, seq_length], dtype=torch.int32, device=device)
+    cu_seqlens = torch.full((50,), seq_length, dtype=torch.int32, device=device)
     cu_seqlens[0] = 0
 
     return PackedSeqParams(
