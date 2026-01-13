@@ -410,7 +410,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     coordinator_ready_event,
                     inference_coordinator_port,
                     get_pg_size(self.pg_collection.dp),
-                    self.controller.tokenizer
+                    self.controller.tokenizer,
                 ),
             )
             self.inference_coordinator_process.start()
@@ -1219,7 +1219,7 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.cuda.nvtx.range_push("detokenize_finished_requests")
         if not self.use_coordinator:
             # if not using coordinator, detokenize here
-            # else coordinator will handle detokenization 
+            # else coordinator will handle detokenization
             # and overlap it with the engine
             for record in finished_request_records:
                 for request in record.requests:

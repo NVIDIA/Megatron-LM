@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-import io
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -25,12 +24,8 @@ def serialize_tensor(tensor: torch.Tensor) -> List:
         (bytes) Byte representation of tensor.
     """
     torch.cuda.nvtx.range_push("serialize_tensor")
-    # buffer = io.BytesIO()
-    # torch.save(tensor, buffer)
-    # buffer.seek(0)
-    # tensor_bytes = buffer.read()
 
-    # simply convert tensor into a list 
+    # simply convert tensor into a list
     tensor = tensor.cpu().tolist()
 
     torch.cuda.nvtx.range_pop()
@@ -108,13 +103,11 @@ class InferenceRequest:
         # Dataclass to dict.
         torch.cuda.nvtx.range_push("InferenceRequest.serialize")
         torch.cuda.nvtx.range_push("shallow-dict")
-        #obj = asdict(self)
-        obj = self.__dict__ # shallow dict copy 
+        # obj = asdict(self)
+        obj = self.__dict__  # shallow dict copy
         torch.cuda.nvtx.range_pop()
         obj["status"] = self.status.name if self.status else None
-        obj["sampling_params"] = (
-            self.sampling_params.serialize() if self.sampling_params else None
-        )
+        obj["sampling_params"] = self.sampling_params.serialize() if self.sampling_params else None
         obj["inference_parameters"] = (
             self.inference_parameters.serialize() if self.inference_parameters else None
         )
@@ -152,8 +145,6 @@ class InferenceRequest:
         for k, v in obj.items():
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(self, k, deserialize_tensor(v[1]))
-
-        
 
 
 class DynamicInferenceEventType(Enum):
@@ -324,13 +315,12 @@ class DynamicInferenceRequest(InferenceRequest):
         """
         request = cls(**obj)
         request._post_deserialize(obj)
-        
+
         return request
-    
+
     def _post_deserialize(self, obj):
         super()._post_deserialize(obj)
         self.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
-
 
     @property
     def tracked_metadata(self) -> List[Any]:
