@@ -549,8 +549,15 @@ class PipelineOffloadManager:
                 debug_rank(f"setting offload to false for group {name} at chunk index {chunk_idx}")
             else:
                 break
-        debug_rank(f"offload margin {self._offload_margin}")
         assert self._offload_margin == 0, "Offload margin is not 0"
+        keep_on_gpu_bytes = self._pp_rank * self._delta_offload_bytes_across_pp_ranks
+        for chunk in self._cached_chunks_backward:
+            for group in chunk.offload_groups:
+                if group.offload and keep_on_gpu_bytes > 0:
+                    debug_rank(f"group {group._name} offload {group.offload} \
+                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
+                    keep_on_gpu_bytes -= group.total_offload_bytes
+                    group.offload = False
         # Dump the offload information
         total_tensor_count = {}
         total_offload_bytes = {}
@@ -607,15 +614,19 @@ class PipelineOffloadManager:
         return None
 
     def init_model_chunk_offload_handler(
-        self, vp_size, vp_stage, min_offloaded_tensor_size=1024 * 1024
+        self, pp_rank, vp_size, vp_stage, min_offloaded_tensor_size=1024 * 1024,
+        delta_offload_bytes_across_pp_ranks=0
     ):
         """
         Initialize a chunk offload handler for a model chunk (microbatch).
 
         Args:
+            pp_rank: Pipeline parallel rank
             vp_size: Virtual pipeline size
             vp_stage: Virtual pipeline stage index (None means stage 0)
             min_offloaded_tensor_size: Minimum tensor size (in elements) to offload
+            delta_offload_bytes_across_pp_ranks:
+                Difference of offload bytes across PP ranks to balance the offload load.
         """
         if not self._is_warmup:
             return
@@ -624,6 +635,9 @@ class PipelineOffloadManager:
         if self._stages is None:
             self._vpp = vp_size
             self._stages = [[] for _ in range(vp_size)]
+
+        self._delta_offload_bytes_across_pp_ranks = delta_offload_bytes_across_pp_ranks
+        self._pp_rank = pp_rank
 
         if vp_stage is None:
             cur_vpp_rank = 0
@@ -1169,10 +1183,11 @@ def get_fine_grained_offloading_context(flag):
     return PipelineOffloadManager.get_instance() if flag else nullcontext()
 
 
-def fine_grained_offloading_init_chunk_handler(vp_size, vp_stage, min_offloaded_tensor_size):
+def fine_grained_offloading_init_chunk_handler(pp_rank, vp_size, vp_stage, \
+    min_offloaded_tensor_size, delta_offload_bytes_across_pp_ranks):
     """Initialize the chunk handler, called at the start of a microbatch forward pass."""
     PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
-        vp_size, vp_stage, min_offloaded_tensor_size
+        pp_rank, vp_size, vp_stage, min_offloaded_tensor_size, delta_offload_bytes_across_pp_ranks
     )
 
 

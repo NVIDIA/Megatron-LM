@@ -2440,6 +2440,8 @@ def _add_training_args(parser):
                        help='The minimum size of the tensor to be offloaded.')
     group.add_argument('--delay-offload-until-cuda-graph', action='store_true',
                        help='Delay the offload until the CUDA graph is executed for minimal CPU overhead.')
+    group.add_argument('--delta-offload-bytes-across-pp-ranks', type=int, default=0,
+                       help='Difference of offload bytes across PP ranks to balance the offload load.')
     group.add_argument('--disable-jit-fuser', action='store_true',
                        help='Disable the JIT fuser.')
     group.add_argument('--batch-invariant-mode', action='store_true',
