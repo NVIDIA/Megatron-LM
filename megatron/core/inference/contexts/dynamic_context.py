@@ -1843,6 +1843,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
 
+        # >>>
+        if 70 in set(evict_request_ids.tolist()):
+            # pax("evict_request_ids")
+            print(".................................. evict ids: %s." % str(evict_request_ids.tolist()))
+        # <<<
+
         # Release memory.
         self.release_memory_blocks_from_request_indexes(evict_request_idxs)
 
