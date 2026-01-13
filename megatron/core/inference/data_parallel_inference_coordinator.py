@@ -294,10 +294,13 @@ class DataParallelInferenceCoordinator:
                 tokens to be detokenized. It is modified in place.
         """
         for request in finished_request_record["requests"]:
-            if request["prompt"] is None:
-                request["prompt"] = self.tokenizer.detokenize(
-                    request["prompt_tokens"].tolist()
-                )
+            # if request["prompt"] is None:
+            #     if isinstance(request["prompt_tokens"], torch.Tensor):
+            #         request["prompt_tokens"] = request["prompt_tokens"].tolist()
+
+            #     request["prompt"] = self.tokenizer.detokenize(
+            #         request["prompt_tokens"]
+            #     )
             request["generated_text"] = self.tokenizer.detokenize(
                 request["generated_tokens"]
             )
