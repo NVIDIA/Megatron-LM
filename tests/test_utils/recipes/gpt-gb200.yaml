@@ -39,7 +39,6 @@ spec:
 
     NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
     export GPUS_PER_NODE={gpus}
-    RUN_ID=$(uuidgen)
 
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
