@@ -798,7 +798,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self,
         request_ids: torch.Tensor,
         finished_request_ids: torch.Tensor,
-        evict_request_ids: torch.Tensor | None,
+        evict_request_ids: torch.Tensor,
         step_time: float,
         sample: torch.Tensor,
         log_probs: torch.Tensor,
@@ -810,7 +810,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             request_ids (torch.Tensor): A list of request_ids
             finished_request_ids (torch.Tensor): A list of finished request ids
-            evict_request_ids (torch.Tensor | None): A list of evicted request ids.
+            evict_request_ids (torch.Tensor): A list of evicted request ids.
             step_time (float): The latency of the last step
             sample: (torch.Tensor): The newly generated tokens for each request
             log_probs: (List): Log probs for each request
@@ -824,8 +824,7 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
         self.finished_request_count += len(finished_request_ids)
-        if evict_request_ids is not None:
-            self.evicted_request_count += evict_request_ids.numel()
+        self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
@@ -946,7 +945,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_top_n_logprobs.append(logit_dict)
 
         # Handle evicted requests.
-        if evict_request_ids is not None:
+        # >>>
+        # if evict_request_ids is not None:
+        if evict_request_ids.numel() > 0:
+        # <<<
 
             evict_request_ids = evict_request_ids.tolist()
 
@@ -1140,8 +1142,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.step_start_event.record()
         # >>>
-        import os
-        os.environ["ENGINE_STEP_COUNT"] = str(self.step_count)
+        import builtins
+        builtins.step_count = self.step_count
         # <<<
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()

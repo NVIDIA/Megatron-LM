@@ -698,21 +698,7 @@ class Attention(MegatronModule, ABC):
                     assert (
                         not self.batch_invariant_mode
                     ), "Batch invariant mode is not supported for flash attention 2"
-                    # >>>
-                    # import os
-                    # if int(os.environ["ENGINE_STEP_COUNT"]) == 49:
-                    #     pax("flash_attn_args")
-                    # <<<
-                    # >>>
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
-                    # +++
-                    # try:
-                    #     output_total = flash_attn_with_kvcache(**flash_attn_args)
-                    # except Exception as e:
-                    #     import os
-                    #     print("................ step_count: %d." % int(os.environ["ENGINE_STEP_COUNT"]))
-                    #     pax("flash_attn_args")
-                    # <<<
         return output_total
 
     def forward(
