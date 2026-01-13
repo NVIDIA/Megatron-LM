@@ -824,7 +824,10 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
         self.finished_request_count += len(finished_request_ids)
-        self.evicted_request_count += evict_request_ids.numel()
+        # >>>
+        if evict_request_ids is not None:
+        # <<<
+            self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
@@ -1138,10 +1141,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
-        # >>>
-        import builtins
-        builtins.step_count = self.step_count
-        # <<<
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
         self.step_end_event.synchronize()
@@ -1203,6 +1202,9 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_ids = step_result["finished_request_ids"]
             newly_paused_request_ids = step_result.get("newly_paused_request_ids")
             evict_request_ids = step_result.get("evict_request_ids")
+            # >>>
+            assert evict_request_ids is not None
+            # <<<
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
