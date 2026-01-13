@@ -1763,9 +1763,24 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.block_allocator.total_avail,
             )
 
+            # >>>
+            # if step_count == 106:
+            #     pax({
+            #         "paused_request_count" : self.paused_request_count,
+            #         "active_request_count" : active_request_count,
+            #         "resume_request_count" : resume_request_count,
+            #         "paused offsets" : self.request_last_kv_block_offset[:self.paused_request_count],
+            #     })
+            # <<<
+
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
+
+        self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count] = (
+            self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count]
+            + 1
+        ) % self.block_size_tokens
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
         if resume_request_count > 0:
@@ -2139,10 +2154,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # 6.b. Evict requests that overflow the paused buffer.
-        evict_request_ids = self.evict_overflow_paused_requests(
-            active_request_count,
-            next_tokens,
-        )
+        # >>>
+        # evict_request_ids = self.evict_overflow_paused_requests(
+        #     active_request_count,
+        #     next_tokens,
+        # )
+        # +++
+        evict_request_ids = EMPTY_EVICTED_REQUEST_IDS
+        # <<<
 
         # 6.c. Resume any additional requests.
         active_request_count, newly_paused_request_ids = (
@@ -2175,11 +2194,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_pos_ids[: self.active_token_count] = self.request_kv_length_offsets[
             self.paused_request_count : self.total_request_count
         ]
-
-        self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count] = (
-            self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count]
-            + 1
-        ) % self.block_size_tokens
 
         # 8. We make relevant changes to the token bookkeeping tensors
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
