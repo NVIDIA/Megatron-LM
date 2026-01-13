@@ -105,8 +105,19 @@ class OptimizerConfig:
     min_lr: Optional[float] = None
     """Minumum value for learning rate. The scheduler clip values below this threshold."""
 
+    decoupled_lr: Optional[float] = None
+    """Separate learning rate for the input and output layer."""
+
+    decoupled_min_lr: Optional[float] = None
+    """Minimum value for learning rate for the input and output layer. The scheduler clip values
+       below this threshold.
+    """
+
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
+
+    apply_wd_to_qk_layernorm: bool = False
+    """If true, apply weight decay to qk layernorm as a special case."""
 
     ##############
     # Precision

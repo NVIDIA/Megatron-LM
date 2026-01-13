@@ -33,6 +33,8 @@ class ParamGroupOverride(TypedDict):
     end_wd: float
     wd_mult: float
 
+    _force_override: bool = False
+
 
 def param_group_override_to_tuple(
     param_group_override: ParamGroupOverride | None,
@@ -61,16 +63,30 @@ def combine_param_group_overrides(
         ParamGroupOverride: combined param group override
     """
     combined_override = ParamGroupOverride()
+
+    # Common overrides.
     for override in param_group_overrides:
-        if override is None:
+        if override is None or override.get("_force_override", False):
             continue
         for key, value in override.items():
+            if key.startswith("_"):
+                continue
             if key in combined_override:
                 if combined_override[key] != value:
                     raise ValueError(
                         f"Conflicting overrides for {key}: {combined_override[key]} and {value}"
                     )
             combined_override[key] = value
+
+    # Overrides that force overrides.
+    for override in param_group_overrides:
+        if override is None or not override.get("_force_override", False):
+            continue
+        for key, value in override.items():
+            if key.startswith("_"):
+                continue
+            combined_override[key] = value
+
     return combined_override
 
 
