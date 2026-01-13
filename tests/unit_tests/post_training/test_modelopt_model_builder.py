@@ -1,4 +1,6 @@
-"""Unit tests for model_provider integration with ModelOpt builder."""
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
+"""Unit tests for model_provider integration with ModelOpt model_builder."""
 
 from argparse import Namespace
 
