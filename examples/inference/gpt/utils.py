@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import json
 import itertools
 import random
@@ -11,10 +12,10 @@ from typing import Any, List, Optional
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import get_mem_size_str
 from megatron.core.transformer.module import MegatronModule
 
 from megatron.core.inference.sampling_params import SamplingParams
-
 
 
 def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -54,6 +55,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help='Number of tokens to generate for each prompt',
     )
     group.add_argument(
+        "--num-tokens-from-file",
+        action='store_true',
+        default=False,
+        help='Use per-prompt num_tokens_to_generate from prompt file',
+    )
+    group.add_argument(
         "--top-n-logprobs",
         type=int,
         default=0,
@@ -65,7 +72,7 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Add a deterministic number of requests per step. This arg is "
         "prioritized over `--incoming-requests-per-sec` below (which is non-"
         "deterministic). Note that the number of requests added per step is "
-        "additionally limited by the inference context's `max_requests`, "
+        "additionally limited by the inference context's `max_active_requests`, "
         "`max_tokens`, and KV buffer size.",
     )
     group.add_argument(
@@ -88,6 +95,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         choices=["mamba", "gpt"],
         default="gpt",
         help="Model provider",
+    )
+    group.add_argument(
+        "--skip-prompt-log-probs",
+        action='store_true',
+        default=False,
+        help='Skip prompt log probs.',
     )
     group.add_argument(
         "--output-path",
@@ -117,16 +130,17 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         'will be used, in order.',
     )
     group.add_argument(
-        "--inference-coordinator-port",
-        type=int,
-        help="This port will be used to setup the inference co-ordinator on node-0",
-        default=12346
-    )
-    group.add_argument(
         "--use-flashinfer-fused-rope",
         action='store_true',
         default=False,
         help='Use flashinfer fused rope implementation.',
+    )
+    group.add_argument(
+        "--no-record-throughput",
+        action='store_false',
+        dest="record_throughput",
+        help="Disable throughput recording in --output-file"
+        
     )
 
     return parser
@@ -176,6 +190,7 @@ class Request:
         self.time_end = None
         self.state = "not-started"
         self.sampling_params: SamplingParams = sampling_params if sampling_params is not None else get_default_sampling_params(tokenizer.eod)
+        self.sampling_params = copy.deepcopy(self.sampling_params)
 
     def __str__(self) -> str:
         return "state '%s'; toffset %.1e; prompt len %d; output len %d; '%s'" % (
@@ -262,10 +277,27 @@ def get_synthetic_requests(
         int(args.incoming_requests_per_sec * args.incoming_requests_duration),
     )
 
+    # Build prompts with expected lengths.
+    assert (
+        len(args.num_tokens_to_prompt) == 2
+        and
+        args.num_tokens_to_prompt[1] >= args.num_tokens_to_prompt[0]
+    )
+    max_prompt_length = args.num_tokens_to_prompt[1]
+    max_prompt_text = "hi " * max_prompt_length
+    max_prompt_tokens = tokenizer.tokenize(max_prompt_text)
+    prompt_lengths = [
+        random.randint(*args.num_tokens_to_prompt)
+        for _ in time_offsets
+    ]
+    prompt_tokens_list = [ max_prompt_tokens[:l] for l in prompt_lengths ]
+    prompt_texts = [ tokenizer.detokenize(tt) for tt in prompt_tokens_list ]
+
     # Init requests.
+    assert len(prompt_texts) == len(time_offsets)
     requests = [
-        Request("hi " * random.randint(*args.num_tokens_to_prompt), t, tokenizer, sampling_params)
-        for t in time_offsets
+        Request(t, o, tokenizer, sampling_params=sampling_params)
+        for t, o in zip(prompt_texts, time_offsets)
     ]
 
     return requests
@@ -281,9 +313,19 @@ def get_requests_from_file(
     # Load prompts.
     n_prompts = sum(1 for _ in open(args.prompt_file))
     prompts = []
+    if sampling_params is None:
+        sampling_params = get_default_sampling_params(tokenizer.eod)
+    sampling_params_list = []
     with open(args.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
-            prompts.append(json.loads(line)["text"])
+            line_dict = json.loads(line)
+            prompts.append(line_dict["text"])
+
+            sp = copy.deepcopy(sampling_params)
+            if args.num_tokens_from_file:
+                sp.num_tokens_to_generate = line_dict["chatgpt_output_token_length"]
+            sampling_params_list.append(sp)
+
             if len(prompts) == args.prompt_file_num_truncate:
                 break
 
@@ -297,8 +339,8 @@ def get_requests_from_file(
 
     # Init requests.
     requests = [
-        Request(p, t, tokenizer, sampling_params)
-        for p, t in tqdm(zip(prompts, time_offsets), "init requests", total=len(prompts))
+        Request(p, t, tokenizer, sp)
+        for p, t, sp in tqdm(zip(prompts, time_offsets, sampling_params_list), "init requests", total=len(prompts))
     ]
 
     return requests
@@ -342,7 +384,7 @@ def build_dynamic_engine_setup_prefix(
 
     Args:
         args (Namespace): Command-line arguments for this run.
-        context (DynamicInferenceContext): Stores limits such as `max_requests`,
+        context (DynamicInferenceContext): Stores limits such as `max_active_requests`,
             `max_tokens`, and `gtd_request_count`.
         requests (List[DynamicInferenceRequest]): List of inference requests.
 
@@ -351,10 +393,7 @@ def build_dynamic_engine_setup_prefix(
     """
     # CUDA graph config
     if args.cuda_graph_impl == "local":
-        cg_str = (
-            f"graphs {context.cuda_graph_token_counts[0]}:"
-            f"{context.cuda_graph_token_counts[-1]}"
-        )
+        cg_str = f"graphs {len(context.cuda_graph_batch_dimensions_list)}"
     else:
         cg_str = "--"
 
@@ -379,17 +418,10 @@ def build_dynamic_engine_setup_prefix(
     )
 
     # Buffer limits config
-    flw = args.inference_dynamic_batching_buffer_overflow_factor
-    flw_str = "no overflow" if flw is None else f"{flw:.1f}"
     buffer_limits_str = (
-        f"bf {args.inference_dynamic_batching_buffer_size_gb:.0f}, {flw_str} "
-        f"[r {context.max_requests}, t {context.max_tokens}]"
-    )
-
-    # Guaranteed request config
-    guaranteed_fraction_str = (
-        f"gtd {args.inference_dynamic_batching_buffer_guaranteed_fraction:.2f} "
-        f"[r {context.gtd_request_count}]"
+        f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
+        f"{context.block_allocator.active_count} chunks "
+        f"[r {context.max_active_requests}, t {context.max_tokens}]"
     )
 
     parts = [
@@ -399,7 +431,6 @@ def build_dynamic_engine_setup_prefix(
         uvm_str,
         request_str,
         buffer_limits_str,
-        guaranteed_fraction_str,
     ]
 
     return " | ".join(parts)

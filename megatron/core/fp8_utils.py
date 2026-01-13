@@ -571,6 +571,7 @@ if HAVE_TE:
                     fp8_format=fp8_format
                 )
             elif config.fp8_recipe == Fp8Recipe.custom:
+                assert config.fp8_quantizer_factory is not None
                 fp8_recipe = _get_custom_recipe(config.fp8_quantizer_factory)
             else:
                 raise ValueError(
@@ -689,8 +690,13 @@ if HAVE_TE:
 
         @wraps(original_forward)
         def padded_forward(input_tensor, *args, **kwargs):
-            # Only do padding for fp8 if we are in fp8 context
-            if not FP8GlobalStateManager.is_fp8_enabled():
+            is_context_quantized = FP8GlobalStateManager.is_fp8_enabled()
+            if hasattr(module, "will_execute_quantized"):
+                module_uses_quant = module.will_execute_quantized(is_context_quantized)
+            else:
+                module_uses_quant = is_context_quantized
+            # Only do padding for fp8 if we are in fp8 or fp4 context
+            if not module_uses_quant:
                 return original_forward(input_tensor, *args, **kwargs)
 
             # With sequence parallelism we need to all-gather before padding
