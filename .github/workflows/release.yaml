@@ -1,0 +1,55 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: 'Release Megatron-Core'
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-ref:
+        description: Ref (SHA or branch name) to release
+        required: true
+        type: string
+      dry-run:
+        description: Do not publish a wheel and GitHub release.
+        required: true
+        default: true
+        type: boolean
+      create-gh-release:
+        description: Create a GitHub release
+        required: true
+        default: true
+        type: boolean
+      version-bump-branch:
+        description: Branch for version bump
+        required: true
+        type: string
+
+permissions:
+  contents: write # To read repository content
+  pull-requests: write # To create PRs
+
+jobs:
+  release:
+    uses: ./.github/workflows/_release_library.yml
+    with:
+      release-ref: ${{ inputs.release-ref || github.sha }}
+      dry-run: ${{ inputs.dry-run || false }}
+      version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
+      create-gh-release: ${{ inputs.create-gh-release || true }}
+    secrets:
+      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
+      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
+      PAT: ${{ secrets.PAT }}

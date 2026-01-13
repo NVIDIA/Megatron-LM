@@ -387,7 +387,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def has_final_layernorm_in_this_stage(self):
         """
         Check if this vpp stage contains the final layernorm.
-
         Note:
             Final layernorm now has been moved from the post-process stage to the last decoder
             layer by using this function.
@@ -426,12 +425,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
+        padding_mask: Optional[Tensor] = None,
     ):
         """Forward method with activation checkpointing."""
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                padding_mask=None,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -462,6 +467,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             attention_bias=attention_bias,
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
                         )
                 return hidden_states, context
 
@@ -481,6 +487,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    padding_mask,
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -491,6 +498,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    padding_mask,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -596,6 +604,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
@@ -705,6 +714,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
+                    padding_mask=padding_mask,
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
@@ -737,6 +747,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
+                            padding_mask=padding_mask,
                         )
 
                     if (
