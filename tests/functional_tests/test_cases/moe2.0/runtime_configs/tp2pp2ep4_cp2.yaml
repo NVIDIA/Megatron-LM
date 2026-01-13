@@ -15,9 +15,8 @@ MODEL_ARGS:
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 2
-  --num-virtual-stages-per-pipeline-rank: 4
-  --expert-model-parallel-size: 4
-  --context-parallel-size: 1
+  --expert-model-parallel-size: 2
+  --context-parallel-size: 2
   --expert-tensor-parallel-size: 1
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
@@ -27,8 +26,7 @@ MODEL_ARGS:
   --micro-batch-size: 4
   # MoE training related args
   --moe-grouped-gemm: true
-  --moe-token-dispatcher-type: flex 
-  --moe-flex-dispatcher-backend: deepep
+  --moe-token-dispatcher-type: alltoall
   # Add mixed precision args
   --bf16: true
   # kernel fusion related args
@@ -38,3 +36,4 @@ MODEL_ARGS:
   --manual-gc: true
   --manual-gc-interval: 100
 TEST_TYPE: resume-ckpt
+
