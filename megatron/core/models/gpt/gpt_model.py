@@ -100,7 +100,7 @@ class GPTModel(LanguageModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        mtp_hybrid_override_pattern: str = None,
+        mtp_layer_pattern: str = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -209,7 +209,7 @@ class GPTModel(LanguageModule):
 
         if self.mtp_process:
             self.mtp = MultiTokenPredictionBlock(
-                config=self.config, spec=self.mtp_block_spec, vp_stage=vp_stage, mtp_hybrid_override_pattern=mtp_hybrid_override_pattern
+                config=self.config, spec=self.mtp_block_spec, vp_stage=vp_stage, mtp_layer_pattern=mtp_layer_pattern
             )
 
         # Output

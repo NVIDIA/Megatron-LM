@@ -178,9 +178,9 @@ def num_floating_point_operations(args, batch_size):
             for layer_type in args.hybrid_override_pattern:
                 if layer_type in counts:
                     counts[layer_type] += 1
-            if args.mtp_hybrid_override_pattern:
+            if args.mtp_layer_pattern:
                 assert args.mtp_num_layers is not None
-                for layer_type in args.mtp_hybrid_override_pattern:
+                for layer_type in args.mtp_layer_pattern:
                     if layer_type in counts:
                         counts[layer_type] += args.mtp_num_layers
             return counts['*'], counts['M'], counts['-'], counts['E']

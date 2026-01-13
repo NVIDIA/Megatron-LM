@@ -562,7 +562,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MultiTokenPredictionLayerSubmodules,
-        mtp_hybrid_override_pattern: str = None,
+        mtp_layer_pattern: str = None,
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -576,7 +576,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.layer_number = layer_number
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
-        self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
+        self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_layer_pattern = mtp_layer_pattern
 
         # Validate attention mask type if using transformer-based inner layers
@@ -638,7 +638,7 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         # Build inner layers: three possible paths
         # 1. New Mamba path: build from pattern using shared layer_builder
-        # 2. Legacy Mamba path: build MambaStack with mtp_hybrid_override_pattern
+        # 2. Legacy Mamba path: build MambaStack with mtp_layer_pattern
         # 3. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and mamba_submodules is not None:
             # New Mamba path: build inner layers from pattern using shared layer_builder
@@ -654,20 +654,20 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
             self.mtp_model_layer = MTPModelLayerContainer(inner_layers, config=config)
         elif self.config.mtp_num_layers is not None:
-            if self.mtp_hybrid_override_pattern is not None:
+            if self.mtp_layer_pattern is not None:
                 # Legacy Mamba path: build MambaStack with override pattern
                 pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
                 # We do not need pre and post process stage for MTP layer, given they are
                 # handled in the MultiTokenPredictionLayer itself.
                 assert self.config.mtp_num_layers_per_layer is not None, \
-                    "mtp_num_layers_per_layer must be set when using mtp_hybrid_override_pattern"
+                    "mtp_num_layers_per_layer must be set when using mtp_layer_pattern"
                 self.mtp_model_layer = build_module(
                     self.submodules.mtp_model_layer,
                     self.config,
                     pre_process=False,
                     post_process=False,
-                    hybrid_override_pattern=self.mtp_hybrid_override_pattern,
+                    hybrid_override_pattern=self.mtp_layer_pattern,
                     dtype=self.config.params_dtype,
                     pg_collection=pg_collection,
                     vp_stage=self.vp_stage,
@@ -809,7 +809,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         inference_params=inference_params,
                         packed_seq_params=packed_seq_params,
                     )
-                elif self.mtp_hybrid_override_pattern is not None:
+                elif self.mtp_layer_pattern is not None:
                     # Legacy Mamba path: MambaStack with override pattern
                     # Since pre-process is set to False, we need to set the input tensor manually.
                     self.mtp_model_layer.set_input_tensor(hidden_states)
@@ -1122,7 +1122,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
-        mtp_hybrid_override_pattern: str = None,
         pg_collection: ProcessGroupCollection = None,
         # New: For Mamba path with unified pattern syntax
         mtp_layer_pattern: Optional[str] = None,
@@ -1130,7 +1129,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         mamba_submodules: Optional["MambaStackSubmodules"] = None,
     ):
         super().__init__(config=config)
-        self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
+        self.mtp_layer_pattern = mtp_layer_pattern
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
@@ -1183,7 +1182,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_number=layer_number,
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
-                    mtp_hybrid_override_pattern=self.mtp_hybrid_override_pattern
+                    mtp_layer_pattern=self.mtp_layer_pattern
                 )
             return module
 

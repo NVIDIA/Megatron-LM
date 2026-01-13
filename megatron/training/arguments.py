@@ -530,7 +530,7 @@ def validate_args(args, defaults={}):
     assert args.global_batch_size > 0
 
     # Deprecation warnings for legacy MTP arguments
-    if args.mtp_hybrid_override_pattern is not None:
+    if args.mtp_layer_pattern is not None:
         import warnings
         warnings.warn(
             "--mtp-hybrid-override-pattern is deprecated. "

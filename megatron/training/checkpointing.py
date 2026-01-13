@@ -1347,7 +1347,8 @@ def load_args_from_checkpoint(
     _set_arg('hidden_dropout', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
-    _set_arg('mtp_hybrid_override_pattern', force=True)
+    _set_arg('mtp_layer_pattern', old_arg_name='mtp_hybrid_override_pattern', force=True)  # old name
+    _set_arg('mtp_layer_pattern', force=True)  # new mtp name, takes precedence
     _set_arg('spec', force=True)
     _set_arg('hybrid_attention_ratio', force=True)
     _set_arg('hybrid_mlp_ratio', force=True)
