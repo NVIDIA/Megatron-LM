@@ -204,9 +204,9 @@ class MambaStack(MegatronModule):
         attention_mask: Tensor,
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,
-        padding_mask=None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        padding_mask=None,
     ):
         """
         Forward function of the MambaStack class.
