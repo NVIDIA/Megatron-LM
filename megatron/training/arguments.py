@@ -1217,8 +1217,13 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print('Warning: enabling --no-load-optim when skipping training.')
 
-    # Muon optimizercheck
+    # Muon optimizer check
     if 'muon' in args.optimizer:
+
+        # TODO: remove these checks once we support them
+        assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce for now."
+        assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather for now."
+
         assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
