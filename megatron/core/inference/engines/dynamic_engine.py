@@ -410,6 +410,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     coordinator_ready_event,
                     inference_coordinator_port,
                     get_pg_size(self.pg_collection.dp),
+                    self.controller.tokenizer
                 ),
             )
             self.inference_coordinator_process.start()
@@ -1216,15 +1217,19 @@ class DynamicInferenceEngine(AbstractEngine):
         # Detokenize all finished requests (critical for InferenceClient, which
         # doesn't necessarily have the tokenizer).
         torch.cuda.nvtx.range_push("detokenize_finished_requests")
-        for record in finished_request_records:
-            for request in record.requests:
-                if request.prompt is None:
-                    request.prompt = self.controller.tokenizer.detokenize(
-                        request.prompt_tokens.tolist()
+        if not self.use_coordinator:
+            # if not using coordinator, detokenize here
+            # else coordinator will handle detokenization 
+            # and overlap it with the engine
+            for record in finished_request_records:
+                for request in record.requests:
+                    if request.prompt is None:
+                        request.prompt = self.controller.tokenizer.detokenize(
+                            request.prompt_tokens.tolist()
+                        )
+                    request.generated_text = self.controller.tokenizer.detokenize(
+                        request.generated_tokens
                     )
-                request.generated_text = self.controller.tokenizer.detokenize(
-                    request.generated_tokens
-                )
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("coordinator_communication")
