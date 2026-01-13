@@ -57,9 +57,7 @@ except ImportError:
     rearrange = None
 
 try:
-    from flash_attn_3.flash_attn_interface import (
-        _flash_attn_forward,
-    )
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
     from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
@@ -70,9 +68,7 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flashattn_hopper.flash_attn_interface import (
-            _flash_attn_forward,
-        )
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
