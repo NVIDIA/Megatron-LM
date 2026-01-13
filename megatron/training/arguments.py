@@ -2062,10 +2062,6 @@ def _add_logging_args(parser):
                        help='Path to save the wandb results locally.')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
-    group.add_argument('--log-overload-factor', action='store_true',
-                       help='If set, log MoE router overload factors to tensorboard: '
-                       'avg_overload_factor, max_overload_factor (load imbalance across EP ranks), '
-                       'and max_cum_overload_factor (peak cumulative tokens ratio for memory analysis).')
     return parser
 
 

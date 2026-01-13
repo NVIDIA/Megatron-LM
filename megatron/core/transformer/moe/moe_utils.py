@@ -42,7 +42,6 @@ except ImportError:
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER = {}
-_MOE_OVERLOAD_FACTOR_TRACKER = {}
 
 
 def switch_load_balancing_loss_func(
@@ -824,221 +823,6 @@ def clear_aux_losses_tracker():
         tracker[name]["values"].zero_()
 
 
-def get_overload_factor_tracker():
-    """Return the overload factor tracker."""
-    global _MOE_OVERLOAD_FACTOR_TRACKER
-    return _MOE_OVERLOAD_FACTOR_TRACKER
-
-
-class SaveOverloadFactorFunction(torch.autograd.Function):
-    """Autograd function to save overload factor data for forward and backward passes."""
-
-    @staticmethod
-    def forward(ctx, tensor, routing_map, layer_number, num_local_experts):
-        """Forward pass: save overload factor data with 'fwd' label.
-
-        Args:
-            tensor: A tensor in the autograd graph (e.g., probs) to pass through.
-            routing_map: The routing map tensor [num_tokens, num_experts].
-            layer_number: Layer index (1-based).
-            num_local_experts: Number of experts per EP rank.
-
-        Returns:
-            tensor unchanged (pass-through).
-        """
-        if layer_number is None:
-            return tensor
-
-        # Compute local tokens per expert
-        local_tokens_per_expert = routing_map.sum(dim=0).detach().float()
-
-        # Group by EP rank: reshape [num_experts] -> [ep_size, num_local_experts] and sum
-        num_experts = local_tokens_per_expert.shape[0]
-        ep_size = num_experts // num_local_experts
-        local_tokens_per_ep_rank = local_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1)
-
-        # Save to tracker
-        tracker = get_overload_factor_tracker()
-        if "fwd" not in tracker:
-            tracker["fwd"] = {}
-        if "fwd_bwd" not in tracker:
-            tracker["fwd_bwd"] = []
-
-        layer_idx = layer_number - 1  # Convert to 0-based index
-        if layer_idx not in tracker["fwd"]:
-            tracker["fwd"][layer_idx] = []
-
-        tracker["fwd"][layer_idx].append(local_tokens_per_ep_rank)
-        tracker["fwd_bwd"].append(local_tokens_per_ep_rank)
-
-        # Save for backward
-        ctx.save_for_backward(local_tokens_per_ep_rank)
-
-        return tensor
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Backward pass: append negated tokens to fwd_bwd tracker."""
-        if ctx.saved_tensors:
-            (local_tokens_per_ep_rank,) = ctx.saved_tensors
-            tracker = get_overload_factor_tracker()
-            if "fwd_bwd" in tracker:
-                tracker["fwd_bwd"].append(-local_tokens_per_ep_rank)
-        return grad_output, None, None, None
-
-
-def save_overload_factor_to_tracker(
-    tensor: torch.Tensor,
-    routing_map: torch.Tensor,
-    layer_number: int,
-    num_local_experts: int,
-    tp_ep_group: torch.distributed.ProcessGroup,
-    dp_group: torch.distributed.ProcessGroup,
-):
-    """Save local tokens per EP rank and track token counts for activation memory analysis.
-
-    This function wraps SaveOverloadFactorFunction to:
-    1. Store data for overload factor computation (done in get_overload_factors_for_logging())
-    2. Track tokens in forward/backward for activation memory analysis
-
-    Args:
-        tensor: A tensor in the autograd graph (e.g., probs) - passed through unchanged.
-        routing_map: The routing map tensor [num_tokens, num_experts].
-        layer_number: Layer index (1-based).
-        num_local_experts: Number of experts per EP rank.
-        tp_ep_group: The TP x EP group for all-reducing.
-        dp_group: The DP group for max/avg reduction.
-
-    Returns:
-        tensor unchanged.
-    """
-    # Set comm groups in tracker (outside autograd function)
-    tracker = get_overload_factor_tracker()
-    if "tp_ep_group" not in tracker:
-        tracker["tp_ep_group"] = tp_ep_group
-        tracker["dp_group"] = dp_group
-
-    return SaveOverloadFactorFunction.apply(tensor, routing_map, layer_number, num_local_experts)
-
-
-def get_overload_factors_for_logging() -> dict:
-    """Compute overload factors from stored data and return organized metrics for logging.
-
-    This function performs:
-    1. All-reduce over TP x EP to get tokens per EP rank within each DP rank
-    2. MAX reduction across DP ranks to get max tokens per EP rank
-    3. AVG reduction across DP ranks to get avg tokens per EP rank
-    4. Computes overload_factor = max_tokens / avg_tokens
-
-    Should be called outside the critical path (e.g., during logging).
-
-    Returns:
-        dict: A dictionary with structure:
-            {
-                "avg_overload_factor": float,
-                "max_overload_factor": float,
-                "max_cumsum_tokens": float (peak tokens from cumsum of fwd/bwd),
-            }
-    """
-    tracker = get_overload_factor_tracker()
-    if "fwd" not in tracker or not tracker["fwd"]:
-        return {}
-    tp_ep_group = tracker.get("tp_ep_group")
-    dp_group = tracker.get("dp_group")
-
-    # Collect fwd tensors for overload factor calculation
-    fwd_tensors = []
-    layer_indices = []  # layer_idx for each fwd tensor
-
-    for layer_idx in sorted(tracker["fwd"].keys()):
-        for local_tokens_per_ep_rank in tracker["fwd"][layer_idx]:
-            fwd_tensors.append(local_tokens_per_ep_rank)
-            layer_indices.append(layer_idx)
-
-    if not fwd_tensors:
-        return {}
-
-    # Stack fwd_bwd tensors (already has fwd positive, bwd negative)
-    fwd_bwd_tensors = tracker.get("fwd_bwd", [])
-    fwd_bwd_tensors_stacked = torch.stack(fwd_bwd_tensors, dim=0) if fwd_bwd_tensors else None
-
-    # All-reduce across tp_ep_group, cumsum, and find max
-    max_cum_overload_factor = None
-    if fwd_bwd_tensors_stacked is not None:
-        if tp_ep_group is not None:
-            torch.distributed.all_reduce(fwd_bwd_tensors_stacked, group=tp_ep_group)
-        cumsum_tokens = fwd_bwd_tensors_stacked.cumsum(dim=0)
-        max_cumsum_tokens = cumsum_tokens.max().item()
-
-        # Calculate max_cum_overload_factor = max_cumsum_tokens / cumsum_tokens.mean(dim=1).max()
-        mean_cumsum_max = cumsum_tokens.mean(dim=1).max()
-        local_max_cum_overload_factor = max_cumsum_tokens / (mean_cumsum_max.item() + 1e-8)
-
-        # Max all-reduce to find global max across DP ranks
-        if dp_group is not None:
-            cum_overload_tensor = torch.tensor(
-                [local_max_cum_overload_factor], device=fwd_bwd_tensors_stacked.device
-            )
-            torch.distributed.all_reduce(cum_overload_tensor, group=dp_group, op=torch.distributed.ReduceOp.MAX)
-            max_cum_overload_factor = cum_overload_tensor.item()
-        else:
-            max_cum_overload_factor = local_max_cum_overload_factor
-    all_tensors = fwd_tensors
-    # Stack all tensors and do all-reduce over TP x EP
-    # Shape: [num_entries, ep_size]
-    stacked_tensors = torch.stack(all_tensors, dim=0)
-    if tp_ep_group is not None:
-        torch.distributed.all_reduce(stacked_tensors, group=tp_ep_group)
-
-    # Now reduce across DP ranks: get both MAX and AVG
-    if dp_group is not None:
-        # Clone for max reduction
-        max_tokens_per_ep_rank = stacked_tensors.clone()
-        torch.distributed.all_reduce(
-            max_tokens_per_ep_rank, group=dp_group, op=torch.distributed.ReduceOp.MAX
-        )
-        # AVG reduction for mean tokens
-        avg_tokens_per_ep_rank = stacked_tensors.clone()
-        torch.distributed.all_reduce(
-            avg_tokens_per_ep_rank, group=dp_group, op=torch.distributed.ReduceOp.AVG
-        )
-    else:
-        max_tokens_per_ep_rank = stacked_tensors
-        avg_tokens_per_ep_rank = stacked_tensors
-
-    # Compute two overload factors for each entry:
-    # 1. avg_overload_factor = max(avg_tokens) / mean(avg_tokens) - based on AVG across DP
-    # 2. max_overload_factor = max(max_tokens) / mean(max_tokens) - based on MAX across DP
-    avg_max_tokens = avg_tokens_per_ep_rank.max(dim=1).values  # [num_entries]
-    avg_mean_tokens = avg_tokens_per_ep_rank.float().mean(dim=1)  # [num_entries]
-    avg_overload_factors = (avg_max_tokens / (avg_mean_tokens + 1e-8))  # [num_entries]
-
-    max_max_tokens = max_tokens_per_ep_rank.max(dim=1).values  # [num_entries]
-    max_mean_tokens = max_tokens_per_ep_rank.float().mean(dim=1)  # [num_entries]
-    max_overload_factors = (max_max_tokens / (max_mean_tokens + 1e-8))  # [num_entries]
-
-    # Compute overall statistics
-    # avg_overload_factor uses mean, max_overload_factor uses max
-    result = {
-        "avg_overload_factor": avg_overload_factors.mean().item(),
-        "max_overload_factor": max_overload_factors.max().item(),
-        "max_cum_overload_factor": max_cum_overload_factor,
-    }
-
-    return result
-
-
-def clear_overload_factor_tracker():
-    """Clear the overload factor tracker."""
-    tracker = get_overload_factor_tracker()
-    if "fwd" in tracker:
-        tracker["fwd"].clear()
-    if "fwd_bwd" in tracker:
-        tracker["fwd_bwd"].clear()
-    tracker.pop("tp_ep_group", None)
-    tracker.pop("dp_group", None)
-
-
 def reduce_aux_losses_tracker_across_ranks(
     track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
 ):
@@ -1090,7 +874,6 @@ def track_moe_metrics(
     writer,
     wandb_writer=None,
     total_loss_dict=None,
-    overload_dict=None,
     per_layer_logging=False,
     force_initialize: bool = False,
     track_names: Optional[List[str]] = None,
@@ -1159,27 +942,6 @@ def track_moe_metrics(
                         },
                         iteration,
                     )
-
-    # Log overload factor metrics
-    overload_metrics = get_overload_factors_for_logging()
-    if overload_metrics:
-        if overload_dict is not None:
-            overload_dict.update(overload_metrics)
-        if writer is not None:
-            if "avg_overload_factor" in overload_metrics:
-                writer.add_scalar("moe/avg_overload_factor", overload_metrics["avg_overload_factor"], iteration)
-            if "max_overload_factor" in overload_metrics:
-                writer.add_scalar("moe/max_overload_factor", overload_metrics["max_overload_factor"], iteration)
-            if "max_cum_overload_factor" in overload_metrics and overload_metrics["max_cum_overload_factor"] is not None:
-                writer.add_scalar("moe/max_cum_overload_factor", overload_metrics["max_cum_overload_factor"], iteration)
-        if wandb_writer:
-            if "avg_overload_factor" in overload_metrics:
-                wandb_writer.log({"moe/avg_overload_factor": overload_metrics["avg_overload_factor"]}, iteration)
-            if "max_overload_factor" in overload_metrics:
-                wandb_writer.log({"moe/max_overload_factor": overload_metrics["max_overload_factor"]}, iteration)
-            if "max_cum_overload_factor" in overload_metrics and overload_metrics["max_cum_overload_factor"] is not None:
-                wandb_writer.log({"moe/max_cum_overload_factor": overload_metrics["max_cum_overload_factor"]}, iteration)
-    clear_overload_factor_tracker()
 
     clear_aux_losses_tracker()
 
