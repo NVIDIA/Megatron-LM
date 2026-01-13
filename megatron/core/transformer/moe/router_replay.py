@@ -1,9 +1,15 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from enum import Enum
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
+
 class RouterReplayAction(Enum):
+    """
+    A Enum to define the actions for router replay.
+    """
+
     RECORD = "record"  # Record the topk indices for replay
     REPLAY_FORWARD = "replay_forward"  # Replay the recorded topk indices for forward pass
     REPLAY_BACKWARD = "replay_backward"  # Replay topk indices for re-compute during backward pass
@@ -30,7 +36,7 @@ class RouterReplay:
         if len(all_layers_topk_indices) != len(RouterReplay.global_router_replay_instances):
             raise ValueError(
                 f"The number of replay tensors ({len(all_layers_topk_indices)}) "
-                f"does not match router instances ({len(RouterReplay.global_router_replay_instances)})."
+                f"does not match instances ({len(RouterReplay.global_router_replay_instances)})."
             )
         for i, router_instance in enumerate(RouterReplay.global_router_replay_instances):
             router_instance.set_target_indices(all_layers_topk_indices[i])
@@ -129,7 +135,7 @@ class RouterReplay:
                                              should return a tuple of (values, indices).
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: A tuple containing the top-k values (probs) and indices.
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing the top-k values and indices.
         """
         if self.router_replay_action == RouterReplayAction.RECORD:
             probs, top_indices = default_compute_topk(
