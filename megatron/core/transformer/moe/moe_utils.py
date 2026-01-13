@@ -769,29 +769,18 @@ def clear_aux_losses_tracker():
         tracker[name]["values"].zero_()
 
 
-def reduce_aux_losses_tracker_across_ranks(
-    track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
-):
+def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = None):
     """Collect and reduce the auxiliary losses across ranks."""
     tracker = get_moe_layer_wise_logging_tracker()
     if track_names is None:
         track_names = tracker.keys()
-
-    if pg_collection is None:
-        # Use parallel_state groups
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        dp_group = parallel_state.get_data_parallel_group(
-            with_context_parallel=False, partial_data_parallel=False
-        )
-    else:
-        pp_group = pg_collection.pp
-        dp_group = pg_collection.dp
-
     for name in track_names:
         values = tracker[name]["values"]
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Collect aux losses across PP.
-        torch.distributed.all_reduce(values, group=pp_group)
+        torch.distributed.all_reduce(
+            values, group=parallel_state.get_pipeline_model_parallel_group()
+        )
         # Reduce aux losses across ranks.
         if tracker[name].get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
@@ -799,7 +788,9 @@ def reduce_aux_losses_tracker_across_ranks(
             # does not have 'dp' attribute, do it manually.
             if not tracker[name].get('reduce_group_has_dp', False):
                 torch.distributed.all_reduce(
-                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
+                    values,
+                    group=parallel_state.get_data_parallel_group(with_context_parallel=False),
+                    op=torch.distributed.ReduceOp.AVG,
                 )
         if tracker[name].get('avg_group') is not None:
             torch.distributed.all_reduce(
@@ -819,7 +810,6 @@ def track_moe_metrics(
     num_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Track the MoE metrics for logging."""
     # Aux loss logging
@@ -834,7 +824,7 @@ def track_moe_metrics(
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
                     tracker[key]["reduce_group_has_dp"] = False
-    reduce_aux_losses_tracker_across_ranks(track_names, pg_collection=pg_collection)
+    reduce_aux_losses_tracker_across_ranks(track_names)
 
     # Get number of MoE layers
     if moe_layer_freq is None:

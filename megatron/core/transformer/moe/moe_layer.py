@@ -130,7 +130,6 @@ class MoELayer(BaseMoELayer):
 
         # Initialize router.
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
-        self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
         if self.config.moe_latent_size:

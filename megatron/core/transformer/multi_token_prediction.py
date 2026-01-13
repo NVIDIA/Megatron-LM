@@ -58,8 +58,8 @@ def tie_word_embeddings_state_dict(
     sharded_state_dict: ShardedStateDict,
     word_emb_weight: Tensor,
     word_emb_weight_key: str,
-    tp_group: torch.distributed.ProcessGroup,
-    dp_cp_group: torch.distributed.ProcessGroup,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """tie the embedding of the mtp processing stage in a given sharded state dict.
 
@@ -93,8 +93,8 @@ def tie_output_layer_state_dict(
     sharded_state_dict: ShardedStateDict,
     output_layer_weight: Tensor,
     output_layer_weight_key: str,
-    tp_group: torch.distributed.ProcessGroup,
-    dp_cp_group: torch.distributed.ProcessGroup,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """tie the output layer of the mtp processing stage in a given sharded state dict.
 

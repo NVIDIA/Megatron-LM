@@ -267,7 +267,6 @@ def _get_megatron_optimizer_based_on_param_groups(
     data_parallel_group_idx: Optional[int] = None,
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
-    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
 
@@ -457,13 +456,6 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    if pg_collection is None or not hasattr(pg_collection, 'tp'):
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-    else:
-        tp_group = pg_collection.tp
-    # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
-    setattr(optimizer, 'tp_group', tp_group)
-
     return optimizer
 
 
@@ -534,23 +526,23 @@ def get_megatron_optimizer(
         overlap_param_gather_with_optimizer_step_flags = [False]
 
     # Setup process groups using helper method
-    process_groups_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(
+    process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
         pg_collection, model_chunks, use_gloo_process_groups
     )
 
-    dp_cp_group = process_groups_dict['dp_cp_group']
-    intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
-    intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
-    mp_group = process_groups_dict['mp_group']
-    expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
-    intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
-    intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
-    intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
+    dp_cp_group = process_groups['dp_cp_group']
+    intra_dp_cp_group = process_groups['intra_dp_cp_group']
+    intra_expt_dp_group = process_groups['intra_expt_dp_group']
+    mp_group = process_groups['mp_group']
+    expt_tp_pp_group = process_groups['expt_tp_pp_group']
+    intra_dp_cp_group_gloo = process_groups['intra_dp_cp_group_gloo']
+    intra_expt_dp_group_gloo = process_groups['intra_expt_dp_group_gloo']
+    intra_dist_opt_group = process_groups['intra_dist_opt_group']
 
     model_parallel_rank = get_pg_rank(mp_group)
 
     if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
-        inter_dist_opt_group = process_groups_dict['inter_dist_opt_group']
+        inter_dist_opt_group = process_groups['inter_dist_opt_group']
         distributed_optimizer_instance_id = get_pg_rank(inter_dist_opt_group)
     else:
         distributed_optimizer_instance_id = 0
@@ -583,7 +575,6 @@ def get_megatron_optimizer(
                     data_parallel_group_idx=model_parallel_rank,
                     intra_dist_opt_group=intra_dist_opt_group,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-                    pg_collection=pg_collection,
                 )
             )
             model_chunk_offset += 1
@@ -631,7 +622,6 @@ def get_megatron_optimizer(
                 data_parallel_group_idx=model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-                pg_collection=pg_collection,
             )
         )
         model_chunk_offset += 1
@@ -669,7 +659,6 @@ def get_megatron_optimizer(
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-                pg_collection=pg_collection,
             )
         )
 
