@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 import torch
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
+from functools import partial
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -184,6 +185,31 @@ class GraphableMegatronModule(MegatronModule):
             # triggered before CUDA Graph running. This is required to ensure the correct param
             # all-gather overlap with forward compute.
             self.cuda_graph_manual_hooks = []
+            # _CudaGraphBackwardDWWrapper object used to manage the wgrad backward computation.
+            # The `backward_dw` func api is the same as `TransformerLayerNode.backward_dw` and
+            # calls wgrad computation in attention module (contains attn and shared expert)
+            # according to CUDA graph scope.
+            self.cuda_graph_backward_dw_wrapper = None
+
+    def init_backward_dw_wrapper(self):
+        """Initialize the backward_dw_wrapper."""
+        from megatron.core.models.gpt.fine_grained_callables import _BackwardDWWrapper
+        config = getattr(self, 'config', None)
+        assert config is not None, (
+            "TransformerLayer must be initialized before calling "
+            "`init_backward_dw_wrapper`."
+        )
+        self.backward_dw_wrapper = _BackwardDWWrapper(self)
+
+    def set_cuda_graph_backward_dw_wrapper(self):
+        assert self.backward_dw_wrapper is not None, (
+            "`backward_dw_wrapper` must be set when cuda graphs are enabled "
+            "for ep overlap."
+        )
+        """Replace the backward_dw callable with dw cuda graph."""
+        self.backward_dw_wrapper.set_graphed_backward_dw_callable(
+            partial(self.backward_dw_cudagraph, self.current_microbatch)
+        )
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
