@@ -205,6 +205,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to log the max attention logit across whole model. Decoupled from qk_clip,
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
+    attention_output_gate: bool = False
+    """Whether to apply output gate to the attention layers."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -459,6 +462,10 @@ class TransformerConfig(ModelParallelConfig):
     This makes the gradients from the router and the shared experts added in
     different orders to the hidden_states, causing minor numerical differences
     in the hidden_states gradient."""
+
+    moe_shared_expert_gate: bool = False
+    """Enable gate for shared expert. Only effective when 
+    moe-shared-expert-intermediate-size is set."""
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
@@ -1355,6 +1362,10 @@ class TransformerConfig(ModelParallelConfig):
                         "apply_rope_fusion is not available. Please install TE >= 1.4."
                     )
 
+        if self.fused_single_qkv_rope:
+            if self.attention_output_gate:
+                raise ValueError("fused_single_qkv_rope does not support gated attention for now.")
+
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
@@ -1680,6 +1691,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            if self.mtp_num_layers == 1:
+                assert self.pipeline_model_parallel_size > 1, (
+                    'Pipeline model parallel size must be larger than 1 '
+                    'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
+                )
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
@@ -1689,6 +1705,12 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_use_legacy_grouped_gemm
             ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+
+        if self.ep_overlap_early_attn_memory_release:
+            assert self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be enabled when enabling '
+                'ep_overlap_early_attn_memory_release'
+            )
 
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
@@ -1825,6 +1847,9 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+
+        if self.attention_output_gate:
+            raise NotImplementedError("Output gate is not supported for MLA yet.")
 
         if self.cache_mla_latents:
             assert (
