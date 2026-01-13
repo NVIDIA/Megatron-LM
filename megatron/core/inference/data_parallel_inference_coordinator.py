@@ -296,7 +296,7 @@ class DataParallelInferenceCoordinator:
         for request in finished_request_record["requests"]:
             if request["prompt"] is None:
                 request["prompt"] = self.tokenizer.detokenize(
-                    request["prompt_tokens"][1].tolist()
+                    request["prompt_tokens"][1]
                 )
             request["generated_text"] = self.tokenizer.detokenize(request["generated_tokens"])
 

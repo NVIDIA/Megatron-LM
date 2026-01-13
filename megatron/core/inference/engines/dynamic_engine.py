@@ -818,7 +818,6 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
         """
-
         active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
@@ -944,6 +943,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
+        
         return active_request_ids, finished_request_records
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:

@@ -21,7 +21,7 @@ def serialize_tensor(tensor: torch.Tensor) -> List:
         tensor (Tensor): Tensor.
 
     Returns:
-        (bytes) Byte representation of tensor.
+        (List) Tensor as a list
     """
     torch.cuda.nvtx.range_push("serialize_tensor")
 
@@ -99,27 +99,21 @@ class InferenceRequest:
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
-
         # Dataclass to dict.
-        torch.cuda.nvtx.range_push("InferenceRequest.serialize")
-        torch.cuda.nvtx.range_push("shallow-dict")
-        # obj = asdict(self)
+        # do not use asdict(self) - it has very high CPU overheads 
+        # and if there are tensors, it will try to deepcopy them
         obj = self.__dict__  # shallow dict copy
-        torch.cuda.nvtx.range_pop()
         obj["status"] = self.status.name if self.status else None
         obj["sampling_params"] = self.sampling_params.serialize() if self.sampling_params else None
         obj["inference_parameters"] = (
             self.inference_parameters.serialize() if self.inference_parameters else None
         )
 
-        torch.cuda.nvtx.range_push("tensor_serialize")
         # Serialize tensors.
         obj = {
             k: (("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor) else v)
             for k, v in obj.items()
         }
-        torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_pop()
         return obj
 
     @classmethod
@@ -208,9 +202,9 @@ class DynamicInferenceEvent:
 
         # Dataclass to dict.
         torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
-        torch.cuda.nvtx.range_push("asdict")
+        # do not use asdict(self) - it has very high CPU overheads 
+        # and if there are tensors, it will try to deepcopy them
         obj = self.__dict__
-        torch.cuda.nvtx.range_pop()
         obj["type"] = self.type.name
 
         # Serialize payload.
@@ -297,9 +291,7 @@ class DynamicInferenceRequest(InferenceRequest):
         """
         torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
-        torch.cuda.nvtx.range_push("events_serialize")
         obj["events"] = [e.serialize() for e in self.events]
-        torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
         return obj
 
