@@ -602,7 +602,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None, flush_delayed_groups=True):
+    def _forward_mlp(
+        self, hidden_states, inference_context=None, padding_mask=None, flush_delayed_groups=True
+    ):
         """
         Perform a forward pass through the feed-forward layer.
 

@@ -789,8 +789,7 @@ class ChunkOffloadHandler:
     def find_group_with_name(self, name: str, start_index: int = 0):
         """Find the group with the given name starting from the given index."""
         return next(
-            (group for group in self.offload_groups[start_index:] if group._name == name),
-            None,
+            (group for group in self.offload_groups[start_index:] if group._name == name), None
         )
 
     def is_empty_chunk(self, name=None):
@@ -806,8 +805,12 @@ class ChunkOffloadHandler:
             f"------finish_all_groups {self} {self._max_group_size} {self._offloaded_group_index}"
         )
         # TODO: check if this is correct
-        # Mark it as finished when all groups are finished and there are no groups to offload or reload
-        if len(self._groups_to_reload) == 0 and len(self._groups_to_offload) == 0 and self._offloaded_group_index > 0:
+        # Mark it as finished when there are no groups to offload or reload
+        if (
+            len(self._groups_to_reload) == 0
+            and len(self._groups_to_offload) == 0
+            and self._offloaded_group_index > 0
+        ):
             return True
         assert name is not None, "Name is required"
         return self.find_group_with_name(name, self._offloaded_group_index) is None
@@ -927,8 +930,9 @@ class ChunkOffloadHandler:
             return False
 
         # Check if next backward chunk is this chunk (for last pipeline stage)
-        next_backward_chunk = \
-            PipelineOffloadManager.get_instance().front_backward_chunk(group._name)
+        next_backward_chunk = PipelineOffloadManager.get_instance().front_backward_chunk(
+            group._name
+        )
         if next_backward_chunk is not None and next_backward_chunk is self:
             # Don't offload the last group with the same name if it's about to be used immediately
             if self.find_next_group(group._name) is None:
@@ -1208,6 +1212,7 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
 def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> torch.Tensor:
     """Record the backward event for cuda graph capture."""
     return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
+
 
 def fine_grained_offloading_reset_instance():
     """Reset the singleton instance of PipelineOffloadManager."""
