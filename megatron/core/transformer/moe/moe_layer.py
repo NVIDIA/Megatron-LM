@@ -397,19 +397,20 @@ class MoELayer(BaseMoELayer):
                 "fc1", self.home_expert_indices
             )
 
-            expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
-            default_stream = torch.cuda.current_stream()
+            # TODO: share the same preprocess operation but use different metadata object
+            fc1_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
+            fc2_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
             if self.config.moe_echo_recompute_expert_dispatch:
                 dispatched_fc1_weights = fc1_expert_checkpoint.checkpoint(
                     partial(
                         self.expert_dispatcher.expert_dispatch, 
-                        expert_dispatch_metadata, 
+                        fc1_expert_dispatch_metadata, 
                     ),
                     *fc1_expert_weights,
                 )
             else:
                 dispatched_fc1_weights = self.expert_dispatcher.expert_dispatch(
-                    expert_dispatch_metadata,
+                    fc1_expert_dispatch_metadata,
                     *fc1_expert_weights,
                 )
             self.experts.set_expert_weights(
@@ -426,13 +427,13 @@ class MoELayer(BaseMoELayer):
                 dispatched_fc2_weights = fc2_expert_checkpoint.checkpoint(
                     partial(
                         self.expert_dispatcher.expert_dispatch, 
-                        expert_dispatch_metadata, 
+                        fc2_expert_dispatch_metadata, 
                     ),
                     *fc2_expert_weights,
                 )
             else:
                 dispatched_fc2_weights = self.expert_dispatcher.expert_dispatch(
-                    expert_dispatch_metadata,
+                    fc2_expert_dispatch_metadata,
                     *fc2_expert_weights,
                 )
             self.experts.set_expert_weights(
@@ -447,7 +448,6 @@ class MoELayer(BaseMoELayer):
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
                 hidden_states, rerouted_probs, metadata
             )
-
         def dispatch_and_compute(hidden_states, probs, metadata):
             with torch.cuda.nvtx.range("token_dispatch"):
                 dispatched_input, probs = self.token_dispatcher.token_dispatch(

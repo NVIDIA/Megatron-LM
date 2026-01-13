@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -1766,7 +1767,9 @@ class MoESyncFreeElasticExpertDispatcher:
         self.ep_size = self.ep_group.size()
         self.ep_rank = self.ep_group.rank()
 
-        self.weight_chunk_size = config.hidden_size * 2 # send weight by chunk for hybrid-ep
+        # Find power of 2 multiplier that makes hidden_size * 2^n closest to 8192
+        n = max(0, round(math.log2(8192 / config.hidden_size)))
+        self.weight_chunk_size = config.hidden_size * (2 ** n)
         self.num_total_experts = config.moe_num_echo_experts
         self.num_local_echo_experts = config.moe_num_echo_experts // self.ep_size
         self.num_local_home_experts = config.num_moe_experts // self.ep_size
