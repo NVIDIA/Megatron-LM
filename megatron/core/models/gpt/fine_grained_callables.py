@@ -428,7 +428,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             attn_backward_dw_wrapper.set_graphed_backward_dw_callable(
                 partial(layer.backward_dw_cudagraph, layer.current_microbatch)
             )
+            node.chunk_state.flush_delayed_groups = False
         else:
+            node.chunk_state.flush_delayed_groups = True
             # wrapper function that keeps consistent api with cuda graph replay
             def forward_func(
                 hidden_states: Tensor,
@@ -559,6 +561,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+
+        if node.chunk_state.flush_delayed_groups:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                fine_grained_offloading_group_flush_delayed_groups,
+            )
+            fine_grained_offloading_group_flush_delayed_groups()
 
         # Need to record residual to comm stream, since it's created on comp stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
