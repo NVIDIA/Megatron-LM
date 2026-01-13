@@ -1,6 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+
+os.environ['WANDB_MODE'] = "disabled"
+os.environ['LOG_TO_WANDB'] = "false"
+
 from unittest.mock import patch
 
 import pytest
@@ -23,6 +27,8 @@ from tests.unit_tests.test_utilities import Utils
 BATCH = 2
 SEQ = 4
 VOCAB = 754
+
+Utils.set_world_size(world_size=1, rank=0)
 
 
 class MockModel(LanguageModule):
@@ -456,3 +462,45 @@ def test_prepare_trajectories_with_sequence_packing(mock_rank):
     assert trajs[1, 1] == 5
     assert trajs[1, 4] == tokenizer.eod
     assert trajs[1, 5] == tokenizer.pad
+
+
+def test_gpt_logprobs():
+    """Test get logprobs on an actual model, not on a mocked one.
+
+    This can be useful for quick benchmarking/analyzing regressions too.
+    """
+
+    args = arguments.parse_args(ignore_unknown_args=True)
+    setattr(args, 'bf16', True)
+    global_vars.set_args(args)
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    transformer_config = TransformerConfig(
+        num_layers=10,
+        hidden_size=256,
+        num_attention_heads=16,
+        use_cpu_initialization=True,
+        embedding_init_method_std=1.0,
+        bf16=True,
+    )
+    gpt_model = GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=10000,
+        max_sequence_length=4192,
+    )
+    sequence_length = gpt_model.max_sequence_length
+
+    gpt_model = Float16Module(gpt_model.config, gpt_model)
+
+    micro_batch_size = 2
+    gpt_model.cuda()
+
+    data = list(range(sequence_length))
+    input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+    position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+
+    logprobs = rl_utils.get_logprobs(gpt_model, input_ids, position_ids=position_ids)
+
+    assert logprobs.shape == (2, sequence_length - 1)
+    Utils.destroy_model_parallel()
