@@ -72,5 +72,5 @@ products:
   - test_case: [gpt_grpo_tp2tp1_pp4pp2_dp8_583m_throughputtest]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
