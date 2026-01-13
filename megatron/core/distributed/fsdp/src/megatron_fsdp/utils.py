@@ -498,8 +498,7 @@ class FSDPDistributedIndex:
         self.fsdp_group_ag = None
         if HAVE_MEGATRON_CORE and parallel_state.has_separate_all_gather_group():
             self.fsdp_group_ag = parallel_state.get_data_parallel_group(
-                        with_context_parallel=True,
-                        independent_all_gather=True
+                with_context_parallel=True, independent_all_gather=True
             )
         # Retrieve the outer-FSDP process group from the DeviceMesh.
         self.outer_fsdp_group = (
@@ -635,7 +634,9 @@ class FSDPDistributedIndex:
             return self.hybrid_fsdp_group
         return self.fsdp_group
 
-    def get_fsdp_group(self, is_expert_parallel: bool = False, independent_all_gather: bool = False) -> ProcessGroup:
+    def get_fsdp_group(
+        self, is_expert_parallel: bool = False, independent_all_gather: bool = False
+    ) -> ProcessGroup:
         """Get the FSDP process group."""
         if is_expert_parallel:
             return self.expt_fsdp_group

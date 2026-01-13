@@ -1602,9 +1602,18 @@ class ParamAndGradBuffer:
             if self.dist_index.get_outer_fsdp_group() is not None:
                 # Outer/Inter-FSDP group when using hybrid FSDP
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
-            if self.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True) is not None:
+            if (
+                self.dist_index.get_fsdp_group(
+                    is_expert_parallel=False, independent_all_gather=True
+                )
+                is not None
+            ):
                 # All-gather group used when overlapping all-gather and gradient reduction.
-                self.ubr_groups.append(self.dist_index.get_fsdp_group(is_expert_parallel=False, independent_all_gather=True))
+                self.ubr_groups.append(
+                    self.dist_index.get_fsdp_group(
+                        is_expert_parallel=False, independent_all_gather=True
+                    )
+                )
 
             if torch.distributed.get_rank() == 0:
                 logging.info(

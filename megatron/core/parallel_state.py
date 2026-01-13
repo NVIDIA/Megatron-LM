@@ -1407,7 +1407,9 @@ def get_pipeline_model_parallel_group(check_initialized=True):
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False, independent_all_gather=False):
+def get_data_parallel_group(
+    with_context_parallel=False, partial_data_parallel=False, independent_all_gather=False
+):
     """Get the data-parallel group the caller rank belongs to."""
     if with_context_parallel:
         if partial_data_parallel:
@@ -1432,7 +1434,7 @@ def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=F
 
 def has_separate_all_gather_group() -> bool:
     """Check if a separate all-gather process group has been created.
-    
+
     Returns True if a dedicated all-gather process group exists for improved
     communication overlap, False otherwise.
     """
