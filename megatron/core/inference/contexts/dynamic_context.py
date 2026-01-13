@@ -68,8 +68,6 @@ except ImportError:
 if TYPE_CHECKING:
     import wandb as WandbModule
 
-EMPTY_EVICTED_REQUEST_IDS = torch.tensor([], dtype=torch.long, device=torch.cuda.current_device())
-
 
 class ContextOverflowError(Exception):
     """Base exception for when a new request does not fit.
@@ -1824,7 +1822,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Nothing to evict?
         if overflow_paused_block_count <= 0:
-            return EMPTY_EVICTED_REQUEST_IDS
+            return None
 
         # Overflow paused block count.
         paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
@@ -1838,7 +1836,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # above, but here we allow up to one paused request to overflow into the
         # active buffer.
         if overflow_paused_request_count == 0:
-            return EMPTY_EVICTED_REQUEST_IDS
+            return None
 
         # Evict request count. (Flip paused_block_counts because evictions are
         # counted from the right-most paused requests.
