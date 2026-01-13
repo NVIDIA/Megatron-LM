@@ -63,6 +63,7 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
@@ -2293,6 +2294,8 @@ def train(
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+    if args.optimizer_cuda_graph:
+        optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -2656,6 +2659,9 @@ def train(
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
         cuda_graph_helper.delete_cuda_graphs()
+
+    if args.optimizer_cuda_graph:
+        del optimizer.step
 
     one_logger_utils.track_e2e_metrics()
 

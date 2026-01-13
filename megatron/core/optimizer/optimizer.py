@@ -1275,7 +1275,7 @@ class ChainedOptimizer(MegatronOptimizer):
             for optimizer in self.chained_optimizers:
                 grads_for_norm += optimizer.get_main_grads_for_grad_norm()
             grad_norm = get_grad_norm_fp32(
-                grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+                grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group(), on_device=self.config.on_device_clip_grad
             )
         else:
             grad_norms = []
