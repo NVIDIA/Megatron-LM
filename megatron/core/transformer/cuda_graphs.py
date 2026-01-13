@@ -1898,6 +1898,16 @@ class TECudaGraphHelper:
                     )
             else:
                 kwargs['fp8_enabled'] = False
+
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                fine_grained_offloading_disable_offload,
+                fine_grained_offloading_enable_offload,
+            )
+
+            # if self.config.offload_module_in_cuda_graph:
+            if self.config.fine_grained_activation_offloading:
+                kwargs['pre_warmup_hook'] = fine_grained_offloading_disable_offload
+                kwargs['post_warmup_hook'] = fine_grained_offloading_enable_offload
             return kwargs
 
         kwargs = get_make_graphed_callables_kwargs()
@@ -1932,7 +1942,12 @@ class TECudaGraphHelper:
         _set_capture_end()
 
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_reset,
+        )
         from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
+
+        fine_grained_offloading_reset()
 
         torch.distributed.barrier()
         for model_chunk in self.model:

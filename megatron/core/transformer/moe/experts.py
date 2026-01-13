@@ -744,6 +744,7 @@ class TEGroupedMLP(MegatronModule):
                 fc1_output,
                 name="expert_fc1",
                 forced_released_tensors=[permuted_local_hidden_states],
+                delay_offload=self.config.delay_offload_until_cuda_graph,
             )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
@@ -822,7 +823,10 @@ class TEGroupedMLP(MegatronModule):
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         if self.offload_moe_act:
             output = fine_grained_offloading_group_commit(
-                output, name="moe_act", forced_released_tensors=[fc1_output]
+                output,
+                name="moe_act",
+                forced_released_tensors=[fc1_output],
+                delay_offload=self.config.delay_offload_until_cuda_graph,
             )
 
         # upad and concat the output
