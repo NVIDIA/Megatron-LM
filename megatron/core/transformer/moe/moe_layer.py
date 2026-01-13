@@ -299,7 +299,7 @@ class MoELayer(BaseMoELayer):
         """Combines expert outputs via communication and adds shared expert output.
 
         This method uses the token dispatcher to combine the outputs from different
-        experts (e.g., via an All-to-All communication)
+        experts (e.g., via an All-to-All communication).
         """
         output = self.token_dispatcher.token_combine(output)
         return output
