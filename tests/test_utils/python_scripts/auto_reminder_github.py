@@ -58,27 +58,42 @@ class PRReviewTracker:
 
         try:
             user = self.github.get_user(username)
+            public_email = None
 
             # 1. Try public profile email first
             if user.email and not user.email.endswith("@users.noreply.github.com"):
-                self.email_cache[username] = user.email
-                return user.email
+                if user.email.endswith("@nvidia.com"):
+                    self.email_cache[username] = user.email
+                    return user.email
+                else:
+                    public_email = user.email
 
             # 2. If no public email, check recent commits on the main repo
             try:
                 # Use get_commits(author=...) which is more direct than search_commits
                 for commit in self.repo.get_commits(author=user)[:10]:
                     email = commit.commit.author.email
-                    if email and not email.endswith("@users.noreply.github.com"):
+                    if (
+                        email
+                        and not email.endswith("@users.noreply.github.com")
+                        and email.endswith("@nvidia.com")
+                    ):
                         self.email_cache[username] = email
                         return email
+                    elif (
+                        email
+                        and not email.endswith("@users.noreply.github.com")
+                        and public_email is None
+                    ):
+                        public_email = email
             except Exception as e:
                 logger.debug(f"Could not check commits for {username}: {e}")
 
-            # 3. Fallback to public email (even if noreply) or a constructed noreply
-            email = user.email or f"{username}@users.noreply.github.com"
-            self.email_cache[username] = email
-            return email
+            if public_email is None:
+                public_email = f"{username}@users.noreply.github.com"
+
+            self.email_cache[username] = public_email
+            return public_email
 
         except Exception as e:
             logger.warning(f"Could not get user object for {username}: {e}")
