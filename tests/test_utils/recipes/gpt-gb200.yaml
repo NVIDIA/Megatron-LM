@@ -42,9 +42,9 @@ spec:
 
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
-        "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/cache/$RUN_ID"
-        "OUTPUT_PATH={assets_dir}"
-        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
+        "OUTPUT_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/output"
+        "TENSORBOARD_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts/"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
@@ -59,7 +59,7 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}} 
     exit_code=$?
     echo "Exit code: $exit_code"
-    rm -rf /lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/cache/$RUN_ID || true
+    rm -rf /lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID || true
     set -x
     exit $exit_code
 
