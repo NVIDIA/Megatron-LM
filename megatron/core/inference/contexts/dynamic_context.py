@@ -1464,7 +1464,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.token_to_pos_ids[:num_tokens].unsqueeze(0),
         )
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def last_token_logits(self, logits: Tensor) -> Tensor:
         """Last tokens of logits.
 
@@ -1494,42 +1493,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         last_token_logits = logits[last_token_idxs, :]
 
         return last_token_logits
-    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    # def last_token_logits(self, logits: Tensor) -> Tensor:
-    #     """Last tokens of logits.
-
-    #     Args:
-    #         logits (Tensor): Output logits of forward pass.
-
-    #     Return:
-    #         (Tensor) Last token logits.
-    #     """
-    #     print(f"logits: {logits}.")
-
-    #     # todo: @lmcafee, remove these asserts?
-    #     assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
-    #     assert logits.size(1) == self.padded_active_token_count, (
-    #         f"logits.size(1) ({tuple(logits.shape)}) != "
-    #         f"padded_active_token_count ({self.padded_active_token_count})."
-    #     )
-
-    #     # Last token logits.
-    #     print(f"logits: {logits}.")
-    #     logits = logits.squeeze(0)
-    #     print(f"logits: {logits}.")
-    #     last_token_idxs = (
-    #         torch.cumsum(
-    #             self.request_query_lengths[self.paused_request_count : self.total_request_count],
-    #             dim=0,
-    #         )
-    #         - 1
-    #     )
-    #     print(f"last_token_idxs: {last_token_idxs}.")
-    #     last_token_logits = logits[last_token_idxs, :]
-    #     print(f"last_token_logits: {last_token_logits}.")
-
-    #     return last_token_logits
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def check_availability(self, req: DynamicInferenceRequest) -> (bool, bool, bool):
         """
@@ -1798,20 +1761,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             # has already used.
             paused_block_counts += 1  # +1 for newly added block
             paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-            # >>>
-            # resume_request_count = min(
-            #     torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
-            #     self.block_allocator.total_avail,
-            # )
-            # +++
-            # resume_request_count += torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel()
-            # resume_request_count = min(resume_request_count, self.block_allocator.total_avail)
-            # +++
             local_resume_request_count = min(
                 torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
                 self.block_allocator.total_avail - resume_request_count,
             )
-            # <<<
 
         self.paused_request_count -= local_resume_request_count
         active_request_count += local_resume_request_count
@@ -1893,34 +1846,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Release memory.
         self.release_memory_blocks_from_request_indexes(evict_request_idxs)
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # # Move evicted requests to the right of active requests, while minimizing
-        # # movement.
-        # if evict_request_count < active_request_count:
-        #     # Swap all evicted requests with right-most active requests.
-        #     src_idxs = torch.arange(
-        #         self.paused_request_count - evict_request_count,
-        #         self.paused_request_count,
-        #         device=torch.cuda.current_device(),
-        #     )
-        #     dst_idxs = torch.arange(
-        #         self.total_request_count - evict_request_count,
-        #         self.total_request_count,
-        #         device=torch.cuda.current_device(),
-        #     )
-        # else:
-        #     # Swap all active requests with left-most evicted requests.
-        #     src_idxs = torch.arange(
-        #         self.paused_request_count - evict_request_count,
-        #         self.paused_request_count - evict_request_count + active_request_count,
-        #         device=torch.cuda.current_device(),
-        #     )
-        #     dst_idxs = torch.arange(
-        #         self.paused_request_count,
-        #         self.paused_request_count + active_request_count,
-        #         device=torch.cuda.current_device(),
-        #     )
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         # Move evicted requests to the right of active requests, while maintaining
         # that resumed requests are adjacent to paused requests. This movement is
         # done in 2 steps:
@@ -1957,7 +1882,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # Swap all active requests with left-most evicted requests.
                 src_idxs = get_idxs(P + R - E, P + R - E + C)
                 dst_idxs = get_idxs(T - C, T)
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # Swap evicted and active requests.
         self._swap_book_keeping_tensors(
@@ -2232,7 +2156,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
         # >>>
-        resume_request_count_0 = resume_request_count
         # print_status()
         # <<<
 
@@ -2242,10 +2165,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             resume_request_count,
             next_tokens,
         )
-        # >>>
-        # # if evict_request_ids is not None:
-        # resume_request_count -= evict_request_ids.numel()
-        # <<<
         # >>>
         # print_status()
         # <<<
@@ -2293,34 +2212,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 8. We resume those requests by assigning blocks and updating bookkeeping tensors
         if resume_request_count > 0:
-            # >>>
             assert torch.all(
                 self.request_last_kv_block_offset[
                     self.paused_request_count : (self.paused_request_count + resume_request_count)
                 ]
                 == 0
             ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step. "
-            # +++
-            # try:
-            #     assert torch.all(
-            #         self.request_last_kv_block_offset[
-            #             self.paused_request_count : (self.paused_request_count + resume_request_count)
-            #         ]
-            #         == 0
-            #     ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step. "
-            # except Exception as e:
-            #     import os
-            #     pax({
-            #         "step_count" : step_count,
-            #         "paused request ids" : self.request_ids[:self.paused_request_count],
-            #         "active request ids" : self.request_ids[self.paused_request_count:(self.paused_request_count + self.total_request_count)],
-            #     }, "resume_request_count, newly_paused_request_ids")
-            # <<<
 
-            # >>>
             assert resume_request_count <= self.block_allocator.total_avail
-            # assert resume_request_count <= self.block_allocator.get_active_avail()
-            # <<<
             block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
             row_idx = torch.arange(
                 self.paused_request_count,

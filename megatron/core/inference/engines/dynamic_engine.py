@@ -945,10 +945,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_top_n_logprobs.append(logit_dict)
 
         # Handle evicted requests.
-        # >>>
-        # if evict_request_ids is not None:
         if evict_request_ids.numel() > 0:
-        # <<<
 
             evict_request_ids = evict_request_ids.tolist()
 
