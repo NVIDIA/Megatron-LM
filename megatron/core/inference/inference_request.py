@@ -214,7 +214,7 @@ class DynamicInferenceEvent:
         # Dataclass to dict.
         torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
         torch.cuda.nvtx.range_push("asdict")
-        obj = asdict(self)
+        obj = self.__dict__
         torch.cuda.nvtx.range_pop()
         obj["type"] = self.type.name
 
@@ -533,10 +533,8 @@ class DynamicInferenceRequestRecord:
                 serialization.
         """
         torch.cuda.nvtx.range_push("DynamicInferenceRequestRecord.serialize")
-        torch.cuda.nvtx.range_push("asdict")
-        obj = asdict(self)
-        torch.cuda.nvtx.range_pop()
-        obj["requests"] = [r.serialize() for r in self.requests]
+        self.requests = [r.serialize() for r in self.requests]
+        obj = self.__dict__  # shallow dict copy
         torch.cuda.nvtx.range_pop()
         return obj
 
