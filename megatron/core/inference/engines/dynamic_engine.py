@@ -719,16 +719,10 @@ class DynamicInferenceEngine(AbstractEngine):
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
         ):
-            # >>>
-            raise Exception("max seq overflow.")
-            # <<<
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
-            # >>>
-            raise Exception("token overflow.")
-            # <<<
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
@@ -742,14 +736,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
-            # >>>
-            if len(self.waiting_request_ids) != len(set(self.waiting_request_ids)):
-                raise Exception("whaaaaaaa?")
-            # <<<
         else:
-            # >>>
-            pax("request")
-            # <<<
             self.failed_request_ids.append(request_id)
 
         return self.requests[request_id].future
@@ -961,13 +948,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if evict_request_ids.numel() > 0:
 
             evict_request_ids = evict_request_ids.tolist()
-            # >>>
-            # if 70 in evict_request_ids:
-            #     pax("evict_request_ids", {
-            #         "requests / 70" : self.requests[70],
-            #         "waiting / 70" : 70 in self.waiting_request_ids,
-            #     })
-            # <<<
 
             # Insert into waiting_request_ids after any chunk prefill request.
             if self.context.chunked_prefill_request_id != -1:
@@ -975,10 +955,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     "TODO: Insert into waiting_request_ids after chunked prefill request."
                 )
             self.waiting_request_ids.extendleft(evict_request_ids)
-            # >>>
-            if len(self.waiting_request_ids) != len(set(self.waiting_request_ids)):
-                raise Exception("whaaaaaaa?")
-            # <<<
 
             # Checkpoint requests (i.e., prompt += generations) + add eviction event.
             for request_id in evict_request_ids:
@@ -1058,10 +1034,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
-                # >>>
-                if req.request_id == 70:
-                    print("...................... add: %d." % req.request_id)
-                # <<<
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
@@ -1166,10 +1138,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
-        # >>>
-        import builtins
-        builtins.step_count = self.step_count
-        # <<<
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
         self.step_end_event.synchronize()
@@ -1361,25 +1329,6 @@ class DynamicInferenceEngine(AbstractEngine):
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
-
-        # >>>
-        # finished_request_ids = set(r.request_id for r in finished_request_records)
-        # if finished_request_ids:
-        #     pax("finished_request_ids", {
-                
-        #     })
-
-        # record70 = [ r for r in finished_request_records if r.request_id == 70 ]
-        # if record70:
-        #     record70 = record70[0]
-        #     req70 = record70.merge()
-        #     pax("record70, req70", {
-        #         "waiting_request_ids" : self.waiting_request_ids,
-        #         "waiting / 70 ?" : 70 in self.waiting_request_ids,
-        #         "waiting / len" : len(self.waiting_request_ids),
-        #         "waiting / len / set": len(set(self.waiting_request_ids)),
-        #     })
-        # <<<
 
         return {
             "active_request_ids": active_request_ids,

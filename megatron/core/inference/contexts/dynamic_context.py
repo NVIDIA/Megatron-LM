@@ -1721,208 +1721,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             self.mamba_metadata.free_slots(request_indexes)
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # def resume_paused_requests(
-    #     self,
-    #     active_request_count: int,
-    #     resume_request_count: int,
-    #     newly_paused_request_ids: torch.Tensor,
-    #     next_tokens: torch.Tensor,
-    # ) -> tuple[int, int, torch.Tensor]:
-    #     """Resume as many paused requests as we have space for in the active buffer.
-
-    #     Args:
-    #         active_request_count (int): Number of active requests.
-    #         resume_request_count (int): Existing number of resumed requests.
-    #         newly_paused_request_ids (torch.Tensor): List of newly paused request ids.
-    #         next_tokens (torch.Tensor): Sampled tokens.
-
-    #     Returns:
-    #         (tuple[int, int, torch.Tensor]) active_request_count, resume_request_count,
-    #         newly_paused_request_ids.
-    #     """
-
-    #     # Assign released blocks to paused requests.
-    #     # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
-    #     local_resume_request_count = 0
-    #     if self.paused_request_count > 0:
-    #         active_block_count_avail = self.block_allocator.get_active_avail()
-    #         paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
-    #         # Flip counts before cumsum, since paused requests are resumed from
-    #         # the right-most index, so we must count resumed blocks starting from
-    #         # the right side.
-    #         paused_block_counts = paused_block_counts.flip(dims=[0])
-    #         # Add +1 to all block counts, since any time a paused request is
-    #         # resumed, it will be starting a new memory block. For background,
-    #         # pausing happens after a request has generated the final token of a
-    #         # memory block (i.e., token 256 of that block), which means the very
-    #         # next token (whenever that request gets unpaused) will be in a new
-    #         # block. So, when we resume a paused request, we have to account for
-    #         # the fact that it will need an extra block beyond the ones that it
-    #         # has already used.
-    #         paused_block_counts += 1  # +1 for newly added block
-    #         paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-    #         local_resume_request_count = min(
-    #             torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
-    #             self.block_allocator.total_avail - resume_request_count,
-    #         )
-
-    #     self.paused_request_count -= local_resume_request_count
-    #     active_request_count += local_resume_request_count
-    #     assert active_request_count > 0, "active_request_count == %d." % active_request_count
-    #     resume_request_count += local_resume_request_count
-
-    #     # Remove resumed requests from newly_paused_request_ids. We do this by
-    #     # truncating the end of newly_paused_request_ids, which works because we
-    #     # resume requests in LIFO order. If local_resume_request_count >
-    #     # len(newly_paused_request_ids), this means that none of the paused
-    #     # requests are newly paused during this update.
-    #     if newly_paused_request_ids is not None and local_resume_request_count > 0:
-    #         newly_paused_request_ids = newly_paused_request_ids[:-local_resume_request_count]
-
-    #     return active_request_count, resume_request_count, newly_paused_request_ids
-
-    # def evict_overflow_paused_requests(
-    #     self,
-    #     active_request_count: int,
-    #     resume_request_count: int,
-    #     next_tokens: torch.Tensor,
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
-    #     """Evict requests that overflow the paused buffer.
-
-    #     Args:
-    #         active_request_count (int): Number of active requests.
-    #         resume_request_count (int): Number of resumed requests.
-    #         next_tokens (torch.Tensor): Sampled tokens.
-
-    #     Returns:
-    #         (torch.Tensor) Evicted request ids.
-    #     """
-
-    #     # Overflow paused block count.
-    #     overflow_paused_block_count = (
-    #         self.block_allocator.get_paused_used() - self.block_allocator.paused_count
-    #     )
-
-    #     # Nothing to evict?
-    #     if overflow_paused_block_count <= 0:
-    #         return EMPTY_EVICTED_REQUEST_IDS
-
-    #     # Overflow paused block count.
-    #     paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
-    #     paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-    #     valid_paused_request_count = torch.nonzero(
-    #         paused_block_counts_cumsum <= self.block_allocator.paused_count
-    #     ).numel()
-    #     overflow_paused_request_count = self.paused_request_count - valid_paused_request_count
-
-    #     # Nothing to evict? (Similar to checking overflow_paused_block_count
-    #     # above, but here we allow up to one paused request to overflow into the
-    #     # active buffer.
-    #     if overflow_paused_request_count == 0:
-    #         return EMPTY_EVICTED_REQUEST_IDS
-
-    #     # Evict request count. (Flip paused_block_counts because evictions are
-    #     # counted from the right-most paused requests.
-    #     paused_block_counts = paused_block_counts[-overflow_paused_request_count:].flip(dims=[0])
-    #     paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-    #     remaining_paused_request_counts = torch.arange(
-    #         overflow_paused_request_count - 1,
-    #         -1,
-    #         -1,
-    #         dtype=paused_block_counts_cumsum.dtype,
-    #         device=torch.cuda.current_device(),
-    #     )
-    #     net_block_counts = paused_block_counts_cumsum - remaining_paused_request_counts
-    #     evict_request_count = torch.nonzero(net_block_counts >= 0)[0].item() + 1
-
-    #     # Eviction index range.
-    #     evict_start_idx = self.paused_request_count - evict_request_count
-    #     evict_end_idx = self.paused_request_count
-    #     evict_request_idxs = torch.arange(
-    #         evict_start_idx, evict_end_idx, device=torch.cuda.current_device()
-    #     )
-    #     evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
-
-    #     # >>>
-    #     if 70 in set(evict_request_ids.tolist()):
-    #         # pax("evict_request_ids")
-    #         print(".................................. evict ids: %s." % str(evict_request_ids.tolist()))
-    #     # <<<
-
-    #     # Release memory.
-    #     self.release_memory_blocks_from_request_indexes(evict_request_idxs)
-
-    #     # Move evicted requests to the right of active requests, while maintaining
-    #     # that resumed requests are adjacent to paused requests. This movement is
-    #     # done in 2 steps:
-    #     # 1. Move evicted requests to the right of resumed requests.
-    #     # 2. Move evicted requests to the right of active requests.
-    #     T = self.total_request_count
-    #     P = self.paused_request_count
-    #     A = active_request_count
-    #     R = resume_request_count
-    #     E = evict_request_count
-    #     C = active_request_count - resume_request_count # continuing active requests
-    #     get_idxs = lambda x, y: torch.arange(x, y, device=torch.cuda.current_device())
-
-    #     # Step 1: Move evicted requests to the right of resumed requests, while
-    #     # minimizing movement.
-    #     if R:
-    #         if E < R:
-    #             # Swap all evicted requests with right-most resumed requests.
-    #             src_idxs = get_idxs(P - E, P)
-    #             dst_idxs = get_idxs(P + R - E, P + R)
-    #         else:
-    #             # Swap all resumed requests with left-most evicted requests.
-    #             src_idxs = get_idxs(P - E, P - E + R)
-    #             dst_idxs = get_idxs(P, P + R)
-
-    #     # Swap evicted and resumed requests.
-    #     self._swap_book_keeping_tensors(
-    #         src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
-    #     )
-
-    #     # Step 2: Move evicted requests to the right of continuing (non-resumed)
-    #     # active requests, while minimizing movement.
-    #     if C:
-    #         if E < C:
-    #             # Swap all evicted requests with right-most active requests.
-    #             src_idxs = get_idxs(P + R - E, P + R)
-    #             dst_idxs = get_idxs(T - E, T)
-    #         else:
-    #             # Swap all active requests with left-most evicted requests.
-    #             src_idxs = get_idxs(P + R - E, P + R - E + C)
-    #             dst_idxs = get_idxs(T - C, T)
-
-    #     # Swap evicted and continuing requests.
-    #     self._swap_book_keeping_tensors(
-    #         src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
-    #     )
-
-    #     # Swap the chunked prefill request to the end of the active requests to
-    #     # obey the invariance.
-    #     if self.chunked_prefill_request_id != -1:
-    #         self._swap_book_keeping_tensors(
-    #             src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
-    #             dst_idxs=torch.tensor([self.total_request_count - evict_request_count - 1]),
-    #             next_tokens=next_tokens,
-    #         )
-
-    #     # Update tracking vars.
-    #     self.paused_request_count -= evict_request_count
-    #     self.total_request_count -= evict_request_count
-
-    #     # Reset unused block ids.
-    #     evict_slice = slice(
-    #         self.total_request_count, self.total_request_count + evict_request_count
-    #     )
-    #     self.request_to_kv_block_ids[evict_slice] = -1
-    #     if self.is_hybrid_model:
-    #         self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
-
-    #     return evict_request_ids
-    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     def resume_paused_requests(
         self,
         active_request_count: int,
@@ -2083,12 +1881,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
 
-        # >>>
-        if 70 in set(evict_request_ids.tolist()):
-            # pax("evict_request_ids")
-            print(".................................. evict ids: %s." % str(evict_request_ids.tolist()))
-        # <<<
-
         # Release memory.
         self.release_memory_blocks_from_request_indexes(evict_request_idxs)
 
@@ -2146,7 +1938,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
 
         return evict_request_ids
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
         """Update context state after calling engine.step().
@@ -2178,8 +1969,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         5. We identify requests that require a new block and add them to the paused requests (i.e move them left)
         6. Resume paused requests & evict overflowing paused requests.
         7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        8. We resume those requests by assigning blocks and updating bookkeeping tensors
-        9. We make relevant changes to the token bookkeeping tensors
+        8. We make relevant changes to the token bookkeeping tensors
 
         Args:
             active_requests_mask (Tensor): 1D Mask tensor marking active requests.
@@ -2339,34 +2129,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # 6. Now that we have the requests in following order [Paused, Active, Finished]
         # We determine how many requests we can resume and resume them
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # # 6.a. First, resume temporarily paused requests.
-        # active_request_count, resume_request_count, newly_paused_request_ids = (
-        #     self.resume_paused_requests(
-        #         active_request_count,
-        #         0, # initial resume_request_count
-        #         newly_paused_request_ids,
-        #         next_tokens,
-        #     )
-        # )
-
-        # # 6.b. Evict requests that overflow the paused buffer.
-        # evict_request_ids = self.evict_overflow_paused_requests(
-        #     active_request_count,
-        #     resume_request_count,
-        #     next_tokens,
-        # )
-
-        # # 6.c. Resume any additional requests.
-        # active_request_count, resume_request_count, newly_paused_request_ids = (
-        #     self.resume_paused_requests(
-        #         active_request_count,
-        #         resume_request_count,
-        #         newly_paused_request_ids,
-        #         next_tokens,
-        #     )
-        # )
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         # 6.a. First, resume temporarily paused requests.
         active_request_count, newly_paused_request_ids = (
             self.resume_paused_requests(
@@ -2390,7 +2152,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 next_tokens,
             )
         )
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count
@@ -2420,36 +2181,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             + 1
         ) % self.block_size_tokens
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # # 8. We resume those requests by assigning blocks and updating bookkeeping tensors
-        # if resume_request_count > 0:
-        #     assert torch.all(
-        #         self.request_last_kv_block_offset[
-        #             self.paused_request_count : (self.paused_request_count + resume_request_count)
-        #         ]
-        #         == 0
-        #     ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step. "
-
-        #     assert resume_request_count <= self.block_allocator.total_avail
-        #     block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
-        #     row_idx = torch.arange(
-        #         self.paused_request_count,
-        #         self.paused_request_count + resume_request_count,
-        #         device=torch.cuda.current_device(),
-        #     )
-        #     col_idx = self.request_kv_block_counts[
-        #         self.paused_request_count : (self.paused_request_count + resume_request_count)
-        #     ]
-        #     self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
-        #     self.request_kv_block_counts[
-        #         self.paused_request_count : (self.paused_request_count + resume_request_count)
-        #     ] += 1
-        #     self.request_last_kv_block_id[
-        #         self.paused_request_count : (self.paused_request_count + resume_request_count)
-        #     ] = block_ids
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
-        # 9. We make relevant changes to the token bookkeeping tensors
+        # 8. We make relevant changes to the token bookkeeping tensors
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
             self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
         )
