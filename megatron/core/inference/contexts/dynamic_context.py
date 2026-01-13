@@ -1737,6 +1737,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         Returns:
             (tuple[int, torch.Tensor]) active_request_count, newly_paused_request_ids.
         """
+        # >>>
+        if self.paused_request_count:
+            assert self.request_kv_block_counts[:self.paused_request_count].max().item() < 2
+        # <<<
 
         # Assign released blocks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
@@ -1763,16 +1767,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.block_allocator.total_avail,
             )
 
-            # >>>
-            # if step_count == 106:
-            #     pax({
-            #         "paused_request_count" : self.paused_request_count,
-            #         "active_request_count" : active_request_count,
-            #         "resume_request_count" : resume_request_count,
-            #         "paused offsets" : self.request_last_kv_block_offset[:self.paused_request_count],
-            #     })
-            # <<<
-
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
@@ -1784,29 +1778,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
         if resume_request_count > 0:
-            # >>>
-            # assert torch.all(
-            #     self.request_last_kv_block_offset[
-            #         self.paused_request_count : (self.paused_request_count + resume_request_count)
-            #     ]
-            #     == 0
-            # ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step."
-            # +++
-            try:
-                assert torch.all(
-                    self.request_last_kv_block_offset[
-                        self.paused_request_count : (self.paused_request_count + resume_request_count)
-                    ]
-                    == 0
-                ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step."
-            except Exception as e:
-                pax({
-                    "e" : e,
-                    "paused_request_count" : self.paused_request_count,
-                    "active_request_count" : active_request_count,
-                    "resume_request_count" : resume_request_count,
-                })
-            # <<<
+            assert torch.all(
+                self.request_last_kv_block_offset[
+                    self.paused_request_count : (self.paused_request_count + resume_request_count)
+                ]
+                == 0
+            ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step."
 
             assert resume_request_count <= self.block_allocator.total_avail
             block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
@@ -2154,14 +2131,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # 6.b. Evict requests that overflow the paused buffer.
-        # >>>
-        # evict_request_ids = self.evict_overflow_paused_requests(
-        #     active_request_count,
-        #     next_tokens,
-        # )
-        # +++
-        evict_request_ids = EMPTY_EVICTED_REQUEST_IDS
-        # <<<
+        evict_request_ids = self.evict_overflow_paused_requests(
+            active_request_count,
+            next_tokens,
+        )
 
         # 6.c. Resume any additional requests.
         active_request_count, newly_paused_request_ids = (
