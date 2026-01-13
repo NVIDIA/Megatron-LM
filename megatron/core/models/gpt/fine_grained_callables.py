@@ -12,14 +12,15 @@ from megatron.core import tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.module import float16_to_fp32
+from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.utils import internal_api
+
 
 def weak_method(method):
     """Creates a weak reference to a method to prevent circular references.
@@ -38,6 +39,7 @@ def weak_method(method):
     return wrapped_func
 
 
+@internal_api
 def should_free_input(name, is_moe, config):
     """Determine if the node should free its input memory.
 
@@ -339,13 +341,14 @@ class _BackwardDWWrapper:
     callables, and determines which components should be executed based on whether CUDA graphs
     are being replayed and which scopes are covered by the graphs.
     """
+
     def __init__(self, layer):
-        assert isinstance(layer, GraphableMegatronModule), (
-            "cuda graphed ep overlap only supports GraphableMegatronModule."
-        )
-        assert isinstance(layer, TransformerLayer), (
-            "cuda graphed ep overlap only supports TransformerLayer for now."
-        )
+        assert isinstance(
+            layer, GraphableMegatronModule
+        ), "cuda graphed ep overlap only supports GraphableMegatronModule."
+        assert isinstance(
+            layer, TransformerLayer
+        ), "cuda graphed ep overlap only supports TransformerLayer for now."
         self.layer = layer
         self.graphed_backward_dw_callable = None
         self.attn_dw_callable = layer.self_attention.backward_dw
