@@ -42,7 +42,7 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
-from megatron.post_training.utils import report_current_memory_info, print_distributed_quant_summary
+from megatron.post_training.utils import report_current_memory_info, print_distributed_quant_summary, modelopt_version_higher_than
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
@@ -298,12 +298,16 @@ if __name__ == "__main__":
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
+        import_kwargs = {
+            "dtype": import_type,
+        }
+        if modelopt_version_higher_than("0.41.0"):
+            import_kwargs.update("trust_remote_code": args.trust_remote_code)
         import_mcore_gpt_from_hf(
             unwrapped_model,
             args.pretrained_model_path,
             workspace_dir,
-            dtype=import_dtype,
-            trust_remote_code=args.trust_remote_code,
+            **import_kwargs,
         )
 
     def _custom_prompt_forward_loop_func(model):

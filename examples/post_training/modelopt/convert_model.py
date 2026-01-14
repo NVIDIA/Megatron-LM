@@ -19,12 +19,13 @@ from megatron.core.parallel_state import destroy_model_parallel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
-from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
+from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta, modelopt_version_higher_than
 from megatron.training import get_args, get_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
+
 
 ALGO_TO_CONFIG = {
     "eagle1": mtsp.config.EAGLE1_DEFAULT_CFG,
@@ -32,6 +33,10 @@ ALGO_TO_CONFIG = {
     "eagle-mtp": mtsp.config.EAGLE_MTP_DEFAULT_CFG,
 }
 
+
+def modelopt_version_higher_than(target_version: str):
+    """Check if Model-Optimizer is greater than this version."""
+    return Version(modelopt.__version__) > Version(target_version)
 
 def add_convert_args(parser):
     """Add additional arguments for ModelOpt checkpoint convertion."""
@@ -125,12 +130,16 @@ if __name__ == "__main__":
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
         print_rank_0("Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype)))
+        import_kwargs = {
+            "dtype": import_type,
+        }
+        if modelopt_version_higher_than("0.41.0"):
+            import_kwargs.update("trust_remote_code": args.trust_remote_code)
         import_mcore_gpt_from_hf(
             unwrapped_model,
             args.pretrained_model_path,
             workspace_dir,
-            dtype=import_dtype,
-            trust_remote_code=args.trust_remote_code,
+            **import_kwargs,
         )
     elif args.load is not None:
         _ = load_modelopt_checkpoint(model)

@@ -6,6 +6,13 @@ import modelopt.torch.quantization as mtq
 from megatron.core import parallel_state
 from megatron.training.utils import unwrap_model
 from modelopt.torch.quantization.utils import is_quantized
+from packaging.version import Version
+
+
+def modelopt_version_higher_than(target_version: str):
+    """Check if Model-Optimizer is greater than this version."""
+    return Version(modelopt.__version__) > Version(target_version)
+
 
 def get_current_memory_info():
     """Get current memory usage."""
