@@ -1,4 +1,3 @@
-from tkinter import N
 from typing import Tuple, Optional
 import math
 import torch
@@ -56,24 +55,26 @@ class SinkhornKnopp(torch.autograd.Function):
         M_init, = ctx.saved_tensors
         num_iterations = ctx.num_iterations
         
-        # Create leaf node with gradient tracking for recomputation
-        M_input = M_init.detach().requires_grad_(True)
-        
-        # Recompute forward pass (M_current changes iteratively, M_input remains as leaf node)
-        M_current = M_input
-        for _ in range(num_iterations):
-            # T_r: Row normalization
-            M_current = M_current / M_current.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            # T_c: Column normalization
-            M_current = M_current / M_current.sum(dim=-2, keepdim=True).clamp(min=1e-8)
-        
-        # Compute dL/dM_input (i.e., dL/dM_init) via autograd
-        grad_M_init, = torch.autograd.grad(
-            outputs=M_current,      # Final output after iterations
-            inputs=M_input,         # Leaf node input
-            grad_outputs=grad_output,
-        )
-        
+        # Recompute forward with autograd enabled
+        with torch.enable_grad():
+            # Leaf for recomputation
+            M_input = M_init.detach().requires_grad_(True)
+
+            M_current = M_input
+            for _ in range(num_iterations):
+                # T_r: Row normalization
+                M_current = M_current / M_current.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                # T_c: Column normalization
+                M_current = M_current / M_current.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+
+            # Compute dL/dM_input (i.e., dL/dM_init) via autograd
+            grad_M_init, = torch.autograd.grad(
+                outputs=M_current,
+                inputs=M_input,
+                grad_outputs=grad_output,
+                create_graph=False,   # typically what you want here
+                retain_graph=False,
+            )
         # Apply chain rule: dL/dH = dL/dM_init * dM_init/dH = dL/dM_init * M_init
         # Since M_init = exp(H_res_logits), we have d(exp(x))/dx = exp(x) = M_init
         grad_input = grad_M_init * M_init
@@ -135,8 +136,6 @@ class HyperConnectionModule(MegatronModule):
     def _init_weights(self):
         """Initialize weights for stable training."""
         nn.init.xavier_uniform_(self.mapping_proj.weight)
-        # Initialize H_res bias to identity-like for stability
-        nn.init.xavier_uniform_(self.bias)
     
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -173,8 +172,9 @@ class HyperConnectionModule(MegatronModule):
         h_post = h[..., self.n:2*self.n].sigmoid() * 2 # [s, b, n]
         
         # H_res = Sinkhorn-Knopp(exp(α_res * (θ_res @ x̃) + b_res))
-        h_res = SinkhornKnopp.apply(h[..., 2*self.n:], self.sinkhorn_iterations) # [s, b, n * n] 
-        
+        h_res = SinkhornKnopp.apply(h[..., 2*self.n:].view(s, b, self.n, self.n), self.sinkhorn_iterations) # [s, b, n, n] 
+
+        # h_res = torch.dia
         
         return h_pre, h_post, h_res
     
@@ -240,14 +240,13 @@ class HyperConnectionModule(MegatronModule):
         Computes: H_res @ residual
         
         Args:
-            h_res: [s, b, n*n] - residual mixing matrix
+            h_res: [s, b, n, n] - residual mixing matrix
             residual: [s, b, n*C] - n-stream hidden states
         """
         s, b, _ = residual.shape 
         C = self.hidden_size
         residual_streams = residual.view(s, b, self.n, C)
-        h_res_streams = h_res.view(s, b, self.n, self.n)
-        mixed = torch.einsum('sbij,sbjc->sbic', h_res_streams, residual_streams) # [s, b, n, C]
+        mixed = torch.einsum('sbij,sbjc->sbic', h_res, residual_streams) # [s, b, n, C]
         return mixed.view(s, b, self.n * C)
     
     def expand(self, layer_output: Tensor, h_post: Tensor) -> Tensor:

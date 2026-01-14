@@ -13,6 +13,8 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_experimental_attention_variant_module_spec_for_backend,
     is_linear_attention_variant,
 )
+
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -383,9 +385,11 @@ def get_transformer_layer_spec_for_backend(
             input_layernorm=input_layernorm,
             self_attention=attention,
             self_attn_bda=get_bias_dropout_add,
+            self_attention_hyper_connection=HyperConnectionModule,
             pre_mlp_layernorm=pre_mlp_layernorm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            mlp_hyper_connection=HyperConnectionModule,
             sharded_state_dict_keys_map=sharded_state_dict_keys_map,
         ),
     )
