@@ -512,9 +512,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 otherwise None.
         """
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             fine_grained_offloading_group_commit,
             fine_grained_offloading_group_start,
-            get_fine_grained_offloading_context,
         )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -527,12 +529,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with get_fine_grained_offloading_context(self.offload_attn_norm):
+            with off_interface.get_context(self.offload_attn_norm):
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     self.input_layernorm, hidden_states
                 )
         else:
-            with get_fine_grained_offloading_context(self.offload_attn_norm):
+            with off_interface.get_context(self.offload_attn_norm):
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
@@ -616,8 +618,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
 
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             fine_grained_offloading_group_start,
-            get_fine_grained_offloading_context,
         )
 
         # Residual connection.
@@ -628,12 +632,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with get_fine_grained_offloading_context(self.offload_mlp_norm):
+            with off_interface.get_context(self.offload_mlp_norm):
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                     self.pre_mlp_layernorm, hidden_states
                 )
         else:
-            with get_fine_grained_offloading_context(self.offload_mlp_norm):
+            with off_interface.get_context(self.offload_mlp_norm):
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")

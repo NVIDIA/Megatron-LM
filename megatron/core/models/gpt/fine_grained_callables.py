@@ -11,9 +11,11 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
     fine_grained_offloading_group_start,
-    get_fine_grained_offloading_context,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphScope
@@ -480,8 +482,27 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
-        if not isinstance(layer.mlp, MoELayer):
-            return hidden_states
+        return hidden_states
+
+    def submodule_post_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+        """
+        Run forward pass for computations between attention and dispatch:
+            pre mlp layernorm->router->dispatch preprocess
+        """
+        if layer.offload_mlp_norm:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
+        if layer.recompute_pre_mlp_layernorm:
+            layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            with off_interface.get_context(layer.offload_mlp_norm):
+                pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                    layer.pre_mlp_layernorm, hidden_states
+                )
+        else:
+            with off_interface.get_context(layer.offload_mlp_norm):
+                pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+
+        probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+        local_tokens, probs = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
