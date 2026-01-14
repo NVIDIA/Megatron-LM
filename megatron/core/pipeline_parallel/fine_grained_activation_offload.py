@@ -1205,8 +1205,22 @@ def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> 
 class FineGrainedActivationOffloadingInterface:
     """Interface for fine-grained activation offloading."""
 
-    def __init__(self):
-        pass
+    def __init__(self, offload: bool, tensor: torch.Tensor, name: str):
+        self.offload = offload
+        self.tensor = tensor
+        self.name = name
+
+    def __enter__(self):
+        """Enter context manager to enable activation offloading hooks."""
+        if self.offload:
+            self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
+            PipelineOffloadManager.get_instance().__enter__()
+        return self.tensor
+
+    def __exit__(self, *args: Any):
+        """Exit context manager to disable activation offloading hooks."""
+        if self.offload:
+            PipelineOffloadManager.get_instance().__exit__()
 
     @staticmethod
     def init_chunk_handler(vp_size, vp_stage, min_offloaded_tensor_size):

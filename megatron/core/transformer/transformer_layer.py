@@ -524,17 +524,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        if self.offload_attn_norm:
-            hidden_states = fine_grained_offloading_group_start(hidden_states, name="attn_norm")
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface.get_context(self.offload_attn_norm):
+            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") \
+                as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     self.input_layernorm, hidden_states
                 )
         else:
-            with off_interface.get_context(self.offload_attn_norm):
+            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") \
+                as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
@@ -620,24 +620,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_start,
-        )
 
         # Residual connection.
         residual = hidden_states
 
-        if self.offload_mlp_norm:
-            hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface.get_context(self.offload_mlp_norm):
+            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") \
+                as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                     self.pre_mlp_layernorm, hidden_states
                 )
         else:
-            with off_interface.get_context(self.offload_mlp_norm):
+            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") \
+                as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
