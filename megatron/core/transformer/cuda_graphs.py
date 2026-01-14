@@ -185,6 +185,10 @@ def _clone_nested_tensors(value: Any) -> Any:
         return type(value)(_clone_nested_tensors(v) for v in value)
     if isinstance(value, dict):
         return {k: _clone_nested_tensors(v) for k, v in value.items()}
+    if isinstance(value, set):
+        raise TypeError(
+            "Sets of tensors are unsupported in cudagraph helpers; use list/tuple instead"
+        )
     return value
 
 
