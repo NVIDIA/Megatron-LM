@@ -3,10 +3,8 @@
 from typing import Literal, Optional
 
 from torch import Tensor
-import torch
-from typing import Dict
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core import parallel_state, tensor_parallel
+
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -17,15 +15,9 @@ from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
-from megatron.core.transformer.multi_token_prediction import (
-    MTPLossAutoScaler,
-    MTPLossLoggingHelper,
-    MultiTokenPredictionBlock,
-    roll_tensor,
-)
-from megatron.core.packed_seq_params import PackedSeqParams
 
 
 class MambaModel(LanguageModule):
@@ -218,94 +210,6 @@ class MambaModel(LanguageModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
-    def _preprocess(
-        self,
-        input_ids: Tensor,
-        position_ids: Tensor,
-        decoder_input: Tensor = None,
-        inference_context: BaseInferenceContext = None,
-        packed_seq_params: PackedSeqParams = None,
-    ):
-        """Preprocesses inputs for the transformer decoder.
-
-        Applies embeddings to input tokens, or uses `decoder_input` from a previous
-        pipeline stage. Also sets up rotary positional embeddings.
-        """
-
-        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
-        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
-
-        # Decoder embedding.
-        if decoder_input is not None:
-            pass
-        elif self.pre_process:
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
-        else:
-            # intermediate stage of pipeline
-            # decoder will get hidden_states from encoder.input_tensor
-            decoder_input = None
-
-        # Rotary positional embeddings (embedding is None for PP intermediate devices)
-        rotary_pos_emb = None
-        rotary_pos_cos = None
-        rotary_pos_sin = None
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            if not self.training and self.config.flash_decode and inference_context:
-                assert (
-                    inference_context.is_static_batching()
-                ), "GPTModel currently only supports static inference batching."
-                # Flash decoding uses precomputed cos and sin for RoPE
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                    inference_context.max_sequence_length,
-                    self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
-                )
-            else:
-                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-                )
-                rotary_pos_emb = self.rotary_pos_emb(
-                    rotary_seq_len,
-                    packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
-                )
-        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
-            if self.training or not self.config.flash_decode:
-                rotary_pos_emb = self.rotary_pos_emb(position_ids, self.mrope_section)
-            else:
-                # Flash decoding uses precomputed cos and sin for RoPE
-                raise NotImplementedError(
-                    "Flash decoding uses precomputed cos and sin for RoPE, not implmented in "
-                    "MultimodalRotaryEmbedding yet."
-                )
-
-        if (
-            (self.config.enable_cuda_graph or self.config.flash_decode)
-            and rotary_pos_cos is not None
-            and inference_context
-            and inference_context.is_static_batching()
-            and not self.training
-        ):
-            current_batch_size = input_ids.shape[0]
-            sequence_len_offset = torch.tensor(
-                [inference_context.sequence_len_offset] * current_batch_size,
-                dtype=torch.int32,
-                device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
-            )
-        else:
-            sequence_len_offset = None
-
-        # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
-        # reference held by this caller function, enabling early garbage collection for
-        # inference. Skip wrapping if decoder_input is logged after decoder completion.
-        if (
-            inference_context is not None
-            and not self.training
-            and not has_config_logger_enabled(self.config)
-        ):
-            decoder_input = WrappedTensor(decoder_input)
-
-        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
-
     def forward(
         self,
         input_ids: Tensor,
@@ -382,16 +286,6 @@ class MambaModel(LanguageModule):
             output_weight = self.shared_embedding_or_output_weight()            
 
         if self.mtp_process:
-            extra_block_kwargs = None
-            packed_seq_params = None
-            decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = self._preprocess(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                decoder_input=decoder_input,
-                inference_context=inference_context,
-                packed_seq_params=packed_seq_params,
-            )
-
 
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -400,12 +294,7 @@ class MambaModel(LanguageModule):
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,
-                **(extra_block_kwargs or {}),
             )
 
         if not self.post_process:
@@ -466,22 +355,3 @@ class MambaModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
-
-    def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
-    ) -> ShardedStateDict:
-        """Sharded state dict implementation for MambaModel backward-compatibility.
-
-        Removing extra state.
-        Tie word embeddings and output layer in mtp process stage.
-
-        Args:
-            prefix (str): Module name prefix.
-            sharded_offsets (tuple): PP related offsets, expected to be empty at this module level.
-            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
-
-        Returns:
-            ShardedStateDict: sharded state dict for the MambaModel
-        """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        return sharded_state_dict
