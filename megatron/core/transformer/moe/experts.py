@@ -30,7 +30,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
 )
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -668,8 +667,9 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        with off_interface(self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1") \
-            as permuted_local_hidden_states:
+        with off_interface(
+            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+        ) as permuted_local_hidden_states:
             fc1_output, bias_parallel = self.linear_fc1(
                 permuted_local_hidden_states, tokens_per_expert
             )

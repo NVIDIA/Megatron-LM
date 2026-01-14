@@ -28,7 +28,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
@@ -806,8 +805,7 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") \
-            as hidden_states:
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
@@ -974,8 +972,9 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                with off_interface(self.offload_core_attention and self.training, query, \
-                    "core_attn") as query:
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
                     core_attn_out = self.core_attention(
                         query,
                         key,

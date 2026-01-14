@@ -27,7 +27,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -247,8 +246,7 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") \
-            as hidden_states:
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             query, key, value = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
@@ -287,8 +285,9 @@ class MultiLatentAttention(Attention):
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                with off_interface(self.offload_core_attention and self.training, query, \
-                    "core_attn") as query:
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
                     core_attn_out = self.core_attention(
                         query,
                         key,
