@@ -88,8 +88,6 @@ class MambaStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         vp_stage: Optional[int] = None,
-        num_layers: int = None,
-        is_mtp_layer: bool = False,
     ) -> None:
         super().__init__(config=config)
         self.residual_in_fp32 = residual_in_fp32
@@ -97,7 +95,6 @@ class MambaStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.vp_stage = vp_stage
-        self.is_mtp_layer = is_mtp_layer
 
         assert pg_collection is not None, "pg_collection must be provided for MambaStack"
 
@@ -117,7 +114,7 @@ class MambaStack(MegatronModule):
         main_pattern = parsed.main_pattern  # MTP pattern ignored here
 
         self.layer_type_list = allocate_layers(
-            self.config.num_layers if num_layers is None else num_layers,
+            self.config.num_layers if self.config.num_layers is not None else len(main_pattern),
             self.hybrid_attention_ratio,
             self.hybrid_mlp_ratio,
             main_pattern,
@@ -138,7 +135,7 @@ class MambaStack(MegatronModule):
             pg_collection=pg_collection,
             layer_offset=pp_layer_offset,
             residual_in_fp32=residual_in_fp32,
-            is_mtp_layer=is_mtp_layer,
+            is_mtp_layer=False,
         )
 
         # Required for activation recomputation
@@ -269,15 +266,6 @@ class MambaStack(MegatronModule):
                 with inner_fp8_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            rotary_pos_emb=rotary_pos_emb,
-                            sequence_len_offset=sequence_len_offset,
-                        )
-                    elif isinstance(layer, MLPLayer):
-                        # MLPLayer (standalone MLP without attention)
-                        hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             inference_context=inference_context,
