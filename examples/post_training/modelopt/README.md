@@ -79,7 +79,7 @@ provide `${EXPORT_DIR}` to `export.sh`.
     ./export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
 
-For KV cache quantization, add a flag like `MLM_EXTRA_ARGS=--export-kv-cache-quant fp8` while specifying your desired KV cache precision (see `quantize.py` `KV_QUANT_CFG_CHOICES`).
+For KV cache quantization, add a flag like `MLM_EXTRA_ARGS="--export-kv-cache-quant fp8"` while specifying your desired KV cache precision (see `KV_QUANT_CFG_CHOICES` in `quantize.py`).
 
 ### ⭐ Online BF16 EAGLE3 Training
 
