@@ -2372,7 +2372,7 @@ def _add_training_args(parser):
                        help='Enable fine-grained activation offloading.')
     group.add_argument('--offload-modules', nargs='*', type=str, default=[],
                        help='The submodules to offload its input. Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
-    group.add_argument('--min-offloaded-tensor-size', type=int, default=10*1024*1024,
+    group.add_argument('--min-offloaded-tensor-size', type=int, default=1024*1024,
                        help='The minimum size of the tensor to be offloaded.')
     group.add_argument('--batch-invariant-mode', action='store_true',
                        help='Use batch-invariant kernels for deterministic forward execution regardless '
