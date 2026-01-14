@@ -22,11 +22,21 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
+# Standard MoE spec (for training)
 moe = get_moe_module_spec(
     use_te=True,
     num_experts=8,  # Can be any positive integer (must not be None).
     moe_grouped_gemm=True,
     moe_use_legacy_grouped_gemm=False,
+)
+
+# Inference-optimized MoE spec
+moe_inference = get_moe_module_spec(
+    use_te=True,
+    num_experts=8,  # Can be any positive integer (must not be None).
+    moe_grouped_gemm=True,
+    moe_use_legacy_grouped_gemm=False,
+    inference_optimized=True,
 )
 
 mamba_stack_spec = ModuleSpec(
@@ -138,10 +148,10 @@ mamba_inference_stack_spec = ModuleSpec(
             ),
         ),
         moe_layer=ModuleSpec(
-            # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
+            # Use inference-optimized MoE layer for better CUDA graph support
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
+                pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
             ),
         ),
     ),

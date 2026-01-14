@@ -15,8 +15,17 @@ def get_moe_module_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    inference_optimized: bool = False,
 ) -> ModuleSpec:
-    """Helper function to get module spec for MoE"""
+    """Helper function to get module spec for MoE
+    
+    Args:
+        use_te: Whether to use Transformer Engine.
+        num_experts: Number of experts.
+        moe_grouped_gemm: Whether to use grouped GEMM.
+        moe_use_legacy_grouped_gemm: Whether to use legacy grouped GEMM.
+        inference_optimized: If True, use InferenceMoELayer for optimized inference.
+    """
     if use_te is not None and use_te:
         backend: BackendSpecProvider = TESpecProvider()
     else:
@@ -26,6 +35,7 @@ def get_moe_module_spec(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        inference_optimized=inference_optimized,
     )
 
 
@@ -35,8 +45,18 @@ def get_moe_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_activation_func: bool = False,
+    inference_optimized: bool = False,
 ) -> ModuleSpec:
-    """Helper function to get module spec for MoE"""
+    """Helper function to get module spec for MoE
+    
+    Args:
+        backend: Backend spec provider (TE or Local).
+        num_experts: Number of experts.
+        moe_grouped_gemm: Whether to use grouped GEMM.
+        moe_use_legacy_grouped_gemm: Whether to use legacy grouped GEMM.
+        use_te_activation_func: Whether to use TE activation function.
+        inference_optimized: If True, use InferenceMoELayer for optimized inference.
+    """
     assert num_experts is not None
 
     linear_fc1 = backend.column_parallel_linear()
@@ -59,8 +79,15 @@ def get_moe_module_spec_for_backend(
     # shared experts spec
     shared_experts = ModuleSpec(module=SharedExpertMLP, submodules=mlp)
 
+    # Select MoE layer class based on inference_optimized flag
+    if inference_optimized:
+        from megatron.core.transformer.moe.moe_layer_inference import InferenceMoELayer
+        moe_layer_class = InferenceMoELayer
+    else:
+        moe_layer_class = MoELayer
+
     # MoE module spec
     moe_module_spec = ModuleSpec(
-        module=MoELayer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
+        module=moe_layer_class, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
     )
     return moe_module_spec

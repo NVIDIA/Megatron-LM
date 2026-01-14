@@ -1199,6 +1199,19 @@ def validate_args(args, defaults={}):
        assert args.moe_pad_experts_for_cuda_graph_inference, \
         "--moe-pad-experts-for-cuda-graph-inference must be set when using CUDA graphs with expert parallelism"
 
+    # Temporary restrictions for inference_optimized MoE with expert parallelism
+    # until CUDA graph support is properly implemented
+    if args.transformer_impl == "inference_optimized" and args.expert_model_parallel_size > 1:
+        assert args.cuda_graph_impl == "none", (
+            "CUDA graphs are not yet supported with --transformer-impl inference_optimized "
+            "and expert parallelism. Please set --cuda-graph-impl none."
+        )
+        assert not args.moe_pad_experts_for_cuda_graph_inference, (
+            "--moe-pad-experts-for-cuda-graph-inference is not yet supported with "
+            "--transformer-impl inference_optimized. This will be enabled once CUDA graph "
+            "support is properly implemented."
+        )
+
     # MoE upcycling check
     if args.moe_use_upcycling:
         assert args.save is not None, "When using upcycling, the --save option must be specified."

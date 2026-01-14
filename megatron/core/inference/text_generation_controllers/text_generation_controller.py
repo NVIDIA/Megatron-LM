@@ -534,6 +534,7 @@ class TextGenerationController:
         if model_config.transformer_impl == "inference_optimized":
             context.maybe_initialize_symmetric_memory()
 
+
         if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
             if context.is_decode_only():
                 # Turn on symmetric all reduce when in decode mode
@@ -778,6 +779,12 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         # if no cuda graphs, directly use dummy forward
         if not context.cuda_graph_batch_dimensions_list:
+            # initialize symmetric memory if needed
+            unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+            model_config = get_model_config(unwrapped_model)
+            if model_config.transformer_impl == "inference_optimized":
+                context.maybe_initialize_symmetric_memory()
+
             return self.inference_wrapped_model.dummy_forward()
 
         # attempt to use cuda-graph if possible
