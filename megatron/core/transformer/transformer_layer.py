@@ -1241,12 +1241,12 @@ class MoETransformerLayer(TransformerLayer):
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-        if (
-            not self.config.cuda_graph_scope
-            or CudaGraphScope.moe_router in self.config.cuda_graph_scope
+        if not self.config.cuda_graph_scope or CudaGraphScope.moe in self.config.cuda_graph_scope:
+            self.cudagraph_manager = CudaGraphManager(config)
+        elif (
+            CudaGraphScope.moe_router in self.config.cuda_graph_scope
             or CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope
         ):
-
             # full MoE layer recompute with partial_cudagraphs. If not partial cudagraphs, MoE
             # layer recompute is handled by the moe_layer.MoELayer class
             self.moe_layer_recompute = (
@@ -1262,9 +1262,6 @@ class MoETransformerLayer(TransformerLayer):
             self.cudagraph_manager_postprocess = CudaGraphManager(
                 self.config, self, function_name="_forward_mlp_postprocess"
             )
-
-        elif CudaGraphScope.moe in self.config.cuda_graph_scope:
-            self.cudagraph_manager = CudaGraphManager(config)
 
     def _forward_mlp_router(self, hidden_states):
         """
@@ -1325,6 +1322,13 @@ class MoETransformerLayer(TransformerLayer):
         If `use_partial_cudagraphs` is True, this method stitches together the
         router, expert_compute, and postprocess calls.
         """
+
+        if inference_context is not None:
+            assert not self.use_partial_cudagraphs, (
+                "Partial cudagraphs for MoEs were detected during inference!"
+                "Please do not use --cuda-graph-scope moe_router moe_preprocess "
+                "alongside inference."
+            )
 
         def _forward_mlp_partial_cudagraphs(hidden_states, inference_context=None):
             residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(

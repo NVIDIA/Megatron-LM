@@ -1585,7 +1585,10 @@ class CudaGraphManager(torch.nn.Module):
             else:
                 # No cudagraphs were found in training mode with grad disabled, so fallback to
                 # eager since autograd is needed to correctly trace the backward graph.
-                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
+                if self.func is not None:
+                    return self.func(*args, **kwargs)
+                else:
+                    return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
 
         self.is_first_microbatch = False
         # If forward only, next replay should be a forward pass as well
