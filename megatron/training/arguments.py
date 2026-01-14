@@ -1646,6 +1646,12 @@ def _add_retro_args(parser):
 
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
+    group.add_argument('--kda-enable', action='store_true', default=False,
+                       help='Enable Kimi Delta Attention mechanism.')
+    group.add_argument('--kda-delta-threshold', type=float, default=0.1,
+                       help='Delta threshold for Kimi Delta Attention sparsity.')
+    group.add_argument('--kda-sparsity-factor', type=float, default=0.5,
+                       help='Sparsity factor for Kimi Delta Attention.')
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')

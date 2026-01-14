@@ -19,32 +19,30 @@ class KDASelfAttention(SelfAttention):
 
     def forward(self, query, key, value, attention_mask=None):
         """
-        Forward pass for KDA attention.
-
+        Forward pass for Kimi Delta Attention (KDA).
         Args:
-            query: Query tensor.
-            key: Key tensor.
-            value: Value tensor.
-            attention_mask: Optional attention mask.
-
+            query: [batch, heads, seq_len, head_dim]
+            key:   [batch, heads, seq_len, head_dim]
+            value: [batch, heads, seq_len, head_dim]
+            attention_mask: Optional mask
         Returns:
-            Output tensor after applying KDA.
+            output: [batch, heads, seq_len, head_dim]
+            attn_weights: [batch, heads, seq_len, seq_len]
         """
-        # Compute delta-based sparse attention logic here
-        # Example placeholder logic (replace with actual implementation):
-        delta = torch.abs(query - key)
-        sparse_mask = delta < self.delta_threshold
-        sparse_attention = torch.mul(sparse_mask, torch.matmul(query, key.transpose(-1, -2)))
+        # Compute pairwise L2 distance between query and key for sparsity
+        q_exp = query.unsqueeze(-2)  # [B, H, S, 1, D]
+        k_exp = key.unsqueeze(-3)    # [B, H, 1, S, D]
+        delta = torch.norm(q_exp - k_exp, dim=-1)  # [B, H, S, S]
+        sparse_mask = (delta < self.delta_threshold).float()
 
-        # Apply sparsity factor
-        sparse_attention = sparse_attention * self.sparsity_factor
+        # Standard attention scores
+        attn_scores = torch.matmul(query, key.transpose(-1, -2))  # [B, H, S, S]
+        # Apply sparsity mask
+        attn_scores = attn_scores * sparse_mask * self.sparsity_factor
 
-        # Apply attention mask if provided
         if attention_mask is not None:
-            sparse_attention = sparse_attention + attention_mask
+            attn_scores = attn_scores + attention_mask
 
-        # Compute final output
-        attention_weights = torch.nn.functional.softmax(sparse_attention, dim=-1)
-        output = torch.matmul(attention_weights, value)
-
-        return output
+        attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
+        output = torch.matmul(attn_weights, value)
+        return output, attn_weights
