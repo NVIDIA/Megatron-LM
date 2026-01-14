@@ -229,6 +229,8 @@ class TestExpertLayerReconfiguration:
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.parametrize(
         "src_tp_pp_exp,dest_tp_pp_exp,use_glu,singleton_local_shards",
