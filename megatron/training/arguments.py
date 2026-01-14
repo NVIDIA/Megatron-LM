@@ -2134,13 +2134,17 @@ def _add_rl_args(parser):
                        help='If set, calculate the intra-group similarity of rollouts.')
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
-    group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=32,
+    group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,
                        help='Maximum number of sequences that can be packed into a single bin. ')
     group.add_argument('--rl-sequence-packing-algo', type=str, default='fifo',
                        choices=['fifo', 'round-robin'],
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
+                       default=False,
+                       help='If set, do not call `delete_cuda_graphs` or `toggle_cuda_graphs` when the inference engine is suspended. '
+                            'Use only when all training and inference cudagraphs and the KV cache fit on device.')
     group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
                        help='Degree of tensor model parallelism for inference for RL.')     
     group.add_argument(
