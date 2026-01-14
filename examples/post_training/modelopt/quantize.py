@@ -299,7 +299,7 @@ if __name__ == "__main__":
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        import_kwargs = {"dtype": import_type}
+        import_kwargs = {"dtype": import_dtype}
         if modelopt_version_higher_than("0.41.0"):
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
