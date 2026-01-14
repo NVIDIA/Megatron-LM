@@ -904,11 +904,11 @@ def validate_args(args, defaults={}):
 
     # Persistent fused layer norm.
     if not is_torch_min_version("1.11.0a0"):
-        args.persist_layer_norm = False
+        args.no_persist_layer_norm = True
         if args.rank == 0:
             print('Persistent fused layer norm kernel is supported from '
                   'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
-                  'Defaulting to persist_layer_norm=False')
+                  'Defaulting to no_persist_layer_norm=True')
 
     # Activation recomputing.
     if args.distribute_saved_activations:
@@ -1356,6 +1356,7 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
@@ -1678,6 +1679,14 @@ def _add_network_size_args(parser):
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",
+        # incompatible defaults in dataclass
+        "gradient_accumulation_fusion",
+        "overlap_p2p_comm",
+        "attention_softmax_in_fp32",
+        "masked_softmax_fusion",
+        "persist_layer_norm",
+        "bias_dropout_fusion",
+        "apply_rope_fusion",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2135,6 +2144,11 @@ def _add_training_args(parser):
                        help='Report loss and timing interval.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
+    group.add_argument('--no-masked-softmax-fusion',
+                       action='store_false',
+                       help='Disable fusion of query_key_value scaling, '
+                       'masking, and softmax.',
+                       dest='masked_softmax_fusion')
     group.add_argument('--no-bias-gelu-fusion', action='store_false',
                        help='Disable bias and gelu fusion.',
                        dest='bias_gelu_fusion')
@@ -2142,6 +2156,13 @@ def _add_training_args(parser):
                        help='Disable bias and swiglu fusion, the fusion is '
                        'available only when using megatron-core.',
                        dest='bias_swiglu_fusion')
+    group.add_argument('--no-bias-dropout-fusion', action='store_false',
+                       help='Disable bias and dropout fusion.',
+                       dest='bias_dropout_fusion')
+    group.add_argument('--no-rope-fusion', action='store_false',
+                       help='Disable rope fusion, the fusion is available '
+                       'only when using megatron-core.',
+                       dest='apply_rope_fusion')
     group.add_argument('--rope-type', type=str, default=None,
                       choices=['rope', 'yarn'],
                       help='Type of rope to use. Note that MLA takes yarn by default, '
@@ -2171,6 +2192,16 @@ def _add_training_args(parser):
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
+    group.add_argument('--no-persist-layer-norm', action='store_true',
+                       help='Disable using persistent fused layer norm kernel. '
+                       'This kernel supports only a set of hidden sizes. Please '
+                       'check persist_ln_hidden_sizes if your hidden '
+                       'size is supported.')
+    group.add_argument('--no-gradient-accumulation-fusion',
+                       action='store_false',
+                       help='Disable fusing gradient accumulation to weight '
+                       'gradient computation of linear layers',
+                       dest='gradient_accumulation_fusion')
     group.add_argument('--use-mcore-models', action='store_true',
                        dest='deprecated_use_mcore_models',
                        help='DEPRECATED. Use the implementation from megatron core.'
@@ -2372,6 +2403,8 @@ def _add_mixed_precision_args(parser):
                        help='Window over which to raise/lower dynamic scale.')
     group.add_argument('--hysteresis', type=int, default=2,
                        help='hysteresis for dynamic loss scaling')
+    group.add_argument('--attention-softmax-in-fp32', action='store_true',
+                       help='Run attention masking and softmax in fp32.')
     group.add_argument('--accumulate-allreduce-grads-in-fp32',
                        action='store_true',
                        help='Gradient accumulation and all-reduce in fp32.')
@@ -2410,6 +2443,9 @@ def _add_distributed_args(parser):
                        help='Number of layers per virtual pipeline stage')
     group.add_argument('--num-virtual-stages-per-pipeline-rank', type=int, default=None,
                        help='Number of virtual pipeline stages per pipeline parallelism rank')
+    group.add_argument('--no-overlap-p2p-communication', action='store_false',
+                       help='overlap pipeline parallel communication with forward and backward chunks in 1F1B',
+                       dest='overlap_p2p_comm')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')

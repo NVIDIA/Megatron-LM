@@ -76,7 +76,9 @@ class ModelParallelConfig:
        load values from a checkpoint.
     """
 
-    use_cpu_initialization: bool = False
+    use_cpu_initialization: bool = field(
+        default=False, metadata={"argparse_meta": {"default": None}}
+    )
     """When set to False, we initialize the weights directly on the GPU. CPU initialization is the
        same regardless of tensor model parallelism, but GPU initialization is not. Transferring
        weights from CPU to GPU can take a significant amount of time for large models.
@@ -147,7 +149,7 @@ class ModelParallelConfig:
     ###################
     # Optimizations
     ###################
-    gradient_accumulation_fusion: bool = True
+    gradient_accumulation_fusion: bool = False
     """If true, fuses weight gradient accumulation to GEMMs. Requires the custom CUDA extension
        fused_weight_gradient_mlp_cuda module. To use gradient_accumulation_fusion you must install
        APEX with --cpp_ext and --cuda_ext. For example: "pip install --global-option=\"--cpp_ext\"
@@ -276,9 +278,7 @@ class ModelParallelConfig:
         should only be set if the sequence length varies by microbatch within a global batch.
     """
 
-    overlap_p2p_comm: bool = field(
-        default=True, metadata={"argparse_meta": {"arg_names": ["--no-overlap-p2p-communication"]}}
-    )
+    overlap_p2p_comm: bool = False
     """When True some of the peer to peer communication for pipeline parallelism will overlap with
        computation. Must be False if batch_p2p_comm is true.
     """

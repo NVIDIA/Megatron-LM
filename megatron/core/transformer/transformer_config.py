@@ -42,7 +42,7 @@ class TransformerConfig(ModelParallelConfig):
     # model architecture
     ####################
 
-    num_layers: Optional[int] = None
+    num_layers: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Number of transformer layers in a transformer block."""
 
     mtp_num_layers: Optional[int] = None
@@ -101,10 +101,10 @@ class TransformerConfig(ModelParallelConfig):
     """If set, the loss layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""
 
-    hidden_size: Optional[int] = None
+    hidden_size: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Transformer hidden size."""
 
-    num_attention_heads: Optional[int] = None
+    num_attention_heads: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Number of transformer attention heads."""
 
     attention_backend: AttnBackend = AttnBackend.auto
@@ -121,7 +121,9 @@ class TransformerConfig(ModelParallelConfig):
        Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
        and learnable offset."""
 
-    num_query_groups: Optional[int] = 1
+    num_query_groups: Optional[int] = field(
+        default=None, metadata={"argparse_meta": {"default": 1}}
+    )
     """Number of query groups for group query attention. If None, normal attention is used."""
 
     ffn_hidden_size: Optional[int] = None
@@ -285,7 +287,7 @@ class TransformerConfig(ModelParallelConfig):
     """If true, scale Q * K^T by 1 / layer-number. This improve numeric stability when training with
     fp16. Also sets `attention_softmax_in_fp32` to True."""
 
-    attention_softmax_in_fp32: bool = False
+    attention_softmax_in_fp32: bool = True
     """If True, run attention masking and softmax in fp32. This should be True if
     apply_query_key_layer_scaling is True."""
 
@@ -299,10 +301,10 @@ class TransformerConfig(ModelParallelConfig):
     bias_activation_fusion: bool = False
     """If True, fuses bias addition and the activation function when possible."""
 
-    masked_softmax_fusion: bool = True
-    """Controls fusion of query_key_value scaling, masking, and softmax."""
+    masked_softmax_fusion: bool = False
+    """If True, uses softmax fusion."""
 
-    persist_layer_norm: bool = True
+    persist_layer_norm: bool = False
     """If True, uses the persistent fused layer norm kernel. This kernel only supports a fixed set
     of hidden sizes."""
 
@@ -310,12 +312,10 @@ class TransformerConfig(ModelParallelConfig):
     """If True, and using local layers (not from TransformerEngine), tells Apex to use the memory
     efficient fused LayerNorm kernel. Ignored if not using LayerNorm."""
 
-    bias_dropout_fusion: bool = True  # TODO: this should be bias_dropout_add_fusion?
+    bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
     """If True, uses bias dropout fusion."""
 
-    apply_rope_fusion: bool = field(
-        default=True, metadata={"argparse_meta": {"arg_names": ["--no-rope-fusion"]}}
-    )
+    apply_rope_fusion: bool = False
     """If True, use fused RoPE kernel."""
 
     use_fused_weighted_squared_relu: bool = False
