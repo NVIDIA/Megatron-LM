@@ -247,9 +247,8 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        if self.offload_qkv_linear:
-            hidden_states = fine_grained_offloading_group_start(hidden_states, name="qkv_linear")
-        with off_interface.get_context(self.offload_qkv_linear):
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") \
+            as hidden_states:
             query, key, value = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
@@ -287,11 +286,9 @@ class MultiLatentAttention(Attention):
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
             )
         else:
-            if self.offload_core_attention and self.training:
-                query = fine_grained_offloading_group_start(query, name="core_attn")
-
             if inference_context is None or inference_context.is_static_batching():
-                with off_interface.get_context(self.offload_core_attention):
+                with off_interface(self.offload_core_attention and self.training, query, \
+                    "core_attn") as query:
                     core_attn_out = self.core_attention(
                         query,
                         key,
@@ -349,9 +346,7 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        if self.offload_attn_proj:
-            core_attn_out = fine_grained_offloading_group_start(core_attn_out, name="attn_proj")
-        with off_interface.get_context(self.offload_attn_proj):
+        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
             output = fine_grained_offloading_group_commit(

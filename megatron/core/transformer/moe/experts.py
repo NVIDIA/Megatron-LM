@@ -668,11 +668,8 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        if self.offload_expert_fc1:
-            permuted_local_hidden_states = fine_grained_offloading_group_start(
-                permuted_local_hidden_states, name="expert_fc1"
-            )
-        with off_interface.get_context(self.offload_expert_fc1):
+        with off_interface(self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1") \
+            as permuted_local_hidden_states:
             fc1_output, bias_parallel = self.linear_fc1(
                 permuted_local_hidden_states, tokens_per_expert
             )
@@ -741,17 +738,14 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        if self.offload_moe_act:
-            fc1_output = fine_grained_offloading_group_start(fc1_output, name="moe_act")
-
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface.get_context(self.offload_moe_act):
+            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
         else:
-            with off_interface.get_context(self.offload_moe_act):
+            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
         output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
