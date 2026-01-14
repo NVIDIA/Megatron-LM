@@ -97,6 +97,21 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Model provider",
     )
     group.add_argument(
+        "--skip-prompt-log-probs",
+        action='store_true',
+        default=False,
+        help='Skip prompt log probs.',
+    )
+    group.add_argument(
+        "--stop-words",
+        metavar='WORD',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Stop words to terminate generation. Each word should be quoted and '
+        'separated by space. Example: --stop-words "\\n\\n" "END" "###"',
+    )
+    group.add_argument(
         "--output-path",
         type=str,
         default=None,
@@ -124,16 +139,17 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         'will be used, in order.',
     )
     group.add_argument(
-        "--inference-coordinator-port",
-        type=int,
-        help="This port will be used to setup the inference co-ordinator on node-0",
-        default=12346
-    )
-    group.add_argument(
         "--use-flashinfer-fused-rope",
         action='store_true',
         default=False,
         help='Use flashinfer fused rope implementation.',
+    )
+    group.add_argument(
+        "--no-record-throughput",
+        action='store_false',
+        dest="record_throughput",
+        help="Disable throughput recording in --output-file"
+        
     )
 
     return parser
@@ -306,7 +322,8 @@ def get_requests_from_file(
     # Load prompts.
     n_prompts = sum(1 for _ in open(args.prompt_file))
     prompts = []
-    sampling_params = get_default_sampling_params(tokenizer.eod)
+    if sampling_params is None:
+        sampling_params = get_default_sampling_params(tokenizer.eod)
     sampling_params_list = []
     with open(args.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
@@ -385,10 +402,7 @@ def build_dynamic_engine_setup_prefix(
     """
     # CUDA graph config
     if args.cuda_graph_impl == "local":
-        cg_str = (
-            f"graphs {context.cuda_graph_token_counts[0]}:"
-            f"{context.cuda_graph_token_counts[-1]}"
-        )
+        cg_str = f"graphs {len(context.cuda_graph_batch_dimensions_list)}"
     else:
         cg_str = "--"
 
@@ -414,7 +428,7 @@ def build_dynamic_engine_setup_prefix(
 
     # Buffer limits config
     buffer_limits_str = (
-        f"bf: {get_mem_size_str(args.inference_dynamic_batching_active_buffer_size_gb*1024**3)}, "
+        f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
         f"{context.block_allocator.active_count} chunks "
         f"[r {context.max_active_requests}, t {context.max_tokens}]"
     )
@@ -429,3 +443,17 @@ def build_dynamic_engine_setup_prefix(
     ]
 
     return " | ".join(parts)
+
+
+def get_global_peak_memory_stats_bytes() -> dict:
+    """Peak allocated CUDA memory aggregated across ranks (MAX), in bytes.
+
+    Uses `torch.cuda.max_memory_allocated()` and assumes peak stats were reset
+    before the benchmark run.
+    """
+    peak_alloc = int(torch.cuda.max_memory_allocated())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        t = torch.tensor([peak_alloc], device="cuda", dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+        peak_alloc = int(t[0].item())
+    return {"mem-max-allocated-bytes": peak_alloc}

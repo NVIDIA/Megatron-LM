@@ -21,11 +21,11 @@ class BlockAllocator:
             space for paused requests that live on the CPU.
     """
 
-    def __init__(self, context: "DynamicInferenceContext", active_count: int):
+    def __init__(self, context: "DynamicInferenceContext", total_count: int):
 
         self.context = context
 
-        active_count -= 1  # -1 for dummy_block_idx (see below)
+        active_count = (total_count - 1) // 2  # -1 for dummy_block_idx (see below)
         active_count = max(1, active_count)  # need at least one block
         self.total_count = 2 * active_count + 1  # +1 for dummy_block_idx
         self.total_avail = self.total_count - 1  # -1 for dummy_block_idx
@@ -115,4 +115,17 @@ class BlockAllocator:
         This resets the available block count to the entire memory pool
         (except for the dummy block).
         """
+
+        # Reset block bag to so we start consuming from the beginning of the pool
+        # for UVM performance.
+        # *Note*: Resetting the block bag is essential because if engine has been
+        # suspended, then the block bag contains non-unique IDs since the
+        # right-most IDs have been 'popped' off and are owned by the context.
+        # Without resetting the block bag, context request memory will clash and
+        # requests will point to each other's memory blocks, resulting in faulty
+        # generations.
+        self.block_bag = torch.arange(
+            self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+
         self.total_avail = self.total_count - 1
