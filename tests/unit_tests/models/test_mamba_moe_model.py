@@ -45,6 +45,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
         "_value_": 1,
     },
     "attention_dropout": 0.0,
+    "attention_output_gate": False,
     "attention_softmax_in_fp32": False,
     "autocast_dtype": "torch.bfloat16",
     "barrier_with_L1_time": True,
@@ -170,6 +171,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk": 6,
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
+    "moe_shared_expert_gate": False,
     "moe_shared_expert_intermediate_size": 3712,
     "moe_shared_expert_overlap": False,
     "moe_token_dispatcher_type": "alltoall",
@@ -275,10 +277,39 @@ def assert_config_matches_golden(cfg: Any) -> None:
     added = [k for k in added if k not in ALLOW_ADDED_FIELDS]
 
     if added or removed or changed:
-        header = (
-            "Mamba MoE config drift detected | "
-            f"added={sorted(added)} | removed={sorted(removed)} | changed={sorted(changed)}"
+        # Build actionable guidance for each type of drift
+        guidance_parts = []
+
+        if added:
+            guidance_parts.append(
+                f"\n\n[ADDED ARGS]: {sorted(added)}\n"
+                "  → Update GOLDEN_CONFIG in this test file to include the new arg(s) with "
+                "their default value(s).\n"
+                "  ⚠️  CAUTION: Review any logic associated with new args to ensure it doesn't "
+                "silently affect downstream model configs or behavior.\n"
+            )
+
+        if changed:
+            guidance_parts.append(
+                f"\n\n[CHANGED DEFAULTS]: {sorted(changed)}\n"
+                "  → Please don't change the default values of existing args unless "
+                "it is absolutely necessary for a bug fix.\n"
+                "  → If you must change the default value, please update the GOLDEN_CONFIG "
+                "in this test file to reflect the new default value.\n"
+            )
+
+        if removed:
+            guidance_parts.append(
+                f"\n\n[REMOVED ARGS]: {sorted(removed)}\n"
+                "  → Do NOT remove args directly. Instead, deprecate them with a warning message "
+                "to maintain backwards compatibility.\n"
+            )
+
+        guidance_parts.append(
+            "Please contact NV-username @jbarker if you are unsure how to proceed.\n"
         )
+
+        header = "Mamba MoE config drift detected!\n" "═" * 60 + "".join(guidance_parts)
         parts = [header]
         if changed:
             formatted = {k: {"expected": golden[k], "actual": current[k]} for k in sorted(changed)}
