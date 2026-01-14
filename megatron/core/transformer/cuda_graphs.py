@@ -101,6 +101,7 @@ class ArgMetadata:
             self.shape = arg.shape
             self.dtype = arg.dtype
             self.device = arg.device
+            self.value = arg.data_ptr()
         else:
             self.value = arg
 
@@ -174,6 +175,44 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
         base_module.layer_number in first_layer_numbers,
         base_module.layer_number in last_layer_numbers,
     )
+
+
+def _clone_nested_tensors(value: Any) -> Any:
+    """Recursively clone tensors inside nested containers."""
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, (tuple, list)):
+        return type(value)(_clone_nested_tensors(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _clone_nested_tensors(v) for k, v in value.items()}
+    if isinstance(value, set):
+        raise TypeError(
+            "Sets of tensors are unsupported in cudagraph helpers; use list/tuple instead"
+        )
+    return value
+
+
+def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Generator:
+    """Make generator state safe for CUDA graph capture/replay.
+
+    Generator state tensors can become inference tensors if created under `torch.inference_mode()`.
+    CUDA graph capture may later attempt in-place updates on that state; this fails for inference
+    tensors. Fix the generator *in-place* (preserving identity) by cloning its state outside
+    inference mode and setting it back.
+    """
+    with torch.inference_mode(mode=False):
+        if hasattr(gen, "graphsafe_get_state"):
+            state = gen.graphsafe_get_state()
+        else:
+            state = gen.get_state()
+
+        cloned_state = _clone_nested_tensors(state)
+        if hasattr(gen, "graphsafe_set_state"):
+            gen.graphsafe_set_state(cloned_state)
+        else:
+            gen.set_state(cloned_state)
+
+    return gen
 
 
 class _CudagraphGlobalRecord:
@@ -683,8 +722,12 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph = torch.cuda.CUDAGraph()
 
         # For cases with multiple active RNG states, e.g. TP.
-        for _, state in get_all_rng_states().items():
-            self.fwd_graph.register_generator_state(state)
+        rng_states = get_all_rng_states()
+        with torch.inference_mode(mode=False):
+            for gen in rng_states.values():
+                self.fwd_graph.register_generator_state(
+                    _ensure_generator_state_is_cudagraph_safe(gen)
+                )
 
         # warmup again as case graph capture mode may execute a different codepath
         for _ in range(self.num_warmup_steps):
@@ -706,6 +749,15 @@ class _CudaGraphRunner(torch.nn.Module):
 
         with self.get_quantization_context():
             torch.cuda.synchronize()
+            # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
+            # before capture begins, to avoid inference-tensor state issues during capture.
+            with torch.inference_mode(mode=False):
+                for device_idx in range(torch.cuda.device_count()):
+                    default_gen = torch.cuda.default_generators[device_idx]
+                    self.fwd_graph.register_generator_state(
+                        _ensure_generator_state_is_cudagraph_safe(default_gen)
+                    )
+
             with torch.cuda.graph(
                 self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
             ):

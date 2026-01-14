@@ -184,6 +184,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = enable_chunked_prefill
         self.inference_logging_step_interval = inference_logging_step_interval
         self.unified_memory_level = context.unified_memory_level
+        self.persist_cuda_graphs = context.persist_cuda_graphs
 
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
@@ -567,10 +568,10 @@ class DynamicInferenceEngine(AbstractEngine):
         ):
             self.context.deallocate_all_tensors()
 
-        # Delete cuda graphs when not using unified memory at all (level 0). For
-        # levels 1 and 2, the context's tensors maintain static memory addresses,
-        # so the cuda graphs are re-used.
-        if self.unified_memory_level == 0:
+        # Delete cuda graphs when not using unified memory at all (level 0) and
+        # `--rl-training-cuda-graphs` is not passed. For UVM levels 1 and 2, the context's tensors
+        # maintain static memory addresses, so the cuda graphs are re-used.
+        if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
             delete_cuda_graphs()
 
         # Maintain references to requests before reset.
@@ -612,7 +613,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # 0). For levels 1 and 2, the context's tensors maintain static
             # memory addresses, so the cuda graphs are re-used.
             capture_time = time.time()
-            if self.unified_memory_level == 0:
+            if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
