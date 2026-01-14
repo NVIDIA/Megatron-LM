@@ -271,6 +271,7 @@ class Attention(MegatronModule, ABC):
         attn_mask_type=None,
         attention_bias=None,
         packed_seq_params=None,
+        hidden_states=None,
     ):
         """Forward method with selective activation checkpointing."""
 
@@ -279,7 +280,8 @@ class Attention(MegatronModule, ABC):
             key = inputs[1]
             value = inputs[2]
             attention_mask = inputs[3]
-            attn_mask_type = inputs[5]
+            hidden_states_input = inputs[4]
+            attn_mask_type = inputs[6]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
             output_ = self.core_attention(
                 query,
@@ -289,17 +291,18 @@ class Attention(MegatronModule, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                hidden_states=hidden_states_input,
             )
             return output_
 
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
+        output_states = tensor_parallel.checkpoint(
+            custom_forward, False, query, key, value, attention_mask, hidden_states, rotary_pos_emb, attn_mask_type
         )
 
-        return hidden_states
+        return output_states
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -941,6 +944,7 @@ class Attention(MegatronModule, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                hidden_states=hidden_states,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
@@ -953,6 +957,7 @@ class Attention(MegatronModule, ABC):
                     attn_mask_type=attn_mask_type,
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
+                    hidden_states=hidden_states,
                 )
 
             else:
