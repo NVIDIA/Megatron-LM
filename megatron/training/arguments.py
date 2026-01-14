@@ -815,11 +815,6 @@ def validate_args(args, defaults={}):
         # TODO(tailaim): add support for other dispatcher types
         print(f"Setting moe_token_dispatcher_type to alltoall for sft sequence packing with pipeline parallelism")
         args.moe_token_dispatcher_type = "alltoall"
-        if args.sequence_packing_scheduler is None:
-            if args.hybrid_context_parallel:
-                args.sequence_packing_scheduler = 'default_hybrid_cp'
-            else:
-                args.sequence_packing_scheduler = 'naive_sequence_packing'
     else:
         args.variable_seq_lengths = False
 
@@ -983,6 +978,9 @@ def validate_args(args, defaults={}):
         assert args.context_parallel_size == 1, 'context parallel size must be 1 for hybrid context parallelism'
 
     if args.sequence_packing:
+        assert not args.create_attention_mask_in_dataloader, \
+        'Sequence packing does not support create_attention_mask_in_dataloader. ' \
+        'Please set --no-create-attention-mask-in-dataloader'
         # Validate that packed sequence buffer is large enough for single sequences
         if args.hybrid_context_parallel:
             # packed_buffer_size = hdp_size * max_seqlen_per_rank >= single_seq_max_len
@@ -2932,7 +2930,7 @@ def _add_distributed_args(parser):
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
     group.add_argument('--min-hybrid-context-parallel-size', type=int, default=1,
                         help='Minimum size of the hybrid context parallel groups.')
-    group.add_argument('--sequence-packing-scheduler', type=str, default='default_hybrid_cp',
+    group.add_argument('--sequence-packing-scheduler', type=str, default=None,
                         choices=['default_hybrid_cp', 'empty_scheduler_with_packing', 'empty_scheduler_no_packing', 'naive_sequence_packing'],
                         help='Scheduler for sequence packing and hybrid context parallel. '
                         'naive_sequence_packing: default naive sequence packing scheduler(just THD, no Hybrid-CP, this '
