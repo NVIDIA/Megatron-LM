@@ -1154,18 +1154,6 @@ class Attention(MegatronModule, ABC):
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
                     )
-%%%%%%% Changes from base to side #2
--                core_attn_out = self.core_attention(
-+                core_attn_out = apply_module(self.core_attention)(
-                     query,
-                     key,
-                     value,
-                     attention_mask,
-                     attn_mask_type=attn_mask_type,
-                     attention_bias=attention_bias,
-                     packed_seq_params=packed_seq_params,
-                 )
->>>>>>> Conflict 1 of 1 ends
 
             else:
                 # Dynamic batching attention kernel.

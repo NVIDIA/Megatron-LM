@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Utilities for improved type hinting with torch interfaces."""
+from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Generic, ParamSpec, Protocol, TypeVar

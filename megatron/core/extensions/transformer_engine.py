@@ -58,19 +58,19 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 
-if TYPE_CHECKING:
-    # For type checking, treat transformer_engine as always available.
+try:
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
     HAVE_TE = True
-else:
-    try:
+except ImportError:
+    if TYPE_CHECKING:
+        # For type checking, treat transformer_engine as always available.
         import transformer_engine as te
         from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
         HAVE_TE = True
-    except ImportError:
+    else:
         from unittest.mock import MagicMock
 
         te = MagicMock()
