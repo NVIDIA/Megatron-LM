@@ -69,3 +69,8 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  - test_case: [gpt_grpo_tp1_pp1_dp8_583m_throughputtest_cudagraphs]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
