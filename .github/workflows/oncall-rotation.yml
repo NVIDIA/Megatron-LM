@@ -45,7 +45,8 @@ jobs:
           # Slack token for updating the Slack usergroup
           SLACK_TOKEN: ${{ secrets.ONCALL_SLACK_TOKEN }}
         run: |
-          pip install --no-cache-dir uv slack-sdk
+          pip install --no-cache-dir uv
+          uv pip install slack-sdk
           uv run python .github/scripts/oncall_manager.py rotate
 
       - name: Commit and Push changes
