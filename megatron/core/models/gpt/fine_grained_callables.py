@@ -13,7 +13,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.module import float16_to_fp32
@@ -380,16 +379,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Run forward pass for computations between attention and dispatch:
             pre mlp layernorm->router->dispatch preprocess
         """
-        if layer.offload_mlp_norm:
-            hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
         if layer.recompute_pre_mlp_layernorm:
             layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface.get_context(layer.offload_mlp_norm):
+            with off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
                     layer.pre_mlp_layernorm, hidden_states
                 )
         else:
-            with off_interface.get_context(layer.offload_mlp_norm):
+            with off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
         probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
@@ -472,6 +469,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, layer.hidden_dropout
             )
+        # Delay the offload of the mlp norm until after the mlp_bda has been computed
+        # because the residual is needed in the mlp_bda.
         if layer.offload_mlp_norm:
             hidden_states = fine_grained_offloading_group_commit(
                 hidden_states, name="mlp_norm", forced_released_tensors=[residual]

@@ -751,6 +751,9 @@ class TEGroupedMLP(MegatronModule):
         output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
+
+        # Delay the offload of the moe act until after the linear_fc2 has been computed
+        # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
         if self.offload_moe_act:
             output = fine_grained_offloading_group_commit(
                 output, name="moe_act", forced_released_tensors=[fc1_output]
