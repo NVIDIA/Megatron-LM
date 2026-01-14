@@ -1,12 +1,14 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import os
-import torch
+
 import modelopt.torch.quantization as mtq
-from megatron.core import parallel_state
-from megatron.training.utils import unwrap_model
+import torch
 from modelopt.torch.quantization.utils import is_quantized
 from packaging.version import Version
+
+from megatron.core import parallel_state
+from megatron.training.utils import unwrap_model
 
 
 def modelopt_version_higher_than(target_version: str):
@@ -45,12 +47,15 @@ def get_mtbench_chat_data():
         example["conversations"] = conversations
         return example
 
-    dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train", token=os.environ.get("HF_TOKEN", None))
+    dataset = load_dataset(
+        "HuggingFaceH4/mt_bench_prompts", split="train", token=os.environ.get("HF_TOKEN", None)
+    )
     return dataset.map(mtbench_to_oai_chat)
+
 
 def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=True):
     """Move tensors to device if not meta device; otherwise materialize with empty_like().
-   
+
     Args:
         module: The target module to apply this transformation.
         device: The desired device of the parameters
@@ -65,9 +70,8 @@ def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=T
         else:
             return tensor.to(device)
 
-    module._apply(
-        lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
-    )
+    module._apply(lambda t: _empty_like_if_meta(t, device=device), recurse=recurse)
+
 
 def print_distributed_quant_summary(model, msg=""):
     from megatron.core import parallel_state
@@ -88,7 +92,9 @@ def print_distributed_quant_summary(model, msg=""):
         return
 
     # Only print from unique TP ranks of [0, 1]
-    if parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0 and parallel_state.get_tensor_model_parallel_rank() in [0, 1]:
+    if parallel_state.get_data_parallel_rank(
+        with_context_parallel=True
+    ) == 0 and parallel_state.get_tensor_model_parallel_rank() in [0, 1]:
         TP_rank = parallel_state.get_tensor_model_parallel_rank()
         EP_rank = parallel_state.get_expert_model_parallel_rank()
         PP_rank = parallel_state.get_pipeline_model_parallel_rank()
