@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Callable, Optional
@@ -7,7 +8,9 @@ from typing import Callable, Optional
 import torch
 from torch.autograd import Variable
 
-from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
+from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank, make_viewless_tensor
+
+logger = logging.getLogger(__name__)
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -105,6 +108,12 @@ def set_ideal_affinity_for_current_gpu():
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
     pynvml.nvmlDeviceSetCpuAffinity(handle)
+
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        f"Set CPU affinity for all GPUs for optimal host-device transfer performance",
+    )
 
 
 @contextmanager
