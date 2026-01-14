@@ -562,11 +562,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MultiTokenPredictionLayerSubmodules,
-        mtp_layer_pattern: str = None,
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # New: For Mamba path - pattern and submodules to build inner layers directly
+        # For Mamba path - pattern and submodules to build inner layers directly
         mtp_layer_pattern: Optional[str] = None,
         mamba_submodules: Optional["MambaStackSubmodules"] = None,
     ):
@@ -576,7 +575,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.layer_number = layer_number
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
-        self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_layer_pattern = mtp_layer_pattern
 
         # Validate attention mask type if using transformer-based inner layers
@@ -654,34 +652,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
             self.mtp_model_layer = MTPModelLayerContainer(inner_layers, config=config)
         elif self.config.mtp_num_layers is not None:
-            if self.mtp_layer_pattern is not None:
-                # Legacy Mamba path: build MambaStack with override pattern
-                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-
-                # We do not need pre and post process stage for MTP layer, given they are
-                # handled in the MultiTokenPredictionLayer itself.
-                assert self.config.mtp_num_layers_per_layer is not None, \
-                    "mtp_num_layers_per_layer must be set when using mtp_layer_pattern"
-                self.mtp_model_layer = build_module(
-                    self.submodules.mtp_model_layer,
-                    self.config,
-                    pre_process=False,
-                    post_process=False,
-                    hybrid_override_pattern=self.mtp_layer_pattern,
-                    dtype=self.config.params_dtype,
-                    pg_collection=pg_collection,
-                    vp_stage=self.vp_stage,
-                    num_layers=self.config.mtp_num_layers_per_layer,
-                    is_mtp_layer=True
-                )
-            else:
-                # GPT path: Uses the transformer block spec for MTP layer
-                self.mtp_model_layer = build_module(
-                    self.submodules.mtp_model_layer,
-                    config=self.config,
-                    vp_stage=self.vp_stage,
-                    is_mtp_layer=True
-                )
+            # GPT path: Uses the transformer block spec for MTP layer
+            self.mtp_model_layer = build_module(
+                self.submodules.mtp_model_layer,
+                config=self.config,
+                vp_stage=self.vp_stage,
+                is_mtp_layer=True
+            )
 
         self.final_layernorm = build_module(
             self.submodules.layer_norm,
