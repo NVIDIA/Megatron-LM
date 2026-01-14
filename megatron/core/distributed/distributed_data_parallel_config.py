@@ -124,6 +124,14 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
    """
 
+   fsdp_db_fallback_dynamic_alloc: bool = Ture
+   """Whether to fall back to dynamic memory allocator when a bucket does not
+        fit FSDP double buffer size. Dynamic memory allocator will not use NCCL
+        user buffer, which usually leads to low performance. If true, FSDP will
+        use the persistently allocated buffer for the bucket that does not fit,
+        it will enable NCCL user buffer with the cost of more memory usage.
+   """
+
     outer_dp_sharding_strategy: str = 'no_shard'
     """
     Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.

@@ -645,7 +645,8 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
     deallocation of temporary buffers during FSDP operations.
     """
 
-    def __init__(self, name: str, fsdp_param_groups: List["ParameterGroup"], size: int = 2):
+    def __init__(self, name: str, fsdp_param_groups: List["ParameterGroup"], size: int = 2, 
+                 fallback_to_dynamic_alloc: bool = True):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
         self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
@@ -678,6 +679,15 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         ), "Found no FSDP units to use fixed-size buffering"
         self.fsdp_double_buffer_units = fsdp_units_to_double_buffer
 
+        for bucket_id, param_group in enumerate(fsdp_param_groups):
+            if (param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None or 
+                param_group.fsdp_unit_id is not in self.fsdp_double_buffer_units):
+                logging.info(f"FSDP unit {param_group.fsdp_unit_id} does not fit in FixedPoolAllcator")
+                if fallback_to_dynamic_alloc is True:
+                    logging.info("It will fall back to dynamic memory allocator, NCCL user buffer is not supported")
+                else
+                    logging.info("It will be allocated a persistent memmory, if memory budget is tight, turn off fsdp-db-fallback-dynamic-alloc")
+        
         # Initialize buffer group status.
         # Each buffer group represents a set of buffers associated with an FSDP unit's bucket group.
         self.idle_buffer = []  # List of available (buf_group_id, offset) tuples.
@@ -690,6 +700,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 self.idle_buffer.append((buf_group_id, bucket_offset))
 
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
+        self.fallback_to_dynamic_alloc = fallback_to_dynamic_alloc
         self.backup_allocator = TemporaryBucketAllocator()
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
@@ -742,9 +753,18 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 f"current using_buffer: {self.using_buffer} \n"
                 f"current idle_buffer: {self.idle_buffer}"
             )
-        else:
+        elif self.fallback_to_dynamic_alloc is False:
             buffer_name = f"{self.name}_not_fit_in_fixed_pool_{bucket_id}_{size}_{dtype}_{device}"
+        else:
+            # If the bucket is not eligible for fixed pool buffering, or no buffer is available,
+            # fall back to dynamic allocation via the backup allocator. This means that we
+            # will do dynamic memory allocation.
+            logging.debug(f"[FSDP] Using backup allocator for {bucket_id} {fsdp_unit_id}")
+            return self.backup_allocator.allocate(
+                bucket_id=bucket_id, size=size, dtype=dtype, device=device
+            )
         
+        # Use buffer_name to get memory from global memory.
         if mem_alloc_context is not None and mem_alloc_context != nullcontext:
             # Check if a new buffer allocation is required
             if (
@@ -776,9 +796,10 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             self.idle_buffer.append(self.using_buffer[bucket_id])
             del self.using_buffer[bucket_id]
             return
-        # If not managed by fixed pool allocator, delegate to the backup allocator.
-        logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
-        self.backup_allocator.free(bucket_id)
+        if self.fallback_to_dynamic_alloc is True:
+            # If not managed by fixed pool allocator, delegate to the backup allocator.
+            logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
+            self.backup_allocator.free(bucket_id)
 
 
 class DataParallelBuffer:
@@ -1829,10 +1850,12 @@ class ParamAndGradBuffer:
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             UB_BUFFER_NUM = 2
             self.weight_alloc = FixedPoolAllocator(
-                name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+                name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM, 
+                fallback_to_dynamic_alloc = ddp_config.fsdp_db_fallback_dynamic_alloc
             )
             self.main_grad_alloc = FixedPoolAllocator(
-                name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+                name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM,
+                fallback_to_dynamic_alloc = ddp_config.fsdp_db_fallback_dynamic_alloc
             )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
