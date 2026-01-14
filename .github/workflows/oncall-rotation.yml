@@ -31,7 +31,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.PAT }}
+          token: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
