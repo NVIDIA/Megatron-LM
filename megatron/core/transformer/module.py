@@ -201,14 +201,23 @@ class GraphableMegatronModule(MegatronModule):
         )
         self.backward_dw_wrapper = _BackwardDWWrapper(self)
 
-    def set_cuda_graph_backward_dw_wrapper(self):
+    def set_te_cuda_graph_backward_dw_wrapper(self):
         """Replace the backward_dw callable with dw cuda graph."""
-        assert self.backward_dw_wrapper is not None, (
-            "`backward_dw_wrapper` must be set when cuda graphs are enabled " "for ep overlap."
-        )
+        assert (
+            self.backward_dw_wrapper is not None
+        ), "`backward_dw_wrapper` must be set when cuda graphs are enabled for ep overlap."
         self.backward_dw_wrapper.set_graphed_backward_dw_callable(
-            partial(self.backward_dw_cudagraph, self.current_microbatch)
+            partial(self._te_cuda_graph_backward_dw_graph, self.current_microbatch)
         )
+
+    def _te_cuda_graph_backward_dw_graph(self, microbatch_idx):
+        """
+        CUDA Graph backward weight gradient computation for current layer.
+        """
+        cg_index = microbatch_idx % len(self.cuda_graphs)
+        if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
+            return
+        self.cuda_graphs[cg_index].backward_dw()
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """

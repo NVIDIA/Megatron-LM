@@ -422,8 +422,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             pre mlp layernorm->router->dispatch preprocess
         """
 
-        if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
-            layer.set_cuda_graph_backward_dw_wrapper()
+        if (
+            isinstance(layer, GraphableMegatronModule)
+            and hasattr(layer, 'cuda_graphs')
+            and layer.cuda_graphs
+        ):
+            layer.set_te_cuda_graph_backward_dw_wrapper()
             forward_func = layer._te_cuda_graph_replay
         else:
             # wrapper function that keeps consistent api with cuda graph replay

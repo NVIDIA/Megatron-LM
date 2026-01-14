@@ -15,6 +15,10 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import (
+    convert_schedule_table_to_order,
+    get_overlap_moe_expert_parallel_comm_order,
+)
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
@@ -108,7 +112,7 @@ def test_get_pipeline_parallel_order(
     schedule_table = schedule.get_schedule_table(
         num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage
     )
-    order = schedule.convert_schedule_table_to_order(
+    order = convert_schedule_table_to_order(
         num_warmup_microbatches, num_model_chunks, schedule_table
     )
 
@@ -132,7 +136,7 @@ def test_get_pipeline_parallel_order(
     layers_per_chunk = 2
     num_layers_per_chunk = [layers_per_chunk] * num_model_chunks
     # disable wgrad compute
-    overlapped_order, chunk_id_list = schedule.get_overlap_moe_expert_parallel_comm_order(
+    overlapped_order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
         order, num_layers_per_chunk, False
     )
     assert max(overlapped_order) == num_model_chunks * layers_per_chunk
@@ -151,7 +155,7 @@ def test_get_pipeline_parallel_order(
     assert accumulated_order == 0
 
     # enable wgrad compute
-    overlapped_order, chunk_id_list = schedule.get_overlap_moe_expert_parallel_comm_order(
+    overlapped_order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
         order, num_layers_per_chunk, True
     )
     assert max(overlapped_order) == num_model_chunks * layers_per_chunk
