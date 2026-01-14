@@ -14,13 +14,12 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 
@@ -31,6 +30,7 @@ if TYPE_CHECKING:
     from megatron.core.ssm.mamba_block import MambaStackSubmodules
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.utils import (
     get_pg_rank,
     is_torch_min_version,
@@ -64,8 +64,8 @@ def tie_word_embeddings_state_dict(
     sharded_state_dict: ShardedStateDict,
     word_emb_weight: Tensor,
     word_emb_weight_key: str,
-    tp_group: torch.distributed.ProcessGroup = None,
-    dp_cp_group: torch.distributed.ProcessGroup = None,
+    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
 ) -> None:
     """tie the embedding of the mtp processing stage in a given sharded state dict.
 
@@ -99,8 +99,8 @@ def tie_output_layer_state_dict(
     sharded_state_dict: ShardedStateDict,
     output_layer_weight: Tensor,
     output_layer_weight_key: str,
-    tp_group: torch.distributed.ProcessGroup = None,
-    dp_cp_group: torch.distributed.ProcessGroup = None,
+    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
 ) -> None:
     """tie the output layer of the mtp processing stage in a given sharded state dict.
 
@@ -323,8 +323,8 @@ class MTPLossLoggingHelper:
         loss: torch.Tensor,
         layer_number: int,
         num_layers: int,
-        reduce_group: torch.distributed.ProcessGroup = None,
-        avg_group: torch.distributed.ProcessGroup = None,
+        reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+        avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Save the mtp loss for logging.
         Args:
@@ -450,10 +450,78 @@ def get_mtp_layer_spec_for_backend(
     return mtp_layer_spec
 
 
-def get_mtp_layer_offset(config: TransformerConfig) -> int:
+def mtp_on_this_rank(
+    config: TransformerConfig, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
+) -> bool:
+    """
+    Check if there is MTP on the current rank.
+
+    Behavior:
+        - If a custom pipeline model parallel layout is provided in the config:
+            - If virtual pipeline parallelism is enabled (and `ignore_virtual` is False), checks
+              whether any MTP layers are present on this (pp_rank, vp_stage) pair.
+            - Otherwise, checks all virtual pipeline ranks of the current pipeline rank. Returns
+              True if any virtual sub-rank includes at least one MTP layer.
+        - If no custom layout is provided, assumes all MTP layers (if any) are placed on the last
+          pipeline stage. The function returns True only on the last pipeline stage.
+    """
+    mtp_on_this_rank = False
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    if config.pipeline_model_parallel_layout is not None:
+        # with custom PP layout, we support put MTP layers on any pipeline stage
+        layout = config.pipeline_model_parallel_layout.layout
+        if (
+            not ignore_virtual
+            and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
+        ):
+            assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
+            num_layers_to_build = layout[pp_rank][vp_stage].count(LayerType.mtp)
+            mtp_on_this_rank = num_layers_to_build > 0
+        else:
+            for vpp_rank in range(len(layout[pp_rank])):
+                num_layers_to_build = layout[pp_rank][vpp_rank].count(LayerType.mtp)
+                if num_layers_to_build > 0:
+                    mtp_on_this_rank = True
+                    break
+    else:
+        # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
+        if config.mtp_num_layers is not None:
+            mtp_on_this_rank = parallel_state.is_pipeline_last_stage(
+                ignore_virtual=ignore_virtual, vp_stage=vp_stage
+            )
+        else:
+            mtp_on_this_rank = False
+    return mtp_on_this_rank
+
+
+def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
+    """Get the ranks of the MTP layers."""
+    mtp_ranks = set()
+    if config.mtp_num_layers is None:
+        return []
+    if config.pipeline_model_parallel_layout is None:
+        return [pp_ranks[-1]]
+    layout = config.pipeline_model_parallel_layout.layout
+    for pp_rank in range(len(layout)):
+        for vpp_rank in range(len(layout[pp_rank])):
+            num_layers_to_build = layout[pp_rank][vpp_rank].count(LayerType.mtp)
+            if num_layers_to_build:
+                mtp_ranks.add(pp_ranks[pp_rank])
+    return list(mtp_ranks)
+
+
+def get_mtp_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
     """Get the offset of the MTP layer."""
-    # Currently, we only support put all of MTP layers on the last pipeline stage.
-    return 0
+    if config.pipeline_model_parallel_size > 1:
+        if config.pipeline_model_parallel_layout:
+            offset = config.pipeline_model_parallel_layout.get_layer_offset(
+                layer_type=LayerType.mtp, vp_stage=vp_stage
+            )
+        else:
+            offset = 0
+    else:
+        offset = 0
+    return offset
 
 
 class MTPModelLayerContainer(MegatronModule):
@@ -481,15 +549,22 @@ def get_mtp_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
     """Get the number of MTP layers to build."""
-    # Currently, we only support put all of MTP layers on the last pipeline stage.
-    vp_size = config.virtual_pipeline_model_parallel_size
-    if pp_rank is None:
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1
-    if is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size) and is_last_pp_stage:
-        return config.mtp_num_layers if config.mtp_num_layers else 0
+    if config.pipeline_model_parallel_layout is not None:
+        # If we have a custom PP layout, get the number of mtp layers in the layout array.
+        num_layers_to_build = config.pipeline_model_parallel_layout.get_num_layers_to_build(
+            layer_type=LayerType.mtp, vp_stage=vp_stage
+        )
+        assert num_layers_to_build == config.mtp_num_layers or num_layers_to_build == 0, (
+            f"Currently, we only support put all of MTP layers on the last pipeline stage, "
+            f"so the number of MTP layers to build ({num_layers_to_build}) must match "
+            f"mtp_num_layers ({config.mtp_num_layers}) or be 0."
+        )
     else:
-        return 0
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
+            num_layers_to_build = config.mtp_num_layers if config.mtp_num_layers else 0
+        else:
+            num_layers_to_build = 0
+    return num_layers_to_build
 
 
 class MTPLossAutoScaler(torch.autograd.Function):
@@ -572,7 +647,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
-        self.layer_number = layer_number
+        self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
         self.mtp_layer_pattern = mtp_layer_pattern
@@ -653,10 +728,14 @@ class MultiTokenPredictionLayer(MegatronModule):
             self.mtp_model_layer = MTPModelLayerContainer(inner_layers, config=config)
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
+            diff_transformer_layer_offset = self.config.num_layers - get_transformer_layer_offset(
+                self.config, vp_stage
+            )
             self.mtp_model_layer = build_module(
                 self.submodules.mtp_model_layer,
                 config=self.config,
                 vp_stage=self.vp_stage,
+                layer_number=self.layer_number + diff_transformer_layer_offset,
                 is_mtp_layer=True
             )
 
@@ -786,17 +865,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                         inference_params=inference_params,
                         packed_seq_params=packed_seq_params,
                     )
-                elif self.mtp_layer_pattern is not None:
-                    # Legacy Mamba path: MambaStack with override pattern
-                    # Since pre-process is set to False, we need to set the input tensor manually.
-                    self.mtp_model_layer.set_input_tensor(hidden_states)
-                    hidden_states = self.mtp_model_layer(
-                        hidden_states=hidden_states,
-                        attention_mask=attention_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        inference_params=inference_params,
-                        inference_context=context,
-                    )
                 else:
                     # GPT path: single TransformerLayer
                     hidden_states, _ = self.mtp_model_layer(
@@ -921,15 +989,15 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-        rotary_pos_emb: Tensor = None,
-        rotary_pos_cos: Tensor = None,
-        rotary_pos_sin: Tensor = None,
-        attention_bias: Tensor = None,
-        inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
-        sequence_len_offset: Tensor = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
     ):
         """
@@ -1040,7 +1108,7 @@ class MultiTokenPredictionBlockSubmodules:
             projection matrix, transformer block, shared output head).
     """
 
-    layer_specs: List[ModuleSpec] = None
+    layer_specs: Optional[List[ModuleSpec]] = None
 
 
 def _get_mtp_block_submodules(
@@ -1099,7 +1167,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         # New: For Mamba path with unified pattern syntax
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
@@ -1224,16 +1292,16 @@ class MultiTokenPredictionBlock(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-        rotary_pos_emb: Tensor = None,
-        rotary_pos_cos: Tensor = None,
-        rotary_pos_sin: Tensor = None,
-        attention_bias: Tensor = None,
-        inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
-        sequence_len_offset: Tensor = None,
-        extra_block_kwargs: dict = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        extra_block_kwargs: Optional[dict] = None,
         embedding=None,
     ) -> Tensor:
         """
@@ -1249,7 +1317,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             (Tensor): The mtp loss tensor of shape [b, s].
         """
         # get hidden states from previous mtp stages
-        offset = get_mtp_layer_offset(self.config)
+        offset = get_mtp_layer_offset(self.config, self.vp_stage)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hidden_states = hidden_states_list[offset]
         for iteration in range(self.config.mtp_num_layers):
@@ -1371,7 +1439,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
-            offset = get_mtp_layer_offset(self.config)
+            offset = get_mtp_layer_offset(self.config, self.vp_stage)
             sharded_prefix = f'{layer_prefix}{layer.layer_number - 1}.'
 
             state_dict_prefix = f'{layer_prefix}{layer.layer_number - 1 - offset}.'

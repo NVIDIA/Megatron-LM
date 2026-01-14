@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from dataclasses import dataclass
@@ -246,6 +246,19 @@ class ModelParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    ep_overlap_early_attn_memory_release: bool = False
+    """Enable early memory release of attention activations during EP overlap.
+    EP overlap can increase peak memory usage when the overlapped forward module allocates 
+    more memory than what is freed by the backward module. This flag addresses this by 
+    reordering the attention backward pass to occur earlier in the schedule.
+    Specifically:
+    - Without this flag: attn_bwd executes after moe_combine_fwd
+    - With this flag: attn_bwd executes before mlp_fwd
+    The earlier execution releases attention activations sooner, reducing peak memory.
+    Note: This may impact performance as moe_combine_fwd and moe_dispatch_bwd become 
+    exposed (not overlapped with other computation).
+    """
+
     ###################
     # Pipeline Parallel
     ###################
@@ -315,6 +328,10 @@ class ModelParallelConfig:
        rank 0 | 0 1 2 0 1 2 3 4 3 4 
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
+
+    mtp_standalone: bool = False
+    """This will be set automatically according to the pipeline layout, 
+    and will be set to True if MTP is in a separate vpp stage."""
 
     ###################
     # CPU Offloading

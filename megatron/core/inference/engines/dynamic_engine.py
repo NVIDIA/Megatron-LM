@@ -184,6 +184,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = enable_chunked_prefill
         self.inference_logging_step_interval = inference_logging_step_interval
         self.unified_memory_level = context.unified_memory_level
+        self.persist_cuda_graphs = context.persist_cuda_graphs
 
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
@@ -192,6 +193,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialize engine.
         self.reset()
+
+        # Set callback for getting stop word finished request IDs
+        self.controller.set_stop_word_finished_ids_callback(
+            self._get_and_clear_stop_word_finished_ids
+        )
 
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
@@ -229,10 +235,15 @@ class DynamicInferenceEngine(AbstractEngine):
         # Request state.
         self.request_counter = Counter()
         self.finished_request_count = 0
+        self.evicted_request_count = 0
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        # Track requests that should stop due to stop words (detected in post_process_requests)
+        self.stop_word_finished_request_ids: set[int] = set()
+        # Track requests currently being finished due to stop words (to skip extra token)
+        self.stop_word_being_finished_ids: set[int] = set()
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
@@ -557,10 +568,10 @@ class DynamicInferenceEngine(AbstractEngine):
         ):
             self.context.deallocate_all_tensors()
 
-        # Delete cuda graphs when not using unified memory at all (level 0). For
-        # levels 1 and 2, the context's tensors maintain static memory addresses,
-        # so the cuda graphs are re-used.
-        if self.unified_memory_level == 0:
+        # Delete cuda graphs when not using unified memory at all (level 0) and
+        # `--rl-training-cuda-graphs` is not passed. For UVM levels 1 and 2, the context's tensors
+        # maintain static memory addresses, so the cuda graphs are re-used.
+        if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
             delete_cuda_graphs()
 
         # Maintain references to requests before reset.
@@ -571,7 +582,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.requests[request_id].record.suspend()
+            self.requests[request_id].record.checkpoint()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -602,7 +613,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # 0). For levels 1 and 2, the context's tensors maintain static
             # memory addresses, so the cuda graphs are re-used.
             capture_time = time.time()
-            if self.unified_memory_level == 0:
+            if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
@@ -716,6 +727,14 @@ class DynamicInferenceEngine(AbstractEngine):
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
+        # Tokenize stop words if provided
+        if request.sampling_params.stop_words:
+            stop_word_ids = [
+                self.controller.tokenize_prompt(stop_word, add_BOS=False)
+                for stop_word in request.sampling_params.stop_words
+            ]
+            request.stop_word_ids = stop_word_ids
+
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
         else:
@@ -780,6 +799,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self,
         request_ids: torch.Tensor,
         finished_request_ids: torch.Tensor,
+        evict_request_ids: torch.Tensor,
         step_time: float,
         sample: torch.Tensor,
         log_probs: torch.Tensor,
@@ -791,6 +811,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             request_ids (torch.Tensor): A list of request_ids
             finished_request_ids (torch.Tensor): A list of finished request ids
+            evict_request_ids (torch.Tensor): A list of evicted request ids.
             step_time (float): The latency of the last step
             sample: (torch.Tensor): The newly generated tokens for each request
             log_probs: (List): Log probs for each request
@@ -804,6 +825,8 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
         self.finished_request_count += len(finished_request_ids)
+        if evict_request_ids is not None:
+            self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
@@ -812,12 +835,19 @@ class DynamicInferenceEngine(AbstractEngine):
         ):
             request: DynamicInferenceRequest = self.get_request(request_id)
             if request_id != self.context.chunked_prefill_request_id:
-                request.generated_tokens.append(token)
-                if request.tpot is None:
-                    request.tpot = []
-                request.tpot.append(step_time)
+                # Skip appending token for requests being finished due to stop words
+                # (they already have their final token from the previous step)
+                if request_id not in self.stop_word_being_finished_ids:
+                    request.generated_tokens.append(token)
+                    if request.tpot is None:
+                        request.tpot = []
+                    request.tpot.append(step_time)
+
+                # Check for stop words (after token is appended)
+                stop_word_hit = self._check_stop_words_for_request_post_append(request)
 
                 if request_id in finished_request_ids:
+                    # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     finished_entry = self.requests.pop(request_id)
@@ -825,6 +855,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_request.generated_length = len(finished_request.generated_tokens)
                     finished_request_records.append(finished_entry.record)
                     finished_entry.future.set_result(finished_entry.record)
+                elif stop_word_hit:
+                    # Stop word detected - mark for removal in next step's bookkeeping
+                    # Don't pop yet; let the next step handle it properly via callback
+                    self.stop_word_finished_request_ids.add(request_id)
+                    active_request_ids.append(request_id)
                 else:
                     active_request_ids.append(request_id)
             else:
@@ -911,7 +946,78 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
+        # Handle evicted requests.
+        if evict_request_ids is not None and evict_request_ids.numel() > 0:
+
+            evict_request_ids = evict_request_ids.tolist()
+
+            # Insert into waiting_request_ids after any chunk prefill request.
+            if self.context.chunked_prefill_request_id != -1:
+                raise Exception(
+                    "TODO: Insert into waiting_request_ids after chunked prefill request."
+                )
+            self.waiting_request_ids.extendleft(evict_request_ids)
+
+            # Checkpoint requests (i.e., prompt += generations) + add eviction event.
+            for request_id in evict_request_ids:
+                self.requests[request_id].record.checkpoint()
+                self.get_request(request_id).add_event_evict()
+
+        # Clear the stop word being finished set after processing
+        self.stop_word_being_finished_ids.clear()
+
         return active_request_ids, finished_request_records
+
+    def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
+        """Get and clear the set of request IDs that should be finished due to stop words.
+
+        This callback is called from the controller during bookkeeping to get request IDs
+        that were detected as hitting stop words in the previous step's post_process_requests.
+
+        Args:
+            active_request_ids: List of currently active request IDs.
+
+        Returns:
+            Set of request IDs from active_request_ids that should be marked as finished.
+        """
+        if not self.stop_word_finished_request_ids:
+            return set()
+
+        # Find which stop word finished IDs are in the current active requests
+        result = self.stop_word_finished_request_ids & set(active_request_ids)
+        # Move to "being finished" set so post_process_requests can skip the extra token
+        self.stop_word_being_finished_ids = result
+        # Clear the IDs that we're returning (they'll be marked as finished)
+        self.stop_word_finished_request_ids -= result
+        return result
+
+    def _check_stop_words_for_request_post_append(self, request: DynamicInferenceRequest) -> bool:
+        """Check if a request should stop due to stop words (after token is appended).
+
+        This method is called from post_process_requests after the token has already
+        been appended to request.generated_tokens.
+
+        Args:
+            request: The request to check.
+
+        Returns:
+            bool: True if the generated sequence ends with a stop word, False otherwise.
+        """
+        # Check if request has stop words configured
+        if request.stop_word_ids is None or len(request.stop_word_ids) == 0:
+            return False
+
+        generated_tokens = request.generated_tokens
+
+        # Check if the sequence ends with any stop word
+        for stop_word_ids in request.stop_word_ids:
+            stop_len = len(stop_word_ids)
+            if len(generated_tokens) >= stop_len:
+                # Check if the last stop_len tokens match the stop word
+                if list(generated_tokens[-stop_len:]) == stop_word_ids:
+                    return True
+
+        return False
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
@@ -1022,7 +1128,7 @@ class DynamicInferenceEngine(AbstractEngine):
         is_decode_only = self.context.is_decode_only()
         pre_step_context_state = {
             "is_decode_only": is_decode_only,
-            "max_active_requests": self.context.max_active_requests,
+            "max_requests": self.context.max_requests,
             "total_request_count": self.context.total_request_count,
             "paused_request_count": self.context.paused_request_count,
             "active_token_count": self.context.active_token_count,
@@ -1055,6 +1161,7 @@ class DynamicInferenceEngine(AbstractEngine):
         post_step_context_state = {
             "waiting_request_count": len(self.waiting_request_ids),
             "finished_request_count": self.finished_request_count,
+            "evicted_request_count": self.evicted_request_count,
             "kv_stats": kvcache_util_stats,
             "padded_active_token_count": self.context.padded_active_token_count,
             "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
@@ -1091,8 +1198,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if step_result is not None:
             active_request_ids = step_result["active_request_ids"]
-            newly_paused_request_ids = step_result["newly_paused_request_ids"]
             finished_request_ids = step_result["finished_request_ids"]
+            newly_paused_request_ids = step_result.get("newly_paused_request_ids")
+            evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
@@ -1109,6 +1217,7 @@ class DynamicInferenceEngine(AbstractEngine):
             (active_request_ids, finished_request_records) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
+                evict_request_ids,
                 step_time,
                 sample,
                 log_probs,
@@ -1184,7 +1293,7 @@ class DynamicInferenceEngine(AbstractEngine):
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f%s ... "
-                "reqs: a %d/%d, p %d, w %d, f %d ... "
+                "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
@@ -1205,10 +1314,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     ),
                     context_state["total_request_count"] - context_state["paused_request_count"],
-                    context_state["max_active_requests"],
+                    context_state["max_requests"],
                     context_state["paused_request_count"],
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
+                    context_state["evicted_request_count"],
                     context_state["total_active_used_blocks"],
                     context_state["total_active_block_count"],
                     context_state["total_paused_used_blocks"],
