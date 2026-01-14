@@ -328,8 +328,9 @@ def select_src_metadata_balanced(
     To avoid always reading from the same group, we:
       - bucket `src_meta_list` by their DP group (tuple of ranks)
       - if there is only one bucket, just return the first entry
-      - otherwise, map the destination rank's DP index to one of the source
-        DP groups in a round-robin fashion, and pick the first metadata in it.
+      - otherwise, use the destination rank's global rank to select a source
+        DP group in a round-robin fashion, ensuring even distribution of load
+        across all source DP groups.
     """
     if not src_meta_list:
         raise ValueError("src_meta_list must be non-empty")
@@ -345,17 +346,13 @@ def select_src_metadata_balanced(
     if len(grouped_by_dp) == 1:
         return src_meta_list[0]
 
-    # Determine this destination rank's index within its DP group (if any).
-    dst_dp_ranks = dst_metadata.data_parallel_group_ranks or []
-    if dst_dp_ranks and dst_rank in dst_dp_ranks:
-        dst_dp_index = dst_dp_ranks.index(dst_rank)
-    else:
-        # Fallback: treat as the first DP index.
-        dst_dp_index = 0
-
-    # Use a stable ordering of DP groups so that round-robin is deterministic.
+    # Use the destination rank's global rank to select a source DP group in a
+    # round-robin fashion. This ensures that even when multiple destination ranks
+    # have the same DP index (e.g., ranks 0,1,2,3 all being at position 0 in their
+    # respective DP groups), they still get distributed across different source
+    # DP groups based on their global rank.
     sorted_dp_groups = sorted(grouped_by_dp.keys())
-    chosen_group = sorted_dp_groups[dst_dp_index % len(sorted_dp_groups)]
+    chosen_group = sorted_dp_groups[dst_rank % len(sorted_dp_groups)]
 
     # Within the chosen group, any representative metadata works; use the first.
     return grouped_by_dp[chosen_group][0]
