@@ -508,6 +508,10 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
     if not torch.distributed.is_initialized():
         return None
 
+    # if parallel_state is not initialized, pass `tp_group` thru
+    if not parallel_state.is_initialized():
+        return tp_group
+
     if tp_group is None:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             warnings.warn(
@@ -960,15 +964,37 @@ def make_tp_sharded_tensor_for_checkpoint(
     is sharded across TP group.
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
+
+    Args:
+        tensor: Tensor to shard
+        key: Key for the sharded tensor
+        tp_axis: Axis to shard across tensor parallel group (default: 0)
+        replica_id: Replica ID for the tensor (default: None)
+        prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
+        **kwargs: Additional arguments. May include:
+            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
+            - dp_cp_group: Data parallel + context parallel group
+              (default: None, falls back to parallel_state)
     """
+    # Pop group parameters from kwargs
+    tp_group = kwargs.pop('tp_group', None)
+    dp_cp_group = kwargs.pop('dp_cp_group', None)
+
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
-    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+    # Get groups with fallback to parallel_state
+    if tp_group is None and dp_cp_group is None:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+    # Use local get_pg_rank and get_pg_size functions
+    tp_rank = get_pg_rank(tp_group)
+    dp_rank = get_pg_rank(dp_cp_group)
+    tp_size = get_pg_size(tp_group)
+    dp_size = get_pg_size(dp_cp_group)
+    dp_replica_id = get_pg_rank(dp_cp_group)
 
     new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
 
@@ -1004,14 +1030,34 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     """Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group).
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
+
+    Keyword Args:
+        tensor: Tensor to create sharded tensor for
+        key: Key for the sharded tensor
+        prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
+        replica_id: Replica ID for the tensor (default: None)
+        **kwargs: Additional arguments. May include:
+            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
+            - dp_cp_group: Data parallel + context parallel group
+              (default: None, falls back to parallel_state)
     """
+    # Pop group parameters from kwargs
+    tp_group = kwargs.pop('tp_group', None)
+    dp_cp_group = kwargs.pop('dp_cp_group', None)
 
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
-    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+    # Get groups with fallback to parallel_state
+    if tp_group is None and dp_cp_group is None:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+    # Use local get_pg_rank and get_pg_size functions
+    dp_rank = get_pg_rank(dp_cp_group)
+    dp_size = get_pg_size(dp_cp_group)
+    dp_replica_id = get_pg_rank(dp_cp_group)
 
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
         # FSDP2 sharding
@@ -1020,7 +1066,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
-        replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
+        replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
 
     return ShardedTensor.from_rank_offsets(
         key,
@@ -1980,9 +2026,17 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
-def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
+def get_batch_on_this_cp_rank(
+    batch: Dict[str, Any], cp_group: Optional[torch.distributed.ProcessGroup] = None
+):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
+
+    Args:
+        batch (Dict[str, Any]): Input batch tensors.
+        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel process group.
+            If provided, uses this group's size and rank. Otherwise, falls back to
+            the current context-parallel settings from parallel_state.
     """
 
     # With causal masking, each token only attends to its prior tokens. Simply split
@@ -1991,9 +2045,15 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
     # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
-    cp_size = parallel_state.get_context_parallel_world_size()
-    if cp_size > 1:
+    # Determine CP topology either from provided group or from current context parallel state
+    if cp_group is not None:
+        cp_size = get_pg_size(cp_group)
+        cp_rank = get_pg_rank(cp_group)
+    else:
+        cp_size = parallel_state.get_context_parallel_world_size()
         cp_rank = parallel_state.get_context_parallel_rank()
+
+    if cp_size > 1:
         for key, val in batch.items():
             if val is not None:
                 seq_dim = 1 if key != "attention_mask" else 2
@@ -2168,16 +2228,6 @@ def unwrap_model(model, module_instances=None):
     return unwrapped_model
 
 
-def maybe_cat(a, b, dim=0, *, required=False):
-    """Concatenates `a` and `b` along `dim` if `a` and `b` exist."""
-    xs = [t for t in (a, b) if t is not None]
-    if not xs:
-        if required:
-            raise ValueError("both tensors are None")
-        return None
-    return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
-
-
 _ASYNC_IO_LOOP: asyncio.AbstractEventLoop | None = None
 
 
@@ -2194,6 +2244,11 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
                 _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
     return loop
+
+
+def is_using_quantization_scales(config):
+    """Returns whether the model is using quantization scales based on the config."""
+    return getattr(config, "fp8", False) or getattr(config, "fp4", False)
 
 
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time

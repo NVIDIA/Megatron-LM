@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
@@ -25,6 +26,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
+    get_pg_rank,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
@@ -53,7 +55,11 @@ except ImportError:
 
 
 def tie_word_embeddings_state_dict(
-    sharded_state_dict: ShardedStateDict, word_emb_weight: Tensor, word_emb_weight_key: str
+    sharded_state_dict: ShardedStateDict,
+    word_emb_weight: Tensor,
+    word_emb_weight_key: str,
+    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
 ) -> None:
     """tie the embedding of the mtp processing stage in a given sharded state dict.
 
@@ -61,13 +67,15 @@ def tie_word_embeddings_state_dict(
         sharded_state_dict (ShardedStateDict): state dict with the weight to tie.
         word_emb_weight (Tensor): weight of the word embedding.
         word_emb_weight_key (str): key of the word embedding in the sharded state dict.
+        tp_group (torch.distributed.ProcessGroup): The tensor parallel group
+        dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
 
     Returns: None, acts in-place
     """
     mtp_word_emb_replica_id = (
         1,  # copy of embedding in pre processing stage
         0,
-        parallel_state.get_data_parallel_rank(with_context_parallel=True),
+        get_pg_rank(dp_cp_group),
     )
     assert word_emb_weight_key in sharded_state_dict
     del sharded_state_dict[word_emb_weight_key]
@@ -76,11 +84,17 @@ def tie_word_embeddings_state_dict(
         key=word_emb_weight_key,
         replica_id=mtp_word_emb_replica_id,
         allow_shape_mismatch=True,
+        tp_group=tp_group,
+        dp_cp_group=dp_cp_group,
     )
 
 
 def tie_output_layer_state_dict(
-    sharded_state_dict: ShardedStateDict, output_layer_weight: Tensor, output_layer_weight_key: str
+    sharded_state_dict: ShardedStateDict,
+    output_layer_weight: Tensor,
+    output_layer_weight_key: str,
+    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
 ) -> None:
     """tie the output layer of the mtp processing stage in a given sharded state dict.
 
@@ -88,13 +102,15 @@ def tie_output_layer_state_dict(
         sharded_state_dict (ShardedStateDict): state dict with the weight to tie.
         output_layer_weight (Tensor): weight of the output layer.
         output_layer_weight_key (str): key of the output layer in the sharded state dict.
+        tp_group (torch.distributed.ProcessGroup): The tensor parallel group
+        dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
 
     Returns: None, acts in-place
     """
     mtp_output_layer_replica_id = (
         1,  # copy of output layer in post processing stage
         0,
-        parallel_state.get_data_parallel_rank(with_context_parallel=True),
+        get_pg_rank(dp_cp_group),
     )
     assert output_layer_weight_key in sharded_state_dict
     del sharded_state_dict[output_layer_weight_key]
@@ -103,6 +119,8 @@ def tie_output_layer_state_dict(
         key=output_layer_weight_key,
         replica_id=mtp_output_layer_replica_id,
         allow_shape_mismatch=True,
+        tp_group=tp_group,
+        dp_cp_group=dp_cp_group,
     )
 
 
@@ -299,8 +317,8 @@ class MTPLossLoggingHelper:
         loss: torch.Tensor,
         layer_number: int,
         num_layers: int,
-        reduce_group: torch.distributed.ProcessGroup = None,
-        avg_group: torch.distributed.ProcessGroup = None,
+        reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+        avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Save the mtp loss for logging.
         Args:
@@ -764,15 +782,15 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-        rotary_pos_emb: Tensor = None,
-        rotary_pos_cos: Tensor = None,
-        rotary_pos_sin: Tensor = None,
-        attention_bias: Tensor = None,
-        inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
-        sequence_len_offset: Tensor = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
     ):
         """
@@ -875,7 +893,7 @@ class MultiTokenPredictionBlockSubmodules:
             projection matrix, transformer block, shared output head).
     """
 
-    layer_specs: List[ModuleSpec] = None
+    layer_specs: Optional[List[ModuleSpec]] = None
 
 
 def _get_mtp_block_submodules(
@@ -931,7 +949,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
         self.submodules = _get_mtp_block_submodules(config, spec)
@@ -980,16 +998,16 @@ class MultiTokenPredictionBlock(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-        rotary_pos_emb: Tensor = None,
-        rotary_pos_cos: Tensor = None,
-        rotary_pos_sin: Tensor = None,
-        attention_bias: Tensor = None,
-        inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
-        sequence_len_offset: Tensor = None,
-        extra_block_kwargs: dict = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        extra_block_kwargs: Optional[dict] = None,
         embedding=None,
     ) -> Tensor:
         """

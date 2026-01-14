@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -18,7 +18,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import LayerType
+from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -218,7 +218,7 @@ class TransformerBlockSubmodules:
             or instance of the layer normalization to be applied.
     """
 
-    layer_specs: List[ModuleSpec] = None
+    layer_specs: Optional[List[ModuleSpec]] = None
     layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
 
 
@@ -273,7 +273,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config)
@@ -281,6 +281,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
 
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
@@ -382,6 +383,33 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )
         else:
             self.final_layernorm = None  # Either this or nn.Identity
+
+        if self.config.inference_fuse_tp_communication:
+            self._setup_fused_tp_communication()
+
+    def _setup_fused_tp_communication(self):
+        """Setup fused TP communication for all layers.
+        We have a fused reduce-scatter + add + layer-norm + all-gather operation.
+        We call this kernel from within row parallel linear layers.
+        But layer-norm needs the layer norm weights from the
+        successive column parallel linear layer.
+        This function is used to pass those weights to the respective layers.
+        """
+
+        for i in range(len(self.layers)):
+            current_layer = self.layers[i]
+
+            # Get next layer's QKV norm weights (None for last layer)
+            if i < len(self.layers) - 1:
+                next_qkv_norm_weights = self.layers[i + 1].get_qkv_layer_norm_weights()
+            else:
+                next_qkv_norm_weights = None
+
+            # Configure all fused TP communication settings in one call
+            current_layer.configure_fused_tp_inference(
+                skip_qkv_norm_and_all_gather=(i > 0),
+                fc2_next_layer_norm_weights=next_qkv_norm_weights,
+            )
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
@@ -522,7 +550,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and self.config.cuda_graph_scope == 'full_iteration'
+            and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -808,7 +836,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, metadata
+                        module,
+                        f'{prefix}{name}.',
+                        sharded_offsets,
+                        metadata,
+                        tp_group=self.tp_group,
                     )
                 )
 
