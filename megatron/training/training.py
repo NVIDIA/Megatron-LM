@@ -1,35 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
-import time
-# The earliest we can measure the start time.
-_TRAIN_START_TIME = time.time()
-
-# Startup timestamps for tracking program initialization phases
-_STARTUP_TIMESTAMPS = {
-    'program_start': None,  # Set by entry script before imports
-    'main_entry': None,     # Set by entry script at start of __main__
-    'pretrain_entry': None, # Set at top of pretrain()
-}
-
-
-def set_startup_timestamps(program_start=None, main_entry=None):
-    """Set startup timestamps from the entry script.
-
-    Call this after imports but before calling pretrain() to register
-    the program start time and main entry time.
-
-    Args:
-        program_start: Timestamp captured at very start of program, before any imports.
-        main_entry: Timestamp captured right after entering __main__ block.
-    """
-    global _TRAIN_START_TIME, _STARTUP_TIMESTAMPS
-    if program_start is not None:
-        _TRAIN_START_TIME = program_start
-        _STARTUP_TIMESTAMPS['program_start'] = program_start
-    if main_entry is not None:
-        _STARTUP_TIMESTAMPS['main_entry'] = main_entry
-
 
 import copy
 import dataclasses
@@ -52,9 +23,10 @@ from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
+import time
 
-_LEGACY_TRAIN_START_TIME = time.time() # NOTE(asolergi-nv): Legacy timestamp
-
+# The earliest we can measure the start time.
+_TRAIN_START_TIME = time.time()
 import torch
 
 try:
@@ -198,15 +170,12 @@ def destroy_global_state():
     destroy_rerun_state_machine()
 
 
-def print_datetime(string, override_timestamp=None):
-    """Note that this call will sync across all ranks. Use override_timestamp if provided;
-       otherwise use current timestamp."""
+def print_datetime(string):
+    """Note that this call will sync across all ranks."""
     torch.distributed.barrier()
-    if override_timestamp is None:
-        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-    else:
-        time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
+    time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print_rank_0(f'[{string}] datetime: {time_str} ')
+
 
 def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
@@ -660,20 +629,10 @@ def pretrain(
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
     """
-    # Capture timestamp right at top of pretrain, before initialize_megatron
-    global _STARTUP_TIMESTAMPS
-    _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
         store = torch.distributed.PrefixStore(str(iteration), store)
-
-    timestamp_after_inprocess_setup = time.time()
-
-    # Early fault tolerance setup - must be done before initialize_megatron
-    # to enable monitoring of the initialization process
-    ft_integration.setup()
-    timestamp_after_in_job_setup = time.time()
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -684,82 +643,36 @@ def pretrain(
         store=store,
     )
 
-    timestamp_after_initialize_megatron = time.time()
-
     args = get_args()
     timers = get_timers()
 
     if args.log_progress:
         append_to_progress_log("Starting job")
 
+    # Initialize fault tolerance
+    # NOTE: ft_integration functions other than `setup` are no-op if the FT is not initialized
+    if args.enable_ft_package:
+        ft_integration.setup(args)
+        ft_integration.maybe_setup_simulated_fault()
+
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
 
-    timestamp_after_set_jit_fusion_options = time.time()
-
-    # Adjust the startup time so it reflects the global minimum.
+    # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
-    # image ... launches).
-    program_start = _STARTUP_TIMESTAMPS.get('program_start')
-    main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
-    pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
-
-    if _STARTUP_TIMESTAMPS['program_start'] is not None:
-        program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
-        torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
-        program_start_global = program_start_global.item()
-        set_startup_timestamps(program_start=program_start_global)
-
-    global _LEGACY_TRAIN_START_TIME
-    start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
+    # image ... launches.
+    global _TRAIN_START_TIME
+    start_time_tensor = torch.tensor([_TRAIN_START_TIME], dtype=torch.double, device='cuda')
     torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
-    _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
-
-    # Capture megatron init end time (matches original time.time() placement)
-    megatron_init_end = time.time()
+    _TRAIN_START_TIME = start_time_tensor.item()
 
     app_metrics = {}
-    app_metrics['app_start_time'] = round(program_start_global * 1000.0)
-    app_metrics['app_model_init_start_time'] = round(program_start_global * 1000.0)
+    app_metrics['app_start_time'] = round(_TRAIN_START_TIME * 1000.0)
+    app_metrics['app_model_init_start_time'] = round(_TRAIN_START_TIME * 1000.0)
 
-    # Print basic megatron init time (using global min start)
-    # NOTE(asolergi-nv): This is not entirely accurate, but we keep it for backwards compatibility.
     print_rank_0(
-        'time to initialize megatron (seconds): {:.3f}'.format(megatron_init_end - _LEGACY_TRAIN_START_TIME)
+        'time to initialize megatron (seconds): {:.3f}'.format(time.time() - _TRAIN_START_TIME)
     )
-
-    # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
-    print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
-    print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
-
-    if program_start is not None and main_entry is not None and pretrain_entry is not None:
-        # Inject startup deltas into timers
-        startup_timers = {
-            'startup-program-entry-spread': program_start - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
-            'startup-library-setup': main_entry - program_start, # Local library imports
-            'startup-program-setup': pretrain_entry - main_entry, # Local __main__ entry to pretrain entry
-            'startup-in-process-setup': timestamp_after_inprocess_setup - pretrain_entry, # Local in-process setup
-            'startup-in-job-setup': timestamp_after_in_job_setup - timestamp_after_inprocess_setup, # Local in-job setup
-            'startup-initialize-megatron': timestamp_after_initialize_megatron - timestamp_after_in_job_setup, # Local initialize megatron
-            'startup-set-jit-fusion-options': timestamp_after_set_jit_fusion_options - timestamp_after_initialize_megatron, # Local set JIT fusion options
-            'all-reduce-start-timestamps-tensor': megatron_init_end - timestamp_after_set_jit_fusion_options, # 2x All-reduce, first collective call
-            'startup-megatron-init-local': megatron_init_end - pretrain_entry, # Local megatron init
-            'startup-megatron-init-global': megatron_init_end - program_start_global, # Local megatron init vs the global earliest program start timestamp
-        }
-        for name, delta in startup_timers.items():
-            timers(name, log_level=0).set_elapsed(delta)
-        timers.log(list(startup_timers.keys()), barrier=True)
-
-        # Print rank 0's absolute timestamps
-        startup_timestamps = {
-            'before library-setup': program_start,
-            'after library-setup': main_entry,
-            'before megatron-init': pretrain_entry,
-        }
-        for name, ts in startup_timestamps.items():
-            ts_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')
-            print_rank_0(f'[{name}] datetime: {ts_str}')
-
     print_datetime('after megatron is initialized')
     app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
@@ -1650,7 +1563,6 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
-    is_first_iteration=False,
     pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
@@ -1660,9 +1572,6 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
-
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -1855,7 +1764,7 @@ def training_log(
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
-    if iteration % args.log_interval == 0 or is_first_iteration:
+    if iteration % args.log_interval == 0:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
@@ -1863,7 +1772,7 @@ def training_log(
             with open(args.memory_snapshot_path, 'wb') as f:
                 dump(snapshot, f)
 
-        elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
+        elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
         throughput = num_floating_point_operations(args, batch_size) / (
@@ -1915,8 +1824,7 @@ def training_log(
                 )
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
-                if should_reset:
-                    total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+                total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
@@ -1928,10 +1836,9 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
-        if should_reset:
-            total_loss_dict[advanced_iters_key] = 0
-            total_loss_dict[skipped_iters_key] = 0
-            total_loss_dict[nan_iters_key] = 0
+        total_loss_dict[advanced_iters_key] = 0
+        total_loss_dict[skipped_iters_key] = 0
+        total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
         if report_memory_flag:
             # Report memory after optimizer state has been initialized.
@@ -1947,7 +1854,7 @@ def training_log(
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
             timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
         # Log timers to stdout
-        timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
+        timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag
 
@@ -2390,7 +2297,6 @@ def train(
     pre_hook_enabled = False
     should_exit = False
     exit_code = 0
-    is_first_iteration = True
 
     if args.manual_gc:
         # Disable the default garbage collector and perform the collection manually.
@@ -2716,10 +2622,8 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
-            is_first_iteration=is_first_iteration,
             pg_collection=model_pg_collection,
         )
-        is_first_iteration = False
 
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid:
@@ -2820,6 +2724,8 @@ def train(
     # a persistent async worker if persistent ckpt worker is enabled
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
+    if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
+        ft_integration.get_rank_monitor_client().shutdown_workload_monitoring()
 
     if args.log_energy:
         energy_monitor.lap()
