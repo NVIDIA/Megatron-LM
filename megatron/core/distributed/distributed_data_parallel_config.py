@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import torch
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -91,9 +93,6 @@ class DistributedDataParallelConfig:
       disables prefetching and may degrade performance. Adjust this value
       based on your system's memory and performance requirements."""
 
-    preserve_fp32_weights: bool = True
-    """If true, preserve fp32 weights in the Megatron FSDP ParamAndGradBuffer."""
-
     keep_fp8_transpose_cache: bool = False
     """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 
@@ -130,14 +129,13 @@ class DistributedDataParallelConfig:
        allocated buffer for the bucket that does not fit, it will enable NCCL 
        user buffer with the cost of more memory usage. If false, FSDP will use
        Dynamic memory allocator, NCCL user buffer won't not enabled, which 
-       usually leads to low performance. 
+       usually leads to low performance.
     """
 
     outer_dp_sharding_strategy: str = 'no_shard'
     """
     Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.
-    Valid values are 'no_shard', 'optim', 'optim_grads', 'optim_grads_params'.
-    This option is only effective when Hybrid FSDP is enabled.
+    Valid values are 'no_shard', 'optim'. This option is only effective when Hybrid FSDP is enabled.
     """
 
     disable_symmetric_registration: bool = False
@@ -156,6 +154,33 @@ class DistributedDataParallelConfig:
 
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
+    main_params_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main weight buffer utilized for distributed optimization with
+      Megatron-FSDP. If set to None, the model compute weight buffer will take the role
+      of the main weights, or when no sharding is applied, the original model weights
+      become the main weights. Defaults to torch.float32.
+    """
+
+    main_grads_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main gradient buffer utilized for distributed optimization with
+      Megatron-FSDP. Defaults to None, in which case main gradients will match the dtype
+      of the model compute parameters specified by the user model.
+    """
+
+    grad_comm_dtype: Optional[torch.dtype] = None
+    """Data type for gradient broadcast / scatter communications. Can be utilized to reduce
+      communication latency, but adds overhead for type-casting and local reduction.
+      Defaults to None, in which case the original model gradient dtype is used.
+    """
+
+    grad_accum_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for gradient reduction and accumulation to control accumulation precision.
+      Specifically, gradients will be reduced at this precision, but accumulated either at
+      this precision or higher precision w.r.t. type-promotion with the main_grads_dtype.
+      Defaults to None, in which case type-promotion with respect to the main_grads_dtype
+      will determine the data-type when accumulating.
+    """
 
     def __post_init__(self):
         import os
