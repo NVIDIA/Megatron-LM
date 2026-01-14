@@ -1296,6 +1296,9 @@ def validate_args(args, defaults={}):
     if args.fine_grained_activation_offloading:
         assert args.transformer_impl == 'transformer_engine', \
             "Fine-grained activation offloading is only supported with transformer_engine implementation"
+        if is_te_min_version("2.10.0"):
+            assert os.getenv("NVTE_CPU_OFFLOAD_V1", "0") == "1", \
+                "For fine-grained activation offloading with TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 should be set to 1 to avoid offloading weights."
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
@@ -2433,7 +2436,7 @@ def _add_training_args(parser):
                        help='Enable fine-grained activation offloading.')
     group.add_argument('--offload-modules', nargs='*', type=str, default=[],
                        help='The submodules to offload its input. Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
-    group.add_argument('--min-offloaded-tensor-size', type=int, default=1024*1024,
+    group.add_argument('--min-offloaded-tensor-size', type=int, default=10*1024*1024,
                        help='The minimum size of the tensor to be offloaded.')
     group.add_argument('--disable-jit-fuser', action='store_true',
                        help='Disable the JIT fuser.')
