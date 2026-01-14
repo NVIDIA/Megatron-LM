@@ -2,6 +2,7 @@
 
 import os
 
+import modelopt
 import modelopt.torch.quantization as mtq
 import torch
 from modelopt.torch.quantization.utils import is_quantized
