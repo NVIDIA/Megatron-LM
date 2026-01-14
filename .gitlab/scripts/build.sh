@@ -22,15 +22,21 @@ ADDITIONAL_PARAMS=()
 
 if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" == "dev" ]]; then
     ADDITIONAL_PARAMS+=("--pull")
-    ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main,mode=max")
-    ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_COMMIT_BRANCH}")
-elif [[ -n "$CI_MERGE_REQUEST_IID" ]]; then
-    ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID},mode=max")
-    ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_MERGE_REQUEST_IID}")
+fi
+
+CI_COMMIT_BRANCH=$(echo "$CI_COMMIT_BRANCH" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')
+ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_COMMIT_BRANCH}-${PLATFORM},mode=max")
+ADDITIONAL_PARAMS+=("--cache-from type=registry,ref=${IMAGE}-buildcache:${CI_COMMIT_BRANCH}-${PLATFORM}")
+ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_COMMIT_BRANCH}-${PLATFORM}")
+
+if [[ -n "$CI_MERGE_REQUEST_IID" ]]; then
+    ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID}-${PLATFORM},mode=max")
+    ADDITIONAL_PARAMS+=("--cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID}-${PLATFORM}")
+    ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_MERGE_REQUEST_IID}-${PLATFORM}")
 fi
 
 if [[ "$CI_COMMIT_BRANCH" == "ci-nightly" ]]; then
-    ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
+    ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly-${PLATFORM}")
 fi
 
 if [[ -n "$TE_GIT_REF" ]]; then
@@ -46,13 +52,11 @@ DOCKER_BUILDKIT=1 docker build \
     --secret id=LOGGER_INDEX_URL \
     --target $STAGE \
     -f docker/$FILE \
-    -t ${IMAGE}:${CI_PIPELINE_ID} \
+    -t ${IMAGE}:${CI_PIPELINE_ID}-${PLATFORM} \
     --builder=container \
     --build-arg JET_API_VERSION=$JET_API_VERSION \
-    --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID} \
-    --cache-from type=registry,ref=${IMAGE}-buildcache:dev \
-    --cache-from type=registry,ref=${IMAGE}-buildcache:main \
     --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
+    --provenance=false \
     --push \
     --progress plain \
     ${ADDITIONAL_PARAMS[@]} .

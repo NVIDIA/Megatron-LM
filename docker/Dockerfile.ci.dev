@@ -16,10 +16,17 @@ ENV UV_LINK_MODE=copy
 
 RUN bash -ex <<"EOF"
     apt-get update
-    apt-get install -y --no-install-recommends gettext python3-venv psmisc
+    apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime
     apt-get clean
     python -m venv /opt/jet
-    wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64 -O /usr/local/bin/yq
+    ARCH=$(uname -m)
+    case "${ARCH}" in \
+      "x86_64") YQ_ARCH=amd64 ;; \
+      "aarch64") YQ_ARCH=arm64 ;; \
+      "armv7l") YQ_ARCH=arm ;; \
+      *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac 
+    wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF

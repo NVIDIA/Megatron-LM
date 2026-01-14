@@ -1,0 +1,71 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: gpt
+  build: mcore-pyt-{environment}
+  nodes: 2
+  gpus: 4
+  n_repeat: 5
+  platforms: dgx_a100
+  script_setup: |
+    unset https_proxy
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    # Checkout backwards-ref
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+  script: |-
+    ls
+    cd /opt/megatron-lm
+
+    NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
+    export GPUS_PER_NODE={gpus}
+
+    ARGUMENTS=(
+        "DATA_PATH=/mnt/artifacts"
+        "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
+        "CHECKPOINT_LOAD_PATH=/mnt/artifacts/"
+        "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "N_REPEAT={n_repeat}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+    )
+
+    set +x 
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}} 
+    exit_code=$?
+    echo "Exit code: $exit_code"
+    rm -rf /lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID || true
+    set -x
+    exit $exit_code
+
+products:
+  - test_case: [gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_gb200]
