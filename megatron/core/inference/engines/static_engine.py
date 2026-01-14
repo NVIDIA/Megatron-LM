@@ -42,8 +42,6 @@ class StaticInferenceEngine(AbstractEngine):
             controller that will be used to define how to preprocess prompts, generate
             outputs and detokenizer the output tokens.
         max_batch_size (int, optional): The maximum number of requests to process at once.
-            Will be set from the InferenceWrapperConfig in `text_generation_controller` by
-            default.
         random_seed (int, optional): Use a random seed if you want deterministic
             results. Defaults to None.
     """
@@ -69,13 +67,12 @@ class StaticInferenceEngine(AbstractEngine):
                 DeprecationWarning,
             )
 
-        inference_wrapper_config = (
-            text_generation_controller.inference_wrapped_model.inference_wrapper_config
-        )
         self.controller = text_generation_controller
+        self.inference_wrapped_model = self.controller.inference_wrapped_model
+        self.config = self.inference_wrapped_model.config
         self.random_seed = random_seed or 1234
 
-        inference_max_batch_size = inference_wrapper_config.inference_max_requests
+        inference_max_batch_size = self.config.inference_max_requests
         if max_batch_size is None:
             max_batch_size = inference_max_batch_size
         elif max_batch_size > inference_max_batch_size:
@@ -91,10 +88,10 @@ class StaticInferenceEngine(AbstractEngine):
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
         # Store original context in case we need to fall back to legacy static engine
-        original_context = text_generation_controller.inference_wrapped_model.inference_context
+        original_context = self.inference_wrapped_model.inference_context
 
         mamba_inference_state_config = get_mamba_inference_state_config_from_model(
-            text_generation_controller.inference_wrapped_model.model
+            self.inference_wrapped_model.model
         )
 
         try:

@@ -8,8 +8,6 @@ import torch
 
 from examples.inference.gpt.gpt_dynamic_inference import (
     add_dynamic_inference_args,
-    get_inference_context,
-    get_inference_controller,
     get_model,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -80,33 +78,12 @@ if __name__ == "__main__":
         args = get_args()
         model = get_model()
 
-        if args.legacy_tokenizer:
-            tokenizer = get_tokenizer()
-        else:
-            tokenizer = build_tokenizer(args)
-
-        mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
-
         # Enable return_log_probs to allow prompt logprobs computation for echo=True requests
         # This sets materialize_only_last_token_logits=False in the inference context,
         # which is required for lm-eval compatibility (loglikelihood evaluation tasks)
         args.return_log_probs = True
 
-        context = get_inference_context(
-            None,
-            None,
-            calculate_max_sequence_length_from_requests=False,
-            mamba_inference_state_config=mamba_inference_state_config,
-        )
-
-        controller = get_inference_controller(model, context)
-
-        engine = DynamicInferenceEngine(
-            controller,
-            context,
-            enable_cuda_graph=args.cuda_graph_impl == "local",
-            random_seed=args.seed,
-        )
+        engine = DynamicInferenceEngine.from_model_and_args(model, args)
 
         asyncio.run(
             run_text_generation_server(

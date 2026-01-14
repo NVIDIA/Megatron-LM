@@ -16,9 +16,6 @@ from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import (
     SimpleTextGenerationController,
@@ -66,20 +63,7 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
     """
     tokenizer = get_tokenizer()
 
-    inference_wrapper_config = InferenceWrapperConfig(
-        hidden_size=args.hidden_size,
-        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
-        fp32_residual_connection=args.fp32_residual_connection,
-        params_dtype=args.params_dtype,
-        padded_vocab_size=args.padded_vocab_size,
-        inference_max_seq_length=args.inference_max_seq_length,
-        inference_max_requests=(
-            args.inference_max_batch_size if args.inference_max_batch_size is not None else 1
-        ),
-        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
-    )
-
-    inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
+    inference_wrapped_model = GPTInferenceWrapper(model)
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
     pp_group = pg_collection.pp
     text_generation_controller = SimpleTextGenerationController(
@@ -90,7 +74,7 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
     return MCoreEngine(
         text_generation_controller=text_generation_controller,
         max_batch_size=(
-            args.inference_max_batch_size if args.inference_max_batch_size is not None else 1
+            args.inference_max_reqeusts if args.inference_max_requests is not None else 1
         ),
     )
 

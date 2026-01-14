@@ -226,6 +226,29 @@ class DynamicInferenceEngine(AbstractEngine):
         # Create cuda graphs.
         self.create_cuda_graphs()
 
+    @classmethod
+    def from_model_and_args(
+        cls,
+        model,
+        args,
+        context: Optional[DynamicInferenceContext] = None,
+        controller: Optional[TextGenerationController] = None,
+    ):
+        if context is None:
+            context = DynamicInferenceContext.from_model_and_args(model, args)
+        if controller is None:
+            controller = TextGenerationController.from_model_and_args(model, args)
+
+        return cls(
+            context,
+            controller,
+            enable_cuda_graph=args.cuda_graph_impl == "local",
+            random_seed=args.seed,
+            track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+            enable_chunked_prefill=not args.disable_chunked_prefill,
+            inference_logging_step_interval=args.inference_logging_step_interval,
+        )
+
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
 
@@ -280,8 +303,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context = self.context
         controller = self.controller
-
-        config = controller.inference_wrapped_model.inference_wrapper_config
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()

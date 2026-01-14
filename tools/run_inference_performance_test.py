@@ -76,22 +76,8 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
     """
     tokenizer = get_tokenizer()
 
-    inference_wrapper_config = InferenceWrapperConfig(
-        hidden_size=args.hidden_size,
-        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
-        fp32_residual_connection=args.fp32_residual_connection,
-        params_dtype=args.params_dtype,
-        padded_vocab_size=args.padded_vocab_size,
-        inference_max_requests=args.inference_max_batch_size,
-        inference_max_seq_length=args.inference_max_seq_length,
-        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
-        moe_pad_experts_for_cuda_graph_inference=args.moe_pad_experts_for_cuda_graph_inference,
-    )
-
-    mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
-
     if args.engine_type == "static":
-        inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
+        inference_wrapped_model = GPTInferenceWrapper(model)
         inference_wrapped_model.model_is_pipeline_parallel = not (
             mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage()
         )
@@ -100,52 +86,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         )
         return StaticInferenceEngine(text_generation_controller=text_generation_controller)
     elif args.engine_type == "dynamic":
-        context = DynamicInferenceContext(
-            params_dtype=args.params_dtype,
-            num_layers=args.num_layers,
-            kv_channels=args.kv_channels,
-            num_attention_heads=(
-                args.num_query_groups if args.group_query_attention else args.num_attention_heads
-            ),
-            max_sequence_length=args.inference_max_seq_length,
-            num_cuda_graphs=(
-                args.inference_dynamic_batching_num_cuda_graphs
-                if args.cuda_graph_impl == "local"
-                else None
-            ),
-            buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
-            buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
-            buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
-            max_requests_override=args.inference_dynamic_batching_max_requests_override,
-            max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
-            block_size_tokens=args.inference_dynamic_batching_block_size,
-            tensor_model_parallel_size=args.tensor_model_parallel_size,
-            pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-            materialize_only_last_token_logits=not args.return_log_probs,
-            mamba_inference_state_config=mamba_inference_state_config,
-            cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
-            kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
-            qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
-            use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
-            use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
-            unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
-        )
-        inference_wrapped_model = GPTInferenceWrapper(
-            model, inference_wrapper_config, inference_context=context
-        )
-        inference_wrapped_model.model_is_pipeline_parallel = not (
-            mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage()
-        )
-        text_generation_controller = TextGenerationController(
-            inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
-        )
-        return DynamicInferenceEngine(
-            text_generation_controller,
-            context,
-            termination_id=-1,
-            enable_cuda_graph=args.cuda_graph_impl == "local",
-            random_seed=args.seed,
-        )
+        return DynamicInferenceEngine.from_model_and_args(model, args)
 
 
 async def generate(

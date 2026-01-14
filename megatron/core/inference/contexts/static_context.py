@@ -1,8 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 from .base_context import BaseInferenceContext
 
@@ -28,7 +26,7 @@ class StaticInferenceContext(BaseInferenceContext):
         self.decode_mode = False
 
     @classmethod
-    def from_config(cls, config: InferenceWrapperConfig) -> "StaticInferenceContext":
+    def from_config(cls, config: TransformerConfig) -> "StaticInferenceContext":
         """Initialize context from a config."""
         max_batch_size = config.inference_max_requests
         max_sequence_length = config.inference_max_seq_length

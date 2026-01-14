@@ -1556,13 +1556,10 @@ def _add_inference_args(parser):
                        dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
-                       dest='inference_max_batch_size')
+                       dest='inference_max_requests')
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length expected for inference (prefill + decode).',
                        dest='inference_max_seq_length')
-    group.add_argument('--inference-max-batch-size', type=int, default=None,
-                       help='Maximum batch size for inference.',
-                       dest='inference_max_batch_size')
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
