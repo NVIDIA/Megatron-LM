@@ -2,7 +2,7 @@
 
 Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly integrating Expert Parallelism with tensor, data, sequence, and pipeline parallelism. With MCore v0.9, we've achieved remarkable performance of **468 TFLOPS** for Mixtral 8X7B bf16 training. Additionally, we support state-of-the-art MoE model architectures including DeepSeek-V3 and Qwen-MoE.
 
-### What's New
+## What's New
 - **Support for DeepSeek-V3 architecture**
   - Enable TP for MLA and DeepSeek-V3
   - Enable CP for MLA and DeepSeek-V3
@@ -18,7 +18,7 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
 - Support Uneven virtual pipeline parallel split
 - Support output-discarding checkpointing on some submodules
 
-### Parallelism
+## Parallelism
 - **Expert Parallelism**
     - A specific method of parallelism for MoE models, where experts are partitioned onto different workers and each worker processes a different batch of training samples, each worker process one or more experts for each MoE layer.
 - **3D Parallelism**: Data Parallelism, Tensor Parallelism, Pipeline Parallelism
@@ -29,7 +29,7 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
 - **MoE Parallel Folding**: Support for setting different parallelism strategies for Attention and MoE components, enabling more flexible and efficient model sharding. See detailed documentation below.
 - **Full distributed optimizer support.**
 
-### Router and Load Balancing
+## Router and Load Balancing
 - Router type:
     - Top-K MLP router
 - Load Balancing algorithms:
@@ -38,7 +38,7 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
     - Aux-loss-free load balancing strategy
 - CUDA fused routing and load balancing kernels
 
-### Performance Optimizations
+## Performance Optimizations
 - (Experimental) **DeepEP** is integrated for efficient token communication in large-scale MoE training.
 - GroupedGEMM when num local experts > 1
     - Supported dtype: bf16
@@ -46,15 +46,15 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
 - Enable `--tp-comm-overlap` for MoE
 - FP8 training support
 
-### Token Dispatch Mechanism
+## Token Dispatch Mechanism
 - Dropless / No token drop
 - Token drop, with or without padding to capacity
 - Token permutation / Unpermutation fusion
 
-### Ease of use
+## Ease of use
 - Checkpoint converter for Mixtral models, see the [example](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mixtral) for details.
 - MoE Layer Frequency to customize the hybrid MoE/Dense layer architecture
-- Distributed checkpoining
+- Distributed checkpointing
 - Per-layer logging
 - Upcycling Support
 
@@ -388,7 +388,7 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 
 # Performance Best Practice
 
-### Tuning Guide of Parallel Mappings
+## Tuning Guide of Parallel Mappings
 
 To find a good parallel mapping that help you achieve a high throughput of a new model, there are some general rule that could help. Here is an overview of properties in different aspects for each parallel strategy.
 
@@ -402,11 +402,11 @@ To find a good parallel mapping that help you achieve a high throughput of a new
 
 For a specific model, the best parallel mapping varies based on the model architecture, trained sequence length and the hardware platform.
 Here we provide some general rules to get better performance:
-1. Keep the model parallism size as small as possible. 
-    - For the large language models, model parallism is often required to prevent OOM, but it will bring communication overhead and hurt performance. 
+1. Keep the model parallelism size as small as possible. 
+    - For the large language models, model parallelism is often required to prevent OOM, but it will bring communication overhead and hurt performance. 
     - With distributed optimizer, master weights and optimizer states will be sharded across all DP ranks with slight communication overhead.
-    So try to reduce the model parallism size and increase data parallism size when there are lots of free GPU memory during training.
-2. Ensure the EPxTP communication winthin the NVLink domain.
+    So try to reduce the model parallelism size and increase data parallelism size when there are lots of free GPU memory during training.
+2. Ensure the EPxTP communication within the NVLink domain.
     - Communications of EP and TP should remain within the NVLink domain as much as possible, as both are communication-intensive.
     - If the model is too large and requires scaling across multiple nodes, consider PP before TP and EP. See item 3 for details.
 3. Use Pipeline Parallelism to scale the model further.
@@ -421,7 +421,7 @@ Here we provide some general rules to get better performance:
     - The efficiency of CP largely depends on whether its communication can be overlapped with computation. 
     - Empirically, use CP when sequence length >= 8K.
 
-### MoE Parallel Folding
+## MoE Parallel Folding
 
 MoE Parallel Folding separates the MoE related parallel groups from Dense groups.
 1. Traditional MoE parallel groups are entangled with dense by using a 5-dimension parallel group generator with default order `tp-cp-ep-dp-pp`. The EP group in MoE is a sub-group of DP in Attention.
@@ -429,15 +429,15 @@ MoE Parallel Folding separates the MoE related parallel groups from Dense groups
 
 By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 
-#### Advantages of MoE Parallel Folding
-1. The CP and EP group are folded together by defualt, such that:
+### Advantages of MoE Parallel Folding
+1. The CP and EP group are folded together by default, such that:
     1. It reduces the minimal required GPUs to turn on both CP and EP. For example, the traditional way with (CP=8, EP=8) needs at least 64 GPUs, for now it only requires 8 GPUs.
     2. The CP and EP communication can be both put in the NVLink domain.
 2. We can set different TP sizes for Attention and MoE part.
     1. For MoE, EP is often more efficient than TP. But in the traditional way, only using EP can get OOM for most models.
     2. With MoE parallel folding, we can turn on TP for Attention part and setting TP=1 for MoE models, which often gets better MFU.
 
-### End-to-End Training Practice
+## End-to-End Training Practice
 **Use the latest NVIDIA PyTorch or NeMo Docker Image**
 - [NGC PyTorch Image](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
 - [NGC NeMo Image](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo)
@@ -460,7 +460,7 @@ By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 **OOM Caused by Token Distribution Imbalance when Training From Scratch**  
 MoE suffers from a severe load imbalance issue when the router is under-trained, leading to the model easily running out of memory (OOM), which typically occurs in the first 100~300 steps when training from scratch. 
 Therefore, there are two recommended ways during the first 200 steps to avoid the OOM problem, which can be removed after the token distribution is more stable:
-1. Increase the `expert-tensor-parallel-size` and decrease `expert-model-parallel-size` to replace EP with TP in MoELayer, this can prevent the load imbalancing between EP ranks. Since current ETP implementation has some memeory overhead, you can further enable activation recomputation only for MoE Layer by adding `--moe-layer-recompute`.
+1. Increase the `expert-tensor-parallel-size` and decrease `expert-model-parallel-size` to replace EP with TP in MoELayer, this can prevent the load imbalancing between EP ranks. Since current ETP implementation has some memory overhead, you can further enable activation recomputation only for MoE Layer by adding `--moe-layer-recompute`.
 2. Setting capacity factor to a relatively small number like 1.0 by adding `--moe-token-capacity-factor 1.0`.
 
 **Leverage DeepSeek's DeepEP for High-Performance Cross-Node Token Dispatching**
@@ -472,7 +472,7 @@ Therefore, there are two recommended ways during the first 200 steps to avoid th
 - Enable router padding with `--moe-router-padding-for-quantization` to reduce padding overhead.
 - Enable native FP8 weights with `--fp8-param-gather` to reduce weights memory cost.
 
-### Reference Best Parallel Mapping
+## Reference Best Parallel Mapping
 
 Here are the reference parallel mappings of MCore v0.8 for Mixtral 8x7B and 8x22B models:
 |        Model            | Vocab Size| Dispatcher | Precision | #GPUs | SEQ LEN | TP | EP | PP | VP | MBS | GBS |
