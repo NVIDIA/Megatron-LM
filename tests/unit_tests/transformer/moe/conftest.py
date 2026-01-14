@@ -20,15 +20,9 @@ def pytest_sessionfinish(session, exitstatus):
 def cleanup():
     yield
     if torch.distributed.is_initialized():
-        try:
-            print("Waiting for destroy_process_group")
-            # Attempt graceful cleanup with a timeout
-            torch.distributed.barrier(timeout=torch.timedelta(seconds=10))
-            torch.distributed.destroy_process_group()
-        except Exception as e:
-            # If cleanup fails, just log and continue
-            # This prevents segfaults during teardown from failing the entire test run
-            print(f"Warning: Failed to cleanly destroy process group: {e}")
+        print("Waiting for destroy_process_group")
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 
 @pytest.fixture(scope="function", autouse=True)
