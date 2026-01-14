@@ -164,7 +164,7 @@ class TestMultiTokenPrediction:
             config=config,
             transformer_layer_spec=transformer_layer_spec,
             mtp_block_spec=mtp_block_spec,
-            vocab_size=args.vocal_size,
+            vocab_size=args.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -188,7 +188,7 @@ class TestMultiTokenPrediction:
         args.num_layers = 2
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
-        args.vocal_size = 128800
+        args.vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 256
@@ -723,7 +723,7 @@ class TestMultiTokenPredictionMamba:
         model = MambaModel(
             config=config,
             mamba_stack_spec=mamba_stack_spec,
-            vocab_size=args.vocal_size,
+            vocab_size=args.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -749,7 +749,7 @@ class TestMultiTokenPredictionMamba:
         args.num_layers = 4
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
-        args.vocal_size = 128800
+        args.vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.num_query_groups = 8

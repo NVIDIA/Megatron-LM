@@ -162,8 +162,6 @@ class MambaModel(LanguageModule):
             from megatron.core.models.mamba.mamba_layer_specs import get_mamba_mtp_block_spec
 
             mtp_block_spec = get_mamba_mtp_block_spec()
-
-            # Extract mamba_submodules from mamba_stack_spec for MTP to use
             mamba_submodules = mamba_stack_spec.submodules
 
             self.mtp = MultiTokenPredictionBlock(
@@ -298,13 +296,11 @@ class MambaModel(LanguageModule):
             rotary_pos_emb=rotary_pos_emb,
         )
 
-        # Get output weight for shared embeddings
         output_weight = None
         if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()            
+            output_weight = self.shared_embedding_or_output_weight()
 
         if self.mtp_process:
-
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -312,6 +308,7 @@ class MambaModel(LanguageModule):
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
                 embedding=self.embedding,
             )
 
@@ -330,7 +327,6 @@ class MambaModel(LanguageModule):
                 compute_language_model_loss=self.compute_language_model_loss,
             )
 
-        
         sequence_parallel_override = False
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():

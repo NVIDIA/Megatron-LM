@@ -94,7 +94,6 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     if pattern is None:
         return ParsedHybridPattern(main_pattern=None, mtp_pattern=None, mtp_num_depths=0)
 
-    # Split by MTP separator
     parts = pattern.split(Symbols.MTP_SEPARATOR)
 
     if len(parts) == 1:

@@ -538,6 +538,20 @@ class MTPModelLayerContainer(MegatronModule):
     def __init__(self, layers: torch.nn.ModuleList, config: TransformerConfig):
         super().__init__(config=config)
         self.layers = layers
+        self._current_microbatch = 0
+
+    @property
+    def current_microbatch(self):
+        """Get current microbatch index for CUDA graph management."""
+        return self._current_microbatch
+
+    @current_microbatch.setter
+    def current_microbatch(self, value):
+        """Set current microbatch and propagate to inner layers for CUDA graphs."""
+        self._current_microbatch = value
+        for layer in self.layers:
+            if hasattr(layer, 'current_microbatch'):
+                layer.current_microbatch = value
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor for pipeline parallelism compatibility."""
@@ -1174,17 +1188,12 @@ class MultiTokenPredictionBlock(MegatronModule):
         mamba_submodules: Optional["MambaStackSubmodules"] = None,
     ):
         super().__init__(config=config)
-        self.mtp_layer_pattern = mtp_layer_pattern
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
-
-        # Store new parameters for pattern-based layer building
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_num_depths = mtp_num_depths
         self.mamba_submodules = mamba_submodules
-
-        # Use config.mtp_use_repeated_layer for both GPT and Mamba paths
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
 
         vp_size = config.virtual_pipeline_model_parallel_size
