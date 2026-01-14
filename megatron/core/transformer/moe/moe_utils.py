@@ -14,7 +14,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, is_te_min_version
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -371,12 +371,15 @@ def unpermute(
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
+        extra_kwargs = {}
+        if is_te_min_version("2.12.0"):
+            extra_kwargs["pad_offsets"] = pad_offsets
         return fused_unpermute(
             permuted_tokens,
             sorted_indices,
             merging_probs=probs,
             restore_shape=restore_shape,
-            pad_offsets=pad_offsets,
+            **extra_kwargs,
         )
 
     _, hidden = restore_shape
