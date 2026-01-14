@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import sys
+from contextlib import nullcontext
 from typing import Any, Optional, Dict
 
 import torch.distributed
@@ -33,6 +34,7 @@ try:
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
+from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
@@ -51,6 +53,7 @@ except ImportError:
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    get_attr_wrapped_model,
     get_model_config,
     get_pg_size,
     get_pg_rank,
@@ -110,6 +113,7 @@ from megatron.core.parallel_state import (
     destroy_model_parallel,
     update_pg_timeout
 )
+from megatron.core.inference.unified_memory import create_unified_mempool
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
@@ -717,6 +721,45 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
 
+    # Build a separate inference model for RL if requested.
+    inference_model = None
+    if args.perform_rl_step:
+        if args.rl_inference_tensor_model_parallel_size is not None:
+            print_rank_0(
+                f"Setting tensor model parallel size to {args.rl_inference_tensor_model_parallel_size} for inference model"
+            )
+            inference_pg_collection = build_inference_pg_collection(
+                tp_size=args.rl_inference_tensor_model_parallel_size,
+                world_size=args.world_size,
+                use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+            )
+
+            # Build an isolated inference config so training config remains unchanged
+            inference_config = copy.deepcopy(config)
+            inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
+
+            # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
+            # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
+            uvm_mempool = None
+            uvm_level = args.rl_inference_model_unified_memory_level
+            if uvm_level and uvm_level > 0:
+                uvm_mempool = create_unified_mempool()
+
+            mempool_ctx = (
+                torch.cuda.use_mem_pool(uvm_mempool) if uvm_mempool is not None else nullcontext()
+            )
+            with mempool_ctx:
+                inference_model = get_model(
+                    model_provider,
+                    model_type,
+                    wrap_with_ddp=False,
+                    pg_collection=inference_pg_collection,
+                    config=inference_config,
+                )
+            inference_model[0].eval()
+
+
+
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
@@ -791,6 +834,7 @@ def pretrain(
                 config,
                 checkpointing_context,
                 non_loss_data_func,
+                inference_model,
             )
 
         print_datetime('after training is done')
@@ -1224,7 +1268,7 @@ def setup_model_and_optimizer(
         # set dense model related args in to global args before getting dense model
         args.num_experts = None
         args.expert_model_parallel_size = 1
-        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity 
+        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
         dense_model_for_upcycling = get_model(model_provider_func, model_type)
@@ -1395,7 +1439,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     log_max_attention_logit = 0
     if args.qk_clip or args.log_max_attention_logit:
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
-            
+
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -1484,6 +1528,7 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1677,6 +1722,7 @@ def training_log(
             num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
+            pg_collection=pg_collection,
         )
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
@@ -2070,6 +2116,7 @@ def train(
     config,
     checkpointing_context,
     non_loss_data_func,
+    inference_model=None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
@@ -2154,6 +2201,8 @@ def train(
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()
+
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
 
     # Tracking loss.
     total_loss_dict = {}
@@ -2407,7 +2456,7 @@ def train(
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
                 train_data_iterator = rl_utils.setup_grpo_data_iterator(
-                    model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                    model, inference_model, optimizer, iteration, ref_state_dict, buffered_rollouts
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
@@ -2538,6 +2587,7 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            pg_collection=model_pg_collection,
         )
 
         # Evaluation.
@@ -2831,7 +2881,7 @@ def evaluate_and_print_results(
         eval_iters = [args.eval_iters]
     else:
         eval_iters = args.eval_iters
-        
+
     if args.full_validation:
         assert len(eval_iters) == len(data_iterators)
 
@@ -2847,7 +2897,7 @@ def evaluate_and_print_results(
         eval_iters = [args.eval_iters]
     else:
         eval_iters = args.eval_iters
-    
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
@@ -3052,7 +3102,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
     if valid_dataloaders is not None:
         # when using full validation, we need to override eval iters with the correct
-        # number of iterations on tp rank 0 so that it can be distributed to the other 
+        # number of iterations on tp rank 0 so that it can be distributed to the other
         # ranks later
         if args.full_validation:
             if args.multiple_validation_sets:

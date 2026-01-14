@@ -81,7 +81,7 @@ dev = [
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
-    "flashinfer-python",
+    "flashinfer-python~=0.5.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -100,7 +100,7 @@ lts = [
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
-    "flashinfer-python",
+    "flashinfer-python~=0.5.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
