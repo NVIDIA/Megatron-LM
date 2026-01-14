@@ -31,7 +31,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN }}
+          token: ${{ secrets.PAT }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -41,7 +41,7 @@ jobs:
       - name: Rotate Schedule
         env:
           # Token to read org team members. Needs read:org scope.
-          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN }}
+          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
           # Slack token for updating the Slack usergroup
           SLACK_TOKEN: ${{ secrets.ONCALL_SLACK_TOKEN }}
         run: |
