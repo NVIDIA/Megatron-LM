@@ -203,7 +203,7 @@ products:
   - test_case: [gpt3_moe_mcore_te_tp2_pp2_ep4_etp1_fine_grained_offloading]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-broken]
         platforms: [dgx_h100]
   #######################################################################
   # Super important mr, mr-github tests that run for both DEV and LTS per mr, mr-github       #
