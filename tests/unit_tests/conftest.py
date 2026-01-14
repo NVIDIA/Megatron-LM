@@ -38,17 +38,6 @@ def pytest_sessionfinish(session, exitstatus):
         session.exitstatus = 0
 
 
-@pytest.fixture(scope="session", autouse=True)
-def cleanup():
-    yield
-    if torch.distributed.is_initialized():
-        try:
-            torch.distributed.barrier()
-            torch.distributed.destroy_process_group()
-        except Exception as e:
-            print(f"Warning: Failed to cleanly destroy process group: {e}")
-
-
 @pytest.fixture(scope="function", autouse=True)
 def set_env():
     if is_te_min_version("1.3"):
