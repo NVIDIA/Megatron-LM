@@ -88,4 +88,5 @@ if __name__ == "__main__":
         export_extra_modules=export_extra_modules,
         dtype=torch.bfloat16,
         export_dir=args.export_dir,
+        trust_remote_code=args.trust_remote_code,
     )

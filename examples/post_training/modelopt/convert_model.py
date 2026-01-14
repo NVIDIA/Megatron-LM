@@ -129,7 +129,8 @@ if __name__ == "__main__":
             unwrapped_model,
             args.pretrained_model_path,
             workspace_dir,
-            dtype = import_dtype,
+            dtype=import_dtype,
+            trust_remote_code=args.trust_remote_code,
         )
     elif args.load is not None:
         _ = load_modelopt_checkpoint(model)

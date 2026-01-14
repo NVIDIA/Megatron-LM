@@ -186,6 +186,7 @@ if __name__ == "__main__":
             args.pretrained_model_path,
             workspace_dir,
             dtype=import_dtype,
+            trust_remote_code=args.trust_remote_code,
         )
 
     def _custom_prompt_forward_loop_func(model):
