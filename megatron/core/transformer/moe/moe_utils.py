@@ -1023,7 +1023,7 @@ def apply_random_logits(logits):
     """
     return RandomSTE.apply(logits)
 
-
+@internal_api
 class RandomSTEShared(torch.autograd.Function):
     """
     STE that generates random values with shared seed across all ranks.
