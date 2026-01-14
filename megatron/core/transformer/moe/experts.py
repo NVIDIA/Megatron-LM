@@ -30,7 +30,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
 )
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
