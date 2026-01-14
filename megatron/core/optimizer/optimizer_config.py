@@ -198,7 +198,8 @@ class OptimizerConfig:
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
 
-    # Muon
+    # Muon.
+    # TODO: move muon configs to it's own `MuonConfig`.
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD."""
 
