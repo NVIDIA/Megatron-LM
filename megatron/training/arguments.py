@@ -2841,8 +2841,6 @@ def _add_tokenizer_args(parser):
     group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
                        help='List of special tokens. For TikTokenizer needs to have '
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
-    group.add_argument('--legacy-tokenizer', action='store_true', default=False,
-                       help='To use Megatron-LM legacy tokenizer system.')
     group.add_argument('--tiktoken-pattern', type=str, default=None,
                        help='Which tiktoken pattern to use. Options: [v1, v2]')
     group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,

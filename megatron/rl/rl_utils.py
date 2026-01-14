@@ -23,7 +23,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from megatron.core import mpu
-from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.optimizer import MegatronOptimizer
@@ -36,6 +35,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import RerunDataIterator
+from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import toggle_cuda_graphs
@@ -647,7 +647,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
 
 def compute_group_stats(
-    rollouts: GroupedRollouts, tokenizer: MegatronLegacyTokenizer
+    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
@@ -738,7 +738,7 @@ def compute_group_stats(
 def maybe_log_training_metrics(
     group_stats: RolloutStats,
     current_iteration: int,
-    tokenizer: MegatronLegacyTokenizer,
+    tokenizer: MegatronTokenizer,
     example_group: list[TokenRollout | Rollout],
     wandb_writer: wandb_run.Run | None = None,
     tb_writer: SummaryWriter | None = None,
@@ -826,7 +826,7 @@ def maybe_log_training_metrics(
 
 
 def prepare_trajectories(
-    rollouts: GroupedRollouts, tokenizer: MegatronLegacyTokenizer, seq_length: int
+    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_length: int
 ):
     """Pad trajectories and extract the generation masks.
 
@@ -970,7 +970,7 @@ def prepare_data_for_update(
     model: list[LanguageModule],
     ref_state_dict: Dict[str, Any],
     rollouts: GroupedRollouts,
-    tokenizer: MegatronLegacyTokenizer,
+    tokenizer: MegatronTokenizer,
 ) -> RerunDataIterator:
     """Extract data for the update from raw rollouts.
 
