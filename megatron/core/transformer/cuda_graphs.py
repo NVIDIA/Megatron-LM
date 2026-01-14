@@ -290,9 +290,6 @@ def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Gen
 
     return gen
 
-def tensors_match(a, b):
-    return a.shape == b.shape and a.dtype == b.dtype and a.device == b.device
-
 
 fwd_buffer_reuse_ref_count = 0
 bwd_buffer_reuse_ref_count = 0
@@ -927,9 +924,11 @@ class _CudaGraphRunner(torch.nn.Module):
                     gc.freeze()
 
                 with torch.cuda.graph(
-                    self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
+                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
                 ):
-                    outputs = self.base_module.forward(*args, **kwargs)
+                    fwd_graph_outputs = self.func(
+                        *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
+                    )
 
                 # Unfreeze GC.
                 if FREEZE_GC:
@@ -941,7 +940,6 @@ class _CudaGraphRunner(torch.nn.Module):
                     # only on the last layer per-device to avoid slowing down graph creation.
                     if self.is_last_layer:
                         gc.collect()
-
 
         # save cudagraph output buffer
         self.fwd_graph_outputs = fwd_graph_outputs
