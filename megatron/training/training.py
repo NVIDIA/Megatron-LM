@@ -174,15 +174,20 @@ def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
-            counts = {'M': 0, '*': 0, '-': 0, 'E':0}
-            for layer_type in args.hybrid_override_pattern:
-                if layer_type in counts:
-                    counts[layer_type] += 1
-            if args.mtp_layer_pattern:
-                assert args.mtp_num_layers is not None
-                for layer_type in args.mtp_layer_pattern:
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+            # Parse unified pattern to separate main and MTP components
+            parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+            counts = {'M': 0, '*': 0, '-': 0, 'E': 0}
+            # Count main decoder layers
+            if parsed.main_pattern:
+                for layer_type in parsed.main_pattern:
                     if layer_type in counts:
-                        counts[layer_type] += args.mtp_num_layers
+                        counts[layer_type] += 1
+            # Count MTP layers (pattern repeated mtp_num_depths times)
+            if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+                for layer_type in parsed.mtp_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += parsed.mtp_num_depths
             return counts['*'], counts['M'], counts['-'], counts['E']
         else:
             num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
@@ -259,10 +264,8 @@ def num_floating_point_operations(args, batch_size):
                      mlp_expansion=4.0, swiglu=False,
                      moe_latent_size=None,
                      moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
-                     vocab_size=256000, mtp_num_layers=None):
+                     vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
-        if mtp_num_layers is None:
-            mtp_num_layers = 0
         flops_fwd = (
                 num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
                                                    num_attn_heads, gqa, gqa_groups, kv_channels) +
