@@ -42,8 +42,11 @@ def pytest_sessionfinish(session, exitstatus):
 def cleanup():
     yield
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-        torch.distributed.destroy_process_group()
+        try:
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group()
+        except Exception as e:
+            print(f"Warning: Failed to cleanly destroy process group: {e}")
 
 
 @pytest.fixture(scope="function", autouse=True)
