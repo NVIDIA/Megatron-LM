@@ -80,8 +80,12 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
+    pp_group = pg_collection.pp
     text_generation_controller = SimpleTextGenerationController(
-        inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
+        inference_wrapped_model=inference_wrapped_model,
+        tokenizer=tokenizer,
+        pp_group=pp_group,
     )
     return MCoreEngine(
         text_generation_controller=text_generation_controller,
@@ -137,7 +141,7 @@ def get_dynamic_inference_engine(
     # Inference context.
     inference_context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
-        num_layers=args.num_layers // args.pipeline_model_parallel_size,
+        num_layers=args.num_layers // inference_pp_size,
         kv_channels=args.kv_channels,
         num_attention_heads=(
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
@@ -150,8 +154,7 @@ def get_dynamic_inference_engine(
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
-        tensor_model_parallel_size=inference_tp_size,
-        pipeline_model_parallel_size=inference_pp_size,
+        pg_collection=pg_collection,  # TP/PP sizes are derived from the model's pg_collection.
         materialize_only_last_token_logits=True,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
@@ -171,8 +174,11 @@ def get_dynamic_inference_engine(
         is_pp_first_stage(pg_collection.pp) and is_pp_last_stage(pg_collection.pp)
     )
 
+    pp_group = getattr(pg_collection, "pp", None)
     text_generation_controller = SimpleTextGenerationController(
-        inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
+        inference_wrapped_model=inference_wrapped_model,
+        tokenizer=tokenizer,
+        pp_group=pp_group,
     )
 
     return DynamicInferenceEngine(
