@@ -83,7 +83,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_loss_coeff": None,
     "dsa_indexer_n_heads": None,
     "dsa_indexer_topk": None,
-    "dsa_indexer_use_sparse_loss": None,
+    "dsa_indexer_use_sparse_loss": False,
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,

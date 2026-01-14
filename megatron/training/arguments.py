@@ -3309,7 +3309,7 @@ def _add_experimental_attention_variant_args(parser):
                        help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
     group.add_argument('--dsa-indexer-topk', default=None, type=int,
                        help='Number of top-k tokens to select in sparse attention indexer.')
-    group.add_argument('--dsa-indexer-loss-coeff', default=0.0, type=float,
+    group.add_argument('--dsa-indexer-loss-coeff', default=None, type=float,
                        help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
     group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
                        help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')

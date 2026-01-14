@@ -243,7 +243,7 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
-    dsa_indexer_use_sparse_loss: Optional[bool] = None
+    dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
