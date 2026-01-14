@@ -62,7 +62,7 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when using sequence_packing.
     """
 
     hybrid_context_parallel: bool = False
@@ -70,6 +70,23 @@ class ModelParallelConfig:
     If true, enables hybrid context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
     Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    """
+
+    sequence_packing_scheduler: Optional[str] = None
+    """
+    Scheduler for sequence packing and hybrid context parallel.
+    naive_sequence_packing: default naive sequence packing scheduler(just THD, no Hybrid-CP, this 
+    is just for comparison with default hybrid-cp scheduler, not recommended for production)
+    default_hybrid_cp: default hybrid-cp scheduler for hybrid context parallel provided by MCore.
+    empty_scheduler_with_packing: scheduling is already handled by the data sampler,
+    this scheduler only performs packing.
+    empty_scheduler_no_packing: scheduling and packing are already handled by the data sampler,
+    this scheduler only returns the batch.
+    """
+
+    sequence_packing: bool = False
+    """
+    If true, enables sft sequence packing.
     """
 
     expert_model_parallel_size: int = 1
