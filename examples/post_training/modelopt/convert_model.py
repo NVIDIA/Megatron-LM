@@ -37,11 +37,6 @@ ALGO_TO_CONFIG = {
 }
 
 
-def modelopt_version_higher_than(target_version: str):
-    """Check if Model-Optimizer is greater than this version."""
-    return Version(modelopt.__version__) > Version(target_version)
-
-
 def add_convert_args(parser):
     """Add additional arguments for ModelOpt checkpoint convertion."""
     group = parser.add_argument_group(title='ModelOpt MCore checkpoint convertion')
