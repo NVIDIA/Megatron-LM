@@ -140,6 +140,7 @@ class DynamicInferenceEventType(Enum):
 
     ADD = auto()
     PAUSE = auto()
+    EVICT = auto()
     FINISH = auto()
     FAIL = auto()
     ERROR_TRANSIENT = auto()
@@ -154,6 +155,7 @@ class DynamicInferenceEvent:
 
     - request added
     - request paused
+    - request evicted
     - request finished
     - request failed
     - request error (transient)
@@ -350,6 +352,10 @@ class DynamicInferenceRequest(InferenceRequest):
         """Add 'pause' event."""
         return self.add_event(DynamicInferenceEventType.PAUSE)
 
+    def add_event_evict(self):
+        """Add 'evict' event."""
+        return self.add_event(DynamicInferenceEventType.EVICT)
+
     def add_event_finish(self):
         """Add 'finish' event."""
         return self.add_event(DynamicInferenceEventType.FINISH)
@@ -377,8 +383,8 @@ class DynamicInferenceRequest(InferenceRequest):
 
 @dataclass(kw_only=True)
 class DynamicInferenceRequestRecord:
-    """History of DynamicInferenceRequest objects over multiple suspend and
-    resumes."""
+    """History of DynamicInferenceRequest objects over multiple request
+    checkpoints."""
 
     requests: list[DynamicInferenceRequest] = field(default_factory=list)
     latency: Optional[float] = None
@@ -417,9 +423,9 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
-    def suspend(self, tokenizer: MegatronTokenizer | None = None):
-        """Suspend request by storing references to previous prompt, generations,
-        and sampling params.
+    def checkpoint(self, tokenizer: MegatronTokenizer | None = None):
+        """Maintain reference to previous request, and then append a new request
+        that concatenates the previous prompt and generations.
 
         Args:
             tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
@@ -460,7 +466,7 @@ class DynamicInferenceRequestRecord:
         self.requests.append(new_request)
 
     def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
-        """Merge requests into a single suspend-agnostic request object.
+        """Merge requests into a single checkpoint-agnostic request object.
 
         Args:
             tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
@@ -478,7 +484,10 @@ class DynamicInferenceRequestRecord:
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         generated_tokens = merge_lists("generated_tokens")
-        generated_text = "".join(r.generated_text for r in self.requests)
+        try:
+            generated_text = "".join(r.generated_text for r in self.requests)
+        except TypeError as e:  # generally means r.generated_text is None
+            generated_text = None
 
         # Merged request.
         request = DynamicInferenceRequest(
