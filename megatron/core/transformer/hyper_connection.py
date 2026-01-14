@@ -249,27 +249,6 @@ class HyperConnectionModule(MegatronModule):
         mixed = torch.einsum('sbij,sbjc->sbic', h_res, residual_streams) # [s, b, n, C]
         return mixed.view(s, b, self.n * C)
     
-    def expand(self, layer_output: Tensor, h_post: Tensor) -> Tensor:
-        """
-        Expand 1-stream layer output to n-stream using H_post weights.
-        
-        Computes: H_post^T @ layer_output (broadcast to n streams)
-        
-        Args:
-            layer_output: [s, b, C] - output from attention/MLP
-            h_post: [s, b, n] - expansion weights
-        
-        Returns:
-            expanded: [s, b, n*C] - n-stream expanded output
-        """
-        s, b, C = layer_output.shape
-        
-        # Expand: [s, b, C] * [s, b, n, 1] -> [s, b, n, C] -> [s, b, n*C]
-        expanded = layer_output.unsqueeze(2) * h_post.unsqueeze(-1)  # [s, b, n, C]
-        expanded = expanded.view(s, b, self.n * C)
-        
-        return expanded
-    
     def forward(
         self,
         hidden_states: Tensor,
