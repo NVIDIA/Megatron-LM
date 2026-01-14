@@ -2104,6 +2104,12 @@ def _add_rl_args(parser):
     group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
                        help='Degree of tensor model parallelism for inference for RL.')     
     group.add_argument(
+        '--rl-inference-pipeline-model-parallel-size',
+        type=int,
+        default=None,
+        help='Degree of pipeline model parallelism for inference for RL.',
+    )
+    group.add_argument(
         '--rl-inference-model-unified-memory-level',
         type=int,
         default=0,
