@@ -264,6 +264,23 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 ![Strong scaling](images/strong_scaling.png)
 
 
+### AMem NCCL Plugin for RL Training (Optional)
+
+For Reinforcement Learning scenarios, enable the AMem NCCL plugin to transparently offload NCCL-allocated GPU memory during inference/rollout phases. This can save up to 10GB+ memory per GPU card.
+
+```bash
+--rl-use-amem-nccl                    # Enable AMem NCCL plugin
+--rl-amem-group-id GROUP_ID           # Process group ID (if needed)
+--rl-amem-offload-during-rollout      # Offload during rollout (default: true)
+```
+
+**Prerequisites:**
+- Install AMem NCCL plugin from [asystem-amem](https://github.com/inclusionAI/asystem-amem)
+- Set environment variables: `NCCL_CUMEM_ENABLE=1` and `AMEM_ENABLE=1`
+- GPU compute capability ≥ sm80 (Ampere or newer)
+
+**→ [Complete AMem Integration Guide](docs/amem_integration.md)** - Installation, configuration, and usage examples.
+
 # Roadmaps
 
 - **[MoE Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - DeepSeek-V3, Qwen3, advanced parallelism, FP8 optimizations, and Blackwell enhancements

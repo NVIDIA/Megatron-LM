@@ -367,9 +367,9 @@ def main():
             print(f"\n{i}. {change.kind.value}\n   Package: {package_name}{path_info}\n   → {change.explain()}\n{'-'*80}")
         
         print(f"\n{'='*80}\nSUMMARY\n{'='*80}\nTotal breaking changes: {len(breaking_changes)}\n{'='*80}\n")
-        
+
         return 1
-        
+    
     except Exception as e:
         logger.error(f"\n❌ Error: {e}")
         if args.verbose:
