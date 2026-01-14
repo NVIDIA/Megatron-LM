@@ -1102,6 +1102,11 @@ def prepare_data_for_update(
                 )
 
             def logprobs_forward_step(data_iterator, model):
+
+                # Avoid self.training checks which will trigger cudagraph capture; this path reuses
+                # the forward pass from training after it has been captured on the 1st iteration.
+                model.eval()
+
                 if args.rl_use_sequence_packing:
                     # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
                     bin_tensor = next(data_iterator)[0]
@@ -1117,7 +1122,7 @@ def prepare_data_for_update(
                 b_trajs = b_trajs.cuda()
                 b_posids = b_posids.cuda()
 
-                return (
+                logprobs = (
                     get_logprobs(
                         model,
                         b_trajs,
@@ -1128,6 +1133,9 @@ def prepare_data_for_update(
                     ),
                     None,
                 )
+
+                model.train()
+                return logprobs
 
             dtype = (
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
