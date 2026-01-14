@@ -681,11 +681,11 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
 
         for bucket_id, param_group in enumerate(fsdp_param_groups):
             if (param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None or 
-                param_group.fsdp_unit_id is not in self.fsdp_double_buffer_units):
+                param_group.fsdp_unit_id not in self.fsdp_double_buffer_units):
                 logging.info(f"FSDP unit {param_group.fsdp_unit_id} does not fit in FixedPoolAllcator")
                 if fallback_to_dynamic_alloc is True:
                     logging.info("It will fall back to dynamic memory allocator, NCCL user buffer is not supported")
-                else
+                else:
                     logging.info("It will be allocated a persistent memmory, if memory budget is tight, turn off fsdp-db-fallback-dynamic-alloc")
         
         # Initialize buffer group status.
@@ -1851,11 +1851,11 @@ class ParamAndGradBuffer:
             UB_BUFFER_NUM = 2
             self.weight_alloc = FixedPoolAllocator(
                 name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM, 
-                fallback_to_dynamic_alloc = ddp_config.fsdp_db_fallback_dynamic_alloc
+                fallback_to_dynamic_alloc = self.ddp_config.fsdp_db_fallback_dynamic_alloc
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM,
-                fallback_to_dynamic_alloc = ddp_config.fsdp_db_fallback_dynamic_alloc
+                fallback_to_dynamic_alloc = self.ddp_config.fsdp_db_fallback_dynamic_alloc
             )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
