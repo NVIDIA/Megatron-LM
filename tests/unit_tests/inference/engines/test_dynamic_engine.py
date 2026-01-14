@@ -106,6 +106,7 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
+    enable_chunked_prefill: bool = False
     cuda_graph_scope: List[CudaGraphScope] = field(
         default_factory=lambda: [CudaGraphScope.full_iteration]
     )
@@ -422,6 +423,7 @@ class TestDynamicInferenceEngine:
             inference_context,
             random_seed=test_config.random_seed,
             enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
+            enable_chunked_prefill=test_config.enable_chunked_prefill,
         )
 
         # Test env.
@@ -1147,7 +1149,7 @@ class TestDynamicInferenceEngine:
         num_tokens_to_generate = 16
         max_sequence_length = prompt_length + num_tokens_to_generate
 
-        # Configure context to force chunking (chunked prefill is enabled by default)
+        # Configure context to force chunking
         env = self._run_test(
             num_requests=1,
             min_prompt_length=prompt_length,
@@ -1157,6 +1159,7 @@ class TestDynamicInferenceEngine:
             model_provider=model_provider,
             context_block_size_tokens=256,
             context_max_tokens=1000,
+            enable_chunked_prefill=True,
         )
 
     @pytest.mark.internal
@@ -1186,6 +1189,7 @@ class TestDynamicInferenceEngine:
             model_provider="gpt",
             context_block_size_tokens=256,
             context_max_tokens=1000,
+            enable_chunked_prefill=True,
         )
 
         # Validate results
