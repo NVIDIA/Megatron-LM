@@ -100,7 +100,7 @@ class InferenceRequest:
                 serialization.
         """
         # Dataclass to dict.
-        # do not use asdict(self) - it has very high CPU overheads 
+        # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
         obj = self.__dict__  # shallow dict copy
         obj["status"] = self.status.name if self.status else None
@@ -202,7 +202,7 @@ class DynamicInferenceEvent:
 
         # Dataclass to dict.
         torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
-        # do not use asdict(self) - it has very high CPU overheads 
+        # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
         obj = self.__dict__
         obj["type"] = self.type.name
