@@ -577,13 +577,15 @@ class Attention(MegatronModule, ABC):
         Wrapper for calling the FA3 _flash_attn_forward function.
         Handles argument conversion for different versions of the _flash_attn_forward API.
         """
-        kwargs = {
+        candidate_kwargs = {
             "q": q,
             "k": k,
             "v": v,
             "k_new": None,
             "v_new": None,
             "qv": None,
+            "out": None,
+            "out_": None,
             "cu_seqlens_q": cu_seqlens_q,
             "cu_seqlens_k": None,
             "cu_seqlens_k_new": None,
@@ -604,6 +606,9 @@ class Attention(MegatronModule, ABC):
             "causal": True,
             "attention_chunk": 0,
             "softcap": 0.0,
+            "window_size": (-1, -1),
+            "window_size_left": -1,
+            "window_size_right": -1,
             "rotary_interleaved": True,
             "scheduler_metadata": None,
             "num_splits": 0 if not self.batch_invariant_mode else 1,
@@ -611,21 +616,16 @@ class Attention(MegatronModule, ABC):
             "sm_margin": 0,
         }
 
-        schema = _flash_attn_forward._schema
-        if "out=" in schema:
-            kwargs["out"] = None
+        # Parse the expect argument names from the function signature
+        if inspect.isfunction(_flash_attn_forward):
+            sig = inspect.signature(_flash_attn_forward)
         else:
-            assert "out_=" in schema
-            kwargs["out_"] = None
+            assert isinstance(_flash_attn_forward, torch._library.custom_ops.CustomOpDef)
+            sig = inspect.signature(_flash_attn_forward._init_fn)
+        valid_kwargs = set(sig.parameters.keys())
+        final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
 
-        if "window_size=" in schema:
-            kwargs["window_size"] = (-1, -1)
-        else:
-            assert "window_size_left=" in schema and "window_size_right=" in schema
-            kwargs["window_size_left"] = -1
-            kwargs["window_size_right"] = -1
-
-        output_total, *unused = _flash_attn_forward(**kwargs)
+        output_total, *unused = _flash_attn_forward(**final_kwargs)
 
         return output_total
 
