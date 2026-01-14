@@ -1288,6 +1288,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
         else:
             kwargs = {}
+            # Common kwargs.
             for f in dataclasses.fields(DistributedDataParallelConfig):
                 if hasattr(args, f.name):
                     kwargs[f.name] = getattr(args, f.name)
@@ -1305,6 +1306,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
             kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['average_in_collective'] = args.ddp_average_in_collective
+            # Megatron-FSDP Mixed-Precision Config
+            kwargs['main_params_dtype'] = args.main_params_dtype
+            kwargs['main_grads_dtype'] = args.main_grads_dtype
+            kwargs['grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
+            kwargs['grad_accum_dtype'] = args.megatron_fsdp_grad_accum_dtype
             ddp_config = DistributedDataParallelConfig(**kwargs)
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
@@ -1319,6 +1325,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
+
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
         ddp_stream = torch.cuda.Stream()

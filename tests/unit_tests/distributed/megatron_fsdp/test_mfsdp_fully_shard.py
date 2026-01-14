@@ -243,8 +243,11 @@ class TestMegatronFsdpFullyShard:
     )
     @pytest.mark.parametrize("model_type", [CNN, TRANSFORMER, TE_TRANSFORMER])
     @pytest.mark.parametrize(
-        "dp_shard_strategy", [NO_SHARD, OPTIM, OPTIM_GRADS, OPTIM_GRADS_PARAMS]
+        # Sharding strategy for optimizer state, gradients, and parameters.
+        "dp_shard_strategy",
+        [NO_SHARD, OPTIM, OPTIM_GRADS, OPTIM_GRADS_PARAMS],
     )
+    # Test FSDP, HSDP, and HFSDP.
     @pytest.mark.parametrize("dp_outer_strategy", [None, NO_SHARD, OPTIM])
     @pytest.mark.parametrize(
         "mesh_dim_config",
@@ -318,7 +321,7 @@ class TestMegatronFsdpFullyShard:
             module=toy_model,
             optimizer=toy_adam,
             device_mesh=device_mesh,
-            dp_shard_dim=DP_SHARD_CP,
+            dp_shard_dim=DP_SHARD_CP if mesh_dim_config[2] > 1 else DP_SHARD,
             dp_outer_dim=DP_OUTER if dp_outer_strategy is not None else None,
             tp_dim=TP,
             hybrid_fsdp_group=(
@@ -327,10 +330,10 @@ class TestMegatronFsdpFullyShard:
             fsdp_unit_modules=fsdp_unit_modules,
             zero_dp_strategy=dp_shard_strategy,
             outer_dp_sharding_strategy=(
-                dp_outer_strategy if dp_outer_strategy is not None else "no_shard"
+                dp_outer_strategy if dp_outer_strategy is not None else NO_SHARD
             ),
-            preserve_fp32_weights=preserve_fp32_weights,
-            grad_reduce_in_fp32=False,
+            main_params_dtype=torch.float32 if preserve_fp32_weights else None,
+            main_grads_dtype=None,
             init_model_with_meta_device=init_model_with_meta_device,
         )
         model = torch.compile(model) if torch_compile else model
@@ -363,11 +366,12 @@ class TestMegatronFsdpFullyShard:
                 isinstance(p.grad, torch.Tensor) and p.grad.to_local().count_nonzero().item() > 0
                 for p in model.parameters()
             )
-            sharding_group = (
-                device_mesh[HSDP].get_group()
-                if dp_outer_strategy == OPTIM
-                else device_mesh[DP_SHARD_CP].get_group()
-            )
+            sharding_dim = DP_SHARD
+            if dp_outer_strategy == OPTIM:
+                sharding_dim = HSDP
+            elif mesh_dim_config[2] > 1:
+                sharding_dim = DP_SHARD_CP
+            sharding_group = device_mesh[sharding_dim].get_group()
             if dp_shard_strategy != NO_SHARD:
                 # Because of uneven sharding, we need to gather the result from all ranks
                 # to verify if any gradients exist or not at this step of training.
@@ -449,15 +453,15 @@ class TestMegatronFsdpFullyShard:
             module=toy_model,
             optimizer=toy_adam,
             device_mesh=device_mesh,
-            dp_shard_dim=DP_SHARD_CP,
+            dp_shard_dim=DP_SHARD_CP if mesh_dim_config[2] > 1 else DP_SHARD,
             dp_outer_dim=DP_OUTER,
             tp_dim=TP,
             hybrid_fsdp_group=device_mesh[HSDP].get_group(),
             fsdp_unit_modules=fsdp_unit_modules,
             zero_dp_strategy=shard_strategy,
             outer_dp_sharding_strategy=outer_shard_strategy,
-            preserve_fp32_weights=True,
-            grad_reduce_in_fp32=True,
+            main_params_dtype=torch.float32,
+            main_grads_dtype=torch.float32,
             init_model_with_meta_device=False,
             sync_model_each_microbatch=True,
         )
@@ -529,15 +533,15 @@ class TestMegatronFsdpFullyShard:
             module=toy_model,
             optimizer=toy_adam,
             device_mesh=device_mesh,
-            dp_shard_dim=DP_SHARD_CP,
+            dp_shard_dim=DP_SHARD_CP if mesh_dim_config[2] > 1 else DP_SHARD,
             dp_outer_dim=DP_OUTER,
             tp_dim=TP,
             hybrid_fsdp_group=device_mesh[HSDP].get_group(),
             fsdp_unit_modules=fsdp_unit_modules,
             zero_dp_strategy=shard_strategy,
             outer_dp_sharding_strategy=outer_shard_strategy,
-            preserve_fp32_weights=True,
-            grad_reduce_in_fp32=True,
+            main_params_dtype=torch.float32,
+            main_grads_dtype=torch.float32,
             init_model_with_meta_device=False,
             sync_model_each_microbatch=True,
         )
@@ -661,7 +665,7 @@ class TestMegatronFsdpFullyShard:
         toy_input = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
         toy_target = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
 
-        for step in range(NUM_STEPS):
+        for _ in range(NUM_STEPS):
 
             # Forward pass.
             output = mfsdp_model(toy_input, toy_input)
@@ -744,7 +748,7 @@ class TestMegatronFsdpFullyShard:
             # Required for FP8 parameters. The optimizer state (and gradients)
             # are never quantized, as TE produces high-precision wgrad and
             # dgrad from FP8 weights and activations. Already defaults to True.
-            preserve_fp32_weights=True,
+            main_params_dtype=torch.float32,
         )
 
         # Initialize the distributed optimizer on the MegatronFSDP model.
@@ -772,5 +776,118 @@ class TestMegatronFsdpFullyShard:
             loss.backward()
 
             # Optimizer step.
+            optimizer.step()
+            optimizer.zero_grad()
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.4.0'),
+        reason="Requires DTensor and DeviceMesh support in (approximately) PyTorch 2.4.0 or later.",
+    )
+    # Test non-FP8 and FP8 parameters.
+    @pytest.mark.parametrize("model_type", [TRANSFORMER, TE_TRANSFORMER])
+    @pytest.mark.parametrize(
+        # Test gradient all-reduce, reduce-scatter, and param all-gather.
+        "dp_shard_strategy",
+        [OPTIM, OPTIM_GRADS, OPTIM_GRADS_PARAMS],
+    )
+    # Test HSDP and HFSDP only. (FSDP collectives are a subset of HSDP.)
+    @pytest.mark.parametrize("dp_outer_strategy", [NO_SHARD, OPTIM])
+    @pytest.mark.parametrize("high_precision_grad_accum", [False, True])
+    def test_fully_shard_custom_dtype(
+        self, model_type, dp_shard_strategy, dp_outer_strategy, high_precision_grad_accum
+    ):
+        """
+        Test custom data-types for gather and reduce communications.
+        """
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+            fully_shard_model,
+            fully_shard_optimizer,
+        )
+
+        if dp_outer_strategy == OPTIM:
+            if dp_shard_strategy != OPTIM_GRADS_PARAMS:
+                pytest.skip(
+                    f"dp_outer sharding strategy {dp_outer_strategy} requires "
+                    "zero_dp_strategy to be full-sharded ('optim_grads_params', 3)."
+                )
+
+        # Construct device mesh with DP-Outer=2 and DP-Shard=4.
+        device_mesh = build_distributed_environment((2, 4, 1, 1))
+
+        # Construct toy model.
+        if model_type == TE_TRANSFORMER:
+            # Use FP8 model parameters to test data-type customization.
+            te_quant_recipe = te.common.recipe.DelayedScaling()
+            with te.pytorch.quantized_model_init(
+                recipe=te_quant_recipe,
+                # Needed for FP8 parameters with Megatron-FSDP.
+                preserve_high_precision_init_val=True,
+            ):
+                toy_model = ToyTETransformer(
+                    model_dim=64,
+                    num_heads=2,
+                    num_layers=2,
+                    output_dim=64,
+                    fuse_qkv_params=True,
+                    params_dtype=torch.bfloat16,
+                    device="meta",
+                )
+                fsdp_unit_modules = [te.pytorch.TransformerLayer, te.pytorch.Linear]
+        else:
+            toy_model, fsdp_unit_modules = build_toy_model(model_type, True)
+
+        # Fully-shard the model.
+        mfsdp_model = fully_shard_model(
+            module=toy_model,
+            device_mesh=device_mesh,
+            dp_shard_dim=DP_SHARD,
+            dp_outer_dim=DP_OUTER if dp_outer_strategy is not None else None,
+            tp_dim=TP,
+            hybrid_fsdp_group=(
+                device_mesh[HSDP].get_group() if dp_outer_strategy is not None else None
+            ),
+            fsdp_unit_modules=fsdp_unit_modules,
+            zero_dp_strategy=dp_shard_strategy,
+            outer_dp_sharding_strategy=(
+                dp_outer_strategy if dp_outer_strategy is not None else NO_SHARD
+            ),
+            # Use FP32 / FP64 for the main buffer.
+            main_params_dtype=torch.float64,
+            main_grads_dtype=torch.float32,
+            # And FP16 for communication.
+            grad_comm_dtype=torch.float16,
+            # To force casts from BF16 to FP16 to FP64 back to FP32 / FP64.
+            grad_accum_dtype=torch.float64 if high_precision_grad_accum else None,
+            init_model_with_meta_device=True,
+        )
+
+        # Initialize the distributed optimizer on the MegatronFSDP model.
+        toy_adam = Adam(params=mfsdp_model.parameters(), lr=0.001)
+        optimizer = fully_shard_optimizer(optimizer=toy_adam)
+
+        # Mock input and target.
+        if model_type == TE_TRANSFORMER:
+            toy_input = torch.randn(16, 64, 64, dtype=torch.bfloat16).to("cuda")
+            toy_target = torch.randn(16, 64, 64, dtype=torch.bfloat16).to("cuda")
+        else:
+            toy_input = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+            toy_target = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+
+        for _ in range(NUM_STEPS):
+
+            # Forward pass.
+            if model_type == TE_TRANSFORMER:
+                with te.pytorch.autocast(recipe=te_quant_recipe):
+                    output = mfsdp_model(toy_input)
+            elif model_type == TRANSFORMER:
+                output = mfsdp_model(toy_input, toy_input)
+
+            # Loss.
+            loss = mse_loss(output, toy_target)
+
+            # Backward pass.
+            loss.backward()
+
+            # Optimizer step syncs gradient communication.
             optimizer.step()
             optimizer.zero_grad()
