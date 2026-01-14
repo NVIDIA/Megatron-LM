@@ -70,7 +70,7 @@ MODEL_ARGS:
   --dist-ckpt-strictness: log_unexpected
   --perform-rl-step: true
   --train-samples: 48828125
-  --exit-interval: 50
+  --exit-interval: 10
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --save-interval: 1000000
   --eval-interval: 1000000
