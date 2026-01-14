@@ -12,10 +12,12 @@ try:
         multi_tensor_applier,
         multi_tensor_l2norm,
         multi_tensor_scale,
+        multi_tensor_scale_tensor,
     )
 
     l2_norm_impl = multi_tensor_l2norm
     multi_tensor_scale_impl = multi_tensor_scale
+    multi_tensor_scale_tensor_impl = multi_tensor_scale_tensor
 except ImportError:
     try:
         import amp_C
@@ -23,6 +25,7 @@ except ImportError:
 
         l2_norm_impl = amp_C.multi_tensor_l2norm
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
+        multi_tensor_scale_tensor_impl = None
     except ImportError:
         import warnings
 
@@ -41,6 +44,7 @@ except ImportError:
         multi_tensor_applier = local_multi_tensor_applier
         l2_norm_impl = local_multi_tensor_l2_norm
         multi_tensor_scale_impl = local_multi_tensor_scale
+        multi_tensor_scale_tensor_impl = None
 
 
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -52,6 +56,7 @@ def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    on_device: bool = False,
 ) -> float:
     """Calculate the norm of gradients in fp32.
 
@@ -130,7 +135,10 @@ def get_grad_norm_fp32(
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
-        total_norm = total_norm.item() ** (1.0 / norm_type)
+        if on_device:
+            total_norm = total_norm.pow(1.0 / norm_type)
+        else:
+            total_norm = total_norm.item() ** (1.0 / norm_type)
 
     return total_norm
 
@@ -170,8 +178,14 @@ def clip_grad_by_total_norm_fp32(
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
-    if clip_coeff < 1.0:
-        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+    dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+    if isinstance(clip_coeff, torch.Tensor):
+        clip_coeff.clamp_max_(1.0)
+        assert multi_tensor_scale_tensor_impl is not None, "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
+        multi_tensor_applier(
+            multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+        )
+    elif clip_coeff < 1.0:
         multi_tensor_applier(
             multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
         )

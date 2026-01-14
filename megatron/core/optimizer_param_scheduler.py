@@ -3,6 +3,7 @@
 """Learning rate decay and weight decay incr functions."""
 import logging
 import math
+import torch
 from typing import Optional
 
 from megatron.core.optimizer import MegatronOptimizer
@@ -203,7 +204,10 @@ class OptimizerParamScheduler:
         """
         self.num_steps += increment
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = self.get_lr(param_group)
+            if isinstance(param_group['lr'], torch.Tensor):
+                param_group['lr'].fill_(self.get_lr(param_group))
+            else:
+                param_group['lr'] = self.get_lr(param_group)
             param_group['weight_decay'] = self.get_wd(param_group) * param_group.get('wd_mult', 1.0)
 
     def state_dict(self) -> dict:

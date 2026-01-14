@@ -217,6 +217,14 @@ class OptimizerConfig:
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
 
+    on_device_clip_grad: bool = False
+    """If True, clip gradients on device. This is used to avoid the overhead of
+    CPU-GPU synchronization.
+    """
+
+    optimizer_cuda_graph: bool = False
+    """If true, enables CUDA graph for optimizer step."""
+
     def __post_init__(self):
         """Check the validity of the config."""
 
@@ -245,6 +253,8 @@ class OptimizerConfig:
                     "Setting --reuse-grad-buf-for-mxfp8-param-ag and --fp8-param-gather is "
                     "recommended for mxfp8 training."
                 )
+
+        assert not self.optimizer_cuda_graph or self.on_device_clip_grad, "Optimizer CUDA graph requires on_device_clip_grad to be set"
 
         if self.use_precision_aware_optimizer:
             assert (
