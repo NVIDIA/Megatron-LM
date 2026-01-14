@@ -9,9 +9,11 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
     fine_grained_offloading_group_start,
-    get_fine_grained_offloading_context,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.module import float16_to_fp32
@@ -382,12 +384,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
         if layer.recompute_pre_mlp_layernorm:
             layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with get_fine_grained_offloading_context(layer.offload_mlp_norm):
+            with off_interface.get_context(layer.offload_mlp_norm):
                 pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
                     layer.pre_mlp_layernorm, hidden_states
                 )
         else:
-            with get_fine_grained_offloading_context(layer.offload_mlp_norm):
+            with off_interface.get_context(layer.offload_mlp_norm):
                 pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
         probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)

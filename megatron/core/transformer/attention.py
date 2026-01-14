@@ -24,9 +24,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
     fine_grained_offloading_group_start,
-    get_fine_grained_offloading_context,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
@@ -828,7 +830,7 @@ class Attention(MegatronModule, ABC):
 
         if self.offload_qkv_linear:
             hidden_states = fine_grained_offloading_group_start(hidden_states, name="qkv_linear")
-        with get_fine_grained_offloading_context(self.offload_qkv_linear):
+        with off_interface.get_context(self.offload_qkv_linear):
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
@@ -997,7 +999,7 @@ class Attention(MegatronModule, ABC):
                 query = fine_grained_offloading_group_start(query, name="core_attn")
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                with get_fine_grained_offloading_context(self.offload_core_attention):
+                with off_interface.get_context(self.offload_core_attention):
                     core_attn_out = self.core_attention(
                         query,
                         key,
@@ -1056,7 +1058,7 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="linear_proj")
         if self.offload_attn_proj:
             core_attn_out = fine_grained_offloading_group_start(core_attn_out, name="attn_proj")
-        with get_fine_grained_offloading_context(self.offload_attn_proj):
+        with off_interface.get_context(self.offload_attn_proj):
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
             output = fine_grained_offloading_group_commit(

@@ -667,6 +667,11 @@ class PipelineOffloadManager:
         """Get the current backward pass chunk handler."""
         return self._cur_backward_chunk
 
+    def mark_not_offloadable(self, tensor: torch.Tensor):
+        """Mark the current forward chunk as not offloadable."""
+        if tensor is not None:
+            tensor.offloading_activation = False
+
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
         debug_rank("----__enter__")
@@ -1164,23 +1169,6 @@ def fine_grained_offloading_group_start(tensor, name=None):
     return FineGrainedOffloadingGroupStartFunction.apply(tensor, cur_forward_chunk, name)
 
 
-def get_fine_grained_offloading_context(flag):
-    """Get the fine-grained offload context"""
-    return PipelineOffloadManager.get_instance() if flag else nullcontext()
-
-
-def fine_grained_offloading_init_chunk_handler(vp_size, vp_stage, min_offloaded_tensor_size):
-    """Initialize the chunk handler, called at the start of a microbatch forward pass."""
-    PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
-        vp_size, vp_stage, min_offloaded_tensor_size
-    )
-
-
-def fine_grained_offloading_reset():
-    """Reset the chunk handler, called at the start of a training iteration."""
-    PipelineOffloadManager.get_instance().reset()
-
-
 def fine_grained_offloading_forward_record(event: torch.cuda.Event) -> None:
     """Record the forward event for cuda graph capture."""
     d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
@@ -1214,6 +1202,42 @@ def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> 
     return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
 
 
-def fine_grained_offloading_reset_instance():
-    """Reset the singleton instance of PipelineOffloadManager."""
-    PipelineOffloadManager.reset_instance()
+class FineGrainedActivationOffloadingInterface:
+    """Interface for fine-grained activation offloading."""
+
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def init_chunk_handler(vp_size, vp_stage, min_offloaded_tensor_size):
+        """Initialize the chunk handler, called at the start of a microbatch forward pass."""
+        PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
+            vp_size, vp_stage, min_offloaded_tensor_size
+        )
+
+    @staticmethod
+    def get_context(flag):
+        """Get the fine-grained offload context"""
+        return PipelineOffloadManager.get_instance() if flag else nullcontext()
+
+    @staticmethod
+    def mark_not_offloadable(tensor: torch.Tensor):
+        """Mark the tensor as not offloadable."""
+        PipelineOffloadManager.get_instance().mark_not_offloadable(tensor)
+
+    @staticmethod
+    def forward_record(event: torch.cuda.Event) -> None:
+        """Record the forward event for cuda graph capture."""
+        d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
+        torch.cuda.current_stream().record_event(event)
+        torch.cuda.current_stream().wait_stream(d2h_stream)
+
+    @staticmethod
+    def reset():
+        """Reset the chunk handler."""
+        PipelineOffloadManager.get_instance().reset()
+
+    @staticmethod
+    def reset_instance():
+        """Reset the singleton instance."""
+        PipelineOffloadManager.reset_instance()
