@@ -2931,8 +2931,6 @@ def get_train_valid_test_num_samples():
 
     # Get train_samples in current phase.
     if args.phase_transition_iterations:
-        # NOTE: assumes fixed global batch size
-        # TODO(bnorick): assert no batch size ramp up
         phase_transition_samples = [0] + [t * args.global_batch_size for t in args.phase_transition_iterations] + [args.train_samples]
         current_sample = args.iteration * args.global_batch_size
         last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)

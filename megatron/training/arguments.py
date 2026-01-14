@@ -520,7 +520,10 @@ def validate_args(args, defaults={}):
             args.per_split_data_args_path is None
 
     if args.phase_transition_iterations:
-        args.phase_transition_iterations = sorted(int(x.strip()) for x in args.phase_transition_iterations.split(","))
+        args.phase_transition_iterations = sorted(
+            int(x.strip()) for x in args.phase_transition_iterations.split(",")
+        )
+        assert args.rampup_batch_size is None, "multi-phase training does not support batch size ramp-up"
 
     # Batch size.
     assert args.micro_batch_size is not None
@@ -2907,8 +2910,9 @@ def _add_data_args(parser):
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
     group.add_argument('--phase-transition-iterations', type=str, default=None,
-                       help='Comma-separated list of iterations where phase'
-                       ' transitions occur.')
+                       help='Comma-separated list of iterations where phase '
+                       'transitions occur. Requires fixed global batch size across phases. '
+                       'Does not support batch size ramp-up.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
