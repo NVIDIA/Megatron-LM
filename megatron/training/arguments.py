@@ -880,6 +880,8 @@ def validate_args(args, defaults={}):
 
     args.main_grads_dtype = map_dtype(args.main_grads_dtype)
     args.main_params_dtype = map_dtype(args.main_params_dtype)
+    args.megatron_fsdp_grad_comm_dtype = map_dtype(args.megatron_fsdp_grad_comm_dtype)
+    args.megatron_fsdp_grad_accum_dtype = map_dtype(args.megatron_fsdp_grad_accum_dtype)
     args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
 
@@ -3075,15 +3077,23 @@ def _add_experimental_args(parser):
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 
-    # Args of precision-aware optimizer
+    # Args of precision-aware optimizer and Megatron-FSDP.
     group.add_argument('--use-precision-aware-optimizer', action='store_true',
                        help='Use the precision-aware optimizer in TransformerEngine, which allows '
                        'setting the main params and optimizer states to lower precision, such as '
                        'fp16, bf16 and fp8.')
     group.add_argument('--main-grads-dtype', default='fp32', choices=['fp32', 'bf16'],
-                       help='Dtype of main grads when enabling precision-aware-optimizer')
+                       help='Dtype of main grads when enabling precision-aware-optimizer or Megatron-FSDP.')
     group.add_argument('--main-params-dtype', default='fp32', choices=['fp32', 'fp16'],
-                       help='Dtype of main params when enabling precision-aware-optimizer')
+                       help='Dtype of main params when enabling precision-aware-optimizer or Megatron-FSDP.')
+    group.add_argument("--megatron-fsdp-grad-comm-dtype", default=None, choices=['fp32', 'fp16', 'bf16'],
+                        help="When using Megatron-FSDP, this controls the data-type used when communicating "
+                             "model gradients during FSDP. When not specified, the original model gradient "
+                             "data-type will be used.")
+    group.add_argument("--megatron-fsdp-grad-accum-dtype", default=None, choices=['fp32', 'fp16', 'bf16'],
+                        help="When using Megatron-FSDP, this controls the data-type used when reducing and "
+                             "accumulating model gradients during FSDP. When not specified, the data-type "
+                             "will be type-promoted with respect to the main gradient data-type.")
     group.add_argument('--exp-avg-dtype', default='fp32', choices=['fp32', 'fp16', 'bf16', 'fp8'],
                        help='Dtype of exp_avg (1st moment in adam optimizer) when enabling '
                             'precision-aware-optimizer. This dtype is used for storing the '
