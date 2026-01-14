@@ -44,7 +44,7 @@ from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,
 )
-from megatron.core.utils import get_asyncio_loop, log_single_rank
+from megatron.core.utils import get_asyncio_loop, log_single_rank, get_pg_rank
 from megatron.rl.sequence_packing_utils import (
     get_microbatch_dataloader,
     pack_inference_logprobs,
@@ -1575,6 +1575,24 @@ def megatron_rl_inference_mode(
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
+    # Check if AMem NCCL plugin should be used
+    use_amem = getattr(args, 'rl_use_amem_nccl', False)
+    amem_offload_during_rollout = getattr(args, 'rl_amem_offload_during_rollout', True)
+
+    if use_amem:
+        try:
+            from megatron.core import amem_nccl
+
+            # Initialize AMem if available
+            if amem_nccl.is_amem_available():
+                logger.info(f"[{dist.get_rank()}:DP] AMem NCCL plugin enabled for memory offloading")
+            else:
+                logger.warning(f"[{dist.get_rank()}:DP] AMem NCCL plugin requested but not available")
+                use_amem = False
+        except ImportError:
+            logger.warning(f"[{dist.get_rank()}:DP] AMem NCCL module not found, disabling AMem")
+            use_amem = False
+
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
     # If we get a lower precision wrapper, we go one object deeper.
@@ -1599,6 +1617,14 @@ def megatron_rl_inference_mode(
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-before-inference"):
                 optimizer.offload_to_cpu()
+
+        # Offload NCCL memory before inference if AMem is enabled
+        if use_amem and amem_offload_during_rollout:
+            with nvtx_range("amem-nccl-pause-before-inference"):
+                if amem_nccl.nccl_pause():
+                    logger.info(f"[{dist.get_rank()}:DP] Successfully offloaded NCCL memory")
+                else:
+                    logger.warning(f"[{dist.get_rank()}:DP] Failed to offload NCCL memory")
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none":
@@ -1652,6 +1678,14 @@ def megatron_rl_inference_mode(
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none":
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
+
+        # Restore NCCL memory after inference if AMem is enabled
+        if use_amem and amem_offload_during_rollout:
+            with nvtx_range("amem-nccl-resume-after-inference"):
+                if amem_nccl.nccl_resume():
+                    logger.info(f"[{dist.get_rank()}:DP] Successfully restored NCCL memory")
+                else:
+                    logger.warning(f"[{dist.get_rank()}:DP] Failed to restore NCCL memory")
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
         # GPU memory during training.
