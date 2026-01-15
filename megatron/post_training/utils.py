@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import inspect
 import os
 
 import modelopt
@@ -16,6 +17,10 @@ def modelopt_version_higher_than(target_version: str):
     """Check if Model-Optimizer is greater than this version."""
     return Version(modelopt.__version__) > Version(target_version)
 
+def function_has_parameter(function, argument_name: str) -> bool:
+    """Check if a function has a specific argument."""
+    sig = inspect.signature(function)
+    return argument_name in sig.parameters
 
 def get_current_memory_info():
     """Get current memory usage."""
