@@ -15,6 +15,13 @@ from megatron.training.utils import unwrap_model
 
 def modelopt_version_higher_than(target_version: str):
     """Check if Model-Optimizer is greater than this version."""
+    info = "rank {:3}/{:3} checking if nvidia-modelopt-{} is higher than {}".format(
+        torch.distributed.get_rank(),
+        torch.distributed.get_world_size(),
+        str(modelopt.__version__),
+        target_version,
+    )
+    print(info)
     return Version(modelopt.__version__) > Version(target_version)
 
 def function_has_parameter(function, argument_name: str) -> bool:
