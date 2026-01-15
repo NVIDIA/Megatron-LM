@@ -794,9 +794,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
-        # Contract hidden states for hyper connections at the end of the block
-        # Only contract at the last PP stage; intermediate stages keep n-stream for next stage
-        if self.config.enable_hyper_connections and self.post_process:
+        # Only contract if the final layer norm is in this stage
+        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
             hidden_states = HyperConnectionModule.output_contract(
                 hidden_states, self.num_residual_streams
             )  # [s, b, n*C] -> [s, b, C]
