@@ -14,12 +14,12 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 
 
 def build_inference_pg_collection(
-    tp_size: int,
     world_size: int,
-    use_tp_pp_dp_mapping: bool = False,
-    cp_size: Optional[int] = None,
+    tp_size: Optional[int] = None,
     pp_size: Optional[int] = None,
+    cp_size: Optional[int] = None,
     ep_size: Optional[int] = None,
+    use_tp_pp_dp_mapping: bool = False,
 ) -> ProcessGroupCollection:
     """
     Build a ProcessGroupCollection for an RL inference model with custom parallelism settings.
@@ -29,12 +29,12 @@ def build_inference_pg_collection(
     and composite groups) using HyperCommGrid.
 
     Args:
-        tp_size: Tensor model parallel size for the inference model.
         world_size: Total world size (number of ranks).
-        use_tp_pp_dp_mapping: If True, use 'tp-cp-ep-pp-dp' order; otherwise 'tp-cp-ep-dp-pp'.
-        cp_size: Context parallel size. Defaults to current MPU value if None.
+        tp_size: Tensor model parallel size for the inference model. Defaults to current MPU value if None.
         pp_size: Pipeline parallel size. Defaults to current MPU value if None.
+        cp_size: Context parallel size. Defaults to current MPU value if None.
         ep_size: Expert parallel size. Defaults to current MPU value if None.
+        use_tp_pp_dp_mapping: If True, use 'tp-cp-ep-pp-dp' order; otherwise 'tp-cp-ep-dp-pp'.
 
     Returns:
         ProcessGroupCollection configured for the inference model.
@@ -43,6 +43,8 @@ def build_inference_pg_collection(
         AssertionError: If world size is not divisible by tp*cp*pp.
     """
     # Use current MPU values as defaults
+    if tp_size is None:
+        tp_size = mpu.get_tensor_model_parallel_world_size()
     if cp_size is None:
         cp_size = mpu.get_context_parallel_world_size()
     if pp_size is None:
@@ -50,9 +52,9 @@ def build_inference_pg_collection(
     if ep_size is None:
         ep_size = mpu.get_expert_model_parallel_world_size()
 
-    dp_size = world_size // (tp_size * cp_size * pp_size)
-    assert dp_size >= 1 and (tp_size * cp_size * pp_size * dp_size) == world_size, \
-        "World size must be divisible by tp*cp*pp for inference PG layout"
+    dp_size = world_size // (tp_size * cp_size * ep_size * pp_size)
+    assert dp_size >= 1 and (tp_size * cp_size * ep_size * pp_size * dp_size) == world_size, \
+        "World size must be divisible by tp*cp*ep*pp for inference PG layout"
 
     # Build process group grid with appropriate dimension ordering
     if use_tp_pp_dp_mapping:
@@ -83,16 +85,26 @@ def build_inference_pg_collection(
     dp_cp_group = grid.create_pg(["cp", "dp"])
     tp_dp_cp_group = grid.create_pg(["tp", "cp", "dp"])
 
-    # Create embedding groups
-    embd_group_ranks = mpu.default_embedding_ranks(
-        torch.distributed.get_process_group_ranks(pp_group)
-    )
-    embd_group = torch.distributed.new_group(ranks=embd_group_ranks)
+    # Create embedding groups.
+    # We must iterate over all PP groups (in a deterministic order) and create groups
+    # for each, matching how MCore parallel_state.initialize_model_parallel() does it.
+    rank = torch.distributed.get_rank()
+    embd_group = None
+    pos_embd_group = None
 
-    pos_embd_group_ranks = mpu.default_position_embedding_ranks(
-        torch.distributed.get_process_group_ranks(pp_group)
-    )
-    pos_embd_group = torch.distributed.new_group(ranks=pos_embd_group_ranks)
+    # Recompute the PP rank enumeration deterministically from the grid so that every rank
+    # creates embedding groups in the same order.
+    pp_rank_enum = grid.get_rank_enum("pp")
+    for pp_ranks in pp_rank_enum:
+        embd_ranks = mpu.default_embedding_ranks(pp_ranks)
+        group = torch.distributed.new_group(ranks=embd_ranks)
+        if rank in embd_ranks:
+            embd_group = group
+
+        pos_embd_ranks = mpu.default_position_embedding_ranks(pp_ranks)
+        group = torch.distributed.new_group(ranks=pos_embd_ranks)
+        if rank in pos_embd_ranks:
+            pos_embd_group = group
 
     return ProcessGroupCollection(
         tp=tp_group,
