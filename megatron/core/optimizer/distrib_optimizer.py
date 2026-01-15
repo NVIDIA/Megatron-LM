@@ -2549,19 +2549,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         model_param = model_param_to_state_dict_param_map[model_param]
 
                     if is_float8tensor(model_param):
-                        if hasattr(model_param, 'get_high_precision_init_val'):
-                            shard_model_param = (
-                                model_param.get_high_precision_init_val()
-                                .view(-1)[param_range.start : param_range.end]
-                                .clone()
-                                .to(model_param.device)
-                                .float()
-                            )
-                            model_param.clear_high_precision_init_val()
-                        else:
-                            shard_model_param = dequantize_fp8_tensor(model_param).view(-1)[
-                                param_range.start : param_range.end
-                            ]
+                        shard_model_param = dequantize_fp8_tensor(model_param).view(-1)[
+                            param_range.start : param_range.end
+                        ]
                     else:
                         shard_model_param = model_param.view(-1)[
                             param_range.start : param_range.end
