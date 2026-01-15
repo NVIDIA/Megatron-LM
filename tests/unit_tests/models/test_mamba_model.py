@@ -284,10 +284,7 @@ class TestMambaWithDynamicInference:
         )
 
         inference_context = DynamicInferenceContext(
-            params_dtype=config.params_dtype,
-            num_layers=config.num_layers,
-            kv_channels=config.hidden_size // config.num_attention_heads,
-            num_attention_heads=config.num_attention_heads,
+            model_config=self.model.config,
             max_sequence_length=self.model.module.max_sequence_length,
             buffer_size_gb=1.0,
             block_size_tokens=256,

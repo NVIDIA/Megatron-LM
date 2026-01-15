@@ -294,25 +294,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
         projection_size = model_config.kv_channels * num_attention_heads
-        if model_config.tensor_model_parallel_size is None:
-            assert pg_collection is not None
-            tp_size = (
-                get_pg_size(pg_collection.tp)
-                if pg_collection is not None
-                else parallel_state.get_tensor_model_parallel_world_size()
-            )
+        if pg_collection is not None:
+            tp_size = get_pg_size(pg_collection.tp)
         else:
             tp_size = model_config.tensor_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
-        if model_config.pipeline_model_parallel_size is None:
-            assert pg_collection is not None
-            pp_size = (
-                get_pg_size(pg_collection.pp)
-                if pg_collection is not None
-                else parallel_state.get_pipeline_model_parallel_world_size()
-            )
+        if pg_collection is not None:
+            pp_size = get_pg_size(pg_collection.pp)
         else:
             pp_size = model_config.pipeline_model_parallel_size
 
@@ -732,7 +722,16 @@ class DynamicInferenceContext(BaseInferenceContext):
     @classmethod
     def from_model_and_args(cls, model, args, overrides: Optional[Dict[str, Any]] = None):
         """
-        Instantiate a `DynamicInferenceContext` from a model and command-line args.
+        Instantiate a `DynamicInferenceContext` from the model and args.
+
+        Args:
+            model: The Megatron model instance.
+            args: The arguments object.
+            overrides (Optional[Dict[str, Any]]): A dictionary of values to override
+                the default arguments derived from `model` and `args`.
+
+        Returns:
+            DynamicInferenceContext: The initialized inference context.
         """
         config = model.config
 
@@ -760,11 +759,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
+        pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
         kwargs = {
             "model_config": config,
             "max_sequence_length": max_sequence_length,
             "mamba_inference_state_config": mamba_inference_state_config,
+            "pg_collection": pg_collection,
             "num_cuda_graphs": (
                 args.inference_dynamic_batching_num_cuda_graphs
                 if args.cuda_graph_impl == "local"

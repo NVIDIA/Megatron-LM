@@ -10,15 +10,12 @@ import torch
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
-from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
-)
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -77,7 +74,10 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
     tokenizer = get_tokenizer()
 
     if args.engine_type == "static":
-        inference_wrapped_model = GPTInferenceWrapper(model)
+        context = StaticInferenceContext(
+            args.inference_max_requests, args.inference_max_sequence_length
+        )
+        inference_wrapped_model = GPTInferenceWrapper(model, context)
         inference_wrapped_model.model_is_pipeline_parallel = not (
             mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage()
         )
@@ -173,9 +173,7 @@ def generate_dynamic(
         request_id = REQUEST_ID
         REQUEST_ID += 1
         prompt_tokens = request.prompt_tokens
-        inference_engine.add_request(
-            request_id, prompt_tokens, request.inference_parameters,
-        )
+        inference_engine.add_request(request_id, prompt_tokens, request.inference_parameters)
 
     start_time = time.perf_counter()
     all_finished_requests = []
@@ -292,9 +290,7 @@ def main():
                 prompts=args.prompts, inference_requests=requests, sampling_params=sampling_params
             )
         elif args.engine_type == "dynamic":
-            results: List[InferenceRequest] = generate_dynamic(
-                args, requests, inference_engine,
-            )
+            results: List[InferenceRequest] = generate_dynamic(args, requests, inference_engine)
     end_time = time.perf_counter()
     latency = end_time - start_time
 

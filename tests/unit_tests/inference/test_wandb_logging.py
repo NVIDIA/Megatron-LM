@@ -15,6 +15,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -54,10 +55,12 @@ class TestInferenceWandbLogging:
     ):
         """Helper to create a DynamicInferenceContext."""
         return DynamicInferenceContext(
-            params_dtype=params_dtype,
-            num_layers=num_layers,
-            kv_channels=kv_channels,
-            num_attention_heads=num_attention_heads,
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=num_layers,
+                kv_channels=kv_channels,
+                num_attention_heads=num_attention_heads,
+            ),
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
             buffer_size_gb=buffer_size_gb,
@@ -229,10 +232,9 @@ class TestInferenceWandbLogging:
         """Test that paused requests are correctly reflected in stats."""
         set_rounder(1)
         dynamic_context = DynamicInferenceContext(
-            params_dtype=torch.float32,
-            num_layers=2,
-            kv_channels=64,
-            num_attention_heads=8,
+            model_config=TransformerConfig(
+                params_dtype=torch.float32, num_layers=2, kv_channels=64, num_attention_heads=8
+            ),
             max_sequence_length=128,
             num_cuda_graphs=None,
             buffer_size_gb=0.01,  # Small buffer to force pausing

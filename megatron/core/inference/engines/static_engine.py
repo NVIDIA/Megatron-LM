@@ -8,7 +8,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 import torch
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
@@ -72,23 +72,24 @@ class StaticInferenceEngine(AbstractEngine):
         self.config = self.inference_wrapped_model.config
         self.random_seed = random_seed or 1234
 
-        inference_max_batch_size = self.config.inference_max_requests
-        if max_batch_size is None:
-            max_batch_size = inference_max_batch_size
-        elif max_batch_size > inference_max_batch_size:
-            warnings.warn(
-                f"Engine `max_batch_size` ({max_batch_size}) > "
-                f"`inference_max_requests` in `inference_wrapper_config` "
-                f"({inference_max_batch_size}); setting `max_batch_size` to "
-                f"{inference_max_batch_size}",
-                UserWarning,
-            )
-            max_batch_size = inference_max_batch_size
-
-        self.scheduler = Scheduler(max_batch_size=max_batch_size)
-
         # Store original context in case we need to fall back to legacy static engine
         original_context = self.inference_wrapped_model.inference_context
+        assert original_context is not None
+        assert isinstance(original_context, StaticInferenceContext)
+
+        if max_batch_size is None:
+            max_batch_size = original_context.max_batch_size
+        elif max_batch_size > original_context.max_batch_size:
+            warnings.warn(
+                f"Engine `max_batch_size` ({max_batch_size}) > "
+                f"`context.max_batch_size` in `inference_wrapped_model.inference_context` "
+                f"({original_context.max_batch_size}); setting `max_batch_size` to "
+                f"{original_context.max_batch_size}",
+                UserWarning,
+            )
+            max_batch_size = original_context.max_batch_size
+
+        self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
         mamba_inference_state_config = get_mamba_inference_state_config_from_model(
             self.inference_wrapped_model.model
@@ -96,25 +97,28 @@ class StaticInferenceEngine(AbstractEngine):
 
         try:
             if not legacy:
-                dynamic_context = DynamicInferenceContext.from_config(
-                    inference_config=inference_wrapper_config,
-                    model=text_generation_controller.inference_wrapped_model.model,
-                    max_batch_size=max_batch_size,
+                dynamic_context = DynamicInferenceContext(
+                    model_config=self.config,
+                    max_sequence_length=original_context.max_sequence_length,
                     buffer_size_gb=buffer_size_gb,
-                    num_cuda_graphs=1,
                     mamba_inference_state_config=mamba_inference_state_config,
+                    max_requests=max_batch_size,
+                    num_cuda_graphs=1,
+                    block_size_tokens=256,
+                    unified_memory_level=0,
                 )
+
                 self.controller.inference_wrapped_model.inference_context = dynamic_context
                 self.controller.inference_wrapped_model.prep_model_for_inference()
                 self.controller._init_dynamic_sampling_tensors()
 
                 self.dynamic_engine = DynamicInferenceEngine(
                     controller=self.controller,
-                    random_seed=self.random_seed,
                     context=dynamic_context,
-                    enable_cuda_graph=True,
+                    random_seed=self.random_seed,
                 )
         except Exception as e:
+            torch.distributed.breakpoint(0)
             # Get exception details for better debugging
             exception_msg = str(e) if str(e) else f"{type(e).__name__}: {repr(e)}"
             warnings.warn(

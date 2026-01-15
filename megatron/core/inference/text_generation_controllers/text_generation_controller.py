@@ -22,6 +22,7 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference.contexts.base_context import BaseInferenceContext
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
+from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -83,6 +84,17 @@ class TextGenerationController:
             is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
 
+        # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
+        try:
+            self.vocab_size = get_attr_wrapped_model(
+                self.inference_wrapped_model.model, "vocab_size"
+            )
+        except RuntimeError as e:
+            # Handle LlaVa models
+            self.vocab_size = get_attr_wrapped_model(
+                self.inference_wrapped_model.model, "language_model"
+            ).vocab_size
+
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
@@ -97,6 +109,19 @@ class TextGenerationController:
         context: BaseInferenceContext,
         model_inference_wrapper_cls: type[AbstractModelInferenceWrapper] = GPTInferenceWrapper,
     ):
+        """
+        Initializes a `TextGenerationController` from the model and args.
+
+        Args:
+            model: The Megatron model instance.
+            args: The arguments object.
+            context (BaseInferenceContext): The inference context.
+            model_inference_wrapper_cls (type[AbstractModelInferenceWrapper]): The class
+                used to wrap the model for inference. Defaults to GPTInferenceWrapper.
+
+        Returns:
+            TextGenerationController: The initialized text generation controller.
+        """
         tokenizer = build_tokenizer(args)
         # TODO(ksanthanam): Condition this on model type?
         model = model_inference_wrapper_cls(model, context)
@@ -126,8 +151,6 @@ class TextGenerationController:
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.config.params_dtype
-        # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
-        vocab_size = get_attr_wrapped_model(self.inference_wrapped_model.model, "vocab_size")
 
         self._sampling_backend = "torch"
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
@@ -609,8 +632,7 @@ class TextGenerationController:
                 if context.materialize_only_last_token_logits
                 else input_ids.shape[1]
             )
-            vocab_size = get_attr_wrapped_model(self.inference_wrapped_model.model, "vocab_size")
-            logits_shape = [1, logits_seq_len, vocab_size]
+            logits_shape = [1, logits_seq_len, self.vocab_size]
 
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
@@ -1048,8 +1070,10 @@ class TextGenerationController:
         # Pad batch tokens if necessary
         batch_size = len(active_requests)
         max_sequence_length = max_prompt_length_in_batch + sampling_params.num_tokens_to_generate
-        inference_max_batch_size = self.model_config.inference_max_requests
-        inference_max_sequence_length = self.model_config.inference_max_seq_length
+        context = self.inference_wrapped_model.inference_context
+        assert isinstance(context, StaticInferenceContext)
+        inference_max_batch_size = context.max_batch_size
+        inference_max_sequence_length = context.max_sequence_length
         padded_batch_size = inference_max_batch_size if enable_cuda_graph else batch_size
         if padded_batch_size > inference_max_batch_size:
             raise ValueError(
@@ -1088,10 +1112,6 @@ class TextGenerationController:
         generated_sequence_lengths = torch.zeros(
             batch_size, device=torch.cuda.current_device()
         ).cuda()
-
-        # Use padded vocab size because tokenizer vocab size might not include padding
-        # to nearest power of 2
-        vocab_size = get_attr_wrapped_model(self.inference_wrapped_model.model, "vocab_size")
 
         # Check whether early termination is enabled
         no_early_termination = getattr(sampling_params, "no_early_termination", False)
@@ -1235,13 +1255,13 @@ class TextGenerationController:
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
                     logits_seq_len = 1 if materialize_only_last_token_logits else context_length
-                    logits_shape = [batch_size, logits_seq_len, vocab_size]
+                    logits_shape = [batch_size, logits_seq_len, self.vocab_size]
                     if is_pipeline_last_stage(self.pp_group):
                         assert logits is not None and torch.Size(logits_shape) == logits.shape
                     # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
                     # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
-                        [batch_size, logits_seq_len, vocab_size],
+                        [batch_size, logits_seq_len, self.vocab_size],
                         dtype=self.model_config.params_dtype,
                         tensor=logits,
                         pp_group=self.pp_group,
@@ -1271,7 +1291,7 @@ class TextGenerationController:
                 sampled_logits = self.sample_from_logits(
                     last_token_logits,
                     sampling_params,
-                    vocab_size,
+                    self.vocab_size,
                     generation_started=generation_started,
                     top_n_logprobs_dict=top_n_logprobs_dict,
                     logits=logits_for_top_n_prompt_logprobs,

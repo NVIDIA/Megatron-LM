@@ -18,6 +18,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -68,10 +69,12 @@ class TestDynamicContext:
             mamba_inference_state_config = None
 
         dynamic_context = DynamicInferenceContext(
-            params_dtype=params_dtype,
-            num_layers=num_layers // self.pp_size,
-            kv_channels=kv_channels,
-            num_attention_heads=num_attention_heads,
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=num_layers,
+                kv_channels=kv_channels,
+                num_attention_heads=num_attention_heads,
+            ),
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
             use_cuda_graphs_for_non_decode_steps=True,
@@ -1211,22 +1214,36 @@ class TestDynamicContext:
 
         rank = parallel_state.get_pipeline_model_parallel_rank()
 
+        mamba_conv_states_shape = (544, 4)
+        mamba_ssm_states_shape = (8, 64, 16)
+
         if rank == 0:
-            local_num_layers = 12
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                [Symbols.MAMBA] + [Symbols.ATTENTION] * 4,
+                mamba_conv_states_shape,
+                mamba_ssm_states_shape,
+            )
         else:
-            local_num_layers = 4
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                [Symbols.MAMBA] * 4 + [Symbols.ATTENTION],
+                mamba_conv_states_shape,
+                mamba_ssm_states_shape,
+            )
 
         context = DynamicInferenceContext(
-            params_dtype=torch.float32,
-            num_layers=local_num_layers,
-            kv_channels=64,
-            num_attention_heads=8,
+            model_config=TransformerConfig(
+                params_dtype=torch.float32,
+                num_layers=10,
+                kv_channels=64,
+                num_attention_heads=8,
+                pipeline_model_parallel_size=pp_size,
+                tensor_model_parallel_size=1,
+                pipeline_dtype=torch.float32,
+            ),
             max_sequence_length=128,
             buffer_size_gb=0.1,
             block_size_tokens=16,
             max_tokens=1024,
-            pipeline_model_parallel_size=pp_size,
-            tensor_model_parallel_size=1,
             unified_memory_level=0,
         )
 
