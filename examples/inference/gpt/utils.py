@@ -427,10 +427,24 @@ def build_dynamic_engine_setup_prefix(
     )
 
     # Buffer limits config
+    # >>>
+    # buffer_limits_str = (
+    #     f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
+    #     f"{context.block_allocator.active_count} blocks "
+    #     f"[r {context.max_requests}, t {context.max_tokens}]"
+    # )
+    # +++
+    def get_block_size_str(key):
+        segment_count = getattr(context.block_allocator, f"{key}_count")
+        segment_bytes = segment_count * context.block_size_bytes
+        return get_mem_size_str(segment_bytes)
+    total_buffer_blocks = context.block_allocator.total_count
+    active_buffer_blocks = context.block_allocator.active_count
     buffer_limits_str = (
-        f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
-        f"{context.block_allocator.active_count} chunks "
-        f"[r {context.max_requests}, t {context.max_tokens}]"
+        f"ctx: {get_block_size_str('total')} "
+        f"[a {get_block_size_str('active')}, p {get_block_size_str('paused')}], "
+        f"r {context.max_requests}, t {context.max_tokens}"
+        # <<<
     )
 
     parts = [
