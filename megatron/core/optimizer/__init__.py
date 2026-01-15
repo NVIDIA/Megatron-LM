@@ -60,6 +60,7 @@ from .optimizer_config import (
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
+    ParamWithNamePredicate,
     SGDOptimizerConfig,
 )
 
@@ -76,6 +77,23 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
     """
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
+    # First, figure out how we are going to do wd skipping. The two main approaches are:
+    #  1. The classic megatron approach of skipping all len 1 and bias parameters.
+    #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
+    if config.apply_wd_to_qk_layernorm:
+        shape_1_not_qkln_param = ParamWithNamePredicate(
+            name="s1_not_qkln",
+            fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
+            and not ("q_layernorm." in name or "k_layernorm." in name),
+        )
+        param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
+    else:
+        param_length_1_match = ParamPredicate(
+            name="param_len_1", fn=lambda param: len(param.shape) == 1
+        )
+        param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
+
+    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
 
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
@@ -83,20 +101,6 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         if config.decoupled_min_lr is not None:
             decoupled_lr_config["min_lr"] = config.decoupled_min_lr
         config_overrides[decoupled_param_key] = decoupled_lr_config
-
-    # Next construct the standard param group overrides for no weight decay on bias parameters
-    #  as well as any length 1 parameters.
-    param_length_1_match = ParamPredicate(
-        name="param_len_1", fn=lambda param: len(param.shape) == 1
-    )
-    param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
-    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
-
-    if config.apply_wd_to_qk_layernorm:
-        # Override weight decay for qk layernorm as a special case.
-        config_overrides[ParamKey(name=("*q_layernorm.*", "*k_layernorm.*"))] = ParamGroupOverride(
-            wd_mult=1.0, _force_override=True
-        )
 
     return config_overrides
 
