@@ -170,7 +170,8 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
             packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
-            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group. Defaults to None.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group. 
+                Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying Yarn RoPE.

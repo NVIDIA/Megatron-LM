@@ -2171,9 +2171,7 @@ def get_batch_on_this_hybrid_cp_rank(
     if cp_group is not None and cp_group.size() > 1:
         # When using hybrid_context_parallel, each sub-sample of a packed sample is
         # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
-        batch = get_batch_on_this_cp_rank(
-            batch, cp_group=cp_group
-        )
+        batch = get_batch_on_this_cp_rank(batch, cp_group=cp_group)
 
     return batch, packed_seq_params
 

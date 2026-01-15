@@ -189,7 +189,8 @@ class RotaryEmbedding(nn.Module):
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
             packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
-            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group. Defaults to None.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group. 
+                Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -315,7 +316,8 @@ class MultimodalRotaryEmbedding(nn.Module):
             position_ids (torch.Tensor): A postion_id tensor with shape [3, batchsize, seqlens]
             mrope_section (list[int]): Multimodal rope section is for channel dimension of temporal,
                 height and width in rope calculation.
-            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group. Defaults to None.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group. 
+                Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
