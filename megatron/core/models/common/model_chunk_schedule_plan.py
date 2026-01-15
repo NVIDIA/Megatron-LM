@@ -14,7 +14,6 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
-from megatron.core.transformer.multi_token_prediction import get_mtp_num_layers_to_build
 
 
 class ModelChunkState:
@@ -352,36 +351,39 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.context_mask = None
         self._model_chunk_state.attention_bias = None
 
-        transformer_num_layers = model.decoder.num_layers_per_pipeline_rank
-        mtp_num_layers = get_mtp_num_layers_to_build(model.config, vp_stage=self.vp_stage)
-
         # build preprocess
         self.pre_process = PreProcessNode(model, self._model_chunk_state, self._event, comp_stream)
-        # build layer schedule plan for each layer
-        for layer_idx in range(transformer_num_layers):
-            layer = model.decoder._get_layer(layer_idx)
-            layer_plan = TransformerLayerSchedulePlan(
-                layer, self._event, self._model_chunk_state, comp_stream, comm_stream
-            )
-            self._transformer_layers.append(layer_plan)
 
-        # build mtp layers
-        for layer_idx in range(mtp_num_layers):
-            extra_args = {
-                "is_first_layer": layer_idx == 0,
-                "is_last_layer": layer_idx == mtp_num_layers - 1,
-            }
-            layer = model.mtp.layers[layer_idx]
-            layer_plan = TransformerLayerSchedulePlan(
-                layer, self.event, self.state, comp_stream, comm_stream, extra_args
-            )
-            self._transformer_layers.append(layer_plan)
+        # build layer schedule plan for each layer.
+        # The methods to obtain layers are different for MTP so we need the other build plan for
+        # MTP. Also, this can help annotate MTP layer so that it can know where MTP is.
+        self._build_layer_schedule_plan(model.decoder, comp_stream, comm_stream)
+        self._build_layer_schedule_plan(getattr(model, "mtp", None), comp_stream, comm_stream)
 
         # build post process
         if model.post_process:
             self.post_process = PostProcessNode(
                 model, self._model_chunk_state, self._event, comp_stream
             )
+
+    def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
+        if module is None:
+            return
+        num_layers = len(module.layers)
+        for layer_idx in range(num_layers):
+            extra_args = {
+                "is_first_layer": layer_idx == 0,
+                "is_last_layer": layer_idx == num_layers - 1,
+            }
+            layer_plan = TransformerLayerSchedulePlan(
+                module.layers[layer_idx],
+                self.event,
+                self.state,
+                comp_stream,
+                comm_stream,
+                extra_args,
+            )
+            self._transformer_layers.append(layer_plan)
 
     @property
     def event(self):
