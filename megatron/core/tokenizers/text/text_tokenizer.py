@@ -13,7 +13,7 @@ TOKENIZER_MAPPING_LIBRARIES = OrderedDict(
         ("megatron", "MegatronHFTokenizer"),
         ("tiktoken", "TikTokenTokenizer"),
         ("byte-level", "ByteLevelTokenizer"),
-        ("null", "NullTokenizer"),
+        ("null-text", "NullTokenizer"),
         ("sft", "SFTTokenizer"),
     ]
 )

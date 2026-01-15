@@ -53,7 +53,7 @@ def build_tokenizer(args):
         kwargs['trust_remote_code'] = args.trust_remote_code
         kwargs['include_special_tokens'] = args.tokenizer_hf_include_special_tokens
     elif args.tokenizer_type == 'NullTokenizer':
-        tokenizer_library = 'null'
+        tokenizer_library = 'null-text'
         metadata = {'library': tokenizer_library}
         if args.vocab_size:
             kwargs['vocab_size'] = args.vocab_size

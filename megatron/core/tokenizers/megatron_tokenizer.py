@@ -8,7 +8,7 @@ from typing import Optional, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 
-TOKENIZER_MAPPING_NAMES = OrderedDict(
+TEXT_MAPPING_NAMES = OrderedDict(
     [
         ("default", "DefaultTokenizerText"),
         ("gpt", "GPTTokenizer"),
@@ -18,8 +18,14 @@ TOKENIZER_MAPPING_NAMES = OrderedDict(
         ("retro", "RetroTokenizer"),
     ]
 )
+VISION_MAPPING_NAMES = OrderedDict(
+    [
+        ("default", "DefaultTokenizerVision"),
+    ]
+)
 
-TOKENIZER_LIBRARIES = ["sentencepiece", "huggingface", "megatron", "tiktoken", "byte-level", "null", "sft"]
+TEXT_LIBRARIES = ["sentencepiece", "huggingface", "megatron", "tiktoken", "byte-level", "null-text", "sft"]
+VISION_LIBRARIES = ["multimodal", "null-multimodal"]
 
 logger = logging.getLogger(__name__)
 
@@ -70,19 +76,32 @@ class MegatronTokenizer:
                 f"Expected metadata_path to be str or dict, but got {type(metadata_path)}."
             )
 
-        if metadata.get('library', None) not in ['byte-level', 'null']:
+        tokenizer_library = metadata.get('library', None)
+        if tokenizer_library not in ['byte-level', 'null-text', 'null-multimodal']:
             assert tokenizer_path, "Tokenizer path must be specified."
 
+        if tokenizer_library in ['multimodal']:
+            assert 'prompt_format' in kwargs, "Prompt format (`prompt_format`) must be specified."
+            assert 'special_tokens' in kwargs, "Special tokens (`special_tokens`) must be specified."
+            assert 'image_tag_type' in kwargs, "Image tag type (`image_tag_type`) must be specified."
+
         # Initialize tokenizer object
+        tokenizer_type = 'text' if tokenizer_library in TEXT_LIBRARIES else 'vision'
         if metadata.get('tokenizer_class', None):
             tokenizer_cls = getattr(
                 metadata['tokenizer_class_path'], metadata['tokenizer_class_name']
             )
         else:
-            import megatron.core.tokenizers.text.models as models
+            if tokenizer_type == 'vision':
+                import megatron.core.tokenizers.vision.models as models
 
+                mapping_names = VISION_MAPPING_NAMES
+            else:
+                import megatron.core.tokenizers.text.models as models
+
+                mapping_names = TEXT_MAPPING_NAMES
             model_type = metadata.get('model_type', 'default')
-            tokenizer_cls = getattr(models, TOKENIZER_MAPPING_NAMES[model_type])
+            tokenizer_cls = getattr(models, mapping_names[model_type])
         metadata['metadata_path'] = metadata_path
         tokenizer = tokenizer_cls(path=tokenizer_path, config=metadata, **kwargs)
 
@@ -123,9 +142,9 @@ class MegatronTokenizer:
         assert os.path.exists(
             tokenizer_path
         ), "Tokenizer path doesn't exist. Please, provide the correct path to the tokenizer."
-        assert tokenizer_library in TOKENIZER_LIBRARIES, (
+        assert tokenizer_library in TEXT_LIBRARIES or tokenizer_library in VISION_LIBRARIES, (
             "Tokenizer library is not supported. Please, see the list of available "
-            f"tokenizer libraries: {TOKENIZER_LIBRARIES}."
+            f"tokenizer libraries: text: {TEXT_LIBRARIES}, vision: {VISION_LIBRARIES}."
         )
         if model_type is None and tokenizer_class is None:
             model_type = "default"

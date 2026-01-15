@@ -5,9 +5,14 @@ import numpy as np
 from typing import Dict, List, Union
 
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, IMAGE_TOKEN
-from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 from megatron.core.tokenizers.text.libraries.sft_tokenizer import PromptConfig
+
+try:
+    import transformers
+
+    HAVE_TRANSFORMERS = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_TRANSFORMERS = False
 
 
 IMAGE_TAGS = {
@@ -46,27 +51,36 @@ nemotron_custom_template = "{{- bos_token }}{% for message in messages %}{{'<SPE
 nemotron_aligned_custom_template = "{{- bos_token}}{% for message in messages %}{{message['role'] + '\n' + message['content'] + '\n' + '[PREFIX]'}}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant\n' }}{% endif %}"
 
 
-class MultimodalTokenizerTokenizer(MegatronTokenizerBase):
+class MegatronMultimodalTokenizer():
     """Multimodal Tokenizer."""
 
     def __init__(
         self,
-        tokenizer: MegatronTokenizer,
+        path: str,
         prompt_format: str,
         special_tokens: List[str],
         image_tag_type: str,
         force_system_message: bool = False,
+        **kwargs,
     ):
         """Tokenizer with a support for non-text inputs.
 
         Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
 
         Args:
-            tokenizer (MegatronLegacyTokenizer): Underlying tokenizer.
+            path (str): Path to the underlying tokenizer.
             prompt_format (str): Prompt format for the tokenizer.
             special_tokens (List[str]): Non-text tokens.
             image_tag_type (str): Image tag to apply, if any. For example <img><image></img>.
         """
+        if not HAVE_TRANSFORMERS:
+            raise ImportError(
+                "MegatronMultimodalTokenizer currently requires transformers library to be installed."
+            )
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path=path, **kwargs
+        )
+
         self._vocab_size = len(tokenizer)
 
         num_added_tokens = tokenizer.add_tokens(special_tokens, special_tokens=True)
@@ -74,7 +88,7 @@ class MultimodalTokenizerTokenizer(MegatronTokenizerBase):
             special_tokens
         ), f"failed to add {len(special_tokens)} special tokens; only added {num_added_tokens}"
 
-        self._tokenizer = tokenizer
+        self.tokenizer = tokenizer
 
         if prompt_format == "mistral":
             # Mistral format doesn't have prefix for the assistant message.
@@ -193,7 +207,7 @@ class MultimodalTokenizerTokenizer(MegatronTokenizerBase):
     def _encode(self, text: str):
         """Tokenize text input."""
         text = self._apply_image_tag(text)
-        return self._tokenizer.encode(text)
+        return self.tokenizer.encode(text)
 
     def tokenize_conversation(
         self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
@@ -229,7 +243,7 @@ class MultimodalTokenizerTokenizer(MegatronTokenizerBase):
         # Apply possible image tag.
         conversation = self._apply_image_tag(conversation)
 
-        tokens = self._tokenizer.apply_chat_template(
+        tokens = self.tokenizer.apply_chat_template(
             conversation,
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
@@ -249,7 +263,7 @@ class MultimodalTokenizerTokenizer(MegatronTokenizerBase):
             if len(turn["content"]) == 0:
                 raise ValueError(f"empty turn in conversation: {conversation}. Skipping.")
 
-            turn_tokens = self._tokenizer.apply_chat_template(
+            turn_tokens = self.tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
             )
 
@@ -282,15 +296,19 @@ class MultimodalTokenizerTokenizer(MegatronTokenizerBase):
 
     def convert_tokens_to_ids(self, tokens: List[str]):
         """Convert tokens to IDs."""
-        return self._tokenizer.convert_tokens_to_ids(tokens)
+        return self.tokenizer.convert_tokens_to_ids(tokens)
 
     def detokenize(self, tokens: List[int]):
         """Detokenize tokens."""
-        return self._tokenizer.decode(tokens)
+        return self.tokenizer.decode(tokens)
+
+    def add_special_tokens(self, special_tokens: List[str]):
+        """Add special tokens."""
+        self.tokenizer.add_tokens(special_tokens, special_tokens=True)
 
     def get_special_tokens(self):
         """Get special tokens."""
-        return self._tokenizer.get_added_vocab()
+        return self.tokenizer.get_added_vocab()
 
     @property
     def pad(self):
@@ -300,17 +318,7 @@ class MultimodalTokenizerTokenizer(MegatronTokenizerBase):
     @property
     def eod(self):
         """End of sentence token ID."""
-        return self._tokenizer.eos_token_id
-
-    @property
-    def vocab(self):
-        """Vocab."""
-        return NotImplementedError("not used")
-
-    @property
-    def inv_vocab(self):
-        """Inverse vocab."""
-        return NotImplementedError("not used")
+        return self.tokenizer.eos_token_id
 
     @property
     def vocab_size(self):
