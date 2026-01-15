@@ -244,13 +244,13 @@ class MultiLatentAttention(Attention):
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
         with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
-          query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
-              hidden_states,
-              key_value_states,
-              position_ids,
-              packed_seq_params,
-              inference_context=inference_context,
-          )
+            query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                position_ids,
+                packed_seq_params,
+                inference_context=inference_context,
+            )
         if self.offload_qkv_linear:
             query = off_interface.group_commit(
                 query, name="qkv_linear", forced_released_tensors=[hidden_states]
@@ -291,15 +291,15 @@ class MultiLatentAttention(Attention):
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
-                  core_attn_out = self.core_attention(
-                      query,
-                      key,
-                      value,
-                      attention_mask,
-                      packed_seq_params=packed_seq_params,
-                      attn_mask_type=attn_mask_type,
-                      **extra_kwargs,
-                  )
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        packed_seq_params=packed_seq_params,
+                        attn_mask_type=attn_mask_type,
+                        **extra_kwargs,
+                    )
             elif self.cache_mla_latents:
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
