@@ -41,7 +41,7 @@ from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import (
-    function_has_parameters,
+    function_has_parameter,
     modelopt_version_higher_than,
     print_distributed_quant_summary,
     report_current_memory_info,
@@ -302,7 +302,7 @@ if __name__ == "__main__":
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
         import_kwargs = {"dtype": import_dtype}
         # if modelopt_version_higher_than("0.41.0"):
-        if function_has_parameters(import_mcore_gpt_from_hf, "trust_remote_code"):
+        if function_has_parameter(import_mcore_gpt_from_hf, "trust_remote_code"):
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
