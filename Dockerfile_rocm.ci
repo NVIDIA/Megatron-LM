@@ -1,4 +1,4 @@
-ARG BASE_DOCKER=registry-sc-harbor.amd.com/framework/compute-rocm-rel-7.0:64_ubuntu24.04_py3.12_pytorch_release-2.7_130d937d
+ARG BASE_DOCKER=rocm/pytorch:rocm7.1_ubuntu24.04_py3.12_pytorch_release_2.9.1
 FROM $BASE_DOCKER
 
 ARG PYTORCH_ROCM_ARCH_OVERRIDE="gfx942"
