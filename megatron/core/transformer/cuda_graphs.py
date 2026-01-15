@@ -1,8 +1,9 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import inspect
 import logging
+import math
 import os
 import time
 from collections import defaultdict
@@ -21,8 +22,9 @@ from megatron.core.tensor_parallel.random import (
     get_all_rng_states,
     get_cuda_rng_tracker,
 )
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_attr_wrapped_model,
@@ -99,6 +101,7 @@ class ArgMetadata:
             self.shape = arg.shape
             self.dtype = arg.dtype
             self.device = arg.device
+            self.value = arg.data_ptr()
         else:
             self.value = arg
 
@@ -172,6 +175,44 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
         base_module.layer_number in first_layer_numbers,
         base_module.layer_number in last_layer_numbers,
     )
+
+
+def _clone_nested_tensors(value: Any) -> Any:
+    """Recursively clone tensors inside nested containers."""
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, (tuple, list)):
+        return type(value)(_clone_nested_tensors(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _clone_nested_tensors(v) for k, v in value.items()}
+    if isinstance(value, set):
+        raise TypeError(
+            "Sets of tensors are unsupported in cudagraph helpers; use list/tuple instead"
+        )
+    return value
+
+
+def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Generator:
+    """Make generator state safe for CUDA graph capture/replay.
+
+    Generator state tensors can become inference tensors if created under `torch.inference_mode()`.
+    CUDA graph capture may later attempt in-place updates on that state; this fails for inference
+    tensors. Fix the generator *in-place* (preserving identity) by cloning its state outside
+    inference mode and setting it back.
+    """
+    with torch.inference_mode(mode=False):
+        if hasattr(gen, "graphsafe_get_state"):
+            state = gen.graphsafe_get_state()
+        else:
+            state = gen.get_state()
+
+        cloned_state = _clone_nested_tensors(state)
+        if hasattr(gen, "graphsafe_set_state"):
+            gen.graphsafe_set_state(cloned_state)
+        else:
+            gen.set_state(cloned_state)
+
+    return gen
 
 
 class _CudagraphGlobalRecord:
@@ -681,8 +722,12 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph = torch.cuda.CUDAGraph()
 
         # For cases with multiple active RNG states, e.g. TP.
-        for _, state in get_all_rng_states().items():
-            self.fwd_graph.register_generator_state(state)
+        rng_states = get_all_rng_states()
+        with torch.inference_mode(mode=False):
+            for gen in rng_states.values():
+                self.fwd_graph.register_generator_state(
+                    _ensure_generator_state_is_cudagraph_safe(gen)
+                )
 
         # warmup again as case graph capture mode may execute a different codepath
         for _ in range(self.num_warmup_steps):
@@ -704,6 +749,15 @@ class _CudaGraphRunner(torch.nn.Module):
 
         with self.get_quantization_context():
             torch.cuda.synchronize()
+            # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
+            # before capture begins, to avoid inference-tensor state issues during capture.
+            with torch.inference_mode(mode=False):
+                for device_idx in range(torch.cuda.device_count()):
+                    default_gen = torch.cuda.default_generators[device_idx]
+                    self.fwd_graph.register_generator_state(
+                        _ensure_generator_state_is_cudagraph_safe(default_gen)
+                    )
+
             with torch.cuda.graph(
                 self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
             ):
@@ -1087,9 +1141,12 @@ class CudaGraphManager(torch.nn.Module):
         ), "RNG tracker does not support cudagraphs!"
 
         assert config.cuda_graph_impl == "local", "Option cuda_graph_impl=local not enabled."
-        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-            "a crash due to illegal memory access or other undefined behaviour."
+        assert (
+            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+        ), (
+            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
 
         self.cudagraph_runners = []
@@ -1347,23 +1404,40 @@ def _layer_is_graphable(layer, config):
     Check if a layer is graphable.
     """
 
+    # Only GraphableMegatronModule can be graphed.
+    if not isinstance(layer, GraphableMegatronModule):
+        return False
+
+    # If cuda_graph_scope is not set, every layer is graphed.
+    if not config.cuda_graph_scope:
+        return True
+
     # import modules here to avoid a circular import
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
+    from megatron.core.transformer.mlp import MLP
+    from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    if isinstance(layer, MambaLayer) and config.cuda_graph_scope == "full":
+    if isinstance(layer, MambaLayer) and CudaGraphScope.mamba in config.cuda_graph_scope:
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if config.cuda_graph_scope == 'attn':
-            if not (
-                isinstance(layer.self_attention, IdentityOp)
-                and isinstance(layer.cross_attention, IdentityOp)
-            ):
-                # attn layer.
-                return True
-        else:
+        if CudaGraphScope.attn in config.cuda_graph_scope and not (
+            isinstance(layer.self_attention, IdentityOp)
+            and isinstance(layer.cross_attention, IdentityOp)
+        ):
+            # attn layer.
+            return True
+        if (
+            CudaGraphScope.moe in config.cuda_graph_scope
+            or CudaGraphScope.moe_router in config.cuda_graph_scope
+            or CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+        ) and isinstance(layer.mlp, MoELayer):
+            # moe layer.
+            return True
+        if CudaGraphScope.mlp in config.cuda_graph_scope and isinstance(layer.mlp, MLP):
+            # mlp layer.
             return True
     return False
 
@@ -1382,18 +1456,17 @@ class TECudaGraphHelper:
         assert (
             config.cuda_graph_impl == "transformer_engine"
         ), "Option cuda_graph_impl=transformer_engine not enabled."
-        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-            "a crash due to illegal memory access or other undefined behaviour."
+        assert (
+            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+        ), (
+            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
-        assert config.cuda_graph_scope != "full_iteration", (
+        assert CudaGraphScope.full_iteration not in config.cuda_graph_scope, (
             "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
             "Please use cuda_graph_impl=local instead."
         )
-        assert config.cuda_graph_scope in [
-            'full',
-            'attn',
-        ], f"--cuda-graph-scope should be full or attn, got {config.cuda_graph_scope}."
 
         self.model = model
         self.config = config
@@ -1401,6 +1474,9 @@ class TECudaGraphHelper:
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
         self.num_model_chunks = len(model)
+
+        # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
+        self.num_microbatches = None
 
         # Get callables with captureable layers.
         self.chunks_with_decoder = []
@@ -1476,67 +1552,248 @@ class TECudaGraphHelper:
             f'{len(self.flattened_callables)} graphable layers.',
         )
 
+        # One helper object can only capture CUDA Graphs once. Use this flag to check if the graphs
+        # have been created.
+        self._graphs_created = False
+
+    def graphs_created(self):
+        """
+        Returns whether the CUDA Graphs have been created.
+        """
+        return self._graphs_created
+
+    def _get_sample_arguments(self, order):
+        """
+        Generate sample arguments and keyword arguments for CUDA Graph capturing with
+        memory-optimized buffer reuse.
+
+        This method creates static input tensors for each (layer, microbatch) pair needed
+        by TE's make_graphed_callables(). It optimizes memory usage by reusing input buffers
+        across non-overlapping forward passes based on the pipeline parallel schedule.
+        This optimization is essential for reducing peak memory during CUDA Graph capturing with
+        many microbatches, as it allows buffers to be reused instead of allocating new ones for
+        later microbatches.
+
+        Memory Optimization Strategy:
+            The 1F1B (one-forward-one-backward) interleaved schedule in pipeline parallelism
+            means that once a microbatch's backward pass completes, its input buffers are no
+            longer needed. This method tracks buffer lifecycle and reuses "consumed" buffers
+            (those whose backward has completed) for new forward passes with matching tensor
+            signatures (shape, dtype, layout).
+
+            Example schedule: [1, 1, 1, 2, 2, 2, -2, 1, -2, 1, -2, 2, -1, 2, -1, -1, -2, -2, -1, -1]
+            - Positive values indicate forward passes (chunk_id = value)
+            - Negative values indicate backward passes (chunk_id = -value)
+            - When processing -2 (backward of chunk 2), its buffers become available for reuse
+            - The next forward with matching signature can reuse those buffers
+
+        Args:
+            order (List[int]): The forward/backward execution order from
+                convert_schedule_table_to_order(). Positive integers represent forward passes
+                (1-indexed chunk ID), negative integers represent backward passes.
+
+        Returns:
+            Tuple[List[Tuple], List[Dict]]: A tuple containing:
+                - sample_args: List of positional argument tuples for each (layer, microbatch).
+                    Length = num_layers * num_microbatches. Elements with the same tensor
+                    signature may share references to reduce memory allocation.
+                - sample_kwargs: List of keyword argument dicts for each (layer, microbatch).
+                    Length = num_layers * num_microbatches. Elements with the same tensor
+                    signature may share references to reduce memory allocation.
+
+        Data Structures:
+            - fwd_sample_queues: Dict[chunk_id, List[Tuple[sample_keys, fwd_idx]]]
+                Queue of forward samples per chunk awaiting their backward pass.
+            - consumed_sample_queue: Dict[sample_keys, List[fwd_idx]]
+                Pool of buffer indices whose backward is complete, keyed by tensor signature.
+            - sample_keys: Tuple of (shape, dtype, layout) for args + (key, shape, dtype, layout)
+                for kwargs, used to match compatible buffers for reuse.
+        """
+        assert self.num_model_chunks == max(
+            order
+        ), "num_model_chunks must match the max chunk id in order."
+        assert (
+            self.num_microbatches == len(order) // self.num_model_chunks // 2
+        ), "num_microbatches must match the number of microbatches in order."
+
+        # Generate sample arguments and keyword arguments for capturing.
+        sample_args = [None] * (len(self.flattened_callables) * self.num_microbatches)
+        sample_kwargs = [None] * (len(self.flattened_callables) * self.num_microbatches)
+
+        rotary_pos_emb_cache = {}
+
+        def _get_layer_static_inputs(layer, chunk_of_the_layer):
+            """
+            Get the static inputs for a layer.
+            """
+            assert layer in chunk_of_the_layer.decoder.layers or any(
+                layer is mtp_layer.transformer_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+            ), "Layer is not in the chunk"
+
+            def get_rotary_pos_emb(transformer_module, transformer_input):
+                if (
+                    transformer_module.position_embedding_type == 'rope'
+                    and not self.config.multi_latent_attention
+                ):
+                    rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
+                        None, transformer_module.decoder, transformer_input, self.config, None
+                    )
+                    if rotary_seq_len not in rotary_pos_emb_cache:
+                        rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
+                            rotary_seq_len
+                        )
+                    return rotary_pos_emb_cache[rotary_seq_len]
+                else:
+                    return None
+
+            static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
+
+            from megatron.core.transformer.identity_op import IdentityOp
+            from megatron.core.transformer.transformer_layer import TransformerLayer
+
+            contains_self_attn = (
+                isinstance(layer, TransformerLayer)
+                and not isinstance(layer.self_attention, IdentityOp)
+                and (
+                    not self.config.cuda_graph_scope
+                    or CudaGraphScope.attn in self.config.cuda_graph_scope
+                )
+            )
+
+            _sample_kwargs = {}
+            if is_te_min_version("1.10.0"):
+                # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
+                hidden_states = static_inputs.pop("hidden_states")
+                _sample_args = (hidden_states,)
+                if contains_self_attn:
+                    rotary_pos_emb = get_rotary_pos_emb(chunk_of_the_layer, hidden_states)
+                    if rotary_pos_emb is not None:
+                        static_inputs["rotary_pos_emb"] = rotary_pos_emb
+                _sample_kwargs = static_inputs
+            elif contains_self_attn:
+                _sample_args = (
+                    static_inputs.pop("hidden_states"),
+                    static_inputs.pop("attention_mask"),
+                )
+            else:
+                _sample_args = (static_inputs.pop("hidden_states"),)
+            return _sample_args, _sample_kwargs
+
+        # Calculate the starting index of each chunk in callables for future use.
+        prefix_num_layers = [0]
+        for model_chunk_idx in range(self.num_model_chunks):
+            num_layers = self.num_layers_per_chunk[model_chunk_idx]
+            prefix_num_layers.append(prefix_num_layers[-1] + num_layers)
+
+        # Reorganize args and kwargs for input tensor reuse.
+        # fwd_sample_queues is keyed by model chunk index. The value is a queue of tuples.
+        # Each tuple contains the sample key signature and its fwd_idx. When we finish a backward
+        # chunk, we pop the corresponding fwd_idx and push to the consumed_sample_queue.
+        # consumed_sample_queue is keyed by the sample key signature. The value is a queue of the
+        # fwd_idx whose backward has been called so that we can reuse the same static buffers.
+        # In this way, we can reuse the same static input buffers for the non-overlapping samples
+        # with the same input signature.
+        fwd_sample_queues = {}
+        consumed_sample_queue = {}
+        layer_sample_keys_cache = {}
+        fwd_idx = [0] * self.num_model_chunks
+        for chunk_id in order:
+            model_chunk_idx = abs(chunk_id) - 1
+
+            if chunk_id > 0:
+                if model_chunk_idx not in fwd_sample_queues:
+                    fwd_sample_queues[model_chunk_idx] = []
+
+                sample_start_idx = (prefix_num_layers[model_chunk_idx] * self.num_microbatches) + (
+                    fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
+                )
+                for layer_idx, layer in enumerate(self.callables_per_chunk[model_chunk_idx]):
+                    per_callable_fwd_idx = sample_start_idx + layer_idx
+
+                    # Get sample_args and sample_kwargs for index per_callable_fwd_idx.
+                    assert (
+                        sample_args[per_callable_fwd_idx] is None
+                        and sample_kwargs[per_callable_fwd_idx] is None
+                    ), (
+                        f"sample_args and sample_kwargs must be None before assigning static data, "
+                        f"but got sample_args[{per_callable_fwd_idx}] = "
+                        f"{sample_args[per_callable_fwd_idx]} and "
+                        f"sample_kwargs[{per_callable_fwd_idx}] = "
+                        f"{sample_kwargs[per_callable_fwd_idx]}."
+                    )
+                    if id(layer) not in layer_sample_keys_cache:
+                        # Have not generated the static inputs for this layer yet. So we don't
+                        # know the input signature of this layer. Generate the static inputs, and
+                        # cache the signature.
+                        sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
+                            _get_layer_static_inputs(
+                                layer, self.chunks_with_decoder[model_chunk_idx]
+                            )
+                        )
+                        sample_args_keys = tuple(
+                            (t.shape, t.dtype, t.layout) for t in sample_args[per_callable_fwd_idx]
+                        )
+                        sample_kwargs_keys = tuple(
+                            (k, v.shape, v.dtype, v.layout)
+                            for k, v in sorted(sample_kwargs[per_callable_fwd_idx].items())
+                        )
+                        sample_keys = sample_args_keys + sample_kwargs_keys
+                        layer_sample_keys_cache[id(layer)] = sample_keys
+                    else:
+                        # Get signature from cache. This signature will be used to see if we can
+                        # reuse the static inputs of a previous forward pass for this forward pass.
+                        # If not, we still need to generate the new static inputs.
+                        sample_keys = layer_sample_keys_cache[id(layer)]
+
+                    fwd_sample_queues[model_chunk_idx].append((sample_keys, per_callable_fwd_idx))
+                    if consumed_sample_queue.get(sample_keys, []):
+                        # We can reuse the static inputs of a previous forward pass for this
+                        # forward pass, because they are of the same input signature and the
+                        # backward pass of the previous forward pass has completed.
+                        reuse_fwd_idx = consumed_sample_queue[sample_keys].pop(0)
+                        assert (
+                            sample_args[reuse_fwd_idx] is not None
+                            and sample_kwargs[reuse_fwd_idx] is not None
+                        ), (
+                            f"sample_args and sample_kwargs must not be None when reusing, but got "
+                            f"sample_args[{reuse_fwd_idx}] = {sample_args[reuse_fwd_idx]} and "
+                            f"sample_kwargs[{reuse_fwd_idx}] = {sample_kwargs[reuse_fwd_idx]}.",
+                        )
+                        sample_args[per_callable_fwd_idx] = sample_args[reuse_fwd_idx]
+                        sample_kwargs[per_callable_fwd_idx] = sample_kwargs[reuse_fwd_idx]
+
+                    if sample_args[per_callable_fwd_idx] is None:
+                        # Unfortunately, no previous static inputs are available for reuse,
+                        # sample_args is still None. Last attempt: generate the new static inputs
+                        # for this forward pass.
+                        sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
+                            _get_layer_static_inputs(
+                                layer, self.chunks_with_decoder[model_chunk_idx]
+                            )
+                        )
+                fwd_idx[model_chunk_idx] += 1
+            else:
+                num_consumed_samples = min(
+                    len(fwd_sample_queues[model_chunk_idx]),
+                    self.num_layers_per_chunk[model_chunk_idx],
+                )
+                for sample_keys, per_callable_fwd_idx in fwd_sample_queues[model_chunk_idx][
+                    :num_consumed_samples
+                ]:
+                    if sample_keys not in consumed_sample_queue:
+                        consumed_sample_queue[sample_keys] = []
+                    consumed_sample_queue[sample_keys].append(per_callable_fwd_idx)
+                fwd_sample_queues[model_chunk_idx] = fwd_sample_queues[model_chunk_idx][
+                    num_consumed_samples:
+                ]
+
+        return sample_args, sample_kwargs
+
     def _get_cuda_graph_input_data(self):
         """
         Create the CUDA Graph capturing input data.
         The data is organized per-chunk per-microbatch per-layer.
         """
-
-        rotary_pos_emb_cache = {}
-
-        def get_rotary_pos_emb(transformer_module, transformer_input):
-            if (
-                transformer_module.position_embedding_type == 'rope'
-                and not self.config.multi_latent_attention
-            ):
-                rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
-                    None, transformer_module.decoder, transformer_input, self.config, None
-                )
-                if rotary_seq_len not in rotary_pos_emb_cache:
-                    rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                        rotary_seq_len
-                    )
-                return rotary_pos_emb_cache[rotary_seq_len]
-            else:
-                return None
-
-        # Generate sample arguments and keyword arguments for capturing.
-        sample_args = []
-        sample_kwargs = []
-        for chunk_number, chunk_with_decoder in enumerate(self.chunks_with_decoder):
-            if chunk_with_decoder is None:
-                continue
-            layers = self.callables_per_chunk[chunk_number]
-            for _ in range(get_num_microbatches()):
-                for layer in layers:
-                    static_inputs = layer.get_layer_static_inputs(
-                        self.seq_length, self.micro_batch_size
-                    )
-
-                    from megatron.core.transformer.identity_op import IdentityOp
-                    from megatron.core.transformer.transformer_layer import TransformerLayer
-
-                    contains_self_attn = isinstance(layer, TransformerLayer) and not isinstance(
-                        layer.self_attention, IdentityOp
-                    )
-                    if is_te_min_version("1.10.0"):
-                        # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
-                        hidden_states = static_inputs.pop("hidden_states")
-                        sample_args.append((hidden_states,))
-                        if contains_self_attn:
-                            rotary_pos_emb = get_rotary_pos_emb(chunk_with_decoder, hidden_states)
-                            if rotary_pos_emb is not None:
-                                static_inputs["rotary_pos_emb"] = rotary_pos_emb
-                        sample_kwargs.append(static_inputs)
-                    elif contains_self_attn:
-                        sample_args.append(
-                            (
-                                static_inputs.pop("hidden_states"),
-                                static_inputs.pop("attention_mask"),
-                            )
-                        )
-                    else:
-                        sample_args.append((static_inputs.pop("hidden_states"),))
 
         # Get the PP and VPP scheduling order.
         from megatron.core.pipeline_parallel.schedules import (
@@ -1545,14 +1802,23 @@ class TECudaGraphHelper:
             get_schedule_table,
         )
 
+        # If PP is not enabled, we only need to capture one microbatch.
+        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
+            assert (
+                self.num_model_chunks == 1
+            ), "If PP is not enabled, there should be only one model chunk."
+            self.num_microbatches = 1
+        else:
+            self.num_microbatches = get_num_microbatches()
+
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
-            get_num_microbatches(),
+            self.num_microbatches,
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
             False,
         )
         schedule_table = get_schedule_table(
-            get_num_microbatches(),
+            self.num_microbatches,
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
         )
@@ -1567,8 +1833,29 @@ class TECudaGraphHelper:
             msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
 
+        # Generate sample arguments and keyword arguments for capturing.
+        sample_args, sample_kwargs = self._get_sample_arguments(order)
+
         def get_make_graphed_callables_kwargs():
-            kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
+            kwargs = {
+                'allow_unused_input': True,
+                '_order': order,
+                'retain_graph_in_backward': self.config.cuda_graph_retain_backward_graph,
+            }
+
+            # Calculate the number of warmup iterations per layer per microbatch inside TE
+            # make_graphed_callables(). There are two rules:
+            # 1. There should be at least 1 warmup iteration per layer per microbatch inside TE
+            # make_graphed_callables().
+            # 2. There should be at least 10 warmup iterations per layer, counting the MCore warmup
+            # steps before going into this capture routine.
+            kwargs['num_warmup_iters'] = max(
+                1,
+                math.ceil(
+                    (10 - self.config.cuda_graph_warmup_steps * get_num_microbatches())
+                    / self.num_microbatches
+                ),
+            )
 
             if is_te_min_version("2.6.0"):
                 # Starting from TE 2.6.0, make_graphed_callables() accepts different number
@@ -1626,9 +1913,13 @@ class TECudaGraphHelper:
         """
         Start capturing CUDA Graphs.
         """
+        assert not self._graphs_created, "CUDA Graphs have already been created."
+
         torch.distributed.barrier()
         gc.collect()
         torch.cuda.empty_cache()
+        if FREEZE_GC:
+            gc.freeze()
 
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
@@ -1656,8 +1947,13 @@ class TECudaGraphHelper:
             optimizer.zero_grad()
         clear_aux_losses_tracker()
         reset_model_temporary_tensors(self.config, self.model)
+
+        if FREEZE_GC:
+            gc.unfreeze()
         gc.collect()
         torch.cuda.empty_cache()
+
+        self._graphs_created = True
 
     def create_cudagraphs(self):
         """
@@ -1667,17 +1963,22 @@ class TECudaGraphHelper:
 
         # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
         sample_args, kwargs = self._get_cuda_graph_input_data()
-        graphs = make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
+        if self.config.sequence_parallel:
+            rng_context = get_cuda_rng_tracker().fork()
+        else:
+            rng_context = nullcontext()
+        with rng_context:
+            graphs = make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
 
         # Push the captured graphs to the corresponding TransformerBlock.
         num_layers_accumulated = 0
         for layers in self.callables_per_chunk:
             for layer_number, layer in enumerate(layers):
                 layer.cuda_graphs = []
-                for batch_number in range(get_num_microbatches()):
+                for batch_number in range(self.num_microbatches):
                     layer.cuda_graphs.append(
                         graphs[
-                            num_layers_accumulated * get_num_microbatches()
+                            num_layers_accumulated * self.num_microbatches
                             + batch_number * len(layers)
                             + layer_number
                         ]
@@ -1695,3 +1996,33 @@ class TECudaGraphHelper:
             model_chunk = self.model[chunk_number]
             for layer in layers:
                 layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
+
+    def delete_cuda_graphs(self):
+        """
+        Delete all CUDA graphs.
+        """
+        assert self._graphs_created, "CUDA Graphs have not been created."
+
+        graph_resettable = is_te_min_version("2.10.0")
+        graphs_reset, graphs_not_reset = 0, 0
+        for layers in self.callables_per_chunk:
+            for layer in layers:
+                for graph in layer.cuda_graphs:
+                    if graph_resettable:
+                        graph.reset()
+                        graphs_reset += 1
+                    else:
+                        graphs_not_reset += 1
+                layer.cuda_graphs = []
+                layer.cuda_graph_manual_hooks = []
+
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=None,
+            dp_cp_group=None,
+            level=logging.INFO,
+            msg=f'Rank {torch.distributed.get_rank()}: '
+            f'{graphs_reset} graphs deleted with explicit reset, '
+            f'{graphs_not_reset} graphs deleted without explicit reset.',
+        )
+        self._graphs_created = False

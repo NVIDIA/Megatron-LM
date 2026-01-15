@@ -7,7 +7,6 @@ from typing import Any, Dict, Iterable, Optional, Union
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.fp8_utils import prepare_model_for_fp8_inference
 from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
@@ -73,10 +72,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.inference_context = inference_context
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection(
-                tp=parallel_state.get_tensor_model_parallel_group(),
-                pp=parallel_state.get_pipeline_model_parallel_group(),
-            )
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
@@ -173,7 +169,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         for the all-to-all communication."""
         # we use num_dummy_tokens equal to tensor model parallel size
         # so that the dummy forward pass will work with sequence parallel
-        num_dummy_tokens = parallel_state.get_tensor_model_parallel_world_size()
+        num_dummy_tokens = self.tp_size
         tokens = torch.zeros(
             (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
         )
@@ -382,9 +378,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]. The logits are returned only in the last pipeline stage for PP models.
         """
         # Check if we are in a PP model
-        if not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
-        ):
+        if not (is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)):
             tokens = inference_input["tokens"]
             current_batch_size, seq_len = self._get_batch_size_and_seq_len(
                 tokens, recv_buffer_seq_len
