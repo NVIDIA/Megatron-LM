@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain and SFT GPT."""
 
@@ -19,6 +19,8 @@ from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -39,14 +41,20 @@ except ImportError:
 stimer = StragglerDetector()
 
 
-def get_batch(data_iterator, vp_stage=None):
+def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
+    args = get_args()
+    config = core_transformer_config_from_args(args)
     # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage):
+    if not is_first_or_last_pipeline_stage(vp_stage) and (
+    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator)
+    batch = get_batch_on_this_tp_rank(
+        data_iterator,
+        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        )
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
@@ -160,7 +168,12 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
 
 def is_dataset_built_on_rank(vp_stage=None):
-    return is_first_or_last_pipeline_stage(vp_stage) and parallel_state.get_tensor_model_parallel_rank() == 0
+    args = get_args()
+    config = core_transformer_config_from_args(args)
+    return (
+        is_first_or_last_pipeline_stage(vp_stage)
+        or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+    ) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 
 def core_gpt_dataset_config_from_args(args):
@@ -249,6 +262,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
+    is_dataset_built = partial(is_dataset_built_on_rank, vp_stage=vp_stage)
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type, train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
     ).build()
@@ -256,6 +270,21 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     print_rank_0("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
+
+
+def get_embedding_ranks(pp_ranks: List[int]):
+    """Get the embedding ranks."""
+    embedding_ranks = [pp_ranks[0]]
+    if len(pp_ranks) > 1:
+        args = get_args()
+        if not args.untie_embeddings_and_output_weights:
+            embedding_ranks.append(pp_ranks[-1])
+        config = core_transformer_config_from_args(args)
+        mtp_ranks = get_mtp_ranks(pp_ranks, config)
+        embedding_ranks.extend(mtp_ranks)
+    embedding_ranks = list(set(embedding_ranks))
+    embedding_ranks = sorted(embedding_ranks)
+    return embedding_ranks
 
 
 if __name__ == "__main__":
@@ -274,4 +303,5 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         store=store,
+        get_embedding_ranks=get_embedding_ranks,
     )
