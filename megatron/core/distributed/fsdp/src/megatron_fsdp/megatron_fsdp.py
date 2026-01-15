@@ -506,11 +506,23 @@ class MegatronFSDP(torch.nn.Module):
 
         def release_module_parameters(module, bwd, lazy=False, *unused):
             """
-            Release the module parameters after the forward and backward pass.
+            Release the parameters of a given module after completing the forward and backward passes.
 
             Args:
-                module: The module whose parameters are to be released.
-                lazy: If True, release the parameters lazily.
+                module: The module whose parameters should be released.
+                bwd (bool): Indicates if the release is triggered during the backward pass.
+                lazy (bool, optional): Determines when the parameter buffer (bucket) is released.
+                    - If False, the buffer is released immediately.
+                    - If True, the release is deferred until just before the all-gather pipeline
+                    requests a new buffer. The delayed release is performed by invoking
+                    `recycle_unused_buckets`.
+                *unused: Placeholder for any unused arguments.
+
+            Notes:
+                - The function maps each parameter to its corresponding buffer group,
+                then releases the associated bucket through the all-gather pipeline.
+                - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
+                the FP8 transpose cache associated with the module’s parameters.
             """
             for param in module.parameters():
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
