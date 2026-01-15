@@ -41,6 +41,8 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_tp_sharded_tensor_for_checkpoint
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
@@ -569,251 +571,130 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
 
-    # def sharded_state_dict(self, *args, **kwargs):
-    #     """Return a sharded state dict compatible with pre-fusion checkpoints.
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Return a sharded state dict compatible with pre-fusion checkpoints.
 
-    #     When `FUSE_QKV_DOWN_PROJ` is enabled, this module owns a single
-    #     `linear_qkv_down_proj` layer instead of separate `linear_q_down_proj` and
-    #     `linear_kv_down_proj` layers. To keep checkpoints backward compatible, we
-    #     materialize sharded entries for the unfused keys.
+        When `FUSE_QKV_DOWN_PROJ` is enabled, this module owns a single
+        `linear_qkv_down_proj` layer instead of separate `linear_q_down_proj` and
+        `linear_kv_down_proj` layers. To keep checkpoints backward compatible, we
+        materialize sharded entries for the unfused keys.
 
-    #     Note: we only convert weights here (bias is always False). Any TE extra
-    #     state for the fused module is dropped to avoid unexpected keys for old
-    #     readers.
-    #     """
+        Note: we also materialize legacy `_extra_state` entries when present.
+        For dist-ckpt, `_extra_state` is stored as a `ShardedObject` and missing
+        keys will hard-fail during planning. We keep the extra-state blob as-is
+        (no byte slicing) and only rewrite the key/metadata to match legacy
+        module names.
+        """
+        if not FUSE_QKV_DOWN_PROJ:
+            return super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
-    #     prefix = kwargs.get('prefix', args[0] if len(args) > 0 else '')
-    #     sharded_offsets = kwargs.get('sharded_offsets', args[1] if len(args) > 1 else ())
-    #     metadata = kwargs.get('metadata', args[2] if len(args) > 2 else None)
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
-    #     sharded_sd = super().sharded_state_dict(*args, **kwargs)
+        def _clone_sharded_object_with_key(obj: ShardedObject, new_key: str) -> ShardedObject:
+            return ShardedObject(
+                key=new_key,
+                data=obj.data,
+                global_shape=obj.global_shape,
+                global_offset=obj.global_offset,
+                replica_id=obj.replica_id,
+            )
 
-    #     if not FUSE_QKV_DOWN_PROJ:
-    #         return sharded_sd
+        fused_prefix = f"{prefix}linear_qkv_down_proj."
 
-    #     if self.config.q_lora_rank is None:
-    #         # Fusion path is only defined when q_lora_rank is not None.
-    #         return sharded_sd
+        # If TE saved extra state for the fused module, replicate it for legacy
+        # q_down/kv_down keys so that non-fused models can load fused checkpoints
+        # with dist-ckpt (planner is strict about missing keys).
+        fused_extra_keys = [
+            k for k in sharded_state_dict.keys() if k.startswith(fused_prefix) and "_extra_state" in k
+        ]
+        for fused_extra_key in fused_extra_keys:
+            # Preserve suffix ("_extra_state", "_extra_state1", ...) if present.
+            suffix = fused_extra_key[len(fused_prefix) :]
+            q_extra_key = f"{prefix}linear_q_down_proj.{suffix}"
+            kv_extra_key = f"{prefix}linear_kv_down_proj.{suffix}"
+            fused_obj = sharded_state_dict.get(fused_extra_key)
+            if isinstance(fused_obj, ShardedObject):
+                sharded_state_dict[q_extra_key] = _clone_sharded_object_with_key(
+                    fused_obj, q_extra_key
+                )
+                sharded_state_dict[kv_extra_key] = _clone_sharded_object_with_key(
+                    fused_obj, kv_extra_key
+                )
+            elif fused_obj is not None:
+                # Fallback (non-dist-ckpt paths): best-effort copy.
+                sharded_state_dict[q_extra_key] = fused_obj
+                sharded_state_dict[kv_extra_key] = fused_obj
 
-    #     fused_weight_key = f"{prefix}linear_qkv_down_proj.weight"
-    #     if fused_weight_key not in sharded_sd:
-    #         return sharded_sd
+        for key in list(sharded_state_dict.keys()):
+            if key.startswith(fused_prefix):
+                del sharded_state_dict[key]
 
-    #     # Remove all fused qkv down-proj entries (weight + possible extra state).
-    #     for k in [k for k in sharded_sd.keys() if k.startswith(f"{prefix}linear_qkv_down_proj.")]:
-    #         sharded_sd.pop(k, None)
+        # Materialize legacy (pre-fusion) keys.
+        fused_weight = self.linear_qkv_down_proj.weight
+        q_weight, kv_weight = torch.split(
+            fused_weight,
+            [
+                self.config.q_lora_rank,
+                self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
+            ],
+            dim=0,
+        )
 
-    #     # Build local unfused shards from gathered fused full weight.
-    #     # We already popped fused keys; recover local tensor from module directly.
-    #     fused_local_tensor = self.linear_qkv_down_proj.weight
+        q_key = f"{prefix}linear_q_down_proj.weight"
+        kv_key = f"{prefix}linear_kv_down_proj.weight"
 
-    #     tp_group = getattr(self.linear_qkv_down_proj, 'tp_group', None) or getattr(
-    #         self.linear_qkv_down_proj, '_tp_group', None
-    #     )
-    #     if torch.distributed.is_initialized() and tp_group is None:
-    #         tp_group = parallel_state.get_tensor_model_parallel_group()
-    #     if torch.distributed.is_initialized():
-    #         tp_size = parallel_state.get_tensor_model_parallel_world_size()
-    #         tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    #     else:
-    #         tp_size = 1
-    #         tp_rank = 0
+        tp_group = getattr(self, 'tp_group', None)
+        if tp_group is None and hasattr(self, 'pg_collection'):
+            tp_group = self.pg_collection.tp
 
-    #     q_out = self.config.q_lora_rank
-    #     kv_out = self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim
-    #     fused_out = q_out + kv_out
+        sharded_state_dict[q_key] = make_sharded_tensor_for_checkpoint(
+            tensor=q_weight,
+            key=q_key,
+            prepend_offsets=sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
+        )
+        sharded_state_dict[kv_key] = make_sharded_tensor_for_checkpoint(
+            tensor=kv_weight,
+            key=kv_key,
+            prepend_offsets=sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
+        )
 
-    #     # Determine whether the fused layer is TP-sharded along dim 0.
-    #     is_tp_sharded = fused_local_tensor.size(0) != fused_out
+        return sharded_state_dict
 
-    #     if (
-    #         is_tp_sharded
-    #         and tp_size > 1
-    #         and torch.distributed.is_initialized()
-    #         and tp_group is not None
-    #     ):
-    #         gathered = [torch.empty_like(fused_local_tensor) for _ in range(tp_size)]
-    #         torch.distributed.all_gather(gathered, fused_local_tensor, group=tp_group)
-    #         fused_full = torch.cat(gathered, dim=0)
-    #     else:
-    #         fused_full = fused_local_tensor
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Load state dict with automatic fuse/unfuse conversion.
 
-    #     q_full, kv_full = torch.split(fused_full, [q_out, kv_out], dim=0)
+        Supports:
+        - Loading a pre-fusion checkpoint (q_down + kv_down) into a fused model.
+        """
+        if not FUSE_QKV_DOWN_PROJ:
+            return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
-    #     if is_tp_sharded and tp_size > 1:
-    #         q_per = q_out // tp_size
-    #         kv_per = kv_out // tp_size
-    #         q_local_tensor = q_full[tp_rank * q_per : (tp_rank + 1) * q_per].contiguous()
-    #         kv_local_tensor = kv_full[tp_rank * kv_per : (tp_rank + 1) * kv_per].contiguous()
-    #     else:
-    #         q_local_tensor = q_full.contiguous()
-    #         kv_local_tensor = kv_full.contiguous()
+        q_key = f"{prefix}linear_q_down_proj.weight"
+        kv_key = f"{prefix}linear_kv_down_proj.weight"
+        fused_key = f"{prefix}linear_qkv_down_proj.weight"
+        # breakpoint()
 
-    #     # Wrap as ShardedTensors.
-    #     if isinstance(metadata, dict) and 'dp_cp_group' in metadata:
-    #         dp_cp_group = metadata['dp_cp_group']
-    #     elif torch.distributed.is_initialized():
-    #         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-    #     else:
-    #         # No distributed environment: best-effort (tensors will be treated as replicated).
-    #         dp_cp_group = None
+        def _as_tensor(x):
+            # torch.nn.Parameter is a Tensor subclass; keep this minimal.
+            return x.data if hasattr(x, 'data') else x
 
-    #     q_key = f"{prefix}linear_q_down_proj.weight"
-    #     kv_key = f"{prefix}linear_kv_down_proj.weight"
+        # Convert legacy (unfused) checkpoint into fused weight.
+        if fused_key not in state_dict and q_key in state_dict and kv_key in state_dict:
+            q_weight = _as_tensor(state_dict[q_key])
+            kv_weight = _as_tensor(state_dict[kv_key])
+            state_dict[fused_key] = torch.cat([q_weight, kv_weight], dim=0)
+            del state_dict[q_key]
+            del state_dict[kv_key]
+            # Bias is always False, but drop if present to avoid unexpected keys.
+            state_dict.pop(f"{prefix}linear_q_down_proj.bias", None)
+            state_dict.pop(f"{prefix}linear_kv_down_proj.bias", None)
 
-    #     if is_tp_sharded and tp_size > 1:
-    #         sharded_sd[q_key] = make_tp_sharded_tensor_for_checkpoint(
-    #             q_local_tensor,
-    #             q_key,
-    #             tp_axis=0,
-    #             prepend_offsets=sharded_offsets,
-    #             tp_group=tp_group,
-    #             dp_cp_group=dp_cp_group,
-    #         )
-    #         sharded_sd[kv_key] = make_tp_sharded_tensor_for_checkpoint(
-    #             kv_local_tensor,
-    #             kv_key,
-    #             tp_axis=0,
-    #             prepend_offsets=sharded_offsets,
-    #             tp_group=tp_group,
-    #             dp_cp_group=dp_cp_group,
-    #         )
-    #     else:
-    #         sharded_sd[q_key] = make_sharded_tensor_for_checkpoint(
-    #             q_local_tensor,
-    #             q_key,
-    #             prepend_offsets=sharded_offsets,
-    #             tp_group=tp_group,
-    #             dp_cp_group=dp_cp_group,
-    #         )
-    #         sharded_sd[kv_key] = make_sharded_tensor_for_checkpoint(
-    #             kv_local_tensor,
-    #             kv_key,
-    #             prepend_offsets=sharded_offsets,
-    #             tp_group=tp_group,
-    #             dp_cp_group=dp_cp_group,
-    #         )
-
-    #     return sharded_sd
-
-    # def _load_from_state_dict(self, *args, **kwargs):
-    #     """Load state dict with automatic fuse/unfuse conversion.
-
-    #     Supports:
-    #     - Loading a pre-fusion checkpoint (q_down + kv_down) into a fused model.
-    #     - Loading a fused checkpoint (qkv_down) into an unfused model.
-
-    #     This is implemented at the `state_dict` key level so callers can keep
-    #     `strict=True`.
-    #     """
-
-    #     # Torch's signature:
-    #     # _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-    #     #                       missing_keys, unexpected_keys, error_msgs)
-    #     state_dict = args[0]
-    #     prefix = args[1]
-    #     strict = args[3] if len(args) > 3 else kwargs.get('strict', True)
-    #     missing_keys = args[4] if len(args) > 4 else kwargs.get('missing_keys', [])
-    #     unexpected_keys = args[5] if len(args) > 5 else kwargs.get('unexpected_keys', [])
-
-    #     def _pop_any(keys):
-    #         for k in keys:
-    #             if k in state_dict:
-    #                 return k, state_dict.pop(k)
-    #         return None, None
-
-    #     def _drop_prefix_keys(module_prefix):
-    #         for k in [k for k in state_dict.keys() if k.startswith(module_prefix)]:
-    #             state_dict.pop(k, None)
-
-    #     # Only meaningful for MLA LoRA path.
-    #     if self.config.q_lora_rank is None:
-    #         return super()._load_from_state_dict(*args, **kwargs)
-
-    #     q_out = self.config.q_lora_rank
-    #     kv_out = self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim
-    #     fused_out = q_out + kv_out
-
-    #     fused_w_key = f"{prefix}linear_qkv_down_proj.weight"
-    #     q_w_key = f"{prefix}linear_q_down_proj.weight"
-    #     kv_w_key = f"{prefix}linear_kv_down_proj.weight"
-
-    #     tp_group = None
-    #     if hasattr(self, 'linear_qkv_down_proj'):
-    #         tp_group = getattr(self.linear_qkv_down_proj, 'tp_group', None) or getattr(
-    #             self.linear_qkv_down_proj, '_tp_group', None
-    #         )
-    #     elif hasattr(self, 'linear_q_down_proj'):
-    #         tp_group = getattr(self.linear_q_down_proj, 'tp_group', None) or getattr(
-    #             self.linear_q_down_proj, '_tp_group', None
-    #         )
-    #     if tp_group is None and torch.distributed.is_initialized():
-    #         tp_group = parallel_state.get_tensor_model_parallel_group()
-
-    #     if torch.distributed.is_initialized():
-    #         tp_size = parallel_state.get_tensor_model_parallel_world_size()
-    #         tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    #     else:
-    #         tp_size = 1
-    #         tp_rank = 0
-
-    #     def _gather_full_dim0(local_tensor):
-    #         if (
-    #             torch.distributed.is_initialized()
-    #             and tp_group is not None
-    #             and tp_size > 1
-    #         ):
-    #             gathered = [torch.empty_like(local_tensor) for _ in range(tp_size)]
-    #             torch.distributed.all_gather(gathered, local_tensor, group=tp_group)
-    #             return torch.cat(gathered, dim=0)
-    #         return local_tensor
-
-    #     # Case A: current model is fused, checkpoint is unfused.
-    #     if FUSE_QKV_DOWN_PROJ and hasattr(self, 'linear_qkv_down_proj'):
-    #         if fused_w_key not in state_dict and (q_w_key in state_dict and kv_w_key in state_dict):
-    #             q_local = state_dict[q_w_key]
-    #             kv_local = state_dict[kv_w_key]
-
-    #             # If weights are TP-sharded, re-shard into the fused partitioning.
-    #             is_tp_sharded = q_local.size(0) != q_out or kv_local.size(0) != kv_out
-
-    #             if is_tp_sharded and tp_size > 1:
-    #                 q_full = _gather_full_dim0(q_local)
-    #                 kv_full = _gather_full_dim0(kv_local)
-    #                 fused_full = torch.cat([q_full, kv_full], dim=0)
-    #                 fused_per = fused_out // tp_size
-    #                 fused_local = fused_full[tp_rank * fused_per : (tp_rank + 1) * fused_per]
-    #             else:
-    #                 fused_local = torch.cat([q_local, kv_local], dim=0)
-
-    #             state_dict[fused_w_key] = fused_local.contiguous()
-
-    #             # Drop old module keys to avoid unexpected-keys with strict=True.
-    #             _drop_prefix_keys(f"{prefix}linear_q_down_proj.")
-    #             _drop_prefix_keys(f"{prefix}linear_kv_down_proj.")
-
-    #     # Case B: current model is unfused, checkpoint is fused.
-    #     if (not FUSE_QKV_DOWN_PROJ) and (hasattr(self, 'linear_q_down_proj') and hasattr(self, 'linear_kv_down_proj')):
-    #         if fused_w_key in state_dict and (q_w_key not in state_dict and kv_w_key not in state_dict):
-    #             fused_local = state_dict[fused_w_key]
-
-    #             is_tp_sharded = fused_local.size(0) != fused_out
-    #             if is_tp_sharded and tp_size > 1:
-    #                 fused_full = _gather_full_dim0(fused_local)
-    #                 q_full, kv_full = torch.split(fused_full, [q_out, kv_out], dim=0)
-    #                 q_per = q_out // tp_size
-    #                 kv_per = kv_out // tp_size
-    #                 q_local = q_full[tp_rank * q_per : (tp_rank + 1) * q_per]
-    #                 kv_local = kv_full[tp_rank * kv_per : (tp_rank + 1) * kv_per]
-    #             else:
-    #                 q_local, kv_local = torch.split(fused_local, [q_out, kv_out], dim=0)
-
-    #             state_dict[q_w_key] = q_local.contiguous()
-    #             state_dict[kv_w_key] = kv_local.contiguous()
-
-    #             _drop_prefix_keys(f"{prefix}linear_qkv_down_proj.")
-
-    #     return super()._load_from_state_dict(*args, **kwargs)
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def get_query_key_value_tensors(
         self,

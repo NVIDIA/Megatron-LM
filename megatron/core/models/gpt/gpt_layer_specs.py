@@ -392,7 +392,7 @@ def get_transformer_layer_spec_for_backend(
     return transformer_layer
 
 import os
-FUSE_INPUT_LAYERNORM = os.environ.get("FUSE_INPUT_LAYERNORM", "0") == "1"
+FUSE_INPUT_LAYERNORM = os.environ.get("FUSE_INPUT_LAYERNORM", "1") == "1"
 # TODO: add config option to control this
 
 def get_attention_module_spec_for_backend(
@@ -428,16 +428,16 @@ def get_attention_module_spec_for_backend(
     core_attention = backend.core_attention() if not fallback_to_eager_attn else DotProductAttention
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
-        linear_q_down_proj = (
-            backend.column_parallel_linear()
-            if mla_down_proj_use_column_parallel
-            else backend.linear()
-        )
-        linear_kv_down_proj = (
-            backend.column_parallel_linear()
-            if mla_down_proj_use_column_parallel
-            else backend.linear()
-        )
+        down_proj_map = {
+            # (mla_down_proj_use_column_parallel, FUSE_INPUT_LAYERNORM)
+            (True, True): backend.column_parallel_layer_norm_linear(),
+            (True, False): backend.column_parallel_linear(),
+            (False, True): backend.column_parallel_layer_norm_linear(),
+            (False, False): backend.linear(),
+        }
+        linear_q_down_proj = linear_kv_down_proj = down_proj_map[
+            (mla_down_proj_use_column_parallel, FUSE_INPUT_LAYERNORM)
+        ]
         linear_q_up_proj = (
             backend.column_parallel_layer_norm_linear()
             if qk_layernorm and backend.fuse_layernorm_and_linear()
@@ -469,6 +469,11 @@ def get_attention_module_spec_for_backend(
             ),
             metainfo={"fuse_input_layernorm": FUSE_INPUT_LAYERNORM},
         )
+
+        if FUSE_INPUT_LAYERNORM:
+            sharded_state_dict_keys_map.update({
+                "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+            })
     else:
         linear_qkv = (
             backend.column_parallel_layer_norm_linear()
