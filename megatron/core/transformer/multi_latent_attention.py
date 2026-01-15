@@ -240,28 +240,13 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        if self.config.experimental_attention_variant is None:
-            query, key, value = self.get_query_key_value_tensors(
-                hidden_states,
-                key_value_states,
-                position_ids,
-                packed_seq_params,
-                inference_context=inference_context,
-            )
-        elif self.config.experimental_attention_variant == "dsa":
-            query, key, value, q_compressed, _ = self.get_query_key_value_tensors(
-                hidden_states,
-                key_value_states,
-                position_ids,
-                packed_seq_params,
-                inference_context=inference_context,
-                return_compressed_tensors=True,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported experimental attention variant: "
-                f"{self.config.experimental_attention_variant}"
-            )
+        query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
+            hidden_states,
+            key_value_states,
+            position_ids,
+            packed_seq_params,
+            inference_context=inference_context,
+        )
 
         # ===================================================
         # Adjust key, value for inference
@@ -289,34 +274,21 @@ class MultiLatentAttention(Attention):
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                if self.config.experimental_attention_variant is None:
-                    core_attn_out = self.core_attention(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        packed_seq_params=packed_seq_params,
-                        attn_mask_type=attn_mask_type,
-                    )
-                elif self.config.experimental_attention_variant == "dsa":
+                extra_kwargs = {}
+                if self.config.experimental_attention_variant == "dsa":
                     # For dsa we need to pass in the original hidden states and the compressed
                     # query representation.
-                    core_attn_out = self.core_attention(
-                        query,
-                        key,
-                        value,
-                        x=hidden_states,
-                        qr=q_compressed,
-                        attention_mask=attention_mask,
-                        attn_mask_type=attn_mask_type,
-                        attention_bias=None,
-                        packed_seq_params=packed_seq_params,
-                    )
-                else:
-                    raise ValueError(
-                        f"Unsupported attention variant: "
-                        f"{self.config.experimental_attention_variant}"
-                    )
+                    extra_kwargs["x"] = hidden_states
+                    extra_kwargs["qr"] = q_compressed
+                core_attn_out = self.core_attention(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    packed_seq_params=packed_seq_params,
+                    attn_mask_type=attn_mask_type,
+                    **extra_kwargs,
+                )
             elif self.cache_mla_latents:
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
@@ -526,7 +498,6 @@ class MLASelfAttention(MultiLatentAttention):
         inference_context=None,
         *,
         inference_params=None,
-        return_compressed_tensors=False,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -858,10 +829,7 @@ class MLASelfAttention(MultiLatentAttention):
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
 
-        if return_compressed_tensors:
-            return query, key, value, q_compressed, kv_compressed
-        else:
-            return query, key, value
+        return query, key, value, q_compressed, kv_compressed
 
     def uncompress_kv_from_cache(self, kv_cached):
         """
