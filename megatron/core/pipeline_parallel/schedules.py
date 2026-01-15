@@ -11,7 +11,7 @@ from torch.autograd.variable import Variable
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_reset,
+    FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
@@ -680,7 +680,7 @@ def forward_backward_no_pipelining(
         )
 
     if not forward_only and config.fine_grained_activation_offloading:
-        fine_grained_offloading_reset()
+        off_interface.reset()
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
@@ -2047,7 +2047,7 @@ def forward_backward_pipelining_with_interleaving(
         )
 
     if not forward_only and config.fine_grained_activation_offloading:
-        fine_grained_offloading_reset()
+        off_interface.reset()
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
         config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
@@ -2437,7 +2437,7 @@ def forward_backward_pipelining_without_interleaving(
         )
 
     if not forward_only and config.fine_grained_activation_offloading:
-        fine_grained_offloading_reset()
+        off_interface.reset()
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

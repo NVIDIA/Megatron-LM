@@ -10,6 +10,9 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
@@ -107,10 +110,9 @@ def _run_one_iter_and_capture(
       - selected grads (CPU float32)
       - peak_memory_allocated (bytes) during the iteration
     """
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
 
     if enable_offload_reset:
-        off.fine_grained_offloading_reset()
+        off_interface.reset()
 
     # for p in model.parameters():
     #     if p.grad is not None:
@@ -179,7 +181,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
 
     from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
 
-    off.fine_grained_offloading_reset_instance()
+    off_interface.reset_instance()
 
     try:
         # 1) Baseline run (no offloading)
@@ -244,7 +246,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             enable_offload_reset=True,
         )
         # Reset once more to trigger post_warmup_callback and apply steady-state offload decisions.
-        off.fine_grained_offloading_reset()
+        off_interface.reset()
 
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             PipelineOffloadManager,
@@ -453,7 +455,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
         This is the execution path that exercises EP A2A overlap scheduling.
         """
         if enable_offload_reset:
-            off.fine_grained_offloading_reset()
+            off_interface.reset()
 
         data0 = _make_schedule_inputs()
         data1 = _make_schedule_inputs()
@@ -486,7 +488,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
     )
     set_streams()
 
-    off.fine_grained_offloading_reset_instance()
+    off_interface.reset_instance()
 
     try:
         with deterministic_mode():
@@ -513,9 +515,9 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             _restore_params(off_model, base_params)
             off_model.train()
             # Warmup once to populate cached chunks, then reset to apply steady-state offload decisions.
-            off.fine_grained_offloading_reset()
+            off_interface.reset()
             _run_schedule_1f1b_two_microbatches(off_model, enable_offload_reset=False)
-            off.fine_grained_offloading_reset()
+            off_interface.reset()
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 PipelineOffloadManager,
             )

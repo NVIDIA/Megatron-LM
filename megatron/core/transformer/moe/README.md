@@ -222,7 +222,7 @@ Offload the input activation at the granularity of modules
 # Choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
 --offload-modules expert_fc1
 ```
-For more details, please refer to the ```docs/source/api-guide/fine_grained_activation_offloading.md```
+For more details, please refer to the ```docs/user-guide/features/fine_grained_activation_offloading.md```
 
 ### MoE Related Arguments
 | Item | Description |
