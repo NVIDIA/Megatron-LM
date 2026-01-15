@@ -177,6 +177,22 @@ class HyperCommGrid:
 
         return self._pgs[unique_group_key]
 
+    def get_rank_enum(self, dims: Union[str, list[str]]) -> list[list[int]]:
+        r"""Get the rank enumeration for the requested dimension(s).
+
+        This is the exact enumeration that would be used by create_pg for the same
+        dims. It is useful for creating additional groups whose membership is derived from
+        the grid (e.g., embedding/position-embedding groups derived from PP groups).
+
+        Args:
+            dims: Dimension name or list of dimension names.
+
+        Returns:
+            List of rank lists (one per subgroup).
+        """
+        ordered_dims, _ = self._order_dims(dims)
+        return self._gen_rank_enum(ordered_dims)
+
     def _gen_rank_enum(self, dims: list[str]) -> list[list[int]]:
         r"""Generate rank enumeration before calling new_subgroups_by_enumeration
 
