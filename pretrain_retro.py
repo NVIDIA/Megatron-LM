@@ -12,7 +12,7 @@ from megatron.training import get_timers
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import tensor_parallel
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.datasets.retro.query.retro_dataset import get_retro_datasets

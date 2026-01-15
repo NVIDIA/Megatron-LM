@@ -52,8 +52,18 @@ def build_tokenizer(args):
         kwargs['use_fast'] = args.tokenizer_hf_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
         kwargs['include_special_tokens'] = args.tokenizer_hf_include_special_tokens
-    elif args.tokenizer_type == 'NullTokenizer':
-        tokenizer_library = 'null-text'
+    elif args.tokenizer_type == 'MultimodalTokenizer':
+        tokenizer_library = 'multimodal'
+        kwargs['prompt_format'] = args.tokenizer_prompt_format
+        kwargs['special_tokens'] = args.special_tokens
+        kwargs['image_tag_type'] = args.image_tag_type
+        kwargs['force_system_message'] = args.force_system_message
+    elif args.tokenizer_type == 'SFTTokenizer':
+        tokenizer_library = 'sft'
+        tokenizer_path = args.tokenizer_model
+        kwargs['prompt_format'] = args.sft_tokenizer_prompt_format
+    elif args.tokenizer_type in ['NullTokenizer', 'NullMultimodalTokenizer']:
+        tokenizer_library = 'null-text' if args.tokenizer_type == 'NullTokenizer' else 'null-multimodal'
         metadata = {'library': tokenizer_library}
         if args.vocab_size:
             kwargs['vocab_size'] = args.vocab_size
