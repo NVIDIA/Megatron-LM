@@ -1,7 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import copy
 import logging
 import warnings
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import astuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.optim import SGD as CPUSGD
@@ -33,6 +35,11 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+from megatron.core.optimizer_param_scheduler import (
+    ParamGroupOverride,
+    combine_param_group_overrides,
+    param_group_override_to_tuple,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
@@ -48,96 +55,112 @@ from .optimizer import (
     MegatronOptimizer,
     param_group_identifier_keys,
 )
-from .optimizer_config import OptimizerConfig
+from .optimizer_config import (
+    AdamOptimizerConfig,
+    OptimizerConfig,
+    ParamKey,
+    ParamPredicate,
+    SGDOptimizerConfig,
+)
 
 logger = logging.getLogger(__name__)
 
 
+def get_standard_config_overrides(
+    decoupled_lr: float | None = None, decoupled_min_lr: float | None = None
+) -> Dict[ParamKey, ParamGroupOverride]:
+    """Get standard config overrides for the optimizer, handling decoupled LR and common wd skips.
+
+    Args:
+        decoupled_lr (float | None): decoupled learning rate.
+        decoupled_min_lr (float | None): decoupled minimum learning rate.
+
+    Returns:
+        Dict[ParamKey, ParamGroupOverride]: standard config overrides.
+    """
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
+    if decoupled_lr is not None:
+        decoupled_lr_config: ParamGroupOverride = {"max_lr": decoupled_lr}
+        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
+        if decoupled_min_lr is not None:
+            decoupled_lr_config["min_lr"] = decoupled_min_lr
+        config_overrides[decoupled_param_key] = decoupled_lr_config
+
+    # Next construct the standard param group overrides for no weight decay on bias parameters
+    #  as well as any length 1 parameters.
+    param_length_1_match = ParamPredicate(
+        name="param_len_1", fn=lambda param: len(param.shape) == 1
+    )
+    param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
+    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+
+    return config_overrides
+
+
 def _get_param_groups(
     model_chunks: List[MegatronModule],
-    no_weight_decay_cond: Optional[Callable],
-    scale_lr_cond: Optional[Callable],
-    lr_mult: float,
-    lr: float,
-    min_lr: float,
-    decoupled_lr: Optional[float],
-    decoupled_min_lr: Optional[float],
-    default_skip_embedding_weight_decay: bool = False,
+    config: OptimizerConfig,
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
-    Creates parameter groups based on weight decay condition (regularized vs
-    non regularized), learning rate scale condition (lr vs lr_mult * lr),
-    and whether it is expert parameters. scale_lr_cond is used during finetuning
-    where head of the network requires a scaled version of the base learning rate.
+    Creates parameter groups from provided optimizer config object.
+
+    NOTE There can be more than one match between a ParamKey and a parameter.
+        What we do is merge all of the matching ParamKey overrides into a single ParamGroupOverride
+        for that parameter and use that as the key for that parameter. Any parameters that get
+        the same set of merged overrides will be mapped into the same parameter group.
 
     Args:
         model_chunks (List[MegatronModule]): model chunks to create parameter
             groups for.
-        no_weight_decay_cond (func, optional): function to determine whether a
-            parameter should not perform weight decay.
-        scale_lr_cond (func, optional): function to determine whether a parameter
-            should have a scaled learning rate.
-        lr_mult (float): learning rate multiplier for parameters that
-            satisfy scale_lr_cond.
-        lr (float): learning rate.
-        min_lr (float): minimum learning rate.
-        decoupled_lr (Optional[float]): optional decoupled learning rate.
-        decoupled_min_lr (Optional[float]): optional decoupled minimum learning rate.
-        default_skip_embedding_weight_decay (bool): whether to skip weight decay for embedding
-            parameters by default, if no_weight_decay_cond is not provided.
-
+        config (OptimizerConfig): optimizer configuration object.
+        config_overrides (Optional[Dict[ParamKey, ParamGroupOverride]): optimizer overrides,
+            specified on a per-layer basis. NOTE: if you want to skip applying weight decay on bias
+            and length 1 parameters, and also do not want to do any other overrides, set this to an
+            empty dictionary rather than the default value of None.
     Returns:
         List of parameter groups.
     """
 
-    use_decoupled_learning_rate = decoupled_lr is not None
-
-    # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
+    # Map (pg_overrides, is_expert_parallel) to params.
     params_map = {}
+
+    if config_overrides is None:
+        # TODO remove this default behavior eventually.
+        #  This is only needed for backwards compatibility with the old config overrides API where
+        #  the config_overrides argument by default lead to bias parameters and length 1 parameters.
+        #  We assume that users of decoupled LR already provide config overrides so will adapt
+        #  to the new API.
+        config_overrides = get_standard_config_overrides()
+
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
 
+            uses_default_config = False
+            # Get optimizer config overrides for this parameter.
+            param_overrides_list: list[ParamGroupOverride] = []
+            if config_overrides is not None:
+                for param_key, param_override in config_overrides.items():
+                    if param_key.matches(param, name):
+                        param_overrides_list.append(param_override)
+
+            if param_overrides_list:
+                param_override: ParamGroupOverride | None = combine_param_group_overrides(
+                    param_overrides_list
+                )
+            else:
+                param_override = None
+
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
-            if no_weight_decay_cond is not None:
-                no_wd: bool = no_weight_decay_cond(name, param)
-            else:
-                # Do not regularize biases and norm parameters.
-                #  optionally, also skip weight decay for embedding parameters if requested
-                #  (useful if you do not want embeddings to shrink to zero in training
-                #  https://arxiv.org/abs/2312.16903)
-                no_wd = (
-                    name.endswith(".bias")
-                    or len(param.shape) == 1
-                    or (default_skip_embedding_weight_decay and "embedding" in name)
-                )
-
-            if scale_lr_cond is not None:
-                scale_lr = scale_lr_cond(name, param)
-            else:
-                scale_lr = False
-
-            if not no_wd and not scale_lr:
-                wd_mult, _lr_mult = 1.0, 1.0
-            elif not no_wd and scale_lr:
-                wd_mult, _lr_mult = 1.0, lr_mult
-            elif no_wd and not scale_lr:
-                wd_mult, _lr_mult = 0.0, 1.0
-            else:
-                wd_mult, _lr_mult = 0.0, lr_mult
-
-            is_decoupled_lr = False
-            # For input/embedding and output layer: embedding.word_embeddings.weight /
-            # output_layer.weight.
-            if use_decoupled_learning_rate and getattr(
-                param, 'is_embedding_or_output_parameter', False
-            ):
-                is_decoupled_lr = True
-
-            key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+            # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
+            param_override_tuple: tuple[tuple[str, Any], ...] | None = (
+                param_group_override_to_tuple(param_override)
+            )
+            key = (param_override_tuple, is_expert_parallel)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -152,70 +175,49 @@ def _get_param_groups(
         for key in keys:
             if key not in params_key:
                 params_key.append(key)
-
+    # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
-    for key in params_key:
-        wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr = key
+    # Sort keys, None first.
+    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
+        param_override_tuple, is_expert_parallel = key
         params = params_map[key] if key in params_map else []
+        if param_override_tuple is None:
+            param_override: ParamGroupOverride = {}
+        else:
+            param_override: ParamGroupOverride = {k: v for (k, v) in param_override_tuple}
+
+        # False if param_group_override is None or empty tuple or if we do not modify the
+        #  LR schedule.
+        #  NOTE: "default_config" is used for logging the learning rate in training.py.
+        #   so set to True if we do not modify the learning rate.
+        #  if param_group['default_config']:
+        #    learning_rate = param_group['lr']
+        uses_default_lr_schedule: bool = (not bool(param_override_tuple)) or not any(
+            ["lr" in k for k in param_override]
+        )
+
+        # TODO: Remove "backwards compatible" fields below eventually.
+        default_config: ParamGroupOverride = {
+            'wd_mult': 1.0,
+            'lr_mult': 1.0,
+            'is_decoupled_lr': False,
+            # The following two fields may be important to keep even when we remove the
+            #   above "backwards compatible" fields.
+            "max_lr": config.lr,  # user may override this in param_override
+            "min_lr": config.min_lr,  # user may override this in param_override
+        }
+        assert (
+            "params" not in param_override
+        ), "'params' should not be in param_override, this is a protected key"
         param_group = {
             'params': params,
-            'wd_mult': wd_mult,
-            'lr_mult': _lr_mult,
             'is_expert_parallel': is_expert_parallel,
-            'is_decoupled_lr': is_decoupled_lr,
+            'default_config': uses_default_lr_schedule,
+            **default_config,
+            **param_override,  # keep **param_override last so that users can override other fields.
         }
-        # Ensure param_group has required keys for matching when loading optimizer state
-        # See MegatronOptimizer._filter_and_reorder_param_groups.
-        assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
         param_groups.append(param_group)
 
-    param_groups = _update_min_and_max_lr_in_param_groups(
-        param_groups,
-        lr=lr,
-        min_lr=min_lr,
-        decoupled_lr=decoupled_lr,
-        decoupled_min_lr=decoupled_min_lr,
-    )
-
-    return param_groups
-
-
-def _update_min_and_max_lr_in_param_groups(
-    param_groups: List[Dict],
-    lr: float,
-    min_lr: float,
-    decoupled_lr: Optional[float],
-    decoupled_min_lr: Optional[float],
-) -> List[Dict]:
-    """
-    Updates `max_lr` and `min_lr` values in each parameter group, and returns new list.
-    By default, each group will use `lr` / `min_lr` as `max_lr` / `min_lr`.
-    If `decoupled_lr` is provided, then `decoupled_lr` / `decoupled_min_lr` will be used
-    as `max_lr` / `min_lr` for the input and output layer.
-
-    Args:
-        param_groups (List): parameter groups whose 'max_lr' and `min_lr` fields need to
-            be adjusted.
-        lr (float): learning rate.
-        min_lr (float): minimum learning rate.
-        decoupled_lr (Optional[float]): optional decoupled learning rate.
-        decoupled_min_lr (Optional[float]): optional decoupled minimum learning rate.
-
-    Returns:
-        List of adjusted parameter groups.
-    """
-
-    if decoupled_min_lr is None:
-        decoupled_min_lr = min_lr
-
-    for param_group in param_groups:
-        if param_group['is_decoupled_lr']:
-            assert decoupled_lr is not None
-            param_group['max_lr'] = decoupled_lr
-            param_group['min_lr'] = decoupled_min_lr
-        else:
-            param_group['max_lr'] = lr
-            param_group['min_lr'] = min_lr
     return param_groups
 
 
@@ -223,12 +225,9 @@ def _get_param_groups_and_buffers(
     model_chunks: List[MegatronModule],
     model_chunk_offset: int,
     config: OptimizerConfig,
-    no_weight_decay_cond: Optional[Callable],
-    scale_lr_cond: Optional[Callable],
-    lr_mult: float,
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
     filter_fn: Callable,
     buffer_name: str,
-    default_skip_embedding_weight_decay: bool = False,
 ) -> Tuple[List[Dict], Dict[int, List[_ParamAndGradBuffer]]]:
     """Returns parameter groups and buffer for optimizer.
 
@@ -237,33 +236,17 @@ def _get_param_groups_and_buffers(
             groups for.
         model_chunk_offset (int): offset of model_chunks in global model_chunks list.
         config (OptimizerConfig): optimizer configuration object.
-        no_weight_decay_cond (func, optional): function to determine whether a
-            parameter should not perform weight decay.
-        scale_lr_cond (func, optional): function to determine whether a parameter
-            should have a scaled learning rate.
-        lr_mult (float): learning rate multiplier for parameters that
-            satisfy scale_lr_cond.
+        config_overrides (Optional[Dict[ParamKey, ParamGroupOverride]): optimizer/scheduler
+            overrides, specified on the basis of ParamKey matches with each parameter.
         lr (float): learning rate.
         min_lr (float): minimum learning rate.
         filter_fn (callable): filtering function for param_groups.
         buffer_name (str): name of buffer.
-        default_skip_embedding_weight_decay (bool): whether to skip weight decay for
-            embedding parameters by default, if no_weight_decay_cond is not provided.
 
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
-    param_groups = _get_param_groups(
-        model_chunks,
-        no_weight_decay_cond,
-        scale_lr_cond,
-        lr_mult,
-        lr=config.lr,
-        min_lr=config.min_lr,
-        decoupled_lr=config.decoupled_lr,
-        decoupled_min_lr=config.decoupled_min_lr,
-        default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
-    )
+    param_groups = _get_param_groups(model_chunks, config, config_overrides)
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
@@ -284,6 +267,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     data_parallel_group_idx: Optional[int] = None,
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
 
@@ -304,9 +288,12 @@ def _get_megatron_optimizer_based_on_param_groups(
     Returns:
         Instance of MegatronOptimizer.
     """
-    # when freezing sub-models we may have no trainable parameters on a rank and
+    # TODO: Logic needs to be updated to handle different optimizer types (i.e., param_groups
+    # passed into this function need to correspond to the same optimizer).
+
+    # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
-    # for the purposes of grad stats reductions
+    # for the purposes of grad stats reductions.
     if param_groups:
         if config.optimizer_cpu_offload:
             if torch.__version__ < '2.3.0':
@@ -470,17 +457,48 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
+    if pg_collection is None or not hasattr(pg_collection, 'tp'):
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+    else:
+        tp_group = pg_collection.tp
+    # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
+    setattr(optimizer, 'tp_group', tp_group)
+
     return optimizer
+
+
+def check_config_overrides_consistency(
+    config: OptimizerConfig, config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]]
+):
+    """Check if the config overrides are consistent with the config."""
+
+    # TODO: Remove `optimizer` from this eventually (e.g., if we use Muon for some layers and
+    # Adam for other layers). This would need some more refactoring to work though (param_groups
+    # filtered by optimizer passed into _get_megatron_optimizer_based_on_param_groups).
+    if config_overrides is not None:
+        fields_to_check_for_consistency = [
+            'overlap_param_gather_with_optimizer_step',
+            'optimizer',
+            'optimizer_cpu_offload',
+        ]
+        for field_name in fields_to_check_for_consistency:
+            base_field = getattr(config, field_name, None)
+            all_config_overrides = list(config_overrides.values())
+            for config_override in all_config_overrides:
+                if field_name in config_override:
+                    field = config_override[field_name]
+                    if field != base_field:
+                        raise ValueError(
+                            f"Field {field_name} should not be overriden in a config override."
+                        )
+    return True
 
 
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
-    no_weight_decay_cond: Optional[Callable] = None,
-    scale_lr_cond: Optional[Callable] = None,
-    lr_mult: float = 1.0,
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
     use_gloo_process_groups: bool = True,
-    default_skip_embedding_weight_decay: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
     dump_param_to_param_group_map: Optional[str] = None,
 ) -> MegatronOptimizer:
@@ -491,18 +509,11 @@ def get_megatron_optimizer(
     Args:
         config (OptimizerConfig): optimizer configuration object.
         model_chunks (List[MegatronModule]): model chunks to get optimizer for.
-        no_weight_decay_cond (func, optional): function to determine whether a parameter
-            should not perform weight decay. Defaults to None.
-        scale_lr_cond (func, optional): function to determine whether a parameter
-            should have a scaled learning rate. Defaults to None.
-        lr_mult (float, optional): learning rate multiplier for parameters that
-            satisfy scale_lr_cond. Defaults to 1.0.
+        config_overrides (Optional[Dict[ParamKey, OptimizerConfig]]): optional dictionary of
+            optimizer configuration objects to override default optimizer behavior for different
+            subsets of parameters (identified by ParamKey).
         use_gloo_process_groups (bool): if false, disable use of Gloo process groups
             in underlying Megatron optimizers.
-        default_skip_embedding_weight_decay (bool): whether to skip weight decay for
-            embedding parameters by default, if no_weight_decay_cond is not provided.
-            This is useful if you do not want embeddings to shrink to zero in training
-            as recommended in https://arxiv.org/abs/2312.16903
         pg_collection: Optional unified process group for distributed training.
         dump_param_to_param_group_map (Optional[str]): path to dump parameter to param group map.
 
@@ -511,6 +522,8 @@ def get_megatron_optimizer(
     """
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
+
+    check_config_overrides_consistency(config, config_overrides)
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
@@ -521,23 +534,23 @@ def get_megatron_optimizer(
         overlap_param_gather_with_optimizer_step_flags = [False]
 
     # Setup process groups using helper method
-    process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+    process_groups_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(
         pg_collection, model_chunks, use_gloo_process_groups
     )
 
-    dp_cp_group = process_groups['dp_cp_group']
-    intra_dp_cp_group = process_groups['intra_dp_cp_group']
-    intra_expt_dp_group = process_groups['intra_expt_dp_group']
-    mp_group = process_groups['mp_group']
-    expt_tp_pp_group = process_groups['expt_tp_pp_group']
-    intra_dp_cp_group_gloo = process_groups['intra_dp_cp_group_gloo']
-    intra_expt_dp_group_gloo = process_groups['intra_expt_dp_group_gloo']
-    intra_dist_opt_group = process_groups['intra_dist_opt_group']
+    dp_cp_group = process_groups_dict['dp_cp_group']
+    intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
+    intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
+    mp_group = process_groups_dict['mp_group']
+    expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
+    intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
+    intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
+    intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
     model_parallel_rank = get_pg_rank(mp_group)
 
     if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
-        inter_dist_opt_group = process_groups['inter_dist_opt_group']
+        inter_dist_opt_group = process_groups_dict['inter_dist_opt_group']
         distributed_optimizer_instance_id = get_pg_rank(inter_dist_opt_group)
     else:
         distributed_optimizer_instance_id = 0
@@ -553,17 +566,14 @@ def get_megatron_optimizer(
                 model_chunk,
                 model_chunk_offset=model_chunk_offset,
                 config=config,
-                no_weight_decay_cond=no_weight_decay_cond,
-                scale_lr_cond=scale_lr_cond,
-                lr_mult=lr_mult,
+                config_overrides=config_overrides,
                 filter_fn=lambda g: True,
                 buffer_name='buffers',
-                default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
             )
 
             optimizers.append(
                 _get_megatron_optimizer_based_on_param_groups(
-                    config,
+                    config=config,
                     model_chunks=model_chunk,
                     param_groups=param_groups,
                     per_model_buffers=buffers,
@@ -573,6 +583,7 @@ def get_megatron_optimizer(
                     data_parallel_group_idx=model_parallel_rank,
                     intra_dist_opt_group=intra_dist_opt_group,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                    pg_collection=pg_collection,
                 )
             )
             model_chunk_offset += 1
@@ -592,12 +603,9 @@ def get_megatron_optimizer(
             dense_model_chunks,
             model_chunk_offset=model_chunk_offset,
             config=config,
-            no_weight_decay_cond=no_weight_decay_cond,
-            scale_lr_cond=scale_lr_cond,
-            lr_mult=lr_mult,
+            config_overrides=config_overrides,
             filter_fn=lambda g: not g['is_expert_parallel'],
             buffer_name='buffers',
-            default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
         )
         for model_chunk in dense_model_chunks:
             model_chunk.overlap_param_gather_with_optimizer_step = (
@@ -613,7 +621,7 @@ def get_megatron_optimizer(
         # Pass Gloo process groups into optimizer only if needed.
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
-                config,
+                config=config,
                 model_chunks=dense_model_chunks,
                 param_groups=param_groups,
                 per_model_buffers=buffers,
@@ -623,6 +631,7 @@ def get_megatron_optimizer(
                 data_parallel_group_idx=model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                pg_collection=pg_collection,
             )
         )
         model_chunk_offset += 1
@@ -631,12 +640,9 @@ def get_megatron_optimizer(
         model_chunks,
         model_chunk_offset=0,
         config=config,
-        no_weight_decay_cond=no_weight_decay_cond,
-        scale_lr_cond=scale_lr_cond,
-        lr_mult=lr_mult,
+        config_overrides=config_overrides,
         filter_fn=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
-        default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
     )
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:
@@ -653,7 +659,7 @@ def get_megatron_optimizer(
             expt_data_parallel_group_gloo = None
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
-                config,
+                config=config,
                 model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
@@ -663,6 +669,7 @@ def get_megatron_optimizer(
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                pg_collection=pg_collection,
             )
         )
 

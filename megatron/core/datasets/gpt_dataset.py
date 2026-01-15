@@ -49,6 +49,24 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
+    context_parallel_size: int = 1
+    """Option to enable context parallelism"""
+
+    data_parallel_size: int = 1
+    """Option to enable data parallelism"""
+
+    sequence_parallel_size: int = 0
+    """Option to indicate the sequence parallelism size when using TP
+    Set to 0 if sequence parallel is not enabled regardless of TP size.
+    """
+
+    hybrid_context_parallel: bool = False
+    """Option to enable hybrid context parallelism. When setting this to True, 
+    each sample should be divisible by the data parallel size * context parallel size * 2.
+    If sequence parallel is enabled, it should be divisible by the 
+    data parallel size * context parallel size * sequence parallel size * 2.
+    """
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -157,7 +175,7 @@ class GPTDataset(MegatronDataset):
         """Abstract method implementation
 
         Args:
-            idx (Optioal[int]): The index into the dataset
+            idx (Optional[int]): The index into the dataset
 
         Returns:
             Dict[str, torch.Tensor]: The sample information wrapped in a dictionary
@@ -724,7 +742,7 @@ class MockGPTLowLevelDataset:
         return sample
 
     def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
-        """This function is n abstraction over __getitem__ with support for slicing
+        """This function is an abstraction over __getitem__ with support for slicing
 
         Args:
             idx (int): The index into the dataset
@@ -745,7 +763,7 @@ class MockGPTDataset(GPTDataset):
     """The mock GPT dataset
 
     Args:
-        indexed_dataset (MockGPTLowLevelDataset): The MockGPTLowLevelDataset around which to build
+        dataset (MockGPTLowLevelDataset): The MockGPTLowLevelDataset around which to build
             the MockGPTDataset
 
         dataset_path (Optional[str]): This argument is of no consequence for the MockGPTDataset

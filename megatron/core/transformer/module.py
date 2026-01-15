@@ -9,6 +9,7 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -167,7 +168,10 @@ class GraphableMegatronModule(MegatronModule):
         assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
 
         # Enable cuda graphs.
-        if config.cuda_graph_impl == "local":
+        if (
+            config.cuda_graph_impl == "local"
+            and CudaGraphScope.full_iteration not in config.cuda_graph_scope
+        ):
             from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
             self.cudagraph_manager = CudaGraphManager(config, vp_stage=vp_stage)
@@ -393,7 +397,9 @@ class Float16Module(MegatronModule):
         self.config = config
         self.fp16 = config.fp16
         self.bf16 = config.bf16
+        self.vp_size = config.virtual_pipeline_model_parallel_size
         self.vp_stage = getattr(module, 'vp_stage', None)
+        self.pg_collection = getattr(module, 'pg_collection', None)
 
         if self.fp16:
             self.add_module('module', module.half())
@@ -438,11 +444,23 @@ class Float16Module(MegatronModule):
             The wrapped module's outputs, potentially upcast to fp32 depending on pipeline stage
             and ``fp32_output``.
         """
-        if parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=self.vp_stage):
+        from megatron.core.pipeline_parallel.utils import (
+            is_pp_first_stage,
+            is_pp_last_stage,
+            is_vp_first_stage,
+            is_vp_last_stage,
+        )
+
+        if self.pg_collection is None:
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+        else:
+            pp_group = self.pg_collection.pp
+        if is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(pp_group):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
         if (
-            parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=self.vp_stage)
+            is_vp_last_stage(self.vp_stage, self.vp_size)
+            and is_pp_last_stage(pp_group)
             and fp32_output is True
         ):
             outputs = float16_to_fp32(outputs)

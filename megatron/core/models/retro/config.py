@@ -7,10 +7,11 @@ from dataclasses import dataclass
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import experimental_api, is_te_min_version
 
 
 @dataclass
+@experimental_api
 class RetroConfig(TransformerConfig):
     """Configuration object for Retro models."""
 

@@ -270,7 +270,7 @@ def checkpoint_exists(checkpoints_path):
 def read_metadata(tracker_filename):
     # Read the tracker file and either set the iteration or
     # mark it as a release checkpoint.
-    iteration = 0
+    iteration = -1
     release = False
 
     with open_file(tracker_filename, 'r') as f:
@@ -283,7 +283,10 @@ def read_metadata(tracker_filename):
                 print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
                     tracker_filename))
                 sys.exit()
-    assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+            else:
+                # Set iteration to 0 for release checkpoints
+                iteration = 0
+    assert iteration > -1 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
 
     # Get the max iteration retrieved across the ranks.
@@ -336,8 +339,27 @@ def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
-        rng_state_list = ShardedObject('rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
-                                       replica_id=mpu.get_data_parallel_rank(with_context_parallel=True))
+        ep_size = mpu.get_expert_model_parallel_world_size()
+
+        if ep_size > 1:
+            # Shard RNG by PP, TP, DP when using expert parallelism.
+            dp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+            dp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+            rng_state_list = ShardedObject(
+                'rng_state',
+                rng_state_list,
+                (pp_size, tp_size, dp_size),
+                (pp_rank, tp_rank, dp_rank),
+                replica_id=0,
+            )
+        else:
+            rng_state_list = ShardedObject(
+                'rng_state',
+                rng_state_list,
+                (pp_size, tp_size),
+                (pp_rank, tp_rank),
+                replica_id=mpu.get_data_parallel_rank(with_context_parallel=True),
+            )
     elif ckpt_format == "fsdp_dtensor":
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -375,25 +397,12 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
     if args.use_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
         metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
 
-    # Force pre-mcore 0.14 behavior for PyTorch versions below 2.6a0
-    force_pre_mcore_014 = not is_torch_min_version("2.6a0")
-    if force_pre_mcore_014 and not args.dist_ckpt_save_pre_mcore_014:
-        logger.warning(f"PyTorch version {get_torch_version()} below 2.6 detected."
-                       f" Forcing dist_ckpt_save_pre_mcore_014 behavior.")
-
-    if args.dist_ckpt_save_pre_mcore_014 or force_pre_mcore_014:
-        if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
-            if args.ckpt_fully_parallel_save:
-                metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
-            else:
-                metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
-    else:
-        if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
-            if args.dist_ckpt_optim_fully_reshardable:
-                metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
-                metadata['distrib_optim_fully_reshardable_mem_efficient'] = args.distrib_optim_fully_reshardable_mem_efficient
-            else:
-                metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
+    if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
+        if args.dist_ckpt_optim_fully_reshardable:
+            metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
+            metadata['distrib_optim_fully_reshardable_mem_efficient'] = args.distrib_optim_fully_reshardable_mem_efficient
+        else:
+            metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
@@ -1361,6 +1370,9 @@ def load_args_from_checkpoint(
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
+    _set_arg('moe_router_score_function', force=True)
+    _set_arg('moe_router_enable_expert_bias', force=True)
+    _set_arg('moe_router_topk_scaling_factor', force=True)
 
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)
@@ -1372,6 +1384,9 @@ def load_args_from_checkpoint(
     # Heterogeneous args.
     _set_arg('heterogeneous_layers_config_path', force=True)
     _set_arg('heterogeneous_layers_config_encoded_json', force=True)
+
+    # MoE latent projection.
+    _set_arg('moe_latent_size', force=True)
 
     # Tokenizer args.
     _set_arg('tokenizer_type', force=True)
@@ -1763,6 +1778,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # rng states.
     if not release and not args.finetune and not args.no_load_rng and not ignore_rng_state:
         try:
+            cuda_rng_tracker = tensor_parallel.get_cuda_rng_tracker()
+            graph_safe_rng = tensor_parallel.is_graph_safe_cuda_rng_tracker(cuda_rng_tracker)
             if 'rng_state' in state_dict:
                 if args.ckpt_format == "fsdp_dtensor":
                     # FSDP DTensor checkpoints store rng_state in a different format.
@@ -1788,8 +1805,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 # Check for empty states array
                 if not rng_state['rng_tracker_states']:
                     raise KeyError
-                tensor_parallel.get_cuda_rng_tracker().set_states(
-                    rng_state['rng_tracker_states'])
+                rng_tracker_states = {
+                    k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
+                    for k, v in rng_state['rng_tracker_states'].items()
+                }
             else:  # backward compatability
                 random.setstate(state_dict['random_rng_state'])
                 np.random.set_state(state_dict['np_rng_state'])
@@ -1798,8 +1817,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 # Check for empty states array
                 if not state_dict['rng_tracker_states']:
                     raise KeyError
-                tensor_parallel.get_cuda_rng_tracker().set_states(
-                    state_dict['rng_tracker_states'])
+                rng_tracker_states = {
+                    k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
+                    for k, v in state_dict['rng_tracker_states'].items()
+                }
+            cuda_rng_tracker.set_states(rng_tracker_states)
         except KeyError:
             print_rank_0('Unable to load rng state from checkpoint {}. '
                          'Specify --no-load-rng or --finetune to prevent '
@@ -1827,6 +1849,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Notify FT that a checkpoint was loaded.
         is_local_chkpt = (ckpt_type == CheckpointType.LOCAL)
         ft_integration.on_checkpoint_loaded(is_local_chkpt=is_local_chkpt)
+
+    # Patch checkpoint as needed if required field is not found.
+    if optimizer is not None:
+        log_printed = False
+        for param_group in optimizer.param_groups:
+            if 'default_config' not in param_group:
+                param_group['default_config'] = True
+                if not log_printed:
+                    print_rank_0(">>> Inserting 'default_config' field into optimizer.param_groups...")
+                log_printed = True
 
     return iteration, num_floating_point_operations_so_far
 

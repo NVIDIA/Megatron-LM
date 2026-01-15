@@ -80,6 +80,39 @@ def make_viewless(e):
     return e
 
 
+def set_ideal_affinity_for_current_gpu():
+    """Set CPU affinity for the current GPU to optimize host-device transfers."""
+    import uuid
+
+    try:
+        import cuda.bindings.driver as cuda_driver
+        import cuda.bindings.runtime as cuda_runtime
+    except ImportError:
+        try:
+            import cuda.cuda as cuda_driver
+            import cuda.cudart as cuda_runtime
+        except ImportError:
+            # print("cuda-python may not be installed, skipping GPU affinity setting")
+            warnings.warn("cuda-python may not be installed, skipping GPU affinity setting")
+            return
+    try:
+        import pynvml
+    except ImportError:
+        warnings.warn("pynvml is not installed, skipping GPU affinity setting")
+        return
+
+    # Get current CUDA device ID
+    err, device_id = cuda_runtime.cudaGetDevice()
+    assert err == cuda_runtime.cudaError_t.cudaSuccess
+    # Get device UUID
+    err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id)
+    assert err == cuda_driver.CUresult.CUDA_SUCCESS
+    # Set CPU affinity based on GPU's NUMA node
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
+    pynvml.nvmlDeviceSetCpuAffinity(handle)
+
+
 @contextmanager
 def stream_acquire_context(stream, event):
     """Stream acquire context"""
@@ -149,6 +182,8 @@ class ScheduleNode:
         self.free_input = free_input
         self.inputs = None
         self.outputs = None
+        self.manual_grads_release = False
+        self.delay_grads_release = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -230,6 +265,12 @@ class ScheduleNode:
             for g in output_grad:
                 if g is not None:
                     g.record_stream(self.stream)
+                    # Manually trigger the memory release of dgrad tensor
+                    # to avoid delayed garbage collection. If
+                    # delay_grads_release is True, dgrad is last used in
+                    # wgrad compute and skip the release here.
+                    if self.manual_grads_release and not self.delay_grads_release:
+                        g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
         self._release_state()

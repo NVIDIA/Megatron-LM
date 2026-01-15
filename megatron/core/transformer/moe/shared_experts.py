@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from copy import deepcopy
+from copy import copy
 from typing import Optional
 
 import torch
@@ -43,7 +43,7 @@ class SharedExpertMLP(MLP):
         gate: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        config = deepcopy(config)
+        config = copy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
@@ -62,9 +62,11 @@ class SharedExpertMLP(MLP):
         else:
             self.gate_weight = None
 
-        if (self.config.fp8 and is_te_min_version("2.6.0dev0")) or (
-            self.config.fp4 and is_te_min_version("2.7.0.dev0")
-        ):
+        if (
+            self.config.fp8
+            and self.config.fp8_recipe != 'delayed'
+            and is_te_min_version("2.6.0dev0")
+        ) or (self.config.fp4 and is_te_min_version("2.7.0.dev0")):
             # For fp8/fp4 training, the output of pre_mlp_layernorm is saved by router, and
             # the shared expert linear_fc1 also saves the quantized tensor of this output.
             # Here we set the linear_fc1 to save the original input tensors to avoid the extra

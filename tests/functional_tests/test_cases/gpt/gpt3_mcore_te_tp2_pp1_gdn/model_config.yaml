@@ -3,6 +3,7 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
+  ENABLE_LIGHTWEIGHT_MODE: true
 MODEL_ARGS:
   # Add network size args
   --untie-embeddings-and-output-weights: true
@@ -18,13 +19,22 @@ MODEL_ARGS:
   --apply-layernorm-1p: true
   --attention-output-gate: true
   --no-weight-decay-cond-type: apply_wd_to_qk_layernorm
-  --linear-attention-type: gated_delta_net
+  --experimental-attention-variant: gated_delta_net
   --linear-attention-freq: 3
   --linear-conv-kernel-dim: 4
   --linear-key-head-dim: 64
   --linear-value-head-dim: 64
   --linear-num-key-heads: 4
   --linear-num-value-heads: 8
+  # Add MoE args
+  --num-experts: 32
+  --moe-ffn-hidden-size: 64
+  --moe-shared-expert-intermediate-size: 64
+  --moe-shared-expert-gate: true
+  --moe-router-load-balancing-type: aux_loss
+  --moe-router-topk: 8
+  --disable-bias-linear: true
+  --moe-router-dtype: fp32
   # Add logging args
   --log-params-norm: true
   --log-num-zeros-in-grad: true

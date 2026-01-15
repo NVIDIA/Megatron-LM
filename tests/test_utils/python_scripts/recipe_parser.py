@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import itertools
 import logging
@@ -23,6 +24,8 @@ class dotdict(dict):
 def resolve_cluster_config(cluster: str) -> str:
     if cluster == "dgxh100_eos":
         return "eos"
+    if cluster == "dgxgb200_oci-hsg":
+        return "oci-hsg"
     if cluster == "dgxa100_dracooci":
         return "draco-oci-iad"
     if cluster == "dgxa100_dracooci-ord":
@@ -34,28 +37,36 @@ def resolve_cluster_config(cluster: str) -> str:
     raise ValueError(f"Unknown cluster {cluster} provided.")
 
 
-def resolve_artifact_config(cluster: str) -> str:
-    if cluster == "dgxh100_eos":
-        return "eos_lustre"
-    if cluster == "dgxa100_dracooci":
-        return "draco-oci_lustre"
-    if cluster == "dgxa100_dracooci-ord":
-        return "draco-oci-ord_lustre"
-    if cluster == "dgxh100_coreweave":
-        return "coreweave_lustre"
-    raise ValueError(f"Unknown cluster {cluster} provided.")
-
-
 def flatten_products(workload_manifest: dotdict) -> dotdict:
     """Flattens a nested dict of products"""
-    workload_manifest.products = [
-        dict(**dict(zip(inp.keys(), values)), **{"test_case": product["test_case"][0]})
-        for product in (workload_manifest.products or [])
-        if "products" in product
-        for inp in product["products"]
-        for values in itertools.product(*inp.values())
-    ]
+    expanded_products = []
 
+    for product in workload_manifest.products or []:
+        # Skip products that don't have nested product specifications
+        if "products" not in product:
+            continue
+
+        test_case = product["test_case"][0]
+
+        # Iterate over each input specification in the product
+        for inp in product["products"]:
+            # Generate all combinations of the input values (Cartesian product)
+            model_config = inp.pop("model_config", None)
+            runtime_config = inp.pop("runtime_config", None)
+            keys = inp.keys()
+            value_combinations = itertools.product(*inp.values())
+
+            # Create a flattened product dict for each combination
+            for values in value_combinations:
+                product_dict = dict(zip(keys, values))
+                product_dict["test_case"] = test_case
+                if model_config:
+                    product_dict["model_config"] = model_config
+                if runtime_config:
+                    product_dict["runtime_config"] = runtime_config
+                expanded_products.append(product_dict)
+
+    workload_manifest.products = expanded_products
     return workload_manifest
 
 
@@ -98,11 +109,16 @@ def load_and_flatten(config_path: str) -> List[dotdict]:
 
 def filter_by_test_case(workload_manifests: List[dotdict], test_case: str) -> Optional[dotdict]:
     """Returns a workload with matching name. Raises an error if there no or more than a single workload."""
+    print(len(workload_manifests))
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
         if workload_manifest["spec"]["test_case"] == test_case
     )
+    print(len(workload_manifests))
+
+    for w in workload_manifests:
+        print(w["spec"]["test_case"])
 
     if len(workload_manifests) > 1:
         logger.info("Duplicate test_case found!")

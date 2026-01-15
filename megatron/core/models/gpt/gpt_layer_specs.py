@@ -4,9 +4,14 @@ import warnings
 from typing import Optional, Union
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
-from megatron.core.models.gpt.linear_attention_module_specs import (
-    get_linear_attention_module_spec_for_backend,
+from megatron.core.models.backends import (
+    BackendSpecProvider,
+    InferenceSpecProvider,
+    LocalSpecProvider,
+)
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_module_spec_for_backend,
+    is_linear_attention_variant,
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -24,6 +29,7 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_spec_for_backend,
     get_mtp_num_layers_to_build,
 )
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import (
@@ -36,9 +42,10 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
+from megatron.core.utils import is_te_min_version
 
 try:
-    import transformer_engine as te  # pylint: disable=unused-import
+    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
 
     from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -48,7 +55,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import nvidia_kitchen  # pylint: disable=unused-import
+    import nvidia_kitchen  # type: ignore[import-not-found]  # pylint: disable=unused-import
 
     from megatron.core.extensions.kitchen import KitchenSpecProvider
 
@@ -57,7 +64,7 @@ except ImportError:
     HAVE_KITCHEN = False
 
 try:
-    import apex  # pylint: disable=unused-import
+    import apex  # type: ignore[import-untyped]  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -73,12 +80,108 @@ except ImportError:
     HAVE_APEX = False
 
 
+def get_gpt_layer_with_inference_spec(
+    qk_layernorm: Optional[bool] = False,
+    multi_latent_attention: Optional[bool] = False,
+    qk_l2_norm: Optional[bool] = False,
+) -> ModuleSpec:
+    """Use this spec to use inference optimized linear layers.
+    Args:
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+    """
+    assert HAVE_TE, "--transformer-impl inference_optimized requires transformer engine"
+    backend = InferenceSpecProvider()
+
+    mlp = get_mlp_module_spec_for_backend(
+        backend=backend,
+        num_experts=None,
+        moe_grouped_gemm=False,
+        moe_use_legacy_grouped_gemm=False,
+        use_te_op_fuser=False,
+        use_te_activation_func=False,
+    )
+
+    if multi_latent_attention:
+        assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+        linear_q_up_proj = (
+            backend.column_parallel_layer_norm_linear()
+            if qk_layernorm
+            else backend.column_parallel_linear()
+        )
+        linear_kv_up_proj = (
+            backend.column_parallel_layer_norm_linear()
+            if qk_layernorm
+            else backend.column_parallel_linear()
+        )
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=backend.layer_norm(),
+                self_attention=ModuleSpec(
+                    module=MLASelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=backend.column_parallel_linear(),
+                        linear_q_down_proj=backend.linear(),
+                        linear_q_up_proj=linear_q_up_proj,
+                        linear_kv_down_proj=backend.linear(),
+                        linear_kv_up_proj=linear_kv_up_proj,
+                        core_attention=backend.core_attention(),
+                        linear_proj=backend.row_parallel_linear(),
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=IdentityOp,
+                mlp=mlp,
+                mlp_bda=get_bias_dropout_add,
+            ),
+        )
+    else:
+        qk_norm = backend.layer_norm(for_qk=True)
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=SelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=SelfAttentionSubmodules(
+                        linear_qkv=backend.column_parallel_layer_norm_linear(),
+                        core_attention=backend.core_attention(),
+                        linear_proj=backend.row_parallel_linear(),
+                        q_layernorm=(
+                            L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                        ),
+                        k_layernorm=(
+                            L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                        ),
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=IdentityOp,
+                mlp=mlp,
+                mlp_bda=get_bias_dropout_add,
+                sharded_state_dict_keys_map={
+                    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
+                    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
+                    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
+                    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
+                    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
+                    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
+                },
+            ),
+        )
+
+
 def get_gpt_layer_with_transformer_engine_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
-    linear_attention_type: Optional[str] = None,
+    experimental_attention_variant: Optional[str] = None,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
@@ -87,6 +190,8 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
     fallback_to_eager_attn: bool = False,
+    use_kitchen_attention: bool = False,
+    kitchen_attention_backend: str = "sdpa",
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -96,7 +201,8 @@ def get_gpt_layer_with_transformer_engine_spec(
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use multi-latent attention. Defaults to False.
-        linear_attention_type (str, optional): The type of linear attention. Defaults to None.
+        experimental_attention_variant (str, optional): The type of experimental attention variant.
+                                                        Defaults to None.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
@@ -119,7 +225,9 @@ def get_gpt_layer_with_transformer_engine_spec(
     if use_kitchen:
         assert HAVE_KITCHEN
         backend: BackendSpecProvider = KitchenSpecProvider(
-            fallback=TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn)
+            fallback=TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn),
+            use_kitchen_attention=use_kitchen_attention,
+            kitchen_attention_backend=kitchen_attention_backend,
         )
         if use_te_op_fuser:
             raise AssertionError("use_te_op_fuser not compatible with using kitchen in mlp.")
@@ -133,7 +241,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     attention = get_attention_module_spec_for_backend(
         backend=backend,
         sharded_state_dict_keys_map=sharded_state_dict_keys_map,
-        linear_attention_type=linear_attention_type,
+        experimental_attention_variant=experimental_attention_variant,
         qk_layernorm=qk_layernorm,
         qk_l2_norm=qk_l2_norm,
         multi_latent_attention=multi_latent_attention,
@@ -166,12 +274,14 @@ def get_gpt_layer_local_spec(
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
-    linear_attention_type: Optional[str] = None,
+    experimental_attention_variant: Optional[str] = None,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
+    use_kitchen_attention: bool = False,
+    kitchen_attention_backend: str = "sdpa",
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -181,7 +291,8 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use multi-latent attention. Defaults to False.
-        linear_attention_type (str, optional): The type of linear attention. Defaults to None.
+        experimental_attention_variant (str, optional): The type of experimental attention variant.
+                                                        Defaults to None.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
@@ -195,7 +306,11 @@ def get_gpt_layer_local_spec(
 
     if use_kitchen:
         assert HAVE_KITCHEN
-        backend = KitchenSpecProvider(fallback=LocalSpecProvider())
+        backend = KitchenSpecProvider(
+            fallback=LocalSpecProvider(),
+            use_kitchen_attention=use_kitchen_attention,
+            kitchen_attention_backend=kitchen_attention_backend,
+        )
     else:
         backend = LocalSpecProvider()
 
@@ -205,15 +320,17 @@ def get_gpt_layer_local_spec(
             " and will be removed soon. Please update your code accordingly."
         )
 
-    if linear_attention_type is not None:
-        raise NotImplementedError("Linear attention is not supported with local spec yet.")
+    if experimental_attention_variant is not None:
+        raise NotImplementedError(
+            "Experimental attention variant is not supported with local spec yet."
+        )
 
     sharded_state_dict_keys_map = {}
 
     attention = get_attention_module_spec_for_backend(
         backend=backend,
         sharded_state_dict_keys_map=sharded_state_dict_keys_map,
-        linear_attention_type=linear_attention_type,
+        experimental_attention_variant=experimental_attention_variant,
         qk_layernorm=qk_layernorm,
         qk_l2_norm=qk_l2_norm,
         multi_latent_attention=multi_latent_attention,
@@ -281,7 +398,7 @@ FUSE_INPUT_LAYERNORM = os.environ.get("FUSE_INPUT_LAYERNORM", "0") == "1"
 def get_attention_module_spec_for_backend(
     backend: BackendSpecProvider,
     sharded_state_dict_keys_map: dict,
-    linear_attention_type: Optional[str] = None,
+    experimental_attention_variant: Optional[str] = None,
     qk_layernorm: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
@@ -291,11 +408,17 @@ def get_attention_module_spec_for_backend(
 ) -> ModuleSpec:
     """Helper function to get module spec for Attention"""
 
-    if linear_attention_type is not None:
-        return get_linear_attention_module_spec_for_backend(
-            backend=backend,
-            linear_attention_type=linear_attention_type,
-            normalization=normalization,
+    if experimental_attention_variant is not None:
+        return get_experimental_attention_variant_module_spec_for_backend(
+            backend,
+            sharded_state_dict_keys_map,
+            experimental_attention_variant,
+            qk_layernorm,
+            qk_l2_norm,
+            multi_latent_attention,
+            mla_down_proj_use_column_parallel,
+            normalization,
+            fallback_to_eager_attn,
         )
 
     # Adjust for RMS norm.
@@ -506,6 +629,8 @@ def get_gpt_decoder_layer_specs(
         "qk_l2_norm": qk_l2_norm,
         "use_kitchen": config.use_kitchen,
         "normalization": normalization,
+        "use_kitchen_attention": config.use_kitchen_attention,
+        "kitchen_attention_backend": config.kitchen_attention_backend,
     }
     if use_transformer_engine:
         layer_norm_impl = TENorm
@@ -529,21 +654,29 @@ def get_gpt_decoder_layer_specs(
                 num_experts = None
                 moe_grouped_gemm = None
             if attention_type == "linear_attention":
-                if config.linear_attention_type is None:
+                multi_latent_attention = None
+                if is_linear_attention_variant(config.experimental_attention_variant):
+                    # There exists linear attention layer in the model.
+                    experimental_attention_variant = config.experimental_attention_variant
+                else:
                     # Skip if there is no linear attention layer in the model.
                     continue
-                linear_attention_type = config.linear_attention_type
-                multi_latent_attention = None
             else:
-                linear_attention_type = None
                 multi_latent_attention = config.multi_latent_attention
+                if is_linear_attention_variant(config.experimental_attention_variant):
+                    # experimental_attention_variant is a linear attention variant,
+                    # so softmax attention is regular attention layer.
+                    experimental_attention_variant = None
+                else:
+                    # Softmax attention is an experimental attention variant.
+                    experimental_attention_variant = config.experimental_attention_variant
 
             layer_spec_key = f"{mlp_type}_{attention_type}"
             layer_spec_dict[layer_spec_key] = get_layer_spec_fn(
                 num_experts=num_experts,
                 moe_grouped_gemm=moe_grouped_gemm,
                 multi_latent_attention=multi_latent_attention,
-                linear_attention_type=linear_attention_type,
+                experimental_attention_variant=experimental_attention_variant,
                 **get_layer_spec_kwargs,
             )
 
@@ -586,12 +719,13 @@ def get_gpt_decoder_layer_specs(
             f"current linear attention pattern: {config.linear_attention_freq}"
         )
     elif config.linear_attention_freq is None:
-        if config.linear_attention_type is None:
+        if not is_linear_attention_variant(config.experimental_attention_variant):
             linear_attention_pattern = [0] * config.num_layers
         else:
             linear_attention_pattern = [1] * config.num_layers
             warnings.warn(
-                "Linear attention type is specified but linear_attention_freq is None. "
+                f"Linear attention type {config.experimental_attention_variant} is specified "
+                "but linear_attention_freq is None. "
                 "Setting linear_attention_pattern to [1] * config.num_layers as default."
             )
     else:
@@ -632,9 +766,11 @@ def get_gpt_decoder_block_spec(
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
 
     if config.pipeline_model_parallel_layout is not None:
+        layout = config.pipeline_model_parallel_layout
+        assert isinstance(layout, PipelineParallelLayerLayout)
         local_layer_specs = [
             layer_specs[layer_id]
-            for layer_id in config.pipeline_model_parallel_layout.get_layer_id_list(
+            for layer_id in layout.get_layer_id_list(
                 layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
             )
         ]
@@ -665,14 +801,20 @@ def get_gpt_mtp_block_spec(
     if use_transformer_engine:
         backend: BackendSpecProvider = (
             KitchenSpecProvider(
-                fallback=TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn)
+                fallback=TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn),
+                use_kitchen_attention=config.use_kitchen_attention,
+                kitchen_attention_backend=config.kitchen_attention_backend,
             )
             if config.use_kitchen
             else TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn)
         )
     else:
         backend = (
-            KitchenSpecProvider(fallback=LocalSpecProvider())
+            KitchenSpecProvider(
+                fallback=LocalSpecProvider(),
+                use_kitchen_attention=config.use_kitchen_attention,
+                kitchen_attention_backend=config.kitchen_attention_backend,
+            )
             if config.use_kitchen
             else LocalSpecProvider()
         )
@@ -711,6 +853,9 @@ def get_gpt_mtp_block_spec_for_backend(
     # split the mtp layer specs to only include the layers that are built in this pipeline stage.
     mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
     if len(mtp_layer_specs) > 0:
+        assert (
+            len(mtp_layer_specs) == config.mtp_num_layers
+        ), f"currently all of the mtp layers must stage in the same pipeline stage."
         mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
     else:
         mtp_block_spec = None
