@@ -82,7 +82,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             ids (list): text to be tokenized.
 
         Returns:
-            text: dettokenized text.
+            text: detokenized text.
         """
 
         return self._tokenizer.ids_to_text(ids)
