@@ -21,9 +21,9 @@ if [ -z ${EXPORT_DIR} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}EXPORT_DIR${WHITE} is not set (default: ${EXPORT_DIR})!\n"
 fi
 
-if [ "${TP}" != "1" ]; then
-    TP=1
-    printf "${MLM_WARNING} Variable ${PURPLE}TP${WHITE} is forced to be 1 during export!!\n"
+if [ "${TP}" != "1" ] || [ "${EP}" != "1" ] || [ "${ETP}" != "1" ]; then
+    echo "Error: Only Pipeline Parallelism (PP) > 1 is supported during export. Tensor Parallelism (TP), Expert Parallelism (EP), or Expert Tensor Parallelism (ETP) greater than 1 are not supported."
+    exit 1
 fi
 
 
