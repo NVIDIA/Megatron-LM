@@ -650,18 +650,28 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
             else:
-                self.memory_buffer = torch.empty(
-                    (
-                        2,  # key and value
-                        self.num_attention_layers,
-                        self.block_allocator.total_count,
-                        self.block_size_tokens,
-                        self.num_attention_heads_per_partition,
-                        self.hidden_size_per_attention_head,
-                    ),
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
+                # from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+                # mempool = CudaGraphManager.global_mempool
+                # device = torch.cuda.current_device()
+                # torch._C._cuda_beginAllocateCurrentThreadToPool(device, mempool)
+                from torch_memory_saver import torch_memory_saver
+                torch_memory_saver.hook_mode = "torch"
+                with torch_memory_saver.region(enable_cpu_backup=True):
+                    self.memory_buffer = torch.empty(
+                        (
+                            2,  # key and value
+                            self.num_attention_layers,
+                            self.block_allocator.total_count,
+                            self.block_size_tokens,
+                            self.num_attention_heads_per_partition,
+                            self.hidden_size_per_attention_head,
+                        ),
+                        dtype=self.params_dtype,
+                        device=torch.cuda.current_device(),
+                    )
+                # print(f"SIZE OF MEMORY BUFFER: {self.memory_buffer.nbytes / (1024 ** 3) }")
+                # torch._C._cuda_endAllocateToPool(device, mempool)
 
         # Optional state tensors for hybrid models
         def allocate_mamba_states():
