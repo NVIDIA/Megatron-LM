@@ -28,9 +28,6 @@ from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_group_commit,
-)
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
@@ -739,7 +736,7 @@ class TEGroupedMLP(MegatronModule):
                 permuted_local_hidden_states, tokens_per_expert
             )
         if self.offload_expert_fc1:
-            fc1_output = fine_grained_offloading_group_commit(
+            fc1_output = off_interface.group_commit(
                 fc1_output,
                 name="expert_fc1",
                 forced_released_tensors=[permuted_local_hidden_states],
@@ -821,7 +818,7 @@ class TEGroupedMLP(MegatronModule):
         # Delay the offload of the moe act until after the linear_fc2 has been computed
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
         if self.offload_moe_act:
-            output = fine_grained_offloading_group_commit(
+            output = off_interface.group_commit(
                 output,
                 name="moe_act",
                 forced_released_tensors=[fc1_output],

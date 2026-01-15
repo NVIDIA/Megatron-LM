@@ -509,16 +509,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_commit,
-        )
 
         if self.offload_module_in_cuda_graph:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                fine_grained_offloading_backward_record,
-            )
-
-            hidden_states = fine_grained_offloading_backward_record(
+            hidden_states = off_interface.backward_record(
                 hidden_states, TransformerLayer.cuda_graph_event
             )
 
@@ -573,7 +566,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.
         if self.offload_attn_norm:
-            hidden_states = fine_grained_offloading_group_commit(
+            hidden_states = off_interface.group_commit(
                 hidden_states, name="attn_norm", forced_released_tensors=[residual]
             )
 
@@ -720,7 +713,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
 
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_commit,
+            FineGrainedActivationOffloadingInterface as off_interface,
         )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -734,7 +727,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if self.offload_mlp_norm:
-            hidden_states = fine_grained_offloading_group_commit(
+            hidden_states = off_interface.group_commit(
                 hidden_states, name="mlp_norm", forced_released_tensors=[residual]
             )
 
@@ -750,10 +743,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self.config.delay_offload_until_cuda_graph and flush_delayed_groups:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                fine_grained_offloading_group_flush_delayed_groups,
+                FineGrainedActivationOffloadingInterface as off_interface,
             )
 
-            fine_grained_offloading_group_flush_delayed_groups()
+            off_interface.flush_delayed_groups()
         return output
 
     def sharded_state_dict(
@@ -866,10 +859,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             cuda_graph_outputs.append(context)
         if self.offload_module_in_cuda_graph:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                fine_grained_offloading_forward_record,
+                FineGrainedActivationOffloadingInterface as off_interface,
             )
 
-            fine_grained_offloading_forward_record(TransformerLayer.cuda_graph_event)
+            off_interface.forward_record(TransformerLayer.cuda_graph_event)
         return tuple(cuda_graph_outputs)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
@@ -897,10 +890,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self.config.delay_offload_until_cuda_graph:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                fine_grained_offloading_group_flush_delayed_groups,
+                FineGrainedActivationOffloadingInterface as off_interface,
             )
 
-            fine_grained_offloading_group_flush_delayed_groups()
+            off_interface.flush_delayed_groups()
 
         if kwargs.get('context') is not None:
             context = cuda_graph_output.pop()
