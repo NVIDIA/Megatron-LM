@@ -274,6 +274,9 @@ def get_transformer_layer_spec_for_backend(
     )
     return transformer_layer
 
+import os
+FUSE_INPUT_LAYERNORM = os.environ.get("FUSE_INPUT_LAYERNORM", "0") == "1"
+# TODO: add config option to control this
 
 def get_attention_module_spec_for_backend(
     backend: BackendSpecProvider,
@@ -341,7 +344,7 @@ def get_attention_module_spec_for_backend(
                 q_layernorm=qk_norm,
                 kv_layernorm=qk_norm,
             ),
-            metainfo={"fuse_input_layernorm": False},
+            metainfo={"fuse_input_layernorm": FUSE_INPUT_LAYERNORM},
         )
     else:
         linear_qkv = (
