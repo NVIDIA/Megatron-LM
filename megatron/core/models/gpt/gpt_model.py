@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -119,7 +119,7 @@ class GPTModel(LanguageModule):
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
-        self.vp_stage = vp_stage
+        self.vp_stage: Optional[int] = vp_stage
 
         if hasattr(self.config, 'position_embedding_type'):
             self.position_embedding_type = self.config.position_embedding_type
@@ -199,7 +199,7 @@ class GPTModel(LanguageModule):
             ), "mrope require mrope_section setting, but we got None from TransformerConfig"
 
         # Cache for RoPE tensors which do not change between iterations.
-        self.rotary_pos_emb_cache = {}
+        self.rotary_pos_emb_cache: Dict[int, Tuple[Tensor, Tensor]] = {}
 
         # Transformer.
         self.decoder = TransformerBlock(
@@ -219,6 +219,8 @@ class GPTModel(LanguageModule):
         # Output
         if self.post_process:
 
+            self.embedding_activation_buffer: Optional[List[Tensor]] = None
+            self.grad_output_buffer: Optional[List[Tensor]] = None
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
                 # of the final embedding projection layer GEMM. It will hold the activations for
@@ -403,7 +405,7 @@ class GPTModel(LanguageModule):
             if not has_config_logger_enabled(self.config):
                 decoder_input = WrappedTensor(decoder_input)
 
-        preproc_output = (
+        preproc_output: Tuple[Any, ...] = (
             decoder_input,
             rotary_pos_emb,
             rotary_pos_cos,
@@ -429,7 +431,7 @@ class GPTModel(LanguageModule):
         labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
-        extra_block_kwargs: dict = None,
+        extra_block_kwargs: Optional[Dict[str, Any]] = None,
         runtime_gather_output: Optional[bool] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -556,12 +558,6 @@ class GPTModel(LanguageModule):
                 # if loss_mask is not provided, use all ones as loss_mask
                 loss_mask = torch.ones_like(mtp_labels)
             for mtp_layer_number in range(self.config.mtp_num_layers):
-                # output
-                mtp_logits, _ = self.output_layer(
-                    hidden_states_list[mtp_layer_number + 1],
-                    weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
-                )
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
                 mtp_labels, _ = roll_tensor(
                     mtp_labels,
@@ -577,7 +573,20 @@ class GPTModel(LanguageModule):
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
                 )
-                mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
+
+                # Compute mtp loss without storing logits to save memory.
+                mtp_loss = self.compute_output_layer_and_language_model_loss(
+                    hidden_states_list[mtp_layer_number + 1],
+                    labels=mtp_labels,
+                    weight=self.shared_embedding_or_output_weight(),
+                    sequence_parallel_enabled=self.output_layer.sequence_parallel,
+                    column_parallel_linear=self.output_layer,
+                    col_linear_kwargs={
+                        'weight': output_weight,
+                        'runtime_gather_output': runtime_gather_output,
+                    },
+                )
+
                 mtp_loss = loss_mask * mtp_loss
                 if self.training:
                     # TODO(shifangx): remove the use of parallel_state here
@@ -622,9 +631,12 @@ class GPTModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        if has_config_logger_enabled(self.config) or labels is None:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+        else:
+            logits = None
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -651,7 +663,17 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        loss = self.compute_output_layer_and_language_model_loss(
+            hidden_states,
+            labels=labels,
+            weight=self.shared_embedding_or_output_weight(),
+            sequence_parallel_enabled=self.output_layer.sequence_parallel,
+            column_parallel_linear=self.output_layer,
+            col_linear_kwargs={
+                'weight': output_weight,
+                'runtime_gather_output': runtime_gather_output,
+            },
+        )
 
         return loss
 
@@ -685,7 +707,7 @@ class GPTModel(LanguageModule):
         labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
-        extra_block_kwargs: dict = None,
+        extra_block_kwargs: Optional[Dict[str, Any]] = None,
         runtime_gather_output: Optional[bool] = None,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
