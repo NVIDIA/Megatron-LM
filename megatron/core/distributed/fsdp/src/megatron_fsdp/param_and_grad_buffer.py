@@ -682,11 +682,11 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         for bucket_id, param_group in enumerate(fsdp_param_groups):
             if (param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None or 
                 param_group.fsdp_unit_id not in self.fsdp_double_buffer_units):
-                logging.info(f"FSDP unit {param_group.fsdp_unit_id} does not fit in FixedPoolAllcator")
+                logging.info(f"FSDP unit (id={param_group.fsdp_unit_id}) does not fit in FixedPoolAllcator")
                 if fallback_to_dynamic_alloc is True:
                     logging.info("It will fall back to dynamic memory allocator, NCCL user buffer is not supported")
                 else:
-                    logging.info("It will be allocated a persistent memmory, if memory budget is tight, turn off fsdp-db-fallback-dynamic-alloc")
+                    logging.info("It will be allocated a persistent memmory, if memory budget is tight, set trainer.strategy.ddp.fsdp_db_fallback_dynamic_alloc to False")
         
         # Initialize buffer group status.
         # Each buffer group represents a set of buffers associated with an FSDP unit's bucket group.
