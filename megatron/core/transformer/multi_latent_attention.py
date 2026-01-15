@@ -245,8 +245,7 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") \
-            as hidden_states:
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             if self.config.experimental_attention_variant is None:
                 query, key, value = self.get_query_key_value_tensors(
                     hidden_states,
@@ -300,8 +299,9 @@ class MultiLatentAttention(Attention):
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                with off_interface(self.offload_core_attention and self.training, query, \
-                    "core_attn") as query:
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
                     if self.config.experimental_attention_variant is None:
                         core_attn_out = self.core_attention(
                             query,

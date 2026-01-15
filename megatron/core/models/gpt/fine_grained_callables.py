@@ -453,12 +453,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     return hidden_states, None, None, None
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-                    with off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
+                    with off_interface(
+                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
+                    ) as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
                             layer.pre_mlp_layernorm, hidden_states
                         )
                 else:
-                    with off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
+                    with off_interface(
+                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
+                    ) as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
@@ -477,7 +481,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
-        return hidden_states
+        if not isinstance(layer.mlp, MoELayer):
+            return hidden_states
+
+        # Detach here for mlp_bda residual connection
+        node.layer_state.residual = node.detach(hidden_states)
+        if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
+            # Detach here for shared expert connection in moe_combine
+            node.layer_state.shared_expert_output = node.detach(shared_expert_output)
+
+        return local_tokens, probs
 
     def submodule_dispatch_forward(
         node: ScheduleNode, local_tokens: torch.Tensor, probs: torch.Tensor
