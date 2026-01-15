@@ -67,7 +67,6 @@ mkdir -p $CHECKPOINT_SAVE_PATH
 mkdir -p $CHECKPOINT_LOAD_PATH || true
 _CHECKPOINT_LOAD_PATH=$CHECKPOINT_LOAD_PATH
 _CHECKPOINT_SAVE_PATH=$CHECKPOINT_SAVE_PATH
-_TENSORBOARD_PATH=$TENSORBOARD_PATH
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
@@ -129,11 +128,11 @@ for i in $(seq 1 $N_REPEAT); do
     if [[ $i -gt 1 ]]; then
         rm -rf $CHECKPOINT_SAVE_PATH/*
         rm -rf /tmp/checkpoints/*
+        rm -rf $TENSORBOARD_PATH/*
     fi
 
     # First run never loads from a checkpoint
     export RUN_NUMBER=1
-    export TENSORBOARD_PATH=$_TENSORBOARD_PATH/$i/
     export REPEAT=$i
     export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
     export TRAINING_EXIT_CODE=0
