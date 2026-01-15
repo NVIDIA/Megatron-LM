@@ -2,6 +2,10 @@
 import torch
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
+from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
+from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
+from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -10,10 +14,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
-from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
-from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
-from megatron.core.ssm.mlp_layer import MLPLayer
+from megatron.core.typed_torch import not_none
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -26,6 +27,13 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    (
+        TEColumnParallelLinear,
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+    ) = (None, None, None, None, None)
     HAVE_TE = False
 
 try:
@@ -54,12 +62,8 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
             norm = TENorm
         else:
             version = torch.__version__.split('.')
-            version_geq_2_4 = (
-                int(TORCH_VERSION[0]) > 2
-                or (
-                    int(TORCH_VERSION[0]) == 2
-                    and int(TORCH_VERSION[1]) >= 4
-                )
+            version_geq_2_4 = int(TORCH_VERSION[0]) > 2 or (
+                int(TORCH_VERSION[0]) == 2 and int(TORCH_VERSION[1]) >= 4
             )
             assert version_geq_2_4, "Torch version >= 2.4.0 is required for RMSNorm"
             if HAVE_APEX:
@@ -108,8 +112,8 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
                 module=SelfAttention,
                 params={"attn_mask_type": attn_mask_type},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=TELayerNormColumnParallelLinear,
-                    core_attention=TEDotProductAttention,
+                    linear_qkv=not_none(TELayerNormColumnParallelLinear),
+                    core_attention=not_none(TEDotProductAttention),
                     linear_proj=TERowParallelLinear,
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
@@ -121,6 +125,7 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
             mlp_bda=get_bias_dropout_add,
         ),
     )
+
 
 def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
     attn_mask_type = AttnMaskType.causal
@@ -153,8 +158,8 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
                         module=SelfAttention,
                         params={"attn_mask_type": attn_mask_type},
                         submodules=SelfAttentionSubmodules(
-                            linear_qkv=TELayerNormColumnParallelLinear,
-                            core_attention=TEDotProductAttention,
+                            linear_qkv=not_none(TELayerNormColumnParallelLinear),
+                            core_attention=not_none(TEDotProductAttention),
                             linear_proj=TERowParallelLinear,
                         ),
                     ),
@@ -170,7 +175,8 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
                     mlp=ModuleSpec(
                         module=MLP,
                         submodules=MLPSubmodules(
-                            linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                            linear_fc1=TELayerNormColumnParallelLinear,
+                            linear_fc2=TERowParallelLinear,
                         ),
                     ),
                     mlp_bda=get_bias_dropout_add,
@@ -178,6 +184,7 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
             ),
         ),
     )
+
 
 def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     # Dense MLP w/ or w/o TE modules.
