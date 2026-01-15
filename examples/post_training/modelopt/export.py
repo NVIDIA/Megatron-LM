@@ -5,6 +5,7 @@ import functools
 import os
 import sys
 import warnings
+from pathlib import Path
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
@@ -71,8 +72,11 @@ if __name__ == "__main__":
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.to_empty(device="cpu")
 
-    if args.load is not None:
+    if args.load is not None and Path(args.load).is_dir():
         _ = load_modelopt_checkpoint(model)
+    else:
+        raise ValueError(f"Invalid load checkpoint directory: {args.load}")
+
 
     # Decide whether we are exporting only the extra_modules (e.g. EAGLE3).
     # Only the last pp stage may have extra_modules, hence broadcast from the last rank.
@@ -88,4 +92,5 @@ if __name__ == "__main__":
         export_extra_modules=export_extra_modules,
         dtype=torch.bfloat16,
         export_dir=args.export_dir,
+        moe_router_dtype=unwrapped_model.config.moe_router_dtype,
     )

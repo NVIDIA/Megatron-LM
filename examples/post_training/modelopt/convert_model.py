@@ -130,6 +130,7 @@ if __name__ == "__main__":
             args.pretrained_model_path,
             workspace_dir,
             dtype = import_dtype,
+            moe_router_dtype = args.moe_router_dtype   
         )
     elif args.load is not None:
         _ = load_modelopt_checkpoint(model)
