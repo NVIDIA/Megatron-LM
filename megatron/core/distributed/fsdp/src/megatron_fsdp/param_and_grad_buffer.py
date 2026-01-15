@@ -686,7 +686,10 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 if fallback_to_dynamic_alloc is True:
                     logging.info("It will fall back to dynamic memory allocator, NCCL user buffer is not supported")
                 else:
-                    logging.info("It will be allocated a persistent memmory, if memory budget is tight, set trainer.strategy.ddp.fsdp_db_fallback_dynamic_alloc to False")
+                    logging.info(
+                        "It will be allocated a persistent buffer. If the memory budget is tight, "
+                        "set trainer.strategy.ddp.fsdp_db_fallback_dynamic_alloc to True."
+                    )
         
         # Initialize buffer group status.
         # Each buffer group represents a set of buffers associated with an FSDP unit's bucket group.
