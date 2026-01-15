@@ -538,9 +538,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_commit,
-        )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -608,7 +605,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.
         if self.offload_attn_norm:
-            hidden_states = fine_grained_offloading_group_commit(
+            hidden_states = off_interface.group_commit(
                 hidden_states, name="attn_norm", forced_released_tensors=[residual]
             )
 
@@ -755,7 +752,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_commit,
+            FineGrainedActivationOffloadingInterface as off_interface,
         )
 
         using_fused_tp_inference_kernel = (not self.training) and (
@@ -779,7 +776,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if self.offload_mlp_norm:
-            hidden_states = fine_grained_offloading_group_commit(
+            hidden_states = off_interface.group_commit(
                 hidden_states, name="mlp_norm", forced_released_tensors=[residual]
             )
 

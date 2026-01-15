@@ -11,9 +11,6 @@ from megatron.core import tensor_parallel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_group_commit,
-)
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -472,7 +469,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if layer.offload_mlp_norm:
-            hidden_states = fine_grained_offloading_group_commit(
+            hidden_states = off_interface.group_commit(
                 hidden_states, name="mlp_norm", forced_released_tensors=[residual]
             )
         output = make_viewless_tensor(

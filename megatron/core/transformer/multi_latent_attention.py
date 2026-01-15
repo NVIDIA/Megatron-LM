@@ -25,9 +25,6 @@ from megatron.core.models.common.embeddings import (
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_group_commit,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -255,7 +252,7 @@ class MultiLatentAttention(Attention):
                 inference_context=inference_context,
             )
         if self.offload_qkv_linear:
-            query = fine_grained_offloading_group_commit(
+            query = off_interface.group_commit(
                 query, name="qkv_linear", forced_released_tensors=[hidden_states]
             )
 
@@ -317,7 +314,7 @@ class MultiLatentAttention(Attention):
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
             if self.offload_core_attention and self.training:
-                core_attn_out = fine_grained_offloading_group_commit(
+                core_attn_out = off_interface.group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
 
@@ -348,7 +345,7 @@ class MultiLatentAttention(Attention):
         with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output = fine_grained_offloading_group_commit(
+            output = off_interface.group_commit(
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
 
