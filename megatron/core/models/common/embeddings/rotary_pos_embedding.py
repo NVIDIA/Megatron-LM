@@ -25,7 +25,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, internal_api
 
 logger = logging.getLogger(__name__)
 

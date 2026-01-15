@@ -13,6 +13,7 @@ from torch import Tensor
 from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import internal_api
 
 logger = logging.getLogger(__name__)
 
