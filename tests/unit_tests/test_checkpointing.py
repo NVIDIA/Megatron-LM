@@ -118,6 +118,7 @@ def create_args():
     args.ckpt_step = None
     args.swiglu = True
     args.num_experts = 1
+    args.phase_transition_iterations = None
 
     yield args
 
