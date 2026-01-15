@@ -444,8 +444,8 @@ def build_dynamic_engine_setup_prefix(
         f"ctx: {get_block_size_str('total')} "
         f"[a {get_block_size_str('active')}, p {get_block_size_str('paused')}], "
         f"r {context.max_requests}, t {context.max_tokens}"
-        # <<<
     )
+    # <<<
 
     parts = [
         get_model_size_str(model),

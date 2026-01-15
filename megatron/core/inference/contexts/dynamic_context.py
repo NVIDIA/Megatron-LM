@@ -285,6 +285,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
+        persist_cuda_graphs: Optional[bool] = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -406,6 +407,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Unified memory.
         self.unified_memory_level = unified_memory_level
+        self.persist_cuda_graphs = persist_cuda_graphs
         if unified_memory_level > 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
@@ -418,9 +420,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
-        # >>>
-        # pax("unified_memory_level", {"self.unified_memory_level": self.unified_memory_level})
-        # <<<
 
         # Initialize block allocator.
         buffer_size_bytes = int(buffer_size_gb * 1024**3)
@@ -457,12 +456,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             ),
             paused_count=paused_block_count,
         )
-        # >>>
-        # pax({
-        #     "block_allocator / total_count" : self.block_allocator.total_count,
-        #     "unified_memory_level" : self.unified_memory_level,
-        # }, "block_count, paused_block_count")
-        # <<<
 
         # Track request metadata.
         if request_metadata_types is None:
@@ -571,13 +564,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.block_allocator.active_count,
             )
         )
-        # >>>
-        # pax({
-        #     "block_allocator" : self.block_allocator,
-        #     "max_sequence_length" : max_sequence_length,
-        #     "block_size_bytes" : self.block_size_bytes,
-        # })
-        # <<<
 
     def allocate_all_tensors(self, *, is_init: bool) -> None:
         """Allocate GPU state.
@@ -1776,9 +1762,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         Returns:
             (tuple[int, torch.Tensor]) active_request_count, newly_paused_request_ids.
         """
-        # >>>
-        # assert active_request_count > 0, "whaaaaaa?"
-        # <<<
 
         # Assign released blocks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
@@ -1804,30 +1787,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
                 self.block_allocator.total_avail,
             )
-            # >>>
-            # if step_count == 252:
-            #     pax({
-            #         "block_allocator" : self.block_allocator,
-            #         "total_request_count" : self.total_request_count,
-            #         "paused_request_count" : self.paused_request_count,
-            #     }, "active_request_count",
-            #         "active_block_count_avail, paused_block_counts, paused_block_counts_cumsum, resume_request_count")
-            # <<<
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
-        # >>>
-        # assert active_request_count > 0, "active_request_count == %d." % active_request_count
-        # +++
-        # try:
-        #     assert active_request_count > 0, "active_request_count == %d." % active_request_count
-        # except Exception as e:
-        #     pax({
-        #         "block_allocator" : self.block_allocator,
-        #         "total_request_count" : self.total_request_count,
-        #         "paused_request_count" : self.paused_request_count,
-        #     }, "active_request_count, resume_request_count")
-        # <<<
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
         if resume_request_count > 0:
@@ -2173,33 +2135,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # We determine how many requests we can resume and resume them
 
         # 6.a. First, resume temporarily paused requests.
-        # >>>
-        # if active_request_count == 0:
-        # if step_count == 252:
-        #     pax({
-        #         "block_allocator" : self.block_allocator,
-        #         "paused_request_count" : self.paused_request_count,
-        #     }, "active_request_count, active_requests_requiring_new_block_count")
-        # <<<
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
             active_request_count, newly_paused_request_ids, next_tokens
         )
 
         # 6.b. Evict requests that overflow the paused buffer.
-        # >>>
-        # if active_request_count == 0:
-        # if step_count == 252:
-        #     pax({
-        #         "block_allocator" : self.block_allocator,
-        #         "paused_request_count" : self.paused_request_count,
-        #     }, "active_request_count, active_requests_requiring_new_block_count")
-        # <<<
         evict_request_ids = self.evict_overflow_paused_requests(active_request_count, next_tokens)
 
         # 6.c. Resume any additional requests.
-        # >>>
-        # assert active_request_count > 0, "whaaaaaa?"
-        # <<<
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
             active_request_count, newly_paused_request_ids, next_tokens
         )
