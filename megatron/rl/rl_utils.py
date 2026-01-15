@@ -646,18 +646,18 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
 
 def compute_group_stats(
-    rollouts: GroupedRollouts, tokenizer: MegatronLegacyTokenizer
+    rollouts: GroupedRollouts, tokenizer: MegatronLegacyTokenizer, seq_len: int,
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
     Args:
         rollouts: Rollouts to generate the stats for. Each inner list is a group (as in GRPO group), i.e. all rollouts are for the same prompt.
         tokenizer: Tokenizer to tokenize the rollouts in case they are raw strings.
+        seq_len: Maximum sequence length.
 
     Returns:
        RolloutStats object containing all the stats.
     """
-    args = get_args()
     # TODO (rkirby) Maybe do some of this after the tensor building
     group_reward_means = []
     group_reward_stds = []
@@ -670,18 +670,22 @@ def compute_group_stats(
         group_lengths = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
-                lang_rl_log(
-                    f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} tokens] {tokenizer.detokenize(rollout.trajectory)}"
-                )
-                assert (len(rollout.trajectory) == args.seq_length) or (
-                    rollout.trajectory[-1] == tokenizer.eod
-                ), f"Rollout is not the correct length: {len(rollout.trajectory)} {rollout.trajectory[-1]}\n{tokenizer.detokenize(rollout.trajectory)}"
+                for turn_traj in rollout.trajectory:
+                    detokenized_traj = tokenizer.detokenize(turn_traj)
+                    lang_rl_log(
+                        f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} tokens] {detokenized_traj}"
+                    )
+                    # TODO(vitalyk): how does multiturn change EOD/EOT?
+                    assert (len(turn_traj) == seq_len) or (
+                        turn_traj[-1] == tokenizer.eod
+                    ), f"Rollout is not the correct length: {len(turn_taj)} {turn_traj[-1]}\n{detokenized_traj}"
             else:
                 lang_rl_log(
                     f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} chars] {rollout.trajectory}"
                 )
             group_rewards.append(rollout.reward)
-            group_lengths.append(len(rollout.trajectory))
+            #TODO(vitalyk): What is the semantics behind traj length in multiturn? Should we take the last only? Average them instead of extending?
+            group_lengths.extend(len(t) for t in rollout.trajectory)
 
         group_length_maxs.append(max(group_lengths))
         group_length_mins.append(min(group_lengths))
@@ -780,11 +784,10 @@ def maybe_log_training_metrics(
                         columns=['Trajectories', 'Tokens', 'Rewards'],
                         rows=[
                             [
-                                (
-                                    tokenizer.detokenize(r.trajectory)
+                                [(tokenizer.detokenize(turn)
                                     if isinstance(r, TokenRollout)
-                                    else r.trajectory
-                                ),
+                                    else turn) for turn in r.trajectory
+                                ],
                                 r.trajectory,
                                 r.reward,
                             ]
@@ -850,37 +853,43 @@ def prepare_trajectories(
     trajs = []
     generation_masks = []
     inference_logprobs = []
+    # TODO(vitalyk): because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
+    # But in sequence packing, batch sizes are shrinking. Here, the batch size increases.
     for group in rollouts:
         for rollout in group:
-            generation_mask = rollout.generation_mask if isinstance(rollout, TokenRollout) else None
+            # traj, gen mask and logprobs are lists now.
+            # each list entry is a turn, single-turn environments just have a single-element list.
+            # We assume that all lengths of the structs above have the same lengths (number of turns).
 
-            trajectory = (
+            all_turns_trajectories = (
                 rollout.trajectory.copy()
                 if isinstance(rollout, TokenRollout)
                 else tokenizer.tokenize(rollout.trajectory)
             )
-            inf_logprobs = rollout.logprobs
+            assert len(all_turns_trajectories) == 1, "Multiturn support is not implemented yet. WIP."
+            for turn_idx, trajectory in enumerate(all_turns_trajectories):
+                inf_logprobs = rollout.logprobs[turn_idx]
+                generation_mask = rollout.generation_mask[turn_idx] if isinstance(rollout, TokenRollout) else None
+                length = len(trajectory)
+                assert length <= seq_length, "Rollout too long, how did this happen?"
+                if len(trajectory) < seq_length:
+                    assert (
+                        trajectory[-1] == tokenizer.eod
+                    ), "Trajectories under a seq_length limit should have eod token at the end."
 
-            length = len(trajectory)
-            assert length <= seq_length, "Rollout too long, how did this happen?"
-            if len(trajectory) < seq_length:
-                assert (
-                    trajectory[-1] == tokenizer.eod
-                ), "Trajectories under a seq_length limit should have eod token at the end."
+                if length < seq_length:
+                    trajectory.extend([tokenizer.pad] * (seq_length - length))
+                    if generation_mask:
+                        generation_mask.extend([False] * (seq_length - length))
+                trajs.append(trajectory)
+                generation_masks.append(generation_mask)
 
-            if length < seq_length:
-                trajectory.extend([tokenizer.pad] * (seq_length - length))
-                if generation_mask:
-                    generation_mask.extend([False] * (seq_length - length))
-            trajs.append(trajectory)
-            generation_masks.append(generation_mask)
-
-            if inf_logprobs is not None:
-                inf_logprobs_tensor = torch.Tensor(inf_logprobs)
-                # Don't pad individual logprobs here - padding happens later if needed
-                inference_logprobs.append(inf_logprobs_tensor)
-            else:
-                inference_logprobs.append(None)
+                if inf_logprobs is not None:
+                    inf_logprobs_tensor = torch.Tensor(inf_logprobs)
+                    # Don't pad individual logprobs here - padding happens later if needed
+                    inference_logprobs.append(inf_logprobs_tensor)
+                else:
+                    inference_logprobs.append(None)
 
             env_id = rollout.env_id
             env_id_counts[env_id] += 1
@@ -981,7 +990,7 @@ def prepare_data_for_update(
     with nvtx_range("prepare-data-for-update"):
         with nvtx_range("compute-group-stats"):
             # These are computed on all rollouts for reporting purposes
-            group_stats = compute_group_stats(rollouts, tokenizer)
+            group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
             rewards = np.array([[rollout.reward for rollout in group] for group in rollouts])
             group_stats.rewards = rewards.flatten().tolist()
             group_stats.advantages = (

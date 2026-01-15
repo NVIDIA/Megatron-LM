@@ -46,8 +46,8 @@ class GroupedRolloutRequest(Request):
 class Rollout(AgentBaseModel):
     """Data for language-based Rollout."""
 
-    trajectory: str
-    prompt_length: int | None = None
+    trajectory: list[str]
+    prompt_length: list[int] | None = None
     reward: float = None
     env_id: str | None = None
     problem_id: str | None = None
@@ -56,14 +56,15 @@ class Rollout(AgentBaseModel):
 class TokenRollout(AgentBaseModel):
     """Tokenized representation of a language-based Rollout."""
 
-    trajectory: list[int]
+    trajectory: list[list[int]]
     reward: list[float] | float
-    generation_mask: list[list[int]] | list[bool] | None = None
-    logprobs: list[float] | None = None
+    generation_mask: list[list[bool]] | None = None
+    logprobs: list[list[float]] | None = None
     env_id: str | None = None
     problem_id: str | None = None
 
 
+#TODO remove?support multiturn?
 class ContrastiveRollout(AgentBaseModel):
     """Contrastive/Preference data for language-based Rollout."""
 

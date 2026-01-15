@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+import unittest
 from unittest.mock import patch
 
 import pytest
@@ -115,18 +116,18 @@ def test_prepare_trajectories(mock_rank):
 
     tokenizer = MockTokenizer()
     r1 = TokenRollout(
-        trajectory=[1, 2, tokenizer.eod],
+        trajectory=[[1, 2, tokenizer.eod]],
         reward=3.14,
-        generation_mask=[False, True, True],
-        logprobs=[0.1, 0.2, 0.3],
+        generation_mask=[[False, True, True]],
+        logprobs=[[0.1, 0.2, 0.3]],
         env_id='MEGAENV',
         problem_id="2",
     )
     r2 = TokenRollout(
-        trajectory=[1, 2, tokenizer.eod],
+        trajectory=[[1, 2, tokenizer.eod]],
         reward=0.14,
-        generation_mask=[False, True, True],
-        logprobs=[0.1, 0.2, 0.3],
+        generation_mask=[[False, True, True]],
+        logprobs=[[0.1, 0.2, 0.3]],
         env_id='MEGAENV',
         problem_id="2",
     )
@@ -163,18 +164,18 @@ def test_prepare_trajectories_with_packing(mock_rank):
 
     tokenizer = MockTokenizer()
     r1 = TokenRollout(
-        trajectory=[1, 2, tokenizer.eod],
+        trajectory=[[1, 2, tokenizer.eod]],
         reward=3.14,
-        generation_mask=[False, True, True],
-        logprobs=[0.1, 0.2, 0.3],
+        generation_mask=[[False, True, True]],
+        logprobs=[[0.1, 0.2, 0.3]],
         env_id='MEGAENV',
         problem_id="2",
     )
     r2 = TokenRollout(
-        trajectory=[1, 2, 3, tokenizer.eod],
+        trajectory=[[1, 2, 3, tokenizer.eod]],
         reward=0.14,
-        generation_mask=[False, True, True, True],
-        logprobs=[0.1, 0.2, 0.3, -1.2],
+        generation_mask=[[False, True, True, True]],
+        logprobs=[[0.1, 0.2, 0.3, -1.2]],
         env_id='MEGAENV',
         problem_id="2",
     )
@@ -362,6 +363,8 @@ def test_prepare_data_for_update():
             # We expect trajectories to come padded there.
             assert str(e).startswith('Rollout is not the correct length')
 
+        # TODO: I know this is a broken test rn, but why are trajectories tensors?
+        # TokenRollout types do not have tensors in there.
         r1 = TokenRollout(
             trajectory=torch.Tensor([1, 2, 3, tokenizer.eod]).cuda(),
             reward=3.14,
@@ -408,26 +411,26 @@ def test_prepare_trajectories_with_sequence_packing(mock_rank):
 
     # Create rollouts of varying lengths
     r1 = TokenRollout(
-        trajectory=[1, 2, tokenizer.eod],
+        trajectory=[[1, 2, tokenizer.eod]],
         reward=3.14,
-        generation_mask=[False, True, True],
-        logprobs=[0.1, 0.2, 0.3],
+        generation_mask=[[False, True, True]],
+        logprobs=[[0.1, 0.2, 0.3]],
         env_id='MEGAENV',
         problem_id="1",
     )
     r2 = TokenRollout(
-        trajectory=[4, 5, 6, 7, tokenizer.eod],
+        trajectory=[[4, 5, 6, 7, tokenizer.eod]],
         reward=0.14,
-        generation_mask=[False, True, True, True, True],
-        logprobs=[0.4, 0.5, 0.6, 0.7, 0.8],
+        generation_mask=[[False, True, True, True, True]],
+        logprobs=[[0.4, 0.5, 0.6, 0.7, 0.8]],
         env_id='MEGAENV',
         problem_id="2",
     )
     r3 = TokenRollout(
-        trajectory=[8, 9, tokenizer.eod],
+        trajectory=[[8, 9, tokenizer.eod]],
         reward=2.71,
-        generation_mask=[False, True, True],
-        logprobs=[0.9, 1.0, 1.1],
+        generation_mask=[[False, True, True]],
+        logprobs=[[0.9, 1.0, 1.1]],
         env_id='MEGAENV',
         problem_id="3",
     )
