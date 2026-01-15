@@ -392,10 +392,12 @@ class TestGPTWithDynamicInference:
         config = self.gpt_model.config
 
         inference_context = DynamicInferenceContext(
-            params_dtype=config.params_dtype,
-            num_layers=config.num_layers,
-            kv_channels=config.hidden_size // config.num_attention_heads,
-            num_attention_heads=config.num_attention_heads,
+            model_config=TransformerConfig(
+                params_dtype=config.params_dtype,
+                num_layers=config.num_layers,
+                kv_channels=config.hidden_size // config.num_attention_heads,
+                num_attention_heads=config.num_attention_heads,
+            ),
             max_sequence_length=self.gpt_model.module.max_sequence_length,
             buffer_size_gb=1.0,
             block_size_tokens=256,

@@ -259,10 +259,7 @@ class TestGPTModelBatchInvariant:
 
         def _run_engine_with_order(order):
             ctx = DynamicInferenceContext(
-                params_dtype=torch.bfloat16,
-                num_layers=base_model.config.num_layers,
-                kv_channels=base_model.config.kv_channels,
-                num_attention_heads=base_model.config.num_attention_heads,
+                model_config=based_model.config,
                 max_sequence_length=seq_len,
                 buffer_size_gb=0.125,
                 block_size_tokens=16,
