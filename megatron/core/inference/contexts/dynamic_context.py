@@ -1787,7 +1787,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
-        assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
         if resume_request_count > 0:
@@ -2144,6 +2143,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
             active_request_count, newly_paused_request_ids, next_tokens
         )
+
+        assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count
