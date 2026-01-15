@@ -14,6 +14,7 @@ TOKENIZER_MAPPING_LIBRARIES = OrderedDict(
         ("tiktoken", "TikTokenTokenizer"),
         ("byte-level", "ByteLevelTokenizer"),
         ("null", "NullTokenizer"),
+        ("sft", "SFTTokenizer"),
     ]
 )
 

@@ -158,29 +158,40 @@ class SFTTokenizer(MegatronTokenizerTextAbstract):
 
         return tokens, target
 
-    def tokenize(self, text: Union[str, List[Dict]]):
+    def text_to_ids(self, text: Union[str, List[Dict]]):
         """Tokenize conversation or string input."""
         if isinstance(text, list):
             # This code path is used by the inference code currently.
             return self.tokenize_conversation(text, return_target=False, add_generation_prompt=True).tolist()
 
-        return self._encode(text)
-
-    def _encode(self, text: str):
-        """Tokenize text input, w/o chat template"""
         return self._tokenizer.encode(text)
 
-    def convert_tokens_to_ids(self, tokens: List[str]):
+    def tokens_to_ids(self, tokens: List[str]):
         """Convert tokens to IDs."""
         return self._tokenizer.convert_tokens_to_ids(tokens)
 
-    def detokenize(self, tokens: List[int]):
+    def ids_to_text(self, tokens: List[int]):
         """Detokenize tokens."""
         return self._tokenizer.decode(tokens)
+
+    def ids_to_tokens(self):
+        """Converts ids to tokens."""
+        raise NotImplementedError("This method is not supported for SFTTokenizer.")
+    
+    def text_to_tokens(self):
+        """Converts text to tokens."""
+        raise NotImplementedError("This method is not supported for SFTTokenizer.")
+
+    def tokens_to_text(self):
+        """Converts tokens to text."""
+        raise NotImplementedError("This method is not supported for SFTTokenizer.")
 
     def get_special_tokens(self):
         """Get special tokens."""
         return self._tokenizer.get_added_vocab()
+    
+    def add_special_tokens(self):
+        raise NotImplementedError("This method is not supported for SFTTokenizer.")
 
     @property
     def force_eod(self):
