@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 [build-system]
-requires = ["setuptools>=80.0.0", "pybind11", "packaging>=24.2"]
+requires = ["setuptools<80.0.0", "pybind11", "packaging>=24.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -86,6 +86,7 @@ dev = [
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
+    "emerging_optimizers",
 ]
 
 lts = [
@@ -105,6 +106,7 @@ lts = [
     "onnxscript",
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
+    "emerging_optimizers",
 ]
 
 [dependency-groups]
@@ -178,7 +180,7 @@ flash_mla = [
 ]
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.11" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
-emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "fb1add873e7851ec34b48581ea1b15761b73d189" }
+emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
