@@ -263,35 +263,26 @@ def test_get_param_groups_appling_wd_to_qk_layernorm(apply_wd_to_qk_layernorm: b
     config_overrides = get_standard_config_overrides(config=config)
     param_groups = _get_param_groups([net], config, config_overrides)
 
-    assert len(param_groups) == 3
+    assert len(param_groups) == 2
     p_set = set(net.parameters())
 
-    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params']) | set(
-        param_groups[2]['params']
-    )
-    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params']) + len(
-        param_groups[2]['params']
-    )
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params'])
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params'])
     assert param_groups[0]['wd_mult'] == 1.0
     assert param_groups[1]['wd_mult'] == 0.0
-    assert param_groups[2]['wd_mult'] == 1.0
 
-    # There are three param groups, having 5, 6, and 2 parameters respectively.
+    # There are two param groups, having 7, and 6 parameters respectively.
     # Param group A (wd_mult=1.0): conv1.weight, conv2.weight, fc1.weight, fc2.weight, fc3.weight,
+    #    q_layernorm.weight, k_layernorm.weight
     # Param group B (wd_mult=0.0): conv1.bias, conv2.bias, fc1.bias, fc2.bias, fc3.bias,
-    # layernorm.weight
-    # Param group C (wd_mult=1.0): q_layernorm.weight, k_layernorm.weight
-    assert len(param_groups[0]['params']) == 5, (
+    #    layernorm.weight
+    assert len(param_groups[0]['params']) == 7, (
         f"Expected 5 parameters in the first param group, "
         f"but got {len(param_groups[0]['params'])}"
     )
     assert len(param_groups[1]['params']) == 6, (
         f"Expected 6 parameters in the second param group, "
         f"but got {len(param_groups[1]['params'])}"
-    )
-    assert len(param_groups[2]['params']) == 2, (
-        f"Expected 2 parameters in the third param group, "
-        f"but got {len(param_groups[2]['params'])}"
     )
 
 
