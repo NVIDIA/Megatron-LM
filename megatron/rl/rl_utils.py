@@ -216,7 +216,6 @@ GroupedRollouts = list[list[TokenRollout | Rollout]]
 @dataclass(slots=True)
 class RolloutStats:
     mean_reward: float
-    mean_sim: None | float
     mean_length: float
     mean_length_std: float
     max_length: float
@@ -666,7 +665,6 @@ def compute_group_stats(
     group_length_stds = []
     group_length_maxs = []
     group_length_mins = []
-    group_rollout_similarities = []
     for group in rollouts:
         group_rewards = []
         group_lengths = []
@@ -684,24 +682,6 @@ def compute_group_stats(
                 )
             group_rewards.append(rollout.reward)
             group_lengths.append(len(rollout.trajectory))
-        if args.rl_calculate_intra_group_similarity:
-            # We can probably compute this outside, but in case we switch to different group sizes for different envs, let's keep it here.
-            combos = itertools.combinations(range(len(group)), 2)
-            # For every pair (excluding ourselves), check the sequence similarity and log.
-            # Use this to track the diversity of generated rollouts within a group.
-            intra_group_sim = np.mean(
-                list(
-                    map(
-                        lambda idx_pair: SequenceMatcher(
-                            None, group[idx_pair[0]].trajectory, group[idx_pair[1]].trajectory
-                        ).ratio(),
-                        combos,
-                    )
-                )
-            )
-            group_rollout_similarities.append(intra_group_sim)
-        else:
-            group_rollout_similarities = None
 
         group_length_maxs.append(max(group_lengths))
         group_length_mins.append(min(group_lengths))
@@ -713,7 +693,6 @@ def compute_group_stats(
         group_length_stds.append(np.std(group_lengths))
     stats = RolloutStats(
         mean_reward=np.mean(group_reward_means),
-        mean_sim=np.mean(group_rollout_similarities) if group_rollout_similarities else None,
         mean_length=np.mean(group_length_means),
         mean_length_std=np.mean(group_length_stds),
         max_length=np.max(group_length_maxs),
@@ -813,11 +792,6 @@ def maybe_log_training_metrics(
                         ],
                     ),
                 },
-                **(
-                    {'mean_intra_group_similarity': group_stats.mean_sim}
-                    if group_stats.mean_sim
-                    else {}
-                ),
             },
             step=current_iteration,
         )
