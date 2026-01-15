@@ -1820,9 +1820,9 @@ class MoESyncFreeElasticExpertDispatcher:
             torch.Tensor: Expert weights received from other ranks that are needed for
                          processing tokens on this rank.
         """
-
         # Reshape expert weights to tokens to prevent each weight too large to dispatch.
-        dispatched_expert_weights, metadata.handle = HybridEPExpertDispatch.apply(
+        # HybridEPExpertDispatch.apply returns (*dispatched_weights, handle)
+        result = HybridEPExpertDispatch.apply(
             metadata.routing_map, # routing_map
             self.ep_group, # group
             metadata.handle, # handle
@@ -1833,4 +1833,6 @@ class MoESyncFreeElasticExpertDispatcher:
             self.weight_chunk_size, # weight_chunk_size
             *expert_weights, # expert_weights
         )
+        dispatched_expert_weights = result[:-1]
+        metadata.handle = result[-1]
         return dispatched_expert_weights

@@ -499,7 +499,12 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
-        detached_args = detach_variable(args)
+        # Skip detach of leaf nodes, since we want to access main_grad of leaf nodes.
+        detached_args = tuple(
+            arg if (isinstance(arg, torch.Tensor) and arg.is_leaf) else
+            (arg.detach().requires_grad_(arg.requires_grad) if isinstance(arg, torch.Tensor) else arg)
+            for arg in args
+        )
         ctx.detached_args = detached_args
         # ctx.save_for_backward(*detached_args)
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
@@ -508,19 +513,41 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         return outputs
 
     @staticmethod
-    def backward(ctx, *args):
+    def backward(ctx, *output_grads):
         """Backward pass."""
         inputs = ctx.detached_args
         outputs = ctx.outputs
-        outputs_with_grad = []
-        for output in outputs:
-            if torch.is_tensor(output) and output.requires_grad:
-                outputs_with_grad.append(output)
-        torch.autograd.backward(outputs_with_grad, args)
+        valid_outputs_with_grad = []
+        valid_output_grads = []
+        for output, output_grad in zip(outputs, output_grads):
+            if torch.is_tensor(output) and output_grad is not None:
+                valid_outputs_with_grad.append(output)
+                valid_output_grads.append(output_grad)
+
+        # Collect tensor inputs that require gradients
+        tensor_inputs = [inp for inp in inputs if isinstance(inp, torch.Tensor) and inp.requires_grad]
+
+        if valid_outputs_with_grad and tensor_inputs:
+            # Use torch.autograd.grad() instead of backward() to get gradients directly
+            grads = torch.autograd.grad(
+                outputs=valid_outputs_with_grad,
+                inputs=tensor_inputs,
+                grad_outputs=valid_output_grads,
+                allow_unused=True,
+            )
+            # Build a mapping from input tensor id to its gradient
+            grad_map = {id(inp): grad for inp, grad in zip(tensor_inputs, grads)}
+        else:
+            grad_map = {}
+
         ctx.outputs = None
         ctx.inputs = None
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
-        return (None, None) + grads
+
+        input_grads = tuple(
+            grad_map.get(id(inp), None) if isinstance(inp, torch.Tensor) else inp
+            for inp in inputs
+        )
+        return (None, None) + input_grads
 
 
 class CheckpointWithoutOutput(object):
@@ -591,7 +618,8 @@ class CheckpointWithoutOutput(object):
                 t.requires_grad_(requires_grad)
             return t
 
-        inputs = tuple(detach(t) for t in inputs)
+        inputs = tuple(arg if isinstance(arg, torch.Tensor) and arg.is_leaf else
+            detach(arg) for arg in inputs)
         with torch.enable_grad(), fp8_ctx, recompute_ctx:
             outputs = self.run_function(*inputs)
 

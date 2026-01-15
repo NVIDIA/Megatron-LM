@@ -599,13 +599,16 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         ctx.fp8_dispatch = fp8_dispatch
         ctx.num_local_echo_experts = num_local_echo_experts
         ctx.num_local_home_experts = num_local_home_experts
-        return tuple(dispatched_weight_list), handle
+        ctx.expert_weights = expert_weights
+        return (*dispatched_weight_list, handle)
     
     @staticmethod
-    def backward(ctx, *grad_expert_weights):
+    def backward(ctx, *grad_expert_weights_and_handle):
         '''
         Backward pass of fused dispatch of the HybridEP backend
         '''
+        # Last element is grad for handle (None), rest are grad for expert weights
+        grad_expert_weights = grad_expert_weights_and_handle[:-1]
         # TODO: dispatch and accmualte the gradient of the expert weights with fp32
         num_chunks_per_weight = ctx.num_chunks_per_weight
         weight_shape = ctx.weight_shape
@@ -624,7 +627,18 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         # Extract grad for each expert
         weight_grad_list = [weight_grad.reshape(weight_shape) for weight_grad in combined_expert_grad.chunk(ctx.num_local_home_experts, dim=0)]
 
-        return None, None, None, None, None, None, None, None, *weight_grad_list
+        # Note: with gradient accumulation fusion, after the home expert backward, the expert weight has been set grad_added_to_main_grad to True,
+        # so the returned the gradient will not be accumulated to the main grad due to the DDP backward hook. (distributed_data_parallel.py._make_backward_post_hook)
+        # Here we manually accumulate the expert grad from echo experts into main_grad of home experts.
+        dummy_grad_list = []
+        for i, (weight, wgrad) in enumerate(zip(ctx.expert_weights, weight_grad_list)):
+            assert weight.main_grad is not None, f"weight {i} has no main_grad"
+            # Accumulate gradient to main_grad
+            weight.main_grad.add_(wgrad) 
+            weight.grad_added_to_main_grad = True
+            dummy_grad_list.append(None)
+
+        return None, None, None, None, None, None, None, None, *dummy_grad_list
 
 if HAVE_HYBRIDEP:
 

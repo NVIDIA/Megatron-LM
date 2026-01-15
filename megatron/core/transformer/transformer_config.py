@@ -1767,6 +1767,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_enable_echo:
+            assert self.gradient_accumulation_fusion is True, "MoE Echo only support gradient accumulation fusion."
             assert (
                 self.moe_num_echo_experts is not None
             ), "moe_num_echo_experts must be specified when moe_enable_echo is True"
