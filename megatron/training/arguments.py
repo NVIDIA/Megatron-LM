@@ -2162,6 +2162,14 @@ def _add_rl_args(parser):
         help='Degree of expert model parallelism for inference for RL.',
     )
     group.add_argument(
+        '--rl-inference-expert-tensor-model-parallel-size',
+        type=int,
+        default=None,
+        help='Degree of expert tensor model parallelism for inference for RL. '
+             'For MoE models, this controls the TP size for expert layers specifically. '
+             'Defaults to training expert_tensor_parallel_size if not specified.',
+    )
+    group.add_argument(
         '--rl-inference-model-unified-memory-level',
         type=int,
         default=0,
