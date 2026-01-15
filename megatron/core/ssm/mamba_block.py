@@ -19,8 +19,9 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.layer_builder import build_layers_from_pattern
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
+from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers, parse_hybrid_pattern
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
@@ -28,6 +29,9 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
+
+from megatron.core.ssm.mlp_layer import MLPLayer
+
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
@@ -84,12 +88,14 @@ class MambaStack(MegatronModule):
         device=None,
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
         super().__init__(config=config)
         self.residual_in_fp32 = residual_in_fp32
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
+        self.vp_stage = vp_stage
 
         assert pg_collection is not None, "pg_collection must be provided for MambaStack"
 
@@ -102,12 +108,17 @@ class MambaStack(MegatronModule):
         self.hybrid_attention_ratio = hybrid_attention_ratio
         self.hybrid_mlp_ratio = hybrid_mlp_ratio
         self.hybrid_override_pattern = hybrid_override_pattern
+        self.pg_collection = pg_collection
+
+        # Parse pattern - extract only main pattern, MTP handled by MambaModel
+        parsed = parse_hybrid_pattern(hybrid_override_pattern)
+        main_pattern = parsed.main_pattern  # MTP pattern ignored here
 
         self.layer_type_list = allocate_layers(
-            self.config.num_layers,
+            self.config.num_layers if self.config.num_layers is not None else len(main_pattern),
             self.hybrid_attention_ratio,
             self.hybrid_mlp_ratio,
-            self.hybrid_override_pattern,
+            main_pattern,
         )
 
         pp_layer_offset = 0
@@ -115,44 +126,18 @@ class MambaStack(MegatronModule):
             pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
                 self.layer_type_list
             )
+        self._pp_layer_offset = pp_layer_offset
 
-        self.layers = nn.ModuleList()
-        for i, layer_type in enumerate(self.layer_type_list):
-            fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
-            with fp8_init_context:
-                if layer_type == LayerSymbols.MAMBA:
-                    layer = build_module(
-                        submodules.mamba_layer,
-                        config=self.config,
-                        residual_in_fp32=residual_in_fp32,
-                        layer_number=i + 1 + pp_layer_offset,
-                        pp_layer_offset=pp_layer_offset,
-                        pg_collection=pg_collection,
-                    )
-                elif layer_type == LayerSymbols.ATTENTION:
-                    # Transformer layers apply their own pp_layer_offset
-                    layer = build_module(
-                        submodules.attention_layer,
-                        config=self.config,
-                        layer_number=i + 1,
-                        pg_collection=pg_collection,
-                    )
-                elif layer_type == LayerSymbols.MLP:
-                    # Transformer layers apply their own pp_layer_offset
-                    layer = build_module(
-                        submodules.mlp_layer,
-                        config=self.config,
-                        layer_number=i + 1,
-                        pg_collection=pg_collection,
-                    )
-                elif layer_type == LayerSymbols.MOE:
-                    # Transformer layers apply their own pp_layer_offset
-                    layer = build_module(
-                        submodules.moe_layer, config=self.config, layer_number=i + 1
-                    )
-                else:
-                    assert False, "unexpected layer_type"
-            self.layers.append(layer)
+        # Build main decoder layers using shared layer builder
+        self.layers = build_layers_from_pattern(
+            pattern=''.join(self.layer_type_list),
+            submodules=submodules,
+            config=self.config,
+            pg_collection=pg_collection,
+            layer_offset=pp_layer_offset,
+            residual_in_fp32=residual_in_fp32,
+            is_mtp_layer=False,
+        )
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -307,7 +292,7 @@ class MambaStack(MegatronModule):
 
         # Ensure that the tensor passed between pipeline parallel stages is
         # viewless. See related notes in TransformerBlock and TransformerLayer
-        output = make_viewless_tensor(
+        hidden_states = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 

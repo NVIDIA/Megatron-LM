@@ -21,6 +21,12 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
+    MultiTokenPredictionLayer,
+    MultiTokenPredictionLayerSubmodules,
+)
 
 moe = get_moe_module_spec(
     use_te=True,
@@ -87,6 +93,7 @@ mamba_stack_spec = ModuleSpec(
     ),
 )
 
+
 mamba_inference_stack_spec = ModuleSpec(
     module=MambaStack,
     submodules=MambaStackSubmodules(
@@ -146,3 +153,51 @@ mamba_inference_stack_spec = ModuleSpec(
         ),
     ),
 )
+
+
+def get_mamba_mtp_block_spec(use_te: bool = True) -> ModuleSpec:
+    """MTP block spec for Mamba using unified pattern syntax.
+
+    This spec provides norms and projection only - inner layers are built
+    by MultiTokenPredictionLayer using the shared layer_builder with
+    mtp_layer_pattern and mamba_submodules passed from MambaModel.
+
+    The number of MTP depths is determined by the parsed unified pattern
+    (e.g., "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths).
+
+    Args:
+        use_te: Whether to use TransformerEngine modules (default: True)
+
+    Returns:
+        ModuleSpec for MultiTokenPredictionBlock
+
+    Example:
+        >>> mtp_spec = get_mamba_mtp_block_spec()
+        >>> mtp_block = MultiTokenPredictionBlock(
+        ...     config=config,
+        ...     spec=mtp_spec,
+        ...     mtp_layer_pattern="MM",
+        ...     mtp_num_depths=2,
+        ...     mamba_submodules=mamba_stack_spec.submodules,
+        ... )
+    """
+    norm = TENorm if use_te else TENorm  # Fallback to TENorm for now
+    linear = TELayerNormColumnParallelLinear if use_te else TELayerNormColumnParallelLinear
+
+    return ModuleSpec(
+        module=MultiTokenPredictionBlock,
+        submodules=MultiTokenPredictionBlockSubmodules(
+            layer_specs=[
+                ModuleSpec(
+                    module=MultiTokenPredictionLayer,
+                    submodules=MultiTokenPredictionLayerSubmodules(
+                        enorm=norm,
+                        hnorm=norm,
+                        eh_proj=linear,
+                        mtp_model_layer=None,  # Built via pattern + mamba_submodules
+                        layer_norm=norm,
+                    ),
+                )
+            ]
+        ),
+    )
