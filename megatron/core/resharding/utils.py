@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -57,14 +57,20 @@ class ParameterMetadata:
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
 
-    # Canonical name for matching parameters across models with different EP configurations.
-    # Under Expert Parallelism (EP), each rank owns a subset of experts with local indices
-    # (e.g., rank 1 has "weight0" locally, but it's actually global expert 4). The raw param
-    # name can't be used to match across source/destination because the same local name refers
-    # to different global experts on different ranks. resolved_name remaps local expert indices
-    # to global indices (e.g., "layer.experts.weight0" on rank 1 → "layer.experts.weight4"),
-    # enabling the resharding planner to correctly look up and match expert parameters across
-    # models regardless of how EP is configured. For non-EP params, resolved_name == name.
+    # Canonical name for matching parameters across models with different EP/PP configurations.
+    #
+    # - EP (expert parallel): each rank owns a subset of experts with local indices
+    #   (e.g., rank 1 has "weight0" locally, but it's actually global expert 4). The raw param
+    #   name can't be used to match across source/destination because the same local name refers
+    #   to different global experts on different ranks. `resolved_name` remaps local expert indices
+    #   to global indices (e.g., "layer.experts.weight0" on rank 1 → "layer.experts.weight4").
+    #
+    # - PP (pipeline parallel): transformer blocks are often named with rank-local indices
+    #   (e.g., PP stage 1 may have "decoder.layers.0" even though that corresponds to global
+    #   layer 16). For reshard/refit across different PP partitionings (e.g., PP2 ↔ PP1),
+    #   `resolved_name` may be further canonicalized to global layer indices.
+    #
+    # For non-EP and non-PP cases, resolved_name == name.
     resolved_name: Optional[str] = None
     # The global expert index this parameter belongs to (e.g., 4 for global expert 4).
     # Computed alongside resolved_name; None for non-EP or fused expert tensors.
@@ -123,17 +129,29 @@ def _detect_expert_index_from_param_name(param_name: str) -> Optional[int]:
     return None
 
 
-def assign_resolved_name_inplace(meta: ParameterMetadata) -> None:
+def assign_ep_resolved_name_inplace(
+    meta: ParameterMetadata, *, base_name: str | None = None
+) -> None:
     """
-    Compute a canonical resolved_name for EP per-expert parameters, and set global_expert_index.
-    For non-EP or non-per-expert params, resolved_name defaults to original name.
+    EP-only canonicalization for per-expert parameters.
+
+    Under Expert Parallelism (EP), each rank owns a subset of experts with local indices
+    (e.g., rank 1 has "weight0" locally, but it's actually global expert 4). The raw param
+    name can't be used to match across source/destination because the same local name refers
+    to different global experts on different ranks. This function remaps local expert indices
+    to global indices in `resolved_name` and sets `global_expert_index`.
+
+    Effects:
+    - Sets meta.resolved_name (defaults to base_name/meta.name for non-EP).
+    - Sets meta.global_expert_index for per-expert parameters; otherwise leaves it as None.
     """
-    meta.resolved_name = meta.name
+    base = meta.name if base_name is None else base_name
+    meta.resolved_name = base
     meta.global_expert_index = None
     if not meta.is_ep:
         return
 
-    local_idx = _detect_expert_index_from_param_name(meta.name)
+    local_idx = _detect_expert_index_from_param_name(base)
     if local_idx is None:
         # Fused experts tensor: leave name as-is; TP planner will handle slicing
         return
@@ -145,7 +163,7 @@ def assign_resolved_name_inplace(meta: ParameterMetadata) -> None:
     meta.global_expert_index = global_idx
 
     # Replace trailing integer in "weightK"/"biasK" with global_idx
-    parts = meta.name.split('.')
+    parts = base.split('.')
     new_parts = []
     for p in parts:
         if p.startswith('weight') and len(p) > len('weight') and p[len('weight') :].isdigit():
@@ -157,12 +175,82 @@ def assign_resolved_name_inplace(meta: ParameterMetadata) -> None:
     meta.resolved_name = '.'.join(new_parts)
 
 
+def assign_resolved_name_inplace(
+    meta: ParameterMetadata,
+    *,
+    layer_module_prefix_map: Mapping[str, str] | None = None,
+    base_name: str | None = None,
+) -> None:
+    """Set meta.resolved_name so the planner can match the same weights across models.
+
+    It rewrites PP layer indices to global layer indices (when layer_module_prefix_map is
+    provided) and
+    rewrites EP per-expert indices (weightK/biasK) to global expert indices.
+    """
+    name = meta.name if base_name is None else base_name
+    if layer_module_prefix_map:
+        name = _resolve_global_layer_number_in_name(name, layer_module_prefix_map)
+    assign_ep_resolved_name_inplace(meta, base_name=name)
+
+
+def _build_layer_module_prefix_map(module: torch.nn.Module) -> dict[str, str]:
+    """Build a mapping local_module_prefix -> global_module_prefix for PP layer modules.
+
+    Megatron assigns a global, 1-indexed layer_number to each transformer layer module at
+    construction time (including PP/VPP/layout offsets). We convert that to the 0-indexed naming
+    convention used in parameter names and build a map such as:
+
+    - "decoder.layers.0" → "decoder.layers.16"  (if layer_number == 17)
+    """
+    prefix_map: dict[str, str] = {}
+    for module_name, submodule in module.named_modules():
+        if not module_name:
+            continue
+        layer_number = getattr(submodule, 'layer_number', None)
+        if not isinstance(layer_number, int):
+            continue
+        parts = module_name.split('.')
+        if not parts[-1].isdigit():
+            continue
+        parts[-1] = str(layer_number - 1)  # convert 1-indexed to 0-indexed
+        prefix_map[module_name] = '.'.join(parts)
+    return prefix_map
+
+
+def _resolve_global_layer_number_in_name(
+    name: str, layer_module_prefix_map: Mapping[str, str]
+) -> str:
+    """Rewrite a parameter name to use global layer indices (PP-aware).
+
+    Given a parameter name like decoder.layers.0.self_attention..., this function rewrites
+    the decoder.layers.0 prefix to the corresponding global layer index using the owning
+    layer module's layer_number.
+
+    Implementation:
+    - Build a {local_prefix -> global_prefix} map once (outside the per-parameter loop).
+    - Perform a longest-prefix match replacement so we only rewrite the module path portion.
+    """
+    if not layer_module_prefix_map:
+        return name
+
+    parts = name.split('.')
+    for i in range(len(parts), 0, -1):
+        prefix = '.'.join(parts[:i])
+        mapped = layer_module_prefix_map.get(prefix)
+        if mapped is None:
+            continue
+        rest = '.'.join(parts[i:])
+        return mapped if not rest else mapped + '.' + rest
+    return name
+
+
 def extract_param_metadata(
     param: torch.nn.Parameter,
     param_name: str,
     owner_rank: int,
     pg_collection,
     num_experts: Optional[int] = None,
+    layer_module_prefix_map: Mapping[str, str] | None = None,
 ) -> ParameterMetadata:
     """Extract metadata from a parameter for cross-rank communication."""
     # TP flags from attributes (set by Megatron linear layers)
@@ -224,7 +312,10 @@ def extract_param_metadata(
         data_parallel_group_ranks=data_parallel_group_ranks,
         pipeline_parallel_group_ranks=pipeline_parallel_group_ranks,
     )
-    assign_resolved_name_inplace(meta)
+    assign_resolved_name_inplace(
+        meta, layer_module_prefix_map=layer_module_prefix_map, base_name=param_name
+    )
+
     return meta
 
 

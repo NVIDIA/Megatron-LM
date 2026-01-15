@@ -3,7 +3,7 @@
 import copy
 import logging
 from copy import deepcopy
-from functools import partial, wraps
+from functools import partial
 from math import ceil
 from typing import Optional, Tuple
 
@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
@@ -44,7 +44,6 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecated
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -60,57 +59,13 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@deprecated(
-    version="0.16",
-    removal_version="0.17",
-    alternative=None,
-    reason="pg_collection is being passed to sub-module",
-)
-def expert_dist_ckpt_decorator(func):
-    """Decorator of shared_state_dict in expert layer for distributed checkpoint.
-    Since !1940, the TP size for Expert layer can be different with Attention.
-    To make distributed checkpoint work in such cases, we use a decorator to
-    replace the default TP parallel states with expert-TP parallel states.
-    """
-
-    logger.warning("expert_dist_ckpt_decorator is deprecated and will be removed in version 0.17.")
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        # Store original states
-        original_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
-        original_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-        original_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
-        try:
-            # Set new states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = (
-                parallel_state.get_expert_tensor_parallel_rank()
-            )
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = (
-                parallel_state.get_expert_tensor_parallel_world_size()
-            )
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = (
-                parallel_state.get_expert_tensor_parallel_group()
-            )
-
-            # Execute the function
-            result = func(*args, **kwargs)
-        finally:
-            # Restore original states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = original_rank
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = original_size
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = original_group
-        return result
-
-    return wrapper
-
-
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
 
     Executes multiple experts in parallel to maximize computational efficiency.
     """
 
+    # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
     def __init__(
         self,
         num_local_experts: int,
@@ -557,6 +512,7 @@ class TEGroupedMLP(MegatronModule):
     Executes multiple experts in parallel to maximize computational efficiency.
     """
 
+    # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
     def __init__(
         self,
         num_local_experts,
@@ -579,7 +535,6 @@ class TEGroupedMLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.num_local_experts,
@@ -591,7 +546,7 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=False,
             is_expert=True,
             tp_comm_buffer_name='fc1',
-            tp_group=pg_collection.expt_tp,
+            pg_collection=pg_collection,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -599,7 +554,6 @@ class TEGroupedMLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.num_local_experts,
@@ -615,7 +569,7 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=True,
             is_expert=True,
             tp_comm_buffer_name='fc2',
-            tp_group=pg_collection.expt_tp,
+            pg_collection=pg_collection,
         )
 
         self.activation_recompute = (
@@ -833,6 +787,7 @@ class SequentialMLP(MegatronModule):
     This class executes each expert sequentially.
     """
 
+    # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
     def __init__(
         self,
         num_local_experts,

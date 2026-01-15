@@ -63,6 +63,7 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
+
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
 
@@ -174,6 +175,7 @@ def get_inference_context(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
@@ -369,6 +371,7 @@ def run_inference(
                 request.time_end = get_curr_time()
                 request.state = "finished"
                 request.request_id = finished_request.request_id
+                request.events = finished_request.events
 
                 # Update prompt, in case engine has been suspended and resumed.
                 request.prompt_tokens = finished_request.prompt_tokens.tolist()
@@ -543,7 +546,7 @@ def main():
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
-            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+            print(f"\n{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
 
             # ---- Group all outputs for this prompt ----
             output_map = defaultdict(list)
@@ -553,6 +556,12 @@ def main():
 
             # ---- Print each unique output ----
             for output_text, output_request_idxs in output_map.items():
+                evicted = False
+                for idx in output_request_idxs:
+                    for event in requests[idx].events:
+                        if event.type.name == "EVICT":
+                            evicted = True
+                            break
                 if output_text is not None:
                     # Use hash of prompt + generated text in case engine was
                     # suspended and resumed, which misaligns boundary between
@@ -566,7 +575,7 @@ def main():
                     o_hash = "--"
                     o_len = 0
                     escaped_output_text = "--"
-                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
+                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}{', <evicted>' if evicted else ''}] {escaped_output_text}")
                 text_hashes.append(o_hash)
 
         # Write results to JSON. Primarily used for functional testing.
