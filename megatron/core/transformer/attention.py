@@ -27,9 +27,6 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_group_commit,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
@@ -837,7 +834,7 @@ class Attention(MegatronModule, ABC):
             )
         if self.offload_qkv_linear:
             # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
-            qkv_output = fine_grained_offloading_group_commit(
+            qkv_output = off_interface.group_commit(
                 qkv_output, name="qkv_linear", forced_released_tensors=[]
             )
 
@@ -1023,7 +1020,7 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
             if self.offload_core_attention and self.training:
-                core_attn_out = fine_grained_offloading_group_commit(
+                core_attn_out = off_interface.group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
 
@@ -1049,7 +1046,7 @@ class Attention(MegatronModule, ABC):
         with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output = fine_grained_offloading_group_commit(
+            output = off_interface.group_commit(
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
         nvtx_range_pop(suffix="linear_proj")
