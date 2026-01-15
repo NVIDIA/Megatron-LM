@@ -3,7 +3,7 @@
 from collections import deque
 from functools import lru_cache
 from math import ceil, log2
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 

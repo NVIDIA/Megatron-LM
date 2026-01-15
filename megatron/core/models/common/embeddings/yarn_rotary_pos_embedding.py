@@ -102,7 +102,6 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             # method causes a memory leak in NeMo-RL.
             self.forward.cache_clear()
 
-    @lru_cache(maxsize=32)
     def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
@@ -156,8 +155,14 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = emb[:, None, None, :]
         return emb, _mscale
 
+    @lru_cache(maxsize=32)
+    @internal_api
     def forward(
-        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq: bool = False,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
@@ -170,11 +175,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             Tensor: Embeddings after applying Yarn RoPE.
         """
         emb, _mscale = self.get_emb(max_seq_len, offset)
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            # Set CP group to dynamic CP group for CP slicing
-            cp_group = packed_seq_params.cp_group
-        else:
+        if cp_group is None:
             cp_group = self.cp_group
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
