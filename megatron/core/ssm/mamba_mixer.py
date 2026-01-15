@@ -628,9 +628,7 @@ class MambaMixer(MegatronModule):
         return out, out_bias
 
     def _ssm_training(
-        self,
-        zxBCdt: torch.Tensor,
-        packed_seq_params: Optional[PackedSeqParams] = None
+        self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> torch.Tensor:
         """
         Performs SSM computation for training step.
@@ -1247,7 +1245,7 @@ def _split_tensor_factory(
 
 
 def _check_mamba_sequence_packing_support(
-    for_inference_not_training: bool = True
+    for_inference_not_training: bool = True,
 ) -> Tuple[bool, Optional[str]]:
     """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
     if for_inference_not_training:

@@ -129,7 +129,9 @@ class TestMambaModel:
         lengths = [4, 3, 5]
         assert sum(lengths) == sequence_length
         positions = [i for n in lengths for i in range(n)]
-        position_ids = torch.tensor(positions, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = (
+            torch.tensor(positions, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        )
         attention_mask = None
 
         cumsum = [0] + list(accumulate(lengths))
