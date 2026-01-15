@@ -14,7 +14,7 @@ import torch
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
-from megatron.post_training.utils import modelopt_version_higher_than
+from megatron.post_training.utils import modelopt_version_at_least
 from megatron.training import get_args, get_model
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import unwrap_model
@@ -91,6 +91,6 @@ if __name__ == "__main__":
         "dtype": torch.bfloat16,
         "export_dir": args.export_dir,
     }
-    if modelopt_version_higher_than("0.41.0"):
+    if modelopt_version_at_least("0.41.0"):
         export_kwargs.update({"trust_remote_code": args.trust_remote_code})
     mtex.export_mcore_gpt_to_hf(unwrapped_model, args.pretrained_model_name, **export_kwargs)
