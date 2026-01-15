@@ -1023,6 +1023,7 @@ def apply_random_logits(logits):
     """
     return RandomSTE.apply(logits)
 
+
 @internal_api
 class RandomSTEShared(torch.autograd.Function):
     """
@@ -1034,15 +1035,16 @@ class RandomSTEShared(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, logits, std, layer_number):
+        """Forward pass: apply random bias to logits."""
         # Check cache if reuse mode (negative std)
         if std < 0 and layer_number in RandomSTEShared._cache:
             return logits + RandomSTEShared._cache[layer_number]
 
         # Generate random bias with shared seed across all ranks
         with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
-            bias = torch.empty(
-                logits.shape[-1], device=logits.device, dtype=logits.dtype
-            ).normal_(std=abs(std))
+            bias = torch.empty(logits.shape[-1], device=logits.device, dtype=logits.dtype).normal_(
+                std=abs(std)
+            )
 
         # Cache if reuse mode
         if std < 0 and layer_number is not None:
@@ -1052,6 +1054,7 @@ class RandomSTEShared(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Backward pass: pass through gradients."""
         return grad_output, None, None
 
 
