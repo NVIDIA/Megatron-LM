@@ -45,7 +45,6 @@ from typing import Any, Optional
 
 import torch
 
-from . import arguments
 from . import global_vars
 from .utils import is_rank0, print_rank_0
 
@@ -73,22 +72,25 @@ def get_rank_monitor_client() -> Optional[Any]:
     return _GLOBAL_RANK_MONITOR_CLIENT
 
 
-def setup() -> None:
-    """Initialize fault tolerance before initialize_megatron"""
-    args = arguments.parse_args(ignore_unknown_args=True)
-    if not args.enable_ft_package:
-        return
+def setup(args: argparse.Namespace) -> None:
+    """Initialize fault tolerance
 
-    # Initialize fault tolerance
+    Args:
+        args (argparse.Namespace): parsed Megatron-LM command line arguments
+
+    Raises:
+        ValueError: if invalid config is provided
+    """
     from nvidia_resiliency_ext.fault_tolerance import RankMonitorClient
 
-    if os.environ.get("RANK") == "0":
-        print("FT: initializing...", flush=True)
+    print_rank_0(f"FT: initializing...")
 
     checkpoint_dir = args.save
     if not checkpoint_dir:
         raise ValueError("checkpointing save dir must be set to enable fault tolerance")
-    if not os.path.exists(checkpoint_dir):
+    if is_rank0() and not os.path.exists(checkpoint_dir):
+        # MLM checkpoint dir will be needed for saving FT state.
+        # it can happen before the checkpointing, so create it in advance
         os.makedirs(checkpoint_dir, exist_ok=True)
 
     cli = RankMonitorClient()
@@ -107,8 +109,7 @@ def setup() -> None:
 
     cli.init_workload_monitoring()
     _load_state_if_exists()
-    if os.environ.get("RANK") == "0":
-        print(f"FT: initialized. Timeouts={cli.section_timeouts}", flush=True)
+    print_rank_0(f"FT: initialized. Timeouts={cli.section_timeouts}")
 
     cli.start_section("setup")
     global _is_setup_section_open
