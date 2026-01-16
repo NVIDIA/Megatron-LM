@@ -506,6 +506,7 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
             for arg in args
         )
         ctx.detached_args = detached_args
+        ctx.only_calculate_input_grad = checkpoint_without_output_obj.only_calculate_input_grad
         # ctx.save_for_backward(*detached_args)
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
@@ -524,29 +525,33 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
                 valid_outputs_with_grad.append(output)
                 valid_output_grads.append(output_grad)
 
-        # Collect tensor inputs that require gradients
-        tensor_inputs = [inp for inp in inputs if isinstance(inp, torch.Tensor) and inp.requires_grad]
+        if ctx.only_calculate_input_grad:
+            # Use torch.autograd.grad() to get gradients directly without accumulating to .grad
+            tensor_inputs = [inp for inp in inputs if isinstance(inp, torch.Tensor) and inp.requires_grad]
 
-        if valid_outputs_with_grad and tensor_inputs:
-            # Use torch.autograd.grad() instead of backward() to get gradients directly
-            grads = torch.autograd.grad(
-                outputs=valid_outputs_with_grad,
-                inputs=tensor_inputs,
-                grad_outputs=valid_output_grads,
-                allow_unused=True,
+            if valid_outputs_with_grad and tensor_inputs:
+                grads = torch.autograd.grad(
+                    outputs=valid_outputs_with_grad,
+                    inputs=tensor_inputs,
+                    grad_outputs=valid_output_grads,
+                    allow_unused=True,
+                )
+                grad_map = {id(inp): grad for inp, grad in zip(tensor_inputs, grads)}
+            else:
+                grad_map = {}
+
+            input_grads = tuple(
+                grad_map.get(id(inp), None) if isinstance(inp, torch.Tensor) else inp
+                for inp in inputs
             )
-            # Build a mapping from input tensor id to its gradient
-            grad_map = {id(inp): grad for inp, grad in zip(tensor_inputs, grads)}
         else:
-            grad_map = {}
+            # Use torch.autograd.backward() which accumulates gradients to .grad
+            torch.autograd.backward(valid_outputs_with_grad, grad_tensors=valid_output_grads)
+            input_grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
 
         ctx.outputs = None
         ctx.inputs = None
 
-        input_grads = tuple(
-            grad_map.get(id(inp), None) if isinstance(inp, torch.Tensor) else inp
-            for inp in inputs
-        )
         return (None, None) + input_grads
 
 
@@ -564,7 +569,7 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False):
+    def __init__(self, fp8=False, only_calculate_input_grad=False):
         self.fp8 = fp8 is not None
         self.run_function = None
         self.fwd_cpu_rng_state = None
@@ -572,6 +577,7 @@ class CheckpointWithoutOutput(object):
         self.fwd_cuda_rng_state_tracker = None
         self.ctx = None
         self.outputs = None
+        self.only_calculate_input_grad = only_calculate_input_grad
 
     def checkpoint(self, run_function, *args):
         """Checkpoint function."""

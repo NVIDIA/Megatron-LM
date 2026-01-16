@@ -389,8 +389,8 @@ class MoELayer(BaseMoELayer):
         # Step 2: Expert weight dispatch for echo experts
         # Create checkpoints for gradient computation
         with torch.cuda.nvtx.range("expert_dispatch"):
-            fc1_expert_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            fc2_expert_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            fc1_expert_checkpoint = tensor_parallel.CheckpointWithoutOutput(only_calculate_input_grad=True)
+            fc2_expert_checkpoint = tensor_parallel.CheckpointWithoutOutput(only_calculate_input_grad=True)
 
             # Dispatch fc1 expert weights
             fc1_expert_weights = self.experts.get_expert_weights(
