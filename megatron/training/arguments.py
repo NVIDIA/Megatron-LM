@@ -554,6 +554,74 @@ def validate_args(args, defaults={}):
             args.rank,
         )
 
+    # === MTP validation ===
+    # Backward compatibility: convert legacy mtp_hybrid_override_pattern to unified format
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+    sep = Symbols.MTP_SEPARATOR
+    if (
+        getattr(args, 'mtp_hybrid_override_pattern', None) is not None
+        and args.mtp_num_layers is not None
+        and args.mtp_num_layers > 0
+        and (args.hybrid_override_pattern is None or sep not in args.hybrid_override_pattern)
+    ):
+        main_pattern = args.hybrid_override_pattern or ''
+        mtp_pattern = args.mtp_hybrid_override_pattern
+        args.hybrid_override_pattern = main_pattern + sep + sep.join([mtp_pattern] * args.mtp_num_layers)
+        args.mtp_num_layers = None
+        args.mtp_hybrid_override_pattern = None
+        print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_override_pattern}")
+
+    # Infer mtp_num_layers from unified pattern
+    if args.hybrid_override_pattern and sep in args.hybrid_override_pattern:
+        parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+            inferred_mtp_num_layers = parsed.mtp_num_depths
+            if args.mtp_num_layers is None:
+                args.mtp_num_layers = inferred_mtp_num_layers
+            elif args.mtp_num_layers != inferred_mtp_num_layers:
+                raise ValueError(
+                    f"--mtp-num-layers ({args.mtp_num_layers}) conflicts with "
+                    f"MTP depth count ({inferred_mtp_num_layers}) in pattern '{args.hybrid_override_pattern}'"
+                )
+
+    # MTP validation
+    if args.mtp_num_layers:
+        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
+        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
+            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
+            + f"The supported position embedding types are rope and none."
+        )
+
+    # Validate MTP args for hybrid vs non-hybrid models
+    if args.is_hybrid_model:
+        # Mamba/hybrid model MTP validation
+        if args.mtp_num_layers and not (args.hybrid_override_pattern and sep in args.hybrid_override_pattern):
+            # Hybrid model wants MTP but no unified pattern - check for legacy args
+            if args.mtp_hybrid_override_pattern is None:
+                warn_rank_0(
+                    "Hybrid model with --mtp-num-layers but no MTP pattern. "
+                    "Use unified --hybrid-override-pattern with '/' separator (e.g., 'M*M*/MM/MM') "
+                    "or legacy --mtp-hybrid-override-pattern for old checkpoints.",
+                    args.rank
+                )
+    else:
+        # Non-hybrid (GPT) model MTP validation
+        if args.mtp_hybrid_override_pattern is not None:
+            warn_rank_0(
+                "--mtp-hybrid-override-pattern is for Mamba/hybrid models only. "
+                "For GPT models, MTP replicates the main transformer layer structure. "
+                "This argument will be ignored.",
+                args.rank
+            )
+        if args.mtp_spec is not None:
+            warn_rank_0(
+                "--mtp-spec is for Mamba/hybrid models only. "
+                "For GPT models, use the standard layer spec. "
+                "This argument will be ignored.",
+                args.rank
+            )
+    # === End of MTP validation ===
+    
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -1277,56 +1345,6 @@ def validate_args(args, defaults={}):
             assert is_te_min_version("2.7.0"), (
                 "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
                 "when enabling delay_wgrad_compute"
-            )
-
-    # For Mamba/hybrid models with unified pattern, infer mtp_num_layers from pattern
-    if args.hybrid_override_pattern and '/' in args.hybrid_override_pattern:
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
-        parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
-        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
-            inferred_mtp_num_layers = parsed.mtp_num_depths
-            if args.mtp_num_layers is None:
-                args.mtp_num_layers = inferred_mtp_num_layers
-            elif args.mtp_num_layers != inferred_mtp_num_layers:
-                raise ValueError(
-                    f"--mtp-num-layers ({args.mtp_num_layers}) conflicts with "
-                    f"MTP depth count ({inferred_mtp_num_layers}) in pattern '{args.hybrid_override_pattern}'"
-                )
-
-    if args.mtp_num_layers:
-        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
-            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
-        )
-
-    # Validate MTP args for hybrid vs non-hybrid models
-    if args.is_hybrid_model:
-        # Mamba/hybrid model MTP validation
-        if args.mtp_num_layers and not (args.hybrid_override_pattern and '/' in args.hybrid_override_pattern):
-            # Hybrid model wants MTP but no unified pattern - check for legacy args
-            if args.mtp_hybrid_override_pattern is None:
-                warn_rank_0(
-                    "Hybrid model with --mtp-num-layers but no MTP pattern. "
-                    "Use unified --hybrid-override-pattern with '/' separator (e.g., 'M*M*/MM/MM') "
-                    "or legacy --mtp-hybrid-override-pattern for old checkpoints.",
-                    args.rank
-                )
-    else:
-        # Non-hybrid (GPT) model MTP validation
-        if args.mtp_hybrid_override_pattern is not None:
-            warn_rank_0(
-                "--mtp-hybrid-override-pattern is for Mamba/hybrid models only. "
-                "For GPT models, MTP replicates the main transformer layer structure. "
-                "This argument will be ignored.",
-                args.rank
-            )
-        if args.mtp_spec is not None:
-            warn_rank_0(
-                "--mtp-spec is for Mamba/hybrid models only. "
-                "For GPT models, use the standard layer spec. "
-                "This argument will be ignored.",
-                args.rank
             )
 
     if args.cpu_offloading_num_layers > 0:

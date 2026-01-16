@@ -25,22 +25,6 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
     else:
         raise ValueError("You must provide a valid Mamba layer spec via --spec")
 
-    # Backward compatibility: if old checkpoint has separate mtp_hybrid_override_pattern,
-    # construct the unified pattern
-    hybrid_override_pattern = args.hybrid_override_pattern
-    if (
-        getattr(args, 'mtp_hybrid_override_pattern', None) is not None
-        and args.mtp_num_layers is not None
-        and args.mtp_num_layers > 0
-        and (hybrid_override_pattern is None or '/' not in hybrid_override_pattern)
-    ):
-        # Old checkpoint format: combine main pattern with MTP pattern
-        main_pattern = hybrid_override_pattern or ''
-        mtp_pattern = args.mtp_hybrid_override_pattern
-        # Build unified pattern: main/mtp/mtp/... (mtp_num_layers times)
-        hybrid_override_pattern = main_pattern + '/' + '/'.join([mtp_pattern] * args.mtp_num_layers)
-        print_rank_0(f"Converted legacy MTP pattern to unified: {hybrid_override_pattern}")
-
     model = MambaModel(
         config=config,
         mamba_stack_spec=mamba_stack_spec,
@@ -49,7 +33,7 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
         pre_process=pre_process,
         hybrid_attention_ratio=args.hybrid_attention_ratio,
         hybrid_mlp_ratio=args.hybrid_mlp_ratio,
-        hybrid_override_pattern=hybrid_override_pattern,
+        hybrid_override_pattern=args.hybrid_override_pattern,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         parallel_output=True,
