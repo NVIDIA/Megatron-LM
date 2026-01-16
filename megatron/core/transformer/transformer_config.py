@@ -226,6 +226,28 @@ class TransformerConfig(ModelParallelConfig):
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
 
     ####################
+    # attention variant
+    ####################
+    experimental_attention_variant: Optional[str] = None
+    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+
+    dsa_indexer_n_heads: Optional[int] = None
+    """Number of DSA indexer heads."""
+
+    dsa_indexer_head_dim: Optional[int] = None
+    """Dimension per DSA indexer head."""
+
+    dsa_indexer_topk: Optional[int] = None
+    """Number of top-k tokens to select in DSA indexer."""
+
+    dsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+
+    dsa_indexer_use_sparse_loss: bool = False
+    """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
+    top-k indices."""
+
+    ####################
     # initialization
     ####################
     init_method: Optional[Callable] = None
@@ -1835,11 +1857,18 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_qkv_bias
             assert not self.use_kitchen
 
+        if self.experimental_attention_variant == "dsa":
+            assert (
+                self.context_parallel_size == 1
+            ), "Currently context parallelism is not supported by DSAttention!"
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
                 "inference_fuse_tp_communication is only supported "
                 "for inference_optimized transformer implementation."
             )
+
         if self.batch_invariant_mode:
             assert (
                 self.attention_backend == AttnBackend.flash

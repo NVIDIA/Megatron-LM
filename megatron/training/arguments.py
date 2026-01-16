@@ -70,6 +70,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
+    parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
@@ -3367,6 +3368,24 @@ def _add_mla_args(parser):
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
+
+    return parser
+
+def _add_experimental_attention_variant_args(parser):
+    group = parser.add_argument_group(title="experimental_attention_variant")
+    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa'], type=str,
+                       help='Type of attention variant to use. Currently support gated_delta_net and dsa.')
+    # DSA
+    group.add_argument('--dsa-indexer-n-heads', default=None, type=int,
+                       help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
+    group.add_argument('--dsa-indexer-head-dim', default=None, type=int,
+                       help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
+    group.add_argument('--dsa-indexer-topk', default=None, type=int,
+                       help='Number of top-k tokens to select in sparse attention indexer.')
+    group.add_argument('--dsa-indexer-loss-coeff', default=None, type=float,
+                       help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
+    group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
+                       help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
 
     return parser
 
