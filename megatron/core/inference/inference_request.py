@@ -282,7 +282,7 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serialize(self):
+    def serialize(self) -> dict:
         """Converts the instance into a serializable dictionary.
 
         Returns:
