@@ -227,7 +227,8 @@ def setup_amem_environment(enable: bool = True, group_id: Optional[int] = None) 
         # Set log level (3 = INFO)
         os.environ.setdefault('GMM_LOG', '3')
 
-        # TODO: expose AMEM_NCCL_OFFLOAD_FREE_TAG as a CLI option if needed
+        # Optionally set P2P buffer to be freed without CPU offload
+        # os.environ.setdefault('AMEM_NCCL_OFFLOAD_FREE_TAG', '7')
 
         logger.info("AMem NCCL plugin environment configured")
     else:
