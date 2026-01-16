@@ -39,7 +39,10 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
 
         library_class = getattr(tokenizers, TOKENIZER_MAPPING_LIBRARIES[self.library])
 
-        return library_class(self.path, **kwargs)
+        if self.library in ['null-multimodal']:
+            return library_class(**kwargs)
+        else:
+            return library_class(self.path, **kwargs)
 
     def tokenize(self, text: Union[str, List[Dict]]) -> List[int]:
         """
@@ -109,10 +112,14 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
         """Applies tokenizer's chat template."""
         raise NotImplementedError("This method is not supported for vision tokenizers.")
 
-    @property
     def get_special_tokens(self) -> list:
         """Returns a list of the additional special tokens."""
         return self._tokenizer.get_special_tokens()
+
+    @property
+    def vocab(self):
+        """Tokenizer vocab."""
+        return self._tokenizer.vocab
 
     @property
     def vocab_size(self) -> int:
@@ -128,8 +135,3 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
     def eod(self):
         """End of sentence token ID."""
         return self._tokenizer.eod
-
-    @property
-    def vocab(self):
-        """Tokenizer vocab."""
-        return self._tokenizer.vocab

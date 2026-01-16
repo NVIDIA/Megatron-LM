@@ -5,7 +5,6 @@ class MegatronNullMultimodalTokenizer():
     """Megatron Null Multimodal Tokenizer"""
     def __init__(self, vocab_size, image_token=None, image_token_id=None):
         """ """
-        super().__init__(None, vocab_size=vocab_size)
         self._vocab_size_without_eod = int(vocab_size)
         self._eod_id = self._vocab_size_without_eod
 
