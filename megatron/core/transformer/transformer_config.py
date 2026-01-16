@@ -616,6 +616,13 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_force_biased: Optional[float] = None
+    """[Experimental] Apply random expert bias in normal distribution with specified std
+    to router logits. Shared seed across all ranks ensures identical bias.
+    If positive, generates new random bias each forward pass.
+    If negative, generates bias once per layer and reuses it (abs value is std).
+    This is an experimental feature for benchmarking purposes."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
