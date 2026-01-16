@@ -51,6 +51,8 @@ set -exo pipefail
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
+ENABLE_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
+    /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')
 MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.MODE // "pretraining"')
 
@@ -67,6 +69,7 @@ mkdir -p $CHECKPOINT_SAVE_PATH
 mkdir -p $CHECKPOINT_LOAD_PATH || true
 _CHECKPOINT_LOAD_PATH=$CHECKPOINT_LOAD_PATH
 _CHECKPOINT_SAVE_PATH=$CHECKPOINT_SAVE_PATH
+_TENSORBOARD_PATH=$TENSORBOARD_PATH
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
@@ -133,6 +136,10 @@ for i in $(seq 1 $N_REPEAT); do
 
     # First run never loads from a checkpoint
     export RUN_NUMBER=1
+    DIR=$(dirname "$_TENSORBOARD_PATH")
+    FILE=$(basename "$_TENSORBOARD_PATH")
+    export TENSORBOARD_PATH=$DIR/$i/$FILE
+    mkdir -p $(dirname $TENSORBOARD_PATH)
     export REPEAT=$i
     export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
     export TRAINING_EXIT_CODE=0

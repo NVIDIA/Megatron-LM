@@ -166,6 +166,7 @@ def get_dynamic_inference_engine(
         cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
+        persist_cuda_graphs=args.rl_training_cuda_graphs
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context, pg_collection=pg_collection)
