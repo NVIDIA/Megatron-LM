@@ -104,6 +104,8 @@ class MLP(MegatronModule):
         # see https://arxiv.org/pdf/2002.05202.pdf
         # For GLU/SwiGLU, use stride=2 because each TP rank stores interleaved [gate, up] portions.
         # This is critical for correct weight resharding across different TP sizes.
+        # NOTE: Kitchen Linear doesn't support stride != 1.
+        # Weight resharding across TP sizes will have aforementioned problems for that backend.
         if self.config.gated_linear_unit and not self.config.use_kitchen:
             ffn_hidden_size *= 2
             fc1_stride = 2
