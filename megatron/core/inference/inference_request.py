@@ -510,8 +510,8 @@ class DynamicInferenceRequestRecord:
                 serialization.
         """
         torch.cuda.nvtx.range_push("DynamicInferenceRequestRecord.serialize")
-        self.requests = [r.serialize() for r in self.requests]
         obj = self.__dict__  # shallow dict copy
+        obj["requests"] = [r.serialize() for r in obj["requests"]]
         torch.cuda.nvtx.range_pop()
         return obj
 
