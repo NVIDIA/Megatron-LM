@@ -2441,7 +2441,6 @@ def _add_training_args(parser):
                        'which only ensures bitwise identical results when the same inputs are processed in the same batch configuration. '
                        'This will significantly affect speed of training and inference as the kernels are not full optimized.')
 
-
     return parser
 
 
@@ -3419,7 +3418,17 @@ def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
     group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa'], type=str,
                        help='Type of attention variant to use. Currently support gated_delta_net and dsa.')
-
+    # DSA
+    group.add_argument('--dsa-indexer-n-heads', default=None, type=int,
+                       help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
+    group.add_argument('--dsa-indexer-head-dim', default=None, type=int,
+                       help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
+    group.add_argument('--dsa-indexer-topk', default=None, type=int,
+                       help='Number of top-k tokens to select in sparse attention indexer.')
+    group.add_argument('--dsa-indexer-loss-coeff', default=0.0, type=float,
+                       help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
+    group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
+                       help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
     # Linear attention
     group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net'], type=str,
                        help='(Deprecated, use --experimental-attention-variant instead) Type of linear attention to use. Currently support gated_delta_net.')
@@ -3442,19 +3451,6 @@ def _add_experimental_attention_variant_args(parser):
                        help='Number of query and key heads for the gated delta net.')
     group.add_argument('--linear-num-value-heads', default=32, type=int,
                        help='Number of value and gate heads for the gated delta net.')
-
-    # DSA
-    group.add_argument('--dsa-indexer-n-heads', default=None, type=int,
-                       help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
-    group.add_argument('--dsa-indexer-head-dim', default=None, type=int,
-                       help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
-    group.add_argument('--dsa-indexer-topk', default=None, type=int,
-                       help='Number of top-k tokens to select in sparse attention indexer.')
-    group.add_argument('--dsa-indexer-loss-coeff', default=0.0, type=float,
-                       help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
-    group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
-                       help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
-
     return parser
 
 def _add_heterogeneous_args(parser):
