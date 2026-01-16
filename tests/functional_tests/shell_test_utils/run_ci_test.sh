@@ -129,11 +129,15 @@ for i in $(seq 1 $N_REPEAT); do
     if [[ $i -gt 1 ]]; then
         rm -rf $CHECKPOINT_SAVE_PATH/*
         rm -rf /tmp/checkpoints/*
+        rm -rf $TENSORBOARD_PATH/*
     fi
 
     # First run never loads from a checkpoint
     export RUN_NUMBER=1
-    export TENSORBOARD_PATH=$_TENSORBOARD_PATH/$i/
+    DIR=$(dirname "$_TENSORBOARD_PATH")
+    FILE=$(basename "$_TENSORBOARD_PATH")
+    export TENSORBOARD_PATH=$DIR/$i/$FILE
+    mkdir -p $(dirname $TENSORBOARD_PATH)
     export REPEAT=$i
     export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
     export TRAINING_EXIT_CODE=0

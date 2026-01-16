@@ -135,6 +135,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -688,6 +689,13 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+
+    if args.fine_grained_activation_offloading:
+        from megatron.core.pipeline_parallel.utils import (
+            set_ideal_affinity_for_current_gpu
+        )
+        set_ideal_affinity_for_current_gpu()
+
 
     if args.log_progress:
         append_to_progress_log("Starting job")
@@ -1857,6 +1865,16 @@ def training_log(
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
+    # Track sparse attention indexer loss
+    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+        indexer_loss_scale = 1 / get_num_microbatches()
+        DSAIndexerLossLoggingHelper.track_indexer_metrics(
+            loss_scale=indexer_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
+        )
     if iteration % args.log_interval == 0 or is_first_iteration:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
@@ -2220,7 +2238,13 @@ def checkpoint_and_decide_exit(
             return True
 
     # Exit based on iterations.
-    if args.exit_interval and iteration % args.exit_interval == 0:
+    if (
+        args.exit_interval
+        and iteration % args.exit_interval == 0
+    ) or (
+        args.phase_transition_iterations
+        and iteration in args.phase_transition_iterations
+    ):
         if args.save and not saved_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -3122,7 +3146,17 @@ def get_train_valid_test_num_samples():
         eval_samples = eval_iters * args.global_batch_size
     test_samples = args.eval_iters * args.global_batch_size
 
-    return (train_samples, eval_samples, test_samples)
+    # Get train_samples in current phase.
+    if args.phase_transition_iterations:
+        phase_transition_samples = [0] + [t * args.global_batch_size for t in args.phase_transition_iterations] + [args.train_samples]
+        current_sample = args.iteration * args.global_batch_size
+        last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
+        next_transition_sample = min(s for s in phase_transition_samples if s > current_sample)
+        train_samples_in_current_phase = next_transition_sample - last_transition_sample
+    else:
+        train_samples_in_current_phase = train_samples
+
+    return (train_samples_in_current_phase, eval_samples, test_samples)
 
 
 def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
@@ -3150,12 +3184,20 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         assert (
             args.train_samples is None
         ), 'Only backward compatiblity support for iteration-based training'
+
         args.consumed_train_samples = args.iteration * args.global_batch_size
     if args.iteration > 0 and args.consumed_valid_samples == 0:
         if args.train_samples is None:
             args.consumed_valid_samples = (
                 (args.iteration // args.eval_interval) * args.eval_iters * args.global_batch_size
             )
+
+    # Get consumed train samples in this phase.
+    if args.phase_transition_iterations:
+        last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= args.iteration)
+        consumed_train_samples_in_current_phase = (args.iteration - last_transition) * args.global_batch_size
+    else:
+        consumed_train_samples_in_current_phase = args.consumed_train_samples
 
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
@@ -3180,7 +3222,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             if args.skip_train:
                 train_dataloader = None
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
             valid_dataloaders = []
             for valid_d in valid_ds:
                 if args.skip_train or args.full_validation:
