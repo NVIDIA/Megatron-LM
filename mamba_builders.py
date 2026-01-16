@@ -38,6 +38,7 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
+        seq_len_interpolation_factor=args.seq_len_interpolation_factor,
         pg_collection=pg_collection,
     )
 
