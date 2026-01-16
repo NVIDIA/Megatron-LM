@@ -127,30 +127,6 @@ def initialize_megatron(
         # Pytorch distributed.
         _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store)
 
-        # Initialize AMem NCCL plugin if requested for RL scenarios
-        if getattr(args, 'rl_use_amem_nccl', False):
-            try:
-                from megatron.core import amem_nccl
-                
-                # Setup AMem environment
-                group_id = getattr(args, 'rl_amem_group_id', None)
-                amem_nccl.setup_amem_environment(enable=True, group_id=group_id)
-                
-                # Try to set group ID if specified
-                if group_id is not None:
-                    if amem_nccl.nccl_set_group_id(group_id):
-                        if args.rank == 0:
-                            print(f"> AMem NCCL plugin initialized with group ID {group_id}")
-                    else:
-                        logger.warning(f"Failed to set AMem group ID {group_id}")
-                elif args.rank == 0:
-                    print("> AMem NCCL plugin enabled (no group ID set)")
-                    
-            except ImportError as e:
-                if args.rank == 0:
-                    print(f"> Warning: AMem NCCL plugin requested but not available: {e}")
-                logger.warning(f"AMem NCCL module import failed: {e}")
-
         # Random seeds for reproducibility.
         if args.rank == 0:
             print("> setting random seeds to {} ...".format(args.seed))

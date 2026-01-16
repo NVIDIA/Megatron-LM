@@ -479,23 +479,6 @@ Based on [NVIDIA NeMo production configurations](https://github.com/NVIDIA/NeMo/
 --use-distributed-optimizer
 ```
 
-### AMem NCCL Plugin for RL Training (Optional)
-
-For Reinforcement Learning scenarios, enable the AMem NCCL plugin to transparently offload NCCL-allocated GPU memory during inference/rollout phases. This can save up to 10GB+ memory per GPU card.
-
-```bash
---rl-use-amem-nccl                    # Enable AMem NCCL plugin
---rl-amem-group-id GROUP_ID           # Process group ID (if needed)
---rl-amem-offload-during-rollout      # Offload during rollout (default: true)
-```
-
-**Prerequisites:**
-- Install AMem NCCL plugin from [asystem-amem](https://github.com/inclusionAI/asystem-amem)
-- Set environment variables: `NCCL_CUMEM_ENABLE=1` and `AMEM_ENABLE=1`
-- GPU compute capability ≥ sm80 (Ampere or newer)
-
-**→ [Complete AMem Integration Guide](docs/amem_integration.md)** - Installation, configuration, and usage examples.
-
 # Roadmaps
 
 Stay up-to-date with our development roadmaps and planned features:
