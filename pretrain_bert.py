@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 
 from megatron.training import get_args
-from megatron.training import get_tokenizer
 from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.core import tensor_parallel
@@ -25,7 +24,6 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core import mpu, tensor_parallel
-from megatron.core.tokenizers import MegatronTokenizer
 
 
 def model_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
@@ -147,10 +145,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     """Build train, valid, and test datasets."""
     args = get_args()
 
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
 
     config = BERTMaskedWordPieceDatasetConfig(
         random_seed=args.seed,
