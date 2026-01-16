@@ -77,6 +77,14 @@ class MegatronMultimodalTokenizer():
             raise ImportError(
                 "MegatronMultimodalTokenizer currently requires transformers library to be installed."
             )
+        if prompt_format == "nvlm-yi-34b":
+            kwargs.update(
+                {
+                    "from_slow": True,
+                    "legacy": False,
+                    "add_bos_token": True,
+                }
+            )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path=path, **kwargs
         )
