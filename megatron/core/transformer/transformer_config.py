@@ -192,6 +192,9 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    qk_l2_norm: bool = False
+    """Whether to apply llama 4-style qk L2 norm."""
+
     qk_clip: bool = False
     """Whether to clip the query and key weights. Needed for Muon MLA Model training."""
 
@@ -224,6 +227,56 @@ class TransformerConfig(ModelParallelConfig):
     no_rope=4 means RoPE is applied for 3 layers, then skipped for 1 layer, repeating this pattern.
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
+
+    ####################
+    # attention variant
+    ####################
+    experimental_attention_variant: Optional[str] = None
+    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+
+    ####################
+    # DSA
+    ####################
+    dsa_indexer_n_heads: Optional[int] = None
+    """Number of DSA indexer heads."""
+
+    dsa_indexer_head_dim: Optional[int] = None
+    """Dimension per DSA indexer head."""
+
+    dsa_indexer_topk: Optional[int] = None
+    """Number of top-k tokens to select in DSA indexer."""
+
+    dsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+
+    dsa_indexer_use_sparse_loss: bool = False
+    """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
+    top-k indices."""
+
+    ####################
+    # linear attention
+    ####################
+    linear_attention_freq: Optional[Union[int, List[int]]] = None
+    """Frequency between LA (linear attention) layers 
+    and SDPA (scaled dot-product attention) layers.
+    Accepts either:
+    - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
+    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
+
+    linear_conv_kernel_dim: Optional[int] = None
+    """Conv kernel dimension for the gated delta net."""
+
+    linear_key_head_dim: Optional[int] = None
+    """Query and key head dimension for the gated delta net."""
+
+    linear_value_head_dim: Optional[int] = None
+    """Value and gate head dimension for the gated delta net."""
+
+    linear_num_key_heads: Optional[int] = None
+    """Number of query and key heads for the gated delta net."""
+
+    linear_num_value_heads: Optional[int] = None
+    """Number of value and gate heads for the gated delta net."""
 
     ####################
     # initialization
@@ -850,6 +903,46 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            )
+
+        if self.experimental_attention_variant == "gated_delta_net":
+            assert (
+                self.linear_attention_freq is not None
+            ), f"linear_attention_freq must be set for linear gated_delta_net."
+
+            # Check required parameters
+            assert (
+                self.linear_conv_kernel_dim is not None
+            ), "linear_conv_kernel_dim must be set for gated delta net."
+            assert (
+                self.linear_key_head_dim is not None
+            ), "linear_key_head_dim must be set for gated delta net."
+            assert (
+                self.linear_value_head_dim is not None
+            ), "linear_value_head_dim must be set for gated delta net."
+            assert (
+                self.linear_num_key_heads is not None
+            ), "linear_num_key_heads must be set for gated delta net."
+            assert (
+                self.linear_num_value_heads is not None
+            ), "linear_num_value_heads must be set for gated delta net."
+            assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                f"linear_num_key_heads ({self.linear_num_key_heads})."
+            )
+
+            # Check tensor parallelism compatibility
+            assert (
+                self.linear_num_key_heads % self.tensor_model_parallel_size == 0
+            ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
+            assert (
+                self.linear_num_value_heads % self.tensor_model_parallel_size == 0
+            ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
+
+            # Do not support yet, but coming soon.
+            assert self.context_parallel_size == 1, (
+                f"Gated delta net does not support context parallel for now,"
+                f" but got {self.context_parallel_size=}."
             )
 
         if self.fp8:
@@ -1746,6 +1839,16 @@ class TransformerConfig(ModelParallelConfig):
                     'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
                 )
 
+            if self.cuda_graph_impl != "none":
+                assert (
+                    self.cuda_graph_impl == "transformer_engine"
+                    and CudaGraphScope.moe not in self.cuda_graph_scope
+                    and CudaGraphScope.mlp not in self.cuda_graph_scope
+                ), (
+                    'CUDA graph scope on moe and mlp is not '
+                    'supported with overlap_moe_expert_parallel_comm'
+                )
+
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
             assert (
@@ -1754,6 +1857,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_use_legacy_grouped_gemm
             ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+            if self.cuda_graph_impl == "transformer_engine":
+                assert is_te_min_version("2.10.0"), (
+                    'TE version >= 2.10.0 is required for delay_wgrad_compute with '
+                    'partial cuda graph'
+                )
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (
@@ -1820,11 +1928,18 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_qkv_bias
             assert not self.use_kitchen
 
+        if self.experimental_attention_variant == "dsa":
+            assert (
+                self.context_parallel_size == 1
+            ), "Currently context parallelism is not supported by DSAttention!"
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
                 "inference_fuse_tp_communication is only supported "
                 "for inference_optimized transformer implementation."
             )
+
         if self.batch_invariant_mode:
             assert (
                 self.attention_backend == AttnBackend.flash

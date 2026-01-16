@@ -30,19 +30,10 @@ def get_default_strategy(action: StrategyAction, backend: str, version: int):
     """Retrieves a default strategy for a given action, backend and version."""
     error_hint: str = ""
     try:
-        if backend == 'zarr':
-            error_hint = ' Please install `zarr` and `tensorstore!=0.1.46` packages'
-            from .tensorstore import register_default_tensorstore_strategies
+        error_hint = ' Please use PyTorch version >=2.1'
+        from .torch import register_default_torch_strategies
 
-            register_default_tensorstore_strategies()
-            from .zarr import register_default_zarr_strategies
-
-            register_default_zarr_strategies()
-        elif backend == 'torch_dist':
-            error_hint = ' Please use PyTorch version >=2.1'
-            from .torch import register_default_torch_strategies
-
-            register_default_torch_strategies()
+        register_default_torch_strategies()
     except ImportError as e:
         raise CheckpointingException(
             f'Cannot import a default strategy for: {(action.value, backend, version)}. '
