@@ -18,6 +18,9 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
@@ -120,6 +123,7 @@ class GPTModel(LanguageModule):
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.vp_stage = vp_stage
+        self.disable_param_offloading = True
 
         if hasattr(self.config, 'position_embedding_type'):
             self.position_embedding_type = self.config.position_embedding_type
@@ -420,6 +424,24 @@ class GPTModel(LanguageModule):
 
         return preproc_output
 
+    def preprocess_for_fine_grained_offloading(self):
+        """Preprocess for fine-grained activation offloading."""
+        off_interface.init_chunk_handler(
+            vp_size=self.config.virtual_pipeline_model_parallel_size,
+            vp_stage=self.vp_stage,
+            min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+        )
+        if self.disable_param_offloading:
+            for param in self.decoder.parameters():
+                off_interface.mark_not_offloadable(param)
+            if self.mtp_process:
+                for param in self.mtp.parameters():
+                    off_interface.mark_not_offloadable(param)
+            if self.post_process:
+                for param in self.output_layer.parameters():
+                    off_interface.mark_not_offloadable(param)
+            self.disable_param_offloading = False
+
     def forward(
         self,
         input_ids: Tensor,
@@ -445,6 +467,8 @@ class GPTModel(LanguageModule):
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
         """
+        if self.config.fine_grained_activation_offloading:
+            self.preprocess_for_fine_grained_offloading()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -718,6 +742,9 @@ class GPTModel(LanguageModule):
         Returns:
             TransformerModelChunkSchedulePlan: The model chunk schedule plan.
         """
+
+        if self.config.fine_grained_activation_offloading:
+            self.preprocess_for_fine_grained_offloading()
 
         from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 
