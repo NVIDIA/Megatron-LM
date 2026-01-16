@@ -1575,23 +1575,16 @@ def megatron_rl_inference_mode(
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
-    # Check if AMem NCCL plugin should be used
-    use_amem = getattr(args, 'rl_use_amem_nccl', False)
     amem_offload_during_rollout = getattr(args, 'rl_amem_offload_during_rollout', True)
-
-    if use_amem:
+    if amem_offload_during_rollout:
         try:
             from megatron.core import amem_nccl
-
-            # Initialize AMem if available
             if amem_nccl.is_amem_available():
                 logger.info(f"[{dist.get_rank()}:DP] AMem NCCL plugin enabled for memory offloading")
             else:
                 logger.warning(f"[{dist.get_rank()}:DP] AMem NCCL plugin requested but not available")
-                use_amem = False
         except ImportError:
             logger.warning(f"[{dist.get_rank()}:DP] AMem NCCL module not found, disabling AMem")
-            use_amem = False
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 

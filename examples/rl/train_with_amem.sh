@@ -25,8 +25,7 @@ export AMEM_GROUPID=100
 # Log level: 3=INFO, 4=DEBUG, 5=VERBOSE
 export GMM_LOG=3
 
-# Optional: P2P buffer handling (direct free without CPU offload)
-export AMEM_NCCL_OFFLOAD_FREE_TAG=7
+## TODO: expose AMEM_NCCL_OFFLOAD_FREE_TAG as a CLI option if needed
 
 # Path to AMem-enabled NCCL library
 export AMEM_NCCL_LIB_PATH="${AMEM_PATH}/third_party/nccl/build/lib/libnccl.so.2"
@@ -126,7 +125,7 @@ torchrun \
     --fp16 \
     --use-flash-attn \
     --sequence-parallel \
-    --rl-use-amem-nccl \
+    --rl-amem-offload-during-rollout \
     --rl-amem-group-id ${AMEM_GROUPID} \
     --rl-amem-offload-during-rollout \
     --grpo-prompts-per-step ${GRPO_PROMPTS_PER_STEP} \
