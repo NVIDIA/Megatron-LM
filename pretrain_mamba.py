@@ -78,7 +78,6 @@ def get_batch(data_iterator, vp_stage=None):
     # Support for Hybrid Context Parallel (Unused in this script)
     local_cp_size = batch.pop('local_cp_size', None)
 
-    cu_seqlens = batch['cu_seqlens']
     if cu_seqlens is not None:
         assert (
             cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
@@ -86,7 +85,6 @@ def get_batch(data_iterator, vp_stage=None):
         cu_seqlens = cu_seqlens[0]
         batch['cu_seqlens'] = cu_seqlens
 
-        max_seqlen = batch['max_seqlen']
         assert max_seqlen.dim() == 1
         # TODO(duncan): can this be kept as a 0-D tensor?
         batch['max_seqlen'] = int(max_seqlen[0].item())
