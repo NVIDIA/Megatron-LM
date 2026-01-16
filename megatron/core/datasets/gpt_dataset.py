@@ -164,17 +164,15 @@ class GPTDataset(MegatronDataset):
                 ),
             )
         sequences_per_dataset = None
-        token_dtype_code = None
         if config.sequences_per_dataset:
             sequences_per_dataset = config.sequences_per_dataset[dataset_path]
-            token_dtype_code = config.token_dtype_code
         return IndexedDataset(
             dataset_path,
             multimodal=False,
             mmap=config.mmap_bin_files,
             fast_cache_load=config.fast_cache_load,
             sequences_per_dataset=sequences_per_dataset,
-            dtype_code=token_dtype_code,
+            dtype_code=config.token_dtype_code,
         )
 
     def __len__(self) -> int:
