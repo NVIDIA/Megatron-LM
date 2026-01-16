@@ -51,6 +51,9 @@ except ImportError:
 
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_linear_attention_variant,
+)
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_attr_wrapped_model,
@@ -282,9 +285,6 @@ def num_floating_point_operations(args, batch_size):
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
         # TODO(helenn/dnarayanan): Refactor this to reuse the helper methods.
-        # Attention projection size.
-        query_projection_size = args.kv_channels * args.num_attention_heads
-        query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
         # Group Query Attention.
         if not args.group_query_attention:
             args.num_query_groups = args.num_attention_heads
@@ -334,18 +334,15 @@ def num_floating_point_operations(args, batch_size):
             if args.moe_shared_expert_intermediate_size is None
             else args.moe_shared_expert_intermediate_size
         )
-        # SwiGLU.
-        gated_linear_multiplier = 3 / 2 if args.swiglu else 1
 
-        # The 12x term below comes from the following factors; for more details, see
-        # "APPENDIX: FLOATING-POINT OPERATIONS" in https://arxiv.org/abs/2104.04473.
         # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
         #       backward wgrad [weight gradient], backward dgrad [data gradient]).
-        # - 2x: GEMMs of a particular size are stacked twice in the standard Transformer model
-        #       architectures implemented in this codebase (e.g., h->ffn_h GEMM and ffn_h->h GEMM
-        #       in MLP layer).
+        forward_backward_expansion_factor = 3
         # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
-        expansion_factor = 3 * 2 * 2
+        fma_expansion_factor = 2
+        # - 3x (SwiGLU enabled): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
+        # - 2x (SwiGLU disabled): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
+        ffn_expansion_factor = 3 if args.swiglu else 2
 
         if args.multi_latent_attention:
             assert not args.group_query_attention
@@ -375,10 +372,9 @@ def num_floating_point_operations(args, batch_size):
                     + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                     + 1
                 )
-            self_attn_term = (
-                3
-                * 2  # fwd(1) + bwd(2) *FMA
-                * num_layers
+            standard_self_attn_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * (
                     ## q lora + rope + q norm
                     q_term
@@ -395,53 +391,136 @@ def num_floating_point_operations(args, batch_size):
                     ## core attn
                     + args.seq_length
                     * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2
+                    / 2  # causal mask (only half of the mask is non-zero)
                     + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
                 )
             )
 
         else:
             ## MHA or GQA
-            self_attn_term = (
-                expansion_factor
-                * num_layers
-                * args.hidden_size
-                * args.hidden_size
+            query_projection_size = args.kv_channels * args.num_attention_heads
+            key_projection_size = args.kv_channels * args.num_query_groups
+            value_projection_size = args.kv_channels * args.num_query_groups
+            gate_projection_size = query_projection_size if args.attention_output_gate else 0
+            standard_self_attn_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * (
-                    (
-                        1
-                        + (args.num_query_groups / args.num_attention_heads)
-                        # # Only half of the attention matrix is non-zero and needs to be multiplied with V.
-                        + (args.seq_length / args.hidden_size / 2)
+                    ## qkv proj
+                    args.hidden_size
+                    * (
+                        query_projection_size
+                        + key_projection_size
+                        + value_projection_size
+                        + gate_projection_size
                     )
-                    * query_projection_to_hidden_size_ratio
+                    ## core attention
+                    + query_projection_size
+                    * args.seq_length
+                    / 2  # causal mask (only half of the mask is non-zero)
+                    * 2  # QK^T and (QK^T)V
+                    ## out proj
+                    + query_projection_size
+                    * args.hidden_size
                 )
             )
+
+        if is_linear_attention_variant(args.experimental_attention_variant):
+            # Calculate number of dense and MoE Transformer MLPs.
+            if isinstance(args.linear_attention_freq, int):
+                linear_attention_pattern = [
+                    # [1,1,...,1,0,1,1,...,1,0,...]
+                    0 if ((i + 1) % args.linear_attention_freq == 0)
+                    else 1 for i in range(num_layers)
+                ]
+            elif isinstance(args.linear_attention_freq, list):
+                linear_attention_pattern = args.linear_attention_freq
+                assert len(linear_attention_pattern) == num_layers, (
+                    f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
+                    f"expected {num_layers}, "
+                    f"current linear attention pattern: {args.linear_attention_freq}"
+                )
+            elif args.linear_attention_freq is None:
+                # This should be caught by config validation, but raise here as a safety check
+                raise ValueError(
+                    f"Linear attention type {args.experimental_attention_variant} is specified "
+                    "but linear_attention_freq is None. "
+                    "Please set linear_attention_freq to specify the LA/SDPA layer pattern."
+                )
+            else:
+                raise ValueError(
+                    f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
+                    f" {args.linear_attention_freq}"
+                )
+            num_linear_attention_layers = sum(linear_attention_pattern)
+            num_standard_attention_layers = num_layers - num_linear_attention_layers
+
+            if args.experimental_attention_variant == "gated_delta_net":
+                # Calculate the FLOPs for the gated delta net attention.
+                qk_head_dim = args.linear_key_head_dim
+                v_head_dim = args.linear_value_head_dim
+                num_qk_heads = args.linear_num_key_heads
+                num_v_heads = args.linear_num_value_heads
+                qk_dim = qk_head_dim * num_qk_heads
+                v_dim = v_head_dim * num_v_heads
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## in proj
+                        args.hidden_size
+                        * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+                        ## conv1d
+                        + args.linear_conv_kernel_dim
+                        * (2 * qk_dim + v_dim)
+                        ## gated delta rule
+                        + num_v_heads
+                        * (v_head_dim ** 2)
+                        * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
+                        ## out proj
+                        + args.hidden_size
+                        * v_dim
+                    )
+                )
+            else:
+                raise ValueError(
+                    "Invalid experimental_attention_variant: "
+                    f"{args.experimental_attention_variant}"
+                )
+        else:
+            num_linear_attention_layers = 0
+            linear_self_attn_term = 0
+            num_standard_attention_layers = num_layers
+
+        self_attn_term = (
+            linear_self_attn_term * num_linear_attention_layers
+            + standard_self_attn_term * num_standard_attention_layers
+        )
 
         total_floating_point_operations = (
             batch_size
             * args.seq_length
             * (
                 # MLP
-                expansion_factor
-                * num_layers
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * args.hidden_size
                 * (
                     # dense layer (deepseek v2, v3 style)
-                    (args.ffn_hidden_size * gated_linear_multiplier)
-                    * (num_dense_layers / num_layers)
+                    (args.ffn_hidden_size * ffn_expansion_factor)
+                    * num_dense_layers
                     # routed experts
-                    + (moe_ffn_hidden_size * num_experts_routed_to * gated_linear_multiplier)
-                    * (num_moe_layers / num_layers)
+                    + (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
+                    * num_moe_layers
                     # Shared Experts.
-                    + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
-                    * (num_moe_layers / num_layers)
+                    + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
+                    * num_moe_layers
                 )
                 # Self Attention
                 + self_attn_term
                 # MTP norms and proj
-                + 3
-                * 2
+                + forward_backward_expansion_factor
+                * fma_expansion_factor
                 * mtp_num_layers
                 * (
                     # MTP eh norm + final nrom
@@ -450,7 +529,11 @@ def num_floating_point_operations(args, batch_size):
                     + 2 * args.hidden_size * args.hidden_size
                 )
                 # Logit.
-                + 3 * 2 * args.hidden_size * args.padded_vocab_size * (mtp_num_layers + 1)
+                + forward_backward_expansion_factor
+                * fma_expansion_factor
+                * args.hidden_size
+                * args.padded_vocab_size
+                * (mtp_num_layers + 1)  # MTP + final logit
             )
         )
         return total_floating_point_operations
