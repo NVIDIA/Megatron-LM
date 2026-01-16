@@ -74,7 +74,7 @@ jobs:
             rm LICENSE || true
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE bash -c '\
               for python_version in cp310 cp311 cp312 cp313; do \
-                /opt/python/${python_version}-${python_version}/bin/pip install --upgrade "setuptools>=80.0.0" build; \
+                /opt/python/${python_version}-${python_version}/bin/pip install --upgrade "setuptools<80.0.0,>=77.0.0" build; \
               done && \
               for python_version in cp310 cp311 cp312 cp313; do \
                 /opt/python/${python_version}-${python_version}/bin/python -m build; \
