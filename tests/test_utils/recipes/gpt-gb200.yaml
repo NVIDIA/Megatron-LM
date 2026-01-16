@@ -123,7 +123,7 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_h100]
+        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion]
     products:
       - environment: [dev]
