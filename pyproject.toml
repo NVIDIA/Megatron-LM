@@ -134,13 +134,13 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 build = [
-    "setuptools<80.0.0",
+    "setuptools<80.0.0,>=77.0.0",
     "packaging>=24.2",
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-mathdx",     # for TE
+    "nvidia-mathdx",              # for TE
 ]
 linting = [
     "ruff~=0.9.0",
