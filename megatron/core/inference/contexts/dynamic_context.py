@@ -2156,6 +2156,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count
 
+        # Swap the chunked prefill request to the end of the active requests to maintain invariant.
+        # This is necessary because the movements above may have shifted the chunked prefill request.
+        if self.chunked_prefill_request_id != -1:
+            chunked_prefill_idx = self.get_index_of_chunked_prefill_request()
+            target_idx = self.total_request_count - 1
+            if chunked_prefill_idx != target_idx:
+                self._swap_book_keeping_tensors(
+                    src_idxs=torch.tensor([chunked_prefill_idx]),
+                    dst_idxs=torch.tensor([target_idx]),
+                    next_tokens=next_tokens,
+                )
+
         # All these active requests are in decode phase, so they need only 1 token per request
         self.active_token_count = active_request_count
         # Always the first section of token input ids are only used.
