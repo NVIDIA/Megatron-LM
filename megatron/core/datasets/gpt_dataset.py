@@ -55,6 +55,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        Check --per-dataset-sequences-path
     """
 
+    context_parallel_size: Optional[int] = None
+    """The size of the context parallel group. Needed for padding in packed sequences."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
