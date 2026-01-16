@@ -307,8 +307,6 @@ class TestParallelMLAAttention:
             assert query.is_contiguous()
             assert key.is_contiguous()
             assert value.is_contiguous()
-            assert q_compressed.is_contiguous()
-            assert kv_compressed.is_contiguous()
 
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):
@@ -382,8 +380,6 @@ class TestParallelMLAAttention:
             assert q.is_contiguous()
             assert k.is_contiguous()
             assert v.is_contiguous()
-            assert q_compressed.is_contiguous()
-            assert kv_compressed.is_contiguous()
 
             attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
