@@ -295,21 +295,6 @@ class DynamicInferenceRequest(InferenceRequest):
         torch.cuda.nvtx.range_pop()
         return obj
 
-    @classmethod
-    def deserialize(cls, obj: dict) -> "DynamicInferenceRequest":
-        """Deserialize request.
-
-        Args:
-            obj (dict): Serialized request data.
-
-        Returns:
-            (DynamicInferenceRequest) Deserialized request.
-        """
-        request = cls(**obj)
-        request._post_deserialize(obj)
-
-        return request
-
     def _post_deserialize(self, obj):
         super()._post_deserialize(obj)
         self.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
