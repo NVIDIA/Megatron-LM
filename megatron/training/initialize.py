@@ -128,14 +128,14 @@ def initialize_megatron(
         _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store)
 
         # Initialize AMem NCCL plugin if requested for RL scenarios
-        if getattr(args, 'rl_amem_offload_during_rollout', True):
+        if getattr(args, 'rl_use_amem_nccl', False):
             try:
                 from megatron.core import amem_nccl
-                amem_nccl.setup_amem_environment(
-                    enable=True,
-                    group_id=getattr(args, 'rl_amem_group_id', None),
-                )
+                
+                # Setup AMem environment
                 group_id = getattr(args, 'rl_amem_group_id', None)
+                amem_nccl.setup_amem_environment(enable=True, group_id=group_id)
+                
                 # Try to set group ID if specified
                 if group_id is not None:
                     if amem_nccl.nccl_set_group_id(group_id):
@@ -145,6 +145,7 @@ def initialize_megatron(
                         logger.warning(f"Failed to set AMem group ID {group_id}")
                 elif args.rank == 0:
                     print("> AMem NCCL plugin enabled (no group ID set)")
+                    
             except ImportError as e:
                 if args.rank == 0:
                     print(f"> Warning: AMem NCCL plugin requested but not available: {e}")
