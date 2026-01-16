@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -53,6 +53,10 @@ class DistributedDataParallelConfig:
     """If true, use a reduce-scatter implementation which sends lower-precision values
        over the wire (using an all-to-all to keep total communication overhead in line
        with the standard ring implementation) but performs accumulation locally in FP32."""
+
+    param_name_patterns_for_fp32_local_accumulation: Tuple[str] = ()
+    """List of param_name patterns to match against to do local gradient accumulation
+       in FP32. Do not specify when grad_reduce_in_fp32 is already True."""
 
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
@@ -126,3 +130,17 @@ class DistributedDataParallelConfig:
         """Check the validity of the config."""
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+            # Using mxfp8 param without overlap param gather and overlap grad reduce will cause NaN.
+            # TODO: Remove this assertion when the issue is fixed.
+            assert (
+                self.overlap_param_gather
+            ), "--overlap-param-gather is required when using mxfp8 params"
+            assert (
+                self.overlap_grad_reduce
+            ), "--overlap-grad-reduce is required when using mxfp8 params"
+
+        if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
+            assert not self.grad_reduce_in_fp32, (
+                "Only need to explicitly specify param_name patterns for FP32 local accumulation "
+                "if .main_grads aren't already in FP32"
+            )

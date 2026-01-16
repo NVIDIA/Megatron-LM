@@ -1028,6 +1028,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 kwargs['bucket_size'] = args.ddp_bucket_size
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
             kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
+            kwargs['param_name_patterns_for_fp32_local_accumulation'] = \
+                tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
             kwargs['average_in_collective'] = args.ddp_average_in_collective
             if args.use_custom_fsdp and args.use_precision_aware_optimizer:
                 kwargs["preserve_fp32_weights"] = False
