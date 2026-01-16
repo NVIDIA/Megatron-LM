@@ -2142,18 +2142,13 @@ def _add_rl_args(parser):
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
 
     # AMem NCCL plugin arguments
-    group.add_argument('--rl-use-amem-nccl', action='store_true',
-                       help='Enable AMem NCCL plugin for transparent NCCL memory offloading. '
-                            'When enabled, NCCL-allocated GPU memory will be offloaded during '
-                            'rollout/inference phases and restored before training. This can save '
-                            'up to 10GB+ GPU memory per card. Requires AMem NCCL plugin to be installed. '
-                            'See https://github.com/inclusionAI/asystem-amem')
+    # AMem NCCL plugin is now always gated by --rl-amem-offload-during-rollout
     group.add_argument('--rl-amem-group-id', type=int, default=None,
                        help='Group ID for AMem NCCL plugin. Use different IDs for training and '
                             'inference processes when they share GPUs (e.g., 100 for training, '
                             '200 for inference). Must be set before first NCCL memory allocation.')
     group.add_argument('--rl-amem-offload-during-rollout', action=argparse.BooleanOptionalAction, default=True,
-                       help='Whether to offload NCCL memory during rollout collection. Default is True.')
+                       help='Enable AMem NCCL plugin for transparent NCCL memory offloading during rollout/inference. Default is True. When enabled, NCCL-allocated GPU memory will be offloaded during rollout/inference phases and restored before training. This can save up to 10GB+ GPU memory per card. Requires AMem NCCL plugin to be installed. See https://github.com/inclusionAI/asystem-amem')
     return parser
 
 def _add_training_args(parser):
