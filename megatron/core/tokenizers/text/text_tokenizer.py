@@ -113,6 +113,29 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             conversation=conversation, chat_template=chat_template, **kwargs
         )
 
+    def tokenize_conversation(
+        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+    ):
+        """Convert a conversation to tokens. Needed for SFTTokenizer.
+
+        Args:
+            conversation (List[Dict]): Sequence of system/user/assistant messages.
+                Must be in the following format:
+                [
+                    {"role": "system", "content": "something"},
+                    {"role": "user", "content": "something1"},
+                    {"role": "assistant", "content": "something2"},
+                ]
+            return_target (bool): Return target tokens with system and assistant masked.
+            add_generation_prompt (bool): Add assistant prefix to the end.
+        """
+
+        return self._tokenizer.tokenize_conversation(
+            conversation=conversation,
+            return_target=return_target,
+            add_generation_prompt=add_generation_prompt,
+        )
+
     def save_pretrained(self, path: str) -> None:
         """
         Saves HF tokenizer files.
