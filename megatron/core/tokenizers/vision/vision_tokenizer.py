@@ -116,7 +116,7 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
     def get_special_tokens(self) -> list:
         """Returns a list of the additional special tokens."""
         return self._tokenizer.get_special_tokens()
-    
+
     def offsets(self, ids: list[int], text: str) -> list[int]:
         """Calculate offsets."""
         return self._tokenizer.offsets(ids=ids, text=text)
