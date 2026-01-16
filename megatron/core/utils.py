@@ -1,13 +1,3 @@
-def is_ep_owned_param(module, name):
-    """
-    Returns True if the parameter with the given name is owned by an expert-parallel-enabled submodule.
-    """
-    parent = module
-    for sub in name.split(".")[:-1]:
-        parent = getattr(parent, sub, parent)
-        if getattr(parent, "expert_parallel_enabled", False):
-            return True
-    return False
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Utility functions used throughout Megatron core"""
@@ -877,6 +867,29 @@ def log_on_each_pipeline_stage(
 
     if tp_rank == 0 and dp_cp_rank == 0:
         logger.log(*args, **kwargs)
+
+
+def is_ep_owned_param(module, name):
+    """
+    Check if a parameter is owned by an expert-parallel-enabled submodule.
+    
+    Traverses the module hierarchy using the parameter name to find the parent
+    module and checks if any parent has expert_parallel_enabled set to True.
+    
+    Args:
+        module: The root module to start traversal from
+        name: The fully qualified parameter name (e.g., "layers.0.mlp.weight")
+    
+    Returns:
+        bool: True if the parameter is owned by an expert-parallel-enabled submodule,
+              False otherwise
+    """
+    parent = module
+    for sub in name.split(".")[:-1]:
+        parent = getattr(parent, sub, parent)
+        if getattr(parent, "expert_parallel_enabled", False):
+            return True
+    return False
 
 
 def check_param_hashes_across_dp_replicas(
