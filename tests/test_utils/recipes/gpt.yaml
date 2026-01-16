@@ -342,6 +342,11 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_mcore_te_tp2_pp1_gdn]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_mla]
     products:
       - environment: [dev]
