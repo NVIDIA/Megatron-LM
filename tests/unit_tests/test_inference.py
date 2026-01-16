@@ -18,11 +18,10 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.fixture(scope="module")
 def gpt2_tiktoken_tokenizer():
-    return MegatronTokenizer.from_pretained(
+    return MegatronTokenizer.from_pretrained(
         tokenizer_path="/opt/data/tokenizers/tiktoken/tiktoken.vocab.json",
         vocab_size=131072,
         num_special_tokens=1000,
-        special_tokens=["<unk>", "<s>", "</s>"],
         pattern="v1",
     )
 

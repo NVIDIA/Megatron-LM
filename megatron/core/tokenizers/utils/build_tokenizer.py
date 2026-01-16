@@ -7,7 +7,7 @@ MEGATRON_TOKENIZERS = ['BertWordPieceLowerCase', 'BertWordPieceCase', 'GPT2BPETo
 SP_TOKENIZERS = ['SentencePieceTokenizer', 'GPTSentencePieceTokenizer', 'Llama2Tokenizer']
 
 
-def build_tokenizer(args):
+def build_tokenizer(args, **kwargs):
     """ """
     kwargs = {}
     tokenizer_library = None

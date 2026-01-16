@@ -220,6 +220,24 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
     def add_special_tokens(self, special_tokens_dict: dict):
         """Adds special tokens to the tokenizer."""
         raise NotImplementedError("This method is not supported for TikToken tokenizers.")
+    
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Calculate offsets."""
+        try:
+            return self.tokenizer.decode_with_offsets(ids)[1]
+        except UnicodeDecodeError:
+            # Tiktoken has an unnecessary check that raises UnicodeDecodeError
+            # from `text = b"".join(token_bytes).decode("utf-8", errors="strict")`
+            # which is not needed for our use case. So we re-implement it, without
+            # the check.
+
+            token_bytes = self.tokenizer.decode_tokens_bytes(ids)
+            text_len = 0
+            offsets = []
+            for token in token_bytes:
+                offsets.append(max(0, text_len - (0x80 <= token[0] < 0xC0)))
+                text_len += sum(1 for c in token if not 0x80 <= c < 0xC0)
+            return offsets
 
     @property
     def additional_special_tokens_ids(self) -> list:
