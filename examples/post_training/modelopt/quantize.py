@@ -2,6 +2,7 @@
 
 """Sample Generate GPT."""
 
+import copy
 import functools
 import os
 import sys
@@ -11,7 +12,6 @@ import torch
 import torch.distributed
 from datasets import load_dataset
 from tqdm import tqdm
-import copy
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
@@ -22,16 +22,14 @@ try:
 except ImportError:
     mtq_psx = None
     warnings.warn(
-        "psx_formats is not installed. PSX formats quantization configs will not be available.",
+        "psx_formats is not installed. PSX formats quantization configs will not be available."
     )
 
 try:
     import modelopt.torch.quantization.plugins.luts as mtq_luts
 except ImportError:
     mtq_luts = None
-    warnings.warn(
-        "luts is not installed. LUTs quantization configs will not be available.",
-    )
+    warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
 
 
 from modelopt.torch.export import import_mcore_gpt_from_hf
@@ -42,7 +40,11 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
-from megatron.post_training.utils import report_current_memory_info, print_distributed_quant_summary
+from megatron.post_training.utils import (
+    modelopt_version_at_least,
+    print_distributed_quant_summary,
+    report_current_memory_info,
+)
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
@@ -68,7 +70,7 @@ KV_QUANT_CFG_CHOICES = {
     "fp8_affine": "FP8_AFFINE_KV_CFG",
     "nvfp4": "NVFP4_KV_CFG",
     "nvfp4_affine": "NVFP4_AFFINE_KV_CFG",
-    "nvfp4_rotate": "NVFP4_KV_ROTATE_CFG"
+    "nvfp4_rotate": "NVFP4_KV_ROTATE_CFG",
 }
 
 if mtq_psx is not None:
@@ -77,6 +79,7 @@ if mtq_psx is not None:
 if mtq_luts is not None:
     QUANT_CFG_CHOICES.update({k: getattr(mtq_luts, k) for k in mtq_luts.choices})
 
+
 def add_text_generate_ptq_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
     group = parser.add_argument_group(title="ModelOpt text generation ptq")
@@ -84,7 +87,10 @@ def add_text_generate_ptq_args(parser):
         "--calib-size", type=int, default=512, help="Samples to use for ptq calibration."
     )
     group.add_argument(
-        "--calib-dataset", type=str, default="abisee/cnn_dailymail", help="The default clibration dataset is cnn_dailymail from HF hub."
+        "--calib-dataset",
+        type=str,
+        default="abisee/cnn_dailymail",
+        help="The default clibration dataset is cnn_dailymail from HF hub.",
     )
     group.add_argument(
         "--prompts",
@@ -101,21 +107,13 @@ def add_text_generate_ptq_args(parser):
     group.add_argument(
         "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
     )
-    group.add_argument(
-        "--compress",
-        action="store_true",
-        help="Enable real low-bit quantization.",
-    )
+    group.add_argument("--compress", action="store_true", help="Enable real low-bit quantization.")
     group.add_argument(
         "--disable-qkv-quant",
         action="store_true",
         help="Disable q, k, v linear from being quantized.",
     )
-    group.add_argument(
-        "--weight-only",
-        action="store_true",
-        help="Disable input quantization.",
-    )
+    group.add_argument("--weight-only", action="store_true", help="Disable input quantization.")
     group.add_argument(
         "--force-all-expert-routing",
         action="store_true",
@@ -158,6 +156,7 @@ def _is_first_layers(name: str, num_layers: int = 1, num_layers_to_disable: int 
         return False
     return layer_idx < num_layers_to_disable
 
+
 def _is_last_layers(name: str, num_layers: int = 1, num_layers_to_disable: int = 1) -> bool:
     if "layers." not in name:
         return False
@@ -166,6 +165,7 @@ def _is_last_layers(name: str, num_layers: int = 1, num_layers_to_disable: int =
     except ValueError:
         return False
     return layer_idx >= num_layers - num_layers_to_disable
+
 
 def get_first_layers_disabled_config(config, num_layers: int = 1, num_layers_to_disable: int = 1):
     """Get a config for `mtq.quantize` with first & last `num_layers_to_disable` layers disabled.
@@ -177,14 +177,13 @@ def get_first_layers_disabled_config(config, num_layers: int = 1, num_layers_to_
     quant_cfg.update(
         {
             functools.partial(
-                _is_first_layers,
-                num_layers=num_layers,
-                num_layers_to_disable=num_layers_to_disable,
+                _is_first_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
             ): {"enable": False}
         }
     )
     config["quant_cfg"] = quant_cfg
     return config
+
 
 def get_last_layers_disabled_config(config, num_layers: int = 1, num_layers_to_disable: int = 1):
     """Get a config for `mtq.quantize` with last `num_layers_to_disable` layers disabled.
@@ -196,14 +195,13 @@ def get_last_layers_disabled_config(config, num_layers: int = 1, num_layers_to_d
     quant_cfg.update(
         {
             functools.partial(
-                _is_last_layers,
-                num_layers=num_layers,
-                num_layers_to_disable=num_layers_to_disable,
+                _is_last_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
             ): {"enable": False}
         }
     )
     config["quant_cfg"] = quant_cfg
     return config
+
 
 def get_modelopt_torch_quantization_config():
     """Return a quantization config."""
@@ -235,10 +233,10 @@ def get_modelopt_torch_quantization_config():
     # KV Cache Quantization
     enable_quant_kv_cache = args.export_kv_cache_quant != "none"
     if enable_quant_kv_cache and not args.compress:
-        kv_cache_quant_cfg = getattr(mtq, KV_QUANT_CFG_CHOICES[args.export_kv_cache_quant])["quant_cfg"]
-        mtq_config = mtq.utils.update_quant_cfg_with_kv_cache_quant(
-                mtq_config, kv_cache_quant_cfg
-    )
+        kv_cache_quant_cfg = getattr(mtq, KV_QUANT_CFG_CHOICES[args.export_kv_cache_quant])[
+            "quant_cfg"
+        ]
+        mtq_config = mtq.utils.update_quant_cfg_with_kv_cache_quant(mtq_config, kv_cache_quant_cfg)
 
     # Weight Only Quantization
     if args.weight_only:
@@ -285,7 +283,9 @@ if __name__ == "__main__":
     args = get_args()
 
     tokenizer = get_tokenizer()._tokenizer
-    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+    )
 
     report_current_memory_info()
 
@@ -295,14 +295,15 @@ if __name__ == "__main__":
 
     if args.pretrained_model_path is not None:
         from modelopt.torch.export import import_mcore_gpt_from_hf
+
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
+        import_kwargs = {"dtype": import_dtype}
+        if modelopt_version_at_least("0.41.0"):
+            import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
-            unwrapped_model,
-            args.pretrained_model_path,
-            workspace_dir,
-            dtype=import_dtype,
+            unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
 
     def _custom_prompt_forward_loop_func(model):
@@ -330,7 +331,9 @@ if __name__ == "__main__":
     unwrapped_model = unwrap_model(model)[0]
 
     if args.force_all_expert_routing:
-        warnings.warn("--force-all-expert-routing will be deprecated in the next release and is no longer needed.")
+        warnings.warn(
+            "--force-all-expert-routing will be deprecated in the next release and is no longer needed."
+        )
 
     if args.export_quant_cfg is not None:
         if args.export_quant_cfg not in QUANT_CFG_CHOICES:
@@ -358,4 +361,3 @@ if __name__ == "__main__":
 
     if args.save is not None:
         save_checkpoint(1, model, None, None, 0, release=True)
-
