@@ -1329,7 +1329,7 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
-    config_overrides = get_standard_config_overrides(args.decoupled_lr, args.decoupled_min_lr)
+    config_overrides = get_standard_config_overrides(config=config)
 
     return config, config_overrides
 
