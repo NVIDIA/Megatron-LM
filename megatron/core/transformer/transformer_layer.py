@@ -693,9 +693,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(self.mlp, **mlp_kwargs),
-                    False,
-                    pre_mlp_layernorm_output,
+                    functools.partial(self.mlp, **mlp_kwargs), False, pre_mlp_layernorm_output
                 )
         elif should_chunk_mlp_for_prefill:
             # Chunk input along sequence dimension
