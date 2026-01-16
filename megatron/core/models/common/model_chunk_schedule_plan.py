@@ -87,9 +87,6 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'attn') and self.attn is not None:
             del self.attn
             self.attn = None
-        if hasattr(self, 'post_attn') and self.post_attn is not None:
-            del self.post_attn
-            self.post_attn = None
         if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
             del self.moe_dispatch
             self.moe_dispatch = None

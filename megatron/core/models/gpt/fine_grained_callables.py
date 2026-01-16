@@ -455,11 +455,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     return hidden_states, None, None, None
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-                    pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                        layer.pre_mlp_layernorm, hidden_states
-                    )
+                    with off_interface(
+                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
+                    ) as hidden_states:
+                        pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                            layer.pre_mlp_layernorm, hidden_states
+                        )
                 else:
-                    pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+                    with off_interface(
+                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
+                    ) as hidden_states:
+                        pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
@@ -479,25 +485,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         )
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
-        return hidden_states
-
-    def submodule_post_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
-        """
-        Run forward pass for computations between attention and dispatch:
-            pre mlp layernorm->router->dispatch preprocess
-        """
-        if layer.recompute_pre_mlp_layernorm:
-            layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
-                pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                    layer.pre_mlp_layernorm, hidden_states
-                )
-        else:
-            with off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
-                pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
-
-        probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
-        local_tokens, probs = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
