@@ -709,10 +709,10 @@ class IndexedDataset(torch.utils.data.Dataset):
         idx_path = get_idx_path(path_prefix)
         bin_path = get_bin_path(path_prefix)
         if object_storage_config is None and not fast_cache_load:
-            assert os.path.exists(idx_path) and os.path.exists(
-                bin_path
-            ), "One or both of the .idx and .bin files cannot be found at the "
-            f"path prefix {path_prefix}"
+            assert os.path.exists(idx_path) and os.path.exists(bin_path), (
+                "One or both of the .idx and .bin files cannot be found at the "
+                f"path prefix {path_prefix}"
+            )
         self.path_prefix = path_prefix
         self.multimodal = multimodal
         self.mmap = mmap
