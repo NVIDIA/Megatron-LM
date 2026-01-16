@@ -3,7 +3,7 @@
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil
 from typing import Dict, Optional, Tuple
 
@@ -54,6 +54,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """If provided, the sequence and document counts for each dataset. 
        Check --per-dataset-sequences-path
     """
+
+    token_dtype_code: Optional[int] = field(init=False, default=None)
+    """The dtype code for the token ids. 4 for int32, 8 for uint16."""
 
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
