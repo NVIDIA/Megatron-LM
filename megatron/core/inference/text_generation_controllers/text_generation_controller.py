@@ -92,7 +92,7 @@ class TextGenerationController:
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
-        max_requests = context.max_total_requests
+        max_requests = context.max_requests
 
         # Callback to get request IDs that should be marked as finished due to stop words
         self._get_stop_word_finished_ids_callback = None
@@ -851,12 +851,12 @@ class TextGenerationController:
         new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
 
         # Update requests.
-        newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
+        update_result = context.update_requests(active_request_mask, new_sample_copy)
 
         return {
             "active_request_ids": active_request_ids,
-            "newly_paused_request_ids": newly_paused_request_ids,
             "finished_request_ids": finished_request_ids,
+            **(update_result or {}),
         }
 
     @torch.inference_mode()
