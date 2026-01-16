@@ -25,6 +25,7 @@ from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
@@ -325,6 +326,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config._cpu_offloading_context = None
 
+        if config.enable_hyper_connections:
+            self.num_residual_streams = config.num_residual_streams
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -678,6 +681,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        # Expand hidden states for hyper connections at the start of the block
+        # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage
+        if self.config.enable_hyper_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -764,6 +774,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         and self.group_prefetch_offload_commit_async is not None
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
+        # Only contract if the final layer norm is in this stage
+        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+            hidden_states = HyperConnectionModule.output_contract(
+                hidden_states, self.num_residual_streams
+            )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.
         if self.final_layernorm is not None:
