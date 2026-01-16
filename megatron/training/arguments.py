@@ -527,6 +527,12 @@ def validate_args(args, defaults={}):
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
 
+    if args.phase_transition_iterations:
+        args.phase_transition_iterations = sorted(
+            int(x.strip()) for x in args.phase_transition_iterations.split(",")
+        )
+        assert args.rampup_batch_size is None, "multi-phase training does not support batch size ramp-up"
+
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
@@ -1261,6 +1267,13 @@ def validate_args(args, defaults={}):
                 "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
                 "when enabling delay_wgrad_compute"
             )
+
+    if args.fine_grained_activation_offloading:
+        assert args.transformer_impl == 'transformer_engine', \
+            "Fine-grained activation offloading is only supported with transformer_engine implementation"
+        if is_te_min_version("2.10.0"):
+            assert os.getenv("NVTE_CPU_OFFLOAD_V1", "0") == "1", \
+                "For fine-grained activation offloading with TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 should be set to 1 to avoid offloading weights."
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
@@ -2411,6 +2424,12 @@ def _add_training_args(parser):
                        help='The communicator group names to use high priority streams.')
     group.add_argument('--use-te-activation-func', action='store_true',
                        help='Use activation function kernel from Transformer Engine in MLP module.')
+    group.add_argument('--fine-grained-activation-offloading', action='store_true',
+                       help='Enable fine-grained activation offloading.')
+    group.add_argument('--offload-modules', nargs='*', type=str, default=[],
+                       help='The submodules to offload its input. Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
+    group.add_argument('--min-offloaded-tensor-size', type=int, default=1024*1024,
+                       help='The minimum size of the tensor to be offloaded.')
     group.add_argument('--batch-invariant-mode', action='store_true',
                        help='Use batch-invariant kernels for deterministic forward execution regardless '
                        'of batch size. Ensures bitwise identical results when the same inputs are '
@@ -2922,6 +2941,10 @@ def _add_data_args(parser):
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
+    group.add_argument('--phase-transition-iterations', type=str, default=None,
+                       help='Comma-separated list of iterations where phase '
+                       'transitions occur. Requires fixed global batch size across phases. '
+                       'Does not support batch size ramp-up.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
