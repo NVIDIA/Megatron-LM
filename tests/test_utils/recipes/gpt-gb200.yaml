@@ -354,13 +354,3 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_gb200]
-  - test_case: [gpt3_weekly_dgx_h100_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
-    products:
-      - environment: [dev]
-        scope: [nightly]
-        platforms: [dgx_gb200]
-  - test_case: [gpt3_weekly_dgx_h100_mcore_tp4_cp2_native_fp8_tp_sp_cp_tp_overlap]
-    products:
-      - environment: [dev]
-        scope: [nightly]
-        platforms: [dgx_gb200]
