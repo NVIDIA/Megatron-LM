@@ -924,27 +924,16 @@ class LLaVAModel(MegatronModule):
                 )
             )
 
-        if isinstance(self.language_model, MambaModel):
-            output = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                attention_mask=attention_mask,
-                decoder_input=combined_embeddings,
-                labels=new_labels,
-                inference_context=inference_context,
-                runtime_gather_output=runtime_gather_output,
-            )
-        else:
-            output = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                attention_mask=attention_mask,
-                decoder_input=combined_embeddings,
-                labels=new_labels,
-                inference_context=inference_context,
-                runtime_gather_output=runtime_gather_output,
-                packed_seq_params=packed_seq_params,
-            )
+        output = self.language_model(
+            input_ids=None,
+            position_ids=None,
+            attention_mask=attention_mask,
+            decoder_input=combined_embeddings,
+            labels=new_labels,
+            inference_context=inference_context,
+            runtime_gather_output=runtime_gather_output,
+            packed_seq_params=packed_seq_params,
+        )
 
         return output, new_loss_mask
 
