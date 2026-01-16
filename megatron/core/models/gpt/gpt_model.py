@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.chunked_pipeline_parallel_utils import ChunkedPipelineParallelParams
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -285,6 +286,7 @@ class GPTModel(LanguageModule):
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
         padding_mask: Optional[Tensor] = None,
+        chunked_pp_params: Optional[ChunkedPipelineParallelParams] = None,
     ):
         """Preprocesses inputs for the transformer decoder.
 
@@ -355,18 +357,32 @@ class GPTModel(LanguageModule):
                     )
             else:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                    inference_context,
+                    self.decoder,
+                    decoder_input,
+                    self.config,
+                    packed_seq_params,
+                    chunked_pp_params,
                 )
                 rotary_pos_emb = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
+                    rotary_seq_len,
+                    packed_seq_params=packed_seq_params,
+                    chunked_pp_params=chunked_pp_params,
                 )
         elif self.position_embedding_type == 'yarn':
             if self.training or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                    inference_context,
+                    self.decoder,
+                    decoder_input,
+                    self.config,
+                    packed_seq_params,
+                    chunked_pp_params,
                 )
                 rotary_pos_emb, _ = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
+                    rotary_seq_len,
+                    packed_seq_params=packed_seq_params,
+                    chunked_pp_params=chunked_pp_params,
                 )
             else:
                 raise NotImplementedError(
@@ -376,7 +392,10 @@ class GPTModel(LanguageModule):
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
                 rotary_pos_emb = self.rotary_pos_emb(
-                    position_ids, self.mrope_section, packed_seq_params=packed_seq_params
+                    position_ids,
+                    self.mrope_section,
+                    packed_seq_params=packed_seq_params,
+                    chunked_pp_params=chunked_pp_params,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -458,6 +477,7 @@ class GPTModel(LanguageModule):
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
         runtime_gather_output: Optional[bool] = None,
+        chunked_pp_params: Optional[ChunkedPipelineParallelParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
@@ -488,6 +508,7 @@ class GPTModel(LanguageModule):
             inference_context=inference_context,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            chunked_pp_params=chunked_pp_params,
         )
 
         (
@@ -511,6 +532,7 @@ class GPTModel(LanguageModule):
             rotary_pos_sin=rotary_pos_sin,
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             packed_seq_params=packed_seq_params,
+            chunked_pp_params=chunked_pp_params,
             sequence_len_offset=sequence_len_offset,
             padding_mask=padding_mask,
             **(extra_block_kwargs or {}),
