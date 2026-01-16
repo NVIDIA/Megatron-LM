@@ -38,8 +38,7 @@ def test_mock_gpt_dataset():
         compile_helpers()
 
     tokenizer = MegatronTokenizer.from_pretrained(
-        metadata_path={"library": "null-text"},
-        vocab_size=_MOCK_VOCAB_SIZE,
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
     )
 
     config = GPTDatasetConfig(

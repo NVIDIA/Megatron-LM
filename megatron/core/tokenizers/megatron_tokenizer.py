@@ -18,13 +18,17 @@ TEXT_MAPPING_NAMES = OrderedDict(
         ("retro", "RetroTokenizer"),
     ]
 )
-VISION_MAPPING_NAMES = OrderedDict(
-    [
-        ("default", "DefaultTokenizerVision"),
-    ]
-)
+VISION_MAPPING_NAMES = OrderedDict([("default", "DefaultTokenizerVision")])
 
-TEXT_LIBRARIES = ["sentencepiece", "huggingface", "megatron", "tiktoken", "byte-level", "null-text", "sft"]
+TEXT_LIBRARIES = [
+    "sentencepiece",
+    "huggingface",
+    "megatron",
+    "tiktoken",
+    "byte-level",
+    "null-text",
+    "sft",
+]
 VISION_LIBRARIES = ["multimodal", "null-multimodal"]
 
 logger = logging.getLogger(__name__)
@@ -82,8 +86,12 @@ class MegatronTokenizer:
 
         if tokenizer_library in ['multimodal']:
             assert 'prompt_format' in kwargs, "Prompt format (`prompt_format`) must be specified."
-            assert 'special_tokens' in kwargs, "Special tokens (`special_tokens`) must be specified."
-            assert 'image_tag_type' in kwargs, "Image tag type (`image_tag_type`) must be specified."
+            assert (
+                'special_tokens' in kwargs
+            ), "Special tokens (`special_tokens`) must be specified."
+            assert (
+                'image_tag_type' in kwargs
+            ), "Image tag type (`image_tag_type`) must be specified."
 
         # Initialize tokenizer object
         tokenizer_type = 'text' if tokenizer_library in TEXT_LIBRARIES else 'vision'

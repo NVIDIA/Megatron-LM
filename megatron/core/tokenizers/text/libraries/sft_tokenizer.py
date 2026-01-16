@@ -5,13 +5,12 @@ from typing import Dict, List, Union
 
 import numpy as np
 
-from .abstract_tokenizer import MegatronTokenizerTextAbstract
-
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX
 
+from .abstract_tokenizer import MegatronTokenizerTextAbstract
 
-nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}"""
-nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}"""
+nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
+nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 
 
 @dataclass
@@ -37,11 +36,7 @@ class PromptConfig:
 class SFTTokenizer(MegatronTokenizerTextAbstract):
     """SFT Tokenizer."""
 
-    def __init__(
-        self,
-        tokenizer_path: str,
-        prompt_format: str,
-    ):
+    def __init__(self, tokenizer_path: str, prompt_format: str):
         """
         Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
 
@@ -58,7 +53,7 @@ class SFTTokenizer(MegatronTokenizerTextAbstract):
 
         # Currently, only HuggingFace tokenizers are supported.
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path=tokenizer_path,
+            pretrained_model_name_or_path=tokenizer_path
         )
 
         self._vocab_size = len(tokenizer)
@@ -84,7 +79,6 @@ class SFTTokenizer(MegatronTokenizerTextAbstract):
             raise NotImplementedError("unknown SFT prompt format", prompt_format)
 
         self._prompt_format = prompt_format
-
 
     def tokenize_conversation(
         self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
@@ -123,11 +117,11 @@ class SFTTokenizer(MegatronTokenizerTextAbstract):
         # Mask system and user tokens in the target.
         idx = 0
         for turn_idx, turn in enumerate(conversation):
-            
+
             if turn["role"].lower() == "assistant" and len(turn["content"]) == 0:
                 raise ValueError(f"empty assistant turn in conversation: {conversation}.")
             if turn["role"].lower() == "assistant":
-                assert conversation[turn_idx-1]["role"].lower() == "user"
+                assert conversation[turn_idx - 1]["role"].lower() == "user"
 
             turn_tokens = self._tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
@@ -153,7 +147,7 @@ class SFTTokenizer(MegatronTokenizerTextAbstract):
             ), f"expected turn tokens to match tokens in conversation {conversation}"
 
             idx += turn_len
-        
+
         assert idx == len(tokens), f"mismatch in target masking the conversation {conversation}"
 
         return tokens, target
@@ -162,7 +156,9 @@ class SFTTokenizer(MegatronTokenizerTextAbstract):
         """Tokenize conversation or string input."""
         if isinstance(text, list):
             # This code path is used by the inference code currently.
-            return self.tokenize_conversation(text, return_target=False, add_generation_prompt=True).tolist()
+            return self.tokenize_conversation(
+                text, return_target=False, add_generation_prompt=True
+            ).tolist()
 
         return self._tokenizer.encode(text)
 
@@ -177,7 +173,7 @@ class SFTTokenizer(MegatronTokenizerTextAbstract):
     def ids_to_tokens(self):
         """Converts ids to tokens."""
         raise NotImplementedError("This method is not supported for SFTTokenizer.")
-    
+
     def text_to_tokens(self):
         """Converts text to tokens."""
         raise NotImplementedError("This method is not supported for SFTTokenizer.")
@@ -189,7 +185,7 @@ class SFTTokenizer(MegatronTokenizerTextAbstract):
     def get_special_tokens(self):
         """Get special tokens."""
         return self._tokenizer.get_added_vocab()
-    
+
     def add_special_tokens(self):
         raise NotImplementedError("This method is not supported for SFTTokenizer.")
 

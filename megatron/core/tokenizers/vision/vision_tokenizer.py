@@ -5,7 +5,6 @@ from typing import Dict, List, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 
-
 TOKENIZER_MAPPING_LIBRARIES = OrderedDict(
     [
         ("multimodal", "MegatronMultimodalTokenizer"),
@@ -87,7 +86,9 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
         """
 
         return self._tokenizer.tokenize_conversation(
-            conversation=conversation, return_target=return_target, add_generation_prompt=add_generation_prompt
+            conversation=conversation,
+            return_target=return_target,
+            add_generation_prompt=add_generation_prompt,
         )
 
     def add_special_tokens(self, special_tokens: Union[list, dict]) -> None:
@@ -103,11 +104,11 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
         """
 
         self._tokenizer.add_special_tokens(special_tokens)
-    
+
     def convert_tokens_to_ids(self, tokens: List[str]):
         """Convert tokens to IDs."""
         return self._tokenizer.convert_tokens_to_ids(tokens)
-    
+
     def apply_chat_template(self):
         """Applies tokenizer's chat template."""
         raise NotImplementedError("This method is not supported for vision tokenizers.")
@@ -125,7 +126,7 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
     def vocab_size(self) -> int:
         """Returns vocabulary size."""
         return self._tokenizer.vocab_size
-    
+
     @property
     def pad(self):
         """Pad token ID."""

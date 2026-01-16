@@ -63,7 +63,9 @@ def build_tokenizer(args):
         tokenizer_path = args.tokenizer_model
         kwargs['prompt_format'] = args.sft_tokenizer_prompt_format
     elif args.tokenizer_type in ['NullTokenizer', 'NullMultimodalTokenizer']:
-        tokenizer_library = 'null-text' if args.tokenizer_type == 'NullTokenizer' else 'null-multimodal'
+        tokenizer_library = (
+            'null-text' if args.tokenizer_type == 'NullTokenizer' else 'null-multimodal'
+        )
         metadata = {'library': tokenizer_library}
         if args.vocab_size:
             kwargs['vocab_size'] = args.vocab_size

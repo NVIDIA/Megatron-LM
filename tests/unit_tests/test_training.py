@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
-
 from types import SimpleNamespace
 
 from megatron.training.global_vars import set_args

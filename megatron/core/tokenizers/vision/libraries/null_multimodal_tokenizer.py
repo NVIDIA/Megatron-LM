@@ -1,16 +1,23 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 
-class MegatronNullMultimodalTokenizer():
+class MegatronNullMultimodalTokenizer:
     """Megatron Null Multimodal Tokenizer"""
+
     def __init__(self, vocab_size, image_token=None, image_token_id=None):
         """ """
         self._vocab_size_without_eod = int(vocab_size)
         self._eod_id = self._vocab_size_without_eod
 
-        from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX, IMAGE_TOKEN
+        from megatron.core.models.multimodal.llava_model import (
+            DEFAULT_IMAGE_TOKEN_INDEX,
+            IMAGE_TOKEN,
+        )
+
         self._image_token = image_token if image_token is not None else IMAGE_TOKEN
-        self._image_token_id = image_token_id if image_token_id is not None else DEFAULT_IMAGE_TOKEN_INDEX
+        self._image_token_id = (
+            image_token_id if image_token_id is not None else DEFAULT_IMAGE_TOKEN_INDEX
+        )
 
     def tokenize(self, text):
         """
@@ -47,7 +54,9 @@ class MegatronNullMultimodalTokenizer():
 
     def convert_tokens_to_ids(self, tokens):
         """Convert tokens to IDs."""
-        ids = [(int(t) if t != self._image_token else self._image_token_id) for t in tokens.split('  ')]
+        ids = [
+            (int(t) if t != self._image_token else self._image_token_id) for t in tokens.split('  ')
+        ]
         return ids if len(ids) > 1 else ids[0]
 
     @property

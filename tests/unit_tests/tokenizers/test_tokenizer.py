@@ -277,7 +277,7 @@ def test_multimodal_tokenizer():
         {"role": "user", "content": "Hello! Can you summarize this image for me?"},
         {"role": "user", "content": "<image>"},
         {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
-        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"}
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
     ]
 
     conv_tokens = tokenizer.tokenize_conversation(
@@ -305,8 +305,7 @@ def test_null_multimodal_tokenizer():
     """Test MegatronNullMultimodalTokenizer."""
     vocab_size = 10000
     tokenizer = MegatronTokenizer.from_pretrained(
-        metadata_path={"library": "null-multimodal"},
-        vocab_size=vocab_size,
+        metadata_path={"library": "null-multimodal"}, vocab_size=vocab_size
     )
 
     assert tokenizer.vocab_size == (vocab_size + 1), f"expected vocab size is {vocab_size + 1}."

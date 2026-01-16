@@ -15,8 +15,8 @@ from megatron.core.export.model_type import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 VOCAB_SIZE = 256
@@ -62,8 +62,7 @@ def _get_train_data_iterator():
         compile_helpers()
 
     tokenizer = MegatronTokenizer.from_pretrained(
-        metadata_path={"library": "null-text"},
-        vocab_size=50,
+        metadata_path={"library": "null-text"}, vocab_size=50
     )
     config = GPTDatasetConfig(
         random_seed=0,

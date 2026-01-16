@@ -27,8 +27,7 @@ def test_mock_multimodal_dataset():
         compile_helpers()
 
     tokenizer = MegatronTokenizer.from_pretrained(
-        metadata_path={"library": "null-text"},
-        vocab_size=_MOCK_VOCAB_SIZE,
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
     )
     config = MultimodalDatasetConfig(
         random_seed=1234,
