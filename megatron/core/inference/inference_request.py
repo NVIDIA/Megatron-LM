@@ -133,12 +133,27 @@ class InferenceRequest:
         return request
 
     def _post_deserialize(self, obj: dict):
+        """
+        This is called after the dataclass is initialized to handle any special
+        deserialization logic.
+        """
+        # Deserialize status.
         self.status = None if obj["status"] is None else Status[obj["status"]]
+        self.sampling_params = None if obj["sampling_params"] is None else SamplingParams.deserialize(
+            obj["sampling_params"]
+        )
+        self.inference_parameters = (
+            None
+            if obj["inference_parameters"] is None
+            else SamplingParams.deserialize(obj["inference_parameters"])
+        )
 
-        # Deserialize tensors.
+        # Deserialize tensors and sampling params.
         for k, v in obj.items():
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(self, k, deserialize_tensor(v[1]))
+
+
 
 
 class DynamicInferenceEventType(Enum):
