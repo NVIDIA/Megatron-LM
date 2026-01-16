@@ -2142,7 +2142,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.chunked_prefill_request_id != -1:
             self._swap_book_keeping_tensors(
                 src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
-                dst_idxs=torch.tensor([self.total_request_count - evict_request_count - 1]),
+                dst_idxs=torch.tensor([self.total_request_count - 1]),
                 next_tokens=next_tokens,
             )
 
