@@ -9,6 +9,9 @@ from megatron.core.models.backends import (
     InferenceSpecProvider,
     LocalSpecProvider,
 )
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_module_spec_for_backend,
+)
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
@@ -176,6 +179,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
+    experimental_attention_variant: Optional[str] = None,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
@@ -192,6 +196,9 @@ def get_gpt_layer_with_transformer_engine_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        experimental_attention_variant (str, optional): The type of experimental attention variant.
+                                                        Defaults to None.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
@@ -231,6 +238,17 @@ def get_gpt_layer_with_transformer_engine_spec(
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
     )
+
+    if experimental_attention_variant is not None:
+        return get_experimental_attention_variant_module_spec_for_backend(
+            backend=backend,
+            experimental_attention_variant=experimental_attention_variant,
+            qk_layernorm=qk_layernorm,
+            qk_l2_norm=qk_l2_norm,
+            multi_latent_attention=multi_latent_attention,
+            num_experts=num_experts,
+            mlp=mlp,
+        )
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -310,6 +328,7 @@ def get_gpt_layer_local_spec(
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
+    experimental_attention_variant: Optional[str] = None,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
@@ -325,6 +344,9 @@ def get_gpt_layer_local_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        experimental_attention_variant (str, optional): The type of experimental attention variant.
+                                                        Defaults to None.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
@@ -333,6 +355,11 @@ def get_gpt_layer_local_spec(
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
     """
+
+    if experimental_attention_variant is not None:
+        raise NotImplementedError(
+            "Experimental attention variant is not supported with local spec yet."
+        )
 
     if use_kitchen:
         assert HAVE_KITCHEN
@@ -515,7 +542,7 @@ def get_mlp_module_spec_for_backend(
         )
 
 
-def get_gpt_decoder_block_spec(
+def get_gpt_decoder_layer_specs(
     config: TransformerConfig,
     use_transformer_engine: bool,
     normalization: Optional[str] = None,
@@ -607,6 +634,21 @@ def get_gpt_decoder_block_spec(
         else:
             raise ValueError(f"Invalid layer pattern: {moe_layer_pattern}")
 
+    return layer_specs
+
+
+def get_gpt_decoder_block_spec(
+    config: TransformerConfig,
+    use_transformer_engine: bool,
+    normalization: Optional[str] = None,
+    qk_l2_norm: Optional[bool] = False,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+) -> TransformerBlockSubmodules:
+    """GPT block spec."""
+    layer_specs = get_gpt_decoder_layer_specs(
+        config, use_transformer_engine, normalization, qk_l2_norm
+    )
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
@@ -624,6 +666,10 @@ def get_gpt_decoder_block_spec(
         offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
+    if use_transformer_engine:
+        layer_norm_impl = TENorm
+    else:
+        layer_norm_impl = LNImpl
     # Block spec.
     block_spec = TransformerBlockSubmodules(
         layer_specs=local_layer_specs, layer_norm=layer_norm_impl
@@ -691,7 +737,7 @@ def get_gpt_mtp_block_spec_for_backend(
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
     mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
 
-    offset = get_mtp_layer_offset(config)
+    offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
     # split the mtp layer specs to only include the layers that are built in this pipeline stage.
     mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
     if len(mtp_layer_specs) > 0:

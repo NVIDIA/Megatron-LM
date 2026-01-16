@@ -53,6 +53,7 @@ except ImportError:
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    get_attr_wrapped_model,
     get_model_config,
     get_pg_size,
     get_pg_rank,
@@ -91,6 +92,7 @@ except ImportError:
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
+from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -105,6 +107,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -113,6 +116,7 @@ from megatron.core.parallel_state import (
     update_pg_timeout
 )
 from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.resharding.refit import swap_model_weights
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
@@ -643,6 +647,13 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    if args.fine_grained_activation_offloading:
+        from megatron.core.pipeline_parallel.utils import (
+            set_ideal_affinity_for_current_gpu
+        )
+        set_ideal_affinity_for_current_gpu()
+
+
     if args.log_progress:
         append_to_progress_log("Starting job")
 
@@ -723,19 +734,30 @@ def pretrain(
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
-        if args.rl_inference_tensor_model_parallel_size is not None:
+        if (
+            args.rl_inference_tensor_model_parallel_size is not None
+            or args.rl_inference_pipeline_model_parallel_size is not None
+        ):
             print_rank_0(
-                f"Setting tensor model parallel size to {args.rl_inference_tensor_model_parallel_size} for inference model"
+                "Building separate RL inference model with custom parallelism: "
+                f"TP={args.rl_inference_tensor_model_parallel_size}, "
+                f"PP={args.rl_inference_pipeline_model_parallel_size}"
             )
             inference_pg_collection = build_inference_pg_collection(
+                args.world_size,
                 tp_size=args.rl_inference_tensor_model_parallel_size,
-                world_size=args.world_size,
+                pp_size=args.rl_inference_pipeline_model_parallel_size,
                 use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
             )
 
             # Build an isolated inference config so training config remains unchanged
             inference_config = copy.deepcopy(config)
-            inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
+            if args.rl_inference_tensor_model_parallel_size is not None:
+                inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
+            if args.rl_inference_pipeline_model_parallel_size is not None:
+                inference_config.pipeline_model_parallel_size = (
+                    args.rl_inference_pipeline_model_parallel_size
+                )
 
             # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
             # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
@@ -862,8 +884,18 @@ def pretrain(
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
         if getattr(args, 'perform_rl_step', False):
+            rl_eval_model = model
+            if inference_model is not None:
+                inf_core = unwrap_model(inference_model[0])
+                # If separate inference and training models, swap training weights
+                # back to the inference model for RL evaluation.
+                rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
+                swap_model_weights(model, inference_model, args.refit_method)
+                rl_eval_model = inference_model
             rl_utils.evaluate_and_print_results_rl(
-                valid_data_iterator, model, optimizer,
+                valid_data_iterator,
+                rl_eval_model,
+                optimizer,
                 iteration, write_to_tensorboard=not args.skip_train
             )
         else:
@@ -1195,7 +1227,9 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
     config = None
-    if args.optimizer == 'adam':
+    if args.optimizer == 'adam' or 'muon' in args.optimizer:
+        # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
+        # So for now we keep using adam config that's back compat with old way
         kwargs = {}
         for f in dataclasses.fields(AdamOptimizerConfig):
             if hasattr(args, f.name):
@@ -1238,17 +1272,27 @@ def setup_model_and_optimizer(
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers
 
-        # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
-        # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
-        # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
-        optimizer = get_megatron_optimizer(
-            config,
-            model,
-            config_overrides=config_overrides,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
-            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
-        )
+        if 'muon' not in config.optimizer:
+            # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
+            # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
+            # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+            optimizer = get_megatron_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.enable_gloo_process_groups,
+                dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            )
+        else:
+            optimizer = get_megatron_muon_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.enable_gloo_process_groups,
+                layer_wise_distributed_optimizer='dist' in config.optimizer,
+            )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
     if args.moe_use_upcycling:
@@ -1267,7 +1311,7 @@ def setup_model_and_optimizer(
         # set dense model related args in to global args before getting dense model
         args.num_experts = None
         args.expert_model_parallel_size = 1
-        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity 
+        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
         dense_model_for_upcycling = get_model(model_provider_func, model_type)
@@ -1438,7 +1482,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     log_max_attention_logit = 0
     if args.qk_clip or args.log_max_attention_logit:
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
-            
+
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -1527,6 +1571,7 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1720,11 +1765,22 @@ def training_log(
             num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
+            pg_collection=pg_collection,
         )
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
+        )
+    # Track sparse attention indexer loss
+    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+        indexer_loss_scale = 1 / get_num_microbatches()
+        DSAIndexerLossLoggingHelper.track_indexer_metrics(
+            loss_scale=indexer_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
         )
     if iteration % args.log_interval == 0:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
@@ -2084,7 +2140,13 @@ def checkpoint_and_decide_exit(
             return True
 
     # Exit based on iterations.
-    if args.exit_interval and iteration % args.exit_interval == 0:
+    if (
+        args.exit_interval
+        and iteration % args.exit_interval == 0
+    ) or (
+        args.phase_transition_iterations
+        and iteration in args.phase_transition_iterations
+    ):
         if args.save and not saved_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -2198,6 +2260,8 @@ def train(
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()
+
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
 
     # Tracking loss.
     total_loss_dict = {}
@@ -2582,6 +2646,7 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            pg_collection=model_pg_collection,
         )
 
         # Evaluation.
@@ -2598,8 +2663,23 @@ def train(
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
             if getattr(args, 'perform_rl_step', False):
-                rl_utils.evaluate_and_print_results_rl(valid_data_iterator, model, optimizer,
-                                       iteration, write_to_tensorboard=True)
+                rl_eval_model = model
+                # If separate inference and training models, swap training weights
+                # back to the inference model for RL evaluation.
+                if inference_model is not None:
+                    inf_core = unwrap_model(inference_model[0])
+                    rl_utils._maybe_prefetch_separate_inference_model_weights(
+                        inf_core, to_cpu=False
+                    )
+                    swap_model_weights(model, inference_model, args.refit_method)
+                    rl_eval_model = inference_model
+                rl_utils.evaluate_and_print_results_rl(
+                    valid_data_iterator,
+                    rl_eval_model,
+                    optimizer,
+                    iteration,
+                    write_to_tensorboard=True,
+                )
             else:
                 evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
@@ -2875,7 +2955,7 @@ def evaluate_and_print_results(
         eval_iters = [args.eval_iters]
     else:
         eval_iters = args.eval_iters
-        
+
     if args.full_validation:
         assert len(eval_iters) == len(data_iterators)
 
@@ -2891,7 +2971,7 @@ def evaluate_and_print_results(
         eval_iters = [args.eval_iters]
     else:
         eval_iters = args.eval_iters
-    
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
@@ -2967,7 +3047,17 @@ def get_train_valid_test_num_samples():
         eval_samples = eval_iters * args.global_batch_size
     test_samples = args.eval_iters * args.global_batch_size
 
-    return (train_samples, eval_samples, test_samples)
+    # Get train_samples in current phase.
+    if args.phase_transition_iterations:
+        phase_transition_samples = [0] + [t * args.global_batch_size for t in args.phase_transition_iterations] + [args.train_samples]
+        current_sample = args.iteration * args.global_batch_size
+        last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
+        next_transition_sample = min(s for s in phase_transition_samples if s > current_sample)
+        train_samples_in_current_phase = next_transition_sample - last_transition_sample
+    else:
+        train_samples_in_current_phase = train_samples
+
+    return (train_samples_in_current_phase, eval_samples, test_samples)
 
 
 def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
@@ -2995,12 +3085,20 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         assert (
             args.train_samples is None
         ), 'Only backward compatiblity support for iteration-based training'
+
         args.consumed_train_samples = args.iteration * args.global_batch_size
     if args.iteration > 0 and args.consumed_valid_samples == 0:
         if args.train_samples is None:
             args.consumed_valid_samples = (
                 (args.iteration // args.eval_interval) * args.eval_iters * args.global_batch_size
             )
+
+    # Get consumed train samples in this phase.
+    if args.phase_transition_iterations:
+        last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= args.iteration)
+        consumed_train_samples_in_current_phase = (args.iteration - last_transition) * args.global_batch_size
+    else:
+        consumed_train_samples_in_current_phase = args.consumed_train_samples
 
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
@@ -3025,7 +3123,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             if args.skip_train:
                 train_dataloader = None
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
             valid_dataloaders = []
             for valid_d in valid_ds:
                 if args.skip_train or args.full_validation:
@@ -3096,7 +3194,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
     if valid_dataloaders is not None:
         # when using full validation, we need to override eval iters with the correct
-        # number of iterations on tp rank 0 so that it can be distributed to the other 
+        # number of iterations on tp rank 0 so that it can be distributed to the other
         # ranks later
         if args.full_validation:
             if args.multiple_validation_sets:
