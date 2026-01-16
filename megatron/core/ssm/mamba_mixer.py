@@ -24,6 +24,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
     tensor_merge,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -35,8 +36,9 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import (
-    check_mamba_sequence_packing_support,
     deprecate_inference_params,
+    is_causal_conv1d_min_version,
+    is_mamba_min_version,
     log_single_rank,
 )
 
@@ -401,6 +403,7 @@ class MambaMixer(MegatronModule):
         inference_context=None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
         hidden_states: (nL, B, D) / (L B D)
@@ -416,39 +419,43 @@ class MambaMixer(MegatronModule):
 
         if in_inference_mode:
             if inference_context.is_dynamic_batching():
-                return self.dynamic_inference(hidden_states, inference_context)
+                return self._dynamic_inference(hidden_states, inference_context)
             else:
                 assert inference_context.is_static_batching()
                 assert not self.config.sequence_parallel
                 conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
                 if inference_context.seqlen_offset > 0:
                     # The states are updated inplace
-                    out, out_bias = self.decode(hidden_states, conv_state, ssm_state)
+                    out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
         zxBCdt, _ = self.in_proj(hidden_states)
 
-        zxBCdt = self.cp.pre_conv_ssm(zxBCdt)
+        zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
         if in_inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
-            y = self.ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            assert packed_seq_params is None, (
+                "Training with packed sequences is not supported "
+                "in the non-memory-efficient code path."
+            )
+            y = self._ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
-            y = self.ssm_training(zxBCdt)
+            y = self._ssm_training(zxBCdt, packed_seq_params)
 
         out, out_bias = self.out_proj(y)
 
         return out, out_bias
 
-    def dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
+    def _dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
         """
         Executes dynamic inference by separating decode and prefill requests and
         running them independently. Also runs the chunked prefill request independently
         if it exists.
         """
         sequence_packing_available, reason_for_no_sequence_packing = (
-            check_mamba_sequence_packing_support()
+            _check_mamba_sequence_packing_support(for_inference_not_training=True)
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
@@ -466,7 +473,7 @@ class MambaMixer(MegatronModule):
 
         if decode_req_count > 0 and prefill_req_count == 0:
             # Decode-only
-            y = self.ssm_decode(
+            y = self._ssm_decode(
                 zxBCdt.transpose(0, 1),
                 conv_state,
                 ssm_state,
@@ -475,7 +482,7 @@ class MambaMixer(MegatronModule):
         elif decode_req_count == 0 and (prefill_req_count > 0 or has_explicit_chunked_prefill_req):
             if prefill_req_count > 0:
                 # Prefill only (regular prefill requests)
-                y_prefill = self.ssm_prefill(
+                y_prefill = self._ssm_prefill(
                     zxBCdt,
                     conv_state=conv_state,
                     ssm_state=ssm_state,
@@ -493,7 +500,7 @@ class MambaMixer(MegatronModule):
                     context.mamba_metadata.device_chunked_prefill,
                     check_bounds=False,
                 )
-                y_chunked_prefill = self.ssm_prefill(
+                y_chunked_prefill = self._ssm_prefill(
                     zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[1]],
                     conv_state=conv_state,
                     ssm_state=ssm_state,
@@ -522,7 +529,7 @@ class MambaMixer(MegatronModule):
                 check_bounds=False,
             )
             # Decode requests
-            y_decode = self.ssm_decode(
+            y_decode = self._ssm_decode(
                 zxBCdt[:decode_req_count].transpose(0, 1),
                 conv_state,
                 ssm_state,
@@ -531,7 +538,7 @@ class MambaMixer(MegatronModule):
             y_prefill, y_chunked_prefill = None, None
             if prefill_req_count > 0:
                 # Regular prefill requests
-                y_prefill = self.ssm_prefill(
+                y_prefill = self._ssm_prefill(
                     zxBCdt_prefill,
                     conv_state=conv_state,
                     ssm_state=ssm_state,
@@ -549,7 +556,7 @@ class MambaMixer(MegatronModule):
                     context.mamba_metadata.device_chunked_prefill,
                     check_bounds=False,
                 )
-                y_chunked_prefill = self.ssm_prefill(
+                y_chunked_prefill = self._ssm_prefill(
                     zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[1]],
                     conv_state=conv_state,
                     ssm_state=ssm_state,
@@ -586,7 +593,7 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
-    def decode(
+    def _decode(
         self, hidden_states, conv_state, ssm_state, batch_indices: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Performs inference step for decoding."""
@@ -607,7 +614,7 @@ class MambaMixer(MegatronModule):
 
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
 
-        y = self.ssm_decode(
+        y = self._ssm_decode(
             zxBCdt, conv_state=conv_state, ssm_state=ssm_state, batch_indices=batch_indices
         )
 
@@ -620,7 +627,9 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
-    def ssm_training(self, zxBCdt: torch.Tensor) -> torch.Tensor:
+    def _ssm_training(
+        self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> torch.Tensor:
         """
         Performs SSM computation for training step.
 
@@ -639,6 +648,14 @@ class MambaMixer(MegatronModule):
         if self.conv1d.bias is not None:
             self.conv1d.bias.data_ptr()
 
+        seq_idx = None
+        if packed_seq_params is not None:
+            sequence_packing_available, reason_for_no_sequence_packing = (
+                _check_mamba_sequence_packing_support(for_inference_not_training=False)
+            )
+            assert sequence_packing_available, reason_for_no_sequence_packing
+            seq_idx = self._create_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
+
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
             rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
@@ -655,17 +672,48 @@ class MambaMixer(MegatronModule):
             headdim=None if self.D_has_hdim else self.headdim,
             ngroups=self.cp.ngroups_local_tpcp,
             norm_before_gate=self.norm_before_gate,
+            seq_idx=seq_idx,
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()
-        y = self.cp.post_conv_ssm(y)
+        y = self.cp.post_conv_ssm(y, packed_seq_params)
 
         if self.rmsnorm:
             y = self.norm(y)
 
         return y
 
-    def ssm_prefill(
+    def _create_packed_seq_idx(self, packed_seq_params: PackedSeqParams, total_tokens: int):
+        """
+        If total_tokens is 16 (for example), this method takes packed_seq_params.cu_seqlens_q_padded
+        (or cu_seqlens_q) which is of the form [0, 5, 7, 11] and returns a tensor of the form
+        [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3],
+        which is [0]*(5-0) + [1]*(7-5) + [2]*(11-7) + [3]*(16-11)
+        In the above example, there are three sequences in the pack.
+        In general, the output has an additional sequence index (e.g. 0, 1, 2, 3) so that any tokens
+        beyond the last padded input sequence are accounted for as an extra sequence. However, If
+        cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
+        included.
+        """
+        # Example: [0, 5, 7, 11] -> [0, 5, 7, 11, 16]
+        if packed_seq_params.cu_seqlens_q_padded is not None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+        else:
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+        total_tokens_tensor = torch.tensor(
+            [total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
+        )
+        cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
+        # Example: [0, 5, 7, 11, 16] -> [5, 2, 4, 5]
+        seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
+        # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
+        seq_idx = torch.repeat_interleave(
+            torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
+        )
+        seq_idx = seq_idx.to(torch.int32).unsqueeze(0)  # Add a batch dimension
+        return seq_idx
+
+    def _ssm_prefill(
         self,
         zxBCdt: torch.Tensor,
         conv_state: Optional[torch.Tensor],
@@ -849,7 +897,7 @@ class MambaMixer(MegatronModule):
 
         return y
 
-    def ssm_decode(
+    def _ssm_decode(
         self,
         zxBCdt: torch.Tensor,
         conv_state: torch.Tensor,
@@ -1073,7 +1121,7 @@ class MambaMixer(MegatronModule):
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
                     module_sd,
                     f"{prefix}{name}.",
-                    {f"weight": 0, f"bias": 0},
+                    {"weight": 0, "bias": 0},
                     sharded_offsets,
                     tp_group=self.tp_group,
                     dp_cp_group=metadata['dp_cp_group'],
@@ -1194,3 +1242,22 @@ def _split_tensor_factory(
     return ShardedTensorFactory(
         orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
     )
+
+
+def _check_mamba_sequence_packing_support(
+    for_inference_not_training: bool = True,
+) -> Tuple[bool, Optional[str]]:
+    """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
+    if for_inference_not_training:
+        # https://github.com/Dao-AILab/causal-conv1d/commit/d87608f78f87d1288a7821d9e6ff4b10a8d5bf07
+        conv1d_min = "1.5.3.post1"
+        # https://github.com/state-spaces/mamba/commit/4f77d5306e19f5c7ae37665a44c3e61e24cafcb5
+        mamba_min = "2.2.6.post3"
+    else:
+        conv1d_min = "1.4.0"
+        mamba_min = "2.0.0"
+    if not is_causal_conv1d_min_version(conv1d_min):
+        return False, f"causal_conv1d >= {conv1d_min} is required"
+    elif not is_mamba_min_version(mamba_min):
+        return False, f"mamba_ssm >= {mamba_min} is required"
+    return True, None

@@ -56,6 +56,12 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
         )
 
+    assert batch["cu_seqlens"] is None and batch["max_seqlen"] is None, (
+        "Packed sequence training is not yet supported for GPTModel."
+    )
+    del batch["cu_seqlens"]
+    del batch["max_seqlen"]
+
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
