@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -58,6 +58,10 @@ class DistributedDataParallelConfig:
     """If true, use a reduce-scatter implementation which sends lower-precision values
        over the wire (using an all-to-all to keep total communication overhead in line
        with the standard ring implementation) but performs accumulation locally in FP32."""
+
+    param_name_patterns_for_fp32_local_accumulation: Tuple[str] = ()
+    """List of param_name patterns to match against to do local gradient accumulation
+       in FP32. Do not specify when grad_reduce_in_fp32 is already True."""
 
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
@@ -204,3 +208,9 @@ class DistributedDataParallelConfig:
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
+
+        if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
+            assert not self.grad_reduce_in_fp32, (
+                "Only need to explicitly specify param_name patterns for FP32 local accumulation "
+                "if .main_grads aren't already in FP32"
+            )
