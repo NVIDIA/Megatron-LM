@@ -41,6 +41,9 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_tp_sharded_tensor_for_checkpoint
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 try:
@@ -57,6 +60,7 @@ try:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELinear,
+        TELayerNormColumnParallelLinear,
         set_save_original_input,
     )
     from megatron.core.post_training.modelopt.layers import Linear
@@ -386,6 +390,11 @@ class MultiLatentAttention(Attention):
         return output, bias
 
 
+import os
+# FUSE_QKV_DOWN_PROJ = True
+FUSE_QKV_DOWN_PROJ = os.environ.get("FUSE_QKV_DOWN_PROJ", "0") == "1"
+# TODO: add config option to control this
+
 class MLASelfAttention(MultiLatentAttention):
     """MLA Self-attention layer class
 
@@ -438,29 +447,31 @@ class MLASelfAttention(MultiLatentAttention):
                 Linear,
                 TEColumnParallelLinear,
                 ColumnParallelLinear,
+                TELayerNormColumnParallelLinear,
             ]:
                 q_down_proj_kwargs['gather_output'] = False
             else:
                 raise ValueError(f"Unsupported linear_q_down_proj: {submodules.linear_q_down_proj}")
 
-            self.linear_q_down_proj = build_module(
-                submodules.linear_q_down_proj,
-                self.config.hidden_size,
-                self.config.q_lora_rank,
-                config=self.config,
-                init_method=self.config.init_method,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name='q_down_proj',
-                skip_weight_param_allocation=False,
-                tp_group=(
-                    pg_collection.tp
-                    if q_down_proj_kwargs.get('parallel_mode') != 'duplicated'
-                    else None
-                ),
-                **q_down_proj_kwargs,
-            )
+            if not FUSE_QKV_DOWN_PROJ:
+                self.linear_q_down_proj = build_module(
+                    submodules.linear_q_down_proj,
+                    self.config.hidden_size,
+                    self.config.q_lora_rank,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name='q_down_proj',
+                    skip_weight_param_allocation=False,
+                    tp_group=(
+                        pg_collection.tp
+                        if q_down_proj_kwargs.get('parallel_mode') != 'duplicated'
+                        else None
+                    ),
+                    **q_down_proj_kwargs,
+                )
 
             self.linear_q_up_proj = build_module(
                 submodules.linear_q_up_proj,
@@ -483,29 +494,52 @@ class MLASelfAttention(MultiLatentAttention):
             Linear,
             TEColumnParallelLinear,
             ColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
         ]:
             kv_down_proj_kwargs['gather_output'] = False
         else:
             raise ValueError(f"Unsupported linear_kv_down_proj: {submodules.linear_kv_down_proj}")
 
-        self.linear_kv_down_proj = build_module(
-            submodules.linear_kv_down_proj,
-            self.config.hidden_size,
-            self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name='kv_down_proj',
-            skip_weight_param_allocation=False,
-            tp_group=(
-                pg_collection.tp
-                if kv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
-                else None
-            ),
-            **kv_down_proj_kwargs,
-        )
+        if not FUSE_QKV_DOWN_PROJ:
+            self.linear_kv_down_proj = build_module(
+                submodules.linear_kv_down_proj,
+                self.config.hidden_size,
+                self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='kv_down_proj',
+                skip_weight_param_allocation=False,
+                tp_group=(
+                    pg_collection.tp
+                    if kv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
+                    else None
+                ),
+                **kv_down_proj_kwargs,
+            )
+        # build qkv down proj
+        if FUSE_QKV_DOWN_PROJ:
+            assert kv_down_proj_kwargs == q_down_proj_kwargs, "kv and q down proj kwargs must be the same to fuse"
+            self.linear_qkv_down_proj = build_module(
+                submodules.linear_q_down_proj,
+                self.config.hidden_size,
+                self.config.q_lora_rank + self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='qkv_down_proj',
+                skip_weight_param_allocation=False,
+                tp_group=(
+                    pg_collection.tp
+                    if kv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
+                    else None
+                ),
+                **q_down_proj_kwargs,
+            )
 
         self.linear_kv_up_proj = build_module(
             submodules.linear_kv_up_proj,
@@ -535,6 +569,132 @@ class MLASelfAttention(MultiLatentAttention):
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
+
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Return a sharded state dict compatible with pre-fusion checkpoints.
+
+        When `FUSE_QKV_DOWN_PROJ` is enabled, this module owns a single
+        `linear_qkv_down_proj` layer instead of separate `linear_q_down_proj` and
+        `linear_kv_down_proj` layers. To keep checkpoints backward compatible, we
+        materialize sharded entries for the unfused keys.
+
+        Note: we also materialize legacy `_extra_state` entries when present.
+        For dist-ckpt, `_extra_state` is stored as a `ShardedObject` and missing
+        keys will hard-fail during planning. We keep the extra-state blob as-is
+        (no byte slicing) and only rewrite the key/metadata to match legacy
+        module names.
+        """
+        if not FUSE_QKV_DOWN_PROJ:
+            return super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+        def _clone_sharded_object_with_key(obj: ShardedObject, new_key: str) -> ShardedObject:
+            return ShardedObject(
+                key=new_key,
+                data=obj.data,
+                global_shape=obj.global_shape,
+                global_offset=obj.global_offset,
+                replica_id=obj.replica_id,
+            )
+
+        fused_prefix = f"{prefix}linear_qkv_down_proj."
+
+        # If TE saved extra state for the fused module, replicate it for legacy
+        # q_down/kv_down keys so that non-fused models can load fused checkpoints
+        # with dist-ckpt (planner is strict about missing keys).
+        fused_extra_keys = [
+            k for k in sharded_state_dict.keys() if k.startswith(fused_prefix) and "_extra_state" in k
+        ]
+        for fused_extra_key in fused_extra_keys:
+            # Preserve suffix ("_extra_state", "_extra_state1", ...) if present.
+            suffix = fused_extra_key[len(fused_prefix) :]
+            q_extra_key = f"{prefix}linear_q_down_proj.{suffix}"
+            kv_extra_key = f"{prefix}linear_kv_down_proj.{suffix}"
+            fused_obj = sharded_state_dict.get(fused_extra_key)
+            if isinstance(fused_obj, ShardedObject):
+                sharded_state_dict[q_extra_key] = _clone_sharded_object_with_key(
+                    fused_obj, q_extra_key
+                )
+                sharded_state_dict[kv_extra_key] = _clone_sharded_object_with_key(
+                    fused_obj, kv_extra_key
+                )
+            elif fused_obj is not None:
+                # Fallback (non-dist-ckpt paths): best-effort copy.
+                sharded_state_dict[q_extra_key] = fused_obj
+                sharded_state_dict[kv_extra_key] = fused_obj
+
+        for key in list(sharded_state_dict.keys()):
+            if key.startswith(fused_prefix):
+                del sharded_state_dict[key]
+
+        # Materialize legacy (pre-fusion) keys.
+        fused_weight = self.linear_qkv_down_proj.weight
+        q_weight, kv_weight = torch.split(
+            fused_weight,
+            [
+                self.config.q_lora_rank,
+                self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
+            ],
+            dim=0,
+        )
+
+        q_key = f"{prefix}linear_q_down_proj.weight"
+        kv_key = f"{prefix}linear_kv_down_proj.weight"
+
+        tp_group = getattr(self, 'tp_group', None)
+        if tp_group is None and hasattr(self, 'pg_collection'):
+            tp_group = self.pg_collection.tp
+
+        sharded_state_dict[q_key] = make_sharded_tensor_for_checkpoint(
+            tensor=q_weight,
+            key=q_key,
+            prepend_offsets=sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
+        )
+        sharded_state_dict[kv_key] = make_sharded_tensor_for_checkpoint(
+            tensor=kv_weight,
+            key=kv_key,
+            prepend_offsets=sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
+        )
+
+        return sharded_state_dict
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Load state dict with automatic fuse/unfuse conversion.
+
+        Supports:
+        - Loading a pre-fusion checkpoint (q_down + kv_down) into a fused model.
+        """
+        if not FUSE_QKV_DOWN_PROJ:
+            return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+        q_key = f"{prefix}linear_q_down_proj.weight"
+        kv_key = f"{prefix}linear_kv_down_proj.weight"
+        fused_key = f"{prefix}linear_qkv_down_proj.weight"
+        # breakpoint()
+
+        def _as_tensor(x):
+            # torch.nn.Parameter is a Tensor subclass; keep this minimal.
+            return x.data if hasattr(x, 'data') else x
+
+        # Convert legacy (unfused) checkpoint into fused weight.
+        if fused_key not in state_dict and q_key in state_dict and kv_key in state_dict:
+            q_weight = _as_tensor(state_dict[q_key])
+            kv_weight = _as_tensor(state_dict[kv_key])
+            state_dict[fused_key] = torch.cat([q_weight, kv_weight], dim=0)
+            del state_dict[q_key]
+            del state_dict[kv_key]
+            # Bias is always False, but drop if present to avoid unexpected keys.
+            state_dict.pop(f"{prefix}linear_q_down_proj.bias", None)
+            state_dict.pop(f"{prefix}linear_kv_down_proj.bias", None)
+
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def get_query_key_value_tensors(
         self,
@@ -610,30 +770,42 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # QKV down projection and layernorm
         # =========================================
-        if self.config.q_lora_rank is not None:
-            # if linear_q_down_proj is ColumnParallelLinear:
-            #     q_compressed: [s, b, q_lora_rank / TP]
-            # elif linear_q_down_proj is Linear:
-            #     q_compressed: [s / TP, b, q_lora_rank]
-            q_compressed, _ = self.linear_q_down_proj(hidden_states)
+        if not FUSE_QKV_DOWN_PROJ:
+            if self.config.q_lora_rank is not None:
+                # if linear_q_down_proj is ColumnParallelLinear:
+                #     q_compressed: [s, b, q_lora_rank / TP]
+                # elif linear_q_down_proj is Linear:
+                #     q_compressed: [s / TP, b, q_lora_rank]
+                q_compressed, _ = self.linear_q_down_proj(hidden_states)
 
-            # When output is sharded (ColumnParallelLinear), two things are needed to be
-            # identical to a normal Linear.
-            #   1. Manually gather output to restore output dim q_lora_rank;
-            #   2. Scatter sequence back to s / TP if sequence-parallel since it was
-            #      gathered by ColumnParallelLinear.
-            if q_compressed.size(-1) != self.config.q_lora_rank:
-                q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
-                if self.config.sequence_parallel:
-                    q_compressed = scatter_to_sequence_parallel_region(q_compressed)
-        else:
-            q_compressed = hidden_states
+                # When output is sharded (ColumnParallelLinear), two things are needed to be
+                # identical to a normal Linear.
+                #   1. Manually gather output to restore output dim q_lora_rank;
+                #   2. Scatter sequence back to s / TP if sequence-parallel since it was
+                #      gathered by ColumnParallelLinear.
+                if q_compressed.size(-1) != self.config.q_lora_rank:
+                    q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
+                    if self.config.sequence_parallel:
+                        q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+            else:
+                q_compressed = hidden_states
 
-        # if linear_kv_down_proj is ColumnParallelLinear:
-        #     kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim) / TP]
-        # elif linear_kv_down_proj is Linear:
-        #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-        kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+            # if linear_kv_down_proj is ColumnParallelLinear:
+            #     kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim) / TP]
+            # elif linear_kv_down_proj is Linear:
+            #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
+            kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+
+        if FUSE_QKV_DOWN_PROJ:
+            qkv, _ = self.linear_qkv_down_proj(hidden_states)
+            _q, _kv = torch.split(
+                qkv,
+                [self.config.q_lora_rank, self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim],
+                dim=-1,
+            )
+            q_compressed = _q
+            kv_combined = _kv
+
         if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
             # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
             kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
