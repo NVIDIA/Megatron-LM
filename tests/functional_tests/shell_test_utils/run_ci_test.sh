@@ -128,18 +128,20 @@ SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH |
 export RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
 
 for i in $(seq 1 $N_REPEAT); do
-    if [[ $i -gt 1 ]]; then
-        rm -rf $CHECKPOINT_SAVE_PATH/*
-        rm -rf /tmp/checkpoints/*
-        rm -rf $TENSORBOARD_PATH/*
-    fi
-
-    # First run never loads from a checkpoint
-    export RUN_NUMBER=1
+    # Move TB logs into a repeat-specific directory
     DIR=$(dirname "$_TENSORBOARD_PATH")
     FILE=$(basename "$_TENSORBOARD_PATH")
     export TENSORBOARD_PATH=$DIR/$i/$FILE
     mkdir -p $(dirname $TENSORBOARD_PATH)
+
+    if [[ $i -gt 1 ]]; then
+        rm -rf $CHECKPOINT_SAVE_PATH/* || true
+        rm -rf /tmp/checkpoints/* || true   
+        rm -rf $TENSORBOARD_PATH/* || true
+    fi
+
+    # First run never loads from a checkpoint
+    export RUN_NUMBER=1
     export REPEAT=$i
     export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
     export TRAINING_EXIT_CODE=0
@@ -202,15 +204,18 @@ for i in $(seq 1 $N_REPEAT); do
         echo "No frozen checkpoint found. Will skip second run."
 
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
-        rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+        if [[ $NODE_RANK -eq 0 ]]; then
+            rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+        fi
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
         break
     fi
 
     if [[ "$TEST_TYPE" == "ckpt-resume" && "$TRAINING_EXIT_CODE" -eq 0 ]]; then
         export CHECKPOINT_LOAD_PATH=$CHECKPOINT_SAVE_PATH
-
-        rm -rf "$CHECKPOINT_LOAD_PATH/iter_$(printf "%07d\n" "$TRAIN_ITERS")"
+        if [[ $NODE_RANK -eq 0 ]]; then
+            rm -rf "$CHECKPOINT_LOAD_PATH/iter_$(printf "%07d\n" "$TRAIN_ITERS")"
+        fi
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_LOAD_PATH/latest_checkpointed_iteration.txt
 
         export RUN_NUMBER=2
@@ -227,7 +232,9 @@ for i in $(seq 1 $N_REPEAT); do
         bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh || TRAINING_EXIT_CODE=$?
 
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
-        rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+        if [[ $NODE_RANK -eq 0 ]]; then
+            rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+        fi
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
     fi
 
