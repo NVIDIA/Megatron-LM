@@ -790,6 +790,29 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    #####################################
+    # Fine-grained Activation Offloading
+    #####################################
+    fine_grained_activation_offloading: bool = False
+    """If True, offload the input of the specified modules to the CPU.
+    Fine-grained activation offloading is a module-level offloading method
+    instead of a layer-level offloading method like cpu_offloading."""
+
+    offload_modules: Optional[list[str]] = None
+    """The submodules to offload its input.
+    choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
+             "mlp_norm", "expert_fc1", "moe_act".
+    "attn_norm": offload the input of the normalization in the attention part.
+    "qkv_linear": offload the input of the qkv linear part.
+    "core_attn": offload the input of the core attention part.
+    "attn_proj": offload the input of the attn linear projection part.
+    "mlp_norm": offload the input of the normalization in the mlp part.
+    "expert_fc1": offload the input of the expert fc1 part.
+    "moe_act": offload the input of the moe act part.
+    """
+    min_offloaded_tensor_size: int = 1024 * 1024
+    """The minimum size of the tensor to be offloaded."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1109,6 +1132,32 @@ class TransformerConfig(ModelParallelConfig):
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
+        if self.fine_grained_activation_offloading:
+            assert (
+                not self.cpu_offloading
+            ), "fine_grained_activation_offloading cannot be enabled with cpu_offloading."
+            assert self.offload_modules is not None and len(self.offload_modules) > 0
+            allowed_modules = {
+                "core_attn",
+                "attn_proj",
+                "expert_fc1",
+                "moe_act",
+                "attn_norm",
+                "mlp_norm",
+                "qkv_linear",
+            }
+            invalid_modules = set(self.offload_modules) - allowed_modules
+            assert not invalid_modules, (
+                f'Invalid choices for offload_modules: {invalid_modules}. '
+                f'Allowed modules are: {allowed_modules}'
+            )
+            if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
+                raise ValueError(
+                    "attn_proj cannot be set to offload_modules alone without core_attn "
+                    "because the input of attn_proj is the output of core_attn, "
+                    "which is needed in core_attn.backward()."
+                )
+
         if (
             self.num_layers_in_first_pipeline_stage is not None
             or self.num_layers_in_last_pipeline_stage is not None
@@ -1170,7 +1219,7 @@ class TransformerConfig(ModelParallelConfig):
                 self.virtual_pipeline_model_parallel_size = detected_vpp_size
 
             # Check whether the layout is valid.
-            self.pipeline_model_parallel_layout.validate_layer_layout(
+            self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
                 num_layers=self.num_layers, mtp_num_layers=self.mtp_num_layers
             )
 
@@ -1697,6 +1746,16 @@ class TransformerConfig(ModelParallelConfig):
                     'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
                 )
 
+            if self.cuda_graph_impl != "none":
+                assert (
+                    self.cuda_graph_impl == "transformer_engine"
+                    and CudaGraphScope.moe not in self.cuda_graph_scope
+                    and CudaGraphScope.mlp not in self.cuda_graph_scope
+                ), (
+                    'CUDA graph scope on moe and mlp is not '
+                    'supported with overlap_moe_expert_parallel_comm'
+                )
+
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
             assert (
@@ -1705,6 +1764,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_use_legacy_grouped_gemm
             ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+            if self.cuda_graph_impl == "transformer_engine":
+                assert is_te_min_version("2.10.0"), (
+                    'TE version >= 2.10.0 is required for delay_wgrad_compute with '
+                    'partial cuda graph'
+                )
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (
