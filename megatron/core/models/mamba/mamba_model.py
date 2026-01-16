@@ -10,6 +10,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
@@ -183,6 +184,7 @@ class MambaModel(LanguageModule):
         runtime_gather_output: Optional[bool] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tensor:
         """Forward function of the Mamba model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -222,9 +224,12 @@ class MambaModel(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            )
 
         # Wrap decoder_input to allow the decoder (MambaBlock) to delete the
         # reference held by this caller function, enabling early garbage collection
@@ -248,6 +253,7 @@ class MambaModel(LanguageModule):
             attention_mask=attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
         )
 
         if not self.post_process:

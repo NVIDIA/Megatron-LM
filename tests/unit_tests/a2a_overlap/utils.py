@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass

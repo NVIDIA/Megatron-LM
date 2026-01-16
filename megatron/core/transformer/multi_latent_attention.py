@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 import math
@@ -15,12 +15,15 @@ except ImportError:
     HAVE_EINOPS = False
 
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -36,7 +39,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import deprecate_inference_params, is_te_min_version
+from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -174,6 +177,7 @@ class MultiLatentAttention(Attention):
             skip_bias_add=True,
             is_expert=False,
             tp_comm_buffer_name='proj',
+            tp_group=self.pg_collection.tp,
         )
 
         if (
@@ -239,13 +243,18 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        query, key, value = self.get_query_key_value_tensors(
-            hidden_states,
-            key_value_states,
-            position_ids,
-            packed_seq_params,
-            inference_context=inference_context,
-        )
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+            query, key, value = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                position_ids,
+                packed_seq_params,
+                inference_context=inference_context,
+            )
+        if self.offload_qkv_linear:
+            query = off_interface.group_commit(
+                query, name="qkv_linear", forced_released_tensors=[hidden_states]
+            )
 
         # ===================================================
         # Adjust key, value for inference
@@ -273,14 +282,17 @@ class MultiLatentAttention(Attention):
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    packed_seq_params=packed_seq_params,
-                    attn_mask_type=attn_mask_type,
-                )
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        packed_seq_params=packed_seq_params,
+                        attn_mask_type=attn_mask_type,
+                    )
             elif self.cache_mla_latents:
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
@@ -301,6 +313,10 @@ class MultiLatentAttention(Attention):
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+            if self.offload_core_attention and self.training:
+                core_attn_out = off_interface.group_commit(
+                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                )
 
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
@@ -326,7 +342,12 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        output, bias = self.linear_proj(core_attn_out)
+        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
+            output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output = off_interface.group_commit(
+                output, name="attn_proj", forced_released_tensors=[core_attn_out]
+            )
 
         return output, bias
 
@@ -347,6 +368,9 @@ class MLASelfAttention(MultiLatentAttention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
         super().__init__(
             config=config,
             submodules=submodules,
@@ -396,6 +420,11 @@ class MLASelfAttention(MultiLatentAttention):
                 is_expert=False,
                 tp_comm_buffer_name='q_down_proj',
                 skip_weight_param_allocation=False,
+                tp_group=(
+                    pg_collection.tp
+                    if q_down_proj_kwargs.get('parallel_mode') != 'duplicated'
+                    else None
+                ),
                 **q_down_proj_kwargs,
             )
 
@@ -410,6 +439,7 @@ class MLASelfAttention(MultiLatentAttention):
                 skip_bias_add=False,
                 is_expert=False,
                 tp_comm_buffer_name='q_up_proj',
+                tp_group=pg_collection.tp,
             )
 
         kv_down_proj_kwargs = {}
@@ -435,6 +465,11 @@ class MLASelfAttention(MultiLatentAttention):
             is_expert=False,
             tp_comm_buffer_name='kv_down_proj',
             skip_weight_param_allocation=False,
+            tp_group=(
+                pg_collection.tp
+                if kv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
+                else None
+            ),
             **kv_down_proj_kwargs,
         )
 
@@ -449,6 +484,7 @@ class MLASelfAttention(MultiLatentAttention):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
+            tp_group=pg_collection.tp,
         )
 
         if self.config.q_lora_rank is not None:
@@ -569,12 +605,9 @@ class MLASelfAttention(MultiLatentAttention):
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
-            if (
-                parallel_state.get_tensor_model_parallel_world_size() > 1
-                and self.config.sequence_parallel
-            ):
+            if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
-                k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb)
+                k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
         if packed_seq_params is not None:
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
