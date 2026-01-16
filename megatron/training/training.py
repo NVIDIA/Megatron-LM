@@ -107,6 +107,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -1770,6 +1771,16 @@ def training_log(
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
+        )
+    # Track sparse attention indexer loss
+    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+        indexer_loss_scale = 1 / get_num_microbatches()
+        DSAIndexerLossLoggingHelper.track_indexer_metrics(
+            loss_scale=indexer_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
         )
     if iteration % args.log_interval == 0:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
