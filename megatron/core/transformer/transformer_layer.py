@@ -653,6 +653,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        # Only MoE layers need padding_mask
+        mlp_kwargs = {"padding_mask": padding_mask} if self.is_moe_layer else {}
 
         if self.offload_mlp_norm:
             hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
@@ -687,11 +689,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
-                    padding_mask=padding_mask,
+                    **mlp_kwargs,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(self.mlp, padding_mask=padding_mask),
+                    functools.partial(self.mlp, **mlp_kwargs),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -709,7 +711,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, **mlp_kwargs)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
