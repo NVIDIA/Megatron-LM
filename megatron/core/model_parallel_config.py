@@ -6,7 +6,14 @@ from typing import Callable, ContextManager, Optional
 
 import torch
 
-from megatron.core.utils import experimental_api
+from megatron.core.utils import experimental_api, get_te_version, is_te_min_version
+
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except ImportError:
+    HAVE_PACKAGING = False
 
 
 @dataclass
@@ -62,7 +69,7 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when using sequence_packing.
     """
 
     hybrid_context_parallel: bool = False
@@ -70,6 +77,24 @@ class ModelParallelConfig:
     If true, enables hybrid context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
     Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    When enabling hybrid_context_parallel, sequence_packing must be true.
+    """
+
+    sequence_packing_scheduler: Optional[str] = None
+    """
+    Scheduler for sequence packing and hybrid context parallel.
+    naive_sequence_packing: default naive sequence packing scheduler(just THD, no Hybrid-CP, this 
+    is just for comparison with default hybrid-cp scheduler, not recommended for production)
+    default_hybrid_cp: default hybrid-cp scheduler for hybrid context parallel provided by MCore.
+    empty_scheduler_with_packing: scheduling is already handled by the data sampler,
+    this scheduler only performs packing.
+    empty_scheduler_no_packing: scheduling and packing are already handled by the data sampler,
+    this scheduler only returns the batch.
+    """
+
+    sequence_packing: bool = False
+    """
+    If true, enables sft sequence packing.
     """
 
     expert_model_parallel_size: int = 1
@@ -438,3 +463,23 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
+        if self.hybrid_context_parallel and not self.sequence_packing:
+            raise ValueError("Hybrid context parallel requires sequence packing to be enabled")
+        if self.sequence_packing:
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
+            # TODO: remove this after we fix the convergence issue with TE < 2.9.
+            if not (
+                is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")
+            ):
+                raise ValueError(
+                    "SFT sequence packing requires Transformer Engine >= 2.9.0 "
+                    f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
+                )
+            if self.sequence_packing_scheduler == None:
+               if self.hybrid_context_parallel:
+                  self.sequence_packing_scheduler = "default_hybrid_cp"
+               else:
+                  self.sequence_packing_scheduler = "naive_sequence_packing"
