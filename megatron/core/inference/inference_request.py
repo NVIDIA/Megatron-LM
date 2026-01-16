@@ -102,7 +102,7 @@ class InferenceRequest:
         # Dataclass to dict.
         # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
-        obj = self.__dict__  # shallow dict copy
+        obj = self.__dict__.copy()  # shallow dict copy
         obj["status"] = self.status.name if self.status else None
         obj["sampling_params"] = self.sampling_params.serialize() if self.sampling_params else None
         obj["inference_parameters"] = (
@@ -204,7 +204,7 @@ class DynamicInferenceEvent:
         torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
         # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
-        obj = self.__dict__
+        obj = self.__dict__.copy()
         obj["type"] = self.type.name
 
         # Serialize payload.
@@ -510,7 +510,7 @@ class DynamicInferenceRequestRecord:
                 serialization.
         """
         torch.cuda.nvtx.range_push("DynamicInferenceRequestRecord.serialize")
-        obj = self.__dict__  # shallow dict copy
+        obj = self.__dict__.copy()  # shallow dict copy
         obj["requests"] = [r.serialize() for r in obj["requests"]]
         torch.cuda.nvtx.range_pop()
         return obj
