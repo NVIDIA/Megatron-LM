@@ -1,3 +1,13 @@
+def is_ep_owned_param(module, name):
+    """
+    Returns True if the parameter with the given name is owned by an expert-parallel-enabled submodule.
+    """
+    parent = module
+    for sub in name.split(".")[:-1]:
+        parent = getattr(parent, sub, parent)
+        if getattr(parent, "expert_parallel_enabled", False):
+            return True
+    return False
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Utility functions used throughout Megatron core"""

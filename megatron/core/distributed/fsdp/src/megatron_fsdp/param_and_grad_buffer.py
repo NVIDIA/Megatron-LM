@@ -1317,19 +1317,12 @@ def _get_parameter_groups(
     # All parameters in the module are assigned a parameter group, even non-FSDP modules.
     parameter_groups = []
     for name, param in module.named_parameters():
-        # Check if this is an expert parameter and if the MoE layer has expert parallelism enabled
-        if is_expert_parameter(name, param):
-            # Skip FSDP wrapping for expert parameters when Expert Parallelism is enabled
-            # These parameters are already sharded by EP and should not be double-sharded by FSDP
-            moe_layer = None
-            for m in module.modules():
-                if hasattr(m, 'experts') and any(p is param for p in m.parameters()):
-                    moe_layer = m
-                    break
-            
-            # If the MoE layer has expert parallelism enabled, skip this parameter
-            if moe_layer is not None and getattr(moe_layer, 'expert_parallel_enabled', False):
-                continue
+        # Skip FSDP param/grad buffer construction for expert-parallel-owned parameters
+        parent_module = module
+        for submodule_name in name.split(".")[:-1]:
+            parent_module = getattr(parent_module, submodule_name, parent_module)
+        if getattr(parent_module, "expert_parallel_enabled", False):
+            continue
         
         # We need this information to correctly dynamically allocate Tensors!
         is_fp8 = is_float8tensor(param)
