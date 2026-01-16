@@ -2147,7 +2147,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        self.total_request_count = active_request_count + self.paused_request_count
+        assert self.total_request_count == active_request_count + self.paused_request_count
 
         # All these active requests are in decode phase, so they need only 1 token per request
         self.active_token_count = active_request_count
