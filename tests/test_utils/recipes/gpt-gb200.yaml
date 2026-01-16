@@ -122,7 +122,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion]
     products:
