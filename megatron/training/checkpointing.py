@@ -113,6 +113,8 @@ def check_checkpoint_args(checkpoint_args):
         _compare('tokenizer_type')
     if args.data_parallel_random_init:
         _compare('data_parallel_random_init')
+    if args.phase_transition_iterations:
+        _compare('global_batch_size')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size',
                  old_arg_name='model_parallel_size')

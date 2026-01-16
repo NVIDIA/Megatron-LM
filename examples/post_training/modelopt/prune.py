@@ -20,12 +20,18 @@ import modelopt.torch.prune as mtp
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.prune.plugins.mcore_minitron import SUPPORTED_HPARAMS
 
-from megatron.core.parallel_state import get_pipeline_model_parallel_group, get_tensor_model_parallel_group
+from megatron.core.parallel_state import (
+    get_pipeline_model_parallel_group,
+    get_tensor_model_parallel_group,
+)
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
-from megatron.post_training.utils import report_current_memory_info
+from megatron.post_training.utils import (
+    modelopt_version_at_least,
+    report_current_memory_info,
+)
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
@@ -38,10 +44,7 @@ def add_prune_args(parser):
     """Add additional arguments for ModelOpt pruning."""
     group = parser.add_argument_group(title="ModelOpt pruning")
     group.add_argument(
-        "--calib-size",
-        type=int,
-        default=1024,
-        help="Samples to use for pruning calibration.",
+        "--calib-size", type=int, default=1024, help="Samples to use for pruning calibration."
     )
     group.add_argument(
         "--prompts",
@@ -56,21 +59,14 @@ def add_prune_args(parser):
         help="Reference texts. Please use | to separate different batches.",
     )
     group.add_argument(
-        "--pretrained-model-path",
-        type=str,
-        default=None,
-        help="HuggingFace pretrained model",
+        "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
     )
     # Pruning parameters
     group.add_argument(
-        "--target-ffn-hidden-size",
-        type=int,
-        help="Prune MLP FFN hidden size to this value",
+        "--target-ffn-hidden-size", type=int, help="Prune MLP FFN hidden size to this value"
     )
     group.add_argument(
-        "--target-hidden-size",
-        type=int,
-        help="Prune hidden size (embedding dim) to this value",
+        "--target-hidden-size", type=int, help="Prune hidden size (embedding dim) to this value"
     )
     group.add_argument(
         "--target-num-attention-heads",
@@ -93,14 +89,10 @@ def add_prune_args(parser):
         help="Prune dimension of Mamba attention heads to this value",
     )
     group.add_argument(
-        "--target-num-moe-experts",
-        type=int,
-        help="Prune number of MoE experts to this value",
+        "--target-num-moe-experts", type=int, help="Prune number of MoE experts to this value"
     )
     group.add_argument(
-        "--target-moe-ffn-hidden-size",
-        type=int,
-        help="Prune MoE FFN hidden size to this value",
+        "--target-moe-ffn-hidden-size", type=int, help="Prune MoE FFN hidden size to this value"
     )
     group.add_argument(
         "--target-moe-shared-expert-intermediate-size",
@@ -169,7 +161,9 @@ if __name__ == "__main__":
     check_arguments(args)
 
     tokenizer = get_tokenizer()._tokenizer
-    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+    )
     unwrapped_model = unwrap_model(model)[0]
 
     report_current_memory_info()
@@ -181,11 +175,11 @@ if __name__ == "__main__":
     if args.pretrained_model_path is not None:
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
+        import_kwargs = {"dtype": import_dtype}
+        if modelopt_version_at_least("0.41.0"):
+            import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
-            unwrapped_model,
-            args.pretrained_model_path,
-            workspace_dir,
-            dtype=import_dtype,
+            unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
 
     def _custom_prompt_forward_loop_func(model):
@@ -211,7 +205,9 @@ if __name__ == "__main__":
             simple_generate(model, tokens.input_ids.cuda(), osl=1)
 
     if args.layers_to_drop:
-        mtp.mcore_minitron.drop_mcore_language_model_layers(model, layers_to_drop=args.layers_to_drop)
+        mtp.mcore_minitron.drop_mcore_language_model_layers(
+            model, layers_to_drop=args.layers_to_drop
+        )
     else:
         print_rank_0("Pruning model...")
         export_config = {

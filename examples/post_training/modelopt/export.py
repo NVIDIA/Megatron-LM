@@ -14,6 +14,7 @@ import torch
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.utils import modelopt_version_at_least
 from megatron.training import get_args, get_model
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import unwrap_model
@@ -65,7 +66,9 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+    )
 
     # Materialize the model from meta device to cpu before loading the checkpoint.
     unwrapped_model = unwrap_model(model)[0]
@@ -76,16 +79,18 @@ if __name__ == "__main__":
 
     # Decide whether we are exporting only the extra_modules (e.g. EAGLE3).
     # Only the last pp stage may have extra_modules, hence broadcast from the last rank.
-    export_extra_modules = hasattr(unwrapped_model, "eagle_module") or hasattr(unwrapped_model, "medusa_heads")
+    export_extra_modules = hasattr(unwrapped_model, "eagle_module") or hasattr(
+        unwrapped_model, "medusa_heads"
+    )
     torch.distributed.broadcast_object_list(
-        [export_extra_modules],
-        src=torch.distributed.get_world_size() - 1,
+        [export_extra_modules], src=torch.distributed.get_world_size() - 1
     )
 
-    mtex.export_mcore_gpt_to_hf(
-        unwrapped_model,
-        args.pretrained_model_name,
-        export_extra_modules=export_extra_modules,
-        dtype=torch.bfloat16,
-        export_dir=args.export_dir,
-    )
+    export_kwargs = {
+        "export_extra_modules": export_extra_modules,
+        "dtype": torch.bfloat16,
+        "export_dir": args.export_dir,
+    }
+    if modelopt_version_at_least("0.41.0"):
+        export_kwargs.update({"trust_remote_code": args.trust_remote_code})
+    mtex.export_mcore_gpt_to_hf(unwrapped_model, args.pretrained_model_name, **export_kwargs)

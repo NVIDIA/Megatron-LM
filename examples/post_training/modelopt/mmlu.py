@@ -234,5 +234,5 @@ if __name__ == "__main__":
             flush=True,
         )
 
-    if args.lower_bound is not None:
-        assert sum(avg_correct) / len(avg_correct) > args.lower_bound
+        if args.lower_bound is not None:
+            assert sum(avg_correct) / len(avg_correct) > args.lower_bound

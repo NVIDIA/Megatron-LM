@@ -143,6 +143,7 @@ def create_ckpt_load_args(create_args):
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
     args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
+    args.phase_transition_iterations = None
 
     yield args
 

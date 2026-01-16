@@ -182,6 +182,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mrope_section": None,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
+    "mtp_standalone": False,
     "multi_latent_attention": False,
     "no_rope_freq": None,
     "no_sync_func": None,
@@ -253,6 +254,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "wgrad_deferral_limit": 0,
     "window_attn_skip_freq": None,
     "window_size": None,
+    "fine_grained_activation_offloading": False,
+    "min_offloaded_tensor_size": 1024 * 1024,
+    "offload_modules": [],
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
