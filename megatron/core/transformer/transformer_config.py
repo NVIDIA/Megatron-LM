@@ -563,6 +563,16 @@ class TransformerConfig(ModelParallelConfig):
     """[Compatibility alias for moe_router_padding_for_quantization]
     Enabling this will also enable moe_router_padding_for_quantization."""
 
+    moe_permute_padding_for_quantization: Optional[bool] = False
+    """Enable padding during MoE token permutation and corresponding unpadding during unpermutation
+    so that the number of tokens in each expert's permuted block is aligned to a multiple of 16 / 32
+    for quantized precisions such as FP8 and FP4. This can remove explicit padding/
+    unpadding around GroupedMLP kernels, which improves throughput and reduces peak memory usage."""
+
+    moe_fp8_flow: Optional[bool] = False
+    """Whether to quantize activations to FP8 before DeepEP token dispatch to reduce
+    communication bandwidth and feed them directly into expert up-projection (GroupedMLP/GEMM)."""
+
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
     When using group-limited routing:
@@ -1162,6 +1172,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mla_up_proj",
                     "mlp",
                     "moe",
+                    "moe_expert",
                     "shared_experts",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
@@ -1211,6 +1222,15 @@ class TransformerConfig(ModelParallelConfig):
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
                         )
+
+            if "moe" in self.recompute_modules and "moe_expert" in self.recompute_modules:
+                raise ValueError(
+                    "moe in recompute_modules is not supported with moe_expert in recompute_modules"
+                )
+            if "moe_expert" in self.recompute_modules and (not self.fp8 or (self.fp8 and self.fp8_recipe != 'blockwise')):
+                raise ValueError(
+                    "moe_expert recompute_modules is supported fp8 blockwise recipe"
+                )
 
         if self.moe_layer_recompute:
             warnings.warn(
@@ -1582,6 +1602,26 @@ class TransformerConfig(ModelParallelConfig):
                     "allgather and alltoall_seq dispatcher does not support "
                     "moe_router_padding_for_quantization."
                 )
+
+        if self.moe_permute_padding_for_quantization:
+            if self.fp8 is None and self.fp4 is None:
+                raise ValueError(
+                    "moe_permute_padding_for_quantization requires a quantized precision recipe(e.g., fp8 or fp4) to be enabled."
+                )
+
+            if not self.moe_permute_fusion:
+                raise ValueError(
+                    "moe_permute_padding_for_quantization currently requires fused permute."
+                )
+
+            from megatron.core.transformer.moe.moe_utils import fused_permute_and_pad_with_probs
+
+            if fused_permute_and_pad_with_probs is None:
+                raise ValueError("fused_permute_and_pad_with_probs is not available.")
+
+        if self.moe_fp8_flow:
+            if self.fp8 is None or (self.fp8 is not None and self.fp8_recipe != "blockwise"):
+                raise ValueError("moe_fp8_flow only support blockwise.")
 
         if (
             self.moe_router_topk == 1
