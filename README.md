@@ -269,9 +269,8 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 For Reinforcement Learning scenarios, enable the AMem NCCL plugin to transparently offload NCCL-allocated GPU memory during inference/rollout phases. This can save up to 10GB+ memory per GPU card.
 
 ```bash
---rl-use-amem-nccl                    # Enable AMem NCCL plugin
+--rl-amem-offload-during-rollout      # Enable AMem NCCL plugin for memory offloading during rollout/inference (default: true)
 --rl-amem-group-id GROUP_ID           # Process group ID (if needed)
---rl-amem-offload-during-rollout      # Offload during rollout (default: true)
 ```
 
 **Prerequisites:**
