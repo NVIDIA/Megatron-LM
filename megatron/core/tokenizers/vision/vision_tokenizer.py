@@ -104,6 +104,10 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
     def convert_tokens_to_ids(self, tokens: List[str]):
         """Convert tokens to IDs."""
         return self._tokenizer.convert_tokens_to_ids(tokens)
+    
+    def apply_chat_template(self):
+        """Applies tokenizer's chat template."""
+        raise NotImplementedError("This method is not supported for vision tokenizers.")
 
     @property
     def get_special_tokens(self) -> list:
@@ -124,3 +128,8 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
     def eod(self):
         """End of sentence token ID."""
         return self._tokenizer.eod
+
+    @property
+    def vocab(self):
+        """Tokenizer vocab."""
+        return self._tokenizer.vocab

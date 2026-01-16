@@ -324,3 +324,8 @@ class MegatronMultimodalTokenizer():
     def vocab_size(self):
         """Vocabulary size."""
         return self._vocab_size
+
+    @property
+    def vocab(self):
+        """Tokenizer vocab."""
+        return self.tokenizer.get_vocab()
