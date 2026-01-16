@@ -57,7 +57,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         library_class = getattr(tokenizers, TOKENIZER_MAPPING_LIBRARIES[self.library])
 
-        if self.library in ['byte-level', 'null']:
+        if self.library in ['byte-level', 'null-text']:
             return library_class(**kwargs)
         else:
             return library_class(self.path, **kwargs)

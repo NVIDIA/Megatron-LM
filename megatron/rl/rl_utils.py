@@ -70,7 +70,6 @@ from megatron.training.global_vars import (
     get_tokenizer,
     get_wandb_writer,
 )
-from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import (
     get_ltor_masks_and_position_ids,
     get_nvtx_range,
@@ -844,7 +843,7 @@ def prepare_trajectories(
 
     DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>']
 
-    if isinstance(tokenizer, _HuggingFaceTokenizer):
+    if tokenizer.library == "huggingface":
         if not tokenizer.pad:
             for pad_token in DEFAULT_PAD_TOKENS:
                 if pad_token in tokenizer.vocab:
@@ -855,7 +854,7 @@ def prepare_trajectories(
                     break
             else:
                 raise ValueError("No pad token found in tokenizer vocabulary")
-    elif isinstance(tokenizer, CustomTikTokenizer):
+    elif tokenizer.library == "tiktoken":
         assert "<SPECIAL_233>" in tokenizer.vocab, "Pad token is NOT in the tokenizer"
         tokenizer._pad_id = tokenizer.vocab["<SPECIAL_233>"]
 

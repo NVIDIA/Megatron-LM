@@ -1,6 +1,3 @@
-import json
-import sys
-
 import pytest
 import torch
 from packaging import version
@@ -196,7 +193,7 @@ def test_tiktoken_tokenizer():
 
 
 def test_null_tokenizer():
-    metadata = {"library": "null"}
+    metadata = {"library": "null-text"}
     tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, vocab_size=131072)
 
     ids = tokenizer.tokenize("11 325 97")

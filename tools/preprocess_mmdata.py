@@ -20,7 +20,7 @@ try:
 except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
 
-from megatron.training.tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.indexed_dataset import IndexedDatasetBuilder
 
 
