@@ -869,6 +869,18 @@ def log_on_each_pipeline_stage(
         logger.log(*args, **kwargs)
 
 
+def assert_not_fsdp_wrapped_ep_param(module, param_name: str):
+    """
+    EP-owned parameters must never be wrapped or replaced by FSDP.
+    This assertion exists to prevent silent double-sharding regressions.
+    """
+    if getattr(module, "expert_parallel_enabled", False):
+        raise AssertionError(
+            f"FSDP attempted to manage EP-owned parameter: {param_name}. "
+            "This indicates a missing EP exclusion in the FSDP code path."
+        )
+
+
 def is_ep_owned_param(module, name):
     """
     Check if a parameter is owned by an expert-parallel-enabled submodule.

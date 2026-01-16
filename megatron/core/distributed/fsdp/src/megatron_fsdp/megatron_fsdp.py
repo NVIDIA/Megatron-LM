@@ -1143,9 +1143,11 @@ class MegatronFSDP(torch.nn.Module):
         pg_buffer = self.param_and_grad_buffer
         fsdp_params = dict(pg_buffer.optimizer_named_parameters)
         from megatron.core.utils import is_ep_owned_param
+        from megatron.core.utils import assert_not_fsdp_wrapped_ep_param
         for name, param in self.module.named_parameters():
             # Skip FSDP replacement for expert-parallel-owned parameters
             if is_ep_owned_param(self.module, name):
+                assert_not_fsdp_wrapped_ep_param(self.module, name)
                 continue
             assert name in fsdp_params, f"Parameter {name} not found in FSDP parameters."
             dist_param = fsdp_params[name]
