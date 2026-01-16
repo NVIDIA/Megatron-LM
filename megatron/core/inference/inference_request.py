@@ -139,8 +139,10 @@ class InferenceRequest:
         """
         # Deserialize status.
         self.status = None if obj["status"] is None else Status[obj["status"]]
-        self.sampling_params = None if obj["sampling_params"] is None else SamplingParams.deserialize(
-            obj["sampling_params"]
+        self.sampling_params = (
+            None
+            if obj["sampling_params"] is None
+            else SamplingParams.deserialize(obj["sampling_params"])
         )
         self.inference_parameters = (
             None
@@ -152,8 +154,6 @@ class InferenceRequest:
         for k, v in obj.items():
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(self, k, deserialize_tensor(v[1]))
-
-
 
 
 class DynamicInferenceEventType(Enum):
