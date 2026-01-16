@@ -11,28 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: 'Test Template'
-description: 'Template for running NeMo tests in a containerized environment'
+name: "Test Template"
+description: "Template for running NeMo tests in a containerized environment"
 
 inputs:
   container-image:
-    description: 'Container image to use for test'
+    description: "Container image to use for test"
     required: true
   timeout:
-    description: 'Max runtime of test in minutes'
+    description: "Max runtime of test in minutes"
     required: false
-    default: '30'
+    default: "30"
   script:
-    description: 'Test script to execute'
+    description: "Test script to execute"
     required: true
   is-optional:
-    description: 'Pass this job on failure.'
+    description: "Pass this job on failure."
     required: false
-    default: 'false'
+    default: "false"
   is_unit_test:
-    description: 'Upload coverage as unit test'
+    description: "Upload coverage as unit test"
     required: false
-    default: 'false'
+    default: "false"
   tag:
     description: Latest or legacy test suite
     required: true
@@ -43,11 +43,14 @@ inputs:
     description: Model to launch
     required: false
   PAT:
-    description: 'GitHub Personal Access Token'
+    description: "GitHub Personal Access Token"
+    required: true
+  is_ci_workload:
+    description: "Is CI workload"
     required: true
 
 runs:
-  using: 'composite'
+  using: "composite"
   steps:
     - name: Checkout repository
       uses: actions/checkout@v2
@@ -120,9 +123,10 @@ runs:
       id: has-run-functional-tests-label
       env:
         GH_TOKEN: ${{ github.token }}
+        IS_CI_WORKLOAD: ${{ inputs.is_ci_workload }}
       run: |
         PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-        HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "false"
+        HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "$IS_CI_WORKLOAD"
         echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
     - name: Create run-script (e2e test)
