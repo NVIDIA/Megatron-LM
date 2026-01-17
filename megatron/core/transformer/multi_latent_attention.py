@@ -527,6 +527,11 @@ class MLASelfAttention(MultiLatentAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
+        if packed_seq_params is not None:
+            assert (
+                packed_seq_params.local_cp_size is None
+            ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
+            Please disable hybrid_context_parallel."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -558,7 +563,7 @@ class MLASelfAttention(MultiLatentAttention):
             else:
                 rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
                 cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
             else:

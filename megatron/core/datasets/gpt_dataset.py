@@ -50,6 +50,24 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
+    context_parallel_size: int = 1
+    """Option to enable context parallelism"""
+
+    data_parallel_size: int = 1
+    """Option to enable data parallelism"""
+
+    sequence_parallel_size: int = 0
+    """Option to indicate the sequence parallelism size when using TP
+    Set to 0 if sequence parallel is not enabled regardless of TP size.
+    """
+
+    hybrid_context_parallel: bool = False
+    """Option to enable hybrid context parallelism. When setting this to True, 
+    each sample should be divisible by the data parallel size * context parallel size * 2.
+    If sequence parallel is enabled, it should be divisible by the 
+    data parallel size * context parallel size * sequence parallel size * 2.
+    """
+
     sequences_per_dataset: Optional[Dict[str, int]] = None
     """If provided, the sequence and document counts for each dataset. 
        Check --per-dataset-sequences-path

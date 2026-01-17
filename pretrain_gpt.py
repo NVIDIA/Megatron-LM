@@ -19,8 +19,8 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 from megatron.training import (
     get_args,
     get_timers,
@@ -60,7 +60,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -68,16 +68,24 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
         )
 
-    assert batch["cu_seqlens"] is None and batch["max_seqlen"] is None, (
-        "Packed sequence training is not yet supported for GPTModel."
-    )
-    del batch["cu_seqlens"]
-    del batch["max_seqlen"]
+    cu_seqlens = batch.pop('cu_seqlens', None)
+    cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
+    max_seqlen = batch.pop('max_seqlen', None)
+    local_cp_size = batch.pop('local_cp_size', None)
+    if local_cp_size is not None:
+        local_cp_size = int(local_cp_size.item())
 
-    # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank(batch)
-
-    return batch.values()
+    if cu_seqlens is None and local_cp_size is None:
+        # slice batch along sequence dimension for context parallelism
+        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+        packed_seq_params = None
+    elif local_cp_size is None:  # Packed THD format
+        assert max_seqlen.dim() == 1
+        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
+    else: # Hybrid CP format
+        batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
+    
+    return (*batch.values(), packed_seq_params)
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -162,7 +170,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:
@@ -178,7 +186,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -232,6 +240,10 @@ def core_gpt_dataset_config_from_args(args):
         "fast_cache_load": args.dataloader_fast_cache_load,
         "sequences_per_dataset": sequences_per_dataset,
         "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
+        "context_parallel_size": args.context_parallel_size,
+        "data_parallel_size": args.data_parallel_size,
+        "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
+        "hybrid_context_parallel": args.hybrid_context_parallel,
     }
 
     # add FIM args to the config

@@ -82,8 +82,13 @@ def get_batch(data_iterator, vp_stage=None):
         return empty_batch.values()
 
     batch = get_batch_on_this_tp_rank(data_iterator)
-
+    
     cu_seqlens = batch['cu_seqlens']
+    # Unused at the moment
+    cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
+    # Support for Hybrid Context Parallel (Unused in this script)
+    local_cp_size = batch.pop('local_cp_size', None)
+
     if cu_seqlens is not None:
         assert (
             cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
