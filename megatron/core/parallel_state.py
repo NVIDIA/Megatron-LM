@@ -60,6 +60,7 @@ _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = None
 # Expert data parallel group
 _EXPERT_DATA_PARALLEL_GROUP = None
 _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
+_EXPERT_DATA_PARALLEL_GROUP_AG = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
@@ -117,6 +118,7 @@ _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
+_DATA_PARALLEL_GROUP_WITH_CP_AG = None
 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 
@@ -537,6 +539,7 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
+    create_all_gather_group: Optional[bool] = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -650,6 +653,13 @@ def initialize_model_parallel(
             This option is only valid when use_sharp is True.
             By default (None), it is enabled from dp group.
             Available options (choose one): [dp, dp_replica]
+
+        create_all_gather_group (bool, default = False):
+            Create a separate process group for all-gather operations to avoid
+            head-of-line blocking with reduce-scatter operations. When enabled,
+            creates an additional NCCL communicator with identical ranks as the
+            dp-cp group but with independent progress engines for better communication
+            overlap.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -787,6 +797,7 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
     global _DATA_PARALLEL_GROUP_WITH_CP
+    global _DATA_PARALLEL_GROUP_WITH_CP_AG
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
@@ -818,6 +829,15 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
             group_desc="DATA_PARALLEL_GROUP_WITH_CP",
         )
+        if create_all_gather_group:
+            group_with_cp_ag = create_group(
+                ranks_with_cp,
+                timeout=timeout,
+                pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
+                group_desc="DATA_PARALLEL_GROUP_WITH_CP_AG",
+            )
+        else:
+            group_with_cp_ag = None
         if create_gloo_process_groups:
             group_with_cp_gloo = create_group(
                 ranks_with_cp,
@@ -829,6 +849,7 @@ def initialize_model_parallel(
             group_with_cp_gloo = None
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
+            _DATA_PARALLEL_GROUP_WITH_CP_AG = group_with_cp_ag
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
 
@@ -1187,6 +1208,10 @@ def initialize_model_parallel(
     assert _EXPERT_DATA_PARALLEL_GROUP is None, "Expert data group is already initialized"
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, "Expert data group-gloo is already initialized"
+    global _EXPERT_DATA_PARALLEL_GROUP_AG
+    assert (
+        _EXPERT_DATA_PARALLEL_GROUP_AG is None
+    ), "Expert data parallel group with AG is already initialized"
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     assert (
         _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is None
@@ -1220,10 +1245,20 @@ def initialize_model_parallel(
             )
         else:
             group_gloo = None
+        # Create separate all-gather group for expert data parallelism to enable overlap
+        if create_all_gather_group:
+            group_ag = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
+                group_desc="EXPERT_DATA_PARALLEL_GROUP_AG",
+            )
+        else:
+            group_ag = None
         if rank in ranks:
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
-
+            _EXPERT_DATA_PARALLEL_GROUP_AG = group_ag
         if num_distributed_optimizer_instances > 1:
             # Create groups for Partial DistOpt, one for intra-partial DP domain
             # Another for inter-partial DP domain
@@ -1345,7 +1380,9 @@ def get_pipeline_model_parallel_group(check_initialized=True):
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
+def get_data_parallel_group(
+    with_context_parallel=False, partial_data_parallel=False, independent_all_gather=False
+):
     """Get the data-parallel group the caller rank belongs to."""
     if with_context_parallel:
         if partial_data_parallel:
@@ -1353,6 +1390,11 @@ def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=F
                 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
             ), "Intra partial data parallel group is not initialized"
             return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+        if independent_all_gather:
+            assert (
+                _DATA_PARALLEL_GROUP_WITH_CP_AG is not None
+            ), "data parallel group with context parallel AG is not initialized"
+            return _DATA_PARALLEL_GROUP_WITH_CP_AG
         assert (
             _DATA_PARALLEL_GROUP_WITH_CP is not None
         ), "data parallel group with context parallel combined is not initialized"
@@ -1361,6 +1403,24 @@ def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=F
         assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
         assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
         return _DATA_PARALLEL_GROUP
+
+
+def has_separate_all_gather_group() -> bool:
+    """Check if a separate all-gather process group has been created.
+
+    Returns True if a dedicated all-gather process group exists for improved
+    communication overlap, False otherwise.
+    """
+    return _DATA_PARALLEL_GROUP_WITH_CP_AG is not None
+
+
+def has_separate_expert_all_gather_group() -> bool:
+    """Check if a separate all-gather process group for experts has been created.
+
+    Returns True if a dedicated all-gather process group for expert parallelism exists
+    for improved communication overlap, False otherwise.
+    """
+    return _EXPERT_DATA_PARALLEL_GROUP_AG is not None
 
 
 def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
@@ -1852,8 +1912,16 @@ def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True):
     return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
 
 
-def get_expert_data_parallel_group(check_initialized=True, partial_expert_data_parallel=False):
+def get_expert_data_parallel_group(
+    check_initialized=True, partial_expert_data_parallel=False, independent_all_gather=False
+):
     """Get expert data parallel group."""
+    if independent_all_gather:
+        if check_initialized:
+            assert (
+                _EXPERT_DATA_PARALLEL_GROUP_AG is not None
+            ), "Expert data parallel group with AG is not initialized"
+        return _EXPERT_DATA_PARALLEL_GROUP_AG
     if partial_expert_data_parallel:
         if check_initialized:
             assert (
@@ -2011,6 +2079,9 @@ def destroy_model_parallel():
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
 
+    global _DATA_PARALLEL_GROUP_WITH_CP_AG
+    _DATA_PARALLEL_GROUP_WITH_CP_AG = None
+
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None
 
@@ -2117,6 +2188,9 @@ def destroy_model_parallel():
     ):
         torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
+
+    global _EXPERT_DATA_PARALLEL_GROUP_AG
+    _EXPERT_DATA_PARALLEL_GROUP_AG = None
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
