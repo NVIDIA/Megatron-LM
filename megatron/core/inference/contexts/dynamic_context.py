@@ -185,7 +185,7 @@ def get_mem_size_str(n_bytes: int) -> str:
         nquery = int(1024**exp)
         if round(n_bytes / nquery) >= 1:
             return "%.3g %s" % (n_bytes / nquery, suffix)
-    raise Exception(f"something went wrong, n_bytes={n_bytes}.")
+    return "%.3g bytes" % n_bytes
 
 
 @internal_api
@@ -411,7 +411,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if unified_memory_level > 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
-            except UnifiedMemoryUnsupportedError:
+            except UnifiedMemoryUnsupportedError as e:
+                # >>>
+                raise e
+                # <<<
                 if torch.distributed.get_rank() == 0:
                     warnings.warn(
                         "Unified memory requested but not available; defaulting to GPU memory."
@@ -1787,7 +1790,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
-        assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
         if resume_request_count > 0:
@@ -2144,6 +2146,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
             active_request_count, newly_paused_request_ids, next_tokens
         )
+
+        # >>> [ new ]
+        assert active_request_count > 0, "active_request_count == %d." % active_request_count
+        # <<<
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count

@@ -63,6 +63,12 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
+# >>>
+from lutil import pax as _pax
+import builtins
+builtins.pax = _pax
+# <<<
+
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -463,6 +469,9 @@ def main():
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
+    # >>>
+    # pax("requests")
+    # <<<
     context = get_inference_context(
         requests,
         sampling_params,
@@ -648,12 +657,15 @@ def main():
             "--"
         )
         print(
-            f"{setup_prefix} … "
-            f"throughput: {throughput:.3f} tok/s … ",
-            f"total time: {total_time:.3f}s … "
-            f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-            f"steps: {engine.step_count:d} … "
-            f"capture {capture_str}"
+            f"{setup_prefix} .... " +
+            " | ".join([
+                f"throughput: {throughput:.3f} tok/s",
+                f"total time: {total_time:.3f}s",
+                f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB",
+                f"steps: {engine.step_count:d}",
+                f"evicted: {engine.evicted_request_count}",
+                f"capture {capture_str}",
+            ])
         )
         print("~~~")
 
