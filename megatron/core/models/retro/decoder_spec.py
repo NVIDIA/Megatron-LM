@@ -1,13 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Specs for Retro decoder."""
+from __future__ import annotations
 
-import typing
 from typing import Optional
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
+    get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.decoder_attention import (
@@ -23,6 +25,7 @@ from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
 )
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 try:
     import apex  # pylint: disable=unused-import
@@ -56,7 +59,7 @@ except ImportError:
 
 
 def get_retro_decoder_layer_te_spec(
-    encoder_block_spec: typing.Union[ModuleSpec, TransformerBlockSubmodules, None] = None
+    encoder_block_spec: ModuleSpec | TransformerBlockSubmodules | None = None,
 ) -> ModuleSpec:
     """Retro decoder TE spec (uses Transformer Engine components).
 
@@ -73,9 +76,9 @@ def get_retro_decoder_layer_te_spec(
     Returns:
         A module spec with Transformer Engine modules.
     """
-    spec = get_gpt_layer_with_transformer_engine_spec()
-    spec.submodules.pre_cross_attn_layernorm = TENorm
-    spec.submodules.cross_attention = ModuleSpec(
+    submodules = get_gpt_layer_with_transformer_engine_submodules()
+    submodules.pre_cross_attn_layernorm = TENorm
+    submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
         params={"encoder_block_spec": encoder_block_spec},
         submodules=CrossAttentionSubmodules(
@@ -85,12 +88,12 @@ def get_retro_decoder_layer_te_spec(
             linear_proj=TERowParallelLinear,
         ),
     )
-    spec.submodules.cross_attn_bda = ModuleSpec(module=RetroDecoderBiasDropoutAdd)
-    return spec
+    submodules.cross_attn_bda = ModuleSpec(module=RetroDecoderBiasDropoutAdd)
+    return ModuleSpec(module=TransformerLayer, submodules=submodules)
 
 
 def get_retro_decoder_layer_local_spec(
-    encoder_block_spec: typing.Optional[ModuleSpec] = None,
+    encoder_block_spec: ModuleSpec | TransformerBlockSubmodules | None = None,
 ) -> ModuleSpec:
     """Retro decoder local spec (uses Megatron-Core components).
 
@@ -107,9 +110,9 @@ def get_retro_decoder_layer_local_spec(
     Returns:
         A module spec with local modules.
     """
-    spec = get_gpt_layer_local_spec()
-    spec.submodules.pre_cross_attn_layernorm = LNImpl
-    spec.submodules.cross_attention = ModuleSpec(
+    submodules = get_gpt_layer_local_submodules()
+    submodules.pre_cross_attn_layernorm = LNImpl
+    submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
         params={"encoder_block_spec": encoder_block_spec},
         submodules=CrossAttentionSubmodules(
@@ -119,15 +122,15 @@ def get_retro_decoder_layer_local_spec(
             linear_proj=RowParallelLinear,
         ),
     )
-    spec.submodules.cross_attn_bda = ModuleSpec(module=RetroDecoderBiasDropoutAdd)
-    return spec
+    submodules.cross_attn_bda = ModuleSpec(module=RetroDecoderBiasDropoutAdd)
+    return ModuleSpec(module=TransformerLayer, submodules=submodules)
 
 
 def get_retro_decoder_block_spec(
     config: RetroConfig,
     use_transformer_engine: bool,
-    vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
+    vp_stage: int | None = None,
+    pp_rank: int | None = None,
 ) -> TransformerBlockSubmodules:
     """Retro decoder block spec.
 

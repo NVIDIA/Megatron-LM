@@ -13,7 +13,9 @@ from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
     optim_state_to_sharding_state,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLP, apply_swiglu_sharded_factory
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -32,7 +34,7 @@ def initialize_mlp(glu=True):
         gated_linear_unit=glu,
     )
     return MLP(
-        transformer_config, get_gpt_layer_with_transformer_engine_spec().submodules.mlp.submodules
+        transformer_config, get_gpt_layer_with_transformer_engine_submodules().mlp.submodules
     )
 
 
