@@ -1475,13 +1475,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             ckpt_args = state_dict.get("args")
 
         if not hasattr(ckpt_args, "tensor_model_parallel_size"):
-            print_rank_0("WARNING: TP size not found in checkpoint args, using 0 as default.")
+            print_rank_0("WARNING: TP size not found in checkpoint args, using 1 as default.")
         if not hasattr(ckpt_args, "pipeline_model_parallel_size"):
-            print_rank_0("WARNING: PP size not found in checkpoint args, using 0 as default.")
+            print_rank_0("WARNING: PP size not found in checkpoint args, using 1 as default.")
 
         ckpt_tp_pp = (
-            getattr(ckpt_args, "tensor_model_parallel_size", 0),
-            getattr(ckpt_args, "pipeline_model_parallel_size", 0),
+            getattr(ckpt_args, "tensor_model_parallel_size", 1),
+            getattr(ckpt_args, "pipeline_model_parallel_size", 1),
         )
         run_tp_pp = (
             args.tensor_model_parallel_size,

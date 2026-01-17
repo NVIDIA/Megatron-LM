@@ -173,6 +173,7 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
             moe_ffn_hidden_size=128,
             moe_shared_expert_intermediate_size=128,
             qk_layernorm=True,
+            qk_l2_norm=True,
             use_cpu_initialization=True,
         )
         default_spec = get_gpt_decoder_block_spec(

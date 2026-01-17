@@ -20,6 +20,8 @@ docker buildx create --name container --driver=docker-container --use tls-enviro
 
 ADDITIONAL_PARAMS=()
 
+CI_COMMIT_BRANCH="${CI_COMMIT_BRANCH:-$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}"
+
 if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" == "dev" ]]; then
     ADDITIONAL_PARAMS+=("--pull")
 fi
