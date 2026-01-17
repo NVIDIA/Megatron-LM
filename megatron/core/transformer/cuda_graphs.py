@@ -10,6 +10,9 @@ from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import fields, is_dataclass
 from enum import Enum
+from functools import partial
+from itertools import zip_longest
+from math import ceil
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -101,6 +104,7 @@ class ArgMetadata:
             self.shape = arg.shape
             self.dtype = arg.dtype
             self.device = arg.device
+            self.value = arg.data_ptr()
         else:
             self.value = arg
 
@@ -174,6 +178,44 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
         base_module.layer_number in first_layer_numbers,
         base_module.layer_number in last_layer_numbers,
     )
+
+
+def _clone_nested_tensors(value: Any) -> Any:
+    """Recursively clone tensors inside nested containers."""
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, (tuple, list)):
+        return type(value)(_clone_nested_tensors(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _clone_nested_tensors(v) for k, v in value.items()}
+    if isinstance(value, set):
+        raise TypeError(
+            "Sets of tensors are unsupported in cudagraph helpers; use list/tuple instead"
+        )
+    return value
+
+
+def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Generator:
+    """Make generator state safe for CUDA graph capture/replay.
+
+    Generator state tensors can become inference tensors if created under `torch.inference_mode()`.
+    CUDA graph capture may later attempt in-place updates on that state; this fails for inference
+    tensors. Fix the generator *in-place* (preserving identity) by cloning its state outside
+    inference mode and setting it back.
+    """
+    with torch.inference_mode(mode=False):
+        if hasattr(gen, "graphsafe_get_state"):
+            state = gen.graphsafe_get_state()
+        else:
+            state = gen.get_state()
+
+        cloned_state = _clone_nested_tensors(state)
+        if hasattr(gen, "graphsafe_set_state"):
+            gen.graphsafe_set_state(cloned_state)
+        else:
+            gen.set_state(cloned_state)
+
+    return gen
 
 
 class _CudagraphGlobalRecord:
@@ -683,8 +725,12 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph = torch.cuda.CUDAGraph()
 
         # For cases with multiple active RNG states, e.g. TP.
-        for _, state in get_all_rng_states().items():
-            self.fwd_graph.register_generator_state(state)
+        rng_states = get_all_rng_states()
+        with torch.inference_mode(mode=False):
+            for gen in rng_states.values():
+                self.fwd_graph.register_generator_state(
+                    _ensure_generator_state_is_cudagraph_safe(gen)
+                )
 
         # warmup again as case graph capture mode may execute a different codepath
         for _ in range(self.num_warmup_steps):
@@ -706,6 +752,15 @@ class _CudaGraphRunner(torch.nn.Module):
 
         with self.get_quantization_context():
             torch.cuda.synchronize()
+            # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
+            # before capture begins, to avoid inference-tensor state issues during capture.
+            with torch.inference_mode(mode=False):
+                for device_idx in range(torch.cuda.device_count()):
+                    default_gen = torch.cuda.default_generators[device_idx]
+                    self.fwd_graph.register_generator_state(
+                        _ensure_generator_state_is_cudagraph_safe(default_gen)
+                    )
+
             with torch.cuda.graph(
                 self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
             ):
@@ -1510,7 +1565,7 @@ class TECudaGraphHelper:
         """
         return self._graphs_created
 
-    def _get_sample_arguments(self, order):
+    def _get_sample_arguments(self, order, chunk_id_list=None):
         """
         Generate sample arguments and keyword arguments for CUDA Graph capturing with
         memory-optimized buffer reuse.
@@ -1539,6 +1594,9 @@ class TECudaGraphHelper:
             order (List[int]): The forward/backward execution order from
                 convert_schedule_table_to_order(). Positive integers represent forward passes
                 (1-indexed chunk ID), negative integers represent backward passes.
+            chunk_id_list (List[Tuple[int, int]]): The list of chunk IDs and layer IDs in the
+                order. This is useful only when overlap_moe_expert_parallel_comm is enabled,
+                the order maps each layers' idx to their original chunk id.
 
         Returns:
             Tuple[List[Tuple], List[Dict]]: A tuple containing:
@@ -1560,9 +1618,11 @@ class TECudaGraphHelper:
         assert self.num_model_chunks == max(
             order
         ), "num_model_chunks must match the max chunk id in order."
-        assert (
-            self.num_microbatches == len(order) // self.num_model_chunks // 2
-        ), "num_microbatches must match the number of microbatches in order."
+        if chunk_id_list is None:
+            # check only if 1f1b overlap is disabled.
+            assert (
+                self.num_microbatches == len(order) // self.num_model_chunks // 2
+            ), "num_microbatches must match the number of microbatches in order."
 
         # Generate sample arguments and keyword arguments for capturing.
         sample_args = [None] * (len(self.flattened_callables) * self.num_microbatches)
@@ -1645,8 +1705,8 @@ class TECudaGraphHelper:
         consumed_sample_queue = {}
         layer_sample_keys_cache = {}
         fwd_idx = [0] * self.num_model_chunks
-        for chunk_id in order:
-            model_chunk_idx = abs(chunk_id) - 1
+        for idx, chunk_id in enumerate(order):
+            model_chunk_idx = abs(ceil(chunk_id)) - 1
 
             if chunk_id > 0:
                 if model_chunk_idx not in fwd_sample_queues:
@@ -1655,7 +1715,14 @@ class TECudaGraphHelper:
                 sample_start_idx = (prefix_num_layers[model_chunk_idx] * self.num_microbatches) + (
                     fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
                 )
-                for layer_idx, layer in enumerate(self.callables_per_chunk[model_chunk_idx]):
+                if chunk_id_list:
+                    model_chunk_idx = chunk_id_list[idx][0]
+                    callables_curr_chunk = [
+                        self.callables_per_chunk[model_chunk_idx][chunk_id_list[idx][1]]
+                    ]
+                else:
+                    callables_curr_chunk = self.callables_per_chunk[model_chunk_idx]
+                for layer_idx, layer in enumerate(callables_curr_chunk):
                     per_callable_fwd_idx = sample_start_idx + layer_idx
 
                     # Get sample_args and sample_kwargs for index per_callable_fwd_idx.
@@ -1692,7 +1759,7 @@ class TECudaGraphHelper:
                         # reuse the static inputs of a previous forward pass for this forward pass.
                         # If not, we still need to generate the new static inputs.
                         sample_keys = layer_sample_keys_cache[id(layer)]
-
+                    model_chunk_idx = abs(chunk_id) - 1
                     fwd_sample_queues[model_chunk_idx].append((sample_keys, per_callable_fwd_idx))
                     if consumed_sample_queue.get(sample_keys, []):
                         # We can reuse the static inputs of a previous forward pass for this
@@ -1714,13 +1781,16 @@ class TECudaGraphHelper:
                         # Unfortunately, no previous static inputs are available for reuse,
                         # sample_args is still None. Last attempt: generate the new static inputs
                         # for this forward pass.
+                        if chunk_id_list:
+                            model_chunk_idx = chunk_id_list[idx][0]
                         sample_args[per_callable_fwd_idx], sample_kwargs[per_callable_fwd_idx] = (
                             _get_layer_static_inputs(
                                 layer, self.chunks_with_decoder[model_chunk_idx]
                             )
                         )
+                        model_chunk_idx = abs(chunk_id) - 1
                 fwd_idx[model_chunk_idx] += 1
-            else:
+            elif ceil(chunk_id) == chunk_id:
                 num_consumed_samples = min(
                     len(fwd_sample_queues[model_chunk_idx]),
                     self.num_layers_per_chunk[model_chunk_idx],
@@ -1734,6 +1804,9 @@ class TECudaGraphHelper:
                 fwd_sample_queues[model_chunk_idx] = fwd_sample_queues[model_chunk_idx][
                     num_consumed_samples:
                 ]
+            else:
+                # skip register static inputs for wgrad backward graphs
+                continue
 
         return sample_args, sample_kwargs
 
@@ -1745,13 +1818,15 @@ class TECudaGraphHelper:
 
         # Get the PP and VPP scheduling order.
         from megatron.core.pipeline_parallel.schedules import (
-            convert_schedule_table_to_order,
             get_pp_rank_microbatches,
             get_schedule_table,
         )
 
         # If PP is not enabled, we only need to capture one microbatch.
-        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
+        if (
+            parallel_state.get_pipeline_model_parallel_world_size() == 1
+            and not self.config.overlap_moe_expert_parallel_comm
+        ):
             assert (
                 self.num_model_chunks == 1
             ), "If PP is not enabled, there should be only one model chunk."
@@ -1780,9 +1855,36 @@ class TECudaGraphHelper:
             level=logging.DEBUG,
             msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
+        chunk_id_list = None
+        if self.config.overlap_moe_expert_parallel_comm:
+            wgrad_in_graph_scope = CudaGraphScope.attn in self.config.cuda_graph_scope or (
+                CudaGraphScope.moe_router in self.config.cuda_graph_scope
+                and self.config.moe_shared_expert_intermediate_size is not None
+                and not self.config.moe_shared_expert_overlap
+            )
+            capture_wgrad_graph = self.config.delay_wgrad_compute and wgrad_in_graph_scope
+            order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
+                order, self.num_layers_per_chunk, capture_wgrad_graph
+            )
+            self.num_layers_per_chunk = [1] * sum(self.num_layers_per_chunk)
+            self.num_model_chunks = max(order)
+            _order_without_wgrad = []
+            for c_id in order:
+                if ceil(c_id) != c_id:
+                    continue
+                _order_without_wgrad.append(c_id)
+            self.num_microbatches = len(_order_without_wgrad) // self.num_model_chunks // 2
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=None,
+                dp_cp_group=None,
+                level=logging.DEBUG,
+                msg=f'Rank {torch.distributed.get_rank()}: '
+                f'ORDER after overlap_moe_expert_parallel_comm {order}',
+            )
 
         # Generate sample arguments and keyword arguments for capturing.
-        sample_args, sample_kwargs = self._get_sample_arguments(order)
+        sample_args, sample_kwargs = self._get_sample_arguments(order, chunk_id_list)
 
         def get_make_graphed_callables_kwargs():
             kwargs = {
@@ -1924,13 +2026,17 @@ class TECudaGraphHelper:
             for layer_number, layer in enumerate(layers):
                 layer.cuda_graphs = []
                 for batch_number in range(self.num_microbatches):
-                    layer.cuda_graphs.append(
-                        graphs[
+                    if self.config.overlap_moe_expert_parallel_comm:
+                        graph_idx = (
+                            num_layers_accumulated + layer_number
+                        ) * self.num_microbatches + batch_number
+                    else:
+                        graph_idx = (
                             num_layers_accumulated * self.num_microbatches
                             + batch_number * len(layers)
                             + layer_number
-                        ]
-                    )
+                        )
+                    layer.cuda_graphs.append(graphs[graph_idx])
             num_layers_accumulated += len(layers)
 
         self._finish_capturing(start_time)
@@ -1974,3 +2080,133 @@ class TECudaGraphHelper:
             f'{graphs_not_reset} graphs deleted without explicit reset.',
         )
         self._graphs_created = False
+
+
+def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
+    """Convert a tunable schedule lookup table to the te.make_graphed_callables() accepted
+    order format. For example, the tunable schedule table for PP2 N3M5 with VP2 is as below:
+    virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
+    microbatch_id         | 0 1 2 0 1 2 3 4 3 4
+    model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
+
+    Then the forward backward separated order is:
+    forward               | 1 1 1 2 2 2 1 1 2 2
+    backward              | -2 -2 -2 -1 -1 -1 -2 -2 -1 -1
+
+    If num_warmup_microbatches is 5, the output order is:
+    1 1 1 2 2 2 -2 1 -2 1 -2 2 -1 2 -1 -1 -2 -2 -1 -1
+    """
+    _, model_chunk_id_table = zip(*schedule_table)
+    forward_order = [chunk_id + 1 for chunk_id in model_chunk_id_table]
+    backward_order = [chunk_id - num_model_chunks for chunk_id in model_chunk_id_table]
+    order = forward_order[:num_warmup_microbatches]
+    for i in range(num_warmup_microbatches, len(forward_order)):
+        order.append(forward_order[i])
+        order.append(backward_order[i - num_warmup_microbatches])
+    if num_warmup_microbatches > 0:
+        order.extend(backward_order[-num_warmup_microbatches:])
+    return order
+
+
+def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
+    """
+    This functions gets the order for overlap_moe_expert_parallel_comm schedule for the original
+    chunk-wise order list. Each chunk is transformered to chunks with only 1 layer so that
+    layers between 2 chunks can now overlap with each other while following the graph order.
+    If capture_wgrad_graph is True, the wgrad backward graph is also added to the order by
+    decreasing the layer id by 0.5.
+
+    Args:
+        order (List[int]): The original chunk-wise order list. Positive values represent forward
+            passes for chunks, negative values represent backward passes. The absolute value
+            indicates the chunk ID (1-indexed).
+        num_layers_per_chunk (List[int]): Number of graphable layers in each chunk. The length
+            of this list equals the number of chunks.
+        capture_wgrad_graph (bool): If True, weight gradient computation graphs are added to the
+            order by appending entries with layer_id - 0.5.
+
+    Returns:
+        Tuple[List[float], List[Optional[List[int]]]]: A tuple containing:
+            - new_order: The layer-wise order list where each chunk is expanded to individual
+              layers. Positive values are forward passes, negative values are backward passes.
+              Values with .5 suffix indicate weight gradient computations.
+            - chunk_id_list: A list parallel to new_order. For forward passes, contains
+              [chunk_id, layer_index_within_chunk]. For backward passes, contains None.
+
+    Example:
+        original_order: [1, 2, -2, 1, -1, -1]
+        num_layers_per_chunk: [1, 2]
+        capture_wgrad_graph=True:
+            new_order: [1, 2, 3, 1, -3, -3.5, -2, -2.5, -1, -1.5, -1, -1.5]
+            chunk_id_list: [[0, 0], [1, 0], [1, 1], [0, 0], None,
+                            None, None, None, None, None, None, None]
+        capture_wgrad_graph=False:
+            new_order: [1, 2, 3, 1, -3, -2, -1, -1]
+            chunk_id_list: [[0, 0], [1, 0], [1, 1], [0, 0], None, None, None, None]
+    """
+
+    def _add_order(new_order, chunk_id_list, c_id, layer_id, is_wgrad=False, index=None):
+        if is_wgrad:
+            new_order.append(layer_id - 0.5)
+        else:
+            new_order.append(layer_id)
+        if c_id > 0:
+            chunk_id_list.append([abs(c_id) - 1, index])
+        else:
+            chunk_id_list.append(None)
+
+    new_order = []
+    chunk_id_list = []
+    add_order = partial(_add_order, new_order, chunk_id_list)
+    first_backward_idx, last_forward_idx = None, None
+    for idx, c_id in enumerate(order):
+        if first_backward_idx is None and c_id < 0:
+            first_backward_idx = idx
+        if c_id > 0:
+            last_forward_idx = idx
+
+    def get_layer_range(c_id):
+        num_layers = num_layers_per_chunk[abs(c_id) - 1]
+        num_layers_previous_chunks = sum(num_layers_per_chunk[: abs(c_id) - 1])
+        if c_id > 0:
+            return list(
+                range(num_layers_previous_chunks + 1, num_layers_previous_chunks + num_layers + 1)
+            )
+        return list(range(-num_layers_previous_chunks - num_layers, -num_layers_previous_chunks))
+
+    # warmup stage
+    for c_id in order[:first_backward_idx]:
+        layer_range = get_layer_range(c_id)
+        new_order += layer_range
+        chunk_id_list.extend([abs(c_id) - 1, i] for i in range(len(layer_range)))
+
+    # 1f1b overlap stage
+    if first_backward_idx < last_forward_idx:
+        for c_id_b, c_id_f in zip(
+            order[first_backward_idx : last_forward_idx + 1 : 2],
+            order[first_backward_idx + 1 : last_forward_idx + 1 : 2],
+        ):
+            layer_range_f = get_layer_range(c_id_f)
+            layer_range_b = get_layer_range(c_id_b)
+            index = 0
+            for l_b, l_f in zip_longest(layer_range_b, layer_range_f, fillvalue=0):
+                # always forward graph before backward graph
+                if l_f != 0:
+                    add_order(c_id_f, l_f, index=index)
+                if l_b != 0:
+                    add_order(c_id_b, l_b)
+                    if capture_wgrad_graph and index < len(layer_range_b) - 1:
+                        add_order(c_id_b, l_b, is_wgrad=True)
+                index += 1
+            # last wgrad backward
+            if capture_wgrad_graph and layer_range_b:
+                add_order(c_id_b, layer_range_b[-1], is_wgrad=True)
+
+    # cool down stage, backward graphs only
+    for c_id in order[last_forward_idx + 1 :]:
+        for l_b in get_layer_range(c_id):
+            add_order(c_id, l_b)
+            if capture_wgrad_graph:
+                add_order(c_id, l_b, is_wgrad=True)
+
+    return new_order, chunk_id_list

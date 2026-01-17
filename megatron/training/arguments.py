@@ -70,6 +70,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
+    parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
@@ -320,10 +321,35 @@ def moe_freq_type(x):
       This allows defining arbitrary patterns of expert and dense layers.
       The pattern length must match the total number of transformer layers.
       Examples:
-          "([0]+[1]*23)": 1 dense layer followed by 23 experts layers
+          "([0]+[1]*23)": 1 dense layer followed by 23 expert layers
           "([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.
     """
     if isinstance(x, int):
+        return x
+    assert isinstance(x, str)
+    if '[' in x:
+        # it's a custom pattern
+        return _eval_pattern(x)
+    else:
+        # it's a single int but in str
+        return int(x)
+
+def la_freq_type(x):
+    """Frequency between LA (linear attention) layers and SDPA (scaled dot-product attention) layers.
+
+    Accepts either:
+    - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
+    - A string "N": Same as above, but provided as a string
+    - A string containing a Python list expression that defines a custom pattern, e.g.:
+      "([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0]
+      where 1 indicates an LA layer and 0 indicates a SDPA layer.
+      This allows defining arbitrary patterns of LA and SDPA layers.
+      The pattern length must match the total number of transformer layers.
+      Examples:
+          "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers
+          "([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.
+    """
+    if x is None or isinstance(x, int):
         return x
     assert isinstance(x, str)
     if '[' in x:
@@ -526,6 +552,12 @@ def validate_args(args, defaults={}):
         assert any(elt is not None
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
+
+    if args.phase_transition_iterations:
+        args.phase_transition_iterations = sorted(
+            int(x.strip()) for x in args.phase_transition_iterations.split(",")
+        )
+        assert args.rampup_batch_size is None, "multi-phase training does not support batch size ramp-up"
 
     # Batch size.
     assert args.micro_batch_size is not None
@@ -893,6 +925,17 @@ def validate_args(args, defaults={}):
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
+    if args.no_weight_decay_cond_type is not None:
+        print_rank_0(
+            'WARNING: --no-weight-decay-cond-type is deprecated. Please use --apply-wd-to-qk-layernorm instead.',
+            args.rank,
+        )
+        if args.no_weight_decay_cond_type == "apply_wd_to_qk_layernorm":
+            args.apply_wd_to_qk_layernorm = True
+        else:
+            raise ValueError(f"Invalid no_weight_decay_cond_type: {args.no_weight_decay_cond_type}")
+        args.no_weight_decay_cond_type = None
+
     if args.weight_decay_incr_style == 'constant':
         assert args.start_weight_decay is None
         assert args.end_weight_decay is None
@@ -1217,6 +1260,18 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print('Warning: enabling --no-load-optim when skipping training.')
 
+    # Muon optimizer check
+    if 'muon' in args.optimizer:
+
+        # TODO: remove these checks once we support them
+        assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce for now."
+        assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather for now."
+
+        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
+        assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
+        assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
+        assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -1249,6 +1304,13 @@ def validate_args(args, defaults={}):
                 "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
                 "when enabling delay_wgrad_compute"
             )
+
+    if args.fine_grained_activation_offloading:
+        assert args.transformer_impl == 'transformer_engine', \
+            "Fine-grained activation offloading is only supported with transformer_engine implementation"
+        if is_te_min_version("2.10.0"):
+            assert os.getenv("NVTE_CPU_OFFLOAD_V1", "0") == "1", \
+                "For fine-grained activation offloading with TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 should be set to 1 to avoid offloading weights."
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
@@ -1480,11 +1542,6 @@ def _add_transformer_engine_args(parser):
                        help='Keep the compute param in fp4 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp4.',
                        dest='fp4_param')
-    group.add_argument('--te-rng-tracker', action='store_true', default=False,
-                       help='Use the Transformer Engine version of the random number generator. '
-                            'Required for CUDA graphs support.')
-    group.add_argument('--inference-rng-tracker', action='store_true', default=False,
-                       help='Use a random number generator configured for inference.')
     group.add_argument('--te-precision-config-file', default=None,
                        help='Configuration file to select per-module precision overrides. '
                        'See TransformerEngineMixedPrecision.md')
@@ -1569,7 +1626,14 @@ def _add_inference_args(parser):
                        'If the UVM level is 0, then only GPU memory is used and '
                        'the total memory equals `buffer_size_gb`. If the UVM '
                        'level is 1, then additional memory is utilized on the '
-                       'CPU and the total memory equals `2 * buffer_size_gb`.')
+                       'CPU and the total memory equals `buffer_size_gb + '
+                       'paused_buffer_size_gb`.')
+    group.add_argument('--inference-dynamic-batching-paused-buffer-size-gb',
+                       type=float, default=None,
+                       help='Amount of memory reserved for paused requests in '
+                       'the dynamic inference context. Active requests are '
+                       'paused when there are not enough active blocks available '
+                       'to continue generating a request.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
@@ -2024,13 +2088,8 @@ def _add_regularization_args(parser):
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
-    group.add_argument('--start-weight-decay', type=float,
-                       help='Initial weight decay coefficient for L2 regularization.')
-    group.add_argument('--end-weight-decay', type=float,
-                       help='End of run weight decay coefficient for L2 regularization.')
-    group.add_argument('--weight-decay-incr-style', type=str, default='constant',
-                       choices=['constant', 'linear', 'cosine'],
-                       help='Weight decay increment function.')
+    group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
+                       help='Apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
@@ -2044,6 +2103,33 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--muon-momentum', type=float, default=0.9,
+                       help='Momentum factor for Muon optimizer')
+    group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
+                       dest='muon_split_qkv',
+                       help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-use-nesterov', action='store_true',
+                       help='Whether to use Nesterov-style momentum in the internal SGD')
+    group.add_argument('--muon-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       help='Scale mode for Muon optimizer')
+    group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
+                       choices=['low', 'medium', 'high'],
+                       help='FP32 matmul precision for Newton-Schulz iteration')
+    group.add_argument('--muon-num-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schulz steps for Muon optimizer')
+    group.add_argument('--muon-tp-mode', type=str, default='blockwise',
+                       choices=['blockwise', 'duplicated', 'distributed'],
+                       help='How to perform NS calculation for tensor model parallel weights')
+    group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
+                       help='Additional scale factor for the muon update')
+
+    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
+                       help='Type of no weight decay condition. Choices: '
+                       'None (default): apply weight decay to 1D weights and biases.'
+                       '"apply_wd_to_qk_layernorm": additionally apply weight decay to '
+                       'qk layernorm as a special case.'
+                       'DEPRECATED. Please use --apply-wd-to-qk-layernorm instead. ')
     return parser
 
 
@@ -2113,8 +2199,18 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
+                       default=False,
+                       help='If set, do not call `delete_cuda_graphs` or `toggle_cuda_graphs` when the inference engine is suspended. '
+                            'Use only when all training and inference cudagraphs and the KV cache fit on device.')
     group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
                        help='Degree of tensor model parallelism for inference for RL.')     
+    group.add_argument(
+        '--rl-inference-pipeline-model-parallel-size',
+        type=int,
+        default=None,
+        help='Degree of pipeline model parallelism for inference for RL.',
+    )
     group.add_argument(
         '--rl-inference-model-unified-memory-level',
         type=int,
@@ -2155,7 +2251,11 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
+    from megatron.training.training_config import TrainingConfig
+    from megatron.training.common_config import ProfilingConfig
+
+    prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["record_shapes", "nvtx_ranges"])
+    prof_group = prof_factory.build_group(parser, "profiling")
 
     train_factory = ArgumentGroupFactory(TrainingConfig)
     group = train_factory.build_group(parser, "training")
@@ -2177,9 +2277,6 @@ def _add_training_args(parser):
     group.add_argument('--no-check-for-nan-in-loss-and-grad', action='store_false',
                        help='Check for NaNs in loss and grad',
                        dest='check_for_nan_in_loss_and_grad')
-    group.add_argument('--check-for-spiky-loss', action='store_true',
-                       help='Check for spiky loss',
-                       dest='check_for_spiky_loss')
     group.add_argument('--check-for-large-grads', action='store_true',
                        help='Check for unexpectedly large grads',
                        dest='check_for_large_grads')
@@ -2220,32 +2317,11 @@ def _add_training_args(parser):
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
-    group.add_argument('--profile', action='store_true',
-                       help='Enable nsys profiling. When using this option, nsys '
-                       'options should be specified in commandline. An example '
-                       'nsys commandline is `nsys profile -s none -t nvtx,cuda '
-                       '-o <path/to/output_file> --force-overwrite true '
-                       '--capture-range=cudaProfilerApi '
-                       '--capture-range-end=stop`.')
-    group.add_argument('--profile-step-start', type=int, default=10,
-                       help='Global step to start profiling.')
-    group.add_argument('--profile-step-end', type=int, default=12,
-                       help='Global step to stop profiling.')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--disable-gloo-process-groups', action='store_false',
                        dest='enable_gloo_process_groups',
                        help='Disables creation and usage of Gloo process groups.')
-    group.add_argument('--use-pytorch-profiler', action='store_true',
-                       help='Use the built-in pytorch profiler. '
-                       'Useful if you wish to view profiles in tensorboard.',
-                       dest='use_pytorch_profiler')
-    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
-                       help='Global ranks to profile.')
-    group.add_argument('--record-memory-history', action="store_true", default=False,
-                       help='Record memory history in last rank.')
-    group.add_argument('--memory-snapshot-path', type=str, default="snapshot.pickle",
-                       help='Specifies where to dump the memory history pickle.')
     group.add_argument('--tp-comm-overlap', action='store_true', help='Enables the '
                        ' overlap of Tensor parallel communication and GEMM kernels.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
@@ -2335,7 +2411,7 @@ def _add_training_args(parser):
     group.add_argument('--qk-clip-threshold', type=float, default=100,
                        help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
@@ -2393,44 +2469,39 @@ def _add_training_args(parser):
                        help='The communicator group names to use high priority streams.')
     group.add_argument('--use-te-activation-func', action='store_true',
                        help='Use activation function kernel from Transformer Engine in MLP module.')
+    group.add_argument('--fine-grained-activation-offloading', action='store_true',
+                       help='Enable fine-grained activation offloading.')
+    group.add_argument('--offload-modules', nargs='*', type=str, default=[],
+                       help='The submodules to offload its input. Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
+    group.add_argument('--min-offloaded-tensor-size', type=int, default=1024*1024,
+                       help='The minimum size of the tensor to be offloaded.')
     group.add_argument('--batch-invariant-mode', action='store_true',
                        help='Use batch-invariant kernels for deterministic forward execution regardless '
                        'of batch size. Ensures bitwise identical results when the same inputs are '
                        'processed in different batch configurations. This is more strict than deterministic-mode '
                        'which only ensures bitwise identical results when the same inputs are processed in the same batch configuration. '
                        'This will significantly affect speed of training and inference as the kernels are not full optimized.')
-
+    group.add_argument('--disable-jit-fuser', action='store_true',
+                       help='Disable the JIT fuser.')
 
     return parser
 
 
 def _add_rerun_machine_args(parser):
-    group = parser.add_argument_group(title='rerun engine')
+    from megatron.training.resilience_config import RerunStateMachineConfig
 
-    group.add_argument('--error-injection-rate', type=int, default=0,
-                       help='Rate at which to inject unexpected results, '
-                       'e.g. 1000 means once every 1000 result validations')
-    group.add_argument('--error-injection-type', type=str, default='transient_error',
-                       choices=['correct_result', 'transient_error', 'persistent_error'],
-                       help='Type of error to inject. ')
-    group.add_argument('--rerun-mode', type=str, default='validate_results',
-                       choices=['disabled', 'validate_results', 'report_stats'],
-                       help='Use re-run engine to validate results (default) '
-                       'or to emit stats on variability of computations due to '
-                       'non-deterministic algorithms.')
+    rerun_factory = ArgumentGroupFactory(RerunStateMachineConfig, exclude=["check_for_nan_in_loss"])
+    group = rerun_factory.build_group(parser, "rerun engine")
 
     return parser
 
 
 def _add_initialization_args(parser):
-    group = parser.add_argument_group(title='initialization')
+    from megatron.training.common_config import RNGConfig
 
-    group.add_argument('--seed', type=int, default=1234,
-                       help='Random seed used for python, numpy, '
-                       'pytorch, and cuda.')
-    group.add_argument('--data-parallel-random-init', action='store_true',
-                       help='Enable random initialization of params '
-                       'across data parallel ranks')
+    rng_factory = ArgumentGroupFactory(RNGConfig)
+    group = rng_factory.build_group(parser, "RNG and initialization")
+
     group.add_argument('--init-method-std', type=float, default=0.02,
                        help='Standard deviation of the zero mean normal '
                        'distribution used for weight initialization.')
@@ -2451,59 +2522,21 @@ def _add_initialization_args(parser):
 
 
 def _add_learning_rate_args(parser):
-    group = parser.add_argument_group(title='learning rate')
+    from megatron.training.training_config import SchedulerConfig
+
+    sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=["no_weight_decay_cond_type"])
+    group = sched_factory.build_group(parser, title="learning rate and weight decay")
 
     group.add_argument('--lr', type=float, default=None,
                        help='Initial learning rate. Depending on decay style '
                        'and initial warmup, the learning rate at each '
                        'iteration would be different.')
-    group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine', 'inverse-square-root', 'WSD'],
-                       help='Learning rate decay function.')
-    group.add_argument('--lr-wsd-decay-style', type=str, default='exponential',
-                       choices=['exponential', 'linear', 'cosine', 'minus_sqrt'],
-                       help='Decay style for the annealing phase of WSD'),
-    group.add_argument('--lr-decay-iters', type=int, default=None,
-                       help='number of iterations to decay learning rate over,'
-                       ' If None defaults to `--train-iters`')
-    group.add_argument('--lr-decay-samples', type=int, default=None,
-                       help='number of samples to decay learning rate over,'
-                       ' If None defaults to `--train-samples`')
-    group.add_argument('--lr-wsd-decay-samples', type=int, default=None,
-                       help='number of samples for the annealing phase in the wsd schedule')
-    group.add_argument('--lr-wsd-decay-iters', type=int, default=None,
-                       help='number of iterations for the annealing phase in the wsd schedule')
-    group.add_argument('--lr-warmup-fraction', type=float, default=None,
-                       help='fraction of lr-warmup-(iters/samples) to use '
-                       'for warmup (as a float)')
-    group.add_argument('--lr-warmup-iters', type=int, default=0,
-                       help='number of iterations to linearly warmup '
-                       'learning rate over.')
-    group.add_argument('--lr-warmup-samples', type=int, default=0,
-                       help='number of samples to linearly warmup '
-                       'learning rate over.')
-    group.add_argument('--lr-warmup-init', type=float, default=0.0,
-                       help='Initial value for learning rate warmup. The '
-                       'scheduler starts warmup from this value.')
     group.add_argument('--warmup', type=int, default=None,
                        help='Old lr warmup argument, do not use. Use one of the'
                        '--lr-warmup-* arguments above')
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minimum value for learning rate. The scheduler'
                        'clip values below this threshold.')
-    group.add_argument('--override-opt_param-scheduler', '--override-opt-param-scheduler',
-                       action='store_true',
-                       help='Reset the values of the scheduler (learning rate,'
-                       'warmup iterations, minimum learning rate, maximum '
-                       'number of iterations, and decay style from input '
-                       'arguments and ignore values from checkpoints. Note'
-                       'that all the above values will be reset.')
-    group.add_argument('--use-checkpoint-opt_param-scheduler', '--use-checkpoint-opt-param-scheduler',
-                       action='store_true',
-                       help='Use checkpoint to set the values of the scheduler '
-                       '(learning rate, warmup iterations, minimum learning '
-                       'rate, maximum number of iterations, and decay style '
-                       'from checkpoint and ignore input arguments.')
     group.add_argument('--decoupled-lr', type=float, default=None,
                        help='Separate learning rate for the input and output layer')
     group.add_argument('--decoupled-min-lr', type=float, default=None,
@@ -2590,13 +2623,13 @@ def _add_checkpointing_args(parser):
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
     group.add_argument('--ckpt-format', default='torch_dist',
-                       choices=['torch', 'torch_dist', 'zarr', 'torch_dcp', 'fsdp_dtensor'],
+                       choices=['torch', 'torch_dist', 'torch_dcp', 'fsdp_dtensor'],
                        help='Checkpoint format to use. torch is the format used by torch.save/load.'
                        ' torch_dist is a megatron built-in distributed checkpointing format.'
                        ' torch_dcp is the torch.distributed.checkpoint format.'
                        ' fsdp_dtensor is a torch DCP native, Megatron FSDP training-specific checkpoint format.')
     group.add_argument('--ckpt-convert-format', default=None,
-                       choices=['torch', 'torch_dist', 'zarr'],
+                       choices=['torch', 'torch_dist'],
                        help='Checkpoint format for conversion.')
     group.add_argument('--ckpt-convert-save', default=None,
                        help='Save directory for converted checkpoint.')
@@ -2878,7 +2911,7 @@ def _add_distributed_args(parser):
 
 
 def _add_validation_args(parser):
-    from megatron.training.config import ValidationConfig
+    from megatron.training.training_config import ValidationConfig
 
     val_factory = ArgumentGroupFactory(ValidationConfig)
     group = val_factory.build_group(parser, "validation")
@@ -2954,6 +2987,10 @@ def _add_data_args(parser):
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
+    group.add_argument('--phase-transition-iterations', type=str, default=None,
+                       help='Comma-separated list of iterations where phase '
+                       'transitions occur. Requires fixed global batch size across phases. '
+                       'Does not support batch size ramp-up.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -3377,6 +3414,43 @@ def _add_mla_args(parser):
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
 
+    return parser
+
+def _add_experimental_attention_variant_args(parser):
+    group = parser.add_argument_group(title="experimental_attention_variant")
+    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa'], type=str,
+                       help='Type of attention variant to use. Currently support gated_delta_net and dsa.')
+    # DSA
+    group.add_argument('--dsa-indexer-n-heads', default=None, type=int,
+                       help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
+    group.add_argument('--dsa-indexer-head-dim', default=None, type=int,
+                       help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
+    group.add_argument('--dsa-indexer-topk', default=None, type=int,
+                       help='Number of top-k tokens to select in sparse attention indexer.')
+    group.add_argument('--dsa-indexer-loss-coeff', default=None, type=float,
+                       help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
+    group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
+                       help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
+    # Linear attention
+    group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
+                       help='Frequency between LA (linear attention) layers and'
+                            ' SDPA (scaled dot-product attention) layers. Accepts either: '
+                            '- An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer '
+                            '- A string containing a Python list expression that defines a custom pattern, e.g.: '
+                            '"([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
+                            'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
+                            'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
+                            '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    group.add_argument('--linear-conv-kernel-dim', default=4, type=int,
+                       help='Conv kernel dimension for the gated delta net.')
+    group.add_argument('--linear-key-head-dim', default=128, type=int,
+                       help='Query and key head dimension for the gated delta net.')
+    group.add_argument('--linear-value-head-dim', default=128, type=int,
+                       help='Value and gate head dimension for the gated delta net.')
+    group.add_argument('--linear-num-key-heads', default=16, type=int,
+                       help='Number of query and key heads for the gated delta net.')
+    group.add_argument('--linear-num-value-heads', default=32, type=int,
+                       help='Number of value and gate heads for the gated delta net.')
     return parser
 
 def _add_heterogeneous_args(parser):

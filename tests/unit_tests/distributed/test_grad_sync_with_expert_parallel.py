@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 import contextlib
 from typing import Optional
 
@@ -169,15 +171,20 @@ def test_grad_sync(
         )
         != 0
     ):
-        # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/data_parallel_word_size
-        # When average_in_collective=False, the grad data is always first scaled by 1/data_parallel_word_size and then summed by AR/RS
-        # when use_distributed_optimizer=True, only for rank=0 param_and_grad_buffer.grad_data[0] is updated, for other ranks
-        # another shard of grad_data is updated while param_and_grad_buffer.grad_data[0] is unchanged (=1/data_parallel_word_size)
+        # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals
+        # 1/data_parallel_word_size.
+        # When average_in_collective=False, the grad data is always first scaled by
+        # 1/data_parallel_word_size and then summed by AR/RS.
+        # When use_distributed_optimizer=True, only for rank=0,
+        # param_and_grad_buffer.grad_data[0] is updated. For other ranks another shard of
+        # grad_data is updated while param_and_grad_buffer.grad_data[0] is unchanged
+        # (=1/data_parallel_word_size).
         non_ep_expected_grad_data_value_after_collective /= (
             parallel_state.get_data_parallel_world_size()
         )
     if ep_size > 1:
-        # For MoE models with exper parallelism, each expert will receive tokens from EPxETP times batches, such that the expert gradient will be EPxETP times after backward,
+        # For MoE models with exper parallelism, each expert will receive tokens from EPxETP
+        # times batches, such that the expert gradient will be EPxETP times after backward,
         # and the expected gradient after collective should be 1.0 as same as dense params.
         ep_param_and_grad_buffer.grad_data.data.fill_(float(ep_size * etp_size))
         ep_expected_grad_data_value_after_collective = 1
@@ -186,14 +193,30 @@ def test_grad_sync(
             and (not average_in_collective)
             and parallel_state.get_expert_data_parallel_rank(partial_expert_data_parallel=True) != 0
         ):
-            # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/EDP
-            # When average_in_collective=False, the grad data is always first scaled by expert_data_parallel_size and then summed by AR/RS
-            # after SUM collective in expert_data_group, the scale will be 1.0.
+            # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals 1/EDP.
+            # When average_in_collective=False, the grad data is always first scaled by
+            # expert_data_parallel_size and then summed by AR/RS.
+            # After SUM collective in expert_data_group, the scale will be 1.0.
             ep_expected_grad_data_value_after_collective /= (
                 parallel_state.get_expert_data_parallel_world_size()
             )
 
+    register_grad_sync_context = (
+        contextlib.nullcontext() if overlap_grad_reduce else pytest.raises(AssertionError)
+    )
+
+    # Call register_grad_ready for all params before starting test to seed tracking
+    # data structures.
     params = list(model.parameters())
+    for param in params:
+        with register_grad_sync_context:
+            bucket_group = param_to_bucket_group[param]
+            bucket_group.register_grad_ready(param)
+    # Call reset to set .is_first_batch to False.
+    for param in params:
+        bucket_group = param_to_bucket_group[param]
+        bucket_group.reset()
+
     map_bucket_to_last_param_idx = {}
     for i, param in enumerate(params):
         if not (param in param_to_bucket_group):
@@ -206,9 +229,6 @@ def test_grad_sync(
             param_idx = 0
         map_bucket_to_last_param_idx[bucket_group] = param_idx
 
-        register_grad_sync_context = (
-            contextlib.nullcontext() if overlap_grad_reduce else pytest.raises(AssertionError)
-        )
         finish_grad_sync_context = contextlib.nullcontext()
         if (
             param_idx < (len(bucket_group.params) - 1)
@@ -220,6 +240,7 @@ def test_grad_sync(
 
         with register_grad_sync_context:
             bucket_group.register_grad_ready(param)
+
         with finish_grad_sync_context:
             # When overlap_grad_reduce is True, this should throw an assertion error until all
             # params in the model have registered their grad above.
