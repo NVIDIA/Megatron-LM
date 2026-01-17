@@ -3065,9 +3065,6 @@ class GradReducePipeline:
                 grad_reduce_event.wait()
                 free_up_grad_bucket()
 
-        if suggested_queue_size == 0 and self.outer_fsdp_group_grad_reduce:
-            torch.cuda.current_stream().wait_stream(self.outer_fsdp_group_grad_reduce_stream)
-
     def _enforce_double_buffer_limit(self, add_buckets):
         if not self.buffer.ddp_config.fsdp_double_buffer:
             return
