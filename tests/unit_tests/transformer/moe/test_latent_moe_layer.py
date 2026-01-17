@@ -30,7 +30,9 @@ class TestLatentMoELayer:
     @pytest.mark.parametrize("num_moe_experts", [4])
     @pytest.mark.parametrize("use_te,grouped_gemm", [(True, True), (True, False), (False, False)])
     @pytest.mark.parametrize("moe_latent_size", [8, 16])
-    def test_latent_moe_layer(self, num_moe_experts, moe_token_dispatcher_type, use_te, grouped_gemm, moe_latent_size):
+    def test_latent_moe_layer(
+        self, num_moe_experts, moe_token_dispatcher_type, use_te, grouped_gemm, moe_latent_size
+    ):
         Utils.initialize_model_parallel(1, 1)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         self.transformer_config = TransformerConfig(
@@ -64,20 +66,34 @@ class TestLatentMoELayer:
         moe_layer.cuda()
         config = moe_layer.config
 
-        assert moe_layer.shared_experts.linear_fc1.weight.shape[1] == config.hidden_size, "Shared expert computation has to happen in hidden dimension."
-        assert moe_layer.shared_experts.linear_fc2.weight.shape[0] == config.hidden_size, "Shared expert computation has to happen in hidden dimension."
+        assert (
+            moe_layer.shared_experts.linear_fc1.weight.shape[1] == config.hidden_size
+        ), "Shared expert computation has to happen in hidden dimension."
+        assert (
+            moe_layer.shared_experts.linear_fc2.weight.shape[0] == config.hidden_size
+        ), "Shared expert computation has to happen in hidden dimension."
         if grouped_gemm:
             for i in range(num_moe_experts):
                 fc1_weight = getattr(moe_layer.experts.linear_fc1, f"weight{i}")
                 fc2_weight = getattr(moe_layer.experts.linear_fc2, f"weight{i}")
-                assert fc1_weight.shape[1] == config.moe_latent_size, f"Shape mismatch for expert {i} {fc1_weight.shape=}"
-                assert fc2_weight.shape[0] == config.moe_latent_size, f"Shape mismatch for expert {i} {fc2_weight.shape=}"
+                assert (
+                    fc1_weight.shape[1] == config.moe_latent_size
+                ), f"Shape mismatch for expert {i} {fc1_weight.shape=}"
+                assert (
+                    fc2_weight.shape[0] == config.moe_latent_size
+                ), f"Shape mismatch for expert {i} {fc2_weight.shape=}"
         else:
             for i in range(num_moe_experts):
                 expert = moe_layer.experts.local_experts[i] 
-                assert expert.linear_fc1.weight.shape[1] == config.moe_latent_size, f"Shape mismatch for expert {i} {fc1_weight.shape=}"
-                assert expert.linear_fc2.weight.shape[0] == config.moe_latent_size, f"Shape mismatch for expert {i} {fc2_weight.shape=}"
-        assert moe_layer.router.weight.shape[1] == config.hidden_size, "MoE routing has to happen in hidden dimension."
+                assert (
+                    expert.linear_fc1.weight.shape[1] == config.moe_latent_size
+                ), f"Shape mismatch for expert {i} {fc1_weight.shape=}"
+                assert (
+                    expert.linear_fc2.weight.shape[0] == config.moe_latent_size
+                ), f"Shape mismatch for expert {i} {fc2_weight.shape=}"
+        assert (
+            moe_layer.router.weight.shape[1] == config.hidden_size
+        ), "MoE routing has to happen in hidden dimension."
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((32, 2, config.hidden_size))
