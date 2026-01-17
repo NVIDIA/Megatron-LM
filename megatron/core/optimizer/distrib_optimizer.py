@@ -1732,6 +1732,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     replace_kwargs.pop('dtype')
                 tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
                 tensors[state_key].validate_metadata_integrity()
+
+            # Remove 'step' from tensors to prevent it from polluting common_state_dict.
+            # With Expert Parallelism, different ranks have different param_idx counts,
+            # and 'step' (a plain tensor) ends up in common_state_dict with param_idx keys,
+            # causing false warnings in _validate_common_state_dict.
+            tensors.pop('step', None)
             return tensors
 
         # Not stored in the checkpoint, used only to identify params in
