@@ -71,6 +71,10 @@ class StaticInferenceContext(BaseInferenceContext):
         """Functional access to `.decode_mode`, to match dynamic context."""
         return self.decode_mode
 
+    def using_cuda_graph_this_step(self) -> bool:
+        """Returns True if cuda graphs are being used for this step."""
+        return self.is_decode_only()
+
     def reset(self):
         """Resets the inference state for a new batch."""
         self.sequence_len_offset = 0

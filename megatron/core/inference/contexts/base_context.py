@@ -27,6 +27,11 @@ class BaseInferenceContext(abc.ABC):
         """Return `True` if context uses dynamic batching."""
         return not self.is_static_batching()
 
+    @abc.abstractmethod
+    def using_cuda_graph_this_step(self) -> bool:
+        """Returns True if cuda graphs are being used for this step."""
+        pass
+
     def increment_sequence_len_offset(self, increment: int) -> None:
         """Update sequence length offset. No-op for dynamic batching."""
         if self.is_static_batching():
