@@ -13,7 +13,8 @@ TOKENIZER_MAPPING_LIBRARIES = OrderedDict(
         ("megatron", "MegatronHFTokenizer"),
         ("tiktoken", "TikTokenTokenizer"),
         ("byte-level", "ByteLevelTokenizer"),
-        ("null", "NullTokenizer"),
+        ("null-text", "NullTokenizer"),
+        ("sft", "SFTTokenizer"),
     ]
 )
 
@@ -56,7 +57,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         library_class = getattr(tokenizers, TOKENIZER_MAPPING_LIBRARIES[self.library])
 
-        if self.library in ['byte-level', 'null']:
+        if self.library in ['byte-level', 'null-text']:
             return library_class(**kwargs)
         else:
             return library_class(self.path, **kwargs)
@@ -82,7 +83,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             ids (list): text to be tokenized.
 
         Returns:
-            text: dettokenized text.
+            text: detokenized text.
         """
 
         return self._tokenizer.ids_to_text(ids)
@@ -110,6 +111,29 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         return self._tokenizer.apply_chat_template(
             conversation=conversation, chat_template=chat_template, **kwargs
+        )
+
+    def tokenize_conversation(
+        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+    ):
+        """Convert a conversation to tokens. Needed for SFTTokenizer.
+
+        Args:
+            conversation (List[Dict]): Sequence of system/user/assistant messages.
+                Must be in the following format:
+                [
+                    {"role": "system", "content": "something"},
+                    {"role": "user", "content": "something1"},
+                    {"role": "assistant", "content": "something2"},
+                ]
+            return_target (bool): Return target tokens with system and assistant masked.
+            add_generation_prompt (bool): Add assistant prefix to the end.
+        """
+
+        return self._tokenizer.tokenize_conversation(
+            conversation=conversation,
+            return_target=return_target,
+            add_generation_prompt=add_generation_prompt,
         )
 
     def save_pretrained(self, path: str) -> None:
@@ -140,6 +164,10 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         """
 
         self._tokenizer.add_special_tokens(special_tokens)
+
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Calculate offsets."""
+        return self._tokenizer.offsets(ids=ids, text=text)
 
     @property
     def additional_special_tokens_ids(self) -> list:

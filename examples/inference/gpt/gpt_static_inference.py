@@ -30,7 +30,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from pretrain_gpt import model_provider as gpt_model_provider
 from pretrain_mamba import model_provider as mamba_model_provider

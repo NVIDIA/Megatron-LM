@@ -173,16 +173,6 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 
 If `--tokenizer-metadata` is not specified, a default metadata file is generated automatically based on the tokenizer type.
 
-### Legacy Tokenizer Support
-
-The old tokenizer system is still supported for backward compatibility:
-
-```bash
-torchrun --nproc_per_node=8 pretrain_gpt.py \
-    --legacy-tokenizer \
-    ...
-```
-
 ## Supported Tokenizer Libraries
 
 | Library | Description | Use Case |

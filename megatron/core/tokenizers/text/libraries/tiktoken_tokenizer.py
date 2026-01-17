@@ -2,6 +2,7 @@
 
 import base64
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -13,6 +14,8 @@ except ImportError:
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 from .chat_template import MegatronTokenizerChatTemplate
+
+logger = logging.getLogger(__name__)
 
 PATTERN_TIKTOKEN_V1 = (
     r"[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"
@@ -44,10 +47,10 @@ def reload_mergeable_ranks(
     with open(path, "r") as f:
         vocab = json.load(f)
     assert isinstance(vocab, list)
-    print(f"Vocab size: {len(vocab)}")
+    logger.info(f"Vocab size: {len(vocab)}")
     if max_vocab is not None:
         vocab = vocab[:max_vocab]
-        print(f"Cutting vocab to first {len(vocab)} tokens.")
+        logger.info(f"Cutting vocab to first {len(vocab)} tokens.")
 
     # build ranks
     ranks: Dict[bytes, int] = {}
@@ -125,7 +128,7 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
         ]
         self.special_filler = special_filler
         if special_filler:
-            print(
+            logger.info(
                 "Adding special tokens: "
                 f"{', '.join(special_tokens)}, {special_filler[0]}, ..., {special_filler[-1]}"
             )
@@ -220,6 +223,24 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
     def add_special_tokens(self, special_tokens_dict: dict):
         """Adds special tokens to the tokenizer."""
         raise NotImplementedError("This method is not supported for TikToken tokenizers.")
+
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Calculate offsets."""
+        try:
+            return self.tokenizer.decode_with_offsets(ids)[1]
+        except UnicodeDecodeError:
+            # Tiktoken has an unnecessary check that raises UnicodeDecodeError
+            # from `text = b"".join(token_bytes).decode("utf-8", errors="strict")`
+            # which is not needed for our use case. So we re-implement it, without
+            # the check.
+
+            token_bytes = self.tokenizer.decode_tokens_bytes(ids)
+            text_len = 0
+            offsets = []
+            for token in token_bytes:
+                offsets.append(max(0, text_len - (0x80 <= token[0] < 0xC0)))
+                text_len += sum(1 for c in token if not 0x80 <= c < 0xC0)
+            return offsets
 
     @property
     def additional_special_tokens_ids(self) -> list:

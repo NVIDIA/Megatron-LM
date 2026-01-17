@@ -1,5 +1,4 @@
-import json
-import sys
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
 import torch
@@ -196,7 +195,7 @@ def test_tiktoken_tokenizer():
 
 
 def test_null_tokenizer():
-    metadata = {"library": "null"}
+    metadata = {"library": "null-text"}
     tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, vocab_size=131072)
 
     ids = tokenizer.tokenize("11 325 97")
@@ -255,3 +254,98 @@ def test_write_metadata():
         model_type="gpt",
         overwrite=True,
     )
+
+
+def test_multimodal_tokenizer():
+    """Test MegatronMultimodalTokenizer."""
+    prompt_format = "qwen2p0"
+    special_tokens = ["<image>"]
+    image_tag_type = "nvlm"
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "multimodal"},
+        prompt_format=prompt_format,
+        special_tokens=special_tokens,
+        image_tag_type=image_tag_type,
+    )
+    # Simple encode - decode roundtrip.
+    assert (
+        tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
+    ), "encode-decode roundtrip failed"
+
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello! Can you summarize this image for me?"},
+        {"role": "user", "content": "<image>"},
+        {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
+    ]
+
+    conv_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0, "failed to tokenize conversation"
+
+    conv_tokens, target_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0 and len(conv_tokens) == len(
+        target_tokens
+    ), "failed to tokenize conversation and return target tokens"
+
+    # Try converting tokens to ids.
+    assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
+
+    assert tokenizer._tokenizer._apply_image_tag("<image>hello") == "<Image><image></Image>hello"
+    assert tokenizer._tokenizer._apply_image_tag([{"role": "user", "content": "<image>hello"}]) == [
+        {"role": "user", "content": "<Image><image></Image>hello"}
+    ]
+
+
+def test_null_multimodal_tokenizer():
+    """Test MegatronNullMultimodalTokenizer."""
+    vocab_size = 10000
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-multimodal"}, vocab_size=vocab_size
+    )
+
+    assert tokenizer.vocab_size == (vocab_size + 1), f"expected vocab size is {vocab_size + 1}."
+
+    assert tokenizer.tokenize("1 22 333") == [1, 22, 333], "tokenization is failed."
+
+    assert tokenizer.detokenize([1, 22, 333]) == "1 22 333", "detokenization is failed."
+
+
+def test_sft_tokenizer():
+    """Test SFTTokenizer."""
+    prompt_format = "nemotron-nano-v2"
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "sft"},
+        prompt_format=prompt_format,
+    )
+
+    # Simple encode - decode roundtrip.
+    assert (
+        tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
+    ), "encode-decode roundtrip failed"
+
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello! Can you summarize this image for me?"},
+        {"role": "user", "content": "<image>"},
+        {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
+    ]
+
+    conv_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0, "failed to tokenize conversation"
+
+    conv_tokens, target_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0 and len(conv_tokens) == len(
+        target_tokens
+    ), "failed to tokenize conversation and return target tokens"

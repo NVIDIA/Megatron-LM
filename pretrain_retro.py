@@ -7,12 +7,11 @@ import torch
 from importlib import import_module
 
 from megatron.training import get_args
-from megatron.training import get_tokenizer
 from megatron.training import get_timers
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import tensor_parallel
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.datasets.retro.query.retro_dataset import get_retro_datasets
@@ -85,11 +84,8 @@ def get_batch(data_iterator):
 
     args = get_args()
 
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
-        
+    tokenizer = build_tokenizer(args)
+   
     config = get_retro_config()
 
     # Items and their type.
@@ -185,10 +181,7 @@ def train_valid_test_datasets_provider(train_valid_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
 
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
 
     # Dataset config.
     retro_config = get_retro_config()
@@ -234,7 +227,7 @@ def train_valid_test_datasets_provider(train_valid_test_num_samples):
             config=retro_config,
             gpt_datasets=gpt_datasets,
             sample_length=args.seq_length,
-            eod_token_id=get_tokenizer().eod,
+            eod_token_id=None,
         )
 
     # Multi-split GPT datasets.
