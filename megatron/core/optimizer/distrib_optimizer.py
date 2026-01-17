@@ -517,6 +517,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             "due to checkpointing requirements."
         )
 
+        self._state_offloader: Optional[OptimizerStateOffloader] = None
+
         # when freezing sub-models we have no real optimizer
         # but still need a stub DistributedOptimizer class
         if optimizer is None:
@@ -605,7 +607,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
-        self._state_offloader: Optional[OptimizerStateOffloader] = None
         if self.config.offload_optimizer_states:
             self._state_offloader = OptimizerStateOffloader(self)
 
