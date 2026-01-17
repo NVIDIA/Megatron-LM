@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import os
 
 import torch
 
@@ -29,12 +28,9 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     return parser
 
 
-
 @trace_async_exceptions
 async def run_text_generation_server(
-    engine: DynamicInferenceEngine,
-    coordinator_port: int,
-    flask_port: int,
+    engine: DynamicInferenceEngine, coordinator_port: int, flask_port: int
 ):
     """Runs the Flask server from rank 0 and initializes the DynamicInferenceEngine on all ranks.
 
@@ -69,6 +65,7 @@ async def run_text_generation_server(
         tasks_to_run.append(server_task)
 
     await asyncio.gather(*tasks_to_run)
+
 
 if __name__ == "__main__":
     with torch.inference_mode():
@@ -106,12 +103,7 @@ if __name__ == "__main__":
             context,
             enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
+            enable_chunked_prefill=not args.disable_chunked_prefill,
         )
 
-        asyncio.run(
-            run_text_generation_server(
-                engine,
-                args.inference_coordinator_port,
-                args.port,
-            )
-        )
+        asyncio.run(run_text_generation_server(engine, args.inference_coordinator_port, args.port))

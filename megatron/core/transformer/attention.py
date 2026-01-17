@@ -589,6 +589,7 @@ class Attention(MegatronModule, ABC):
         cu_seqlens_k,
         seqlens_k,
         block_table,
+        is_decode_only,
     ) -> Tensor:
         """Flash attention kernel for mixed decode and prefill samples.
 
@@ -602,6 +603,7 @@ class Attention(MegatronModule, ABC):
             cu_seqlens_k (Tensor): Cumulative key sequence lengths.
             seqlens_k (Tensor): key sequence lengths.
             block_table (Tensor): KV cache block ids for all samples.
+            is_decode_only (bool): True if batch is decode only.
         Return:
             (Tensor) Attention output.
         """
@@ -610,7 +612,7 @@ class Attention(MegatronModule, ABC):
         assert block_table is not None
 
         # Flash attn kernel.
-        if max_seqlen_q > 1:
+        if not is_decode_only:
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
@@ -1020,6 +1022,7 @@ class Attention(MegatronModule, ABC):
                     cu_kv_lengths,
                     kv_lengths,
                     block_table,
+                    inference_context.is_decode_only(),
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
