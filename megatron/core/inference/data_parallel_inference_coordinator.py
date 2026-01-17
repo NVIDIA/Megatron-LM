@@ -65,7 +65,7 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
-    def __init__(self, inference_coordinator_port: int, data_parallel_size: int):
+    def __init__(self, inference_coordinator_port: int, data_parallel_size: int, tokenizer):
         """
         Initializes the inference coordinator.
 
@@ -116,6 +116,7 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_request_id = {}
 
         self.next_request_id = 0
+        self.tokenizer = tokenizer
 
     def get_next_data_parallel_rank(self):
         """
@@ -261,6 +262,7 @@ class DataParallelInferenceCoordinator:
                 finished_request_records = deserialized_payload[1]
 
                 for finished_request_record in finished_request_records:
+                    self.detokenize(finished_request_record)
                     fid = finished_request_record["requests"][0]["request_id"]
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
@@ -280,9 +282,25 @@ class DataParallelInferenceCoordinator:
             else:
                 raise UnknownHeaderError(header)
 
+    def detokenize(self, finished_request_record):
+        """
+        Detokenizes the generated tokens in the finished request record.
+
+        This method uses the coordinator's tokenizer to convert the list of
+        generated token IDs back into human-readable text.
+
+        Args:
+            finished_request_record (dict): The record containing the generated
+                tokens to be detokenized. It is modified in place.
+        """
+        for request in finished_request_record["requests"]:
+            if request["prompt"] is None:
+                request["prompt"] = self.tokenizer.detokenize(request["prompt_tokens"][1])
+            request["generated_text"] = self.tokenizer.detokenize(request["generated_tokens"])
+
     @classmethod
     def entrypoint(
-        cls, ready_event: Event, inference_coordinator_port: int, data_parallel_size: int
+        cls, ready_event: Event, inference_coordinator_port: int, data_parallel_size: int, tokenizer
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -296,7 +314,7 @@ class DataParallelInferenceCoordinator:
             inference_coordinator_port (int): The port to bind to.
             data_parallel_size (int): The number of expected TP-coordinators.
         """
-        coordinator = cls(inference_coordinator_port, data_parallel_size)
+        coordinator = cls(inference_coordinator_port, data_parallel_size, tokenizer)
         ready_event.set()
         try:
             coordinator.start()
