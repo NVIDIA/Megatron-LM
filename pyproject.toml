@@ -90,6 +90,11 @@ dev = [
     "emerging_optimizers",
 ]
 
+# Optional MoE dependencies that may require building from source with CUTLASS headers
+moe = [
+    "nv-grouped-gemm~=1.1",
+]
+
 lts = [
     "tqdm",
     "einops~=0.8",
@@ -99,7 +104,6 @@ lts = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -245,7 +249,7 @@ select = ["S506"]
 
 # - On top of the Google convention, disable `D417`, which requires
 #   documentation for every function parameter.
-# - F841: local variable assigned but never used (exluced to favor readability)
+# - F841: local variable assigned but never used (exluded to favor readability)
 # TODO: Remove D10 once we are about to release to get all the docstrings written
 ignore = ["D417", "D10", "F841"]
 
