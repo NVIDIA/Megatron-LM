@@ -1145,13 +1145,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
             and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
         ):
-            if kwargs['inference_context'].is_static_batching():
-                using_cuda_graph = kwargs['inference_context'].is_decode_only()
-            else:
-                # it can happen that non-decode steps have a token count greater than the max
-                # supported cuda graph token count. In that case this flag will be set to
-                # False by initialize_attention, and we should not use cuda graphs.
-                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+            # it can happen that non-decode steps have a token count greater than the max
+            # supported cuda graph token count. In that case this flag will be set to
+            # False by initialize_attention, and we should not use cuda graphs.
+            using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
             if using_cuda_graph:
                 return True
         return False
