@@ -64,7 +64,7 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     output_tensors = []
     # get callables
     callables, dw = build_layer_callables(model)
-    attn, post_attn, dispatch, moe, combine, post_process = callables
+    attn, dispatch, moe, combine, post_process = callables
     assert post_process is None
     dummy_model = DummyState()
     dummy_model.decoder = DummyState()
@@ -76,24 +76,16 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
         node.chunk_state.model = dummy_model
 
         # attn fwd
-        hidden_states = attn(node, input_tensors[i])
-
-        # post attn fwd
-        local_tokens, probs = post_attn(node, hidden_states)
+        local_tokens, probs = attn(node, input_tensors[i])
 
         # dispatch fwd
         dispatched_tokens = dispatch(node, local_tokens, probs)
 
         # moe fwd
-        expert_outputs = moe(node, dispatched_tokens)
-        if model.mlp.use_shared_expert:
-            expert_output, shared_expert_output = expert_outputs
-        else:
-            expert_output = expert_outputs
-            shared_expert_output = None
+        expert_output = moe(node, dispatched_tokens)
 
         # combine fwd
-        hidden_states = combine(node, expert_output, shared_expert_output)
+        hidden_states = combine(node, expert_output)
 
         # loss
         output_tensors.append(hidden_states)
