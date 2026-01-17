@@ -227,6 +227,43 @@ class DynamicInferenceEngine(AbstractEngine):
         # Create cuda graphs.
         self.create_cuda_graphs()
 
+    @classmethod
+    def from_model_and_args(
+        cls,
+        model,
+        args,
+        controller: Optional[TextGenerationController] = None,
+        context: Optional[DynamicInferenceContext] = None,
+    ):
+        """
+        Initializes a `DynamicInferenceEngine` from the model and args.
+
+        Args:
+            model: The Megatron model instance.
+            args: The arguments object.
+            controller (Optional[TextGenerationController]): An optional existing
+                controller. If None, one is created from the model and args.
+            context (Optional[DynamicInferenceContext]): An optional existing
+                context. If None, one is created from the model and args.
+
+        Returns:
+            DynamicInferenceEngine: The initialized inference engine.
+        """
+        if context is None:
+            context = DynamicInferenceContext.from_model_and_args(model, args)
+        if controller is None:
+            controller = TextGenerationController.from_model_and_args(model, args, context)
+
+        return cls(
+            controller,
+            context,
+            enable_cuda_graph=args.cuda_graph_impl == "local",
+            random_seed=args.seed,
+            track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+            enable_chunked_prefill=not args.disable_chunked_prefill,
+            inference_logging_step_interval=args.inference_logging_step_interval,
+        )
+
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
 
@@ -282,8 +319,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context = self.context
         controller = self.controller
-
-        config = controller.inference_wrapped_model.inference_wrapper_config
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()

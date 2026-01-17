@@ -24,9 +24,6 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -100,26 +97,13 @@ class TestTextGenerationController:
         if dtype == torch.bfloat16:
             gpt_model = Float16Module(gpt_model.config, gpt_model)
 
-        inference_wrapper_config = InferenceWrapperConfig(
-            hidden_size=self.hidden_size,
-            inference_batch_times_seqlen_threshold=-1,
-            inference_max_seq_length=2048,
-            inference_max_requests=16 if fp8 else self.batch_size,
-            fp32_residual_connection=False,
-            params_dtype=dtype,
-            padded_vocab_size=self.vocab_size,
-        )
-
         if static:
-            inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+            inference_context = StaticInferenceContext(
+                max_batch_size=16 if fp8 else self.batch_size, max_sequence_length=2048
+            )
         else:
             inference_context = DynamicInferenceContext(
-                params_dtype=dtype,
-                num_layers=transformer_config.num_layers // pipeline_model_parallel_size,
-                kv_channels=transformer_config.kv_channels,
-                num_attention_heads=transformer_config.num_attention_heads,
-                tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
-                pipeline_model_parallel_size=transformer_config.pipeline_model_parallel_size,
+                model_config=transformer_config,
                 max_sequence_length=2048,
                 buffer_size_gb=0.2,
                 materialize_only_last_token_logits=False,
@@ -128,9 +112,7 @@ class TestTextGenerationController:
                 unified_memory_level=0,  # unit tests currently broken with UVM
             )
 
-        inference_wrapped_model = GPTInferenceWrapper(
-            gpt_model, inference_wrapper_config, inference_context
-        )
+        inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_context)
 
         inference_wrapped_model.model_is_pipeline_parallel = not (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()

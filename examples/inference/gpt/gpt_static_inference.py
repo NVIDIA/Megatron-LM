@@ -1,9 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import os
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
 from model_provider import model_provider
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
@@ -22,9 +19,6 @@ from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
-)
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -48,6 +42,7 @@ from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
+
 
 def add_static_inference_args(parser):
     """Static inference arguments."""
@@ -83,30 +78,16 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
         tokenizer = get_tokenizer()
     else:
         tokenizer = build_tokenizer(args)
-    inference_wrapper_config = InferenceWrapperConfig(
-        hidden_size=args.hidden_size,
-        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
-        fp32_residual_connection=args.fp32_residual_connection,
-        params_dtype=args.params_dtype,
-        padded_vocab_size=args.padded_vocab_size,
-        inference_max_requests=args.inference_max_batch_size,
-        inference_max_seq_length=args.inference_max_seq_length,
-        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
-        fp8=args.fp8,
-        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
+    inference_context = StaticInferenceContext(
+        args.inference_max_requests, args.inference_max_seq_length
     )
-
-    inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
-
-    inference_wrapped_model = GPTInferenceWrapper(
-        model, inference_wrapper_config, inference_context
-    )
+    inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
     engine_kwargs = {
-        "text_generation_controller" : text_generation_controller,
-        "legacy" : args.use_legacy_static_engine,
+        "text_generation_controller": text_generation_controller,
+        "legacy": args.use_legacy_static_engine,
     }
     if not args.use_legacy_static_engine:
         engine_kwargs["buffer_size_gb"] = args.inference_dynamic_batching_buffer_size_gb
@@ -164,12 +145,6 @@ def main():
     )
 
     args = get_args()
-
-    if args.max_batch_size is not None:
-        warnings.warn(
-            f"`--max-batch-size` has been deprecated in favor of `--inference-max-requests`."
-        )
-        args.inference_max_batch_size = max(args.max_batch_size, args.inference_max_batch_size)
 
     # Set up model and load checkpoint
     if args.model_provider == "gpt":
@@ -246,14 +221,15 @@ def main():
         from collections import defaultdict
 
         unique_prompt_map = defaultdict(list)
-        for result_idx, result in enumerate(results):
+        for result_idx, record in enumerate(results):
+            result = record.requests[0]
             unique_prompt_map[result.prompt].append(result_idx)
 
         # Print unique prompts + outputs.
         for unique_idx, (prompt_text, result_idxs) in enumerate(unique_prompt_map.items()):
             result_idx = result_idxs[0]
-            result = results[result_idx]
-            generated_text = result.generated_text.replace("\n", "\\n")
+            record = results[result_idx]
+            generated_text = record.requests[0].generated_text.replace("\n", "\\n")
             print(
                 f"{unique_idx}/{len(unique_prompt_map)} [{len(result_idxs)}]. {prompt_text} "
                 f"... {generated_text}"
@@ -276,7 +252,7 @@ def main():
                 )
             ),
             len(requests),
-            args.inference_max_batch_size,
+            args.inference_max_requests,
             stats["allocated_bytes.all.peak"] / (1024**3),
             stats["reserved_bytes.all.peak"] / (1024**3),
             latency,
@@ -291,7 +267,6 @@ def main():
         os._exit(0)
     else:
         torch.distributed.destroy_process_group()
-
 
 
 if __name__ == "__main__":

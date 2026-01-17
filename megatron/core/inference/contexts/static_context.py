@@ -1,9 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
-
 from .base_context import BaseInferenceContext
 
 
@@ -26,13 +22,6 @@ class StaticInferenceContext(BaseInferenceContext):
         self.batch_size_offset = 0
         self.key_value_memory_dict = {}
         self.decode_mode = False
-
-    @classmethod
-    def from_config(cls, config: InferenceWrapperConfig) -> "StaticInferenceContext":
-        """Initialize context from a config."""
-        max_batch_size = config.inference_max_requests
-        max_sequence_length = config.inference_max_seq_length
-        return cls(max_batch_size, max_sequence_length)
 
     def swap_key_value_dict(self, batch_idx):
         "swap between batches"
