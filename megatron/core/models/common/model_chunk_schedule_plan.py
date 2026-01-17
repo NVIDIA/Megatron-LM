@@ -281,6 +281,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         extra_block_kwargs=None,
         runtime_gather_output: Optional[bool] = None,
         loss_mask: Optional[Tensor] = None,
+        padding_mask=None,
     ):
         """Initialize the schedule plan of all Transformer layers' sub-modules.
 
@@ -323,6 +324,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.mtp_hidden_states = None
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
+        self._model_chunk_state.padding_mask = padding_mask
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
         self._model_chunk_state.runtime_gather_output = runtime_gather_output
         self._model_chunk_state.model = model
