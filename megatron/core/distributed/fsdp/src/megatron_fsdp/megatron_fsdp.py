@@ -136,6 +136,8 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_double_buffer (bool): Whether to use persistently allocated double buffers
             for the temporary memory needed in the FSDP communication. This flag is
             automatically set to True when nccl_ub is True.
+        fsdp_db_fallback_dynamic_alloc (bool): Whether to fall back to dynamic memory allocator 
+            when a bucket does not fit FSDP double buffer size.
         disable_symmetric_registration (bool): Whether to disable symmetric (window) registration
             for NCCL userbuffer registration. This option will force to use conventional (local)
             userbuffer registration when nccl_ub is set.
@@ -152,6 +154,7 @@ class MegatronFSDP(torch.nn.Module):
         ...     keep_fp8_transpose_cache=False,
         ...     nccl_ub=False,
         ...     fsdp_double_buffer=False,
+        ...     fsdp_db_fallback_dynamic_alloc=True,
         ...     disable_symmetric_registration=False,
         ... )
     """
@@ -170,6 +173,7 @@ class MegatronFSDP(torch.nn.Module):
         keep_fp8_transpose_cache: bool = False,
         nccl_ub: bool = False,
         fsdp_double_buffer: bool = False,
+        fsdp_db_fallback_dynamic_alloc: bool = True,
         disable_symmetric_registration: bool = False,
         enable_fine_grained_param_gather_hook: bool = False,
     ):
@@ -214,6 +218,7 @@ class MegatronFSDP(torch.nn.Module):
                 keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
                 nccl_ub=nccl_ub,
                 fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+                fsdp_db_fallback_dynamic_alloc=fsdp_db_fallback_dynamic_alloc,
                 disable_symmetric_registration=disable_symmetric_registration,
             )
         else:
