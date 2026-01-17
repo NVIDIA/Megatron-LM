@@ -191,7 +191,7 @@ This container comes with all dependencies pre-installed with compatible version
 
 ```bash
 # Run container with mounted directories
-docker run --runtime --nvidia --gpus all -it --rm \
+docker run --runtime=nvidia --gpus all -it --rm \
   -v /path/to/megatron:/workspace/megatron \
   -v /path/to/dataset:/workspace/dataset \
   -v /path/to/checkpoints:/workspace/checkpoints \
@@ -296,7 +296,7 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 
 ```bash
 # 8 GPUs, FP8 precision, mock data
-./examples/llama/train_llama3_8b_fp8.sh
+./examples/llama/train_llama3_8b_h100_fp8.sh
 ```
 
 ## Data Preparation
