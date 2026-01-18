@@ -732,9 +732,10 @@ class Attention(MegatronModule, ABC):
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
+        cross_layer_kv: Optional[Tuple[Tensor, Tensor]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Optional[Tuple[Tensor, Tensor]]]:
         """
         Perform a forward pass through the attention module.
 
@@ -839,6 +840,13 @@ class Attention(MegatronModule, ABC):
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
+        # --- Cross-Layer Attention (CLA) ---
+        # kv_for_sharing will be returned so the next layer can reuse it.
+        # If cross_layer_kv is provided, this layer is a "Slave" layer and will
+        # use the shared KV instead of its own.
+        kv_for_sharing: Optional[Tuple[Tensor, Tensor]] = None
+        # --- End CLA ---
+
         if split_qkv:
             if self.config.attention_output_gate:
                 query, key, value, gate = qkv_output
@@ -973,6 +981,15 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
+        # --- Cross-Layer Attention (CLA): substitute shared KV if provided ---
+        # If cross_layer_kv is provided, this layer is a "Slave" layer.
+        # We discard the locally computed K/V and use the shared ones.
+        # Note: RoPE has already been applied to the shared K in the Master layer,
+        # so we should NOT apply RoPE again.
+        if cross_layer_kv is not None:
+            key, value = cross_layer_kv
+        # --- End CLA ---
+
         # ==================================
         # core attention computation
         # ==================================
@@ -1058,7 +1075,32 @@ class Attention(MegatronModule, ABC):
             )
         nvtx_range_pop(suffix="linear_proj")
 
-        return output, bias
+        # --- Cross-Layer Attention (CLA): determine kv_for_sharing ---
+        # For CLA, we need to return the computed (key, value) after RoPE is applied.
+        # The key and value tensors are captured in the scope after the RoPE block.
+        # However, the decision of whether this layer computes fresh KV or reuses
+        # shared KV is handled in transformer_block.py.
+        # Here, we simply provide the local key/value (which may or may not have been used).
+        # The caller (transformer_block) decides if it was a Master or Slave layer.
+        #
+        # Note: We capture key and value here AFTER RoPE and inference adjustment,
+        # because that's the state the next layer would need.
+        #
+        # We should only populate kv_for_sharing if this is a self-attention layer.
+        if self.attention_type == "self" and self.config.cross_layer_attention_interval > 1:
+            # Check if cross_layer_kv was provided (Slave layer)
+            if cross_layer_kv is not None:
+                # This layer used shared KV, so it doesn't produce new KV for sharing.
+                kv_for_sharing = None
+            else:
+                # This layer computed its own KV (Master layer).
+                # Capture the key and value after RoPE has been applied.
+                # 'key' and 'value' should be in scope from the main forward body.
+                # However, the 'key' and 'value' variables point to the post-RoPE tensors.
+                kv_for_sharing = (key, value)
+        # --- End CLA ---
+
+        return output, bias, kv_for_sharing
 
     @jit_fuser
     def _apply_output_gate(self, x, gate):

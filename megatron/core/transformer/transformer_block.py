@@ -460,6 +460,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             def custom_forward(
                 hidden_states, attention_mask, context, context_mask, rotary_pos_emb
             ):
+                # --- Cross-Layer Attention (CLA) ---
+                current_cla_kv = None
+                cla_interval = self.config.cross_layer_attention_interval
+                # --- End CLA ---
+
                 for index in range(start, end):
                     layer = self._get_layer(index)
 
@@ -479,8 +484,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
+                    # --- Cross-Layer Attention (CLA) ---
+                    is_cla_master_layer = (
+                        cla_interval <= 1 or (layer.layer_number - 1) % cla_interval == 0
+                    )
+                    cross_layer_kv_for_layer = None if is_cla_master_layer else current_cla_kv
+                    # --- End CLA ---
+
                     with inner_quantization_context:
-                        hidden_states, context = layer(
+                        hidden_states, context, kv_for_sharing = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             context=context,
@@ -489,7 +501,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             attention_bias=attention_bias,
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
+                            cross_layer_kv=cross_layer_kv_for_layer,
                         )
+
+                    # --- Cross-Layer Attention (CLA) ---
+                    if is_cla_master_layer and kv_for_sharing is not None:
+                        current_cla_kv = kv_for_sharing
+                    # --- End CLA ---
                 return hidden_states, context
 
             return custom_forward
@@ -557,6 +575,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             raise ValueError("Invalid activation recompute method.")
 
         return hidden_states
+
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -734,6 +753,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     use_inner_quantization_context=use_inner_quantization_context,
                 )
             else:
+                # --- Cross-Layer Attention (CLA) ---
+                # Track the shared KV from the most recent Master layer.
+                current_cla_kv = None
+                cla_interval = self.config.cross_layer_attention_interval
+                # --- End CLA ---
+
                 for l_no, layer in enumerate(self.layers):
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
@@ -750,8 +775,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
+                    # --- Cross-Layer Attention (CLA) ---
+                    # Determine if this layer is a Master (computes fresh KV) or Slave (reuses KV).
+                    # Layer numbers are 1-indexed. Master layers: (layer_number - 1) % interval == 0.
+                    # For interval=2: Master for layers 1, 3, 5, ... Slave for 2, 4, 6, ...
+                    is_cla_master_layer = (
+                        cla_interval <= 1 or (layer.layer_number - 1) % cla_interval == 0
+                    )
+                    cross_layer_kv_for_layer = None if is_cla_master_layer else current_cla_kv
+                    # --- End CLA ---
+
                     with self.offload_context, inner_quantization_context:
-                        hidden_states, context = layer(
+                        hidden_states, context, kv_for_sharing = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             context=context,
@@ -764,7 +799,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
+                            cross_layer_kv=cross_layer_kv_for_layer,
                         )
+
+                    # --- Cross-Layer Attention (CLA) ---
+                    # If this was a Master layer, update the shared KV for subsequent Slave layers.
+                    if is_cla_master_layer and kv_for_sharing is not None:
+                        current_cla_kv = kv_for_sharing
+                    # --- End CLA ---
 
                     if (
                         torch.is_grad_enabled()
@@ -772,6 +814,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         and self.group_prefetch_offload_commit_async is not None
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
 
         # Final layer norm.
         if self.final_layernorm is not None:

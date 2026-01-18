@@ -81,7 +81,7 @@ class TestParallelAttention:
 
         attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
 
-        output, bias = self.parallel_attention(hidden_states, attention_mask)
+        output, bias, _ = self.parallel_attention(hidden_states, attention_mask)
 
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
@@ -119,7 +119,7 @@ class TestParallelAttention:
         rotary_pos_emb = torch.ones(
             sequence_length, 1, 1, self.parallel_attention.config.kv_channels
         ).cuda()
-        output, bias = self.parallel_attention(
+        output, bias, _ = self.parallel_attention(
             hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
         )
 
@@ -155,7 +155,7 @@ class TestParallelAttention:
 
         attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
 
-        output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
+        output, bias, _ = checkpointed_parallel_attention(hidden_states, attention_mask)
 
         assert config.recompute_granularity == 'selective'
         assert "core_attn" in config.recompute_modules
@@ -393,7 +393,7 @@ class TestSelfAttention:
         )
         hidden_states_ref = copy.deepcopy(hidden_states)
 
-        output, bias = self.self_attention(hidden_states, None)
+        output, bias, _ = self.self_attention(hidden_states, None)
         assert config.recompute_granularity is None
         # Check if output and bias have the correct shape
         assert output.shape[0] == sequence_length

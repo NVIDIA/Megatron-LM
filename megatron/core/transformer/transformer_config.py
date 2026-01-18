@@ -221,12 +221,20 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    cross_layer_attention_interval: int = 1
+    """Interval for Cross-Layer Attention (CLA) KV sharing.
+    1: Standard attention (no sharing, every layer computes its own KV).
+    2: CLA2 - Share KV every 2 layers (Layer i generates KV, Layer i+1 reuses it).
+    N: Share KV every N layers. Layers where (layer_number - 1) % N == 0 compute fresh KV.
+    See arXiv:2405.12981 for details."""
+
     no_rope_freq: Optional[Union[int, List[int]]] = None
     """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
     An integer N: Creates a pattern where RoPE is skipped every N-1 layers. For example,
     no_rope=4 means RoPE is applied for 3 layers, then skipped for 1 layer, repeating this pattern.
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
+
 
     ####################
     # attention variant

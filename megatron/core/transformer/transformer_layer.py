@@ -487,9 +487,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
-        hidden_states, context = self._forward_attention(*args, **kwargs)
+        hidden_states, context, kv_for_sharing = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
-        return output, context
+        return output, context, kv_for_sharing
 
     def _forward_attention(
         self,
@@ -505,6 +505,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: Optional[Any] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        cross_layer_kv: Optional[tuple] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -566,7 +567,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
+        attention_output = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -577,7 +578,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            cross_layer_kv=cross_layer_kv,
         )
+        # Unpack attention output: (output, bias, kv_for_sharing)
+        attention_output_with_bias = (attention_output[0], attention_output[1])
+        kv_for_sharing = attention_output[2]
         nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:
@@ -633,7 +638,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias, residual, self.hidden_dropout
             )
 
-        return hidden_states, context
+        return hidden_states, context, kv_for_sharing
 
     def _forward_mlp(self, hidden_states, inference_context=None):
         """
