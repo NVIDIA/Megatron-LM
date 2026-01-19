@@ -61,6 +61,7 @@ class MockTokenizer:
         self.eod = 43
         self.vocab_size = VOCAB
         self.bos = None
+        self.library = None
 
     def detokenize(self, tokens):
         return [str(tok) for tok in tokens]
