@@ -1271,6 +1271,11 @@ def validate_args(args, defaults={}):
             "must be used in conjunction with `--fp8-recipe delayed`."
         )
 
+    if args.offload_optimizer_states:
+        assert args.use_distributed_optimizer, "offload_optimizer_states is only supported with distributed optimizer"
+        assert args.optimizer == 'adam', "offload_optimizer_states is only supported with adam optimizer"
+        assert not args.use_megatron_fsdp, "offload_optimizer_states does not support Megatron-FSDP for now."
+
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
     if args.replication:
@@ -2386,6 +2391,14 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
+    group.add_argument('--offload-optimizer-states',
+                       action='store_true',
+                       dest='offload_optimizer_states',
+                       help='Offload optimizer states to CPU after each optimizer step and '
+                       'reload them before the next optimizer step. '
+                       'Only support TE FusedAdam optimizer.'
+                       'Note that this still uses pure GPU optimizer instead of '
+                       'HybridDeviceOptimizer for --optimizer-cpu-offload.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
@@ -3332,6 +3345,12 @@ def _add_moe_args(parser):
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-router-force-load-balancing', action='store_true',
                        help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
+    group.add_argument('--moe-router-force-biased', type=float, default=None,
+                       help='[Experimental] Apply random expert bias in normal distribution with specified std to router logits. '
+                       'Shared seed across all ranks ensures identical bias. '
+                       'If positive, generates new random bias each forward pass. '
+                       'If negative, generates bias once per layer and reuses it (abs value is std). '
+                       'This experimental feature is for benchmarking purposes only!')
     group.add_argument('--moe-router-padding-for-quantization', action='store_true',
                        help='Pad the routing_map to make sure the number of tokens each expert received '
                        'is a multiple of 16/32 for FP8/FP4 precision. It is suggested to enable this for '
