@@ -8,7 +8,7 @@ ENV_VARS:
   NVTE_CPU_OFFLOAD_V1: 1
   NVTE_FUSED_ATTN: 0
   NCCL_ALGO: ^NVLS
-  CUBLAS_WORKSPACE_CONFIG: ':4096:8'
+  CUBLAS_WORKSPACE_CONFIG: ":4096:8"
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
@@ -129,7 +129,6 @@ MODEL_ARGS:
   --exit-interval: 50
 TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular
 METRICS:
-  - "iteration-time"
   - "lm loss"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
