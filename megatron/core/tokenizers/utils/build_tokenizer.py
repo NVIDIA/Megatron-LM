@@ -102,8 +102,8 @@ def vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
     after = int(math.ceil(after / multiple) * multiple)
     if args.rank == 0 and logging_enabled:
         logger.info(
-            ' > padded vocab (size: {}) with {} dummy tokens '
-            '(new size: {})'.format(orig_vocab_size, after - orig_vocab_size, after),
-            flush=True,
+            f' > padded vocab (size: {orig_vocab_size}) with '
+            f'{after - orig_vocab_size} dummy tokens '
+            f'(new size: {after})'
         )
     return after
