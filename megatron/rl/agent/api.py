@@ -64,12 +64,11 @@ class TokenRollout(AgentBaseModel):
     problem_id: str | None = None
 
 
-#TODO remove?support multiturn?
 class ContrastiveRollout(AgentBaseModel):
     """Contrastive/Preference data for language-based Rollout."""
 
-    chosen_trajectory: str
-    rejected_trajectory: str
+    chosen_trajectory: [str]
+    rejected_trajectory: [str]
 
 
 class Head2HeadRolloutRequest(Request):
