@@ -153,6 +153,39 @@ class TestLayerWiseOptimizer:
             )
             assert total_params > 0, "No parameters found in optimizer"
 
+    @pytest.mark.parametrize('tp', [1, 2, 4])
+    @pytest.mark.parametrize('pp', [1, 2, 4])
+    def test_allgather_params(self, tp, pp):
+        """Test that parameter broadcasting works correctly across DP ranks."""
+        if tp * pp > 8:
+            pytest.skip(f"TP*PP > 8 is larger than world size")
+
+        Utils.initialize_model_parallel(tp, pp)
+
+        model, optimizer = setup_model_and_optimizer(
+            seed=2,
+            tp=tp,
+            pp=pp,
+            bf16=True,
+            dist_opt=False,
+            initialize_fn=initialize_gpt_model,
+            optimizer='dist_muon',
+        )
+
+        # If this is a LayerWiseDistributedOptimizer, test broadcast
+        if isinstance(optimizer, LayerWiseDistributedOptimizer):
+            # Store original param values
+            original_params = {}
+            for name, param in model[0].named_parameters():
+                original_params[name] = param.data.clone()
+
+            # Call broadcast (should be idempotent if no updates)
+            optimizer.allgather_params()
+
+            # Check params are unchanged after broadcast without step
+            for name, param in model[0].named_parameters():
+                assert torch.allclose(param.data, original_params[name])
+
     # TODO(@boxiangw): add PP=4 back and fix the test
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2])
