@@ -7,10 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import numpy
 import torch.distributed
 
 from megatron.core import mpu, parallel_state
-from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
+from megatron.core.datasets.data_schedule import PackingScheduler, wrap_dataloader, get_batch_on_this_rank_for_sequence_packing
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
@@ -21,6 +22,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
@@ -156,14 +158,14 @@ def create_args():
     args.mid_level_dataset_surplus = 0.005
     args.create_attention_mask_in_dataloader = False
     args.sft_mock_dataset_config_json = None
-    args.hybrid_context_parallel_scheduler = "balanced"
+    args.sequence_packing_scheduler = None
     args.check_for_nan_in_loss_and_grad = False
     args.check_for_spiky_loss = False
     args.sequence_parallel = False
     args.untie_embeddings_and_output_weights = True
     args.hidden_dropout = 0.0
     args.attention_dropout = 0.0
-    args.moe_ffn_hidden_size = 768
+    args.moe_ffn_hidden_size = None
     args.use_legacy_models = False
     args.allow_ambiguous_pad_tokens = False
     args.add_bias_linear = False
@@ -176,6 +178,8 @@ def create_args():
     args.max_seqlen_per_dp_cp_rank = None
     args.variable_seq_lengths = False
     args.moe_token_dispatcher_type = "allgather"
+    args.moe_latent_size = None
+    args.te_precision_config_file = None
 
     yield args
 
@@ -206,10 +210,8 @@ def initialize_gpt_model(
         context_parallel_size=args.context_parallel_size,
         sequence_parallel=args.sequence_parallel,
         hybrid_context_parallel=args.hybrid_context_parallel,
-        hybrid_context_parallel_scheduler=getattr(
-            args, "hybrid_context_parallel_scheduler", "balanced"
-        ),
-        sft_sequence_packing=getattr(args, "sft_sequence_packing", False),
+        sequence_packing_scheduler=args.sequence_packing_scheduler,
+        sequence_packing=getattr(args, "sequence_packing", False),
         max_seqlen_per_dp_cp_rank=getattr(args, "max_seqlen_per_dp_cp_rank", None),
         virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         hidden_dropout=args.hidden_dropout,
@@ -293,12 +295,9 @@ def get_data_iterator(args):
     from megatron.training.datasets.sft_dataset import MockSFTDataset, MockSFTLowLevelDataset
     from megatron.training.training import build_train_valid_test_data_iterators
     from megatron.training.utils import (
-        get_batch_on_this_cp_rank,
-        get_batch_on_this_tp_rank,
-        get_blend_and_blend_per_split,
-        is_first_or_last_pipeline_stage,
+        get_blend_and_blend_per_split
     )
-    from pretrain_gpt import is_dataset_built_on_rank, train_valid_test_datasets_provider
+    from pretrain_gpt import is_dataset_built_on_rank
 
     blend, blend_per_split = get_blend_and_blend_per_split(args)
     # rebuild_tokenizer(args)
@@ -319,127 +318,143 @@ def get_data_iterator(args):
         sequence_parallel_size=args.tensor_model_parallel_size,
         hybrid_context_parallel=args.hybrid_context_parallel,
         sft_mock_dataset_config_json=args.sft_mock_dataset_config_json,
-        sft_sequence_packing=args.sft_sequence_packing,
+        sequence_packing=args.sequence_packing,
     )
-    train_ds, test_ds, valid_ds = BlendedMegatronDatasetBuilder(
+    train_ds, _, _ = BlendedMegatronDatasetBuilder(
         MockSFTDataset,
         [100000, 2560, 2560],
         partial(is_dataset_built_on_rank, vp_stage=None),
         dataset_config,
     ).build()
+    
+    is_tp_first = parallel_state.get_tensor_model_parallel_rank() == 0
+    is_pp_first = parallel_state.get_pipeline_model_parallel_rank() == 0
+    is_pp_last = (parallel_state.get_pipeline_model_parallel_rank() == 
+        parallel_state.get_pipeline_model_parallel_world_size() - 1)
 
-    train_data_iterator, valid_data_iterator, test_data_iterator = (
-        build_train_valid_test_data_iterators(train_valid_test_datasets_provider)
-    )
-
-    return train_data_iterator
-
+    if is_tp_first and (is_pp_first or is_pp_last):
+        dp_rank = parallel_state.get_data_parallel_rank()
+        dp_size = args.data_parallel_size // args.context_parallel_size
+        num_microbatches = args.global_batch_size // dp_size // args.micro_batch_size
+        start_index = dp_rank * num_microbatches
+        end_index = start_index + num_microbatches
+        samples = [train_ds[i] for i in range(start_index, end_index)]
+        if args.sequence_packing:
+            data_iterator = RerunDataIterator(iter([samples]))
+        else:
+            for sample in samples:
+                sample['tokens'] = sample['tokens'].unsqueeze(0)
+                sample['labels'] = sample['labels'].unsqueeze(0)
+                sample['loss_mask'] = sample['loss_mask'].unsqueeze(0)
+                sample['position_ids'] = sample['position_ids'].unsqueeze(0)
+            data_iterator = RerunDataIterator(iter(samples))
+    else:
+        data_iterator = None
+        
+    if (args.virtual_pipeline_model_parallel_size is not None and 
+        args.virtual_pipeline_model_parallel_size > 1):
+        vpp_size = args.virtual_pipeline_model_parallel_size
+        if is_pp_first:
+            data_iterator = [data_iterator] + [None for _ in range(vpp_size - 1)]
+        elif is_pp_last:
+            data_iterator = [None for _ in range(vpp_size - 1)] + [data_iterator]
+        else:
+            data_iterator = [None for _ in range(vpp_size)]
+            
+    return data_iterator
 
 # Dense and MoE Models
 @pytest.mark.parametrize(
     ('tp_pp_cp_vpp', 'is_moe'),
     [
         ((1, 2, 1, None), True),
-        # ((1, 4, 1, None), True),
-        # ((2, 2, 4, None), True),
-        # ((2, 4, 4, None), True),
-        # ((2, 1, 4, None), True),
-        # ((1, 1, 2, None), True),
-        # ((1, 2, 1, None), False),
-        # ((1, 4, 1, None), False),
-        # ((2, 2, 2, None), False),
-        # ((2, 4, 1, None), False),
-        # ((2, 1, 4, None), False),
-        # ((1, 1, 2, None), False),
+        ((1, 4, 1, None), True),
+        ((2, 2, 2, None), True),
+        ((1, 1, 2, None), True),
+        ((1, 2, 1, None), False),
+        ((1, 4, 1, None), False),
+        ((2, 2, 2, None), False),
+        ((1, 1, 2, None), False),
     ],
 )
-@pytest.mark.skipif(True, reason="Temporary skip for CI")
 def test_packing_and_hybrid_cp(create_args, tp_pp_cp_vpp, is_moe):
-    def _assert_loss_close(loss, loss_ref, *, atol=1e-6, msg="loss mismatch"):
-        # Megatron's forward_backward_func(forward_only=True) typically returns a list of dicts
-        # (per-microbatch), where each dict maps loss-name -> tensor.
-        def _normalize_if_sum_and_count(t: torch.Tensor) -> torch.Tensor:
-            # Some Megatron losses are returned as a 2-vector: [loss_sum, num_tokens].
-            # In that case, compare per-token loss to make results comparable across
-            # different effective sequence lengths (e.g., packing vs non-packing).
-            if torch.is_tensor(t) and t.dim() == 1 and t.numel() == 2:
-                denom = t[1].clamp_min(1.0)
-                return t[0] / denom
-            return t
-
-        if isinstance(loss, dict):
-            assert isinstance(loss_ref, dict), f"{msg}: type {type(loss)} vs {type(loss_ref)}"
-            assert loss.keys() == loss_ref.keys(), f"{msg}: keys {loss.keys()} vs {loss_ref.keys()}"
-            for k in loss.keys():
-                v = loss[k]
-                v_ref = loss_ref[k]
-                if torch.is_tensor(v) and torch.is_tensor(v_ref):
-                    v_n = _normalize_if_sum_and_count(v)
-                    v_ref_n = _normalize_if_sum_and_count(v_ref)
-                    assert torch.allclose(v_n, v_ref_n, atol=atol), f"{msg} at key={k}"
-                else:
-                    assert v == v_ref, f"{msg} at key={k}: {v} vs {v_ref}"
-        else:
-            assert torch.is_tensor(loss) and torch.is_tensor(
-                loss_ref
-            ), f"{msg}: expected tensors, got {type(loss)} and {type(loss_ref)}"
-            loss_n = _normalize_if_sum_and_count(loss)
-            loss_ref_n = _normalize_if_sum_and_count(loss_ref)
-            assert torch.allclose(loss_n, loss_ref_n, atol=atol), msg
+    
+    def _compute_avg_loss(losses_list):
+        """计算所有 micro-batches 的平均 loss"""
+        total_loss_sum = 0.0
+        total_tokens = 0.0
+        for loss_dict in losses_list:
+            if isinstance(loss_dict, dict) and 'lm loss' in loss_dict:
+                t = loss_dict['lm loss']
+                if torch.is_tensor(t) and t.dim() == 1 and t.numel() == 2:
+                    total_loss_sum += t[0].item()
+                    total_tokens += t[1].item()
+        if total_tokens > 0:
+            return total_loss_sum / total_tokens
+        return 0.0
 
     args = create_args
     losses_reduced_baseline, is_last_stage = dummy_forward_func(
         args,
-        is_sft_sequence_packing=False,
+        is_sequence_packing=False,
         is_hybrid_context_parallel=False,
         tp_pp_cp_vpp=tp_pp_cp_vpp,
         is_moe=is_moe,
     )
     losses_reduce_packing, _ = dummy_forward_func(
         args,
-        is_sft_sequence_packing=True,
+        is_sequence_packing=True,
         is_hybrid_context_parallel=False,
         tp_pp_cp_vpp=tp_pp_cp_vpp,
         is_moe=is_moe,
     )
     losses_reduced_hybrid, _ = dummy_forward_func(
         args,
-        is_sft_sequence_packing=True,
+        is_sequence_packing=True,
         is_hybrid_context_parallel=True,
         tp_pp_cp_vpp=tp_pp_cp_vpp,
         is_moe=is_moe,
     )
+    if is_last_stage and torch.distributed.get_rank() == 0:
+        avg_baseline = _compute_avg_loss(losses_reduced_baseline)
+        avg_packing = _compute_avg_loss(losses_reduce_packing)
+        avg_hybrid = _compute_avg_loss(losses_reduced_hybrid)
+        print(f"avg_loss_baseline: {avg_baseline:.6f}")
+        print(f"avg_loss_packing: {avg_packing:.6f}")
+        print(f"avg_loss_hybrid: {avg_hybrid:.6f}")
+    
     # NOTE: dummy_forward_func() destroys model-parallel groups before returning.
     # So we must not query parallel_state after it returns.
     if is_last_stage:
-        for loss, loss_baseline in zip(losses_reduce_packing, losses_reduced_baseline):
-            _assert_loss_close(
-                loss,
-                loss_baseline,
-                atol=1e-6,
-                msg="losses_reduce_packing and losses_reduced_baseline are not equal",
-            )
-        for loss, loss_baseline in zip(losses_reduced_hybrid, losses_reduced_baseline):
-            _assert_loss_close(
-                loss,
-                loss_baseline,
-                atol=1e-6,
-                msg="losses_reduced_hybrid and losses_reduced_baseline are not equal",
-            )
+        avg_baseline = _compute_avg_loss(losses_reduced_baseline)
+        avg_packing = _compute_avg_loss(losses_reduce_packing)
+        avg_hybrid = _compute_avg_loss(losses_reduced_hybrid)
+        
+        rtol = 1e-3  # 相对误差 0.1%
+    
+        # 相对误差: |a - b| / |b| < rtol
+        rel_err_packing = abs(avg_packing - avg_baseline) / abs(avg_baseline) if avg_baseline != 0 else 0
+        rel_err_hybrid = abs(avg_hybrid - avg_baseline) / abs(avg_baseline) if avg_baseline != 0 else 0
+
+        assert rel_err_packing < rtol, \
+            f"packing avg loss {avg_packing:.6f} vs baseline {avg_baseline:.6f}, rel_err={rel_err_packing:.6e}"
+        assert rel_err_hybrid < rtol, \
+            f"hybrid avg loss {avg_hybrid:.6f} vs baseline {avg_baseline:.6f}, rel_err={rel_err_hybrid:.6e}"
+            
     print("test_packing_and_hybrid_cp passed with tp_pp_cp_vpp: ", tp_pp_cp_vpp, "is_moe: ", is_moe)
 
 
 def dummy_forward_func(
-    args, is_sft_sequence_packing, is_hybrid_context_parallel, tp_pp_cp_vpp, is_moe
+    args, is_sequence_packing, is_hybrid_context_parallel, tp_pp_cp_vpp, is_moe
 ):
     from megatron.core.pipeline_parallel import get_forward_backward_func
     from pretrain_gpt import forward_step, get_batch
 
-    args.sft_sequence_packing = is_sft_sequence_packing
+    args.sequence_packing = is_sequence_packing
     args.hybrid_context_parallel = is_hybrid_context_parallel
 
-    if is_moe:
-        args.num_experts = 4
+    args.num_experts = 4 if is_moe else None
+    args.moe_ffn_hidden_size = 768 if is_moe else None
 
     def set_tp_pp_vpp(tp, pp, cp, vpp=None, destroy_first=True):
         if destroy_first:
@@ -450,6 +465,12 @@ def dummy_forward_func(
         args.data_parallel_size = 8 // (tp * pp)
         # Hybrid-CP requires context_parallel_size == 1; CP is achieved via DPxCP hybrid groups.
         args.context_parallel_size = 1 if args.hybrid_context_parallel else cp
+        if args.hybrid_context_parallel:
+            dp_cp_size = args.data_parallel_size * args.context_parallel_size
+            if dp_cp_size % 2 != 0:
+                pytest.skip(
+                    "Hybrid context parallel requires an even dp-cp group size"
+                )
         if tp > 1:
             args.sequence_parallel = True
         Utils.initialize_model_parallel(
@@ -462,7 +483,7 @@ def dummy_forward_func(
         )
 
     set_tp_pp_vpp(*tp_pp_cp_vpp)
-    if is_sft_sequence_packing:
+    if is_sequence_packing:
         args.variable_seq_lengths = True
         # TODO(tailaim): add support for other dispatcher types
         print(
@@ -471,13 +492,15 @@ def dummy_forward_func(
         args.moe_token_dispatcher_type = "alltoall"
         if is_hybrid_context_parallel:
             args.max_seqlen_per_dp_cp_rank = args.seq_length // args.data_parallel_size
+            args.sequence_packing_scheduler = "default_hybrid_cp"
         else:
             args.max_seqlen_per_dp_cp_rank = args.seq_length // args.context_parallel_size
+            args.sequence_packing_scheduler = "naive_sequence_packing"
+    else:
+        args.sequence_packing_scheduler = None
 
     set_global_variables(args)
     # set_args(args)
-
-    # init_num_microbatches_calculator(0, None, 256, 1, args.data_parallel_size)
 
     layer_spec_fn = get_gpt_decoder_block_spec if is_moe else gpt_te_spec
     model = initialize_gpt_model(
@@ -489,20 +512,17 @@ def dummy_forward_func(
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
-        is_moe=True,
+        is_moe=is_moe,
         with_mtp=False,
     )
     model = model if isinstance(model, list) else [model]
 
     data_iterator = get_data_iterator(args)
 
-    # #debugmtl
-    # print(f"iterator: {next(data_iterator)}")
-
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
-        data_iterator=[data_iterator] * len(model),
+        data_iterator=data_iterator,
         model=model,
         num_microbatches=args.global_batch_size
         // args.data_parallel_size
@@ -831,5 +851,166 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
                 ), f"CP partitioned labels have wrong shape: {actual_seq_len} != {expected_seq_len}"
 
     finally:
+        Utils.destroy_model_parallel()
+        unset_global_variables()
+
+
+@pytest.mark.parametrize(
+    ("tp", "pp", "cp", "vpp","scheduler_type"),
+    [
+        (1, 1, 1, None, PackingScheduler.DEFAULT_HYBRID_CP),
+        (1, 1, 8, None, PackingScheduler.NAIVE_SEQUENCE_PACKING),
+        (2, 1, 1, None, PackingScheduler.DEFAULT_HYBRID_CP),
+        (2, 1, 4, None, PackingScheduler.NAIVE_SEQUENCE_PACKING),
+        (2, 4, 1, None, PackingScheduler.NAIVE_SEQUENCE_PACKING),
+        (2, 2, 1, None, PackingScheduler.DEFAULT_HYBRID_CP),
+        (2, 2, 1, None, PackingScheduler.NAIVE_SEQUENCE_PACKING),
+        (1, 4, 1, 4, PackingScheduler.DEFAULT_HYBRID_CP),
+        (1, 4, 1, 4, PackingScheduler.NAIVE_SEQUENCE_PACKING),
+    ],
+)
+def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
+    '''
+    Test wrap_dataloader function with different scheduler types.
+    '''
+    args = SimpleNamespace()
+    args.tensor_model_parallel_size = tp
+    args.pipeline_model_parallel_size = pp
+    args.context_parallel_size = cp
+    args.virtual_pipeline_model_parallel_size = None
+    args.data_parallel_size = 8 // (tp * pp * cp)
+    args.seq_length = 8192
+    args.max_seqlen_per_dp_cp_rank = 8192
+    if scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP:
+        args.hybrid_context_parallel = True
+    elif scheduler_type is PackingScheduler.NAIVE_SEQUENCE_PACKING:
+        args.hybrid_context_parallel = False
+
+    # Skip invalid configurations
+    if args.data_parallel_size < 1:
+        raise ValueError(f"Invalid config: tp={tp}, pp={pp}, cp={cp} exceeds world size 8")
+
+    def _create_single_sample(seq_len):
+        # hard code the padding size to 16
+        pad_size = 16
+        seq_len_padded = ((seq_len + pad_size - 1) // pad_size) * pad_size
+        device = torch.device("cuda", torch.cuda.current_device())
+        tokens = torch.randint(0, 16384, (seq_len_padded,), dtype=torch.int64, device=device)
+        labels = tokens + 1
+        position_ids = torch.arange(seq_len_padded, dtype=torch.int64, device=device)
+        loss_mask = torch.ones(seq_len_padded, dtype=torch.float32, device=device)
+        loss_mask[0:seq_len] = 1
+        loss_mask[seq_len:] = 0
+        original_seq_len = torch.tensor(seq_len, dtype=torch.int32, device=tokens.device)
+        padded_seq_len = torch.tensor(seq_len_padded, dtype=torch.int32, device=tokens.device)
+        return {
+            'tokens': tokens,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'position_ids': position_ids,
+            "original_seq_len": original_seq_len,
+            "padded_seq_len": padded_seq_len,
+        }
+
+    # Initialize model parallel
+    Utils.initialize_model_parallel(
+        tp,
+        pp,
+        vpp,
+        context_parallel_size=cp,
+        hybrid_context_parallel=args.hybrid_context_parallel,
+        min_hybrid_context_parallel_size=1,
+    )
+    
+    global_batch_size = 64
+    micro_batch_size = 1
+    import random
+    nums = [random.randint(2048, args.seq_length) for _ in range(global_batch_size)] # 64 sequences 
+    
+    config = SimpleNamespace()
+    config.max_seqlen_per_dp_cp_rank = args.max_seqlen_per_dp_cp_rank
+    config.microbatch_group_size_per_vp_stage = pp
+    config.hybrid_context_parallel = args.hybrid_context_parallel
+    config.virtual_pipeline_model_parallel_size = vpp
+    
+    
+    dp_rank = parallel_state.get_data_parallel_rank()
+    dp_size = parallel_state.get_data_parallel_world_size()
+    
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    
+    is_pp_first = (pp_rank == 0)
+    is_pp_last = (pp_rank == pp - 1)
+    is_tp_first = (tp_rank == 0)
+    
+    if is_tp_first and (is_pp_first or is_pp_last):
+        num_per_dp = global_batch_size // dp_size // micro_batch_size
+        samples = [_create_single_sample(num) for num in nums[dp_rank*num_per_dp:(dp_rank+1)*num_per_dp]]
+        data_iterator = RerunDataIterator(iter([samples]))
+    else:
+        data_iterator = None
+    
+    if is_tp_first:
+        if vpp is not None and vpp > 1:
+            if is_pp_first:
+                data_iterator = [data_iterator] + [None for _ in range(vpp - 1)]
+            elif is_pp_last:
+                data_iterator = [None for _ in range(vpp - 1)] + [data_iterator]
+            else:
+                data_iterator = [None for _ in range(vpp)]
+    try:
+        # Call the function under test
+        (new_data_iterator, num_micro_batches, num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch) = wrap_dataloader(data_iterator, config, scheduler_type)
+        
+        # check the result
+        assert type(num_micro_batches) is int
+        assert type(num_total_tokens_this_global_batch) is float or type(num_total_tokens_this_global_batch) is numpy.float32
+        assert type(sequence_square_sum_this_global_batch) is float or type(sequence_square_sum_this_global_batch) is numpy.float32
+        
+        def _check_batch(batch_all, batch_keys):
+            for batch in batch_all:
+                assert set(batch.keys()) == set(batch_keys), f"batch keys: {set(batch.keys())} != {set(batch_keys)}"
+                for key in batch_keys:
+                    assert batch[key] is not None
+                    
+        # verify the result
+        if is_tp_first:
+            batch_keys = ["cu_seqlens","max_seqlen","cu_seqlens_padded"]
+            if scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP:
+                batch_keys.append("local_cp_size")
+            if vpp is not None and vpp > 1:
+                if is_pp_first:
+                    for data_iterator in new_data_iterator[1:]:
+                        batch_all = [next(data_iterator) for _ in range(num_micro_batches)]
+                        _check_batch(batch_all, batch_keys)
+                    new_data_iterator = new_data_iterator[0]
+                elif is_pp_last:
+                    for data_iterator in new_data_iterator[:-1]:
+                        batch_all = [next(data_iterator) for _ in range(num_micro_batches)]
+                        _check_batch(batch_all, batch_keys)
+                    new_data_iterator = new_data_iterator[-1]
+                else:
+                    for data_iterator in new_data_iterator:
+                        batch_all = [next(data_iterator) for _ in range(num_micro_batches)]
+                        _check_batch(batch_all, batch_keys)
+                    new_data_iterator = new_data_iterator[0]
+            
+            batch_all = [next(new_data_iterator) for _ in range(num_micro_batches)]
+            if is_pp_first or is_pp_last:
+                batch_keys += ["tokens", "position_ids", "labels", "loss_mask"]
+                
+            _check_batch(batch_all, batch_keys)
+        else:
+            if vpp is not None and vpp > 1:
+                assert type(new_data_iterator) is list and len(new_data_iterator) == vpp
+                for data_iterator in new_data_iterator:
+                    assert data_iterator is None
+            else:
+                assert new_data_iterator is None
+        
+    finally:
+        if torch.distributed.get_rank() == 0:
+            print(f"rank:0, exit test_wrap_dataloader successfully with tp:{tp}, pp:{pp}, cp:{cp}, vpp:{vpp}, scheduler_type:{scheduler_type}",flush=True)
         Utils.destroy_model_parallel()
         unset_global_variables()

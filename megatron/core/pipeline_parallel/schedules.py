@@ -520,7 +520,6 @@ def wrap_iterator_helper(
 ):
     """Warp data iterator for sequence packing if needed."""
     if config.sequence_packing:
-        num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch = None, None
         scheduler_type_map = {
             'default_hybrid_cp': PackingScheduler.DEFAULT_HYBRID_CP,
             'empty_scheduler_with_packing': PackingScheduler.EMPTY_PACKING,
@@ -707,7 +706,7 @@ def forward_backward_no_pipelining(
     ):
         create_cudagraphs()
 
-    if config.sequence_packing:
+    if config.sequence_packing and not forward_only:
         forward_data_store.append(
             [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
         )
@@ -2091,7 +2090,7 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
-    if config.sequence_packing:
+    if config.sequence_packing and not forward_only:
         forward_data_store.append(
             [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
         )
@@ -2489,7 +2488,7 @@ def forward_backward_pipelining_without_interleaving(
     ):
         create_cudagraphs()
 
-    if config.sequence_packing:
+    if config.sequence_packing and not forward_only:
         forward_data_store.append(
             [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
         )

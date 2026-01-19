@@ -437,7 +437,8 @@ def wrap_dataloader(
         # When VPP is enabled, align num_micro_batches to this multiple.
         (
             None
-            if config.virtual_pipeline_model_parallel_size is None
+            if (config.virtual_pipeline_model_parallel_size is None or 
+                config.virtual_pipeline_model_parallel_size == 1)
             else config.microbatch_group_size_per_vp_stage
         ),
         config.hybrid_context_parallel,
@@ -1009,7 +1010,14 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         single_microbatch = []
 
         for i in range(len(sample_id_seqlens)):
-            single_microbatch = [i]
+            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
+                single_microbatch.append(i)
+                sum_seqlen += sample_id_seqlens[i][1]
+            else:
+                packed_id_groups.append(single_microbatch)
+                single_microbatch = [i]
+                sum_seqlen = sample_id_seqlens[i][1]
+        if len(single_microbatch) > 0:
             packed_id_groups.append(single_microbatch)
 
         # we want the number of packed sequences to be multiple of dp_size
@@ -1100,6 +1108,8 @@ class DefaultHybridCPscheduler(BaseScheduler):
         # we only fetch it once, rather than iterating num_micro_batches times.
         for key in required_keys:
             if key not in batch[0]:
+                #debugmtl
+                print(f"key {key} not in batch[0]: {batch[0]}")
                 return False
         return True
 
@@ -1631,13 +1641,22 @@ class DefaultHybridCPscheduler(BaseScheduler):
                 sample_id_group = fill_empty(sample_id_group)
             return sample_id_group
 
+        attempts_since_split = 0
         while remainder > 0:
-            assert i >= 0, f'align_sample_id_groups: no tail microbatch has enough ids to split'
+            if i < 0:
+                if attempts_since_split >= len(sample_id_groups):
+                    assert (
+                        False
+                    ), f'align_sample_id_groups: no tail microbatch has enough ids to split'
+                i = len(sample_id_groups) - 1
             group1, group2 = split_group(sample_id_groups[i])
             if group1 is not None and group2 is not None:
                 sample_id_groups[i] = group1
                 sample_id_groups.append(group2)
                 remainder -= 1
+                attempts_since_split = 0
+            else:
+                attempts_since_split += 1
             i -= 1
 
         return sample_id_groups
@@ -1704,16 +1723,18 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # data_iterator should return a batch including the following keys.
     batch_keys = [
-        'tokens',
-        'position_ids',
-        'labels',
-        'loss_mask',
         'cu_seqlens',
         'cu_seqlens_padded',
         'max_seqlen',
     ]
     if hybrid_context_parallel:
         batch_keys.append('local_cp_size')
+    if is_first_stage:
+        batch_keys.append('tokens')
+        batch_keys.append('position_ids')
+    if is_last_stage:
+        batch_keys.append('labels')
+        batch_keys.append('loss_mask')
 
     # Get a batch from data_iterator or create an emtpy batch.
     if is_tp_rank_0:
