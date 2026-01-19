@@ -86,12 +86,8 @@ class TestT5Model:
         self, tmp_path_dist_ckpt, src_spec_type, dst_spec_type, model_type
     ):
         enc_dec_spec_fn = {
-            'te': {
-                't5': (t5_encoder_te_spec, t5_decoder_te_spec),
-            },
-            'local': {
-                't5': (t5_encoder_local_spec, t5_decoder_local_spec),
-            },
+            'te': {'t5': (t5_encoder_te_spec, t5_decoder_te_spec)},
+            'local': {'t5': (t5_encoder_local_spec, t5_decoder_local_spec)},
         }
         src_encoder_decoder_spec_fn = enc_dec_spec_fn[src_spec_type][model_type]
         dst_encoder_decoder_spec_fn = enc_dec_spec_fn[dst_spec_type][model_type]
@@ -145,12 +141,8 @@ class TestT5ModelReconfiguration:
         *dest_tp_pp, dst_encpp = dest_tp_pp_encpp
 
         enc_dec_spec_fn = {
-            'te': {
-                't5': (t5_encoder_te_spec, t5_decoder_te_spec),
-            },
-            'local': {
-                't5': (t5_encoder_local_spec, t5_decoder_local_spec),
-            },
+            'te': {'t5': (t5_encoder_te_spec, t5_decoder_te_spec)},
+            'local': {'t5': (t5_encoder_local_spec, t5_decoder_local_spec)},
         }
 
         common_test_parallel_reconfiguration_e2e(
