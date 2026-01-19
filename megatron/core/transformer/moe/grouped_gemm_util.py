@@ -27,7 +27,7 @@ def assert_grouped_gemm_is_available():
         "- CUDA toolkit (nvcc)\n"
         "- CUTLASS headers (can be installed via 'apt-get install libcutlass-dev' on Ubuntu)\n"
         "- Compatible GPU with compute capability >= 8.0\n\n"
-        "We recommand installing TE (>= 1.9) for more comprehensive grouped gemm support. "
+        "We recommend installing TE (>= 1.9) for more comprehensive grouped gemm support. "
         "If you don't have TE nor nv-grouped-gemm, please remove the '--moe-grouped-gemm' argument."
     )
     assert grouped_gemm_is_available(), error_msg
