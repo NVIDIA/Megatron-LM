@@ -217,24 +217,38 @@ class GraphableMegatronModule(MegatronModule):
         )
         return static_inputs
 
-    def setup_manual_hooks(self, make_hook_func):
+    def setup_manual_hooks(self, make_forward_pre_hook_func, make_backward_post_hook_func):
         """
         Set CUDA Graph manual hooks for the submodules that contain direct parameters and are
         covered by cudagraphs.
         """
-        self.cuda_graph_manual_hooks = []
+        self.cuda_graph_manual_pre_hooks = []
+        self.cuda_graph_manual_post_hooks = []
 
         # Select the modules who contain direct parameters and are covered by cudagraphs.
         # Add these modules to the `cuda_graph_manual_hooks` because their hooks will not
         # be automatically triggered when they go through the CUDA Graph path.
         param_modules = {}
+        params = {}
         for submodule in self._get_submodules_under_cudagraphs():
             for module in submodule.modules():
                 if next(module.parameters(recurse=False), None) is not None:
                     # Module contains direct parameters.
                     param_modules[id(module)] = module
-        for module in param_modules.values():
-            self.cuda_graph_manual_hooks.append((make_hook_func(), (module,)))
+
+                    # Add parameters to `params` to avoid duplicate parameters.
+                    if not hasattr(module, "register_wgrad_accumulation_and_reduce_hooks"):
+                        continue
+                    for param in module.parameters(recurse=False):
+                        params[id(param)] = param
+
+        # Save forward pre-hooks and backward post-hooks.
+        if make_forward_pre_hook_func is not None:
+            for module in param_modules.values():
+                self.cuda_graph_manual_pre_hooks.append((make_forward_pre_hook_func(), (module,)))
+        if make_backward_post_hook_func is not None:
+            for param in params.values():
+                self.cuda_graph_manual_post_hooks.append(make_backward_post_hook_func(param))
 
     def _get_submodules_under_cudagraphs(self):
         """

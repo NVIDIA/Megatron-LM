@@ -1090,6 +1090,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
             return
         self.cuda_graphs[cg_index].backward_dw()
+        for hook in self.cuda_graph_manual_post_hooks:
+            hook()
 
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
