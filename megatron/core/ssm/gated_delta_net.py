@@ -561,6 +561,19 @@ class GatedDeltaNet(MegatronModule):
 
         return sharded_state_dict
 
+    def backward_dw(self):
+        """Execute weight gradient computation for all linear layers."""
+        self._backward_in_proj()
+        self._backward_out_proj()
+
+    def _backward_in_proj(self):
+        """Computes weight gradients of input projection layer."""
+        self.in_proj.backward_dw()
+
+    def _backward_out_proj(self):
+        """Computes weight gradients of output projection layer."""
+        self.out_proj.backward_dw()
+
 
 ####################
 # Sharded state dict utilities
