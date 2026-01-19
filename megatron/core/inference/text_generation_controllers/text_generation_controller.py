@@ -24,7 +24,7 @@ from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling_params import SamplingParams, SpeculativeConfig, SpeculativeMethod
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
@@ -935,6 +935,435 @@ class TextGenerationController:
         """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
         loop = get_asyncio_loop(loop)
         return loop.run_until_complete(self.async_generate_output_tokens_dynamic_batch())
+
+    # ==================== Speculative Decoding Methods ====================
+
+    def _has_speculative_decoding(self) -> bool:
+        """Check if any active request has speculative decoding enabled."""
+        context = self.inference_wrapped_model.inference_context
+        # Check if the context supports speculative decoding
+        if not hasattr(context, 'prepare_speculative_state'):
+            return False
+
+        # Check if model has MTP support
+        model = self.inference_wrapped_model.model
+        if not hasattr(model, 'mtp_process') or not model.mtp_process:
+            return False
+
+        return True
+
+    def _get_mtp_num_layers(self) -> int:
+        """Get the number of MTP layers from the model config."""
+        model = self.inference_wrapped_model.model
+        if hasattr(model, 'config') and hasattr(model.config, 'mtp_num_layers'):
+            return model.config.mtp_num_layers or 0
+        return 0
+
+    @torch.inference_mode()
+    async def async_generate_output_tokens_dynamic_batch_speculative(
+        self,
+        num_speculative_tokens: int,
+        skip_bookkeeping: Optional[bool] = False,
+    ) -> Optional[Dict]:
+        """Forward step with MTP speculative decoding for dynamic batching.
+
+        This method performs speculative decoding using Multi-Token Prediction (MTP) heads.
+        The process is:
+        1. Run main model forward to get base token logits + MTP hidden states
+        2. Sample the base token and MTP speculative tokens
+        3. Run verification forward pass with all tokens
+        4. Verify speculative tokens against verification logits
+        5. Accept valid tokens and commit to KV cache
+
+        Args:
+            num_speculative_tokens (int): Number of speculative tokens to generate per request.
+            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+
+        Returns:
+            (Optional[Dict]): Same format as async_generate_output_tokens_dynamic_batch
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        # No tokens?
+        if context.active_token_count == 0:
+            return None
+
+        # Check if MTP is available
+        mtp_num_layers = self._get_mtp_num_layers()
+        if mtp_num_layers == 0:
+            # Fall back to regular generation if no MTP
+            return await self.async_generate_output_tokens_dynamic_batch(skip_bookkeeping)
+
+        # Clamp num_speculative_tokens to available MTP layers
+        num_speculative_tokens = min(num_speculative_tokens, mtp_num_layers)
+
+        # Save context state for potential rollback
+        saved_state = context.prepare_speculative_state()
+
+        try:
+            # Step 1: Get initial logits and sample first token
+            input_ids, position_ids = self._dynamic_step_context_init()
+
+            cuda_graph_request_count = (
+                context.padded_active_request_count if context.is_decode_only() else None
+            )
+
+            # Forward pass with MTP enabled to get all hidden states
+            logits, mtp_logits_list = self._dynamic_step_forward_with_mtp(
+                input_ids, position_ids, num_speculative_tokens
+            )
+
+            await asyncio.sleep(0)
+
+            # Step 2: Sample base token
+            self._dynamic_step_sample_bookkeeping()
+            self._dynamic_step_sample_logits(logits)
+
+            # Get base token samples
+            base_tokens = self._sampled_tokens_cuda[:active_request_count].clone()
+
+            # Step 3: Sample speculative tokens from MTP logits
+            speculative_tokens = self._sample_speculative_tokens(
+                mtp_logits_list, num_speculative_tokens, active_request_count
+            )
+
+            # Step 4: Run verification - process base + speculative tokens through main model
+            # First, update context with base token
+            base_tokens_clone = base_tokens.clone()
+
+            # Set up context for verification pass
+            all_tokens = torch.cat(
+                [base_tokens.unsqueeze(1), speculative_tokens], dim=1
+            )  # [active_request_count, 1 + num_speculative_tokens]
+
+            # Prepare context for speculative tokens
+            context.setup_speculative_tokens(speculative_tokens, num_speculative_tokens)
+
+            # Allocate blocks if needed
+            if not context.allocate_speculative_blocks(num_speculative_tokens):
+                # Not enough memory, fall back to non-speculative
+                context.restore_speculative_state(saved_state)
+                return await self.async_generate_output_tokens_dynamic_batch(skip_bookkeeping)
+
+            # Forward pass to compute KV cache for all tokens
+            input_ids_verify, position_ids_verify = self._dynamic_step_context_init()
+            verification_logits = self._dynamic_step_forward_logits(
+                input_ids_verify, position_ids_verify
+            )
+
+            # Step 5: Verify speculative tokens
+            num_accepted, next_tokens = self._verify_speculative_tokens(
+                base_tokens,
+                speculative_tokens,
+                verification_logits,
+                num_speculative_tokens,
+                active_request_count,
+            )
+
+            # Commit accepted tokens
+            context.commit_speculative_tokens(
+                num_accepted, speculative_tokens, num_speculative_tokens
+            )
+
+            # Update sampled tokens with the next token to generate
+            self._sampled_tokens_cuda[:active_request_count] = next_tokens
+
+            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+
+            log_probs = None
+            top_n_logprobs = None
+            if return_log_probs or return_top_n_logprobs:
+                log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(
+                    verification_logits
+                )
+                if return_top_n_logprobs:
+                    top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
+                        verification_logits, log_probs_tensor
+                    )
+
+            if skip_bookkeeping:
+                request_bookkeeping = {}
+            else:
+                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+
+            ret = {
+                "sample": self._sampled_tokens_cuda[:active_request_count],
+                "speculative_tokens": speculative_tokens,
+                "num_accepted": num_accepted,
+                "log_probs": log_probs,
+                "top_n_logprobs": top_n_logprobs,
+                "cuda_graph_request_count": cuda_graph_request_count,
+            }
+            ret.update(request_bookkeeping)
+            return ret
+
+        except Exception as e:
+            # Rollback on error
+            context.restore_speculative_state(saved_state)
+            raise
+
+    def _dynamic_step_forward_with_mtp(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        num_speculative_tokens: int,
+    ) -> Tuple[Tensor, List[Tensor]]:
+        """Forward step with MTP to get base logits and MTP logits for speculative tokens.
+
+        Args:
+            input_ids (Tensor): The input token IDs.
+            position_ids (Tensor): The position IDs.
+            num_speculative_tokens (int): Number of speculative tokens to generate.
+
+        Returns:
+            Tuple[Tensor, List[Tensor]]: Base logits and list of MTP logits for each layer.
+        """
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
+        context = self.inference_wrapped_model.inference_context
+        model = self.inference_wrapped_model.model
+
+        # Forward pass - the model will run MTP layers if mtp_process is True
+        with torch.inference_mode():
+            # We need access to the hidden states from MTP layers
+            # For now, we use the standard forward and extract MTP logits separately
+            logits = self.inference_wrapped_model.run_one_forward_step(
+                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+            )
+
+        # Handle pipeline parallelism
+        if self.model_is_pipeline_parallel:
+            active_request_count = context.total_request_count - context.paused_request_count
+            logits_seq_len = (
+                active_request_count
+                if context.materialize_only_last_token_logits
+                else input_ids.shape[1]
+            )
+            vocab_size = inference_wrapper_config.padded_vocab_size
+            logits_shape = [1, logits_seq_len, vocab_size]
+
+            if is_pipeline_last_stage(self.pp_group):
+                assert logits is not None and torch.Size(logits_shape) == logits.shape
+
+            logits = broadcast_from_last_pipeline_stage(
+                logits_shape,
+                dtype=inference_wrapper_config.params_dtype,
+                tensor=logits,
+                pp_group=self.pp_group,
+            )
+
+        # For MTP speculative decoding, we need to get MTP logits
+        # The MTP logits are computed by running the MTP layers on the hidden states
+        # In the current architecture, we need to add a way to get MTP logits during inference
+
+        # For now, return empty MTP logits list - this requires model modifications
+        # to expose MTP inference logits
+        mtp_logits_list = self._compute_mtp_logits_for_inference(
+            model, num_speculative_tokens, context
+        )
+
+        return logits, mtp_logits_list
+
+    def _compute_mtp_logits_for_inference(
+        self, model, num_speculative_tokens: int, context
+    ) -> List[Tensor]:
+        """Compute MTP logits for inference speculative decoding.
+
+        This method extracts logits from MTP layers for speculative token generation.
+        The GPT model caches MTP logits in `_last_mtp_logits` during inference forward pass.
+
+        Args:
+            model: The GPT model with MTP support.
+            num_speculative_tokens (int): Number of speculative tokens needed.
+            context: The inference context.
+
+        Returns:
+            List[Tensor]: List of logits tensors, one per MTP layer.
+        """
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        mtp_logits_list = []
+
+        # Check if model has cached MTP logits from the last forward pass
+        # The GPT model now caches _last_mtp_logits during inference when mtp_process=True
+        if hasattr(model, '_last_mtp_logits') and model._last_mtp_logits is not None:
+            cached_mtp_logits = model._last_mtp_logits
+            for i in range(min(num_speculative_tokens, len(cached_mtp_logits))):
+                mtp_logits_list.append(cached_mtp_logits[i])
+
+        # If we don't have enough cached MTP logits, pad with zeros
+        vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
+        device = torch.cuda.current_device()
+        dtype = self.inference_wrapped_model.inference_wrapper_config.params_dtype
+
+        while len(mtp_logits_list) < num_speculative_tokens:
+            # Create placeholder logits for missing MTP layers
+            placeholder = torch.zeros(
+                (1, active_request_count, vocab_size), dtype=dtype, device=device
+            )
+            mtp_logits_list.append(placeholder)
+
+        return mtp_logits_list
+
+    def _sample_speculative_tokens(
+        self,
+        mtp_logits_list: List[Tensor],
+        num_speculative_tokens: int,
+        active_request_count: int,
+    ) -> Tensor:
+        """Sample speculative tokens from MTP logits.
+
+        Args:
+            mtp_logits_list (List[Tensor]): List of MTP logits for each speculative position.
+            num_speculative_tokens (int): Number of speculative tokens to sample.
+            active_request_count (int): Number of active requests.
+
+        Returns:
+            Tensor: Sampled speculative tokens of shape [active_request_count, num_speculative_tokens]
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+
+        speculative_tokens = torch.empty(
+            (active_request_count, num_speculative_tokens),
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+
+        # Sample from each MTP layer's logits
+        for spec_idx in range(num_speculative_tokens):
+            if spec_idx < len(mtp_logits_list):
+                mtp_logits = mtp_logits_list[spec_idx]
+
+                # Extract last token logits if needed
+                if context.materialize_only_last_token_logits:
+                    last_token_logits = mtp_logits.squeeze(0)
+                else:
+                    last_token_logits = context.last_token_logits(mtp_logits)
+
+                # Use greedy sampling for speculative tokens (most common approach)
+                # Can be extended to support other sampling strategies
+                speculative_tokens[:, spec_idx] = last_token_logits.argmax(dim=-1)
+            else:
+                # If we don't have enough MTP layers, use the termination token
+                term_ids = self._request_metadata["termination_id"][active_request_slice]
+                speculative_tokens[:, spec_idx] = term_ids
+
+        return speculative_tokens
+
+    def _verify_speculative_tokens(
+        self,
+        base_tokens: Tensor,
+        speculative_tokens: Tensor,
+        verification_logits: Tensor,
+        num_speculative_tokens: int,
+        active_request_count: int,
+    ) -> Tuple[Tensor, Tensor]:
+        """Verify speculative tokens against verification logits.
+
+        Uses rejection sampling to determine which speculative tokens to accept.
+
+        Args:
+            base_tokens (Tensor): The base tokens sampled from main model. Shape: [active_request_count]
+            speculative_tokens (Tensor): The speculative tokens. Shape: [active_request_count, num_speculative_tokens]
+            verification_logits (Tensor): Logits from verification forward pass.
+            num_speculative_tokens (int): Number of speculative tokens per request.
+            active_request_count (int): Number of active requests.
+
+        Returns:
+            Tuple[Tensor, Tensor]: Number of accepted tokens per request and next tokens to use.
+        """
+        context = self.inference_wrapped_model.inference_context
+
+        # For greedy verification, check if speculative tokens match the argmax of verification logits
+        # verification_logits has shape [1, seq_len, vocab_size] where seq_len includes all tokens
+
+        # Get logits for each position
+        if context.materialize_only_last_token_logits:
+            # In this mode, we only have the last token's logits
+            # We need to compare against the last speculative token
+            verification_probs = F.softmax(verification_logits.squeeze(0), dim=-1)
+            verified_tokens = verification_logits.squeeze(0).argmax(dim=-1)
+
+            # Simple verification: accept all if last token matches
+            num_accepted = torch.zeros(
+                active_request_count, dtype=torch.int32, device=base_tokens.device
+            )
+            next_tokens = verified_tokens[:active_request_count]
+
+            # For each request, check how many consecutive tokens match
+            all_tokens = torch.cat([base_tokens.unsqueeze(1), speculative_tokens], dim=1)
+
+            for req_idx in range(active_request_count):
+                for tok_idx in range(num_speculative_tokens):
+                    spec_token = speculative_tokens[req_idx, tok_idx]
+                    # In greedy verification, we accept if the speculative token matches
+                    # what we would have sampled from the verification logits
+                    if tok_idx < verified_tokens.shape[0] and spec_token == verified_tokens[req_idx]:
+                        num_accepted[req_idx] += 1
+                    else:
+                        # First mismatch - next token is from verification
+                        next_tokens[req_idx] = verified_tokens[req_idx]
+                        break
+                else:
+                    # All speculative tokens accepted, sample new token
+                    next_tokens[req_idx] = verified_tokens[req_idx]
+
+        else:
+            # Full sequence logits available
+            # Each request has (1 + num_speculative_tokens) logits positions
+            tokens_per_request = 1 + num_speculative_tokens
+
+            num_accepted = torch.zeros(
+                active_request_count, dtype=torch.int32, device=base_tokens.device
+            )
+            next_tokens = base_tokens.clone()
+
+            # Extract per-request logits
+            request_logits = verification_logits.view(
+                active_request_count, tokens_per_request, -1
+            )
+
+            for req_idx in range(active_request_count):
+                # Get verification predictions for this request
+                req_verification = request_logits[req_idx].argmax(dim=-1)
+
+                # Check base token first (position 0 predicts position 1)
+                if base_tokens[req_idx] != req_verification[0]:
+                    # Base token rejected, use verification result
+                    next_tokens[req_idx] = req_verification[0]
+                    continue
+
+                # Check speculative tokens
+                for tok_idx in range(num_speculative_tokens):
+                    spec_token = speculative_tokens[req_idx, tok_idx]
+                    verify_token = req_verification[tok_idx + 1] if tok_idx + 1 < tokens_per_request else spec_token
+
+                    if spec_token == verify_token:
+                        num_accepted[req_idx] += 1
+                    else:
+                        next_tokens[req_idx] = verify_token
+                        break
+                else:
+                    # All accepted, sample from last position
+                    if tokens_per_request - 1 < request_logits.shape[1]:
+                        next_tokens[req_idx] = req_verification[-1]
+
+        return num_accepted, next_tokens
+
+    @torch.inference_mode()
+    def generate_output_tokens_dynamic_batch_speculative(
+        self,
+        num_speculative_tokens: int,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> Optional[Dict]:
+        """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch_speculative`."""
+        loop = get_asyncio_loop(loop)
+        return loop.run_until_complete(
+            self.async_generate_output_tokens_dynamic_batch_speculative(
+                num_speculative_tokens=num_speculative_tokens
+            )
+        )
 
     def _update_top_n_logprobs_dict(
         self,

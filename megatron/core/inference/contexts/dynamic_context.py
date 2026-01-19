@@ -2141,3 +2141,291 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not self.is_symmetric_memory_initialized:
             parallel_state._set_global_symmetric_memory_buffer()
             self.is_symmetric_memory_initialized = True
+
+    # ==================== Speculative Decoding Support ====================
+
+    def prepare_speculative_state(self) -> dict:
+        """Save the current context state for potential rollback after speculative decoding.
+
+        This method saves all the bookkeeping tensor states that would be modified during
+        speculative token generation. If speculative tokens are rejected, these can be
+        restored to rollback the context to its pre-speculation state.
+
+        Returns:
+            dict: A dictionary containing all saved state tensors and scalar values.
+        """
+        active_request_slice = slice(self.paused_request_count, self.total_request_count)
+
+        state = {
+            # Scalar values
+            "active_token_count": self.active_token_count,
+            "total_request_count": self.total_request_count,
+            "paused_request_count": self.paused_request_count,
+            "num_prefill_requests": self.num_prefill_requests,
+            # Request bookkeeping tensors (cloned for safety)
+            "request_kv_length_offsets": self.request_kv_length_offsets[active_request_slice].clone(),
+            "request_query_lengths": self.request_query_lengths[active_request_slice].clone(),
+            "request_kv_block_counts": self.request_kv_block_counts[active_request_slice].clone(),
+            "request_last_kv_block_id": self.request_last_kv_block_id[active_request_slice].clone(),
+            "request_last_kv_block_offset": self.request_last_kv_block_offset[
+                active_request_slice
+            ].clone(),
+            # Token bookkeeping tensors
+            "token_to_input_ids": self.token_to_input_ids[: self.active_token_count].clone(),
+            "token_to_pos_ids": self.token_to_pos_ids[: self.active_token_count].clone(),
+            "token_to_request_idx": self.token_to_request_idx[: self.active_token_count].clone(),
+            "token_to_block_idx": self.token_to_block_idx[: self.active_token_count].clone(),
+            "token_to_position_in_request": self.token_to_position_in_request[
+                : self.active_token_count
+            ].clone(),
+            "token_to_local_position_within_kv_block": self.token_to_local_position_within_kv_block[
+                : self.active_token_count
+            ].clone(),
+        }
+
+        return state
+
+    def restore_speculative_state(self, state: dict) -> None:
+        """Restore the context state from a previously saved speculative state.
+
+        This method is called when speculative tokens are rejected and we need to
+        rollback to the pre-speculation state.
+
+        Args:
+            state (dict): The saved state from prepare_speculative_state().
+        """
+        # Restore scalar values
+        self.active_token_count = state["active_token_count"]
+        self.total_request_count = state["total_request_count"]
+        self.paused_request_count = state["paused_request_count"]
+        self.num_prefill_requests = state["num_prefill_requests"]
+
+        active_request_slice = slice(self.paused_request_count, self.total_request_count)
+
+        # Restore request bookkeeping tensors
+        self.request_kv_length_offsets[active_request_slice] = state["request_kv_length_offsets"]
+        self.request_query_lengths[active_request_slice] = state["request_query_lengths"]
+        self.request_kv_block_counts[active_request_slice] = state["request_kv_block_counts"]
+        self.request_last_kv_block_id[active_request_slice] = state["request_last_kv_block_id"]
+        self.request_last_kv_block_offset[active_request_slice] = state[
+            "request_last_kv_block_offset"
+        ]
+
+        # Restore token bookkeeping tensors
+        saved_token_count = state["token_to_input_ids"].shape[0]
+        self.token_to_input_ids[:saved_token_count] = state["token_to_input_ids"]
+        self.token_to_pos_ids[:saved_token_count] = state["token_to_pos_ids"]
+        self.token_to_request_idx[:saved_token_count] = state["token_to_request_idx"]
+        self.token_to_block_idx[:saved_token_count] = state["token_to_block_idx"]
+        self.token_to_position_in_request[:saved_token_count] = state["token_to_position_in_request"]
+        self.token_to_local_position_within_kv_block[:saved_token_count] = state[
+            "token_to_local_position_within_kv_block"
+        ]
+
+    def setup_speculative_tokens(
+        self, speculative_tokens: Tensor, num_speculative_tokens: int
+    ) -> None:
+        """Set up the context for generating KV cache entries for speculative tokens.
+
+        This method prepares the context to process multiple speculative tokens in a single
+        forward pass. It updates token bookkeeping tensors to include the speculative tokens
+        that need to have their KV cache computed.
+
+        Args:
+            speculative_tokens (Tensor): The speculative tokens for each request.
+                Shape: [num_active_requests, num_speculative_tokens]
+            num_speculative_tokens (int): Number of speculative tokens per request.
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+        active_request_slice = slice(self.paused_request_count, self.total_request_count)
+
+        if speculative_tokens.dim() == 1:
+            speculative_tokens = speculative_tokens.unsqueeze(1)
+
+        assert speculative_tokens.shape == (active_request_count, num_speculative_tokens), (
+            f"speculative_tokens shape mismatch: expected ({active_request_count}, "
+            f"{num_speculative_tokens}), got {speculative_tokens.shape}"
+        )
+
+        # Each request will have num_speculative_tokens additional tokens
+        # We need to update the token bookkeeping tensors
+        current_positions = self.request_kv_length_offsets[active_request_slice]
+
+        # Flatten speculative tokens and compute their positions
+        flat_speculative = speculative_tokens.flatten()
+        num_total_speculative = active_request_count * num_speculative_tokens
+
+        # Request indices for speculative tokens
+        request_indices = torch.arange(
+            self.paused_request_count,
+            self.total_request_count,
+            device=speculative_tokens.device,
+        ).repeat_interleave(num_speculative_tokens)
+
+        # Position offsets within each request
+        position_offsets = torch.arange(
+            1, num_speculative_tokens + 1, device=speculative_tokens.device
+        ).repeat(active_request_count)
+
+        # Global positions for each speculative token
+        positions_per_request = current_positions.repeat_interleave(num_speculative_tokens)
+        speculative_positions = positions_per_request + position_offsets
+
+        # Update token bookkeeping for speculative tokens
+        spec_start = self.active_token_count
+        spec_end = spec_start + num_total_speculative
+
+        self.token_to_input_ids[spec_start:spec_end] = flat_speculative
+        self.token_to_pos_ids[spec_start:spec_end] = speculative_positions
+        self.token_to_request_idx[spec_start:spec_end] = request_indices
+        self.token_to_position_in_request[spec_start:spec_end] = speculative_positions
+
+        # Compute block indices and local positions for speculative tokens
+        self.token_to_block_idx[spec_start:spec_end] = self._compute_block_idx_for_positions(
+            request_indices, speculative_positions
+        )
+        self.token_to_local_position_within_kv_block[spec_start:spec_end] = (
+            speculative_positions % self.block_size_tokens
+        )
+
+        # Update active token count to include speculative tokens
+        self.active_token_count = spec_end
+
+    def _compute_block_idx_for_positions(
+        self, request_indices: Tensor, positions: Tensor
+    ) -> Tensor:
+        """Compute the block indices for given positions in specific requests.
+
+        Args:
+            request_indices (Tensor): The request indices for each position.
+            positions (Tensor): The positions within each request's sequence.
+
+        Returns:
+            Tensor: The block indices for each position.
+        """
+        block_numbers = positions // self.block_size_tokens
+        # Get block IDs from request_to_kv_block_ids
+        # This requires advanced indexing
+        block_ids = self.request_to_kv_block_ids[
+            request_indices.long(), block_numbers.long()
+        ]
+        return block_ids
+
+    def commit_speculative_tokens(
+        self,
+        num_accepted_per_request: Tensor,
+        speculative_tokens: Tensor,
+        max_speculative_tokens: int,
+    ) -> Tensor:
+        """Commit accepted speculative tokens to the context state.
+
+        This method updates the context to reflect the accepted speculative tokens.
+        It handles the case where different requests may have different numbers of
+        accepted tokens.
+
+        Args:
+            num_accepted_per_request (Tensor): Number of accepted tokens per request.
+                Shape: [num_active_requests]
+            speculative_tokens (Tensor): The speculative tokens for each request.
+                Shape: [num_active_requests, max_speculative_tokens]
+            max_speculative_tokens (int): Maximum number of speculative tokens.
+
+        Returns:
+            Tensor: The next token for each request (first rejected token or
+                sampled from verification).
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+        active_request_slice = slice(self.paused_request_count, self.total_request_count)
+
+        # Update KV length offsets by adding accepted tokens
+        # Each request advances by num_accepted_per_request[i] tokens
+        self.request_kv_length_offsets[active_request_slice] += num_accepted_per_request
+
+        # Update block bookkeeping for requests that might need new blocks
+        for i in range(active_request_count):
+            request_idx = self.paused_request_count + i
+            num_accepted = num_accepted_per_request[i].item()
+
+            if num_accepted > 0:
+                new_position = self.request_kv_length_offsets[request_idx].item()
+                new_block_offset = (new_position - 1) % self.block_size_tokens
+                new_block_count = (new_position + self.block_size_tokens - 1) // self.block_size_tokens
+
+                self.request_last_kv_block_offset[request_idx] = new_block_offset
+                self.request_kv_block_counts[request_idx] = new_block_count
+
+                if new_block_count > 0:
+                    self.request_last_kv_block_id[request_idx] = self.request_to_kv_block_ids[
+                        request_idx, new_block_count - 1
+                    ]
+
+        return num_accepted_per_request
+
+    def allocate_speculative_blocks(self, num_speculative_tokens: int) -> bool:
+        """Pre-allocate KV cache blocks that may be needed for speculative tokens.
+
+        This method ensures there are enough free blocks to store KV cache for
+        speculative tokens. If not enough blocks are available, it returns False.
+
+        Args:
+            num_speculative_tokens (int): Number of speculative tokens per request.
+
+        Returns:
+            bool: True if allocation was successful, False otherwise.
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+        active_request_slice = slice(self.paused_request_count, self.total_request_count)
+
+        # Calculate how many additional blocks might be needed
+        current_offsets = self.request_last_kv_block_offset[active_request_slice]
+        potential_new_positions = current_offsets + num_speculative_tokens
+
+        # Count how many requests would need new blocks
+        blocks_needed = (potential_new_positions > self.block_size_tokens).sum().item()
+
+        # Check if we have enough free blocks
+        if blocks_needed > self.block_allocator.total_avail:
+            return False
+
+        # Allocate new blocks for requests that need them
+        if blocks_needed > 0:
+            new_block_ids = self.block_allocator.allocate_memory_blocks(blocks_needed)
+            if new_block_ids is None or len(new_block_ids) < blocks_needed:
+                return False
+
+            # Assign new blocks to requests that need them
+            block_idx = 0
+            for i in range(active_request_count):
+                request_idx = self.paused_request_count + i
+                if potential_new_positions[i] > self.block_size_tokens:
+                    current_block_count = self.request_kv_block_counts[request_idx].item()
+                    self.request_to_kv_block_ids[request_idx, current_block_count] = new_block_ids[
+                        block_idx
+                    ]
+                    block_idx += 1
+
+        return True
+
+    def get_speculative_token_count_limit(self) -> int:
+        """Get the maximum number of speculative tokens that can be used.
+
+        This considers available memory blocks and max sequence length constraints.
+
+        Returns:
+            int: Maximum number of speculative tokens that can be safely used.
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+        if active_request_count == 0:
+            return 0
+
+        active_request_slice = slice(self.paused_request_count, self.total_request_count)
+
+        # Check sequence length constraints
+        current_lengths = self.request_kv_length_offsets[active_request_slice]
+        max_remaining = (self.max_sequence_length - current_lengths - 1).min().item()
+
+        # Check block availability (rough estimate)
+        available_blocks = self.block_allocator.total_avail
+        max_from_blocks = available_blocks * self.block_size_tokens // active_request_count
+
+        return max(0, min(int(max_remaining), int(max_from_blocks)))

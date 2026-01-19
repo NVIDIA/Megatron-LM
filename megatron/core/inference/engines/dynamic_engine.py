@@ -1117,6 +1117,31 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
+        
+        # Check if speculative decoding is enabled for any active request
+        # Only use speculative decoding in decode-only mode
+        use_speculative = False
+        num_speculative_tokens = 0
+        if is_decode_only:
+            active_request_ids = self.context.request_ids[
+                self.context.paused_request_count : self.context.total_request_count
+            ].tolist()
+            for rid in active_request_ids:
+                if rid in self.requests:
+                    req_entry = self.requests[rid]
+                    sp = req_entry.request.sampling_params
+                    if sp is not None and sp.speculative_config is not None:
+                        use_speculative = True
+                        num_speculative_tokens = max(
+                            num_speculative_tokens,
+                            sp.speculative_config.num_speculative_tokens
+                        )
+
+        if use_speculative and num_speculative_tokens > 0:
+            result = await self.controller.async_generate_output_tokens_dynamic_batch_speculative(
+                num_speculative_tokens=num_speculative_tokens
+            )
+        else:
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
         self.step_end_event.synchronize()

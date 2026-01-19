@@ -550,10 +550,28 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
+        # Cache MTP logits for speculative decoding inference
+        mtp_inference_logits = None
+
         if self.mtp_process:
-            mtp_labels = labels.clone()
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
             hidden_states = hidden_states_list[0]
+
+            if in_inference_mode:
+                # For inference with speculative decoding, compute and cache MTP logits
+                mtp_inference_logits = []
+                for mtp_layer_number in range(self.config.mtp_num_layers):
+                    mtp_logits, _ = self.output_layer(
+                        hidden_states_list[mtp_layer_number + 1],
+                        weight=output_weight,
+                        runtime_gather_output=runtime_gather_output,
+                    )
+                    mtp_inference_logits.append(mtp_logits)
+                # Cache the MTP logits for use by speculative decoding
+                self._last_mtp_logits = mtp_inference_logits
+            else:
+                # Training mode: compute MTP losses
+                mtp_labels = labels.clone()
             if loss_mask is None:
                 # if loss_mask is not provided, use all ones as loss_mask
                 loss_mask = torch.ones_like(mtp_labels)

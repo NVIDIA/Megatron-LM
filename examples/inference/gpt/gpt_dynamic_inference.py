@@ -38,7 +38,7 @@ from megatron.core.inference.engines import DynamicInferenceEngine, EngineSuspen
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling_params import SamplingParams, SpeculativeConfig, SpeculativeMethod
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -93,6 +93,26 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action='store_true',
         default=False,
         help="If true, only run throughput check without verifying outputs."
+    )
+    
+    # Speculative decoding arguments
+    group.add_argument(
+        "--speculative-decoding",
+        action='store_true',
+        default=False,
+        help="Enable speculative decoding using MTP (Multi-Token Prediction) heads."
+    )
+    group.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        default=1,
+        help="Number of speculative tokens to generate per step (must be <= mtp_num_layers)."
+    )
+    group.add_argument(
+        "--speculative-greedy-verification",
+        action='store_true',
+        default=True,
+        help="Use greedy verification for speculative tokens (default: True)."
     )
 
     return parser
@@ -437,6 +457,17 @@ def main():
     else:
         tokenizer = build_tokenizer(args)
 
+    # Speculative config (if enabled).
+    speculative_config = None
+    if args.speculative_decoding:
+        speculative_config = SpeculativeConfig(
+            method=SpeculativeMethod.MTP,
+            num_speculative_tokens=args.num_speculative_tokens,
+            use_greedy_verification=args.speculative_greedy_verification,
+        )
+        if torch.distributed.get_rank() == 0:
+            print(f"Speculative decoding enabled with MTP: {args.num_speculative_tokens} speculative tokens")
+
     # Sampling params.
     sampling_params = SamplingParams(
         temperature=args.temperature,
@@ -448,6 +479,7 @@ def main():
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         top_n_logprobs=args.top_n_logprobs,
         stop_words=args.stop_words,
+        speculative_config=speculative_config,
     ) 
 
     model = get_model()
