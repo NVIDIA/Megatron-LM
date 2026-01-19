@@ -201,7 +201,7 @@ pip install megatron-core
 
 ### Optional MoE Dependencies
 
-For Mixture of Experts (MoE) training with CUTLASS Grouped GEMM support:
+For Mixture of Experts (MoE) training with the legacy Grouped GEMM support:
 
 ```bash
 pip install --no-build-isolation megatron-core[moe]
@@ -214,6 +214,9 @@ pip install --no-build-isolation megatron-core[moe]
 - GPU with compute capability >= 8.0
 
 2. We recommend installing Transformer Engine (>=1.9) for more comprehensive grouped gemm support.
+The legacy grouped gemm will only be used when
+    - `--moe-grouped-gemm` is specified and
+    - TE (>= 1.9) is not available or `--moe-use-legacy-grouped-gemm` is specified
 
 ## System Requirements
 
