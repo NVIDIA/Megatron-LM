@@ -14,8 +14,8 @@ def grouped_gemm_is_available():
 def assert_grouped_gemm_is_available():
     """Assert that grouped_gemm is available."""
     error_msg = (
-        "Grouped GEMM is not available. To use MoE with grouped GEMM, you need to install "
-        "nv-grouped-gemm.\n\n"
+        "CUTLASS Grouped GEMM is not available. To use MoE with CUTLASS grouped GEMM, "
+        "you need to install nv-grouped-gemm.\n\n"
         "Installation options:\n"
         "1. Install from PyPI (requires CUDA toolkit and CUTLASS headers):\n"
         "   pip install 'megatron-core[moe]'\n"
