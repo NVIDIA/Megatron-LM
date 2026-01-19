@@ -506,7 +506,8 @@ class MegatronFSDP(torch.nn.Module):
 
         def release_module_parameters(module, bwd, lazy=False, *unused):
             """
-            Release the parameters of a given module after completing the forward and backward passes.
+            Release the parameters of a given module after completing the forward
+            and backward passes.
 
             Args:
                 module: The module whose parameters should be released.
