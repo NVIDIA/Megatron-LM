@@ -952,11 +952,11 @@ class DynamicInferenceEngine(AbstractEngine):
             evict_request_ids = evict_request_ids.tolist()
 
             # Insert into waiting_request_ids after any chunk prefill request.
-            if self.context.chunked_prefill_request_id != -1:
-                raise Exception(
-                    "TODO: Insert into waiting_request_ids after chunked prefill request."
-                )
             self.waiting_request_ids.extendleft(evict_request_ids)
+            if self.context.chunked_prefill_request_id != -1:
+                chunked_prefill_id = self.waiting_request_ids[len(evict_request_ids)]
+                del self.waiting_request_ids[len(evict_request_ids)]
+                self.waiting_request_ids.appendleft(chunked_prefill_id)
 
             # Checkpoint requests (i.e., prompt += generations) + add eviction event.
             for request_id in evict_request_ids:

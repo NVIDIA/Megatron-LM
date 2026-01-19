@@ -36,6 +36,7 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
+from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -604,6 +605,24 @@ def forward_backward_no_pipelining(
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
         )
+    elif config.hybrid_context_parallel:
+        forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            output_tensor_grad,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            first_val_step,
+            forward_only,
+            no_sync_func,
+            total_num_tokens,
+            check_first_val_step,
+            model_type,
+        )
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):
@@ -796,32 +815,6 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
                 ]
             )
     return schedule_table
-
-
-def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
-    """Convert a tunable schedule lookup table to the te.make_graphed_callables() accepted
-    order format. For example, the tunable schedule table for PP2 N3M5 with VP2 is as below:
-    virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
-    microbatch_id         | 0 1 2 0 1 2 3 4 3 4
-    model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
-
-    Then the forward backward separated order is:
-    forward               | 1 1 1 2 2 2 1 1 2 2
-    backward              | -2 -2 -2 -1 -1 -1 -2 -2 -1 -1
-
-    If num_warmup_microbatches is 5, the output order is:
-    1 1 1 2 2 2 -2 1 -2 1 -2 2 -1 2 -1 -1 -2 -2 -1 -1
-    """
-    _, model_chunk_id_table = zip(*schedule_table)
-    forward_order = [chunk_id + 1 for chunk_id in model_chunk_id_table]
-    backward_order = [chunk_id - num_model_chunks for chunk_id in model_chunk_id_table]
-    order = forward_order[:num_warmup_microbatches]
-    for i in range(num_warmup_microbatches, len(forward_order)):
-        order.append(forward_order[i])
-        order.append(backward_order[i - num_warmup_microbatches])
-    if num_warmup_microbatches > 0:
-        order.extend(backward_order[-num_warmup_microbatches:])
-    return order
 
 
 def forward_backward_pipelining_with_interleaving(
