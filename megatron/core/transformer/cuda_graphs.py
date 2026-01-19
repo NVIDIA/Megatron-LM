@@ -1994,13 +1994,13 @@ class TECudaGraphHelper:
         Set CUDA Graph manual hooks for the modules that contain direct parameters and
         are covered by cudagraphs.
         """
-        make_forward_pre_hook_func = model_chunk._make_forward_pre_hook
-        if self.config.delay_wgrad_compute:
-            make_backward_post_hook_func = model_chunk._make_backward_post_hook
-        else:
-            make_backward_post_hook_func = None
         for chunk_number, layers in enumerate(self.callables_per_chunk):
             model_chunk = self.model[chunk_number]
+            make_forward_pre_hook_func = model_chunk._make_forward_pre_hook
+            if self.config.delay_wgrad_compute:
+                make_backward_post_hook_func = model_chunk._make_backward_post_hook
+            else:
+                make_backward_post_hook_func = None
             for layer in layers:
                 layer.setup_manual_hooks(make_forward_pre_hook_func, make_backward_post_hook_func)
 
