@@ -3332,6 +3332,12 @@ def _add_moe_args(parser):
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-router-force-load-balancing', action='store_true',
                        help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
+    group.add_argument('--moe-router-force-biased', type=float, default=None,
+                       help='[Experimental] Apply random expert bias in normal distribution with specified std to router logits. '
+                       'Shared seed across all ranks ensures identical bias. '
+                       'If positive, generates new random bias each forward pass. '
+                       'If negative, generates bias once per layer and reuses it (abs value is std). '
+                       'This experimental feature is for benchmarking purposes only!')
     group.add_argument('--moe-router-padding-for-quantization', action='store_true',
                        help='Pad the routing_map to make sure the number of tokens each expert received '
                        'is a multiple of 16/32 for FP8/FP4 precision. It is suggested to enable this for '
