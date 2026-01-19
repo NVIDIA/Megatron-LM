@@ -156,6 +156,7 @@ def _get_transformer_layer_spec(use_te, config):
             args.moe_grouped_gemm,
             args.qk_layernorm,
             args.multi_latent_attention,
+            args.use_bitnet,
             args.experimental_attention_variant,
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             normalization=args.normalization,
