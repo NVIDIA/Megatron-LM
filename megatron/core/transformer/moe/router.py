@@ -667,7 +667,7 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(logits)
         # Log overload factor if enabled
         if self.config.log_overload_factor:
             # Compute num_local_experts from config and EP size
