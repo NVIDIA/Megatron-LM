@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
+    BlockLevelCheckpointManager,
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
     checkpoint,
@@ -226,5 +227,202 @@ def test_checkpoint_without_output():
     output1.backward(torch.ones((4, 4)), retain_graph=True)
     output2.backward(torch.ones((4, 4)), retain_graph=True)
     assert torch.equal(input1.grad, input2.grad)
+
+    Utils.destroy_model_parallel()
+
+
+def test_block_level_checkpoint_manager():
+    """
+    Test BlockLevelCheckpointManager with three sequential checkpoint functions.
+
+    This test verifies that:
+    1. The manager correctly handles sequential checkpoints where each function's
+       output is the next function's input
+    2. Recomputation happens in the correct order during backward
+    3. Gradients are computed correctly and match the non-checkpointed version
+    """
+
+    # Define three simple functions that form a chain:
+    # x -> func1 -> y1 -> func2 -> y2 -> func3 -> y3
+    def func1(x):
+        # Simple linear transformation
+        return x * 2 + 1
+
+    def func2(x):
+        # Non-linear transformation
+        return torch.nn.functional.gelu(x)
+
+    def func3(x):
+        # Another transformation
+        return x * x + x
+
+    Utils.initialize_model_parallel()
+
+    # ========== Test 1: Basic forward and backward correctness ==========
+    # Create input tensor
+    input_ref = torch.randn(4, 4, device='cuda', requires_grad=True)
+    input_ckpt = input_ref.detach().clone().requires_grad_(True)
+
+    # Reference: normal forward without checkpoint
+    y1_ref = func1(input_ref)
+    y2_ref = func2(y1_ref)
+    y3_ref = func3(y2_ref)
+    loss_ref = y3_ref.sum()
+    loss_ref.backward()
+    grad_ref = input_ref.grad.clone()
+
+    # With BlockLevelCheckpointManager
+    manager = BlockLevelCheckpointManager()
+
+    ckpt1 = CheckpointWithoutOutput()
+    y1 = ckpt1.checkpoint(func1, input_ckpt)
+    manager.add_checkpoint(ckpt1)
+
+    ckpt2 = CheckpointWithoutOutput()
+    y2 = ckpt2.checkpoint(func2, y1)
+    manager.add_checkpoint(ckpt2)
+
+    ckpt3 = CheckpointWithoutOutput()
+    y3 = ckpt3.checkpoint(func3, y2)
+    manager.add_checkpoint(ckpt3)
+
+    # Register unified recompute hook on the final output
+    manager.discard_all_outputs_and_register_unified_recompute(y3)
+
+    # Verify outputs are discarded (storage size is 0)
+    assert y1.untyped_storage().size() == 0, "y1 storage should be released"
+    assert y2.untyped_storage().size() == 0, "y2 storage should be released"
+    assert y3.untyped_storage().size() == 0, "y3 storage should be released"
+
+    # Compute loss and backward
+    loss_ckpt = y3.sum()
+    loss_ckpt.backward()
+    grad_ckpt = input_ckpt.grad.clone()
+
+    # Verify gradients match
+    assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6), (
+        f"Gradients mismatch!\n"
+        f"With manager: {grad_ckpt}\n"
+        f"Reference: {grad_ref}"
+    )
+
+    # ========== Test 2: With randomness (dropout-like behavior) ==========
+    def func_with_dropout(x):
+        # Simulates dropout: random mask applied
+        return torch.nn.functional.dropout(x, p=0.3, training=True)
+
+    # Reset inputs
+    input_ref2 = torch.randn(4, 4, device='cuda', requires_grad=True)
+    input_ckpt2 = input_ref2.detach().clone().requires_grad_(True)
+
+    # Set same random seed for both paths
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    # Reference forward
+    y1_ref2 = func_with_dropout(input_ref2)
+    y2_ref2 = func2(y1_ref2)
+    loss_ref2 = y2_ref2.sum()
+    loss_ref2.backward()
+    grad_ref2 = input_ref2.grad.clone()
+
+    # Reset random seed
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    # With checkpoint manager
+    manager2 = BlockLevelCheckpointManager()
+
+    ckpt1_2 = CheckpointWithoutOutput()
+    y1_2 = ckpt1_2.checkpoint(func_with_dropout, input_ckpt2)
+    manager2.add_checkpoint(ckpt1_2)
+
+    ckpt2_2 = CheckpointWithoutOutput()
+    y2_2 = ckpt2_2.checkpoint(func2, y1_2)
+    manager2.add_checkpoint(ckpt2_2)
+
+    manager2.discard_all_outputs_and_register_unified_recompute(y2_2)
+
+    loss_ckpt2 = y2_2.sum()
+    loss_ckpt2.backward()
+    grad_ckpt2 = input_ckpt2.grad.clone()
+
+    # Gradients should match because RNG state is restored during recompute
+    assert torch.allclose(grad_ckpt2, grad_ref2, atol=1e-6), (
+        f"Gradients with dropout mismatch!\n"
+        f"With manager: {grad_ckpt2}\n"
+        f"Reference: {grad_ref2}"
+    )
+
+    Utils.destroy_model_parallel()
+
+
+def test_block_level_checkpoint_manager_with_multiple_outputs():
+    """
+    Test BlockLevelCheckpointManager with functions that return multiple outputs.
+    """
+
+    def func_multi_output(x):
+        # Returns two outputs
+        return x * 2, x + 1
+
+    def func_combine(a, b):
+        # Combines two inputs
+        return a + b
+
+    Utils.initialize_model_parallel()
+
+    input_ref = torch.randn(4, 4, device='cuda', requires_grad=True)
+    input_ckpt = input_ref.detach().clone().requires_grad_(True)
+
+    # Reference
+    y1a_ref, y1b_ref = func_multi_output(input_ref)
+    y2_ref = func_combine(y1a_ref, y1b_ref)
+    loss_ref = y2_ref.sum()
+    loss_ref.backward()
+    grad_ref = input_ref.grad.clone()
+
+    # With manager
+    manager = BlockLevelCheckpointManager()
+
+    ckpt1 = CheckpointWithoutOutput()
+    y1a, y1b = ckpt1.checkpoint(func_multi_output, input_ckpt)
+    manager.add_checkpoint(ckpt1)
+
+    ckpt2 = CheckpointWithoutOutput()
+    y2 = ckpt2.checkpoint(func_combine, y1a, y1b)
+    manager.add_checkpoint(ckpt2)
+
+    manager.discard_all_outputs_and_register_unified_recompute(y2)
+
+    loss_ckpt = y2.sum()
+    loss_ckpt.backward()
+    grad_ckpt = input_ckpt.grad.clone()
+
+    assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6), (
+        f"Gradients mismatch with multiple outputs!\n"
+        f"With manager: {grad_ckpt}\n"
+        f"Reference: {grad_ref}"
+    )
+
+    Utils.destroy_model_parallel()
+
+
+def test_block_level_checkpoint_manager_error_handling():
+    """
+    Test error handling in BlockLevelCheckpointManager.
+    """
+    Utils.initialize_model_parallel()
+
+    manager = BlockLevelCheckpointManager()
+
+    # Test 1: Adding non-CheckpointWithoutOutput object should raise TypeError
+    with pytest.raises(TypeError):
+        manager.add_checkpoint("not a checkpoint")
+
+    # Test 2: Adding checkpoint that hasn't called checkpoint() should raise ValueError
+    ckpt = CheckpointWithoutOutput()
+    with pytest.raises(ValueError):
+        manager.add_checkpoint(ckpt)
 
     Utils.destroy_model_parallel()

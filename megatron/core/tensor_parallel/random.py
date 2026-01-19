@@ -590,6 +590,97 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
+class BlockLevelCheckpointManager:
+    """
+    Block-Level Checkpoint Manager.
+
+    Manages multiple CheckpointWithoutOutput objects within a block, enabling unified
+    recomputation during backward pass. This is particularly useful for scenarios where
+    multiple checkpoint operations have sequential dependencies (i.e., the output of one
+    checkpoint is the input of the next).
+
+    The manager ensures that during backward:
+    1. All checkpoint outputs are discarded to save memory
+    2. Recomputation happens in the correct forward order
+    3. Each checkpoint's output is restored before the next one needs it as input
+
+    Usage:
+        manager = BlockLevelCheckpointManager()
+
+        ckpt1 = CheckpointWithoutOutput()
+        y1 = ckpt1.checkpoint(func1, x)
+        manager.add_checkpoint(ckpt1)
+
+        ckpt2 = CheckpointWithoutOutput()
+        y2 = ckpt2.checkpoint(func2, y1)  # y1 is input
+        manager.add_checkpoint(ckpt2)
+
+        # Register unified recompute hook on the final output
+        manager.discard_all_outputs_and_register_unified_recompute(y2)
+    """
+
+    def __init__(self):
+        """Initialize the BlockLevelCheckpointManager."""
+        self.checkpoints = []
+
+    def add_checkpoint(self, ckpt):
+        """
+        Add a CheckpointWithoutOutput object to the manager.
+
+        Args:
+            ckpt: CheckpointWithoutOutput object that has already called checkpoint()
+        """
+        if not isinstance(ckpt, CheckpointWithoutOutput):
+            raise TypeError("Expected CheckpointWithoutOutput object")
+        if ckpt.outputs is None:
+            raise ValueError("CheckpointWithoutOutput must call checkpoint() before adding")
+        self.checkpoints.append(ckpt)
+
+    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
+        """
+        Discard all checkpoint outputs and register a unified recompute hook.
+
+        This method:
+        1. Releases the storage of all checkpoint outputs to save memory
+        2. Registers a hook on hook_tensor that will trigger sequential recomputation
+           of all checkpoints when gradients flow back
+
+        Args:
+            hook_tensor: The tensor to register the recompute hook on. This should be
+                        the final output that depends on all checkpointed computations.
+
+        Note:
+            The caller must ensure that:
+            - hook_tensor's gradient is computed before any recomputed tensor is needed
+            - All checkpoint outputs are no longer used in the forward pass after this call
+        """
+        # Discard all checkpoint outputs to save memory
+        for ckpt in self.checkpoints:
+            for output in ckpt.outputs:
+                output.untyped_storage().resize_(0)
+
+        # Register unified recompute hook
+        if hook_tensor.requires_grad:
+            hook_tensor.register_hook(self._unified_recompute_hook)
+
+    def _unified_recompute_hook(self, grad_output):
+        """
+        Unified recompute hook that recomputes all checkpoints in forward order.
+
+        This hook is triggered during backward pass. It sequentially recomputes each
+        checkpoint, which restores the output tensor storage. Since checkpoints are
+        processed in forward order, each checkpoint's input (which is the previous
+        checkpoint's output) will be available when needed.
+
+        Args:
+            grad_output: The gradient output (passed by PyTorch hook mechanism)
+        """
+        for ckpt in self.checkpoints:
+            # Call _recompute for each checkpoint in forward order
+            # The _recompute method will restore the output tensor storage
+            ckpt._recompute(None)
+
+
 class CheckpointWithoutOutput(object):
     """
     Checkpoint a model or part of the model and release the output.
