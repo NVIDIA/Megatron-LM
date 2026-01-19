@@ -3,6 +3,7 @@
 import math
 from types import SimpleNamespace
 
+from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.global_vars import set_args
 from megatron.training.training import build_train_valid_test_data_iterators
 from tests.unit_tests.test_utilities import Utils
@@ -33,22 +34,6 @@ def create_test_args():
     return args
 
 
-def _vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
-    """Pad vocab size so it is divisible by model parallel size and
-    still having GPU friendly size."""
-
-    after = orig_vocab_size
-    multiple = args.make_vocab_size_divisible_by * args.tensor_model_parallel_size
-    after = int(math.ceil(after / multiple) * multiple)
-    if args.rank == 0 and logging_enabled:
-        print(
-            ' > padded vocab (size: {}) with {} dummy tokens '
-            '(new size: {})'.format(orig_vocab_size, after - orig_vocab_size, after),
-            flush=True,
-        )
-    return after
-
-
 class TestTraining:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -77,14 +62,14 @@ class TestTraining:
         for vocab in range(1, 600000, 1000):
             for mult in [1, 17, 32, 64, 128]:
                 args.make_vocab_size_divisible_by = mult
-                assert old_round_impl(vocab, mult) == _vocab_size_with_padding(
+                assert old_round_impl(vocab, mult) == vocab_size_with_padding(
                     vocab, args, False
                 ), (vocab, mult)
 
         for vocab in range(1, 10_000, 500):
             for mult in range(1, 1024 + 1):
                 args.make_vocab_size_divisible_by = mult
-                assert old_round_impl(vocab, mult) == _vocab_size_with_padding(
+                assert old_round_impl(vocab, mult) == vocab_size_with_padding(
                     vocab, args, False
                 ), (vocab, mult)
 

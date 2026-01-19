@@ -35,13 +35,9 @@ from megatron.core.models.retro.utils import (
     get_config_path,
     get_gpt_data_dir,
 )
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_args, initialize_megatron, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.tokenizer.tokenizer import (
-    _BertWordPieceTokenizer,
-    _GPT2BPETokenizer,
-    _GPTSentencePieceTokenizer,
-)
 from megatron.training import get_train_valid_test_num_samples
 from pretrain_gpt import is_dataset_built_on_rank
 from tools.bert_embedding import BertEmbedder, DiskDataParallelBertEmbedder
@@ -114,7 +110,7 @@ def get_gpt_chunk_datasets(config):
         split_preprocessing=config.retro_gpt_split,
         path_to_cache=config.retro_gpt_data_cache_path,
         return_document_ids=True,
-        tokenizer=config.retro_tokenizers.gpt,
+        tokenizer=build_tokenizer(args),
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,

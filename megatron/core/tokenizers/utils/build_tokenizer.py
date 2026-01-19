@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import math
+
 from megatron.core.tokenizers import MegatronTokenizer
 
 MEGATRON_TOKENIZERS = ['BertWordPieceLowerCase', 'BertWordPieceCase', 'GPT2BPETokenizer']
@@ -81,4 +83,24 @@ def build_tokenizer(args, **kwargs):
         tokenizer_path=tokenizer_path, metadata_path=metadata, **kwargs
     )
 
+    # Add vocab size (if not already set from a checkpoint).
+    if getattr(args, "padded_vocab_size", None) is None:
+        args.padded_vocab_size = vocab_size_with_padding(tokenizer.vocab_size, args)
+
     return tokenizer
+
+
+def vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
+    """Pad vocab size so it is divisible by model parallel size and
+    still having GPU friendly size."""
+
+    after = orig_vocab_size
+    multiple = args.make_vocab_size_divisible_by * args.tensor_model_parallel_size
+    after = int(math.ceil(after / multiple) * multiple)
+    if args.rank == 0 and logging_enabled:
+        print(
+            ' > padded vocab (size: {}) with {} dummy tokens '
+            '(new size: {})'.format(orig_vocab_size, after - orig_vocab_size, after),
+            flush=True,
+        )
+    return after

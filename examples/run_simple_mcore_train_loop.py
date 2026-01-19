@@ -20,10 +20,10 @@ from megatron.core.datasets.blended_megatron_dataset_builder import (
     BlendedMegatronDatasetBuilder,
 )
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
-from megatron.training.tokenizer.tokenizer import _NullTokenizer
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.tokenizers import MegatronTokenizer
 
 
 _SEQUENCE_LENGTH: int = 64
@@ -102,7 +102,10 @@ def get_train_data_iterator() -> Iterator:
         reset_position_ids=False,
         reset_attention_mask=False,
         eod_mask_loss=False,
-        tokenizer=_NullTokenizer(vocab_size=_SEQUENCE_LENGTH),
+        tokenizer=MegatronTokenizer.from_pretrained(
+            metdata_path={"library": "null-text"},
+            vocab_size=_SEQUENCE_LENGTH,
+        ),
         mid_level_dataset_surplus=0.005,
     )
 

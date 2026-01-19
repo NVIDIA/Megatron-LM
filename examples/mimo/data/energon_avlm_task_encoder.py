@@ -39,7 +39,6 @@ from megatron.energon import (
 )
 from megatron.energon.task_encoder.base import stateless
 from megatron.training import get_args
-from megatron.training.tokenizer.multimodal_tokenizer import mistral_custom_template
 
 IMAGE_TOKEN = "<image>"
 AUDIO_TOKEN = "<audio>"
