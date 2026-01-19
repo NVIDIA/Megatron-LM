@@ -156,7 +156,7 @@ class TestLayerWiseOptimizer:
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])
     def test_allgather_params(self, tp, pp):
-        """Test that parameter broadcasting works correctly across DP ranks."""
+        """Test that parameter allgather works correctly across DP ranks."""
         if tp * pp > 8:
             pytest.skip(f"TP*PP > 8 is larger than world size")
 
@@ -179,7 +179,7 @@ class TestLayerWiseOptimizer:
             for name, param in model[0].named_parameters():
                 original_params[name] = param.data.clone()
 
-            # Call broadcast (should be idempotent if no updates)
+            # Call allgather (should be idempotent if no updates)
             optimizer.allgather_params()
 
             # Check params are unchanged after broadcast without step
