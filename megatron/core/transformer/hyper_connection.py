@@ -156,7 +156,7 @@ class HyperConnectionModule(MegatronModule):
         # Todo: kernel fusion
         # x_norm = self.norm(x)  # [s, b, n*C]
         r = x.norm(dim=-1, keepdim=True) / math.sqrt(nC) # shape: [s, b, 1]
-
+        r = 1.0 / (r + 1e-8) # shape: [s, b, 1]
         # Project to mapping space
         proj = self.mapping_proj(x)  # [s, b, n^2 + 2n]
         
