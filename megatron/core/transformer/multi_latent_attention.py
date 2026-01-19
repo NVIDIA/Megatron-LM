@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
 import torch
+import torch.nn.functional as F
 
 try:
     from einops import rearrange
@@ -276,6 +277,12 @@ class MultiLatentAttention(Attention):
         if value is not None:
             value = value.contiguous()
 
+        thd_qkv_format = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        orig_v_dim = value.shape[-1] if value is not None else None
+        if thd_qkv_format and value is not None and query.shape[-1] != orig_v_dim:
+            # Pad V so THD attention can run when Q/V head dims differ.
+            value = F.pad(value, [0, query.shape[-1] - orig_v_dim])
+
         # ==================================
         # core attention computation
         # ==================================
@@ -338,7 +345,13 @@ class MultiLatentAttention(Attention):
             # Flatten back: [seq, batch, num_heads * v_head_dim]
             core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if thd_qkv_format:
+            if core_attn_out.ndim == 2 and value is not None:
+                core_attn_out = core_attn_out.reshape(
+                    *core_attn_out.shape[:-1], -1, value.shape[-1]
+                )
+            if orig_v_dim is not None and query.shape[-1] != orig_v_dim:
+                core_attn_out = core_attn_out[..., :orig_v_dim]
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
