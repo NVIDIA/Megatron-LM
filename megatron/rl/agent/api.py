@@ -67,8 +67,8 @@ class TokenRollout(AgentBaseModel):
 class ContrastiveRollout(AgentBaseModel):
     """Contrastive/Preference data for language-based Rollout."""
 
-    chosen_trajectory: [str]
-    rejected_trajectory: [str]
+    chosen_trajectory: list[str]
+    rejected_trajectory: list[str]
 
 
 class Head2HeadRolloutRequest(Request):
