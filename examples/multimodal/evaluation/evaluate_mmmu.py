@@ -104,7 +104,7 @@ def mmmu_eval(input_path, groundtruth_path):
     print(output.stderr)
     print(output.stdout)
 
-    m = re.search("'Overall': {'num': \d+, 'acc': (\d.\d+)}", output.stdout)
+    m = re.search(r"'Overall': {'num': \d+, 'acc': (\d\.\d+)}", output.stdout)
 
     return float(m.group(1)) * 100.0
 
