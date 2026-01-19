@@ -459,3 +459,21 @@ def test_prepare_trajectories_with_sequence_packing(mock_rank):
     assert trajs[1, 1] == 5
     assert trajs[1, 4] == tokenizer.eod
     assert trajs[1, 5] == tokenizer.pad
+
+
+def test_single_turn_advantage_calculation():
+    rewards = [[-1, 1], [4, 4]]
+    num_turns = [[1, 1], [1, 1]]
+    advs = rl_utils.calculate_grpo_advantages(rewards, num_turns)
+    torch.testing.assert_close(
+        torch.tensor(advs), torch.tensor([-1, 1.0, 0.0, 0.0]), atol=1e-4, rtol=1e-5
+    )
+
+
+def test_multi_turn_advantage_calculation():
+    rewards = [[-1, 1], [4, 4]]
+    num_turns = [[2, 1], [1, 3]]
+    advs = rl_utils.calculate_grpo_advantages(rewards, num_turns)
+    torch.testing.assert_close(
+        torch.tensor(advs), torch.tensor([-1, -1, 1.0, 0.0, 0.0, 0.0, 0.0]), atol=1e-4, rtol=1e-5
+    )

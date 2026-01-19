@@ -645,6 +645,33 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             return logprobs
 
 
+def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]]) -> np.ndarray:
+    """Calculate GRPO advantages from rewards/num_turns.
+
+    For multiturn rollouts, the logic is a bit more involved.
+    # For training, we'll be turning each turn into a trajectory with the same reward
+    # within a trajectory, e.g. if [[a,b],[c,d,e]] trajectory has reward 1.0, we will
+    # get [a,b] with 1.0 and [c,d,e] with 1.0 when doing updates.
+    """
+
+    rewards = np.array(rewards)
+
+    num_turns = np.array(num_turns)
+    # Each outer dimension of num_turns is a group. Sum of those gives total num_turns per group.
+    # Let's use this to calculate advantage.
+    # mean/std should be repeated based on group lens
+    group_turns = num_turns.sum(axis=-1)
+    reward_means = rewards.mean(axis=1, keepdims=True).repeat(group_turns)
+    reward_stds = rewards.std(axis=1, keepdims=True).repeat(group_turns)
+
+    # rewards are originally [g, group_size]
+    # Making an assumption that all groups are of the same size!
+    # @vitalyk: this will go away when we start sending env-based sample reqs.
+    rewards = rewards.flatten().repeat(num_turns.flatten())
+
+    return ((rewards - reward_means) / (1e-4 + reward_stds)).tolist()
+
+
 def compute_group_stats(
     rollouts: GroupedRollouts, tokenizer: MegatronLegacyTokenizer, seq_len: int,
 ) -> RolloutStats:
@@ -665,10 +692,14 @@ def compute_group_stats(
     group_length_stds = []
     group_length_maxs = []
     group_length_mins = []
+    rewards = []
+    num_turns = [] # num_turns per traj
     for group in rollouts:
         group_rewards = []
         group_lengths = []
+        group_num_turns = []
         for rollout in group:
+            group_num_turns.append(len(rollout.trajectory))
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
                     detokenized_traj = tokenizer.detokenize(turn_traj)
@@ -691,10 +722,13 @@ def compute_group_stats(
         group_length_mins.append(min(group_lengths))
         group_reward_means.append(np.mean(group_rewards))
         group_reward_stds.append(np.std(group_rewards))
+        rewards.extend(group_rewards)
         group_length_means.append(np.mean(group_lengths))
         # https://arxiv.org/abs/2504.21233 reports that lens variants hurts.
         # Let's track this.
         group_length_stds.append(np.std(group_lengths))
+        num_turns.append(group_num_turns)
+
     stats = RolloutStats(
         mean_reward=np.mean(group_reward_means),
         mean_length=np.mean(group_length_means),
@@ -712,8 +746,8 @@ def compute_group_stats(
         min_inf_prob=None,
         max_inf_prob=None,
         mean_inf_prob=None,
-        rewards=None,  # We will fill those in later in prepare_data_for_update.
-        advantages=None,  # We will fill those in later in prepare_data_for_update.
+        rewards=[r for group in rewards for r in group],
+        advantages=calculate_grpo_advantages(rewards, num_turns),
     )
     return stats
 
@@ -891,8 +925,7 @@ def prepare_trajectories(
                 else:
                     inference_logprobs.append(None)
 
-            env_id = rollout.env_id
-            env_id_counts[env_id] += 1
+            env_id_counts[rollout.env_id] += 1
 
     logger.info(f"[{dist.get_rank()}] Rollout counts:")
     for env_id, count in env_id_counts.items():
@@ -989,30 +1022,10 @@ def prepare_data_for_update(
 
     with nvtx_range("prepare-data-for-update"):
         with nvtx_range("compute-group-stats"):
-            # These are computed on all rollouts for reporting purposes
             group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
-            rewards = np.array([[rollout.reward for rollout in group] for group in rollouts])
-            group_stats.rewards = rewards.flatten().tolist()
-            group_stats.advantages = (
-                (
-                    (rewards - rewards.mean(axis=1, keepdims=True))
-                    / (1e-4 + rewards.std(axis=1, keepdims=True))
-                )
-                .flatten()
-                .tolist()
-            )
-            global_rollout_count = len(group_stats.rewards)
 
         with nvtx_range("prepare_advantages", time=True):        
-            # [g, group_size]
-            # Making an assumption that all groups are of the same size!
-            rewards = torch.tensor(rewards, device='cpu')
-            advantages = (rewards - rewards.mean(axis=1, keepdim=True)) / (
-                1e-4 + rewards.std(axis=1, keepdim=True)
-            )
-
-            # Flatten advantages for training and move to GPU
-            advantages = global_advantages = advantages.view(-1).cuda()
+            advantages = global_advantages = advantages.cuda()
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
@@ -1024,6 +1037,7 @@ def prepare_data_for_update(
                 mpu.get_data_parallel_rank() * data_split_size,
                 (mpu.get_data_parallel_rank() + 1) * data_split_size,
             )
+            # TODO(vitalyk): This has to be rewritten assuming we are multiturn now.
             rollouts = rollouts[data_split_range[0] : data_split_range[1]]
             # First we calculate them on a global level and then we split and recalculate on a local level.
             # Sequence packing and reporting needs it global but non-packing wants it local.
@@ -1231,7 +1245,7 @@ def prepare_data_for_update(
                runtime_state.global_batches_per_collection = optimizer_steps
             else:
                 runtime_state.packing_context = None
-                runtime_state.global_batches_per_collection = global_rollout_count / args.global_batch_size
+                runtime_state.global_batches_per_collection = len(group_stats.rewards) / args.global_batch_size
                 dataset_tensors = [
                     compute_trajs,
                     advantages,
@@ -1261,35 +1275,22 @@ def prepare_data_for_update(
     return RerunDataIterator(itertools.cycle(loader))
 
 
-def get_rollout_data_iterator(
+def get_grpo_data_iterator(
     model: LanguageModule,
     inference_model: LanguageModule | None,
     optimizer: MegatronOptimizer,
     iteration: int,
     ref_state_dict: Dict[str, torch.Tensor],
-) -> RerunDataIterator:
-
-    args = get_args()
-    tokenizer = get_tokenizer()
-
-    buffered_rollouts = get_environment_rollouts(
-        model, inference_model, optimizer, args.grpo_prompts_per_step, args.grpo_group_size
-    )
-    buffered_rollouts = prepare_data_for_update(model, ref_state_dict, buffered_rollouts, tokenizer)
-
-    return buffered_rollouts
-
-
-def setup_grpo_data_iterator(
-    model: LanguageModule,
-    inference_model: LanguageModule | None,
-    optimizer: MegatronOptimizer,
-    iteration: int,
-    ref_state_dict: Dict[str, torch.Tensor],
+    grpo_iterations: int,
+    grpo_prompts_per_step: int,
+    grpo_group_size: int,
     buffered_rollouts: RerunDataIterator | None = None,
 ) -> RerunDataIterator:
     """
-    Set up the data iterator for GRPO training.
+    Get the data iterator for GRPO training.
+
+    Depending on the sampling parameters either performs data collections or returns
+    the buffered_rollouts as is.
 
     Args:
         model: The language model
@@ -1297,11 +1298,13 @@ def setup_grpo_data_iterator(
         iteration: Current training iteration
         ref_state_dict: Reference model state dict for GRPO
         buffered_rollouts: Previously collected rollouts (if any)
+        grpo_iterations: How many steps we reuse the sampled data for.
+        grpo_prompts_per_step: How many prompts we sample per data collection.
+        grpo_group_size: How many samples we do per prompt.
 
     Returns:
         RerunDataIterator for the current training step
     """
-    args = get_args()
     runtime_state = get_rl_runtime_state()
 
     if inference_model is not None:
@@ -1313,14 +1316,16 @@ def setup_grpo_data_iterator(
     if (
         buffered_rollouts is None or
         iteration == runtime_state.last_collection_iteration + 
-        (args.grpo_iterations * runtime_state.global_batches_per_collection)
+        (grpo_iterations * runtime_state.global_batches_per_collection)
     ):
-        train_data_iterator = get_rollout_data_iterator(model,inference_model, optimizer, iteration, ref_state_dict)
-        runtime_state.reset_iteration_counters(iteration)
-    else:
-        train_data_iterator = buffered_rollouts
 
-    return train_data_iterator
+        buffered_rollouts = get_environment_rollouts(
+            model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
+        )
+        buffered_rollouts = prepare_data_for_update(model, ref_state_dict, buffered_rollouts, get_tokenizer())
+        runtime_state.reset_iteration_counters(iteration)
+
+    return buffered_rollouts
 
 
 def evaluate_and_print_results_rl(
