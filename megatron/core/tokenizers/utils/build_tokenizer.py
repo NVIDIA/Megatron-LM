@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 import math
 
 from megatron.core.tokenizers import MegatronTokenizer
@@ -7,6 +8,8 @@ from megatron.core.tokenizers import MegatronTokenizer
 MEGATRON_TOKENIZERS = ['BertWordPieceLowerCase', 'BertWordPieceCase', 'GPT2BPETokenizer']
 
 SP_TOKENIZERS = ['SentencePieceTokenizer', 'GPTSentencePieceTokenizer', 'Llama2Tokenizer']
+
+logger = logging.getLogger(__name__)
 
 
 def build_tokenizer(args, **kwargs):
@@ -98,7 +101,7 @@ def vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
     multiple = args.make_vocab_size_divisible_by * args.tensor_model_parallel_size
     after = int(math.ceil(after / multiple) * multiple)
     if args.rank == 0 and logging_enabled:
-        print(
+        logger.info(
             ' > padded vocab (size: {}) with {} dummy tokens '
             '(new size: {})'.format(orig_vocab_size, after - orig_vocab_size, after),
             flush=True,
