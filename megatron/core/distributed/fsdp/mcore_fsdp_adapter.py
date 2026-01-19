@@ -392,7 +392,8 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
         == outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()
     ), (
         f"[Megatron-FSDP] DP-TP mesh size {len(dp_tp_meshes[0].reshape(-1).tolist())} "
-        f"does not match expected size {outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()}."
+        f"does not match the expected size"
+        f"{outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()}."
     )
     return dp_tp_meshes[0]
 
