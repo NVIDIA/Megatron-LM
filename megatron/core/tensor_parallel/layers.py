@@ -11,7 +11,15 @@ from typing import Any, Callable, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-
+# Import BitNet quantization kernels
+try:
+    from onebitllms import activation_quant_triton, weight_quant_triton
+    HAVE_ONEBIT = True
+except ImportError:
+    HAVE_ONEBIT = False
+    activation_quant_triton = None
+    weight_quant_triton = None
+    
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_global_memory_buffer,
@@ -1319,3 +1327,141 @@ class RowParallelLinear(torch.nn.Module):
             f"{type(self).__name__}(in_features={self.input_size}, "
             f"out_features={self.output_size}, bias={use_bias}, TP={tp})"
         )
+
+class BitNetColumnParallelLinear(ColumnParallelLinear):
+    """
+    BitNet-enabled Column Parallel Linear Layer.
+
+    Extends ColumnParallelLinear with BitNet quantization while maintaining
+    all tensor parallelism functionality. BitNet quantization is applied
+    during training by overriding _forward_impl to quantize activations and weights.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config: ModelParallelConfig,
+        init_method: Callable,
+        bias: bool = True,
+        gather_output: bool = False,
+        stride: int = 1,
+        keep_master_weight_for_test: bool = False,
+        skip_bias_add: bool = False,
+        skip_weight_param_allocation: bool = False,
+        embedding_activation_buffer: Optional[List[torch.Tensor]] = None,
+        grad_output_buffer: Optional[List[torch.Tensor]] = None,
+        is_expert: bool = False,
+        tp_comm_buffer_name: str = None,
+        disable_grad_reduce: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        """
+        Initialize BitNet Column Parallel Linear layer.
+
+        BitNet quantization is automatically enabled when onebitllms is installed.
+        """
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            gather_output=gather_output,
+            stride=stride,
+            keep_master_weight_for_test=keep_master_weight_for_test,
+            skip_bias_add=skip_bias_add,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            embedding_activation_buffer=embedding_activation_buffer,
+            grad_output_buffer=grad_output_buffer,
+            is_expert=is_expert,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            disable_grad_reduce=disable_grad_reduce,
+            tp_group=tp_group,
+        )
+
+        if not HAVE_ONEBIT:
+            raise ImportError(
+                "BitNet requires onebitllms to be installed. "
+                "Install with: pip install onebitllms"
+            )
+
+    def _forward_impl(self, input, weight, *args, **kwargs):
+        """
+        Override parent's _forward_impl to apply BitNet quantization.
+        reference: https://github.com/tiiuae/onebitllms/blob/main/src/onebitllms/layers/bitnet.py
+        
+        Uses the Straight-Through Estimator (STE) pattern from onebitllms:
+            x_quant = x + (quant(x) - x).detach()
+        """
+        # Apply STE quantization pattern (matches onebitllms BitNetLinear.forward)
+        input_quantized = input + (activation_quant_triton(input) - input).detach()
+        weight_quantized = weight + (weight_quant_triton(weight) - weight).detach()
+
+        return super()._forward_impl(input_quantized, weight_quantized, *args, **kwargs)
+
+
+class BitNetRowParallelLinear(RowParallelLinear):
+    """
+    BitNet-enabled Row Parallel Linear Layer.
+
+    Extends RowParallelLinear with BitNet quantization while maintaining
+    all tensor parallelism functionality. BitNet quantization is applied
+    during training by overriding _forward_impl to quantize inputs and weights.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config: ModelParallelConfig,
+        init_method: Callable,
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        stride: int = 1,
+        keep_master_weight_for_test: bool = False,
+        is_expert: bool = False,
+        tp_comm_buffer_name: str = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        """
+        Initialize BitNet Row Parallel Linear layer.
+        BitNet quantization is automatically enabled when onebitllms is installed.
+        """
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            input_is_parallel=input_is_parallel,
+            skip_bias_add=skip_bias_add,
+            stride=stride,
+            keep_master_weight_for_test=keep_master_weight_for_test,
+            is_expert=is_expert,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group,
+        )
+
+        if not HAVE_ONEBIT:
+            raise ImportError(
+                "BitNet requires onebitllms to be installed. "
+                "Install with: pip install onebitllms"
+            )
+
+    def _forward_impl(self, input, weight, *args, **kwargs):
+        """
+        Override parent's _forward_impl to apply BitNet quantization.
+        reference: https://github.com/tiiuae/onebitllms/blob/main/src/onebitllms/layers/bitnet.py
+        
+        Uses the Straight-Through Estimator (STE) pattern from onebitllms:
+            x_quant = x + (quant(x) - x).detach()
+        """
+        # Apply STE quantization pattern (matches onebitllms BitNetLinear.forward)
+        input_quantized = input + (activation_quant_triton(input) - input).detach()
+        weight_quantized = weight + (weight_quant_triton(weight) - weight).detach()
+
+        return super()._forward_impl(input_quantized, weight_quantized, *args, **kwargs)

@@ -1105,7 +1105,12 @@ def validate_args(args, defaults={}):
         args.moe_ffn_hidden_size = args.ffn_hidden_size
         if args.rank == 0:
             print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
-
+            
+    # BitNet validation
+    if args.use_bitnet:
+        assert args.transformer_impl == 'local', \
+            'BitNet training requires --transformer-impl local , we  will use onebitllm triton kernels for BitNet fwd and bwd pass ' \
+                
     # Context parallel
     if args.context_parallel_size > 1:
         assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
@@ -2490,6 +2495,8 @@ def _add_training_args(parser):
                        'This will significantly affect speed of training and inference as the kernels are not full optimized.')
     group.add_argument('--disable-jit-fuser', action='store_true',
                        help='Disable the JIT fuser.')
+    group.add_argument('--use-bitnet', action='store_true',
+                    help='Pretraining bitnet')
 
     return parser
 

@@ -81,7 +81,12 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             else:
                 # Define the decoder block spec
                 decoder_layer_specs = get_gpt_decoder_layer_specs(
-                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
+                    config,
+                    use_transformer_engine=use_te,
+                    normalization=args.normalization,
+                    qk_l2_norm=args.qk_l2_norm,
+                    use_bitnet=args.use_bitnet,
+                    vp_stage=vp_stage,
                 )
                 transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
             # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
@@ -116,12 +121,12 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
 
 def _get_transformer_layer_spec(use_te, config):
     """Get transformer layer specification based on configuration.
-    
+
     Args:
         use_te (bool): Whether to use Transformer Engine
         args: Training arguments
         config: Model configuration
-        
+
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
