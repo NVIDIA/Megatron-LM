@@ -113,6 +113,8 @@ def check_checkpoint_args(checkpoint_args):
         _compare('tokenizer_type')
     if args.data_parallel_random_init:
         _compare('data_parallel_random_init')
+    if args.phase_transition_iterations:
+        _compare('global_batch_size')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size',
                  old_arg_name='model_parallel_size')
@@ -1473,13 +1475,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             ckpt_args = state_dict.get("args")
 
         if not hasattr(ckpt_args, "tensor_model_parallel_size"):
-            print_rank_0("WARNING: TP size not found in checkpoint args, using 0 as default.")
+            print_rank_0("WARNING: TP size not found in checkpoint args, using 1 as default.")
         if not hasattr(ckpt_args, "pipeline_model_parallel_size"):
-            print_rank_0("WARNING: PP size not found in checkpoint args, using 0 as default.")
+            print_rank_0("WARNING: PP size not found in checkpoint args, using 1 as default.")
 
         ckpt_tp_pp = (
-            getattr(ckpt_args, "tensor_model_parallel_size", 0),
-            getattr(ckpt_args, "pipeline_model_parallel_size", 0),
+            getattr(ckpt_args, "tensor_model_parallel_size", 1),
+            getattr(ckpt_args, "pipeline_model_parallel_size", 1),
         )
         run_tp_pp = (
             args.tensor_model_parallel_size,
