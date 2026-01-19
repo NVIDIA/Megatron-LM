@@ -215,10 +215,13 @@ def fp8_set_raw_data(tensor: torch.Tensor, data: torch.Tensor, set_transpose: bo
         data_attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
 
     old_data = getattr(tensor, data_attr)
-    assert old_data.dtype == data.dtype, "The data types of raw data don't match"
-    assert (
-        old_data.shape == data.shape
-    ), f"Shape {old_data.shape} of old_data doesn't match {data.shape} of new_data"
+    if old_data is not None:
+        assert (
+            old_data.dtype == data.dtype
+        ), f"The data types of raw data don't match {old_data.dtype} vs {data.dtype}"
+        assert (
+            old_data.shape == data.shape
+        ), f"Shape {old_data.shape} of old_data doesn't match {data.shape} of new_data"
     setattr(tensor, data_attr, data)
 
 
