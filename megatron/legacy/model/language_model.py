@@ -360,7 +360,7 @@ class TransformerLanguageModel(MegatronModule):
         self.decoder_attn_mask_type = decoder_attn_mask_type
         self.add_pooler = add_pooler
         self.encoder_hidden_state = None
-        self.add_retriever = args.retro_add_retriever
+        self.add_retriever = False
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
 
         # Embeddings.
@@ -399,9 +399,7 @@ class TransformerLanguageModel(MegatronModule):
         if self.add_encoder:
             self.encoder = ParallelTransformer(
                 config,
-                model_type=(
-                    args.model_type if not args.retro_add_retriever else ModelType.retro_decoder
-                ),
+                model_type=args.model_type,
                 self_attn_mask_type=self.encoder_attn_mask_type,
                 pre_process=self.pre_process,
                 post_process=self.post_process,

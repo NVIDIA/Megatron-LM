@@ -6,14 +6,6 @@ import torch
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.validation import StrictHandling
-from megatron.core.models.retro.decoder_spec import (
-    get_retro_decoder_layer_local_spec,
-    get_retro_decoder_layer_te_spec,
-)
-from megatron.core.models.retro.encoder_spec import (
-    get_retro_encoder_layer_local_spec,
-    get_retro_encoder_layer_te_spec,
-)
 from megatron.core.models.T5 import T5Model
 from megatron.core.models.T5.t5_spec import decoder_model_with_local_spec as t5_decoder_local_spec
 from megatron.core.models.T5.t5_spec import (
@@ -96,11 +88,9 @@ class TestT5Model:
         enc_dec_spec_fn = {
             'te': {
                 't5': (t5_encoder_te_spec, t5_decoder_te_spec),
-                'retro': (get_retro_encoder_layer_te_spec, get_retro_decoder_layer_te_spec),
             },
             'local': {
                 't5': (t5_encoder_local_spec, t5_decoder_local_spec),
-                'retro': (get_retro_encoder_layer_local_spec, get_retro_decoder_layer_local_spec),
             },
         }
         src_encoder_decoder_spec_fn = enc_dec_spec_fn[src_spec_type][model_type]
@@ -157,11 +147,9 @@ class TestT5ModelReconfiguration:
         enc_dec_spec_fn = {
             'te': {
                 't5': (t5_encoder_te_spec, t5_decoder_te_spec),
-                'retro': (get_retro_encoder_layer_te_spec, get_retro_decoder_layer_te_spec),
             },
             'local': {
                 't5': (t5_encoder_local_spec, t5_decoder_local_spec),
-                'retro': (get_retro_encoder_layer_local_spec, get_retro_decoder_layer_local_spec),
             },
         }
 
