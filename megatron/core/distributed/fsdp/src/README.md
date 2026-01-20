@@ -116,6 +116,10 @@ fully_shard(model)
 # Your model is now ready for distributed training!
 ```
 
+### `torch.compile` support
+
+Megatron-FSDP supports `torch.compile`, but this feature is still experimental and may introduce performance regressions in some workloads.
+
 ## `fully_shard` / `MegatronFSDP` API - Advanced Features
 
 Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fine-tuning your model's performance:
