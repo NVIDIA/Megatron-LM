@@ -18,8 +18,9 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import internal_api
+from megatron.core.utils import deprecated
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -39,10 +40,6 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
-
-
-# MOE logging
-_MOE_LAYER_WISE_LOGGING_TRACKER = {}
 
 
 def switch_load_balancing_loss_func(
@@ -789,8 +786,9 @@ def save_to_aux_losses_tracker(
     num_layers: int,
     reduce_group: torch.distributed.ProcessGroup = None,
     avg_group: torch.distributed.ProcessGroup = None,
+    percentiles: Optional[List[float]] = None,
     reduce_group_has_dp: bool = False,
-):
+) -> None:
     """Save the auxiliary loss for logging.
     Args:
         name (str): The name of the loss.
@@ -799,76 +797,43 @@ def save_to_aux_losses_tracker(
         num_layers (int): The number of total layers.
         reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
         avg_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+        percentiles (List[float], optional): List of percentiles to compute for logging.
         reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
             Set this to True if the reduce group has data parallel ranks. This flag is used to
             ensure the correct reduction in aux loss tracking.
     """
-    # Skip aux loss logging if layer_number is None.
-    if layer_number is None:
-        return
-
-    tracker = get_moe_layer_wise_logging_tracker()
-    if name not in tracker:
-        tracker[name] = {}
-        tracker[name]["values"] = torch.zeros(num_layers, device=loss.device)
-    tracker[name]["values"][layer_number - 1] += loss.detach()  # Aggregate the loss for the layer.
-    tracker[name]["reduce_group"] = reduce_group
-    tracker[name]["avg_group"] = avg_group
-    tracker[name]["reduce_group_has_dp"] = reduce_group_has_dp
+    MoEMetricsTracker.get_instance().record(
+        name=name,
+        value=loss,
+        layer_number=layer_number,
+        num_layers=num_layers,
+        reduce_group=reduce_group,
+        avg_group=avg_group,
+        percentiles=percentiles,
+        reduce_group_has_dp=reduce_group_has_dp,
+    )
 
 
-def clear_aux_losses_tracker():
+def clear_aux_losses_tracker() -> None:
     """Clear the auxiliary losses."""
-    tracker = get_moe_layer_wise_logging_tracker()
-    for name in tracker:
-        tracker[name]["values"].zero_()
+    MoEMetricsTracker.get_instance().clear()
 
 
 def reduce_aux_losses_tracker_across_ranks(
     track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
 ):
-    """Collect and reduce the auxiliary losses across ranks."""
-    tracker = get_moe_layer_wise_logging_tracker()
-    if track_names is None:
-        track_names = tracker.keys()
-
-    if pg_collection is None:
-        # Use parallel_state groups
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        dp_group = parallel_state.get_data_parallel_group(
-            with_context_parallel=False, partial_data_parallel=False
-        )
-    else:
-        pp_group = pg_collection.pp
-        dp_group = pg_collection.dp
-
-    for name in track_names:
-        values = tracker[name]["values"]
-        # TODO(Hepteract): delete the usage of the global parallel_state.
-        # Collect aux losses across PP.
-        torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce aux losses across ranks.
-        if tracker[name].get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
-            # Need to conduct reduction across data parallel ranks. When the reduce_group
-            # does not have 'dp' attribute, do it manually.
-            if not tracker[name].get('reduce_group_has_dp', False):
-                torch.distributed.all_reduce(
-                    values,
-                    group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-                    op=torch.distributed.ReduceOp.AVG,
-                )
-        if tracker[name].get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
-        # Average aux losses across data parallel ranks.
-        # The `global_load_balancing_loss` already uses `tp_dp_cp_group` in `reduce_group`,
-        # so we don't need to reduce it again. Others use `tp_cp_group` in `reduce_group`.
-        if name != "global_load_balancing_loss":
-            torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+    """Reduce the auxiliary losses across ranks."""
+    MoEMetricsTracker.get_instance()._reduce_across_ranks(track_names, pg_collection)
 
 
+def get_moe_layer_wise_logging_tracker():
+    """Return the moe layer wise tracker in legacy dict format."""
+    return MoEMetricsTracker.get_instance().get_raw_tracker()
+
+
+@deprecated(
+    version="0.15", removal_version="0.17", alternative="MoEMetricsTracker.get_instance().track()"
+)
 def track_moe_metrics(
     loss_scale: float,
     iteration: int,
@@ -882,69 +847,24 @@ def track_moe_metrics(
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
-):
-    """Track the MoE metrics for logging."""
-    # Aux loss logging
-    tracker = get_moe_layer_wise_logging_tracker()
-    # Initialize the tracker if force_initialize is True
-    if force_initialize:
-        if track_names is not None:
-            for key in track_names:
-                if key not in tracker:
-                    tracker[key] = {}
-                    tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
-                    tracker[key]["reduce_group"] = None
-                    tracker[key]["avg_group"] = None
-                    tracker[key]["reduce_group_has_dp"] = False
+) -> str:
+    """Track the MoE metrics for logging.
 
-    reduce_aux_losses_tracker_across_ranks(track_names, pg_collection=pg_collection)
-
-    # Get number of MoE layers
-    if moe_layer_freq is None:
-        num_moe_layers = num_layers
-    elif isinstance(moe_layer_freq, int):
-        assert isinstance(num_layers, int)
-        moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
-        num_moe_layers = sum(moe_layer_pattern)
-    elif isinstance(moe_layer_freq, list):
-        num_moe_layers = sum(moe_layer_freq)
-    else:
-        raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
-
-    if mtp_num_layers is not None:
-        num_moe_layers += mtp_num_layers
-
-    aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
-    for name, loss_list in aux_losses.items():
-        if total_loss_dict is not None:
-            if name not in total_loss_dict:
-                total_loss_dict[name] = loss_list.sum() / num_moe_layers
-            else:
-                total_loss_dict[name] += loss_list.sum() / num_moe_layers
-        if writer is not None:
-            # currently when using add_scalars,
-            # torch.utils.add_scalars makes each timer its own run, which
-            # polutes the runs list, so we just add each as a scalar
-            writer.add_scalar(name, loss_list.sum() / num_moe_layers, iteration)
-            if per_layer_logging:
-                for i, loss in enumerate(loss_list.tolist()):
-                    writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
-
-            # W&B logging lacks support for logging multiple scalars simultaneously.
-            # As a workaround, we log each scalar individually first, then we can create
-            # a custom panel to manually group them to a single plot.
-            if wandb_writer:
-                wandb_writer.log({f"{name}": loss_list.sum() / num_moe_layers}, iteration)
-                if per_layer_logging:
-                    wandb_writer.log(
-                        {
-                            f"moe/{name}_layer_{i}": loss
-                            for i, loss in enumerate(loss_list.tolist())
-                        },
-                        iteration,
-                    )
-
-    clear_aux_losses_tracker()
+    Deprecated: Use MoEMetricsTracker.get_instance().track() directly.
+    """
+    return MoEMetricsTracker.get_instance().track(
+        loss_scale=loss_scale,
+        iteration=iteration,
+        writer=writer,
+        wandb_writer=wandb_writer,
+        per_layer_logging=per_layer_logging,
+        force_initialize=force_initialize,
+        names=track_names,
+        num_layers=num_layers,
+        moe_layer_freq=moe_layer_freq,
+        mtp_num_layers=mtp_num_layers,
+        pg_collection=pg_collection,
+    )
 
 
 def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_rate):
@@ -986,13 +906,6 @@ def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
     return tensor
 
 
-def get_moe_layer_wise_logging_tracker():
-    """Return the moe layer wise tracker."""
-    global _MOE_LAYER_WISE_LOGGING_TRACKER
-    return _MOE_LAYER_WISE_LOGGING_TRACKER
-
-
-@internal_api
 class RandomSTE(torch.autograd.Function):
     """
     Straight-Through Estimator(STE) function that returns random values
