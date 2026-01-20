@@ -200,17 +200,7 @@ class MLP(MegatronModule):
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
             if self.config.gated_linear_unit:
-
-                def glu(x):
-                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                    if (val := self.config.activation_func_clamp_value) is not None:
-                        x_glu = x_glu.clamp(min=None, max=val)
-                        x_linear = x_linear.clamp(min=-val, max=val)
-                    return self.config.activation_func(x_glu) * (
-                        x_linear + self.config.glu_linear_offset
-                    )
-
-                intermediate_parallel = glu(intermediate_parallel)
+                intermediate_parallel = self._glu(intermediate_parallel)
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
@@ -232,6 +222,16 @@ class MLP(MegatronModule):
             output_bias = None
 
         return output, output_bias
+
+    def _glu(self, x):
+        """
+        Gated Linear Unit function.
+        """
+        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+        if (val := self.config.activation_func_clamp_value) is not None:
+            x_glu = x_glu.clamp(min=None, max=val)
+            x_linear = x_linear.clamp(min=-val, max=val)
+        return self.config.activation_func(x_glu) * (x_linear + self.config.glu_linear_offset)
 
     # pylint: disable=missing-function-docstring
     def sharded_state_dict(
