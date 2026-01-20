@@ -194,10 +194,7 @@ def test_param_to_index_alignment_with_padding():
         local_start, local_end = bucket.param_to_index[param]
 
         # param_to_index should match the padded offsets used in the global buffer.
-        assert (local_start, local_end) == (
-            expected_local_start,
-            expected_local_end,
-        )
+        assert (local_start, local_end) == (expected_local_start, expected_local_end)
 
         # At least one param should have been padded relative to naive packing.
         if local_start != naive_offset:
