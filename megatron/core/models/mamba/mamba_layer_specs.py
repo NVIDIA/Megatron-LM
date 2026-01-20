@@ -28,12 +28,36 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayerSubmodules,
 )
 
+# This should be private and should not be used outside of this file.
 moe = get_moe_module_spec(
     use_te=True,
     num_experts=8,  # Can be any positive integer (must not be None).
     moe_grouped_gemm=True,
     moe_use_legacy_grouped_gemm=False,
 )
+
+
+# MTP block spec for Mamba - provides norms and projection only.
+# Inner layers are built by MultiTokenPredictionLayer using the shared
+# layer_builder with mtp_layer_pattern and mamba_submodules.
+_mamba_mtp_block_spec = ModuleSpec(
+    module=MultiTokenPredictionBlock,
+    submodules=MultiTokenPredictionBlockSubmodules(
+        layer_specs=[
+            ModuleSpec(
+                module=MultiTokenPredictionLayer,
+                submodules=MultiTokenPredictionLayerSubmodules(
+                    enorm=TENorm,
+                    hnorm=TENorm,
+                    eh_proj=TEColumnParallelLinear,
+                    mtp_model_layer=None,  # Built via pattern + mamba_submodules
+                    layer_norm=TENorm,
+                ),
+            )
+        ]
+    ),
+)
+
 
 mamba_stack_spec = ModuleSpec(
     module=MambaStack,
@@ -90,6 +114,7 @@ mamba_stack_spec = ModuleSpec(
                 pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
         ),
+        mtp_block_spec=_mamba_mtp_block_spec,
     ),
 )
 
@@ -151,53 +176,6 @@ mamba_inference_stack_spec = ModuleSpec(
                 pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
         ),
+        mtp_block_spec=_mamba_mtp_block_spec,
     ),
 )
-
-
-def get_mamba_mtp_block_spec(use_te: bool = True) -> ModuleSpec:
-    """MTP block spec for Mamba using unified pattern syntax.
-
-    This spec provides norms and projection only - inner layers are built
-    by MultiTokenPredictionLayer using the shared layer_builder with
-    mtp_layer_pattern and mamba_submodules passed from MambaModel.
-
-    The number of MTP depths is determined by the parsed unified pattern
-    (e.g., "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths).
-
-    Args:
-        use_te: Whether to use TransformerEngine modules (default: True)
-
-    Returns:
-        ModuleSpec for MultiTokenPredictionBlock
-
-    Example:
-        >>> mtp_spec = get_mamba_mtp_block_spec()
-        >>> mtp_block = MultiTokenPredictionBlock(
-        ...     config=config,
-        ...     spec=mtp_spec,
-        ...     mtp_layer_pattern="MM",
-        ...     mtp_num_depths=2,
-        ...     mamba_submodules=mamba_stack_spec.submodules,
-        ... )
-    """
-    norm = TENorm if use_te else TENorm  # Fallback to TENorm for now
-    linear = TELayerNormColumnParallelLinear if use_te else TELayerNormColumnParallelLinear
-
-    return ModuleSpec(
-        module=MultiTokenPredictionBlock,
-        submodules=MultiTokenPredictionBlockSubmodules(
-            layer_specs=[
-                ModuleSpec(
-                    module=MultiTokenPredictionLayer,
-                    submodules=MultiTokenPredictionLayerSubmodules(
-                        enorm=norm,
-                        hnorm=norm,
-                        eh_proj=linear,
-                        mtp_model_layer=None,  # Built via pattern + mamba_submodules
-                        layer_norm=norm,
-                    ),
-                )
-            ]
-        ),
-    )

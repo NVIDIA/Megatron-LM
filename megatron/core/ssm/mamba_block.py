@@ -45,6 +45,7 @@ class MambaStackSubmodules:
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
+    mtp_block_spec: Optional[ModuleSpec] = None
 
 
 class MambaStack(MegatronModule):
@@ -110,15 +111,11 @@ class MambaStack(MegatronModule):
         self.hybrid_override_pattern = hybrid_override_pattern
         self.pg_collection = pg_collection
 
-        # Parse pattern - extract only main pattern, MTP handled by MambaModel
-        parsed = parse_hybrid_pattern(hybrid_override_pattern)
-        main_pattern = parsed.main_pattern  # MTP pattern ignored here
-
         self.layer_type_list = allocate_layers(
-            self.config.num_layers if self.config.num_layers is not None else len(main_pattern),
+            self.config.num_layers if self.config.num_layers is not None else len(self.hybrid_override_pattern),
             self.hybrid_attention_ratio,
             self.hybrid_mlp_ratio,
-            main_pattern,
+            self.hybrid_override_pattern,
         )
 
         pp_layer_offset = 0

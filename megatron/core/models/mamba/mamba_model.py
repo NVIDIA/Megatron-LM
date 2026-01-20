@@ -16,7 +16,10 @@ from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+from megatron.core.transformer.multi_token_prediction import (
+    mtp_on_this_rank,
+    MultiTokenPredictionBlock,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     WrappedTensor,
@@ -114,7 +117,7 @@ class MambaModel(LanguageModule):
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
-            self.mtp_pattern is not None and self.mtp_num_depths > 0 and self.post_process
+            self.mtp_pattern is not None and self.mtp_num_depths > 0 and mtp_on_this_rank(self.config, vp_stage=self.vp_stage)
         )
 
         # Cache for RoPE tensors which do not change between iterations.
@@ -151,18 +154,20 @@ class MambaModel(LanguageModule):
             pre_process=self.pre_process,
             hybrid_attention_ratio=self.hybrid_attention_ratio,
             hybrid_mlp_ratio=self.hybrid_mlp_ratio,
-            hybrid_override_pattern=self.hybrid_override_pattern,
+            hybrid_override_pattern=parsed.main_pattern,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
         )
 
-        # MTP block (MambaModel creates it, MTP builds its own inner layers)
+        # MTP block - uses mtp_block_spec from mamba_stack_spec.submodules
         if self.mtp_process:
-            from megatron.core.models.mamba.mamba_layer_specs import get_mamba_mtp_block_spec
-
-            mtp_block_spec = get_mamba_mtp_block_spec()
             mamba_submodules = mamba_stack_spec.submodules
+            mtp_block_spec = mamba_submodules.mtp_block_spec
+            assert mtp_block_spec is not None, (
+                "MTP pattern specified but mtp_block_spec is None in mamba_stack_spec.submodules. "
+                "Ensure mamba_stack_spec includes mtp_block_spec for MTP support."
+            )
 
             self.mtp = MultiTokenPredictionBlock(
                 config=self.config,
@@ -189,7 +194,7 @@ class MambaModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.pre_process or self.post_process:
+        if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
         for name, module in self.named_modules():

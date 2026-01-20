@@ -26,6 +26,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MTPLossAutoScaler,
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    mtp_on_this_rank,
     roll_tensor,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -139,7 +140,9 @@ class GPTModel(LanguageModule):
             self.rotary_base = rotary_base
         self.rotary_scaling = rope_scaling
         self.mtp_block_spec = mtp_block_spec
-        self.mtp_process = mtp_block_spec is not None and self.post_process
+        self.mtp_process = mtp_block_spec is not None and mtp_on_this_rank(
+            self.config, vp_stage=vp_stage
+        )
 
         if self.pre_process or self.mtp_process:
             self.embedding = LanguageModelEmbedding(

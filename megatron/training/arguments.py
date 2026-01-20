@@ -537,6 +537,7 @@ def validate_args(args, defaults={}):
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
 
+    # === MTP validation ===
     # Deprecation warnings for legacy MTP arguments
     if args.mtp_hybrid_override_pattern is not None:
         warn_rank_0(
@@ -554,7 +555,6 @@ def validate_args(args, defaults={}):
             args.rank,
         )
 
-    # === MTP validation ===
     # Backward compatibility: convert legacy mtp_hybrid_override_pattern to unified format
     from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, parse_hybrid_pattern
     sep = Symbols.MTP_SEPARATOR
@@ -567,7 +567,6 @@ def validate_args(args, defaults={}):
         main_pattern = args.hybrid_override_pattern or ''
         mtp_pattern = args.mtp_hybrid_override_pattern
         args.hybrid_override_pattern = main_pattern + sep + sep.join([mtp_pattern] * args.mtp_num_layers)
-        args.mtp_num_layers = None
         args.mtp_hybrid_override_pattern = None
         print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_override_pattern}")
 
@@ -1896,7 +1895,7 @@ def _add_network_size_args(parser):
                        help='Untie embeddings and output weights.')
     group.add_argument('--multi-latent-attention', action='store_true',
                        help='Use multi-latent attention for model.')
-    group.add_argument('--mtp-num-layers', type=int, default=None,
+    group.add_argument('--mtp-num-layers', type=int, default=0,
                        help='Number of Multi-Token Prediction (MTP) Layers.'
                        'MTP extends the prediction scope to multiple future tokens at each position.'
                        'This MTP implementation sequentially predict additional tokens '
