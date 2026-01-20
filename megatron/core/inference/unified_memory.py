@@ -144,29 +144,31 @@ def compile_allocator():
       return ptr;
     }
 
-#if CUDART_VERSION >= 13000
-    EXPORT void managed_free(void* ptr, size_t size, cudaMemLocation device, void* stream) {
-#else
     EXPORT void managed_free(void* ptr, size_t size, int device, void* stream) {
-#endif
       // Memory allocated with cudaMallocManaged should be released with cudaFree.
       (void)size; (void)device; (void)stream;
       if (ptr) cudaFree(ptr);
     }
 
     // Prefetch managed memory to a device (or to CPU with cudaCpuDeviceId == -1).
-#if CUDART_VERSION >= 13000
-    EXPORT int managed_prefetch(void* ptr, size_t size, cudaMemLocation device, cudaStream_t stream) {
-      cudaError_t err = cudaMemPrefetchAsync(ptr, (size_t)size, device, stream);
-      return (int)err;
-    }
-#else
     EXPORT int managed_prefetch(void* ptr, size_t size, int device, void* stream) {
       cudaStream_t s = (cudaStream_t)stream;
-      cudaError_t err = cudaMemPrefetchAsync(ptr, (size_t)size, device, s);
+      cudaError_t err;
+      #if CUDART_VERSION >= 13000
+        cudaMemLocation location;
+        if (device == (int)-1) {
+          location.type = cudaMemLocationTypeHost;
+          location.id = 0;
+        } else {
+          location.type = cudaMemLocationTypeDevice;
+          location.id = device;
+        }
+        err = cudaMemPrefetchAsync(ptr, (size_t)size, location, 0, s);
+      #else
+        err = cudaMemPrefetchAsync(ptr, (size_t)size, device, s);
+      #endif
       return (int)err;
     }
-#endif
 
     // Update preferred location advice for managed memory (GPU device id, or CPU with cudaCpuDeviceId == -1).
     EXPORT int managed_advise_preferred_location(void* ptr, size_t size, int device) {

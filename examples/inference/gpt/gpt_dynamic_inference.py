@@ -470,9 +470,6 @@ def main():
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
-    # >>>
-    # pax("requests")
-    # <<<
     context = get_inference_context(
         requests,
         sampling_params,
@@ -613,14 +610,7 @@ def main():
             json_results = {}
 
             # Write every 'n' requests, plus the final request.
-            # >>>
-            # raise Exception("hi.")
-            # <<<
             for i, req in enumerate(requests):
-                # >>>
-                # from lutil import pax
-                # pax({"req / generated_tokens": req.output_tokens})
-                # <<<
                 if i % args.output_every_n_results == 0 or i == len(requests) - 1:
                     # >>>
                     # print(f' Attributes of request {i}: {req.__dict__}')

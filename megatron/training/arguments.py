@@ -70,6 +70,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
+    parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
@@ -320,10 +321,35 @@ def moe_freq_type(x):
       This allows defining arbitrary patterns of expert and dense layers.
       The pattern length must match the total number of transformer layers.
       Examples:
-          "([0]+[1]*23)": 1 dense layer followed by 23 experts layers
+          "([0]+[1]*23)": 1 dense layer followed by 23 expert layers
           "([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.
     """
     if isinstance(x, int):
+        return x
+    assert isinstance(x, str)
+    if '[' in x:
+        # it's a custom pattern
+        return _eval_pattern(x)
+    else:
+        # it's a single int but in str
+        return int(x)
+
+def la_freq_type(x):
+    """Frequency between LA (linear attention) layers and SDPA (scaled dot-product attention) layers.
+
+    Accepts either:
+    - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
+    - A string "N": Same as above, but provided as a string
+    - A string containing a Python list expression that defines a custom pattern, e.g.:
+      "([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0]
+      where 1 indicates an LA layer and 0 indicates a SDPA layer.
+      This allows defining arbitrary patterns of LA and SDPA layers.
+      The pattern length must match the total number of transformer layers.
+      Examples:
+          "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers
+          "([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.
+    """
+    if x is None or isinstance(x, int):
         return x
     assert isinstance(x, str)
     if '[' in x:
@@ -526,6 +552,12 @@ def validate_args(args, defaults={}):
         assert any(elt is not None
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
+
+    if args.phase_transition_iterations:
+        args.phase_transition_iterations = sorted(
+            int(x.strip()) for x in args.phase_transition_iterations.split(",")
+        )
+        assert args.rampup_batch_size is None, "multi-phase training does not support batch size ramp-up"
 
     # Batch size.
     assert args.micro_batch_size is not None
@@ -893,6 +925,17 @@ def validate_args(args, defaults={}):
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
+    if args.no_weight_decay_cond_type is not None:
+        print_rank_0(
+            'WARNING: --no-weight-decay-cond-type is deprecated. Please use --apply-wd-to-qk-layernorm instead.',
+            args.rank,
+        )
+        if args.no_weight_decay_cond_type == "apply_wd_to_qk_layernorm":
+            args.apply_wd_to_qk_layernorm = True
+        else:
+            raise ValueError(f"Invalid no_weight_decay_cond_type: {args.no_weight_decay_cond_type}")
+        args.no_weight_decay_cond_type = None
+
     if args.weight_decay_incr_style == 'constant':
         assert args.start_weight_decay is None
         assert args.end_weight_decay is None
@@ -944,6 +987,13 @@ def validate_args(args, defaults={}):
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
+
+    if args.hybrid_context_parallel:
+        assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
+        assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
+        assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
+        assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
+        assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -1261,6 +1311,13 @@ def validate_args(args, defaults={}):
                 "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
                 "when enabling delay_wgrad_compute"
             )
+
+    if args.fine_grained_activation_offloading:
+        assert args.transformer_impl == 'transformer_engine', \
+            "Fine-grained activation offloading is only supported with transformer_engine implementation"
+        if is_te_min_version("2.10.0"):
+            assert os.getenv("NVTE_CPU_OFFLOAD_V1", "0") == "1", \
+                "For fine-grained activation offloading with TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 should be set to 1 to avoid offloading weights."
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
@@ -2044,6 +2101,8 @@ def _add_regularization_args(parser):
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
+    group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
+                       help='Apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
@@ -2078,6 +2137,12 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
 
+    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
+                       help='Type of no weight decay condition. Choices: '
+                       'None (default): apply weight decay to 1D weights and biases.'
+                       '"apply_wd_to_qk_layernorm": additionally apply weight decay to '
+                       'qk layernorm as a special case.'
+                       'DEPRECATED. Please use --apply-wd-to-qk-layernorm instead. ')
     return parser
 
 
@@ -2417,13 +2482,20 @@ def _add_training_args(parser):
                        help='The communicator group names to use high priority streams.')
     group.add_argument('--use-te-activation-func', action='store_true',
                        help='Use activation function kernel from Transformer Engine in MLP module.')
+    group.add_argument('--fine-grained-activation-offloading', action='store_true',
+                       help='Enable fine-grained activation offloading.')
+    group.add_argument('--offload-modules', nargs='*', type=str, default=[],
+                       help='The submodules to offload its input. Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
+    group.add_argument('--min-offloaded-tensor-size', type=int, default=1024*1024,
+                       help='The minimum size of the tensor to be offloaded.')
     group.add_argument('--batch-invariant-mode', action='store_true',
                        help='Use batch-invariant kernels for deterministic forward execution regardless '
                        'of batch size. Ensures bitwise identical results when the same inputs are '
                        'processed in different batch configurations. This is more strict than deterministic-mode '
                        'which only ensures bitwise identical results when the same inputs are processed in the same batch configuration. '
                        'This will significantly affect speed of training and inference as the kernels are not full optimized.')
-
+    group.add_argument('--disable-jit-fuser', action='store_true',
+                       help='Disable the JIT fuser.')
 
     return parser
 
@@ -2564,13 +2636,13 @@ def _add_checkpointing_args(parser):
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
     group.add_argument('--ckpt-format', default='torch_dist',
-                       choices=['torch', 'torch_dist', 'zarr', 'torch_dcp', 'fsdp_dtensor'],
+                       choices=['torch', 'torch_dist', 'torch_dcp', 'fsdp_dtensor'],
                        help='Checkpoint format to use. torch is the format used by torch.save/load.'
                        ' torch_dist is a megatron built-in distributed checkpointing format.'
                        ' torch_dcp is the torch.distributed.checkpoint format.'
                        ' fsdp_dtensor is a torch DCP native, Megatron FSDP training-specific checkpoint format.')
     group.add_argument('--ckpt-convert-format', default=None,
-                       choices=['torch', 'torch_dist', 'zarr'],
+                       choices=['torch', 'torch_dist'],
                        help='Checkpoint format for conversion.')
     group.add_argument('--ckpt-convert-save', default=None,
                        help='Save directory for converted checkpoint.')
@@ -2826,6 +2898,13 @@ def _add_distributed_args(parser):
                        '--hierarchical-context-parallel-sizes 2 4 indicates every two adjacent gpus '
                        'forms the first level of cp groups and the cp ranks with the same odevity '
                        'forms the second level of cp groups.')
+    group.add_argument('--max-seqlen-per-cp-rank', type=int, default=None,
+                       help='Maximum sequence length per CP rank. This is used to calculate the '
+                       'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
+    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
+                       help='Enables hybrid context parallel. This is used to balance the workload '
+                       'of each CP rank when we use packed samples with variable sequence lengths. '
+                       'Requires --max-seqlen-per-cp-rank to be set.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '
@@ -2928,6 +3007,10 @@ def _add_data_args(parser):
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
+    group.add_argument('--phase-transition-iterations', type=str, default=None,
+                       help='Comma-separated list of iterations where phase '
+                       'transitions occur. Requires fixed global batch size across phases. '
+                       'Does not support batch size ramp-up.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -3351,6 +3434,43 @@ def _add_mla_args(parser):
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
 
+    return parser
+
+def _add_experimental_attention_variant_args(parser):
+    group = parser.add_argument_group(title="experimental_attention_variant")
+    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa'], type=str,
+                       help='Type of attention variant to use. Currently support gated_delta_net and dsa.')
+    # DSA
+    group.add_argument('--dsa-indexer-n-heads', default=None, type=int,
+                       help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
+    group.add_argument('--dsa-indexer-head-dim', default=None, type=int,
+                       help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
+    group.add_argument('--dsa-indexer-topk', default=None, type=int,
+                       help='Number of top-k tokens to select in sparse attention indexer.')
+    group.add_argument('--dsa-indexer-loss-coeff', default=None, type=float,
+                       help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
+    group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
+                       help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
+    # Linear attention
+    group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
+                       help='Frequency between LA (linear attention) layers and'
+                            ' SDPA (scaled dot-product attention) layers. Accepts either: '
+                            '- An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer '
+                            '- A string containing a Python list expression that defines a custom pattern, e.g.: '
+                            '"([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
+                            'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
+                            'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
+                            '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    group.add_argument('--linear-conv-kernel-dim', default=4, type=int,
+                       help='Conv kernel dimension for the gated delta net.')
+    group.add_argument('--linear-key-head-dim', default=128, type=int,
+                       help='Query and key head dimension for the gated delta net.')
+    group.add_argument('--linear-value-head-dim', default=128, type=int,
+                       help='Value and gate head dimension for the gated delta net.')
+    group.add_argument('--linear-num-key-heads', default=16, type=int,
+                       help='Number of query and key heads for the gated delta net.')
+    group.add_argument('--linear-num-value-heads', default=32, type=int,
+                       help='Number of value and gate heads for the gated delta net.')
     return parser
 
 def _add_heterogeneous_args(parser):
