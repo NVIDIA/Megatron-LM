@@ -687,10 +687,10 @@ class PipelineOffloadManager:
         """Get the current backward pass chunk handler."""
         return self._cur_backward_chunk
 
-    def mark_not_offloadable(self, tensor: torch.Tensor):
+    def mark_not_offload(self, tensor: torch.Tensor):
         """Mark the current forward chunk as not offloadable."""
         if tensor is not None:
-            tensor.offloading_activation = False
+            tensor._do_not_offload = True
 
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
@@ -880,7 +880,8 @@ class ChunkOffloadHandler:
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False
         # Respect tensor's offload preference if specified
-        if hasattr(tensor, "offloading_activation") and not tensor.offloading_activation:
+        if getattr(tensor, "_TE_do_not_offload", False) \
+            or getattr(tensor, "_do_not_offload", False):
             return False
         return True
 
@@ -1234,9 +1235,9 @@ class FineGrainedActivationOffloadingInterface:
         )
 
     @staticmethod
-    def mark_not_offloadable(tensor: torch.Tensor):
+    def mark_not_offload(tensor: torch.Tensor):
         """Mark the tensor as not offloadable."""
-        PipelineOffloadManager.get_instance().mark_not_offloadable(tensor)
+        PipelineOffloadManager.get_instance().mark_not_offload(tensor)
 
     @staticmethod
     def forward_record(event: torch.cuda.Event) -> None:

@@ -440,13 +440,13 @@ class GPTModel(LanguageModule):
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
-                off_interface.mark_not_offloadable(param)
+                off_interface.mark_not_offload(param)
             if self.mtp_process:
                 for param in self.mtp.parameters():
-                    off_interface.mark_not_offloadable(param)
+                    off_interface.mark_not_offload(param)
             if self.post_process:
                 for param in self.output_layer.parameters():
-                    off_interface.mark_not_offloadable(param)
+                    off_interface.mark_not_offload(param)
             self.disable_param_offloading = False
 
     def forward(
