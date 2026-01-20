@@ -21,7 +21,7 @@ This guide for Megatron Core walks you through the following tasks:
 
     git clone https://github.com/NVIDIA/Megatron-LM.git
     cd Megatron-LM
-    pip install -U setuptools packaging
+    pip install -U "setuptools<80.0.0,>=77.0.0" packaging
     pip install --no-build-isolation .[dev]
     ```
 

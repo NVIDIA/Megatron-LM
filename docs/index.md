@@ -16,6 +16,7 @@ Megatron Core offers a flexible, reusable foundation for building large-scale tr
 
 ```{toctree}
 :maxdepth: 2
+:hidden:
 :caption: Get Started
 
 get-started/quickstart
@@ -23,6 +24,7 @@ get-started/quickstart
 
 ```{toctree}
 :maxdepth: 2
+:hidden:
 :caption: Basic Usage
 
 user-guide/data-preparation
@@ -32,6 +34,7 @@ user-guide/parallelism-guide
 
 ```{toctree}
 :maxdepth: 2
+:hidden:
 :caption: Supported Models
 
 models/index
@@ -39,6 +42,7 @@ models/index
 
 ```{toctree}
 :maxdepth: 2
+:hidden:
 :caption: Advanced Features
 
 user-guide/features/moe
@@ -54,15 +58,18 @@ user-guide/features/tokenizers
 
 ```{toctree}
 :maxdepth: 1
+:hidden:
 :caption: Developer Guide
 
 developer/contribute
 developer/submit
 developer/oncall
+developer/generate_docs
 ```
 
 ```{toctree}
 :maxdepth: 2
+:hidden:
 :caption: Discussions
 
 advanced/index
@@ -70,6 +77,7 @@ advanced/index
 
 ```{toctree}
 :maxdepth: 2
+:hidden:
 :caption: API Reference
 
 api-guide/index

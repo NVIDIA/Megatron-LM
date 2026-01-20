@@ -1,16 +1,16 @@
 .merge_train_rule: &merge_train_rule
-  UNIT_TEST: "yes"
+  UNIT_TEST: 'yes'
   UNIT_TEST_REPEAT: 1
   UNIT_TEST_TIMEOUT: 30
-  INTEGRATION_TEST: "no"
+  INTEGRATION_TEST: 'no'
   INTEGRATION_TEST_SCOPE: mr
-  FUNCTIONAL_TEST: "yes"
+  FUNCTIONAL_TEST: 'yes'
   FUNCTIONAL_TEST_SCOPE: mr-slim
   FUNCTIONAL_TEST_REPEAT: 1
   FUNCTIONAL_TEST_TIME_LIMIT: 2700
-  CLUSTER_A100: ""
-  CLUSTER_H100: ""
-  PUBLISH: "no"
+  CLUSTER_A100: ''
+  CLUSTER_H100: ''
+  PUBLISH: 'no'
 
 workflow:
   rules:
@@ -35,30 +35,30 @@ workflow:
     # For push to main
     - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH =~ /^core_/)
       variables:
-        UNIT_TEST: "no"
-        INTEGRATION_TEST: "no"
-        FUNCTIONAL_TEST: "yes"
+        UNIT_TEST: 'no'
+        INTEGRATION_TEST: 'no'
+        FUNCTIONAL_TEST: 'yes'
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 5
-        FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
+        FUNCTIONAL_TEST_RECORD_CHECKPOINTS: 'no'
         FUNCTIONAL_TEST_TIME_LIMIT: 3600
-        CLUSTER_A100: ""
-        CLUSTER_H100: ""
-        PUBLISH: "no"
+        CLUSTER_A100: ''
+        CLUSTER_H100: ''
+        PUBLISH: 'no'
       auto_cancel:
         on_new_commit: interruptible
 
     # For merge-trains that need to be fast-tracked
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       variables:
-        UNIT_TEST: "yes"
+        UNIT_TEST: 'yes'
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 30
-        INTEGRATION_TEST: "no"
-        FUNCTIONAL_TEST: "no"
-        CLUSTER_A100: ""
-        CLUSTER_H100: ""
-        PUBLISH: "no"
+        INTEGRATION_TEST: 'no'
+        FUNCTIONAL_TEST: 'no'
+        CLUSTER_A100: ''
+        CLUSTER_H100: ''
+        PUBLISH: 'no'
 
     # For normal merge-trains
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train'
@@ -67,75 +67,75 @@ workflow:
     # For MRs with integration suite
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables:
-        UNIT_TEST: "yes"
+        UNIT_TEST: 'yes'
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 30
-        INTEGRATION_TEST: "yes"
+        INTEGRATION_TEST: 'yes'
         INTEGRATION_TEST_SCOPE: mr
-        FUNCTIONAL_TEST: "no"
+        FUNCTIONAL_TEST: 'no'
         FUNCTIONAL_TEST_SCOPE: mr-slim
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
-        CLUSTER_H100: ""
-        PUBLISH: "no"
+        CLUSTER_A100: ''
+        CLUSTER_H100: ''
+        PUBLISH: 'no'
 
     # For MRs with nightly
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
       variables:
-        UNIT_TEST: "yes"
+        UNIT_TEST: 'yes'
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 30
-        INTEGRATION_TEST: "no"
-        FUNCTIONAL_TEST: "yes"
+        INTEGRATION_TEST: 'no'
+        FUNCTIONAL_TEST: 'yes'
         FUNCTIONAL_TEST_SCOPE: nightly
         FUNCTIONAL_TEST_REPEAT: 5
-        FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
+        FUNCTIONAL_TEST_RECORD_CHECKPOINTS: 'no'
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
-        CLUSTER_H100: ""
-        PUBLISH: "no"
+        CLUSTER_A100: ''
+        CLUSTER_H100: ''
+        PUBLISH: 'no'
 
     # For MRs with weekly
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
       variables:
-        UNIT_TEST: "yes"
+        UNIT_TEST: 'yes'
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 30
-        INTEGRATION_TEST: "no"
-        FUNCTIONAL_TEST: "yes"
+        INTEGRATION_TEST: 'no'
+        FUNCTIONAL_TEST: 'yes'
         FUNCTIONAL_TEST_SCOPE: weekly
         FUNCTIONAL_TEST_REPEAT: 1
-        FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
+        FUNCTIONAL_TEST_RECORD_CHECKPOINTS: 'no'
         FUNCTIONAL_TEST_TIME_LIMIT: 9000
-        CLUSTER_A100: ""
-        CLUSTER_H100: ""
-        PUBLISH: "no"
+        CLUSTER_A100: ''
+        CLUSTER_H100: ''
+        PUBLISH: 'no'
 
     # For MRs with heavy suite
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run functional tests/
       variables:
-        UNIT_TEST: "yes"
+        UNIT_TEST: 'yes'
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 30
-        INTEGRATION_TEST: "no"
-        FUNCTIONAL_TEST: "yes"
+        INTEGRATION_TEST: 'no'
+        FUNCTIONAL_TEST: 'yes'
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
-        CLUSTER_H100: ""
-        PUBLISH: "no"
+        CLUSTER_A100: ''
+        CLUSTER_H100: ''
+        PUBLISH: 'no'
 
     # Default MRs
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result'
       variables:
-        UNIT_TEST: "yes"
+        UNIT_TEST: 'yes'
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 30
-        INTEGRATION_TEST: "no"
-        FUNCTIONAL_TEST: "no"
-        PUBLISH: "no"
+        INTEGRATION_TEST: 'no'
+        FUNCTIONAL_TEST: 'no'
+        PUBLISH: 'no'
 
     - when: never
 
@@ -157,104 +157,109 @@ default:
 
 variables:
   BUILD:
-    value: "yes"
+    value: 'yes'
   UNIT_TEST:
-    value: "yes"
+    value: 'yes'
     options:
-      - "yes"
-      - "no"
+      - 'yes'
+      - 'no'
     description: To run the funtional test suite
   UNIT_TEST_REPEAT:
-    value: "1"
-    description: "Number of repetitions"
+    value: '1'
+    description: 'Number of repetitions'
   UNIT_TEST_TIMEOUT:
-    value: "30"
+    value: '30'
     description: Timeout (minutes) for Unit tests (all repeats)
   INTEGRATION_TEST:
-    value: "yes"
+    value: 'yes'
     options:
-      - "yes"
-      - "no"
+      - 'yes'
+      - 'no'
     description: To run the integration test suite
   INTEGRATION_TEST_SCOPE:
-    value: "mr"
+    value: 'mr'
     options:
-      - "mr"
-      - "nightly"
-      - "weekly"
-      - "pre-release"
-      - "release"
-    description: "Testsuite to run (only for INTEGRATION_TEST=yes)"
+      - 'mr'
+      - 'nightly'
+      - 'weekly'
+      - 'pre-release'
+      - 'release'
+    description: 'Testsuite to run (only for INTEGRATION_TEST=yes)'
   INTEGRATION_TEST_TIME_LIMIT:
-    value: "900"
-    description: "Timeout in seconds per test"
+    value: '900'
+    description: 'Timeout in seconds per test'
   INTEGRATION_TEST_CASES:
-    value: "all"
+    value: 'all'
     description: "Comma-separated list of test_cases to run. Use 'all' to run the full suite."
   FUNCTIONAL_TEST:
-    value: "yes"
+    value: 'yes'
     options:
-      - "yes"
-      - "no"
+      - 'yes'
+      - 'no'
     description: To run the funtional test suite
   FUNCTIONAL_TEST_SCOPE:
-    value: "mr"
+    value: 'mr'
     options:
-      - "mr"
-      - "nightly"
-      - "weekly"
-      - "pre-release"
-      - "release"
-    description: "Testsuite to run (only for FUNCTIONAL_TEST=yes)"
+      - 'mr'
+      - 'nightly'
+      - 'weekly'
+      - 'pre-release'
+      - 'release'
+    description: 'Testsuite to run (only for FUNCTIONAL_TEST=yes)'
   FUNCTIONAL_TEST_REPEAT:
-    value: "5"
-    description: "Number of repetitions per test"
+    value: '5'
+    description: 'Number of repetitions per test'
   FUNCTIONAL_TEST_TIME_LIMIT:
-    value: "2700"
-    description: "Timeout in seconds per test"
+    value: '2700'
+    description: 'Timeout in seconds per test'
   FUNCTIONAL_TEST_CASES:
-    value: "all"
+    value: 'all'
     description: "Comma-separated list of test_cases to run. Use 'all' to run the full suite."
   FUNCTIONAL_TEST_NAME:
-    description: "Name of functional test run (only for pre-release and release)"
-    value: "$$CI_COMMIT_SHA"
+    description: 'Name of functional test run (only for pre-release and release)'
+    value: '$$CI_COMMIT_SHA'
   FUNCTIONAL_TEST_RECORD_CHECKPOINTS:
-    value: "no"
-    description: "Record golden checkpoints"
+    value: 'no'
+    description: 'Record golden checkpoints'
     options:
-      - "yes"
-      - "no"
+      - 'yes'
+      - 'no'
   CLUSTER_A100:
-    value: "dgxa100_dracooci"
+    value: 'dgxa100_dracooci'
     options:
-      - "dgxa100_dracooci"
-      - "dgxa100_dracooci-ord"
-    description: "Cluster for A100 workloads"
+      - 'dgxa100_dracooci'
+      - 'dgxa100_dracooci-ord'
+    description: 'Cluster for A100 workloads'
   CLUSTER_H100:
-    value: "dgxh100_coreweave"
+    value: 'dgxh100_coreweave'
     options:
-      - "dgxh100_coreweave"
-      - "dgxh100_eos"
-    description: "Cluster for H100 workloads"
+      - 'dgxh100_coreweave'
+      - 'dgxh100_eos'
+    description: 'Cluster for H100 workloads'
+  CLUSTER_GB200:
+    value: 'dgxgb200_oci-hsg'
+    options:
+      - 'dgxgb200_oci-hsg'
+    description: 'Cluster for H100 workloads'
   PUBLISH:
-    value: "no"
+    value: 'no'
     options:
-      - "yes"
-      - "no"
+      - 'yes'
+      - 'no'
     description: Build and publish a wheel to PyPi
   PUBLISH_COMMIT:
-    value: "$$CI_COMMIT_SHA"
+    value: '$$CI_COMMIT_SHA'
     description: Which commit to publish
   PUBLISH_VERSION_BUMP_BRANCH:
-    value: "$$CI_COMMIT_BRANCH"
+    value: '$$CI_COMMIT_BRANCH'
     description: Which branch to target for version bump
   PUBLISH_SCOPE:
-    value: "code-freeze"
+    value: 'code-freeze'
     options:
-      - "code-freeze"
-      - "release"
-      - "review-reminder"
-      - "upgrade-dependencies"
+      - 'code-freeze'
+      - 'release'
+      - 'review-reminder'
+      - 'upgrade-dependencies'
     description: Type of publish (freeze or final release)
 
   # CI wide variables
@@ -262,7 +267,7 @@ variables:
   CI_MCORE_DEV_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci_dev
   CI_NEMO_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/nemo_ci
   UTILITY_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_utility
-  TE_GIT_REF: ""
+  TE_GIT_REF: ''
 
 include:
   - .gitlab/stages/00.pre.yml

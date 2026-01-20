@@ -130,6 +130,7 @@ class MoELayer(BaseMoELayer):
 
         # Initialize router.
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+        self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
         if self.config.moe_latent_size:
@@ -195,7 +196,10 @@ class MoELayer(BaseMoELayer):
         # Initialize shared experts
         if self.use_shared_expert:
             self.shared_experts = build_module(
-                self.submodules.shared_experts, config=self.config, pg_collection=pg_collection
+                self.submodules.shared_experts,
+                config=self.config,
+                pg_collection=pg_collection,
+                gate=self.config.moe_shared_expert_gate,
             )
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
@@ -369,10 +373,11 @@ class MoELayer(BaseMoELayer):
 
         return outputs
 
-    def backward_dw(self):
+    def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
-        self.experts.backward_dw()
-        if self.use_shared_expert and not self.shared_expert_overlap:
+        if routed_experts:
+            self.experts.backward_dw()
+        if shared_experts and self.use_shared_expert and not self.shared_expert_overlap:
             self.shared_experts.backward_dw()
 
     def set_for_recompute_pre_mlp_layernorm(self):

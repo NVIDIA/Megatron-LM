@@ -133,7 +133,7 @@ Megatron-LM/
 
 **What you get:**
 
-- Pre-configured training scripts for GPT, LLama, DeepSeek, Qwen, and more.
+- Pre-configured training scripts for GPT, LLaMA, DeepSeek, Qwen, and more.
 - End-to-end examples from data prep to evaluation
 - Research-focused tools and utilities
 
@@ -178,7 +178,7 @@ Megatron-LM/
 
 ## 🐳 Docker (Recommended)
 
-We strongly recommend using the previous releases of [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) rather than the latest one for optimal compatibility with Megatron Core release and testing. Our releases are always based on the previous month's NGC container, so this ensures compatibility and stability.
+We strongly recommend using the previous releases of [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) rather than the latest one for optimal compatibility with Megatron Core release and testing matrix. Our releases are always based on the previous month's NGC container, so this ensures compatibility and stability.
 
 **Note:** The NGC PyTorch container constraints the python environment globally via `PIP_CONSTRAINT`. In the following examples we will unset the variable.
 
@@ -292,7 +292,7 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 ```
 
-### LLama-3 Training Example
+### LLaMA-3 Training Example
 
 ```bash
 # 8 GPUs, FP8 precision, mock data
@@ -404,9 +404,9 @@ Based on [NVIDIA NeMo production configurations](https://github.com/NVIDIA/NeMo/
 
 | Model | Size | GPUs | TP | PP | CP | EP | Notes |
 |-------|------|------|----|----|----|----|-------|
-| **LLama-3** | 8B | 8 | 1 | 1 | 2 | 1 | CP for long seqlen (8K) |
-| **LLama-3** | 70B | 64 | 4 | 4 | 2 | 1 | TP+PP |
-| **LLama-3.1** | 405B | 1024 | 8 | 8 | 2 | 1 | 3D parallelism for scale |
+| **LLaMA-3** | 8B | 8 | 1 | 1 | 2 | 1 | CP for long seqlen (8K) |
+| **LLaMA-3** | 70B | 64 | 4 | 4 | 2 | 1 | TP+PP |
+| **LLaMA-3.1** | 405B | 1024 | 8 | 8 | 2 | 1 | 3D parallelism for scale |
 | **GPT-3** | 175B | 128-512 | 4 | 8 | 1 | 1 | Large model config |
 | **Mixtral** | 8x7B | 64 | 1 | 4 | 1 | 8 | EP for MoE |
 | **Mixtral** | 8x22B | 256 | 4 | 4 | 8 | 8 | Combined TP+EP for large MoE |
