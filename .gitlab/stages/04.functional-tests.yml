@@ -50,6 +50,7 @@ functional:configure:
     - |
       A100_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo $CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
       H100_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo $CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+      GB200_CLUSTER=$([[ "$CLUSTER_GB200" != "" ]] && echo $CLUSTER_GB200 || echo $DEFAULT_GB200_CLUSTER)
     - |
       RECORD_CHECKPOINTS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Record checkpoints"* || "$FUNCTIONAL_TEST_RECORD_CHECKPOINTS" == "yes" ]] && echo "true" || echo "false")
     - |
@@ -113,12 +114,32 @@ functional:configure:
         --cluster $H100_CLUSTER \
         --output-path "functional-test-job-lts-H100.yaml" \
         ${RELEASE_ARGS[@]}
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment dev \
+        --platform dgx_gb200 \
+        --cluster $GB200_CLUSTER \
+        --output-path "functional-test-job-dev-GB200.yaml" \
+        ${RELEASE_ARGS[@]}
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_gb200 \
+        --cluster $GB200_CLUSTER \
+        --output-path "functional-test-job-lts-GB200.yaml" \
+        ${RELEASE_ARGS[@]}
   artifacts:
     paths:
       - functional-test-job-lts-A100.yaml
       - functional-test-job-lts-H100.yaml
       - functional-test-job-dev-A100.yaml
       - functional-test-job-dev-H100.yaml
+      - functional-test-job-lts-GB200.yaml
+      - functional-test-job-dev-GB200.yaml
       - tests/test_utils/local_recipes
 
 .functional_run:
@@ -157,6 +178,12 @@ functional:run_lts_dgx_h100:
     ENVIRONMENT: lts
     CLUSTER: H100
 
+functional:run_lts_dgx_gb200:
+  extends: [.functional_run]
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: GB200
+
 functional:run_dev_dgx_a100:
   extends: [.functional_run]
   variables:
@@ -168,6 +195,12 @@ functional:run_dev_dgx_h100:
   variables:
     ENVIRONMENT: dev
     CLUSTER: H100
+
+functional:run_dev_dgx_gb200:
+  extends: [.functional_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: GB200
 
 functional:run_nemo:
   extends: [.functional_tests_rules]

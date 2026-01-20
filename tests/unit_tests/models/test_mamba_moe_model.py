@@ -45,6 +45,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
         "_value_": 1,
     },
     "attention_dropout": 0.0,
+    "attention_output_gate": False,
     "attention_softmax_in_fp32": False,
     "autocast_dtype": "torch.bfloat16",
     "barrier_with_L1_time": True,
@@ -78,11 +79,17 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
+    "dsa_indexer_head_dim": None,
+    "dsa_indexer_loss_coeff": None,
+    "dsa_indexer_n_heads": None,
+    "dsa_indexer_topk": None,
+    "dsa_indexer_use_sparse_loss": False,
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,
     "enable_cuda_graph": False,
     "ep_overlap_early_attn_memory_release": False,
+    "experimental_attention_variant": None,
     "expert_model_parallel_size": 4,
     "expert_tensor_parallel_size": 1,
     "external_cuda_graph": False,
@@ -129,6 +136,12 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "kv_channels": 128,
     "layernorm_epsilon": 1e-05,
     "layernorm_zero_centered_gamma": False,
+    "linear_attention_freq": None,
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_value_head_dim": 128,
     "log_max_attention_logit": False,
     "mamba_head_dim": 64,
     "mamba_num_groups": 8,
@@ -170,6 +183,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk": 6,
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
+    "moe_shared_expert_gate": False,
     "moe_shared_expert_intermediate_size": 3712,
     "moe_shared_expert_overlap": False,
     "moe_token_dispatcher_type": "alltoall",
@@ -180,6 +194,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mrope_section": None,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
+    "mtp_standalone": False,
     "multi_latent_attention": False,
     "no_rope_freq": None,
     "no_sync_func": None,
@@ -208,6 +223,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "qk_clip": False,
     "qk_clip_alpha": 0.5,
     "qk_clip_threshold": 100,
+    "qk_l2_norm": False,
     "qk_layernorm": False,
     "quant_recipe": None,
     "recompute_granularity": None,
@@ -251,6 +267,11 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "wgrad_deferral_limit": 0,
     "window_attn_skip_freq": None,
     "window_size": None,
+    "fine_grained_activation_offloading": False,
+    "min_offloaded_tensor_size": 1024 * 1024,
+    "offload_modules": [],
+    "hybrid_context_parallel": False,
+    "max_seqlen_per_dp_cp_rank": None,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
@@ -275,10 +296,39 @@ def assert_config_matches_golden(cfg: Any) -> None:
     added = [k for k in added if k not in ALLOW_ADDED_FIELDS]
 
     if added or removed or changed:
-        header = (
-            "Mamba MoE config drift detected | "
-            f"added={sorted(added)} | removed={sorted(removed)} | changed={sorted(changed)}"
+        # Build actionable guidance for each type of drift
+        guidance_parts = []
+
+        if added:
+            guidance_parts.append(
+                f"\n\n[ADDED ARGS]: {sorted(added)}\n"
+                "  → Update GOLDEN_CONFIG in this test file to include the new arg(s) with "
+                "their default value(s).\n"
+                "  ⚠️  CAUTION: Review any logic associated with new args to ensure it doesn't "
+                "silently affect downstream model configs or behavior.\n"
+            )
+
+        if changed:
+            guidance_parts.append(
+                f"\n\n[CHANGED DEFAULTS]: {sorted(changed)}\n"
+                "  → Please don't change the default values of existing args unless "
+                "it is absolutely necessary for a bug fix.\n"
+                "  → If you must change the default value, please update the GOLDEN_CONFIG "
+                "in this test file to reflect the new default value.\n"
+            )
+
+        if removed:
+            guidance_parts.append(
+                f"\n\n[REMOVED ARGS]: {sorted(removed)}\n"
+                "  → Do NOT remove args directly. Instead, deprecate them with a warning message "
+                "to maintain backwards compatibility.\n"
+            )
+
+        guidance_parts.append(
+            "Please contact NV-username @jbarker if you are unsure how to proceed.\n"
         )
+
+        header = "Mamba MoE config drift detected!\n" "═" * 60 + "".join(guidance_parts)
         parts = [header]
         if changed:
             formatted = {k: {"expected": golden[k], "actual": current[k]} for k in sorted(changed)}

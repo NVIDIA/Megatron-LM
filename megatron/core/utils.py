@@ -73,6 +73,15 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn’t installed or the torch wrapper is missing
+    tex = None
 
 try:
     _torch_version = PkgVersion(torch.__version__)
@@ -470,15 +479,6 @@ def is_causal_conv1d_min_version(version, check_equality=True):
     return get_causal_conv1d_version() > PkgVersion(version)
 
 
-def check_mamba_sequence_packing_support() -> Tuple[bool, Optional[str]]:
-    """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
-    if not is_causal_conv1d_min_version("1.5.3.post1"):
-        return False, "causal_conv1d >= 1.5.3.post1 is required"
-    elif not is_mamba_min_version("2.2.6.post3"):
-        return False, "mamba_ssm >= 2.2.6.post3 is required"
-    return True, None
-
-
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
@@ -507,6 +507,10 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
     # TODO(zijiey): remove this function later.
     if not torch.distributed.is_initialized():
         return None
+
+    # if parallel_state is not initialized, pass `tp_group` thru
+    if not parallel_state.is_initialized():
+        return tp_group
 
     if tp_group is None:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
@@ -2022,9 +2026,17 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
-def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
+def get_batch_on_this_cp_rank(
+    batch: Dict[str, Any], cp_group: Optional[torch.distributed.ProcessGroup] = None
+):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
+
+    Args:
+        batch (Dict[str, Any]): Input batch tensors.
+        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel process group.
+            If provided, uses this group's size and rank. Otherwise, falls back to
+            the current context-parallel settings from parallel_state.
     """
 
     # With causal masking, each token only attends to its prior tokens. Simply split
@@ -2033,12 +2045,18 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
     # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
-    cp_size = parallel_state.get_context_parallel_world_size()
-    if cp_size > 1:
+    # Determine CP topology either from provided group or from current context parallel state
+    if cp_group is not None:
+        cp_size = get_pg_size(cp_group)
+        cp_rank = get_pg_rank(cp_group)
+    else:
+        cp_size = parallel_state.get_context_parallel_world_size()
         cp_rank = parallel_state.get_context_parallel_rank()
+
+    if cp_size > 1:
         for key, val in batch.items():
             if val is not None:
-                seq_dim = 1 if key != "attention_mask" else 2
+                seq_dim = 1 if key != 'attention_mask' else 2
                 val = val.view(
                     *val.shape[0:seq_dim],
                     2 * cp_size,
@@ -2053,6 +2071,100 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
                 batch[key] = val
 
     return batch
+
+
+def get_thd_batch_on_this_cp_rank(
+    batch: Dict[str, Any],
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
+):
+    """Slice each sub-sample in a packed sample batch input along
+    sequence dimension into multiple chunks, which are parallelized
+    across GPUs in a context parallel group.
+    """
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=int(max_seqlen[0].item()),
+        max_seqlen_kv=int(max_seqlen[0].item()),
+    )
+
+    cp_size = get_context_parallel_world_size() if cp_size is None else cp_size
+    cp_rank = get_context_parallel_rank() if cp_rank is None else cp_rank
+    if cp_size > 1:  # slice batch along sequence dimension for context parallelism
+        assert tex is not None and is_te_min_version("1.10.0"), (
+            "Please update Transformer Engine to >= 1.10 to use "
+            "Context Parallel with THD format data"
+        )
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
+        )
+        for key, data in batch.items():
+            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
+                continue
+            batch[key] = data.index_select(1, index)
+
+    return batch, packed_seq_params
+
+
+################################
+### hybrid context parallel ###
+################################
+
+
+def get_batch_on_this_hybrid_cp_rank(
+    batch: Dict[str, Any],
+    local_cp_size: int,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Slice batch input along sequence dimension into multiple chunks,
+    which are parallelized across GPUs in a context parallel group.
+    """
+    assert local_cp_size is not None
+    if cp_group is None:
+        # Get the local cp group required for as defined by the HybridCPDataLoaderWrapper
+        if local_cp_size > 1:
+            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(
+                group_size=local_cp_size
+            )
+    else:
+        # If cp group is provided, it must match the local cp size
+        # as defined by the HybridCPDataLoaderWrapper
+        assert cp_group.size() == local_cp_size
+
+    # Convert [seqlen] to [1, seqlen] similar to default collate_fn
+    # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
+    for key, data in batch.items():
+        if key in ['attention_mask']:
+            continue
+        batch[key] = torch.stack([data], 0)
+    sample_length = batch['tokens'].shape[1]
+    # TODO(pmannan): Take care of padding tokens here if not divisible by cp_size*2
+    # Create packed_seq_params for SBHD format with cp group information.
+    packed_seq_params = PackedSeqParams(
+        qkv_format="sbhd",
+        cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        cu_seqlens_kv=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        cu_seqlens_q_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        cu_seqlens_kv_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        max_seqlen_q=sample_length,
+        max_seqlen_kv=sample_length,
+        local_cp_size=local_cp_size,
+        cp_group=cp_group,
+    )
+
+    if cp_group is not None and cp_group.size() > 1:
+        # When using hybrid_context_parallel, each sub-sample of a packed sample is
+        # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
+        batch = get_batch_on_this_cp_rank(batch, cp_group=cp_group)
+
+    return batch, packed_seq_params
 
 
 ######################
