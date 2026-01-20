@@ -64,6 +64,10 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     return sharded_buffer
 
 
+def _pad(number_to_be_padded: int, divisor: int) -> int:
+    return int(math.ceil(number_to_be_padded / divisor) * divisor)
+
+
 class _ParamAndGradBucket:
     """
     Bucket to keep track of a subset of the model's parameters and gradients.
@@ -78,6 +82,7 @@ class _ParamAndGradBucket:
             communication. Its application is twofold: it facilitates the averaging of gradients
             and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
         bucket_id: Index of bucket in buffer.
+        alignment: alignment for the param offset.
     """
 
     def __init__(
@@ -89,6 +94,7 @@ class _ParamAndGradBucket:
         numel_unpadded: int,
         gradient_scaling_factor: float,
         bucket_id: int,
+        alignment: int,
     ):
         self.params_list = params
         self.params = set(params)
@@ -105,6 +111,7 @@ class _ParamAndGradBucket:
         self.param_to_index = {}
         offset = 0
         for param in params:
+            offset = _pad(offset, alignment)
             self.param_to_index[param] = (offset, offset + param.numel())
             offset += param.numel()
 
@@ -620,9 +627,6 @@ class _ParamAndGradBuffer:
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
 
-        def _pad(number_to_be_padded: int, divisor: int) -> int:
-            return int(math.ceil(number_to_be_padded / divisor) * divisor)
-
         def _pad_end_of_bucket_if_needed(bucket_end_index: int) -> int:
             """
             Pads end index of bucket if using distributed optimizer (to ensure uniform sharding).
@@ -824,6 +828,7 @@ class _ParamAndGradBuffer:
                         end_index=bucket_end_index,
                         numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
                         bucket_id=cur_bucket_id,
+                        alignment=64 if self.ddp_config.use_distributed_optimizer else 1,
                     )
                 )
                 bucket_start_index = bucket_end_index
@@ -843,6 +848,7 @@ class _ParamAndGradBuffer:
                     end_index=bucket_end_index,
                     numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
                     bucket_id=cur_bucket_id,
+                    alignment=64 if self.ddp_config.use_distributed_optimizer else 1,
                 )
             )
 
@@ -897,6 +903,7 @@ class _ParamAndGradBuffer:
         end_index: int,
         numel_unpadded: int,
         bucket_id: int,
+        alignment: int,
     ) -> _ParamAndGradBucket:
         """
         Helper function that creates a new bucket. Also updates param->bucket mapping.
@@ -926,6 +933,7 @@ class _ParamAndGradBuffer:
             numel_unpadded=numel_unpadded,
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
+            alignment=alignment,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
