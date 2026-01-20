@@ -8,7 +8,10 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    model_parallel_cuda_manual_seed,
+    MHCBlockRecomputeManager,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
@@ -311,3 +314,252 @@ def get_tensor_shapes_for_tp(transformer_config, tp_size):
         'self_attention.linear_qkv.weight': (hs * 3 // tp_size, hs),
         'self_attention.linear_qkv.bias': (hs * 3 // tp_size,),
     }
+
+
+class TestTransformerLayerWithHyperConnectionRecompute:
+    """Test TransformerLayer with HyperConnection and MHC block recomputation."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _create_layer_with_hyper_connection(self, hidden_size=64, num_streams=4):
+        """Create a TransformerLayer with hyper connection enabled."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            recompute_hyper_connections=True,
+            recompute_granularity='selective',
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        layer = TransformerLayer(config, layer_spec.submodules)
+        layer.cuda()
+        return layer, config
+
+    def test_forward_with_hyper_connection_recompute(self):
+        """
+        Test that TransformerLayer forward works correctly with HyperConnection
+        and MHC block recomputation enabled.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        layer, config = self._create_layer_with_hyper_connection(hidden_size, num_streams)
+        layer.train()  # Enable training mode for recomputation
+
+        # Input shape: [seq_len, batch_size, n * hidden_size] for hyper connections
+        n_channels = num_streams * hidden_size
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        # Create manager for MHC block recomputation
+        manager = MHCBlockRecomputeManager()
+
+        # Forward pass with recompute manager
+        output, context = layer(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            mhc_recompute_manager=manager,
+            is_last_layer_in_block=True,  # Last layer, so MLP BDA not checkpointed
+        )
+
+        # Verify output shape
+        assert output.shape == (seq_len, batch_size, n_channels), (
+            f"Expected output shape {(seq_len, batch_size, n_channels)}, got {output.shape}"
+        )
+
+        # Register unified recompute hook (simulating what TransformerBlock does)
+        manager.discard_all_outputs_and_register_unified_recompute(output)
+
+        # Backward pass should work without error
+        loss = output.sum()
+        loss.backward()
+
+        # Verify gradients exist
+        assert hidden_states.grad is not None, "Gradients should be computed for hidden_states"
+        assert hidden_states.grad.shape == hidden_states.shape
+
+    def test_forward_backward_correctness_with_recompute(self):
+        """
+        Test that forward/backward with MHC recompute produces correct gradients
+        compared to forward/backward without recompute.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        # Create layer with recompute enabled
+        layer, config = self._create_layer_with_hyper_connection(hidden_size, num_streams)
+        layer.train()
+
+        n_channels = num_streams * hidden_size
+
+        # Create input tensors
+        hidden_states_ref = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        hidden_states_ckpt = hidden_states_ref.detach().clone().requires_grad_(True)
+
+        # Forward without recompute manager (reference)
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        output_ref, _ = layer(
+            hidden_states=hidden_states_ref,
+            attention_mask=attention_mask,
+            mhc_recompute_manager=None,
+        )
+        loss_ref = output_ref.sum()
+        loss_ref.backward()
+        grad_ref = hidden_states_ref.grad.clone()
+
+        # Reset layer state for checkpoint run
+        layer.zero_grad()
+
+        # Forward with recompute manager
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        manager = MHCBlockRecomputeManager()
+        output_ckpt, _ = layer(
+            hidden_states=hidden_states_ckpt,
+            attention_mask=attention_mask,
+            mhc_recompute_manager=manager,
+            is_last_layer_in_block=True,
+        )
+
+        # Register unified recompute hook
+        manager.discard_all_outputs_and_register_unified_recompute(output_ckpt)
+
+        loss_ckpt = output_ckpt.sum()
+        loss_ckpt.backward()
+        grad_ckpt = hidden_states_ckpt.grad.clone()
+
+        # Verify gradients match
+        assert torch.allclose(grad_ckpt, grad_ref, atol=1e-4, rtol=1e-4), (
+            f"Gradients mismatch between recompute and non-recompute paths.\n"
+            f"Max diff: {(grad_ckpt - grad_ref).abs().max()}"
+        )
+
+    def test_intermediate_layer_with_recompute(self):
+        """
+        Test TransformerLayer as an intermediate layer (not last in block).
+        In this case, MLP BDA should also be checkpointed.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        layer, config = self._create_layer_with_hyper_connection(hidden_size, num_streams)
+        layer.train()
+
+        n_channels = num_streams * hidden_size
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        manager = MHCBlockRecomputeManager()
+
+        # Forward pass - NOT the last layer in block
+        output, context = layer(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            mhc_recompute_manager=manager,
+            is_last_layer_in_block=False,  # Intermediate layer, MLP BDA is checkpointed
+        )
+
+        # Verify output shape
+        assert output.shape == (seq_len, batch_size, n_channels)
+
+        # For intermediate layers, we need to pass output to next layer
+        # Here we just register the recompute hook on output for testing
+        manager.discard_all_outputs_and_register_unified_recompute(output)
+
+        # Backward pass should work
+        loss = output.sum()
+        loss.backward()
+
+        assert hidden_states.grad is not None
+        assert hidden_states.grad.shape == hidden_states.shape
+
+    def test_multiple_layers_chain_with_recompute(self):
+        """
+        Test multiple TransformerLayers chained together with a single
+        MHCBlockRecomputeManager, simulating TransformerBlock behavior.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+        num_layers = 3
+
+        # Create multiple layers
+        config = TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            recompute_hyper_connections=True,
+            recompute_granularity='selective',
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        layers = [
+            TransformerLayer(config, layer_spec.submodules, layer_number=i + 1).cuda()
+            for i in range(num_layers)
+        ]
+
+        for layer in layers:
+            layer.train()
+
+        n_channels = num_streams * hidden_size
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        # Single manager for all layers (like TransformerBlock)
+        manager = MHCBlockRecomputeManager()
+
+        # Forward through all layers
+        h = hidden_states
+        for i, layer in enumerate(layers):
+            is_last = (i == num_layers - 1)
+            h, _ = layer(
+                hidden_states=h,
+                attention_mask=attention_mask,
+                mhc_recompute_manager=manager,
+                is_last_layer_in_block=is_last,
+            )
+
+        # Register unified recompute on final output
+        manager.discard_all_outputs_and_register_unified_recompute(h)
+
+        # Backward pass
+        loss = h.sum()
+        loss.backward()
+
+        # Verify gradients
+        assert hidden_states.grad is not None
+        assert hidden_states.grad.shape == hidden_states.shape
+        # Check that gradient is non-trivial (not all zeros)
+        assert hidden_states.grad.abs().sum() > 0
