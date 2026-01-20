@@ -2,6 +2,10 @@
 
 """Dataloaders."""
 
+import os
+import threading
+import ctypes
+import sys
 
 import random
 import torch
@@ -247,6 +251,7 @@ class MegatronSFTPrefetchDPBalancedSampler(MegatronPretrainingSampler):
 
     def prefetch_batch(self, queue1, queue2):
         torch.multiprocessing._set_thread_name("pt_prefetch_batch")
+        torch.set_num_threads(1)
         # global_store = DistKVStore(world_size=torch.distributed.get_world_size(), rank=torch.distributed.get_rank(), group_name=global_group_name)
         # within_node_store = DistKVStore(world_size=8, rank=torch.distributed.get_rank(), group_name=within_node_group_name)
         # assert torch.distributed.get_world_size() % 8 == 0, f"world_size should be divisible by 8" # 单机8卡
@@ -265,7 +270,6 @@ class MegatronSFTPrefetchDPBalancedSampler(MegatronPretrainingSampler):
             # print(f"PUT queue2, {batch_data=}")
 
     def prepare_batch(self, batch):
-        torch.multiprocessing._set_thread_name("pt_prefetch_batch")
         batch_numel = [self.get_numel(idx) for idx in batch]
         # TODO: use distributed `get_numel` to reduce io pressure.
         
