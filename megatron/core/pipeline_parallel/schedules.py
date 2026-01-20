@@ -9,6 +9,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.datasets.data_schedule import PackingScheduler, wrap_dataloader
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_reset,
@@ -512,6 +513,30 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+def wrap_iterator_helper(
+    config,
+    data_iterator: Union[Iterator, List[Iterator]],
+    num_microbatches: int,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
+    """Warp data iterator for sequence packing if needed."""
+    if config.sequence_packing:
+        num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch = None, None
+        scheduler_type_map = {
+            'default': PackingScheduler.DEFAULT,
+            'empty': PackingScheduler.EMPTY,
+        }
+        if config.sequence_packing_scheduler not in scheduler_type_map:
+            raise ValueError(
+                f"Invalid sequence packing scheduler: \
+                {config.sequence_packing_scheduler}"
+            )
+        scheduler_type = scheduler_type_map[config.sequence_packing_scheduler]
+        return wrap_dataloader(data_iterator, config, scheduler_type, pg_collection=None)
+    else:
+        return data_iterator, num_microbatches, None, None
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -593,6 +618,14 @@ def forward_backward_no_pipelining(
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+
+    if config.sequence_packing:
+        (
+            data_iterator,
+            num_microbatches,
+            num_total_tokens_this_global_batch,
+            sequence_square_sum_this_global_batch,
+        ) = wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
@@ -691,6 +724,11 @@ def forward_backward_no_pipelining(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    if config.sequence_packing and not forward_only:
+        forward_data_store.append(
+            [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
+        )
 
     return forward_data_store
 
@@ -1047,6 +1085,14 @@ def forward_backward_pipelining_with_interleaving(
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
+
+    if config.sequence_packing:
+        (
+            data_iterator,
+            num_microbatches,
+            num_total_tokens_this_global_batch,
+            sequence_square_sum_this_global_batch,
+        ) = wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2064,6 +2110,11 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
+    if config.sequence_packing and not forward_only:
+        forward_data_store.append(
+            [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
+        )
+
     return forward_data_store
 
 
@@ -2180,6 +2231,14 @@ def forward_backward_pipelining_without_interleaving(
             "Invalid combination of p2p_communicator, pg_collection "
             "provide none or provide all the process groups"
         )
+
+    if config.sequence_packing:
+        (
+            data_iterator,
+            num_microbatches,
+            num_total_tokens_this_global_batch,
+            sequence_square_sum_this_global_batch,
+        ) = wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2449,5 +2508,10 @@ def forward_backward_pipelining_without_interleaving(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    if config.sequence_packing and not forward_only:
+        forward_data_store.append(
+            [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
+        )
 
     return forward_data_store

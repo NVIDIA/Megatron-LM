@@ -1974,6 +1974,33 @@ class TransformerConfig(ModelParallelConfig):
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
 
+        if self.sequence_packing:
+            # Check TE version.
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
+            # TODO: remove this after we fix the convergence issue with TE < 2.9.
+            if not (
+                is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")
+            ):
+                raise ValueError(
+                    "SFT sequence packing requires Transformer Engine >= 2.9.0 "
+                    f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
+                )
+
+            assert self.context_parallel_size * self.max_seqlen_per_dp_cp_rank >= self.seq_length
+
+            # Needed for passing variable sequences between pp stages.
+            self.variable_seq_lengths = True
+
+            # TODO(tailaim): add support for other dispatcher types
+            warnings.warn("Setting moe_token_dispatcher_type to alltoall for sft sequence packing.")
+            args.moe_token_dispatcher_type = "alltoall"
+
+            if self.sequence_packing_scheduler is None:
+                self.sequence_packing_scheduler = 'default'
+
 
 @dataclass
 @experimental_api
