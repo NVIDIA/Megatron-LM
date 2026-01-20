@@ -5,7 +5,7 @@ Unit tests for HyperConnection block-level recomputation.
 
 Tests the following functionality:
 1. HyperConnectionModule._forward_with_checkpoint
-2. HyperConnectionModule.apply_h_post_with_checkpoint
+2. HyperConnectionModule.apply_h_post with manager parameter
 3. Integration with MHCBlockRecomputeManager
 4. TransformerLayer with mhc_recompute_manager
 5. TransformerBlock with recompute_hyper_connections
@@ -116,7 +116,7 @@ class TestHyperConnectionCheckpoint:
 
     def test_apply_h_post_with_checkpoint(self):
         """
-        Test that apply_h_post_with_checkpoint produces correct gradients.
+        Test that apply_h_post with manager produces correct gradients.
         """
         hidden_size = 64
         num_streams = 4
@@ -134,9 +134,9 @@ class TestHyperConnectionCheckpoint:
         x_ckpt = x.detach().clone().requires_grad_(True)
         h_post_ckpt = h_post.detach().clone().requires_grad_(True)
 
-        # Reference: without checkpoint
+        # Reference: without checkpoint (manager=None)
         torch.manual_seed(42)
-        x_out_ref, bias_out_ref = module.apply_h_post((x, bias), h_post)
+        x_out_ref, bias_out_ref = module.apply_h_post((x, bias), h_post, manager=None)
         loss_ref = x_out_ref.sum()
         if bias_out_ref is not None:
             loss_ref = loss_ref + bias_out_ref.sum()
@@ -144,10 +144,10 @@ class TestHyperConnectionCheckpoint:
         grad_x_ref = x.grad.clone()
         grad_h_post_ref = h_post.grad.clone()
 
-        # With checkpoint
+        # With checkpoint (manager provided)
         torch.manual_seed(42)
         manager = MHCBlockRecomputeManager()
-        x_out_ckpt, bias_out_ckpt = module.apply_h_post_with_checkpoint(
+        x_out_ckpt, bias_out_ckpt = module.apply_h_post(
             (x_ckpt, bias), h_post_ckpt, manager=manager
         )
         loss_ckpt = x_out_ckpt.sum()
