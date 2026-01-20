@@ -35,58 +35,11 @@ For instructions, refer to [Quick Start](https://docs.nvidia.com/megatron-core/d
 
 </details>
 
-<details>
-<summary>Table of Contents</summary>
 
-**Getting Started**
 
-- [Quick Start](#-quick-start)
-- [Latest News](#latest-news)
-- [Megatron Overview](#megatron-overview)
-  - [Project Structure](#project-structure)
-  - [Megatron-LM: Reference Implementation](#megatron-lm-reference-implementation)
-  - [Megatron Core: Production Library](#megatron-core-production-library)
-- [Installation](#installation)
-  - [Docker (Recommended)](#-docker-recommended)
-  - [Pip Installation](#pip-installation)
-  - [System Requirements](#system-requirements)
 
-**Core Features**
 
-- [Performance Benchmarking](#performance-benchmarking)
-  - [Weak Scaling Results](#weak-scaling-results)
-  - [Strong Scaling Results](#strong-scaling-results)
-- [Ecosystem Libraries](#ecosystem-libraries)
-
-**Training**
-
-- [Training](#training)
-  - [Getting Started](#getting-started)
-  - [Data Preparation](#data-preparation)
-- [Parallelism Strategies](#parallelism-strategies)
-  - [Data Parallelism (DP)](#data-parallelism-dp)
-  - [Tensor Parallelism (TP)](#tensor-parallelism-tp)
-  - [Pipeline Parallelism (PP)](#pipeline-parallelism-pp)
-  - [Context Parallelism (CP)](#context-parallelism-cp)
-  - [Expert Parallelism (EP)](#expert-parallelism-ep)
-  - [Parallelism Selection Guide](#parallelism-selection-guide)
-- [Performance Optimizations](#performance-optimizations)
-
-**Resources**
-
-- [Examples](./examples/) - Training scripts and tutorials
-- [Documentation](https://docs.nvidia.com/Megatron-Core/) - Official docs
-- [Roadmaps](#roadmaps) - Development roadmaps and feature tracking
-- [Community & Support](#community--support) - Get help and contribute
-  - [Getting Help](#getting-help)
-  - [Contributing](#contributing)
-  - [Citation](#citation)
-
-</details>
-
-# Megatron Overview
-
-## Project Structure
+# Project Structure
 
 ```
 Megatron-LM/
@@ -165,77 +118,7 @@ Megatron-LM/
 
 **Compatible with:** [Hugging Face Accelerate](https://github.com/huggingface/accelerate), [Colossal-AI](https://github.com/hpcaitech/ColossalAI), [DeepSpeed](https://github.com/microsoft/DeepSpeed)
 
-# Installation
 
-## 🐳 Docker (Recommended)
-
-We strongly recommend using the previous releases of [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) rather than the latest one for optimal compatibility with Megatron Core release and testing matrix. Our releases are always based on the previous month's NGC container, so this ensures compatibility and stability.
-
-**Note:** The NGC PyTorch container constraints the python environment globally via `PIP_CONSTRAINT`. In the following examples we will unset the variable.
-
-This container comes with all dependencies pre-installed with compatible versions and optimized configurations for NVIDIA GPUs:
-
-- PyTorch (latest stable version)
-- CUDA, cuDNN, NCCL (latest stable versions)
-- Support for FP8 on NVIDIA Hopper, Ada, and Blackwell GPUs
-- For best performance, use NVIDIA Turing GPU architecture generations and later
-
-```bash
-# Run container with mounted directories
-docker run --runtime --nvidia --gpus all -it --rm \
-  -v /path/to/megatron:/workspace/megatron \
-  -v /path/to/dataset:/workspace/dataset \
-  -v /path/to/checkpoints:/workspace/checkpoints \
-  -e PIP_CONSTRAINT= \
-  nvcr.io/nvidia/pytorch:25.04-py3
-```
-
-## Pip Installation
-
-Megatron Core offers support for two NGC PyTorch containers:
-
-- `dev`: Moving head that supports the most recent upstream dependencies
-- `lts`: Long-term support of NGC PyTorch 24.01
-
-Both containers can be combined with `mlm` which adds package dependencies for Megatron-LM on top of Megatron Core.
-
-```bash
-# Install the latest release dependencies
-pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-pip install --no-build-isolation megatron-core[dev]
-# For running an M-LM application:
-pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-pip install --no-build-isolation megatron-core[mlm,dev]
-```
-
-```bash
-# Install packages for LTS support NGC PyTorch 24.01
-pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-pip install --no-build-isolation megatron-core[lts]
-# For running an M-LM application:
-pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-pip install --no-build-isolation megatron-core[mlm,lts]
-```
-
-For a version of Megatron Core with only torch, run:
-
-```bash
-pip install megatron-core
-```
-
-## System Requirements
-
-### Hardware Requirements
-
-- **FP8 Support**: NVIDIA Hopper, Ada, Blackwell GPUs
-- **Recommended**: NVIDIA Turing architecture or later
-
-### Software Requirements
-
-- **CUDA/cuDNN/NCCL**: Latest stable versions
-- **PyTorch**: Latest stable version
-- **Transformer Engine**: Latest stable version
-- **Python**: 3.12 recommended
 
 # Performance Benchmarking
 
