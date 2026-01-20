@@ -552,6 +552,11 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
     """
     Checkpoint Function Helper for CheckpointWithouOutput.
     Save context for recompute.
+    
+    Handles both tensor and non-tensor arguments:
+    - Tensor arguments are saved via save_for_backward
+    - Non-tensor arguments (int, float, bool, None, etc.) are stored separately
+      in ctx attributes and reconstructed during recomputation
     """
 
     @staticmethod
@@ -569,7 +574,29 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
-        ctx.save_for_backward(*detach_variable(args))
+        
+        # Separate tensor and non-tensor arguments
+        # save_for_backward can only save tensors, so we need to handle non-tensors separately
+        tensor_args = []
+        non_tensor_indices = []
+        non_tensor_values = []
+        
+        for i, arg in enumerate(args):
+            if isinstance(arg, torch.Tensor):
+                tensor_args.append(arg)
+            else:
+                # Store non-tensor argument's index and value
+                non_tensor_indices.append(i)
+                non_tensor_values.append(arg)
+        
+        # Save tensor arguments via save_for_backward
+        ctx.save_for_backward(*detach_variable(tuple(tensor_args)))
+        
+        # Store non-tensor metadata in ctx attributes (not via save_for_backward)
+        ctx.non_tensor_indices = non_tensor_indices
+        ctx.non_tensor_values = non_tensor_values
+        ctx.total_args_count = len(args)
+        
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
         checkpoint_without_output_obj.ctx = ctx
@@ -781,8 +808,8 @@ class CheckpointWithoutOutput(object):
                 recompute_ctx = contextlib.nullcontext()
                 fp8_ctx = contextlib.nullcontext()
 
-            # Store the inputs for backward pass
-            inputs = self.ctx.saved_tensors
+            # Get tensor inputs from saved_tensors
+            tensor_inputs = self.ctx.saved_tensors
 
             def detach(t):
                 if isinstance(t, torch.Tensor):
@@ -791,7 +818,29 @@ class CheckpointWithoutOutput(object):
                     t.requires_grad_(requires_grad)
                 return t
 
-            inputs = tuple(detach(t) for t in inputs)
+            tensor_inputs = tuple(detach(t) for t in tensor_inputs)
+            
+            # Reconstruct full args list by merging tensor and non-tensor arguments
+            # Non-tensor args are stored in ctx.non_tensor_indices and ctx.non_tensor_values
+            total_args_count = self.ctx.total_args_count
+            non_tensor_indices = self.ctx.non_tensor_indices
+            non_tensor_values = self.ctx.non_tensor_values
+            
+            # Build full inputs list
+            inputs = [None] * total_args_count
+            tensor_idx = 0
+            non_tensor_idx = 0
+            for i in range(total_args_count):
+                if non_tensor_idx < len(non_tensor_indices) and non_tensor_indices[non_tensor_idx] == i:
+                    # This position is a non-tensor argument
+                    inputs[i] = non_tensor_values[non_tensor_idx]
+                    non_tensor_idx += 1
+                else:
+                    # This position is a tensor argument
+                    inputs[i] = tensor_inputs[tensor_idx]
+                    tensor_idx += 1
+            
+            inputs = tuple(inputs)
             with torch.enable_grad(), fp8_ctx, recompute_ctx:
                 outputs = self.run_function(*inputs)
 
