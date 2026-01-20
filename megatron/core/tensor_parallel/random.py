@@ -590,37 +590,43 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-class BlockLevelCheckpointManager:
+class MHCBlockRecomputeManager:
     """
-    Block-Level Checkpoint Manager.
+    MHC (Manifold-Constrained Hyper-Connections) Block-Level Recompute Manager.
 
-    Manages multiple CheckpointWithoutOutput objects within a block, enabling unified
-    recomputation during backward pass. This is particularly useful for scenarios where
-    multiple checkpoint operations have sequential dependencies (i.e., the output of one
-    checkpoint is the input of the next).
+    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock for
+    HyperConnection computations, enabling unified recomputation during backward pass.
+    This is particularly useful for scenarios where multiple checkpoint operations have
+    sequential dependencies (i.e., the output of one checkpoint is the input of the next).
 
     The manager ensures that during backward:
     1. All checkpoint outputs are discarded to save memory
     2. Recomputation happens in the correct forward order
     3. Each checkpoint's output is restored before the next one needs it as input
 
+    Design Philosophy:
+    - This manager is passed into HyperConnectionModule.forward() so that the checkpoint
+      logic is encapsulated within HyperConnection, making TransformerLayer unaware of
+      the detailed checkpoint process.
+    - When manager is None, HyperConnection operates normally without checkpointing.
+    - When manager is provided, HyperConnection wraps its computations with
+      CheckpointWithoutOutput and registers them to the manager.
+
     Usage:
-        manager = BlockLevelCheckpointManager()
+        # In TransformerBlock:
+        manager = MHCBlockRecomputeManager()
 
-        ckpt1 = CheckpointWithoutOutput()
-        y1 = ckpt1.checkpoint(func1, x)
-        manager.add_checkpoint(ckpt1)
+        # Pass manager to each layer's HyperConnection
+        for layer in self.layers:
+            hidden_states = layer.forward(..., mhc_recompute_manager=manager)
 
-        ckpt2 = CheckpointWithoutOutput()
-        y2 = ckpt2.checkpoint(func2, y1)  # y1 is input
-        manager.add_checkpoint(ckpt2)
-
-        # Register unified recompute hook on the final output
-        manager.discard_all_outputs_and_register_unified_recompute(y2)
+        # After all layers, register unified recompute on final output
+        final_output = hidden_states.sum()  # or loss
+        manager.discard_all_outputs_and_register_unified_recompute(final_output)
     """
 
     def __init__(self):
-        """Initialize the BlockLevelCheckpointManager."""
+        """Initialize the MHCBlockRecomputeManager."""
         self.checkpoints = []
 
     def add_checkpoint(self, ckpt):
@@ -648,6 +654,7 @@ class BlockLevelCheckpointManager:
         Args:
             hook_tensor: The tensor to register the recompute hook on. This should be
                         the final output that depends on all checkpointed computations.
+                        Typically this is the loss tensor or a sum of the block output.
 
         Note:
             The caller must ensure that:
@@ -679,6 +686,10 @@ class BlockLevelCheckpointManager:
             # Call _recompute for each checkpoint in forward order
             # The _recompute method will restore the output tensor storage
             ckpt._recompute(None)
+
+
+# Backward compatibility alias
+BlockLevelCheckpointManager = MHCBlockRecomputeManager
 
 
 class CheckpointWithoutOutput(object):
