@@ -141,7 +141,7 @@ Use a null tokenizer for testing or non-text models:
 
 ```python
 tokenizer = MegatronTokenizer.from_pretrained(
-    metadata_path={"library": "null"},
+    metadata_path={"library": "null-text"},
     vocab_size=131072,
 )
 ```
