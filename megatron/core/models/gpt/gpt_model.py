@@ -351,13 +351,19 @@ class GPTModel(LanguageModule):
                     rotary_seq_len,
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
+                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
         elif self.position_embedding_type == 'yarn':
             if self.training or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
-                rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len)
+                rotary_pos_emb, _ = self.rotary_pos_emb(
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                )
             else:
                 raise NotImplementedError(
                     "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
@@ -365,7 +371,11 @@ class GPTModel(LanguageModule):
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
-                rotary_pos_emb = self.rotary_pos_emb(position_ids, self.mrope_section)
+                rotary_pos_emb = self.rotary_pos_emb(
+                    position_ids,
+                    self.mrope_section,
+                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
                 raise NotImplementedError(
