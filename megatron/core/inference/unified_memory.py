@@ -1,16 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import ctypes
-
-
-def _clear_cuda_error():
-    """Clear any sticky CUDA error to prevent cascading failures."""
-    try:
-        import torch
-        # This clears the last error
-        torch.cuda.synchronize()
-    except Exception:
-        pass
 import os
 import signal
 import threading
@@ -350,11 +340,7 @@ def prefetch_managed_tensor(tensor, *, device: int, stream=None) -> None:
         ctypes.c_void_p(int(tensor.data_ptr())), ctypes.c_size_t(nbytes), int(device), stream_ptr
     )
     if err != 0:
-        # Clear the CUDA error state to prevent cascading failures
-        _clear_cuda_error()
-        # Return error code so caller with name context can issue a better warning
-        return err
-    return 0
+        raise RuntimeError(f"cudaMemPrefetchAsync failed with cudaError={err}")
 
 
 def advise_managed_tensor_preferred_location(tensor, *, device: int) -> None:
@@ -383,11 +369,7 @@ def advise_managed_tensor_preferred_location(tensor, *, device: int) -> None:
         ctypes.c_void_p(int(tensor.data_ptr())), ctypes.c_size_t(nbytes), int(device)
     )
     if err != 0:
-        # Clear the CUDA error state to prevent cascading failures
-        _clear_cuda_error()
-        # Return error code so caller with name context can issue a better warning
-        return err
-    return 0
+        raise RuntimeError(f"cudaMemAdviseSetAccessedBy failed with cudaError={err}")
 
 
 def advise_managed_tensor_accessed_by(tensor, *, device: int) -> None:
@@ -416,14 +398,7 @@ def advise_managed_tensor_accessed_by(tensor, *, device: int) -> None:
         ctypes.c_void_p(int(tensor.data_ptr())), ctypes.c_size_t(nbytes), int(device)
     )
     if err != 0:
-        # Clear the CUDA error state to prevent cascading failures
-        _clear_cuda_error()
-        raise RuntimeError(
-            f"cudaMemAdviseSetAccessedBy failed (cudaError={err}) for tensor: "
-            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}, "
-            f"data_ptr=0x{tensor.data_ptr():x}, nbytes={nbytes}. "
-            "This tensor is not UVM-allocated."
-        )
+        raise RuntimeError(f"cudaMemAdviseSetAccessedBy failed with cudaError={err}")
 
 
 def prefetch_managed_module_parameters(
@@ -525,7 +500,7 @@ def advise_managed_module_parameters_preferred_location(
         err = advise_managed_tensor_preferred_location(t, device=device)
         if err:
             raise RuntimeError(
-                f"cudaMemAdviseSetPreferredLocation failed (cudaError={err}) for parameter '{name}': "
+                f"cudaMemAdviseSetPreferredLocation failed (cudaError={err}) for param '{name}': "
                 f"shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}, "
                 f"data_ptr=0x{t.data_ptr():x}, nbytes={t.nbytes}. "
                 "This tensor is not UVM-allocated."
@@ -544,7 +519,7 @@ def advise_managed_module_parameters_preferred_location(
             err = advise_managed_tensor_preferred_location(b, device=device)
             if err:
                 raise RuntimeError(
-                    f"cudaMemAdviseSetPreferredLocation failed (cudaError={err}) for buffer '{name}': "
+                    f"cudaMemAdviseSetPreferredLocation failed (err={err}) for buf '{name}': "
                     f"shape={tuple(b.shape)}, dtype={b.dtype}, device={b.device}, "
                     f"data_ptr=0x{b.data_ptr():x}, nbytes={b.nbytes}. "
                     "This tensor is not UVM-allocated."
