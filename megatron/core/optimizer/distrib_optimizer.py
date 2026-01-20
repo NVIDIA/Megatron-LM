@@ -2507,7 +2507,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):
                     name = name[len("module.") :]
-                matched_keys = [k for k in names_in_state_dict if name in k]
+                matched_keys = [k for k in names_in_state_dict if k.endswith(name)]
                 assert (
                     len(matched_keys) == 1
                 ), f"Parameter {name} has {len(matched_keys)} matches in state dict"
