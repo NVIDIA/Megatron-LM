@@ -3680,6 +3680,12 @@ def _add_experimental_args(parser):
                        help='Number of Sinkhorn-Knopp iterations for doubly stochastic projection. Default: 20.')
     group.add_argument('--mhc-init-gating-factor', type=float, default=0.01,
                        help='Initial gating factor for mHC alpha parameters. Default: 0.01.')
+    group.add_argument('--recompute-hyper-connections', action='store_true',
+                       default=False,
+                       help='Enable recomputation for HyperConnection intermediate activations. '
+                       'When enabled, all HyperConnection operations are wrapped with '
+                       'CheckpointWithoutOutput for memory-efficient recomputation. '
+                       'Requires --enable-hyper-connections and --recompute-granularity selective.')
 
     return parser
 
