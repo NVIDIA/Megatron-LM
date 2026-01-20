@@ -11,19 +11,10 @@ Megatron-LM & Megatron Core
 
 <div align="left">
 
-## ⚡ Quick Start
+## Quick Start
 
-```bash
-# 1. Install Megatron Core with required dependencies
-pip install --no-build-isolation megatron-core[mlm,dev]
+For instructions, refer to [Quick Start](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html).
 
-# 2. Clone repository for examples
-git clone https://github.com/NVIDIA/Megatron-LM.git
-cd Megatron-LM
-pip install --no-build-isolation .[mlm,dev]
-```
-
-**→ [Complete Installation Guide](#installation)** - Docker, pip variants (dev,lts,etc.), and system requirements
 
 # Latest News
 
