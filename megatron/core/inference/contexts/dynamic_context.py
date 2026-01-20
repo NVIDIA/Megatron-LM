@@ -224,6 +224,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_requests (int): Max number of active requests to use for
             decode-only forward passes. This value is primarily limited by the
             combination of `buffer_size_gb` and `max_sequence_length`.
+        max_requests_scaler (float): Scale the inference context's default
+            `max_requests` by the given amount. This value should be <= 1, and can
+            be used to optimize eviction from the context.
         max_tokens (int): Max number of tokens to use for forward passes. This is
             primarily limited by prefill activation memory usage. (Defaults to
             16384).
@@ -267,6 +270,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         buffer_size_gb: float,
         paused_buffer_size_gb: float | None = None,
         max_requests: int = None,
+        max_requests_scaler: float = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         block_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
@@ -484,11 +488,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
 
         # Set max_requests, max_tokens.
+        assert max_requests is None or max_requests_scaler is None, (
+            "Either `max_requests` or `max_requests_scaler` can be given, but not both."
+        )
         if max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
             self.max_requests = self.block_allocator.total_count - 1  # -1 for dummy block
             self.max_requests = self.max_requests // tp_size * tp_size
             self.max_requests = self.max_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
+
+            if max_requests_scaler is not None:
+                assert 0 < max_requests_scaler <= 1
+                self.max_requests = max(1, int(self.max_requests * max_requests_scaler))
         else:
             # User can control request overflow via max_requests.
             self.max_requests = max_requests
@@ -564,6 +575,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.block_allocator.active_count,
             )
         )
+        # >>>
+        # pax({
+        #     "total_count" : self.block_allocator.total_count,
+        #     "max_requests" : self.max_requests,\
+        # })
+        # <<<
 
     def allocate_all_tensors(self, *, is_init: bool) -> None:
         """Allocate GPU state.
@@ -1790,6 +1807,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
+        # >>>
+        # assert active_request_count > 0, "active_request_count == %d." % active_request_count
+        # <<<
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
         if resume_request_count > 0:
@@ -1921,14 +1941,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
         )
 
-        # Swap the chunked prefill request to the end of the active requests to
-        # obey the invariance.
-        if self.chunked_prefill_request_id != -1:
-            self._swap_book_keeping_tensors(
-                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
-                dst_idxs=torch.tensor([self.total_request_count - evict_request_count - 1]),
-                next_tokens=next_tokens,
-            )
+        # >>>
+        # # Swap the chunked prefill request to the end of the active requests to
+        # # obey the invariance.
+        # if self.chunked_prefill_request_id != -1:
+        #     self._swap_book_keeping_tensors(
+        #         src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
+        #         dst_idxs=torch.tensor([self.total_request_count - evict_request_count - 1]),
+        #         next_tokens=next_tokens,
+        #     )
+        # <<<
 
         # Update tracking vars.
         self.paused_request_count -= evict_request_count
@@ -2091,9 +2113,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
             if active_requests_requiring_new_block_count > 0:
+                # >>>
+                # newly_paused_request_ids = self.request_ids[
+                #     torch.nonzero(active_requests_requiring_new_block) + self.paused_request_count
+                # ]
+                # +++
                 newly_paused_request_ids = self.request_ids[
-                    torch.nonzero(active_requests_requiring_new_block) + self.paused_request_count
+                    torch.nonzero(active_requests_requiring_new_block)[:, 0] + self.paused_request_count
+                    # torch.nonzero(active_requests_requiring_new_block)[0] ? ? ? + self.paused_request_count
                 ]
+                # pax({
+                #     "request_ids" : self.request_ids,
+                #     "active_requests_requiring_new_block" : active_requests_requiring_new_block,
+                #     "idxs" : torch.nonzero(active_requests_requiring_new_block),
+                # }, "newly_paused_request_ids")
+                # <<<
 
             # Swap unfinished active requests on the left side with paused requests on the right side
             # NOTE : We add paused request count because we concatenate
@@ -2146,6 +2180,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
             active_request_count, newly_paused_request_ids, next_tokens
         )
+
+        # >>>
+        # Swap the chunked prefill request to the end of the active requests to
+        # obey the invariance.
+        if self.chunked_prefill_request_id != -1:
+            self._swap_book_keeping_tensors(
+                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
+                dst_idxs=torch.tensor([self.total_request_count - evict_request_count - 1]),
+                next_tokens=next_tokens,
+            )
+        # <<<
 
         # >>> [ new ]
         assert active_request_count > 0, "active_request_count == %d." % active_request_count

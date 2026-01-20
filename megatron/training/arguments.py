@@ -1593,6 +1593,12 @@ def _add_inference_args(parser):
                        help='Override the inference context\'s `max_requests`. '
                        'By default, `max_requests` is set to the number of '
                        'blocks in the context\'s memory buffer.')
+    group.add_argument('--inference-dynamic-batching-max-requests-scaler',
+                       type=float, default=None,
+                       help='Scale the inference context\'s default '
+                       '`max_requests` by the given amount. This value should be '
+                       '<= 1, and can be used to optimize eviction from the '
+                       'context.')
     group.add_argument('--inference-dynamic-batching-max-tokens',
                        type=int, default=None,
                        help='Override the inference context\'s default `max_tokens`.')

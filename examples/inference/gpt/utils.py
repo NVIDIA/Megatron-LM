@@ -438,8 +438,8 @@ def build_dynamic_engine_setup_prefix(
         segment_count = getattr(context.block_allocator, f"{key}_count")
         segment_bytes = segment_count * context.block_size_bytes
         return get_mem_size_str(segment_bytes)
-    total_buffer_blocks = context.block_allocator.total_count
-    active_buffer_blocks = context.block_allocator.active_count
+    # total_buffer_blocks = context.block_allocator.total_count
+    # active_buffer_blocks = context.block_allocator.active_count
     buffer_limits_str = (
         f"ctx: {get_block_size_str('total')} "
         f"[a {get_block_size_str('active')}, p {get_block_size_str('paused')}], "

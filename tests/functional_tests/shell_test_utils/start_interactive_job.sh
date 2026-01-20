@@ -79,6 +79,9 @@ fi
 
 # Add current directory to container mounts
 CONTAINER_MOUNTS="$DATASET_DIR:/mnt/artifacts,$(pwd):/opt/megatron-lm"
+# >>>
+CONTAINER_MOUNTS+=",/lustre/fsw/portfolios/adlr/projects/adlr_nlp_llmnext/users/lmcafee/lmind:/opt/lmind"
+# <<<
 
 # Build the final srun command
 SRUN_CMD="srun \

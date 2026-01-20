@@ -183,6 +183,7 @@ def get_inference_context(
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
         max_requests=args.inference_dynamic_batching_max_requests,
+        max_requests_scaler=args.inference_dynamic_batching_max_requests_scaler,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
@@ -538,6 +539,26 @@ def main():
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
+
+        # Timing results.
+        stats = torch.cuda.memory_stats()
+        throughput = total_output_tokens / total_time
+        peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
+        peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
+
+        p_times = step_times["prefill"]
+        d_times = step_times["decode"]
+
+        p_total = sum(p_times)
+        d_total = sum(d_times)
+
+        p_count = len(p_times)
+        d_count = len(d_times)
+
+        p_mean = p_total / p_count
+        d_mean = d_total / d_count if d_count != 0 else 0.
+
+        # Unique prompts + generations.
         def escape_str(s):
             return s.replace("\n", "\\n")
 
@@ -592,9 +613,18 @@ def main():
             json_results = {}
 
             # Write every 'n' requests, plus the final request.
+            # >>>
+            # raise Exception("hi.")
+            # <<<
             for i, req in enumerate(requests):
+                # >>>
+                # from lutil import pax
+                # pax({"req / generated_tokens": req.output_tokens})
+                # <<<
                 if i % args.output_every_n_results == 0 or i == len(requests) - 1:
-                    print(f' Attributes of request {i}: {req.__dict__}')
+                    # >>>
+                    # print(f' Attributes of request {i}: {req.__dict__}')
+                    # <<<
                     result_dict = {
                         "input_prompt": req.prompt_text,
                         "generated_text": req.output_text,
@@ -604,6 +634,7 @@ def main():
                         "step_count" : engine.step_count,
                         "top_n_logprobs" : getattr(req, 'generated_top_n_logprobs', None),
                         "prompt_top_n_logprobs" : getattr(req, 'prompt_top_n_logprobs', None),
+                        "events" : [ e.serialize() for e in req.events ],
                     }
                     if req.sampling_params.return_log_probs:
                         result_dict["prompt_logprobs"] = getattr(req, 'prompt_log_probs', None)
@@ -618,28 +649,47 @@ def main():
             # if the fields exist in the golden values.
             json_results.update(peak_mem_stats)
 
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            from dataclasses import asdict
+            json_results["custom"] = {
+                "setup" : {
+                    "setup_prefix" : setup_prefix,
+                    "cuda_graph_impl" : args.cuda_graph_impl,
+                    "cuda_graph_batch_dimensions" : [ asdict(d) for d in context.cuda_graph_batch_dimensions_list ],
+                    "unified_memory_level" : context.unified_memory_level,
+                    "prompt_src" : (
+                        "cli" if args.prompts else
+                        "file" if args.prompt_file else
+                        f"synth({', '.join(map(str, args.num_tokens_to_prompt))})"
+                    ),
+                    "num_requests" : len(requests),
+                    "num_tokens_to_generate" : args.num_tokens_to_generate,
+                    "incoming_requests_duration" :  args.incoming_requests_duration,
+                    "incoming_requests_per_sec" : args.incoming_requests_per_sec,
+                    "incoming_requests_per_step" : args.incoming_requests_per_step,
+                    "block_size_bytes" : context.block_size_bytes,
+                    "total_block_count" : context.block_allocator.total_count,
+                    "active_block_count" : context.block_allocator.active_count,
+                    "paused_block_count" : context.block_allocator.paused_count,
+                },
+                "results" : {
+                    "throughput" : throughput,
+                    "total_time" : total_time,
+                    "peak_alloc_gb" : peak_alloc_gb,
+                    "peak_resvd_gb" : peak_resvd_gb,
+                    "step_count" : engine.step_count,
+                    "evicted_count" : engine.evicted_request_count,
+                    "capture_stats" : engine.capture_stats,
+                },
+            }
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
-                json.dump(json_results, fp, indent=1)
-
-        # Timing results.
-        stats = torch.cuda.memory_stats()
-        throughput = total_output_tokens / total_time
-        print("~~~")
-        peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
-        peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
-
-        p_times = step_times["prefill"]
-        d_times = step_times["decode"]
-
-        p_total = sum(p_times)
-        d_total = sum(d_times)
-
-        p_count = len(p_times)
-        d_count = len(d_times)
-
-        p_mean = p_total / p_count
-        d_mean = d_total / d_count if d_count != 0 else 0.
+                # >>>
+                # json.dump(json_results, fp, indent=1)
+                json.dump(json_results, fp, indent=4)
+                # <<<
 
         # Commented out for now as the step/add/output times are not calculated correctly.
         # print(
@@ -656,6 +706,7 @@ def main():
             if engine.capture_stats else
             "--"
         )
+        print("~~~")
         print(
             f"{setup_prefix} .... " +
             " | ".join([

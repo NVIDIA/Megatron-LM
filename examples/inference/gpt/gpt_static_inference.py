@@ -49,6 +49,13 @@ from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
+# >>>
+from lutil import pax as _pax
+import builtins
+builtins.pax = _pax
+# <<<
+
+
 def add_static_inference_args(parser):
     """Static inference arguments."""
 
@@ -233,6 +240,17 @@ def main():
                 response_logprobs = result.prompt_log_probs + result.generated_log_probs
                 result_dict["logprobs"] = response_logprobs
             results_output[result.request_id] = result_dict
+        # >>>
+        import hashlib
+        import pickle
+        from lutil import pax
+        # pax("result_dict")
+        pax("results", {
+            "generated_tokens" : result_dict["generated_tokens"],
+            "generated tokens / hash" : hashlib.sha1(pickle.dumps(result_dict["generated_tokens"])).hexdigest()[:4]
+
+        })
+        # <<<
 
         with open(args.output_path, 'w') as f:
             json.dump(results_output, f)
