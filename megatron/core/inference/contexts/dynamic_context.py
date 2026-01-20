@@ -340,9 +340,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.pipeline_parallel_group = None
 
-        # Cache the EP group for CUDA graph batch dimension matching.
-        # When using different EP sizes for inference vs training (e.g., RL refit),
-        # we need the inference EP group, not the global (training) EP group.
         if pg_collection is not None and hasattr(pg_collection, 'ep'):
             self.expert_model_parallel_group = pg_collection.ep
         else:
