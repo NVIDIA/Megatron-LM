@@ -130,11 +130,14 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             add_generation_prompt (bool): Add assistant prefix to the end.
         """
 
-        return self._tokenizer.tokenize_conversation(
-            conversation=conversation,
-            return_target=return_target,
-            add_generation_prompt=add_generation_prompt,
-        )
+        if self.library == 'sft':
+            return self._tokenizer.tokenize_conversation(
+                conversation=conversation,
+                return_target=return_target,
+                add_generation_prompt=add_generation_prompt,
+            )
+        else:
+            raise NotImplementedError("This method is supported only for SFTTokenizer.")
 
     def save_pretrained(self, path: str) -> None:
         """
