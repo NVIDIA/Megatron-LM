@@ -267,13 +267,11 @@ class TestMHCBlockRecomputeIntegration:
 
         h = hidden_states_ref
         r = residual_ref
-        h_posts = []
         for module in modules:
-            agg, mixed, h_post = module._forward_normal(h, r)
-            h_posts.append(h_post)
-            # Simulate layer computation: h -> layer_output -> new_residual
-            h = agg + 0.1 * mixed  # Simplified residual merge
-            r = mixed
+            agg, mixed, h_post = module.forward(h, r, mhc_recompute_manager=None)
+            agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=None)
+            h = agg + mixed
+            r = h
 
         loss_ref = h.sum()
         loss_ref.backward()
@@ -288,12 +286,11 @@ class TestMHCBlockRecomputeIntegration:
 
         h = hidden_states_ckpt
         r = residual_ckpt
-        h_posts_ckpt = []
         for module in modules:
-            agg, mixed, h_post = module._forward_with_checkpoint(h, r, manager)
-            h_posts_ckpt.append(h_post)
-            h = agg + 0.1 * mixed
-            r = mixed
+            agg, mixed, h_post = module.forward(h, r, mhc_recompute_manager=manager)
+            agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=manager)
+            h = agg + mixed
+            r = h
 
         loss_ckpt = h.sum()
         manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
@@ -347,9 +344,10 @@ class TestMHCBlockRecomputeIntegration:
         # Reference
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, mixed_ref, h_post_ref = module._forward_normal(
-            hidden_states_ref, residual_ref
+        aggregated_ref, mixed_ref, h_post_ref = module.forward(
+            hidden_states_ref, residual_ref, mhc_recompute_manager=None
         )
+        aggregated_ref, _ = module.apply_h_post((0.1 * aggregated_ref, None), h_post_ref, manager=None)
         # Simulate BDA that is NOT checkpointed (last layer)
         output_ref = aggregated_ref + 0.5 * mixed_ref
         loss_ref = output_ref.sum()
@@ -360,10 +358,11 @@ class TestMHCBlockRecomputeIntegration:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         manager = MHCBlockRecomputeManager()
-        aggregated_ckpt, mixed_ckpt, h_post_ckpt = module._forward_with_checkpoint(
-            hidden_states_ckpt, residual_ckpt, manager
+        aggregated_ckpt, mixed_ckpt, h_post_ckpt = module.forward(
+            hidden_states_ckpt, residual_ckpt, mhc_recompute_manager=manager
         )
 
+        aggregated_ckpt, _ = module.apply_h_post((0.1 * aggregated_ckpt, None), h_post_ckpt, manager=manager)
         # Simulate BDA that is NOT checkpointed (last layer) - this is the hook_tensor
         output_ckpt = aggregated_ckpt + 0.5 * mixed_ckpt
 
