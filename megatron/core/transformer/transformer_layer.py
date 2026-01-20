@@ -637,27 +637,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
         with self.bias_dropout_add_exec_handler():
-            # When mhc_recompute_manager is set, wrap self_attn_bda with checkpoint
-            if mhc_recompute_manager is not None:
-                self.self_attn_bda_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                    ckpt_manager=mhc_recompute_manager
-                )
-                # Unpack tuple to avoid "save_for_backward can only save variables" error
-                attn_output, attn_bias = attention_output_with_bias
-                bda_func = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)
-                
-                def _bda_wrapper(output, bias, res, dropout):
-                    return bda_func((output, bias), res, dropout)
-                
-                hidden_states = self.self_attn_bda_checkpoint.checkpoint(
-                    _bda_wrapper, attn_output, attn_bias, residual, self.hidden_dropout
-                )
-                # No-op when manager is set - manager handles all discarding uniformly
-                self.self_attn_bda_checkpoint.discard_output_and_register_recompute(hidden_states)
-            else:
-                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                    attention_output_with_bias, residual, self.hidden_dropout
-                )
+            hidden_states = self.self_attn_bda(
+                self.training, self.config.bias_dropout_fusion, mhc_recompute_manager
+            )(attention_output_with_bias, residual, self.hidden_dropout)
         nvtx_range_pop(suffix="self_attn_bda")
 
         if self.offload_attn_norm:
@@ -701,27 +683,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
-            # When mhc_recompute_manager is set, wrap cross_attn_bda with checkpoint
-            if mhc_recompute_manager is not None:
-                self.cross_attn_bda_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                    ckpt_manager=mhc_recompute_manager
-                )
-                # Unpack tuple to avoid "save_for_backward can only save variables" error
-                cross_attn_output, cross_attn_bias = attention_output_with_bias
-                bda_func = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)
-                
-                def _bda_wrapper(output, bias, res, dropout):
-                    return bda_func((output, bias), res, dropout)
-                
-                hidden_states = self.cross_attn_bda_checkpoint.checkpoint(
-                    _bda_wrapper, cross_attn_output, cross_attn_bias, residual, self.hidden_dropout
-                )
-                # No-op when manager is set - manager handles all discarding uniformly
-                self.cross_attn_bda_checkpoint.discard_output_and_register_recompute(hidden_states)
-            else:
-                hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                    attention_output_with_bias, residual, self.hidden_dropout
-                )
+            hidden_states = self.cross_attn_bda(
+                self.training, self.config.bias_dropout_fusion, mhc_recompute_manager
+            )(attention_output_with_bias, residual, self.hidden_dropout)
 
         return hidden_states, context
 
@@ -897,27 +861,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         with self.bias_dropout_add_exec_handler():
             # MLP BDA: checkpoint only if NOT the last layer in block
             # Last layer's MLP BDA output serves as hook_tensor for unified recompute
-            if mhc_recompute_manager is not None and not is_last_layer_in_block:
-                self.mlp_bda_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                    ckpt_manager=mhc_recompute_manager
-                )
-                # Unpack tuple to avoid "save_for_backward can only save variables" error
-                mlp_output, mlp_bias = mlp_output_with_bias
-                bda_func = self.mlp_bda(self.training, self.config.bias_dropout_fusion)
-                
-                def _bda_wrapper(output, bias, res, dropout):
-                    return bda_func((output, bias), res, dropout)
-                
-                hidden_states = self.mlp_bda_checkpoint.checkpoint(
-                    _bda_wrapper, mlp_output, mlp_bias, residual, self.hidden_dropout
-                )
-                # No-op when manager is set - manager handles all discarding uniformly
-                self.mlp_bda_checkpoint.discard_output_and_register_recompute(hidden_states)
-            else:
-                # Last layer OR no manager: normal BDA without checkpoint
-                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
-                )
+            mlp_bda_manager = mhc_recompute_manager if not is_last_layer_in_block else None
+            hidden_states = self.mlp_bda(
+                self.training, self.config.bias_dropout_fusion, mlp_bda_manager
+            )(mlp_output_with_bias, residual, self.hidden_dropout)
         nvtx_range_pop(suffix="mlp_bda")
         if self.offload_mlp_norm:
             (hidden_states,) = fine_grained_offloading_group_commit(
