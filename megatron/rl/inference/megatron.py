@@ -64,7 +64,7 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
     return MCoreEngine(
         text_generation_controller=text_generation_controller,
         max_batch_size=(
-            args.inference_max_reqeusts if args.inference_max_requests is not None else 1
+            args.inference_max_requests if args.inference_max_requests is not None else 1
         ),
     )
 

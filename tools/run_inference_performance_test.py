@@ -57,7 +57,6 @@ def add_inference_benchmarking_args(parser):
     group.add_argument(
         "--benchmark-profile", action="store_true", default=False, help="If set, profile"
     )
-    group.add_argument('--stream', action="store_true", default=False, help="If set, stream tokens")
     return parser
 
 
@@ -87,53 +86,6 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         return StaticInferenceEngine(text_generation_controller=text_generation_controller)
     elif args.engine_type == "dynamic":
         return DynamicInferenceEngine.from_model_and_args(model, args)
-
-
-async def generate(
-    inference_engine: Union[StaticInferenceEngine, DynamicInferenceEngine],
-    sampling_params: SamplingParams,
-    prompts: List[str],
-    inference_requests: List[InferenceRequest] = None,
-) -> List[InferenceRequest]:
-    async def collect_stream(prompt, request_id, stream_generator):
-        async for output in stream_generator:
-            pass
-
-    if inference_requests is None:
-        assert prompts is not None
-        inference_requests = [None for _ in range(len(prompts))]
-    elif prompts is None:
-        assert inference_requests is not None
-        tokenizer = get_tokenizer()
-        prompts = [tokenizer.detokenize(request.prompt_tokens) for request in inference_requests]
-
-    request_ids: List[int] = [
-        inference_engine.add_request(
-            prompt=prompt,
-            inference_request=inference_request,
-            inference_parameters=sampling_params,
-            streaming=True,
-        )
-        for prompt, inference_request in zip(prompts, inference_requests)
-    ]
-    stream_generators = [
-        inference_engine.get_stream_generator(request_id) for request_id in request_ids
-    ]
-
-    tasks = [
-        asyncio.create_task(collect_stream(prompt, request_id, stream_generator))
-        for (prompt, request_id, stream_generator) in zip(prompts, request_ids, stream_generators)
-    ]
-
-    await inference_engine.run_engine_async()
-    await asyncio.gather(*tasks)
-
-    results: List[InferenceRequest] = [
-        inference_engine.scheduler.completed_request_pool[request_id] for request_id in request_ids
-    ]
-
-    return results
-
 
 def get_random_prompt_tokens(tokenizer, num_input_tokens) -> List[int]:
     # Get the set of special token IDs to exclude
@@ -178,7 +130,7 @@ def generate_dynamic(
     start_time = time.perf_counter()
     all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        result = inference_engine.step(verbose=False)
+        result = inference_engine.step()
         finished_requests = result["finished_requests"]
         for request in finished_requests:
             req_id = request.request_id
@@ -243,7 +195,7 @@ def main():
     requests = []
     if args.num_input_tokens is not None:
         assert args.prompts is None
-        batch_size = args.inference_max_batch_size
+        batch_size = args.inference_max_requests
         for i in range(batch_size):
             prompt_tokens = get_random_prompt_tokens(tokenizer, args.num_input_tokens)
             requests.append(
@@ -266,7 +218,7 @@ def main():
                 )
             )
 
-    if args.cuda_graph_impl == "local":
+    if args.cuda_graph_impl == "local" and args.engine_type == "static":
         print(f"Running warmup for CUDA graphs...")
         warmup_sampling_params = SamplingParams(num_tokens_to_generate=10)
         warmup_sampling_params.add_attributes({"no_early_termination": True})
@@ -276,21 +228,16 @@ def main():
         torch.cuda.cudart().cudaProfilerStart()
 
     start_time = time.perf_counter()
-    if args.stream:
-        if args.engine_type == "dynamic":
-            raise NotImplementedError("Streaming not supported with DynamicInferenceEngine")
-        results: List[InferenceRequest] = asyncio.run(
-            generate(
-                inference_engine, sampling_params, prompts=args.prompts, inference_requests=requests
-            )
+    if args.engine_type == "static":
+        results: List[InferenceRequest] = inference_engine.generate(
+            prompts=args.prompts, inference_requests=requests, sampling_params=sampling_params
         )
     else:
-        if args.engine_type == "static":
-            results: List[InferenceRequest] = inference_engine.generate(
-                prompts=args.prompts, inference_requests=requests, sampling_params=sampling_params
-            )
-        elif args.engine_type == "dynamic":
-            results: List[InferenceRequest] = generate_dynamic(args, requests, inference_engine)
+        prompts = [request.prompt_tokens for request in requests]
+        results: List[InferenceRequest] = inference_engine.generate(
+            prompts=prompts, sampling_params=sampling_params
+        )
+
     end_time = time.perf_counter()
     latency = end_time - start_time
 
@@ -300,7 +247,8 @@ def main():
         torch.cuda.cudart().cudaProfilerStop()
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        for idx, result in enumerate(results):
+        for idx, record in enumerate(results):
+            result = record.requests[0]
             print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
             generated_log_probs = result.generated_log_probs
             result_dict = {
