@@ -271,6 +271,7 @@ def test_block_level_checkpoint_manager():
     loss_ref.backward()
     grad_ref = input_ref.grad.clone()
 
+    
     # With BlockLevelCheckpointManager
     manager = BlockLevelCheckpointManager()
 
@@ -299,6 +300,8 @@ def test_block_level_checkpoint_manager():
     loss_ckpt.backward()
     grad_ckpt = input_ckpt.grad.clone()
 
+    # print(grad_ckpt)
+    # return 
     # Verify gradients match
     assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6), (
         f"Gradients mismatch!\n"
