@@ -1,3 +1,4 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import contextlib
 import math
 from typing import Optional
