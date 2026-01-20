@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+import os
+
 """Convert HuggingFace GPT-OSS checkpoint to Megatron format."""
 
 from megatron.bridge import AutoBridge
@@ -6,13 +9,15 @@ from megatron.bridge import AutoBridge
 if __name__ == "__main__":
     HF_MODEL = "openai/gpt-oss-20b"
     SAVE_PATH = "./megatron_checkpoints/gpt_oss_20b"
+    WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
     
     print(f"Converting {HF_MODEL} to Megatron format...")
     
     bridge = AutoBridge.from_hf_pretrained(HF_MODEL, trust_remote_code=True)
     provider = bridge.to_megatron_provider()
-    provider.tensor_model_parallel_size = 2
-    provider.pipeline_model_parallel_size = 4
+    provider.expert_tensor_parallel_size = 1
+    provider.tensor_model_parallel_size = 1
+    provider.pipeline_model_parallel_size = WORLD_SIZE
     provider.finalize()
     
     model = provider.provide_distributed_model(wrap_with_ddp=False)
