@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import importlib
 import json
 import logging
 import os
@@ -8,17 +9,17 @@ from typing import Optional, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 
-TEXT_MAPPING_NAMES = OrderedDict(
+TOKENIZER_MAPPING_NAMES = OrderedDict(
     [
-        ("default", "DefaultTokenizerText"),
+        ("default-text", "DefaultTokenizerText"),
         ("gpt", "GPTTokenizer"),
         ("mamba", "MambaTokenizer"),
         ("bert", "BertTokenizer"),
         ("t5", "T5Tokenizer"),
         ("retro", "RetroTokenizer"),
+        ("default-vision", "DefaultTokenizerVision"),
     ]
 )
-VISION_MAPPING_NAMES = OrderedDict([("default", "DefaultTokenizerVision")])
 
 TEXT_LIBRARIES = [
     "sentencepiece",
@@ -94,22 +95,8 @@ class MegatronTokenizer:
             ), "Image tag type (`image_tag_type`) must be specified."
 
         # Initialize tokenizer object
-        tokenizer_type = 'text' if tokenizer_library in TEXT_LIBRARIES else 'vision'
-        if metadata.get('tokenizer_class', None):
-            tokenizer_cls = getattr(
-                metadata['tokenizer_class_path'], metadata['tokenizer_class_name']
-            )
-        else:
-            if tokenizer_type == 'vision':
-                import megatron.core.tokenizers.vision.models as models
+        tokenizer_cls = _get_tokenizer_model_class(tokenizer_library, metadata)
 
-                mapping_names = VISION_MAPPING_NAMES
-            else:
-                import megatron.core.tokenizers.text.models as models
-
-                mapping_names = TEXT_MAPPING_NAMES
-            model_type = metadata.get('model_type', 'default')
-            tokenizer_cls = getattr(models, mapping_names[model_type])
         metadata['metadata_path'] = metadata_path
         tokenizer = tokenizer_cls(path=tokenizer_path, config=metadata, **kwargs)
 
@@ -154,8 +141,9 @@ class MegatronTokenizer:
             "Tokenizer library is not supported. Please, see the list of available "
             f"tokenizer libraries: text: {TEXT_LIBRARIES}, vision: {VISION_LIBRARIES}."
         )
+        tokenizer_type = 'text' if tokenizer_library in TEXT_LIBRARIES else 'vision'
         if model_type is None and tokenizer_class is None:
-            model_type = "default"
+            model_type = f"default-{tokenizer_type}"
 
         # Write metadata
         if not metadata_path:
@@ -196,3 +184,33 @@ def _get_metadata_path(tokenizer_path: str) -> str:
     metadata_path = f'{dir_path}/tokenizer_metadata.json'
 
     return metadata_path
+
+
+def _get_tokenizer_model_class(library: str, metadata: dict) -> MegatronTokenizerBase:
+    """
+    Returns a class which corresponds to choosen tokenizer model type.
+
+    Args:
+        library (str): tokenizer library.
+        metadata (dict): tokenizer metadata.
+
+    Returns:
+        MegatronTokenizerBase: class for choosen tokenizer model type.
+    """
+    # Return tokenizer class if it was specified in metadata.
+    if metadata.get('tokenizer_class', None):
+        return getattr(metadata['tokenizer_class_path'], metadata['tokenizer_class_name'])
+
+    # Define tokenizer type
+    tokenizer_type = 'text' if library in TEXT_LIBRARIES else 'vision'
+
+    module_name = f"megatron.core.tokenizers.{tokenizer_type}.models"
+    models = importlib.import_module(module_name)
+
+    model_type = metadata.get("model_type", None)
+    if model_type is None:
+        model_type = f"default-{tokenizer_type}"
+
+    tokenizer_cls = getattr(models, TOKENIZER_MAPPING_NAMES[model_type])
+
+    return tokenizer_cls
