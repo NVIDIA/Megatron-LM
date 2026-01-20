@@ -11,10 +11,17 @@ Megatron-LM & Megatron Core
 
 <div align="left">
 
-## Quick Start
+## About
 
-For instructions, refer to [Quick Start](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html).
+Megatron-Core (MCore): the core, composable library with GPU-optimized building blocks for custom training frameworks
+You can install this library using pip or use it within the Megatron-LM GitHub repository.
 
+Megatron-LM: GitHub repository that includes Megatron-Core, as well as example training loops utilizing Megatron-Core.
+
+Megatron-Bridge: a separate repository that is ideal for users who wish to train a Hugging Face model.
+It serves as a powerful bridge, conversion, and verification layer between Hugging Face and Megatron Core.
+
+NeMo RL: library that streamlines and scales reinforcement learning, leveraging Megatron-Core.
 
 # Latest News
 
@@ -36,6 +43,9 @@ For instructions, refer to [Quick Start](https://docs.nvidia.com/megatron-core/d
 </details>
 
 
+## Quick Start
+
+For instructions, refer to [Quick Start](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html).
 
 
 
