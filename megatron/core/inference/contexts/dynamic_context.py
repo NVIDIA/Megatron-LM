@@ -1795,7 +1795,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
-        assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
         if resume_request_count > 0:
@@ -1926,15 +1925,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._swap_book_keeping_tensors(
             src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
         )
-
-        # Swap the chunked prefill request to the end of the active requests to
-        # obey the invariance.
-        if self.chunked_prefill_request_id != -1:
-            self._swap_book_keeping_tensors(
-                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
-                dst_idxs=torch.tensor([self.total_request_count - evict_request_count - 1]),
-                next_tokens=next_tokens,
-            )
 
         # Update tracking vars.
         self.paused_request_count -= evict_request_count
@@ -2153,20 +2143,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_request_count, newly_paused_request_ids, next_tokens
         )
 
-        # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        self.total_request_count = active_request_count + self.paused_request_count
+        assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
-        # Swap the chunked prefill request to the end of the active requests to maintain invariant.
-        # This is necessary because the movements above may have shifted the chunked prefill request.
+        # 6.d. Swap the chunked prefill request to the end of the active requests
+        # to obey the invariance.
         if self.chunked_prefill_request_id != -1:
-            chunked_prefill_idx = self.get_index_of_chunked_prefill_request()
-            target_idx = self.total_request_count - 1
-            if chunked_prefill_idx != target_idx:
-                self._swap_book_keeping_tensors(
-                    src_idxs=torch.tensor([chunked_prefill_idx]),
-                    dst_idxs=torch.tensor([target_idx]),
-                    next_tokens=next_tokens,
-                )
+            self._swap_book_keeping_tensors(
+                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
+                dst_idxs=torch.tensor([self.total_request_count - 1]),
+                next_tokens=next_tokens,
+            )
+
+        # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
+        assert self.total_request_count == active_request_count + self.paused_request_count
 
         # All these active requests are in decode phase, so they need only 1 token per request
         self.active_token_count = active_request_count
