@@ -477,3 +477,31 @@ def test_multi_turn_advantage_calculation():
     torch.testing.assert_close(
         torch.tensor(advs), torch.tensor([-1, -1, 1.0, 0.0, 0.0, 0.0, 0.0]), atol=1e-4, rtol=1e-5
     )
+
+
+def test_pad_list_of_nones():
+    with pytest.raises(ValueError) as e_info:
+        rl_utils._pad_nonnull_with_zeros([None] * 3, 42)
+    assert "At least one" in str(e_info)
+
+
+def test_pad_with_wrong_params():
+    with pytest.raises(ValueError) as e_info:
+        rl_utils._pad_nonnull_with_zeros([torch.zeros(5)], 4)
+    assert "larger length" in str(e_info)
+
+
+def test_pad_full_size():
+    padded = rl_utils._pad_nonnull_with_zeros([torch.zeros(5), torch.zeros(5)], 5)
+    assert padded.shape == (2, 5)
+
+
+def test_pad_some_nones():
+    padded = rl_utils._pad_nonnull_with_zeros([None, torch.zeros(5)], 5)
+    assert padded.shape == (2, 5)
+    assert (padded[0] == 0).all()
+
+
+def test_pad_normal():
+    padded = rl_utils._pad_nonnull_with_zeros([torch.zeros(2), torch.zeros(3), torch.zeros(4)], 5)
+    assert padded.shape == (3, 5)

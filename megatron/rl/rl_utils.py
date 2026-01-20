@@ -4,16 +4,13 @@ import gc
 
 # Keep this to make the env registered.
 import itertools
-import json
 import logging
-import math
 import pickle
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional 
 
 import numpy as np
 import torch
@@ -30,8 +27,6 @@ from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
-    get_tensor_model_parallel_src_rank,
-    get_tensor_model_parallel_world_size,
     is_pipeline_last_stage,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -51,7 +46,6 @@ from megatron.rl.sequence_packing_utils import (
     compute_packed_inference_logprobs_stats,
     pack_all_trajectories,
     load_packed_data_by_index,
-    update_sequence_packing_metrics,
     get_sequence_packing_tensorboard_metrics,
     get_sequence_packing_log_info,
     get_default_packed_seq_params,
@@ -233,6 +227,7 @@ class RolloutStats:
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
+    num_turns: list[int] # num_turns per traj
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -709,7 +704,7 @@ def compute_group_stats(
                     # TODO(vitalyk): how does multiturn change EOD/EOT?
                     assert (len(turn_traj) == seq_len) or (
                         turn_traj[-1] == tokenizer.eod
-                    ), f"Rollout is not the correct length: {len(turn_taj)} {turn_traj[-1]}\n{detokenized_traj}"
+                    ), f"Rollout is not the correct length: {len(turn_traj)} {turn_traj[-1]}\n{detokenized_traj}"
             else:
                 lang_rl_log(
                     f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} chars] {rollout.trajectory}"
@@ -722,7 +717,7 @@ def compute_group_stats(
         group_length_mins.append(min(group_lengths))
         group_reward_means.append(np.mean(group_rewards))
         group_reward_stds.append(np.std(group_rewards))
-        rewards.extend(group_rewards)
+        rewards.append(group_rewards)
         group_length_means.append(np.mean(group_lengths))
         # https://arxiv.org/abs/2504.21233 reports that lens variants hurts.
         # Let's track this.
@@ -748,6 +743,7 @@ def compute_group_stats(
         mean_inf_prob=None,
         rewards=[r for group in rewards for r in group],
         advantages=calculate_grpo_advantages(rewards, num_turns),
+        num_turns=[nt for group in num_turns for nt in group],
     )
     return stats
 
@@ -837,7 +833,7 @@ def maybe_log_training_metrics(
 
 
 def prepare_trajectories(
-    rollouts: GroupedRollouts, tokenizer: MegatronLegacyTokenizer, seq_length: int
+    rollouts: GroupedRollouts, tokenizer: MegatronLegacyTokenizer, seq_length: int, use_sequence_packing: bool, rl_skip_bos_token: bool
 ):
     """Pad trajectories and extract the generation masks.
 
@@ -934,34 +930,18 @@ def prepare_trajectories(
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')
     trajs = torch.tensor(trajs, device='cpu')
 
-    args = get_args()
     # Only process if we have inference_logprobs
     if inference_logprobs and any(lp is not None for lp in inference_logprobs):
-        if args.rl_use_sequence_packing:
-            # For sequence packing, we need to pad all logprobs to the same size
-            padded_logprobs = []
-            for logprobs in inference_logprobs:
-                if logprobs is not None:
-                    if len(logprobs) < seq_length:
-                        # Pad with zeros (these positions will be masked anyway)
-                        padding_size = seq_length - len(logprobs)
-                        padded = torch.nn.functional.pad(logprobs, (0, padding_size), value=0.0)
-                        padded_logprobs.append(padded)
-                    else:
-                        padded_logprobs.append(logprobs)
-                else:
-                    # Create zero tensor for None logprobs
-                    padded_logprobs.append(torch.zeros(seq_length))
-            inference_logprobs = torch.stack(padded_logprobs)
-        else:
-            # For non-packing mode, keep as list of tensors (unpadded)
-            # This preserves the original behavior where each sequence can have different lengths
-            pass
+        # We need to pad all logprobs to the same size for sequence packing.
+        # For non-packing mode, keep as list of tensors (unpadded)
+        # This preserves the original behavior where each sequence can have different lengths
+        if use_sequence_packing:
+            inference_logprobs = _pad_nonnull_with_zeros(inference_logprobs, seq_length)
     else:
         inference_logprobs = None
 
     # Some sanity checks regarding the tokenization
-    if not args.rl_skip_bos_token:
+    if not rl_skip_bos_token:
         assert (
             tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
         ), "First token should be bos"
@@ -1023,9 +1003,8 @@ def prepare_data_for_update(
     with nvtx_range("prepare-data-for-update"):
         with nvtx_range("compute-group-stats"):
             group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
-
-        with nvtx_range("prepare_advantages", time=True):        
-            advantages = global_advantages = advantages.cuda()
+            # TODO(vitalyk): why do we need global_advantages here? go inside packing
+            advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
@@ -1039,19 +1018,15 @@ def prepare_data_for_update(
             )
             # TODO(vitalyk): This has to be rewritten assuming we are multiturn now.
             rollouts = rollouts[data_split_range[0] : data_split_range[1]]
+            local_num_turns = sum(group_stats.num_turns[data_split_range[0] : data_split_range[1]])
+            steps_before = sum(group_stats.num_turns[:data_split_range[0]])
+            advantages = advantages[steps_before:steps_before+local_num_turns]
             # First we calculate them on a global level and then we split and recalculate on a local level.
             # Sequence packing and reporting needs it global but non-packing wants it local.
-            rewards = torch.tensor([[r.reward for r in group] for group in rollouts], device='cpu')
-            advantages = (rewards - rewards.mean(axis=1, keepdim=True)) / (
-                1e-4 + rewards.std(axis=1, keepdim=True)
-            )
-
-            # Flatten advantages for training and move to GPU
-            advantages = advantages.view(-1).cuda()
 
         with nvtx_range("prepare_trajectories"):
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
-                rollouts, tokenizer, args.seq_length
+                rollouts, tokenizer, args.seq_length, args.rl_use_sequence_packing, args.rl_skip_bos_token
             )
 
         # Build trajectories based on sequence packing or standard processing
@@ -1095,7 +1070,6 @@ def prepare_data_for_update(
                 )
                 logprobs_batch_size = args.micro_batch_size
 
-
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
@@ -1115,18 +1089,14 @@ def prepare_data_for_update(
                         load_packed_data_by_index(bin_tensor.item(), packing_context, args.rl_inference_logprobs_is_correction)
                     )
                 else:
-                    batch_data = next(data_iterator)
-                    b_trajs, b_posids = batch_data
+                    b_trajs, b_posids = next(data_iterator)
                     b_packed_seq_params = None
-
-                b_trajs = b_trajs.cuda()
-                b_posids = b_posids.cuda()
 
                 return (
                     get_logprobs(
                         model,
-                        b_trajs,
-                        b_posids,
+                        b_trajs.cuda(),
+                        b_posids.cuda(),
                         no_grad=True,
                         sequence_packing=args.rl_use_sequence_packing,                       
                         packed_seq_params=b_packed_seq_params,
@@ -1241,7 +1211,12 @@ def prepare_data_for_update(
 
         with nvtx_range("create_dataloader"):
             if args.rl_use_sequence_packing:
-               loader, optimizer_steps = get_microbatch_dataloader(packing_context)
+               loader, optimizer_steps = get_microbatch_dataloader(packing_context,
+                    global_batch_size=args.global_batch_size, 
+                    rampup_batch_size=args.rampup_batch_size, 
+                    micro_batch_size=args.micro_batch_size, 
+                    decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+               )
                runtime_state.global_batches_per_collection = optimizer_steps
             else:
                 runtime_state.packing_context = None
@@ -1258,7 +1233,9 @@ def prepare_data_for_update(
                     dataset_tensors.append(inference_logprobs)
                 else:
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
-
+                if torch.distributed.get_rank() ==0:
+                    breakpoint()
+                torch.distributed.barrier()
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 
@@ -1365,7 +1342,7 @@ def evaluate_and_print_results_rl(
 
             rank = torch.distributed.get_rank()
             if rank == 0:
-                logger.info(f"Collecting evaluation results...")
+                logger.info("Collecting evaluation results...")
                 agent = get_agent(args)
                 request = EvaluationRequest(
                     inference_interface=inference_interface,
@@ -1675,3 +1652,32 @@ def get_iteration_sequence_count(args):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(sequences_tensor, group=mpu.get_data_parallel_group())
     return int(sequences_tensor.item())
+    
+def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) -> torch.Tensor:
+    """Pad each element of a list of tensors to the length required.
+    Args:
+        data: List of tensors to pad.
+        max_len: Maximum length to pad to. Must be higher or equal than the max len of the data tensors.
+    Returns:
+        A padded tensor which is a stacked list of padded input tensors.
+
+    """
+    if all([el is None for el in data]):
+        raise ValueError("At least one element of the data list should be not None.")
+    padded_data = []
+    for chunk in data:
+        if chunk is not None:
+            padding_size = max_len - len(chunk)
+            if padding_size > 0:
+                # Pad with zeros (these positions will be masked anyway)
+                padded = torch.nn.functional.pad(chunk, (0, padding_size), value=0.0)
+                padded_data.append(padded)
+            elif padding_size == 0:
+                padded_data.append(chunk)
+            else:
+                raise ValueError("One of the input tensors has larger length than padding max len.")
+        else:
+            # Create zero tensor for None logprobs
+            padded_data.append(torch.zeros(max_len))
+    return torch.stack(padded_data)
+

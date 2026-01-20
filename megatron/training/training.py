@@ -2539,7 +2539,10 @@ def train(
         if getattr(args, 'perform_rl_step', False) and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
-            rl_utils.update_sequence_packing_metrics(args)
+            bin_count = (
+                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            )
+            args.consumed_train_bins += bin_count
         else:
             batch_size = (
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()

@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from torch.utils.data import DataLoader, TensorDataset
 from dataclasses import dataclass, field
 from megatron.core.utils import log_single_rank
-from megatron.training.global_vars import get_args, get_tokenizer
+from megatron.training.global_vars import get_tokenizer
 from megatron.training.utils import get_nvtx_range
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.num_microbatches_calculator import get_num_microbatches
@@ -78,7 +78,6 @@ def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext, log
     Args:
         bin_idx: Index of the bin to load.
     """
-    args = get_args()
     # Get packing context (should always be available in packed mode)
     idx = slice(bin_idx, bin_idx + 1)
 
@@ -966,33 +965,20 @@ def distribute_packed_bins(
 def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo):
     tokenizer = get_tokenizer()
     data_parallel_world_size = mpu.get_data_parallel_world_size()
+    data_parallel_group = mpu.get_data_parallel_group()
     nvtx_range = get_nvtx_range()
 
     with nvtx_range("regather_trajectories", time=True):
-        # Regather trajectories from all ranks for packing
-        trajs = trajs.cuda()
-        trajs_list = [torch.empty_like(trajs) for _ in range(data_parallel_world_size)]
-        torch.distributed.all_gather(
-            trajs_list, trajs, group=mpu.get_data_parallel_group()
-        )
-        trajs = torch.cat(trajs_list, dim=0)
+        def _gather(data):
+            data = data.cuda()
+            data_list = [torch.empty_like(data) for _ in range(data_parallel_world_size)]
+            torch.distributed.all_gather(data_list, data, group=data_parallel_group)
+            return torch.cat(data_list, dim=0)
 
-        # Gather all generation masks
-        generation_masks = generation_masks.cuda()
-        masks_list = [torch.empty_like(generation_masks) for _ in range(data_parallel_world_size)]
-        torch.distributed.all_gather(
-            masks_list, generation_masks, group=mpu.get_data_parallel_group()
-        )
-        generation_masks = torch.cat(masks_list, dim=0)
-
-        # Gather inference logprobs if present
+        trajs = _gather(trajs)    
+        generation_masks = _gather(generation_masks) 
         if inference_logprobs is not None:
-            inference_logprobs = inference_logprobs.cuda()
-            logprobs_list = [torch.empty_like(inference_logprobs) for _ in range(data_parallel_world_size)]
-            torch.distributed.all_gather(
-                logprobs_list, inference_logprobs, group=mpu.get_data_parallel_group()
-            )
-            inference_logprobs = torch.cat(logprobs_list, dim=0)
+            inference_logprobs = _gather(inference_logprobs)
 
     with nvtx_range("pack_sequences", time=True):
         # Create packer with max sequences per bin limit to prevent extreme imbalance
@@ -1071,13 +1057,17 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
     return packing_context
 
 
-def get_microbatch_dataloader(packing_context: PackingContext) -> Tuple[DataLoader, int]:
-    args = get_args()
+def get_microbatch_dataloader(packing_context: PackingContext,
+    global_batch_size: int, 
+    rampup_batch_size: int, 
+    micro_batch_size: int, 
+    decrease_batch_size_if_needed: bool,
+) -> Tuple[DataLoader, int]:
     num_bins_this_rank = len(packing_context.packed_trajs)
     dp_world_size = mpu.get_data_parallel_world_size()
 
     # Ratio of collected sequences to the global batch size
-    pct_of_sequences_per_batch = len(packing_context.packing_info.seq_lengths) / args.global_batch_size
+    pct_of_sequences_per_batch = len(packing_context.packing_info.seq_lengths) / global_batch_size
 
     # Ceiling division means we will reuse some bins
     # If we did floor we would leave some behind
@@ -1091,11 +1081,11 @@ def get_microbatch_dataloader(packing_context: PackingContext) -> Tuple[DataLoad
 
     reconfigure_num_microbatches_calculator(
         rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-        rampup_batch_size=args.rampup_batch_size,
+        rampup_batch_size=rampup_batch_size,
         global_batch_size=effective_global_batch_size,
-        micro_batch_size=args.micro_batch_size,
+        micro_batch_size=micro_batch_size,
         data_parallel_size=dp_world_size,
-        decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+        decrease_batch_size_if_needed=decrease_batch_size_if_needed,
     )
 
     new_num_microbatches = get_num_microbatches()
@@ -1106,7 +1096,7 @@ def get_microbatch_dataloader(packing_context: PackingContext) -> Tuple[DataLoad
     log_single_rank(
         logger,
         logging.INFO,
-        f"[Sequence Packing]  - Target sequences per step: {args.global_batch_size}",
+        f"[Sequence Packing]  - Target sequences per step: {global_batch_size}",
     )
     log_single_rank(
         logger,
@@ -1147,17 +1137,8 @@ def get_microbatch_dataloader(packing_context: PackingContext) -> Tuple[DataLoad
 
     bin_indices = torch.arange(num_bins_this_rank)
     dataset = TensorDataset(bin_indices)
-    loader = DataLoader(dataset, batch_size=args.micro_batch_size, shuffle=False, collate_fn=lambda x: x[0], drop_last=True)
+    loader = DataLoader(dataset, batch_size=micro_batch_size, shuffle=False, collate_fn=lambda x: x[0], drop_last=True)
     return loader, optimizer_steps
-
-def update_sequence_packing_metrics(args):
-    """Update bin tracking for sequence packing mode."""
-    if args.rl_use_sequence_packing:
-        bin_count = (
-            mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
-        )
-        args.consumed_train_bins += bin_count
-
 
 def get_sequence_packing_log_info(args):
     """Get logging information for sequence packing mode."""
