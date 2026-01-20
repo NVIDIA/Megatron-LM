@@ -704,10 +704,29 @@ class CheckpointWithoutOutput(object):
 
     Due to the reason above, to save memory with this method, the caller should make sure that the
     discarded output tensors are directly saved in the following modules for backward computation.
+
+    When ckpt_manager is provided:
+    - checkpoint() automatically registers this object to the manager
+    - discard_output_and_register_recompute() only discards output without registering
+      individual recompute hook (manager handles unified hook registration)
+
+    This enables seamless integration with MHCBlockRecomputeManager for block-level
+    recomputation while maintaining backward compatibility with existing code.
     """
 
-    def __init__(self, fp8=False):
+    def __init__(self, fp8=False, ckpt_manager=None):
+        """
+        Initialize CheckpointWithoutOutput.
+
+        Args:
+            fp8: Whether to use FP8 mode. Defaults to False.
+            ckpt_manager: Optional MHCBlockRecomputeManager instance. When provided,
+                         checkpoint() will auto-register to the manager, and
+                         discard_output_and_register_recompute() will only discard
+                         output without registering individual hooks.
+        """
         self.fp8 = fp8 is not None
+        self.ckpt_manager = ckpt_manager
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
@@ -716,7 +735,12 @@ class CheckpointWithoutOutput(object):
         self.outputs = None
 
     def checkpoint(self, run_function, *args):
-        """Checkpoint function."""
+        """
+        Checkpoint function.
+
+        If ckpt_manager was provided during initialization, this checkpoint
+        will be automatically registered to the manager after execution.
+        """
         self.run_function = run_function
 
         self.rng_states = _get_all_rng_states()
@@ -725,6 +749,11 @@ class CheckpointWithoutOutput(object):
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
+
+        # Auto-register to manager if provided
+        if self.ckpt_manager is not None:
+            self.ckpt_manager.add_checkpoint(self)
+
         return outputs
 
     def _recompute(self, _):
@@ -789,10 +818,19 @@ class CheckpointWithoutOutput(object):
         Release the output tensor storages and register the recompute function as a grad hook of
         the hook_tensor.
 
+        If ckpt_manager was provided during initialization, this method is a no-op.
+        The manager will handle both output discarding and unified hook registration
+        via discard_all_outputs_and_register_unified_recompute().
+
         Note: the caller should make sure that the output tensors are no longer used
         in the forward pass and the gradient of the hook_tensor is computed before the recomputed
         tensors are used.
         """
+        # When ckpt_manager is set, this is a no-op.
+        # Manager handles all discarding and hook registration uniformly.
+        if self.ckpt_manager is not None:
+            return
+
         # use resize to release the output tensor memory and still keep the metadata in the tensors.
         # the metadata is still needed for backward
         for output in self.outputs:

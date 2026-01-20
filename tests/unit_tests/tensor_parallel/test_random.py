@@ -232,6 +232,138 @@ def test_checkpoint_without_output():
     Utils.destroy_model_parallel()
 
 
+def test_checkpoint_without_output_with_ckpt_manager_auto_register():
+    """
+    Test that CheckpointWithoutOutput auto-registers to manager when ckpt_manager is provided.
+    """
+    Utils.initialize_model_parallel()
+
+    manager = MHCBlockRecomputeManager()
+
+    def func(x):
+        return x * 2 + 1
+
+    input_t = torch.randn(4, 4, device='cuda', requires_grad=True)
+
+    # Create checkpoint with ckpt_manager - should auto-register
+    ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
+    y = ckpt.checkpoint(func, input_t)
+
+    # Verify auto-registration
+    assert len(manager.checkpoints) == 1
+    assert manager.checkpoints[0] is ckpt
+
+    # Add another checkpoint
+    ckpt2 = CheckpointWithoutOutput(ckpt_manager=manager)
+    y2 = ckpt2.checkpoint(torch.nn.functional.gelu, y)
+
+    # Verify both are registered
+    assert len(manager.checkpoints) == 2
+    assert manager.checkpoints[1] is ckpt2
+
+    # Complete the forward and backward
+    loss = y2.sum()
+    manager.discard_all_outputs_and_register_unified_recompute(loss)
+    loss.backward()
+
+    assert input_t.grad is not None
+
+    Utils.destroy_model_parallel()
+
+
+def test_checkpoint_without_output_discard_is_noop_with_manager():
+    """
+    Test that discard_output_and_register_recompute is a NO-OP when ckpt_manager is set.
+    The manager handles all discarding and hook registration.
+    """
+    Utils.initialize_model_parallel()
+
+    manager = MHCBlockRecomputeManager()
+
+    def func1(x):
+        return x * 2
+
+    def func2(x):
+        return torch.nn.functional.gelu(x)
+
+    # Reference without checkpoint
+    input_ref = torch.randn(4, 4, device='cuda', requires_grad=True)
+    y1_ref = func1(input_ref)
+    y2_ref = func2(y1_ref)
+    loss_ref = y2_ref.sum()
+    loss_ref.backward()
+    grad_ref = input_ref.grad.clone()
+
+    # With ckpt_manager: discard_output_and_register_recompute is a no-op
+    input_ckpt = input_ref.detach().clone().requires_grad_(True)
+
+    ckpt1 = CheckpointWithoutOutput(ckpt_manager=manager)
+    y1 = ckpt1.checkpoint(func1, input_ckpt)
+    # This is a no-op when ckpt_manager is set
+    ckpt1.discard_output_and_register_recompute(y1)
+
+    ckpt2 = CheckpointWithoutOutput(ckpt_manager=manager)
+    y2 = ckpt2.checkpoint(func2, y1)
+    ckpt2.discard_output_and_register_recompute(y2)
+
+    # Verify outputs are NOT discarded yet (discard_output_and_register_recompute is no-op)
+    assert y1.untyped_storage().size() > 0, "y1 should NOT be discarded yet"
+    assert y2.untyped_storage().size() > 0, "y2 should NOT be discarded yet"
+
+    # Now use manager to discard all outputs and register unified hook
+    loss_ckpt = y2.sum()
+    manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+
+    # NOW outputs should be discarded
+    assert y1.untyped_storage().size() == 0, "y1 should be discarded after manager call"
+    assert y2.untyped_storage().size() == 0, "y2 should be discarded after manager call"
+
+    loss_ckpt.backward()
+    grad_ckpt = input_ckpt.grad.clone()
+
+    assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6)
+
+    Utils.destroy_model_parallel()
+
+
+def test_checkpoint_without_output_backward_compat():
+    """
+    Test backward compatibility: CheckpointWithoutOutput without ckpt_manager
+    should work exactly as before.
+    """
+    Utils.initialize_model_parallel()
+
+    def func(x):
+        return torch.nn.functional.gelu(x)
+
+    # Reference
+    input_ref = torch.randn(4, 4, device='cuda', requires_grad=True)
+    y_ref = func(input_ref)
+    z_ref = y_ref * 2
+    loss_ref = z_ref.sum()
+    loss_ref.backward()
+    grad_ref = input_ref.grad.clone()
+
+    # Without ckpt_manager (backward compatible mode)
+    input_ckpt = input_ref.detach().clone().requires_grad_(True)
+
+    ckpt = CheckpointWithoutOutput()  # No ckpt_manager
+    y = ckpt.checkpoint(func, input_ckpt)
+    z = y * 2
+    ckpt.discard_output_and_register_recompute(z)  # Should register individual hook
+
+    # Verify output is discarded
+    assert y.untyped_storage().size() == 0
+
+    loss_ckpt = z.sum()
+    loss_ckpt.backward()
+    grad_ckpt = input_ckpt.grad.clone()
+
+    assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6)
+
+    Utils.destroy_model_parallel()
+
+
 def test_mhc_block_recompute_manager():
     """
     Test MHCBlockRecomputeManager with three sequential checkpoint functions.
@@ -272,20 +404,13 @@ def test_mhc_block_recompute_manager():
     loss_ref.backward()
     grad_ref = input_ref.grad.clone()
 
-    # With MHCBlockRecomputeManager
+    # With MHCBlockRecomputeManager using ckpt_manager parameter (simplified API)
     manager = MHCBlockRecomputeManager()
 
-    ckpt1 = CheckpointWithoutOutput()
-    y1 = ckpt1.checkpoint(func1, input_ckpt)
-    manager.add_checkpoint(ckpt1)
-
-    ckpt2 = CheckpointWithoutOutput()
-    y2 = ckpt2.checkpoint(func2, y1)
-    manager.add_checkpoint(ckpt2)
-
-    ckpt3 = CheckpointWithoutOutput()
-    y3 = ckpt3.checkpoint(func3, y2)
-    manager.add_checkpoint(ckpt3)
+    # Using ckpt_manager parameter for auto-registration
+    y1 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func1, input_ckpt)
+    y2 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func2, y1)
+    y3 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func3, y2)
 
     loss_ckpt = y3.sum()
     # Register unified recompute hook on the final output
@@ -300,8 +425,6 @@ def test_mhc_block_recompute_manager():
     loss_ckpt.backward()
     grad_ckpt = input_ckpt.grad.clone()
 
-    # print(grad_ckpt)
-    # return 
     # Verify gradients match
     assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6), (
         f"Gradients mismatch!\n"
@@ -333,16 +456,11 @@ def test_mhc_block_recompute_manager():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
-    # With checkpoint manager
+    # With checkpoint manager using ckpt_manager parameter
     manager2 = MHCBlockRecomputeManager()
 
-    ckpt1_2 = CheckpointWithoutOutput()
-    y1_2 = ckpt1_2.checkpoint(func_with_dropout, input_ckpt2)
-    manager2.add_checkpoint(ckpt1_2)
-
-    ckpt2_2 = CheckpointWithoutOutput()
-    y2_2 = ckpt2_2.checkpoint(func2, y1_2)
-    manager2.add_checkpoint(ckpt2_2)
+    y1_2 = CheckpointWithoutOutput(ckpt_manager=manager2).checkpoint(func_with_dropout, input_ckpt2)
+    y2_2 = CheckpointWithoutOutput(ckpt_manager=manager2).checkpoint(func2, y1_2)
 
     loss_ckpt2 = y2_2.sum()
 
@@ -386,16 +504,11 @@ def test_mhc_block_recompute_manager_with_multiple_outputs():
     loss_ref.backward()
     grad_ref = input_ref.grad.clone()
 
-    # With manager
+    # With manager using ckpt_manager parameter
     manager = MHCBlockRecomputeManager()
 
-    ckpt1 = CheckpointWithoutOutput()
-    y1a, y1b = ckpt1.checkpoint(func_multi_output, input_ckpt)
-    manager.add_checkpoint(ckpt1)
-
-    ckpt2 = CheckpointWithoutOutput()
-    y2 = ckpt2.checkpoint(func_combine, y1a, y1b)
-    manager.add_checkpoint(ckpt2)
+    y1a, y1b = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_multi_output, input_ckpt)
+    y2 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_combine, y1a, y1b)
 
     loss_ckpt = y2.sum()
     manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
@@ -441,7 +554,7 @@ def test_backward_compat_block_level_checkpoint_manager_alias():
 
     Utils.initialize_model_parallel()
 
-    # Should work the same way
+    # Should work the same way with ckpt_manager parameter
     manager = BlockLevelCheckpointManager()
 
     def func(x):
@@ -449,9 +562,7 @@ def test_backward_compat_block_level_checkpoint_manager_alias():
 
     input_t = torch.randn(4, 4, device='cuda', requires_grad=True)
 
-    ckpt = CheckpointWithoutOutput()
-    y = ckpt.checkpoint(func, input_t)
-    manager.add_checkpoint(ckpt)
+    y = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func, input_t)
 
     loss = y.sum()
     manager.discard_all_outputs_and_register_unified_recompute(loss)
@@ -517,18 +628,14 @@ def test_mhc_block_recompute_manager_partial_checkpoint():
 
     manager = MHCBlockRecomputeManager()
 
-    # Step 1: f is checkpointed
-    ckpt_f = CheckpointWithoutOutput()
-    b = ckpt_f.checkpoint(func_f, input_ckpt)
-    manager.add_checkpoint(ckpt_f)
+    # Step 1: f is checkpointed (using ckpt_manager for auto-registration)
+    b = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_f, input_ckpt)
 
     # Step 2: g is NOT checkpointed (regular operation)
     c = func_g(b)
 
-    # Step 3: h is checkpointed
-    ckpt_h = CheckpointWithoutOutput()
-    d = ckpt_h.checkpoint(func_h, c)
-    manager.add_checkpoint(ckpt_h)
+    # Step 3: h is checkpointed (using ckpt_manager for auto-registration)
+    d = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_h, c)
 
     # Step 4: Compute loss and register unified recompute
     loss_ckpt = d.sum()
@@ -622,16 +729,16 @@ def test_mhc_block_recompute_manager_partial_checkpoint_with_tuple_output():
     grad_x_ref = x_ref.grad.clone()
     grad_residual_ref = residual_ref.grad.clone()
 
-    # ========== With MHCBlockRecomputeManager ==========
+    # ========== With MHCBlockRecomputeManager using ckpt_manager ==========
     x_ckpt = x_ref.detach().clone().requires_grad_(True)
     residual_ckpt = residual_ref.detach().clone().requires_grad_(True)
 
     manager = MHCBlockRecomputeManager()
 
     # Step 1: compute_mappings is checkpointed (returns tuple)
-    ckpt_compute = CheckpointWithoutOutput()
-    h_pre, h_post, h_res = ckpt_compute.checkpoint(compute_mappings, x_ckpt)
-    manager.add_checkpoint(ckpt_compute)
+    h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+        compute_mappings, x_ckpt
+    )
 
     # Step 2: aggregate is NOT checkpointed
     agg = aggregate(x_ckpt, h_pre)
@@ -640,14 +747,14 @@ def test_mhc_block_recompute_manager_partial_checkpoint_with_tuple_output():
     y = torch.nn.functional.gelu(agg)
 
     # Step 4: apply_h_res is checkpointed
-    ckpt_apply_h_res = CheckpointWithoutOutput()
-    mixed = ckpt_apply_h_res.checkpoint(apply_h_res, h_res, residual_ckpt)
-    manager.add_checkpoint(ckpt_apply_h_res)
+    mixed = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+        apply_h_res, h_res, residual_ckpt
+    )
 
     # Step 5: apply_h_post is checkpointed
-    ckpt_apply_h_post = CheckpointWithoutOutput()
-    output = ckpt_apply_h_post.checkpoint(apply_h_post, y, h_post)
-    manager.add_checkpoint(ckpt_apply_h_post)
+    output = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+        apply_h_post, y, h_post
+    )
 
     # Step 6: Final output
     final = output + mixed
