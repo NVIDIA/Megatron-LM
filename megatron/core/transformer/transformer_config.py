@@ -1288,6 +1288,23 @@ class TransformerConfig(ModelParallelConfig):
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
+        # Validation for recompute_hyper_connections
+        if self.recompute_hyper_connections:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "recompute_hyper_connections requires enable_hyper_connections=True."
+                )
+            if self.recompute_granularity != "selective":
+                raise ValueError(
+                    "recompute_hyper_connections requires recompute_granularity='selective'. "
+                    f"Got recompute_granularity={self.recompute_granularity}."
+                )
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "recompute_hyper_connections cannot be used together with 'mlp' in "
+                    "recompute_modules. They use different checkpoint mechanisms that may conflict."
+                )
+
         if self.fine_grained_activation_offloading:
             assert (
                 not self.cpu_offloading
