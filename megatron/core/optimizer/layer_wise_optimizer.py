@@ -183,10 +183,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     @torch.no_grad()
     def broadcast_params(self):
-        """All rank broadcast updated local params. Used by unit test only, to verify 
+        """All rank broadcast updated local params. Used by unit test only, to verify
         allgather_params.
         """
-        # Broadcast linear layer weights to all other ranks. 
+        # Broadcast linear layer weights to all other ranks.
         if self.dp_cp_params_list is None:
             return
         for i, params in enumerate(self.dp_cp_params_list):
