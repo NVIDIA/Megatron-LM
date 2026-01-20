@@ -1,23 +1,28 @@
-# GPTOSS Models 
+# GPT-OSS Training Tutorial
 
-## Table of contents
-- [1. Overview](#1-overview)
-- [2. Prerequisites](#2-prerequisites)
-- [3. Training Setup](#3-training-setup)
-- [4. Configuration](#4-configuration)
-- [5. Test Datasets](#5-test-datasets)
-
-## 1. Overview
-<a id="overview" name="overview"></a>
-
-Train GPTOSS models with Megatron-Core.
-
-## 2. Prerequisites
-<a id="prerequisites" name="prerequisites"></a>
+## Setup
 
 ```bash
-# Clone repository
-export HOST_MEGATRON_LM_DIR="/path/to/your/host/megatron-lm"
-git clone https://github.com/NVIDIA/Megatron-LM.git "$HOST_MEGATRON_LM_DIR"
-
+# Start NeMo container with HF cache mounted
+# Run this from the Megatron-LM root directory
+docker run --rm -it -w /workdir \
+  -v $(pwd):/workdir \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --gpus all \
+  --entrypoint bash \
+  nvcr.io/nvidia/nemo:25.11
 ```
+
+## Step 1: Convert HuggingFace to Megatron (Optional)
+
+```bash
+torchrun --nproc-per-node=8 examples/gptoss/01_convert_hf.py
+```
+
+## Step 2: Pretrain from Scratch
+
+```bash
+torchrun --nproc-per-node=8 examples/gptoss/02_pretrain.py
+```
+
+To load the converted checkpoint, uncomment the `pretrained_checkpoint` line in `02_pretrain.py`.
