@@ -469,6 +469,7 @@ def test_mhc_block_recompute_manager():
     loss_ckpt2.backward()
     grad_ckpt2 = input_ckpt2.grad.clone()
 
+
     # Gradients should match because RNG state is restored during recompute
     assert torch.allclose(grad_ckpt2, grad_ref2, atol=1e-6), (
         f"Gradients with dropout mismatch!\n"
