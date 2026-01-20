@@ -173,6 +173,16 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         return self._tokenizer.offsets(ids=ids, text=text)
 
     @property
+    def space_sensitive(self):
+        """Check if tokenizer is space sensetive."""
+        if self.library in ['sentencepiece', 'huggingface']:
+            return self._tokenizer.space_sensitive
+        else:
+            raise NotImplementedError(
+                f"This method is not supported for {self.library} tokenizers."
+            )
+
+    @property
     def additional_special_tokens_ids(self) -> list:
         """Returns a list of the additional special tokens."""
         return self._tokenizer.additional_special_tokens_ids
