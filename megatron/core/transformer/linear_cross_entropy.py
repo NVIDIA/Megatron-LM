@@ -75,6 +75,7 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
                 sequence_parallel=self.sequence_parallel,
                 reduction=reduction,
                 ignore_index=ignore_index,
+                tp_group=self.tp_group,
             )
             # If reduction != "none" this will be a scalar; for "none" it should
             # match [s, b] and can be reshaped back to [b, s].
