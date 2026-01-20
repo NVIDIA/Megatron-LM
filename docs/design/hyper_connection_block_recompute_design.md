@@ -23,78 +23,98 @@
 
 ### 1.3 核心思路
 
-#### 1.3.1 checkpoint_without_output 输入分类优化
+#### 简化设计原则
 
-本设计对 `checkpoint_without_output` 进行了关键优化，将输入参数显式分为两类：
+本设计的核心是**复用现有的 `CheckpointWithoutOutput` 机制**，不对其进行任何修改。通过引入一个轻量级的 `MHCBlockRecomputeManager` 来统一管理多个 checkpoint：
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                  checkpoint_without_output 输入参数分类                     │
-├────────────────────────────────────┬───────────────────────────────────────┤
-│        Persistent Inputs           │         Refillable Inputs             │
-│      (与前序 checkpoint 无关)       │      (由前序 checkpoint output 填充)  │
-├────────────────────────────────────┼───────────────────────────────────────┤
-│  • 在 ctx.saved_tensors 中保存     │  • 不保存在 ctx 中                    │
-│  • Block 原始输入、常量参数等        │  • 来自上游 checkpoint 的输出         │
-│  • 内存占用固定                     │  • Recompute 时通过 fill 注入         │
-├────────────────────────────────────┼───────────────────────────────────────┤
-│  Example: block_input, dropout_p   │  Example: h_pre, h_res, aggregated    │
-└────────────────────────────────────┴───────────────────────────────────────┘
+│                   简化设计：MHC Block Recompute Manager                     │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  核心原则：                                                                │
+│  1. 不修改 CheckpointWithoutOutput                                         │
+│  2. Manager 仅负责收集和统一调度                                           │
+│  3. 利用 tensor storage 共享机制实现数据传递                               │
+│  4. Manager 传入 HyperConnection.forward()，使 TransformerLayer 无感知    │
+│                                                                            │
+│  工作流程：                                                                │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │ Forward Pass                                                       │   │
+│  │   1. TransformerBlock 创建 MHCBlockRecomputeManager                │   │
+│  │   2. Manager 传入每个 HyperConnectionModule.forward()              │   │
+│  │   3. HyperConnection 内部使用 CheckpointWithoutOutput 并注册到 mgr │   │
+│  │   4. TransformerBlock 在 output 上调用 discard_and_register_...    │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+│                              │                                             │
+│                              ▼                                             │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │ Backward Pass                                                      │   │
+│  │   1. grad 到达 hook_tensor，触发 unified recompute hook            │   │
+│  │   2. 按 forward 顺序依次调用每个 checkpoint 的 _recompute          │   │
+│  │   3. 每个 _recompute 将 output 写回原 tensor storage               │   │
+│  │   4. 下一个 checkpoint 的 input 自动获得正确数据                    │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**优化优势**：
-1. **内存效率**：refillable inputs 不占用存储空间
-2. **语义清晰**：`fill_refillable_inputs` 只处理声明的 refillable 参数
-3. **依赖显式化**：通过 `input_deps` 声明数据来源，便于调试和验证
-4. **向后兼容**：不指定 indices 时默认保存所有 inputs
+**关键洞察**：`CheckpointWithoutOutput` 在 forward 时会 detach input 并保存到 `ctx.saved_tensors`。当 checkpoint[i] 的 output 是 checkpoint[i+1] 的 input 时，它们共享同一个 tensor storage。因此，当我们按顺序 recompute 时，checkpoint[i] 的 `_recompute` 会将结果写回原 storage，checkpoint[i+1] 的 `saved_tensors` 自然就能获取到正确的数据。
 
-#### 1.3.2 Block 级别的数据流
+#### Block 级别的数据流
 
 ```
 Forward Pass:
 ┌─────────────────────────────────────────────────────────────────┐
 │  TransformerBlock                                               │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │ Input (saved) ────────────────────────────────────────── │  │
+│  │ manager = MHCBlockRecomputeManager()                      │  │
+│  │                                                           │  │
+│  │ Input ───────────────────────────────────────────────────│  │
 │  │    │                                                      │  │
 │  │    ▼                                                      │  │
-│  │ [Layer 1: Attention Submodule]                           │  │
-│  │    │ ┌─ HyperConnection (h_pre, h_post, h_res) ──────┐   │  │
-│  │    │ │   • aggregate(hidden, h_pre)                   │   │  │
-│  │    │ │   • apply_h_res(h_res, residual) ─ FREE ──────┼───│──│─► discarded
-│  │    │ └────────────────────────────────────────────────┘   │  │
+│  │ [HyperConnection Computations - All Checkpointed]        │  │
+│  │    │ HyperConnection.forward(hidden, residual, manager)  │  │
+│  │    │ ┌─ compute_mappings ─────────────────────────────┐  │  │
+│  │    │ │   CheckpointWithoutOutput → manager.add()       │  │  │
+│  │    │ │   output: (h_pre, h_post, h_res) ─ DISCARDED ──│──│──│─► freed
+│  │    │ └─────────────────────────────────────────────────┘  │  │
 │  │    │                                                      │  │
-│  │    ├─ LayerNorm (CheckpointWithoutOutput)                │  │
+│  │    │ ┌─ aggregate ────────────────────────────────────┐  │  │
+│  │    │ │   CheckpointWithoutOutput → manager.add()       │  │  │
+│  │    │ │   output: aggregated ─ DISCARDED ──────────────│──│──│─► freed
+│  │    │ └─────────────────────────────────────────────────┘  │  │
+│  │    │                                                      │  │
+│  │    │ ┌─ apply_h_res ──────────────────────────────────┐  │  │
+│  │    │ │   CheckpointWithoutOutput → manager.add()       │  │  │
+│  │    │ │   output: residual_mixed ─ DISCARDED ──────────│──│──│─► freed
+│  │    │ └─────────────────────────────────────────────────┘  │  │
+│  │    │                                                      │  │
+│  │    ├─ LayerNorm                                          │  │
 │  │    ├─ Attention                                          │  │
-│  │    ├─ apply_h_post                                       │  │
-│  │    └─ BDA ──────────────────────────────────────────────│──│─► output (kept temporarily)
-│  │         │                                                 │  │
-│  │    ▼                                                      │  │
-│  │ [Layer 2: MLP Submodule]                                 │  │
-│  │    │ ┌─ HyperConnection ─────────────────────────────┐   │  │
-│  │    │ │   • aggregate, apply_h_res ─ FREE ────────────┼───│──│─► discarded
-│  │    │ └───────────────────────────────────────────────┘   │  │
 │  │    │                                                      │  │
-│  │    ├─ LayerNorm (CheckpointWithoutOutput)                │  │
-│  │    ├─ MLP                                                │  │
-│  │    ├─ apply_h_post                                       │  │
-│  │    └─ BDA ──────────────────────────────────────────────│──│─► output
+│  │    │ ┌─ apply_h_post ─────────────────────────────────┐  │  │
+│  │    │ │   CheckpointWithoutOutput → manager.add()       │  │  │
+│  │    │ │   output ─ DISCARDED ──────────────────────────│──│──│─► freed
+│  │    │ └─────────────────────────────────────────────────┘  │  │
+│  │    │                                                      │  │
+│  │    └─ BDA ───────────────────────────────────────────────│  │
 │  │                                                           │  │
-│  │ ... (repeat for all layers in block)                     │  │
+│  │ ... (repeat for MLP submodule)                           │  │
 │  │                                                           │  │
-│  │ Block Output ◄────────────────────────────────────────── │  │
+│  │ Block Output ◄──────────────────────────────────────────│  │
+│  │                                                           │  │
+│  │ manager.discard_all_outputs_and_register_unified_recompute│  │
 │  └──────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  After forward: discard all intermediate activations,          │
-│                 register recompute hook on block output        │
 └─────────────────────────────────────────────────────────────────┘
 
 Backward Pass:
 ┌─────────────────────────────────────────────────────────────────┐
-│  grad(Block Output) triggers recompute hook                     │
+│  grad(hook_tensor) triggers unified recompute hook              │
 │      │                                                          │
 │      ▼                                                          │
-│  Recompute entire block from saved input                        │
+│  for each checkpoint in forward_order:                          │
+│      checkpoint._recompute(None)  # restores output storage     │
 │      │                                                          │
 │      ▼                                                          │
 │  Continue backward with recomputed activations                  │
@@ -105,706 +125,402 @@ Backward Pass:
 
 ### 2.1 核心组件
 
-#### 2.1.1 `checkpoint_without_output` 优化设计
+#### 2.1.1 `MHCBlockRecomputeManager` 类
 
-**核心思想**：将 checkpoint 的输入参数显式分为两类，使内存管理和 recompute 逻辑更加清晰。
+**位置**：`megatron/core/tensor_parallel/random.py`
 
-##### 输入参数分类
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                     checkpoint_without_output 输入参数                  │
-├─────────────────────────────────┬──────────────────────────────────────┤
-│      persistent_inputs          │         refillable_inputs            │
-│   (与前序 checkpoint 无关)       │    (由前序 checkpoint output 提供)    │
-├─────────────────────────────────┼──────────────────────────────────────┤
-│ • Block 原始输入                 │ • 前序 submodule 的输出              │
-│ • Config/超参数                  │ • h_pre, h_post, h_res              │
-│ • 非 tensor 常量                 │ • aggregated 结果                   │
-│ • 训练相关参数                   │ • apply_h_res 的输出                │
-├─────────────────────────────────┼──────────────────────────────────────┤
-│         ✓ 保存在 ctx            │          ✗ 不保存在 ctx             │
-│     forward 时 clone 保存       │    recompute 时由 manager refill    │
-└─────────────────────────────────┴──────────────────────────────────────┘
-```
-
-##### 优化后的 API 设计
+**目的**：管理一个TransformerBlock内所有需要checkpoint的HyperConnection计算，统一调度recompute。
 
 ```python
-def checkpoint_without_output(
-    func: Callable,
-    *args,
-    persistent_input_indices: Tuple[int, ...] = None,  # 需要保存的参数索引
-    refillable_input_indices: Tuple[int, ...] = None,  # 可被 refill 的参数索引
-    **kwargs
-):
+class MHCBlockRecomputeManager:
     """
-    执行 func 并进行 selective checkpoint，但区分 persistent 和 refillable inputs。
-    
-    Args:
-        func: 要执行的函数
-        *args: 函数参数
-        persistent_input_indices: 需要在 ctx 中保存的参数索引 (default: all indices)
-        refillable_input_indices: 不保存、后续由 BlockLevelCheckpointManager refill 的参数索引
-        **kwargs: 传递给 func 的关键字参数
-    
-    设计原则：
-        - persistent_input_indices 和 refillable_input_indices 应互斥且覆盖所有 tensor args
-        - 如果都不指定，默认所有 args 都是 persistent（兼容现有行为）
-        - refillable inputs 在 ctx 中用 placeholder 占位，不占用实际内存
-    """
-    pass
-```
+    MHC (Manifold-Constrained Hyper-Connections) Block-Level Recompute Manager.
 
-##### `CheckpointWithoutOutputWrapper` 类
+    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock for
+    HyperConnection computations, enabling unified recomputation during backward pass.
 
-```python
-class CheckpointWithoutOutputWrapper:
+    Design Philosophy:
+    - This manager is passed into HyperConnectionModule.forward() so that the checkpoint
+      logic is encapsulated within HyperConnection, making TransformerLayer unaware of
+      the detailed checkpoint process.
+    - When manager is None, HyperConnection operates normally without checkpointing.
+    - When manager is provided, HyperConnection wraps its computations with
+      CheckpointWithoutOutput and registers them to the manager.
+
+    Usage:
+        # In TransformerBlock:
+        manager = MHCBlockRecomputeManager()
+
+        # Pass manager to each layer's HyperConnection (via TransformerLayer)
+        for layer in self.layers:
+            hidden_states = layer.forward(..., mhc_recompute_manager=manager)
+
+        # After all layers, register unified recompute on final output
+        final_output = hidden_states.sum()  # or loss
+        manager.discard_all_outputs_and_register_unified_recompute(final_output)
     """
-    Wrapper that wraps a CheckpointWithoutOutput instance and provides
-    the ability to inject refillable tensors from BlockLevelCheckpointManager.
-    
-    设计原理：
-        在 forward pass 中，refillable_inputs 被标记但不保存实际数据。
-        在 backward pass 触发 recompute 前，manager 调用 fill_refillable_inputs
-        将前序 checkpoint 的输出注入到正确的位置。
-    """
-    
-    def __init__(
-        self,
-        checkpoint_ctx: CheckpointContext,  # checkpoint_without_output 返回的 ctx
-        refillable_indices: Tuple[int, ...],
-        persistent_indices: Tuple[int, ...],
-    ):
-        self.checkpoint_ctx = checkpoint_ctx
-        self.refillable_indices = refillable_indices
-        self.persistent_indices = persistent_indices
-        # Refillable inputs 的 placeholder，recompute 前会被填充
-        self._refillable_placeholders: Dict[int, Tensor] = {}
-    
-    def fill_refillable_inputs(self, **inputs_by_index: Dict[int, Tensor]):
+
+    def __init__(self):
+        """Initialize the MHCBlockRecomputeManager."""
+        self.checkpoints = []
+
+    def add_checkpoint(self, ckpt: CheckpointWithoutOutput):
+        """Add a CheckpointWithoutOutput object to the manager."""
+        self.checkpoints.append(ckpt)
+
+    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor: Tensor):
         """
-        从外部（BlockLevelCheckpointManager）填充 refillable inputs。
+        Discard all checkpoint outputs and register a unified recompute hook.
+        """
+        # Discard all checkpoint outputs to save memory
+        for ckpt in self.checkpoints:
+            for output in ckpt.outputs:
+                output.untyped_storage().resize_(0)
+
+        # Register unified recompute hook
+        if hook_tensor.requires_grad:
+            hook_tensor.register_hook(self._unified_recompute_hook)
+
+    def _unified_recompute_hook(self, grad_output):
+        """Unified recompute hook that recomputes all checkpoints in forward order."""
+        for ckpt in self.checkpoints:
+            ckpt._recompute(None)
+```
+
+**设计要点**：
+
+1. **简单轻量**：Manager 只维护一个 checkpoint 列表，无需复杂的依赖图
+2. **复用现有机制**：直接调用 `CheckpointWithoutOutput._recompute()`，无需重新实现
+3. **顺序保证**：按添加顺序（即 forward 顺序）执行 recompute，自动满足数据依赖
+4. **封装性**：Manager 传入 HyperConnection，TransformerLayer 无需感知 checkpoint 细节
+
+### 2.2 HyperConnectionModule 修改
+
+在 `HyperConnectionModule` 中增加对 `MHCBlockRecomputeManager` 的支持：
+
+```python
+class HyperConnectionModule(MegatronModule):
+    """
+    Unified mHC (Manifold-Constrained Hyper-Connections) module.
+    """
+    
+    def forward(
+        self,
+        hidden_states: Tensor,
+        residual: Tensor, 
+        training: bool = True,
+        mhc_recompute_manager: Optional[MHCBlockRecomputeManager] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Full mHC forward pass.
         
         Args:
-            inputs_by_index: {arg_index: tensor} 映射，只包含 refillable indices
-        
-        Example:
-            # 假设 arg[0] 是 persistent，arg[1], arg[2] 是 refillable
-            wrapper.fill_refillable_inputs({
-                1: prev_checkpoint_output_1,  # 来自前序 checkpoint
-                2: prev_checkpoint_output_2,
-            })
-        
-        语义：
-            这个方法只填充 refillable inputs，persistent inputs 已经在 ctx 中保存。
-            调用后，checkpoint 拥有完整的输入信息用于 recompute。
-        """
-        for idx, tensor in inputs_by_index.items():
-            if idx not in self.refillable_indices:
-                raise ValueError(
-                    f"Index {idx} is not a refillable input. "
-                    f"Refillable indices: {self.refillable_indices}"
-                )
-            self._refillable_placeholders[idx] = tensor
-    
-    def get_all_inputs_for_recompute(self) -> Tuple[Tensor, ...]:
-        """
-        获取 recompute 所需的完整输入。
+            hidden_states: [s, b, n*C] - n-stream hidden states
+            residual: [s, b, n*C] - n-stream hidden states (x_l)
+            training: Whether in training mode
+            mhc_recompute_manager: Optional manager for block-level recomputation.
+                                   If provided, all HyperConnection computations will
+                                   be wrapped with CheckpointWithoutOutput.
         
         Returns:
-            按原始顺序排列的所有输入 tensors (persistent + refillable)
-        
-        内部逻辑：
-            1. 从 ctx.saved_tensors 获取 persistent inputs
-            2. 从 _refillable_placeholders 获取 refillable inputs
-            3. 按原始 arg 顺序合并返回
+            aggregated: [s, b, C] - aggregated input for layer computation
+            mixed: [s, b, n*C] - mixed output (H_res @ x_l)
+            h_post: [s, b, n] - expansion weights
         """
-        all_inputs = {}
-        
-        # 从 ctx 获取 persistent inputs
-        persistent_tensors = self.checkpoint_ctx.saved_tensors
-        for i, idx in enumerate(self.persistent_indices):
-            all_inputs[idx] = persistent_tensors[i]
-        
-        # 从 placeholders 获取 refillable inputs
-        for idx, tensor in self._refillable_placeholders.items():
-            all_inputs[idx] = tensor
-        
-        # 按顺序返回
-        max_idx = max(all_inputs.keys())
-        return tuple(all_inputs.get(i) for i in range(max_idx + 1))
-    
-    def get_recompute_hook(self):
-        """Return the recompute hook function for backward."""
-        return self.checkpoint_ctx._recompute
-```
-
-##### 具体示例：HyperConnection apply_h_res
-
-```python
-# 场景：apply_h_res(h_res, residual) 
-# - h_res: 来自 compute_mappings 的输出（refillable）
-# - residual: 可能来自 block input 或前一层的输出（refillable）
-
-# Forward pass
-wrapper = checkpoint_without_output(
-    hyper_connection.apply_h_res,
-    h_res,           # arg[0]: refillable - 来自 compute_mappings checkpoint
-    residual,        # arg[1]: refillable - 来自前序 layer
-    persistent_input_indices=(),     # 没有需要单独保存的
-    refillable_input_indices=(0, 1), # 全部由前序 checkpoint 提供
-)
-
-# 注册到 manager
-manager.register_submodule_checkpoint(
-    name="layer_0_attn_hc_apply_h_res",
-    wrapper=wrapper,
-    output=residual_mixed,
-    submodule_type=SubmoduleType.HYPER_CONNECTION_APPLY_H_RES,
-    input_deps={
-        0: "layer_0_attn_hc_compute.h_res",   # 指定依赖
-        1: "layer_0_input_residual",
-    }
-)
-
-# Backward pass (在 manager._unified_recompute_hook 中)
-# Manager 根据 input_deps 自动 fill
-wrapper.fill_refillable_inputs({
-    0: recomputed_h_res,      # 从 compute_mappings 重算得到
-    1: recomputed_residual,   # 从前序 layer 重算得到
-})
-```
-
-**关键设计优势**：
-
-1. **内存效率**：refillable inputs 不保存，只保留轻量级索引信息
-2. **语义清晰**：`fill_refillable_inputs` 只处理需要填充的部分，职责单一
-3. **依赖显式化**：通过 `input_deps` 明确每个 checkpoint 的数据来源
-4. **向后兼容**：不指定 indices 时默认保存所有 inputs，兼容现有用法
-
-#### 2.1.2 `BlockLevelCheckpointManager` 类
-
-**目的**：管理一个TransformerBlock内所有submodule的checkpoint，协调依赖关系并执行 refill + recompute。
-
-```python
-class BlockLevelCheckpointManager:
-    """
-    Manages block-level checkpointing for TransformerBlock with HyperConnection.
-    
-    核心职责：
-    1. 维护 submodule checkpoint 之间的依赖关系图
-    2. 在 backward 时按拓扑顺序 recompute 并 refill 下游 checkpoint
-    3. 协调内存释放和 recompute timing
-    
-    关键设计：
-    - 每个 checkpoint 的 refillable_inputs 通过 input_deps 显式声明依赖
-    - recompute 时按依赖顺序执行，确保 refill 数据可用
-    """
-    
-    def __init__(self):
-        self.submodule_checkpoints: Dict[str, SubmoduleCheckpoint] = {}  # name -> checkpoint
-        self.checkpoint_order: List[str] = []  # 按 forward 顺序记录
-        self.block_input: Optional[Tensor] = None
-        self.rng_states: Optional[Tuple] = None
-        # 依赖图：checkpoint_name -> {input_idx: source_checkpoint_name.output_key}
-        self.dependency_graph: Dict[str, Dict[int, str]] = {}
-        
-    def save_block_input(self, hidden_states: Tensor):
-        """
-        Save the block input for later recomputation.
-        Called at the beginning of TransformerBlock.forward().
-        """
-        self.block_input = hidden_states.detach().clone()
-        self.rng_states = _get_all_rng_states()
-        # 将 block_input 注册为特殊的 "源"
-        self._register_source("block_input", hidden_states)
-    
-    def _register_source(self, name: str, tensor: Tensor):
-        """注册一个数据源（用于依赖解析）"""
-        pass
-    
-    def register_submodule_checkpoint(
-        self,
-        name: str,
-        wrapper: CheckpointWithoutOutputWrapper,
-        output: Union[Tensor, Tuple[Tensor, ...]],
-        submodule_type: SubmoduleType,
-        input_deps: Optional[Dict[int, str]] = None,
-        output_keys: Optional[List[str]] = None,
-    ):
-        """
-        注册一个 submodule 的 checkpoint（延迟释放 output）。
-        
-        Args:
-            name: Checkpoint 唯一标识 (e.g., "layer_0_attn_hc_compute")
-            wrapper: CheckpointWithoutOutputWrapper 实例
-            output: Submodule 输出（单个 tensor 或 tuple）
-            submodule_type: Submodule 类型
-            input_deps: {arg_index: "source_name.output_key"} 映射
-                        指定 refillable inputs 的数据来源
-                        Example: {0: "layer_0_attn_hc_compute.h_res", 
-                                  1: "block_input"}
-            output_keys: 输出的命名（用于被下游引用）
-                        Example: ["h_pre", "h_post", "h_res"]
-        
-        设计说明：
-            - input_deps 中的 index 必须与 wrapper 的 refillable_indices 对应
-            - output_keys 使得其他 checkpoint 可以通过 "name.output_key" 引用
-        """
-        checkpoint_info = SubmoduleCheckpoint(
-            name=name,
-            wrapper=wrapper,
-            output=output,
-            submodule_type=submodule_type,
-            input_deps=input_deps or {},
-            output_keys=output_keys or [],
-        )
-        self.submodule_checkpoints[name] = checkpoint_info
-        self.checkpoint_order.append(name)
-        
-        # 更新依赖图
-        if input_deps:
-            self.dependency_graph[name] = input_deps
-    
-    def finalize_block(self, block_output: Tensor):
-        """
-        Called at the end of TransformerBlock.forward().
-        
-        执行步骤：
-        1. 验证依赖图完整性
-        2. 释放所有 intermediate outputs 的内存
-        3. 在 block_output 上注册 unified recompute hook
-        """
-        # Step 1: 验证依赖图
-        self._validate_dependency_graph()
-        
-        # Step 2: 释放所有 intermediate outputs (free memory)
-        for name in self.checkpoint_order:
-            ckpt = self.submodule_checkpoints[name]
-            self._free_tensor_storage(ckpt.output)
-        
-        # Step 3: Register unified recompute hook
-        if block_output.requires_grad:
-            block_output.register_hook(self._unified_recompute_hook)
-    
-    def _validate_dependency_graph(self):
-        """验证所有 input_deps 引用的源都存在"""
-        all_sources = set(self.submodule_checkpoints.keys())
-        all_sources.add("block_input")
-        
-        for name, deps in self.dependency_graph.items():
-            for idx, source_ref in deps.items():
-                source_name = source_ref.split(".")[0]
-                if source_name not in all_sources:
-                    raise ValueError(
-                        f"Checkpoint '{name}' references unknown source '{source_name}'"
-                    )
-    
-    def _free_tensor_storage(self, tensor: Union[Tensor, Tuple]):
-        """释放 tensor 的底层存储"""
-        if isinstance(tensor, tuple):
-            for t in tensor:
-                if t is not None:
-                    t.untyped_storage().resize_(0)
-        elif tensor is not None:
-            tensor.untyped_storage().resize_(0)
-    
-    def _unified_recompute_hook(self, grad_output: Tensor):
-        """
-        Unified recompute hook triggered during backward.
-        
-        按拓扑顺序执行 recompute，并在每步之后 refill 下游 checkpoint。
-        """
-        with _fork_rng():
-            _set_all_rng_states(*self.rng_states)
-            
-            # 存储已 recompute 的输出（用于 refill 下游）
-            recomputed_outputs: Dict[str, Union[Tensor, Tuple]] = {
-                "block_input": self.block_input.detach().requires_grad_(True)
-            }
-            
-            # 按 forward 顺序 recompute
-            with torch.enable_grad():
-                for name in self.checkpoint_order:
-                    ckpt = self.submodule_checkpoints[name]
-                    
-                    # Step 1: 为当前 checkpoint 填充 refillable inputs
-                    self._fill_refillable_inputs(ckpt, recomputed_outputs)
-                    
-                    # Step 2: 执行 recompute
-                    inputs = ckpt.wrapper.get_all_inputs_for_recompute()
-                    output = ckpt.wrapper.checkpoint_ctx.func(*inputs)
-                    
-                    # Step 3: 存储 recomputed output（供下游使用）
-                    recomputed_outputs[name] = output
-                    
-                    # Step 4: 填充 checkpoint 的 output storage
-                    self._refill_output_storage(ckpt.output, output)
-    
-    def _fill_refillable_inputs(
-        self, 
-        ckpt: SubmoduleCheckpoint, 
-        recomputed_outputs: Dict[str, Union[Tensor, Tuple]]
-    ):
-        """
-        为 checkpoint 的 refillable inputs 填充数据。
-        
-        从 recomputed_outputs 中根据 input_deps 查找对应数据。
-        """
-        if not ckpt.input_deps:
-            return
-        
-        refill_data = {}
-        for arg_idx, source_ref in ckpt.input_deps.items():
-            # 解析 source_ref: "source_name" 或 "source_name.output_key"
-            parts = source_ref.split(".", 1)
-            source_name = parts[0]
-            output_key = parts[1] if len(parts) > 1 else None
-            
-            source_output = recomputed_outputs[source_name]
-            
-            if output_key is not None:
-                # 从 tuple output 中按 key 获取
-                source_ckpt = self.submodule_checkpoints.get(source_name)
-                if source_ckpt and source_ckpt.output_keys:
-                    key_idx = source_ckpt.output_keys.index(output_key)
-                    refill_data[arg_idx] = source_output[key_idx]
-                else:
-                    raise ValueError(f"Cannot resolve output_key '{output_key}' for '{source_name}'")
-            else:
-                refill_data[arg_idx] = source_output
-        
-        ckpt.wrapper.fill_refillable_inputs(refill_data)
-    
-    def _refill_output_storage(self, original: Tensor, recomputed: Tensor):
-        """将 recomputed tensor 的数据写入 original 的 storage"""
-        original.untyped_storage().resize_(recomputed.untyped_storage().size())
-        original.copy_(recomputed)
-```
-
-#### 2.1.3 `SubmoduleCheckpoint` 数据类
-
-```python
-@dataclass
-class SubmoduleCheckpoint:
-    """
-    Stores checkpoint information for a single submodule.
-    
-    设计说明：
-        - wrapper: 包含 checkpoint context 和 input 分类信息
-        - input_deps: 声明 refillable inputs 的数据来源
-        - output_keys: 为 output 的各部分命名（支持被下游引用）
-    """
-    name: str
-    wrapper: CheckpointWithoutOutputWrapper
-    output: Union[Tensor, Tuple[Tensor, ...]]
-    submodule_type: SubmoduleType
-    
-    # 输入依赖映射：{arg_index: "source_checkpoint.output_key"}
-    # Example: {0: "layer_0_hc_compute.h_res", 1: "block_input"}
-    input_deps: Dict[int, str] = field(default_factory=dict)
-    
-    # 输出命名（用于被下游依赖引用）
-    # Example: ["h_pre", "h_post", "h_res"] for compute_mappings
-    output_keys: List[str] = field(default_factory=list)
-    
-    def get_output_by_key(self, key: str) -> Tensor:
-        """根据 key 获取 output 中的特定 tensor"""
-        if not self.output_keys:
-            raise ValueError(f"Checkpoint '{self.name}' has no output_keys defined")
-        idx = self.output_keys.index(key)
-        if isinstance(self.output, tuple):
-            return self.output[idx]
-        elif idx == 0:
-            return self.output
+        if mhc_recompute_manager is not None:
+            # === Checkpoint mode: wrap each computation ===
+            return self._forward_with_checkpoint(
+                hidden_states, residual, mhc_recompute_manager
+            )
         else:
-            raise IndexError(f"Output key index {idx} out of range for non-tuple output")
-
-
-class SubmoduleType(Enum):
-    """Submodule 类型枚举，用于分类和调试"""
-    LAYERNORM = "layernorm"
-    HYPER_CONNECTION_COMPUTE = "hc_compute"       # compute_mappings -> (h_pre, h_post, h_res)
-    HYPER_CONNECTION_AGGREGATE = "hc_aggregate"   # aggregate(hidden, h_pre)
-    HYPER_CONNECTION_APPLY_H_RES = "hc_apply_h_res"   # apply_h_res(h_res, residual)
-    HYPER_CONNECTION_APPLY_H_POST = "hc_apply_h_post" # apply_h_post(output, h_post)
-    ATTENTION = "attention"
-    MLP = "mlp"
-    BDA = "bda"
+            # === Normal mode: no checkpointing ===
+            return self._forward_normal(hidden_states, residual)
+    
+    def _forward_normal(
+        self, hidden_states: Tensor, residual: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Normal forward without checkpointing."""
+        # Compute mappings
+        h_pre, h_post, h_res = self.compute_mappings(hidden_states)
+        
+        # Aggregate for layer input
+        aggregated = self.aggregate(hidden_states, h_pre)
+        
+        # Apply h_res to residual
+        mixed = self.apply_h_res(h_res, residual)
+        
+        return aggregated, mixed, h_post
+    
+    def _forward_with_checkpoint(
+        self,
+        hidden_states: Tensor,
+        residual: Tensor,
+        manager: MHCBlockRecomputeManager,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Forward with checkpointing for block-level recomputation."""
+        from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+        
+        # 1. Checkpoint: compute_mappings
+        ckpt_compute = CheckpointWithoutOutput()
+        h_pre, h_post, h_res = ckpt_compute.checkpoint(
+            self.compute_mappings, hidden_states
+        )
+        manager.add_checkpoint(ckpt_compute)
+        
+        # 2. Checkpoint: aggregate
+        ckpt_aggregate = CheckpointWithoutOutput()
+        aggregated = ckpt_aggregate.checkpoint(
+            self.aggregate, hidden_states, h_pre
+        )
+        manager.add_checkpoint(ckpt_aggregate)
+        
+        # 3. Checkpoint: apply_h_res
+        ckpt_apply_h_res = CheckpointWithoutOutput()
+        mixed = ckpt_apply_h_res.checkpoint(
+            self.apply_h_res, h_res, residual
+        )
+        manager.add_checkpoint(ckpt_apply_h_res)
+        
+        return aggregated, mixed, h_post
+    
+    def apply_h_post_with_checkpoint(
+        self,
+        x_with_bias: Tuple[Tensor, Optional[Tensor]],
+        h_post: Tensor,
+        manager: Optional[MHCBlockRecomputeManager] = None,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """
+        Apply H_post with optional checkpointing.
+        
+        This is called separately after the main layer computation (attention/mlp).
+        """
+        if manager is not None:
+            from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+            
+            ckpt_apply_h_post = CheckpointWithoutOutput()
+            result = ckpt_apply_h_post.checkpoint(
+                self.apply_h_post, x_with_bias, h_post
+            )
+            manager.add_checkpoint(ckpt_apply_h_post)
+            return result
+        else:
+            return self.apply_h_post(x_with_bias, h_post)
 ```
 
-##### 依赖关系示意图
+### 2.3 TransformerLayer 修改
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Block-Level Dependency Graph                          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  block_input ─────────────────────────────────────────────────┐             │
-│       │                                                        │             │
-│       ▼                                                        │             │
-│  ┌─────────────────────┐                                       │             │
-│  │ hc_compute          │ persistent: [hidden_states]           │             │
-│  │ output_keys:        │ refillable: []                        │             │
-│  │   h_pre, h_post,    │                                       │             │
-│  │   h_res             │                                       │             │
-│  └─────────┬───────────┘                                       │             │
-│            │                                                    │             │
-│            ├──────────────────────┐                             │             │
-│            │                      │                             │             │
-│            ▼                      ▼                             ▼             │
-│  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  │
-│  │ hc_aggregate        │  │ hc_apply_h_res      │  │                     │  │
-│  │ persistent: []      │  │ persistent: []      │  │                     │  │
-│  │ refillable:         │  │ refillable:         │  │                     │  │
-│  │   {0: block_input,  │  │   {0: hc_compute.   │  │                     │  │
-│  │    1: hc_compute.   │  │       h_res,        │  │                     │  │
-│  │       h_pre}        │  │    1: block_input}  │  │                     │  │
-│  └─────────┬───────────┘  └─────────┬───────────┘  │                     │  │
-│            │                        │               │                     │  │
-│            ▼                        │               │                     │  │
-│  ┌─────────────────────┐            │               │                     │  │
-│  │ layernorm           │            │               │                     │  │
-│  │ persistent: []      │            │               │                     │  │
-│  │ refillable:         │            │               │                     │  │
-│  │   {0: hc_aggregate} │            │               │                     │  │
-│  └─────────┬───────────┘            │               │                     │  │
-│            │                        │               │                     │  │
-│            ▼                        │               │                     │  │
-│  ┌─────────────────────┐            │               │                     │  │
-│  │ attention           │            │               │                     │  │
-│  │ (not checkpointed)  │            │               │                     │  │
-│  └─────────┬───────────┘            │               │                     │  │
-│            │                        │               │                     │  │
-│            ▼                        │               │                     │  │
-│  ┌─────────────────────┐            │               │                     │  │
-│  │ hc_apply_h_post     │            │               │                     │  │
-│  │ persistent: []      │            │               │                     │  │
-│  │ refillable:         │            │               │                     │  │
-│  │   {0: attention,    │◄───────────┼───────────────┘                     │  │
-│  │    1: hc_compute.   │            │                                     │  │
-│  │       h_post}       │            │                                     │  │
-│  └─────────┬───────────┘            │                                     │  │
-│            │                        │                                     │  │
-│            ▼                        ▼                                     │  │
-│  ┌─────────────────────────────────────────────────┐                      │  │
-│  │ bda                                              │                      │  │
-│  │ persistent: [dropout_prob, training_flag, ...]  │                      │  │
-│  │ refillable:                                      │                      │  │
-│  │   {0: hc_apply_h_post,                          │                      │  │
-│  │    1: hc_apply_h_res}                           │                      │  │
-│  └─────────────────────────────────────────────────┘                      │  │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+**设计目标**：TransformerLayer 只需要将 `mhc_recompute_manager` 传递给 HyperConnection，无需感知具体的 checkpoint 过程。
+
+#### 2.3.1 当前代码分析
+
+查看当前 `_forward_mlp` 的实现（简化版）：
+
+```python
+def _forward_mlp(self, hidden_states, ...):
+    # Residual connection
+    residual = hidden_states
+
+    # HyperConnection 前处理
+    if self.config.enable_hyper_connections and self.do_mlp_hyper_connection:
+        hidden_states, residual, mlp_hc_h_post = self.mlp_hyper_connection(
+            hidden_states, residual
+        )
+
+    # Pre-MLP LayerNorm (可选 checkpoint)
+    if self.recompute_pre_mlp_layernorm:
+        self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+        pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+            self.pre_mlp_layernorm, hidden_states
+        )
+    else:
+        pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+
+    # MLP (可选 checkpoint)
+    if self.recompute_mlp:
+        mlp_output_with_bias = tensor_parallel.checkpoint(...)
+    else:
+        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, ...)
+
+    # 注册 pre_mlp layernorm 的 recompute hook
+    if self.recompute_pre_mlp_layernorm:
+        self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+            mlp_output_with_bias[0]
+        )
+
+    # HyperConnection 后处理
+    if self.config.enable_hyper_connections and self.do_mlp_hyper_connection:
+        mlp_output_with_bias = self.mlp_hyper_connection.apply_h_post(
+            mlp_output_with_bias, mlp_hc_h_post
+        )
+
+    return self._forward_post_mlp(mlp_output_with_bias, residual)
 ```
 
-### 2.2 TransformerLayer 修改
-
-在`TransformerLayer`中，需要增加对block-level checkpoint的支持，使用优化后的 API 显式声明 persistent/refillable inputs。
+#### 2.3.2 修改后的代码
 
 ```python
 class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     
-    def __init__(self, ...):
-        # ... existing init ...
-        
-        # Block-level checkpoint support
-        self.block_checkpoint_manager: Optional[BlockLevelCheckpointManager] = None
-        self.enable_block_level_recompute = (
-            config.enable_hyper_connections and 
-            config.hyper_connection_recompute_granularity == "block"
-        )
-    
-    def set_block_checkpoint_manager(self, manager: BlockLevelCheckpointManager):
-        """Called by TransformerBlock to set the shared checkpoint manager."""
-        self.block_checkpoint_manager = manager
-    
-    def _forward_attention_with_block_recompute(self, hidden_states, residual, ...):
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        ...,
+        mhc_recompute_manager: Optional[MHCBlockRecomputeManager] = None,
+    ):
         """
-        Forward pass for attention submodule with block-level recomputation.
+        TransformerLayer forward pass.
         
-        使用优化后的 checkpoint API：
-        - persistent_input_indices: 需要保存在 ctx 的参数
-        - refillable_input_indices: 由前序 checkpoint 填充的参数
-        - input_deps: 声明 refillable 参数的数据来源
+        Args:
+            ...
+            mhc_recompute_manager: Optional manager for MHC block-level recomputation.
+                                   When provided, HyperConnection computations will be
+                                   checkpointed and registered to this manager.
         """
-        manager = self.block_checkpoint_manager
-        layer_prefix = f"layer_{self.layer_number}_attn"
-        
-        # === 1. HyperConnection: compute mappings ===
-        # hidden_states 来自 block_input（第一层）或前一层输出
-        # 这里作为 persistent input 保存，因为它是 layer 的入口
-        if self.do_self_attention_hyper_connection:
-            hc_compute_wrapper = checkpoint_without_output(
-                self.self_attention_hyper_connection.compute_mappings,
-                hidden_states,  # arg[0]: 需要保存
-                persistent_input_indices=(0,),
-                refillable_input_indices=(),  # 无 refillable
-            )
-            h_pre, h_post, h_res = hc_compute_wrapper.checkpoint_ctx.output
-            
-            manager.register_submodule_checkpoint(
-                name=f"{layer_prefix}_hc_compute",
-                wrapper=hc_compute_wrapper,
-                output=(h_pre, h_post, h_res),
-                submodule_type=SubmoduleType.HYPER_CONNECTION_COMPUTE,
-                input_deps={},  # 无外部依赖，persistent 已保存
-                output_keys=["h_pre", "h_post", "h_res"],  # 定义输出命名
-            )
-            
-            # === 2. Aggregate: 不单独 checkpoint，inline 计算 ===
-            # aggregate 是简单计算，不值得单独 checkpoint
-            aggregated = self.self_attention_hyper_connection.aggregate(
-                hidden_states, h_pre
-            )
-            # 将 aggregated 注册为中间结果供下游引用
-            manager._register_source(f"{layer_prefix}_aggregated", aggregated)
-            
-            # === 3. Apply h_res to residual ===
-            # h_res 来自 hc_compute，residual 来自 block_input 或前层
-            hc_res_wrapper = checkpoint_without_output(
-                self.self_attention_hyper_connection.apply_h_res,
-                h_res,      # arg[0]: refillable from hc_compute.h_res
-                residual,   # arg[1]: refillable from previous layer
-                persistent_input_indices=(),  # 全部 refillable，不保存
-                refillable_input_indices=(0, 1),
-            )
-            residual_mixed = hc_res_wrapper.checkpoint_ctx.output
-            
-            manager.register_submodule_checkpoint(
-                name=f"{layer_prefix}_hc_apply_h_res",
-                wrapper=hc_res_wrapper,
-                output=residual_mixed,
-                submodule_type=SubmoduleType.HYPER_CONNECTION_APPLY_H_RES,
-                input_deps={
-                    0: f"{layer_prefix}_hc_compute.h_res",  # 来自 hc_compute
-                    1: self._get_residual_source(),        # block_input 或 prev_layer
-                },
-            )
-        else:
-            aggregated = hidden_states
-            residual_mixed = residual
-        
-        # === 4. LayerNorm ===
-        if self.recompute_input_layernorm:
-            ln_wrapper = checkpoint_without_output(
-                self.input_layernorm,
-                aggregated,  # arg[0]: refillable from aggregate
-                persistent_input_indices=(),
-                refillable_input_indices=(0,),
-            )
-            ln_output = ln_wrapper.checkpoint_ctx.output
-            
-            manager.register_submodule_checkpoint(
-                name=f"{layer_prefix}_ln",
-                wrapper=ln_wrapper,
-                output=ln_output,
-                submodule_type=SubmoduleType.LAYERNORM,
-                input_deps={0: f"{layer_prefix}_aggregated"},
-            )
-        else:
-            ln_output = self.input_layernorm(aggregated)
-            manager._register_source(f"{layer_prefix}_ln_output", ln_output)
-        
-        # === 5. Attention (通常不 checkpoint，计算密集但内存友好) ===
-        attention_output_with_bias = self.self_attention(ln_output, ...)
-        manager._register_source(f"{layer_prefix}_attn_output", attention_output_with_bias)
-        
-        # === 6. Apply h_post ===
-        if self.do_self_attention_hyper_connection:
-            hc_post_wrapper = checkpoint_without_output(
-                self.self_attention_hyper_connection.apply_h_post,
-                attention_output_with_bias,  # arg[0]: refillable from attention
-                h_post,                       # arg[1]: refillable from hc_compute
-                persistent_input_indices=(),
-                refillable_input_indices=(0, 1),
-            )
-            post_output = hc_post_wrapper.checkpoint_ctx.output
-            
-            manager.register_submodule_checkpoint(
-                name=f"{layer_prefix}_hc_apply_h_post",
-                wrapper=hc_post_wrapper,
-                output=post_output,
-                submodule_type=SubmoduleType.HYPER_CONNECTION_APPLY_H_POST,
-                input_deps={
-                    0: f"{layer_prefix}_attn_output",
-                    1: f"{layer_prefix}_hc_compute.h_post",
-                },
-            )
-            attention_output_with_bias = post_output
-        
-        # === 7. BDA (Bias-Dropout-Add) ===
-        # dropout_prob 等标量参数作为 persistent
-        bda_wrapper = checkpoint_without_output(
-            self.self_attn_bda(self.training, self.config.bias_dropout_fusion),
-            attention_output_with_bias,  # arg[0]: refillable
-            residual_mixed,              # arg[1]: refillable
-            self.hidden_dropout,         # arg[2]: persistent (scalar)
-            persistent_input_indices=(2,),  # 只保存 dropout prob
-            refillable_input_indices=(0, 1),
-        )
-        hidden_states = bda_wrapper.checkpoint_ctx.output
-        
-        manager.register_submodule_checkpoint(
-            name=f"{layer_prefix}_bda",
-            wrapper=bda_wrapper,
-            output=hidden_states,
-            submodule_type=SubmoduleType.BDA,
-            input_deps={
-                0: f"{layer_prefix}_hc_apply_h_post" if self.do_self_attention_hyper_connection 
-                   else f"{layer_prefix}_attn_output",
-                1: f"{layer_prefix}_hc_apply_h_res" if self.do_self_attention_hyper_connection
-                   else self._get_residual_source(),
-            },
+        hidden_states, context = self._forward_attention(
+            hidden_states,
+            attention_mask,
+            ...,
+            mhc_recompute_manager=mhc_recompute_manager,
         )
         
-        return hidden_states
+        hidden_states = self._forward_mlp(
+            hidden_states,
+            ...,
+            mhc_recompute_manager=mhc_recompute_manager,
+        )
+        
+        return hidden_states, context
     
-    def _get_residual_source(self) -> str:
-        """获取 residual 的来源名称"""
-        if self.layer_number == 1:
-            return "block_input"
+    def _forward_attention(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        ...,
+        mhc_recompute_manager: Optional[MHCBlockRecomputeManager] = None,
+    ):
+        """Forward pass for self-attention with optional MHC recomputation."""
+        
+        # Residual connection
+        residual = hidden_states
+        
+        # === Self-Attention HyperConnection 前处理 ===
+        if self.config.enable_hyper_connections and self.do_self_attention_hyper_connection:
+            # 将 manager 传入 HyperConnection，checkpoint 逻辑在其内部处理
+            hidden_states, residual, self_attn_hc_h_post = self.self_attention_hyper_connection(
+                hidden_states,
+                residual,
+                mhc_recompute_manager=mhc_recompute_manager,  # 新增参数
+            )
+        
+        # LayerNorm (保持现有逻辑)
+        input_layernorm_output = self.input_layernorm(hidden_states)
+        
+        # Self-Attention
+        attention_output_with_bias = self.self_attention(
+            input_layernorm_output,
+            attention_mask=attention_mask,
+            ...
+        )
+        
+        # === Self-Attention HyperConnection 后处理 ===
+        if self.config.enable_hyper_connections and self.do_self_attention_hyper_connection:
+            # 使用新方法，支持可选的 checkpoint
+            attention_output_with_bias = self.self_attention_hyper_connection.apply_h_post_with_checkpoint(
+                attention_output_with_bias,
+                self_attn_hc_h_post,
+                manager=mhc_recompute_manager,  # 新增参数
+            )
+        
+        # BDA
+        hidden_states = self.self_attn_bda(...)(
+            attention_output_with_bias, residual, self.hidden_dropout
+        )
+        
+        return hidden_states, context
+    
+    def _forward_mlp(
+        self,
+        hidden_states: Tensor,
+        ...,
+        mhc_recompute_manager: Optional[MHCBlockRecomputeManager] = None,
+    ):
+        """Forward pass for MLP with optional MHC recomputation."""
+        
+        # Residual connection
+        residual = hidden_states
+        
+        # === MLP HyperConnection 前处理 ===
+        if self.config.enable_hyper_connections and self.do_mlp_hyper_connection:
+            # 将 manager 传入 HyperConnection，checkpoint 逻辑在其内部处理
+            hidden_states, residual, mlp_hc_h_post = self.mlp_hyper_connection(
+                hidden_states,
+                residual,
+                mhc_recompute_manager=mhc_recompute_manager,  # 新增参数
+            )
+        
+        # === Pre-MLP LayerNorm ===
+        # 注意：当启用 MHC recompute 时，pre_mlp_layernorm 的 recompute 也会被统一管理
+        if self.recompute_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                self.pre_mlp_layernorm, hidden_states
+            )
+            # 如果启用了 MHC recompute，将 layernorm checkpoint 也加入 manager
+            if mhc_recompute_manager is not None:
+                mhc_recompute_manager.add_checkpoint(self.pre_mlp_norm_checkpoint)
         else:
-            return f"layer_{self.layer_number - 1}_mlp_bda"
+            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        
+        # === MLP ===
+        # 注意：当前实现中，recompute_mlp 和 MHC recompute 互斥（见下文说明）
+        if self.recompute_mlp:
+            mlp_output_with_bias = tensor_parallel.checkpoint(...)
+        else:
+            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, ...)
+        
+        # === 注册 pre_mlp layernorm 的 recompute hook ===
+        # 关键：当启用 MHC recompute 时，不再单独注册 hook
+        # 因为 manager 会统一处理所有 checkpoint 的 recompute
+        if self.recompute_pre_mlp_layernorm and mhc_recompute_manager is None:
+            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+                mlp_output_with_bias[0]
+            )
+        
+        # === MLP HyperConnection 后处理 ===
+        if self.config.enable_hyper_connections and self.do_mlp_hyper_connection:
+            mlp_output_with_bias = self.mlp_hyper_connection.apply_h_post_with_checkpoint(
+                mlp_output_with_bias,
+                mlp_hc_h_post,
+                manager=mhc_recompute_manager,  # 新增参数
+            )
+        
+        return self._forward_post_mlp(mlp_output_with_bias, residual)
 ```
 
-**优化后的关键变化**：
-
-1. **显式 input 分类**：每个 checkpoint 明确声明哪些 inputs 是 persistent（需保存），哪些是 refillable（不保存）
-2. **依赖链显式化**：通过 `input_deps` 清晰表达数据流向
-3. **内存节省**：refillable inputs 不占用 ctx 存储空间
-4. **fill 语义简化**：`fill_refillable_inputs` 只需要填充声明的 refillable 参数
-
-### 2.3 TransformerBlock 修改
+### 2.4 TransformerBlock 修改
 
 ```python
 class TransformerBlock(GraphableMegatronModule, MegatronModule):
     
     def forward(self, hidden_states, ...):
-        # ... existing code ...
-        
-        if self.config.enable_hyper_connections and self._should_use_block_level_recompute():
-            return self._forward_with_block_recompute(hidden_states, ...)
+        if self._should_use_mhc_recompute():
+            return self._forward_with_mhc_recompute(hidden_states, ...)
         else:
             return self._forward_normal(hidden_states, ...)
     
-    def _should_use_block_level_recompute(self) -> bool:
-        """Determine if block-level recomputation should be used."""
+    def _should_use_mhc_recompute(self) -> bool:
+        """Determine if MHC block-level recomputation should be used."""
         return (
             self.training and
-            self.config.hyper_connection_recompute_granularity == "block"
+            self.config.enable_hyper_connections and
+            self.config.recompute_hyper_connections
         )
     
-    def _forward_with_block_recompute(self, hidden_states, ...):
-        """
-        Forward pass with block-level recomputation for HyperConnection.
-        """
-        # Create checkpoint manager for this block
-        manager = BlockLevelCheckpointManager()
-        
-        # Save block input
-        manager.save_block_input(hidden_states)
+    def _forward_with_mhc_recompute(self, hidden_states, ...):
+        """Forward pass with MHC block-level recomputation."""
+        # Create recompute manager for this block
+        manager = MHCBlockRecomputeManager()
         
         # Expand for hyper connections if needed
         if self.config.enable_hyper_connections and self.pre_process:
@@ -812,14 +528,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_states, self.num_residual_streams
             )
         
-        # Forward through layers with checkpoint manager
+        # Forward through layers, passing manager to each
         for layer in self.layers:
-            layer.set_block_checkpoint_manager(manager)
             hidden_states, context = layer(
                 hidden_states=hidden_states,
-                ...
+                ...,
+                mhc_recompute_manager=manager,  # 传入 manager
             )
-            layer.set_block_checkpoint_manager(None)  # Clear reference
         
         # Contract if needed
         if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
@@ -831,221 +546,170 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
         
-        # Finalize block - discard intermediates and register recompute hook
-        manager.finalize_block(hidden_states)
+        # Compute hook tensor (typically used with loss)
+        # 注意：实际使用时，hook_tensor 应该是 loss 或其他依赖于所有 checkpoint 的 tensor
+        hook_tensor = hidden_states.sum()
+        
+        # Discard all MHC intermediates and register unified recompute
+        manager.discard_all_outputs_and_register_unified_recompute(hook_tensor)
         
         return hidden_states
 ```
 
-### 2.4 重算逻辑详解
+## 3. 重要限制与约束
 
-#### 2.4.1 核心流程：Refill + Recompute Pipeline
+### 3.1 `recompute_pre_mlp_layernorm` 与 `recompute_mlp` 的互斥性
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     Backward 时的 Refill + Recompute 流程                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  grad_output arrives at block_output                                         │
-│       │                                                                      │
-│       ▼                                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ _unified_recompute_hook 触发                                        │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│       │                                                                      │
-│       ▼                                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 恢复 RNG 状态                                                        │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│       │                                                                      │
-│       ▼                                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ for each checkpoint in forward_order:                               │    │
-│  │                                                                      │    │
-│  │   ┌──────────────────────────────────────────────────────────────┐  │    │
-│  │   │ Step 1: Fill refillable inputs                               │  │    │
-│  │   │                                                               │  │    │
-│  │   │ • 查询 input_deps 中声明的依赖                                │  │    │
-│  │   │ • 从 recomputed_outputs 字典获取对应 tensor                  │  │    │
-│  │   │ • 调用 wrapper.fill_refillable_inputs({idx: tensor, ...})    │  │    │
-│  │   │                                                               │  │    │
-│  │   │ Note: persistent inputs 已在 ctx.saved_tensors 中，无需 fill  │  │    │
-│  │   └──────────────────────────────────────────────────────────────┘  │    │
-│  │                          │                                          │    │
-│  │                          ▼                                          │    │
-│  │   ┌──────────────────────────────────────────────────────────────┐  │    │
-│  │   │ Step 2: Get all inputs and recompute                         │  │    │
-│  │   │                                                               │  │    │
-│  │   │ inputs = wrapper.get_all_inputs_for_recompute()              │  │    │
-│  │   │   • persistent inputs ← ctx.saved_tensors                    │  │    │
-│  │   │   • refillable inputs ← _refillable_placeholders             │  │    │
-│  │   │   • merge by original arg index                              │  │    │
-│  │   │                                                               │  │    │
-│  │   │ output = checkpoint_ctx.func(*inputs)                        │  │    │
-│  │   └──────────────────────────────────────────────────────────────┘  │    │
-│  │                          │                                          │    │
-│  │                          ▼                                          │    │
-│  │   ┌──────────────────────────────────────────────────────────────┐  │    │
-│  │   │ Step 3: Store output for downstream                          │  │    │
-│  │   │                                                               │  │    │
-│  │   │ recomputed_outputs[checkpoint_name] = output                 │  │    │
-│  │   │ (供后续 checkpoint 的 refillable inputs 使用)                 │  │    │
-│  │   └──────────────────────────────────────────────────────────────┘  │    │
-│  │                          │                                          │    │
-│  │                          ▼                                          │    │
-│  │   ┌──────────────────────────────────────────────────────────────┐  │    │
-│  │   │ Step 4: Refill original output storage                       │  │    │
-│  │   │                                                               │  │    │
-│  │   │ • 将 recomputed output 复制到原 output tensor 的 storage     │  │    │
-│  │   │ • 使 autograd 能正确回溯梯度                                 │  │    │
-│  │   └──────────────────────────────────────────────────────────────┘  │    │
-│  │                                                                      │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│       │                                                                      │
-│       ▼                                                                      │
-│  Autograd 继续 backward，每个 checkpoint 的 output 已被正确填充              │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**当前限制**：在启用 MHC recompute 的场景下，`recompute_pre_mlp_layernorm` 和 `recompute_mlp` **不能同时启用**。
 
-#### 2.4.2 `_unified_recompute_hook` 实现
+#### 原因分析
+
+查看当前 `_forward_mlp` 的逻辑：
 
 ```python
-def _unified_recompute_hook(self, grad_output: Tensor):
-    """
-    按 forward 顺序重算整个 block，利用依赖图 refill inputs。
-    
-    关键优化点：
-    1. 只恢复 persistent inputs（从 ctx.saved_tensors）
-    2. refillable inputs 通过 fill_refillable_inputs 从上游 recomputed outputs 获取
-    3. 避免了重复存储前序 checkpoint 的输出
-    """
-    with _fork_rng():
-        _set_all_rng_states(*self.rng_states)
-        
-        # 初始化 recomputed outputs 字典
-        # block_input 是唯一的 "根" 数据源
-        recomputed_outputs: Dict[str, Union[Tensor, Tuple[Tensor, ...]]] = {
-            "block_input": self.block_input.detach().requires_grad_(True)
-        }
-        
-        with torch.enable_grad():
-            # 按 forward 顺序遍历所有 checkpoint
-            for name in self.checkpoint_order:
-                ckpt = self.submodule_checkpoints[name]
-                
-                # ========== Step 1: Fill refillable inputs ==========
-                # 只填充 refillable 部分，persistent 已在 ctx 中
-                if ckpt.input_deps:
-                    refill_data = {}
-                    for arg_idx, source_ref in ckpt.input_deps.items():
-                        # 解析引用: "source_name" 或 "source_name.output_key"
-                        tensor = self._resolve_source_reference(
-                            source_ref, recomputed_outputs
-                        )
-                        refill_data[arg_idx] = tensor
-                    
-                    # 填充 refillable inputs
-                    ckpt.wrapper.fill_refillable_inputs(refill_data)
-                
-                # ========== Step 2: Get complete inputs and recompute ==========
-                # 合并 persistent (from ctx) + refillable (just filled)
-                all_inputs = ckpt.wrapper.get_all_inputs_for_recompute()
-                
-                # 执行 recompute
-                output = ckpt.wrapper.checkpoint_ctx.func(*all_inputs)
-                
-                # ========== Step 3: Store for downstream ==========
-                recomputed_outputs[name] = output
-                
-                # ========== Step 4: Refill original output storage ==========
-                # 将 recomputed 数据复制回原 output tensor，使 autograd 正确工作
-                self._refill_output_storage(ckpt.output, output)
-    
-    def _resolve_source_reference(
-        self, 
-        source_ref: str, 
-        recomputed_outputs: Dict[str, Union[Tensor, Tuple]]
-    ) -> Tensor:
-        """
-        解析依赖引用，从 recomputed_outputs 获取对应 tensor。
-        
-        支持的格式:
-        - "checkpoint_name": 获取整个 output（单个 tensor）
-        - "checkpoint_name.output_key": 获取 output tuple 中的特定元素
-        """
-        parts = source_ref.split(".", 1)
-        source_name = parts[0]
-        
-        if source_name not in recomputed_outputs:
-            raise RuntimeError(
-                f"Source '{source_name}' not yet recomputed. "
-                f"Check checkpoint order and dependencies."
-            )
-        
-        source_output = recomputed_outputs[source_name]
-        
-        if len(parts) == 1:
-            # 直接返回整个 output
-            return source_output
-        else:
-            # 按 output_key 索引
-            output_key = parts[1]
-            source_ckpt = self.submodule_checkpoints.get(source_name)
-            
-            if source_ckpt is None or not source_ckpt.output_keys:
-                raise ValueError(
-                    f"Cannot resolve '{output_key}' for '{source_name}': "
-                    f"no output_keys defined"
-                )
-            
-            key_idx = source_ckpt.output_keys.index(output_key)
-            return source_output[key_idx]
+# Pre-MLP LayerNorm checkpoint
+if self.recompute_pre_mlp_layernorm:
+    self.pre_mlp_norm_checkpoint = CheckpointWithoutOutput()
+    pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+        self.pre_mlp_layernorm, hidden_states
+    )
+
+# MLP (可能也有 checkpoint)
+if self.recompute_mlp:
+    mlp_output_with_bias = tensor_parallel.checkpoint(...)  # 使用不同的 checkpoint 机制
+else:
+    mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, ...)
+
+# 关键：pre_mlp layernorm 的 recompute hook 注册在 mlp_output_with_bias[0] 上
+if self.recompute_pre_mlp_layernorm:
+    self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+        mlp_output_with_bias[0]
+    )
 ```
 
-#### 2.4.3 设计优势总结
+**问题**：
+1. `recompute_mlp` 使用的是 `tensor_parallel.checkpoint()`（PyTorch 风格的完整 checkpoint）
+2. `recompute_pre_mlp_layernorm` 使用的是 `CheckpointWithoutOutput`（selective recompute）
+3. 当两者同时启用时，`pre_mlp_norm_checkpoint.discard_output_and_register_recompute()` 的 hook 注册位置会与 MLP checkpoint 的重算逻辑冲突
 
-| 方面 | 优化前 | 优化后 |
-|------|--------|--------|
-| **ctx 存储** | 保存所有 inputs | 只保存 persistent inputs |
-| **refill 语义** | 不清晰，需猜测哪些需要 fill | 显式声明 refillable indices |
-| **依赖关系** | 隐式，难以追踪 | 通过 input_deps 显式声明 |
-| **内存占用** | 大量重复存储 | 最小化：只存必要的根数据 |
-| **调试友好度** | 低 | 高：依赖图可视化/验证 |
+#### 配置约束
 
-### 2.5 配置参数
+启用 MHC recompute 时，必须满足以下配置：
 
-在`TransformerConfig`中添加新的配置项：
+```python
+# 有效配置
+config = TransformerConfig(
+    enable_hyper_connections=True,
+    recompute_hyper_connections=True,
+    recompute_granularity='selective',  # 必须是 selective
+    # 以下二选一：
+    recompute_pre_mlp_layernorm=True,   # OK
+    recompute_mlp=False,                 # 必须关闭
+)
+
+# 无效配置 - 会导致问题
+config = TransformerConfig(
+    enable_hyper_connections=True,
+    recompute_hyper_connections=True,
+    recompute_pre_mlp_layernorm=True,
+    recompute_mlp=True,  # ❌ 不允许
+)
+```
+
+#### 后续优化方向
+
+使用 `MHCBlockRecomputeManager` 后，理论上可以统一管理所有的 checkpoint，包括 pre_mlp_layernorm 和 MLP。后续可以考虑：
+
+1. 将 MLP 的 checkpoint 也改用 `CheckpointWithoutOutput`
+2. 统一注册到 `MHCBlockRecomputeManager`
+3. 移除 `recompute_pre_mlp_layernorm` 和 `recompute_mlp` 的互斥限制
+
+这需要对 MLP checkpoint 机制进行重构，确保与 MHC recompute 兼容。
+
+### 3.2 配置参数
 
 ```python
 @dataclass
 class TransformerConfig:
     # ... existing fields ...
     
-    hyper_connection_recompute_granularity: Optional[str] = None
+    recompute_hyper_connections: bool = False
     """
-    Recomputation granularity for HyperConnection.
-    Options:
-    - None: No block-level recomputation (use existing selective recompute)
-    - "block": Block-level recomputation for all HyperConnection intermediates
-    - "layer": Layer-level recomputation (finer granularity than block)
-    """
+    Whether to enable recomputation for HyperConnection intermediate activations.
+    When enabled, all HyperConnection computations (compute_mappings, aggregate,
+    apply_h_res, apply_h_post) will be checkpointed and their outputs discarded
+    after forward pass. The outputs are recomputed during backward pass.
     
-    hyper_connection_recompute_include_layernorm: bool = True
-    """
-    Whether to include LayerNorm in block-level recomputation.
-    If False, LayerNorm outputs will be saved separately.
-    """
+    Requirements:
+    - Only effective when enable_hyper_connections=True and training=True
+    - Must use recompute_granularity='selective'
+    - Cannot be used together with recompute_mlp=True (see section 3.1)
     
-    hyper_connection_recompute_include_bda: bool = True
-    """
-    Whether to include BDA operations in block-level recomputation.
+    Recommended configuration:
+        enable_hyper_connections=True
+        recompute_hyper_connections=True
+        recompute_granularity='selective'
+        recompute_pre_mlp_layernorm=True
+        recompute_mlp=False  # Important!
     """
 ```
 
-## 3. 内存分析
+## 4. 数据传递机制
 
-### 3.1 现有方案内存占用
+### 4.1 Storage 共享机制详解
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     数据传递：Storage 共享机制                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Forward:                                                                   │
+│  ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐       │
+│  │ ckpt1.checkpoint│     │ ckpt2.checkpoint│     │ ckpt3.checkpoint│       │
+│  │ compute_mappings│────►│   aggregate     │────►│  apply_h_res    │       │
+│  │ out: h_pre,...  │     │ out: aggregated │     │ out: mixed      │       │
+│  └────────┬────────┘     └────────┬────────┘     └────────┬────────┘       │
+│           │                       │                       │                 │
+│           │ detach & save         │ detach & save         │                 │
+│           │ to ctx.saved_tensors  │ to ctx.saved_tensors  │                 │
+│           ▼                       ▼                       ▼                 │
+│  ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐       │
+│  │ ckpt1.ctx       │     │ ckpt2.ctx       │     │ ckpt3.ctx       │       │
+│  │ saved: [x]      │     │ saved: [x,h_pre]│     │ saved: [h_res,r]│       │
+│  └─────────────────┘     └─────────────────┘     └─────────────────┘       │
+│                                                                             │
+│  * h_pre, aggregated, mixed 等 tensor 的 detached 版本共享 storage          │
+│                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                             │
+│  After discard_all_outputs:                                                 │
+│  所有 checkpoint output 的 storage 全部 resize_(0)，内存释放                │
+│                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                             │
+│  Backward (unified recompute):                                              │
+│                                                                             │
+│  Step 1: ckpt1._recompute(None)                                             │
+│    - inputs = ckpt1.ctx.saved_tensors  # [x]                                │
+│    - h_pre_new, h_post_new, h_res_new = compute_mappings(x)                 │
+│    - h_pre.storage = h_pre_new.storage  # 写回原 storage                    │
+│                                                                             │
+│  Step 2: ckpt2._recompute(None)                                             │
+│    - inputs = ckpt2.ctx.saved_tensors  # [x, h_pre*]                        │
+│    - h_pre* 现在指向 h_pre_new 的数据（storage 已被 refill）                │
+│    - aggregated_new = aggregate(x, h_pre*)                                  │
+│    - aggregated.storage = aggregated_new.storage                            │
+│                                                                             │
+│  ... 以此类推 ...                                                           │
+│                                                                             │
+│  关键：按 forward 顺序 recompute 确保数据依赖被正确满足                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 5. 内存分析
+
+### 5.1 现有方案内存占用
 
 对于一个启用HyperConnection的TransformerLayer（n个residual streams）：
 
@@ -1054,86 +718,81 @@ class TransformerConfig:
 | h_pre | 1 | [s, b, n] | s×b×n×dtype |
 | h_post | 1 | [s, b, n] | s×b×n×dtype |
 | h_res | 1 | [s, b, n, n] | s×b×n²×dtype |
+| aggregated | 1 | [s, b, C] | s×b×C×dtype |
 | residual_mixed | 1 | [s, b, n×C] | s×b×n×C×dtype |
-| ln_output | 2 | [s, b, C] | 2×s×b×C×dtype |
-| attention_output | 1 | [s, b, n×C] | s×b×n×C×dtype |
-| mlp_output | 1 | [s, b, n×C] | s×b×n×C×dtype |
 
-总计每层约：`s×b×(3n + n² + 4nC + 2C)×dtype`
+总计每层约：`s×b×(2n + n² + C + nC)×dtype`
 
-### 3.2 新方案内存占用
+### 5.2 新方案内存占用
 
 | 组件 | Tensor数量 | 形状 | 内存估算 |
 |------|-----------|------|---------|
-| block_input | 1 | [s, b, C] | s×b×C×dtype |
-| block_output | 1 | [s, b, C] | s×b×C×dtype |
+| block_input (saved by first ckpt) | 1 | [s, b, n×C] | s×b×n×C×dtype |
+| checkpoint metadata | - | - | negligible |
 
-总计整个block：`2×s×b×C×dtype`
+总计整个block：`~s×b×n×C×dtype` + 少量 metadata
 
-### 3.3 内存节省
+### 5.3 内存节省
 
-假设：
-- n = 4 (residual streams)
-- C = 4096 (hidden size)
-- L = 32 (layers per block)
+假设 n = 4, C = 4096, L = 32 layers：
 
-内存节省比例约为：
-```
-节省 = L × (3n + n² + 4nC + 2C) / 2C
-     ≈ L × (12 + 16 + 65536 + 8192) / 8192
-     ≈ L × 9 (approximately 9x per layer)
-```
+每层节省：`s×b×(2n + n² + C) ≈ s×b×(8 + 16 + 4096) ≈ s×b×4120`
 
-对于32层的block，总体节省约为 **~280x**。
+对于32层的block，总体节省约为 **~4-5x**。
 
-## 4. 实现计划
+## 6. 实现计划
 
-### Phase 1: 核心基础设施
-1. 实现 `CheckpointWithOutputWrapper`
-2. 实现 `SubmoduleCheckpoint` 数据类
-3. 实现 `BlockLevelCheckpointManager` 基本框架
+### Phase 1: 核心基础设施 ✅
+1. 实现 `MHCBlockRecomputeManager` 类
+2. 添加单元测试验证基本功能
 
-### Phase 2: TransformerLayer 集成
-1. 修改 `TransformerLayer` 支持 block checkpoint manager
-2. 实现 attention submodule 的 block-level checkpoint
-3. 实现 MLP submodule 的 block-level checkpoint
+### Phase 2: HyperConnectionModule 集成
+1. 修改 `HyperConnectionModule.forward()` 支持 manager 参数
+2. 实现 `_forward_with_checkpoint()` 方法
+3. 实现 `apply_h_post_with_checkpoint()` 方法
 
-### Phase 3: TransformerBlock 集成
-1. 修改 `TransformerBlock.forward` 添加 block-level recompute 路径
-2. 实现 `finalize_block` 和 `_unified_recompute_hook`
-3. 添加配置参数验证
+### Phase 3: TransformerLayer 集成
+1. 修改 `TransformerLayer.forward()` 支持 manager 参数
+2. 修改 `_forward_attention()` 传递 manager
+3. 修改 `_forward_mlp()` 传递 manager 并处理 layernorm checkpoint
 
-### Phase 4: 测试与优化
+### Phase 4: TransformerBlock 集成
+1. 修改 `TransformerBlock.forward()` 添加 MHC recompute 路径
+2. 添加配置参数验证
+3. 实现 manager 的生命周期管理
+
+### Phase 5: 测试与优化
 1. 单元测试：验证数值正确性
 2. 集成测试：与现有 checkpoint 机制兼容性
 3. 性能测试：内存和速度 benchmark
 4. 边界条件处理：PP/TP/CP 并行场景
 
-## 5. 风险与缓解
+## 7. 风险与缓解
 
-### 5.1 数值精度
+### 7.1 数值精度
 **风险**：重算可能因RNG状态不一致导致数值差异
 
 **缓解**：
-- 严格保存和恢复所有RNG状态（CPU、CUDA、tracker）
+- `CheckpointWithoutOutput` 已有完善的 RNG 状态保存/恢复机制
 - 添加数值精度验证测试
 
-### 5.2 性能开销
+### 7.2 性能开销
 **风险**：重算引入额外计算开销
 
 **缓解**：
+- HyperConnection 计算相对轻量，重算开销可控
 - 仅在训练时启用
-- 提供细粒度配置，允许用户权衡内存和计算
+- 提供配置开关，允许用户权衡内存和计算
 
-### 5.3 兼容性
+### 7.3 兼容性
 **风险**：与现有 selective recompute、CPU offloading 等特性冲突
 
 **缓解**：
-- 明确互斥配置
+- 复用现有 `CheckpointWithoutOutput` 机制，继承其兼容性
+- 明确 `recompute_pre_mlp_layernorm` 和 `recompute_mlp` 的互斥关系
 - 在 config 验证中添加检查
-- 编写兼容性文档
 
-## 6. API 示例
+## 8. API 示例
 
 ```python
 # 配置示例
@@ -1142,38 +801,39 @@ config = TransformerConfig(
     num_layers=32,
     enable_hyper_connections=True,
     num_residual_streams=4,
-    # 启用 block-level recomputation
-    hyper_connection_recompute_granularity="block",
-    hyper_connection_recompute_include_layernorm=True,
-    hyper_connection_recompute_include_bda=True,
+    # 启用 MHC recomputation
+    recompute_hyper_connections=True,
+    recompute_granularity='selective',
+    recompute_pre_mlp_layernorm=True,
+    recompute_mlp=False,  # 重要：必须关闭
 )
 
 # 模型使用
 model = GPTModel(config=config, ...)
 
-# 训练时自动启用 block-level recomputation
+# 训练时自动启用 recomputation
 for batch in dataloader:
     loss = model(batch)
-    loss.backward()  # 触发 recompute hook
+    loss.backward()  # 触发 unified recompute hook
 ```
 
-## 7. 待讨论问题
+## 9. 待讨论问题
 
-1. **Recompute 粒度选择**：是否需要支持比 block 更细的粒度（如 layer-level）？
-2. **与 TE checkpoint 的交互**：FP8 场景下如何与 TransformerEngine 的 checkpoint 机制协作？
-3. **Pipeline Parallel 边界**：跨 PP stage 的 block 如何处理 input tensor 的保存？
-4. **CUDA Graph 兼容性**：是否需要支持 CUDA Graph 场景？
+1. **与 TE checkpoint 的交互**：FP8 场景下如何与 TransformerEngine 的 checkpoint 机制协作？
+2. **Pipeline Parallel 边界**：跨 PP stage 的 block 如何处理？
+3. **统一 MLP checkpoint**：后续是否将 `recompute_mlp` 也改用 `MHCBlockRecomputeManager` 管理？
 
-## 8. 参考
+## 10. 参考
 
 - 现有 `CheckpointWithoutOutput` 实现：`megatron/core/tensor_parallel/random.py`
+- 新增 `MHCBlockRecomputeManager` 实现：`megatron/core/tensor_parallel/random.py`
 - HyperConnection 实现：`megatron/core/transformer/hyper_connection.py`
 - TransformerLayer 实现：`megatron/core/transformer/transformer_layer.py`
 - mHC 论文：Manifold-Constrained Hyper-Connections
 
 ---
 
-**文档版本**: v1.1  
+**文档版本**: v2.1  
 **作者**: [待填写]  
 **日期**: 2026-01-19  
 **状态**: Draft - 待 Review
@@ -1183,4 +843,6 @@ for batch in dataloader:
 | 版本 | 日期 | 变更内容 |
 |------|------|----------|
 | v1.0 | 2026-01-19 | 初始版本 |
-| v1.1 | 2026-01-19 | 优化 checkpoint_without_output 设计：引入 persistent/refillable input 分类，显式依赖声明 |
+| v1.1 | 2026-01-19 | 优化设计：引入 persistent/refillable input 分类，显式依赖声明 |
+| v2.0 | 2026-01-19 | **简化设计**：移除 input 分类和 Wrapper，直接复用 CheckpointWithoutOutput |
+| v2.1 | 2026-01-19 | **详细设计**：(1) 重命名为 MHCBlockRecomputeManager (2) Manager 传入 HyperConnection.forward() (3) 明确 recompute_pre_mlp_layernorm 和 recompute_mlp 互斥限制 (4) 详细描述 TransformerLayer 修改 |

@@ -4,9 +4,10 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
-    BlockLevelCheckpointManager,
+    BlockLevelCheckpointManager,  # backward compat alias
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
+    MHCBlockRecomputeManager,
     checkpoint,
     convert_cuda_rng_state,
     get_cuda_rng_tracker,
@@ -231,9 +232,9 @@ def test_checkpoint_without_output():
     Utils.destroy_model_parallel()
 
 
-def test_block_level_checkpoint_manager():
+def test_mhc_block_recompute_manager():
     """
-    Test BlockLevelCheckpointManager with three sequential checkpoint functions.
+    Test MHCBlockRecomputeManager with three sequential checkpoint functions.
 
     This test verifies that:
     1. The manager correctly handles sequential checkpoints where each function's
@@ -271,9 +272,8 @@ def test_block_level_checkpoint_manager():
     loss_ref.backward()
     grad_ref = input_ref.grad.clone()
 
-    
-    # With BlockLevelCheckpointManager
-    manager = BlockLevelCheckpointManager()
+    # With MHCBlockRecomputeManager
+    manager = MHCBlockRecomputeManager()
 
     ckpt1 = CheckpointWithoutOutput()
     y1 = ckpt1.checkpoint(func1, input_ckpt)
@@ -287,7 +287,7 @@ def test_block_level_checkpoint_manager():
     y3 = ckpt3.checkpoint(func3, y2)
     manager.add_checkpoint(ckpt3)
 
-    loss_ckpt = y3.sum() 
+    loss_ckpt = y3.sum()
     # Register unified recompute hook on the final output
     manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
 
@@ -334,7 +334,7 @@ def test_block_level_checkpoint_manager():
     torch.cuda.manual_seed(42)
 
     # With checkpoint manager
-    manager2 = BlockLevelCheckpointManager()
+    manager2 = MHCBlockRecomputeManager()
 
     ckpt1_2 = CheckpointWithoutOutput()
     y1_2 = ckpt1_2.checkpoint(func_with_dropout, input_ckpt2)
@@ -344,7 +344,7 @@ def test_block_level_checkpoint_manager():
     y2_2 = ckpt2_2.checkpoint(func2, y1_2)
     manager2.add_checkpoint(ckpt2_2)
 
-    loss_ckpt2 = y2_2.sum() 
+    loss_ckpt2 = y2_2.sum()
 
     manager2.discard_all_outputs_and_register_unified_recompute(loss_ckpt2)
 
@@ -361,9 +361,9 @@ def test_block_level_checkpoint_manager():
     Utils.destroy_model_parallel()
 
 
-def test_block_level_checkpoint_manager_with_multiple_outputs():
+def test_mhc_block_recompute_manager_with_multiple_outputs():
     """
-    Test BlockLevelCheckpointManager with functions that return multiple outputs.
+    Test MHCBlockRecomputeManager with functions that return multiple outputs.
     """
 
     def func_multi_output(x):
@@ -387,7 +387,7 @@ def test_block_level_checkpoint_manager_with_multiple_outputs():
     grad_ref = input_ref.grad.clone()
 
     # With manager
-    manager = BlockLevelCheckpointManager()
+    manager = MHCBlockRecomputeManager()
 
     ckpt1 = CheckpointWithoutOutput()
     y1a, y1b = ckpt1.checkpoint(func_multi_output, input_ckpt)
@@ -397,7 +397,7 @@ def test_block_level_checkpoint_manager_with_multiple_outputs():
     y2 = ckpt2.checkpoint(func_combine, y1a, y1b)
     manager.add_checkpoint(ckpt2)
 
-    loss_ckpt = y2.sum()  
+    loss_ckpt = y2.sum()
     manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
 
     loss_ckpt.backward()
@@ -412,13 +412,13 @@ def test_block_level_checkpoint_manager_with_multiple_outputs():
     Utils.destroy_model_parallel()
 
 
-def test_block_level_checkpoint_manager_error_handling():
+def test_mhc_block_recompute_manager_error_handling():
     """
-    Test error handling in BlockLevelCheckpointManager.
+    Test error handling in MHCBlockRecomputeManager.
     """
     Utils.initialize_model_parallel()
 
-    manager = BlockLevelCheckpointManager()
+    manager = MHCBlockRecomputeManager()
 
     # Test 1: Adding non-CheckpointWithoutOutput object should raise TypeError
     with pytest.raises(TypeError):
@@ -428,5 +428,260 @@ def test_block_level_checkpoint_manager_error_handling():
     ckpt = CheckpointWithoutOutput()
     with pytest.raises(ValueError):
         manager.add_checkpoint(ckpt)
+
+    Utils.destroy_model_parallel()
+
+
+def test_backward_compat_block_level_checkpoint_manager_alias():
+    """
+    Test that BlockLevelCheckpointManager alias works for backward compatibility.
+    """
+    # BlockLevelCheckpointManager should be an alias for MHCBlockRecomputeManager
+    assert BlockLevelCheckpointManager is MHCBlockRecomputeManager
+
+    Utils.initialize_model_parallel()
+
+    # Should work the same way
+    manager = BlockLevelCheckpointManager()
+
+    def func(x):
+        return x * 2
+
+    input_t = torch.randn(4, 4, device='cuda', requires_grad=True)
+
+    ckpt = CheckpointWithoutOutput()
+    y = ckpt.checkpoint(func, input_t)
+    manager.add_checkpoint(ckpt)
+
+    loss = y.sum()
+    manager.discard_all_outputs_and_register_unified_recompute(loss)
+    loss.backward()
+
+    assert input_t.grad is not None
+
+    Utils.destroy_model_parallel()
+
+
+def test_mhc_block_recompute_manager_partial_checkpoint():
+    """
+    Test MHCBlockRecomputeManager with partial checkpointing.
+
+    This test verifies the real-world scenario where only some operations
+    are checkpointed while others are not.
+
+    Computation chain:
+        a --[f]--> b --[g]--> c --[h]--> d --[sum]--> loss
+                   ^           ^
+                   |           |
+              checkpointed  checkpointed
+              (ckpt_f)      (ckpt_h)
+
+    Only f and h are wrapped with CheckpointWithoutOutput.
+    g is a regular operation without checkpoint.
+
+    This mimics the HyperConnection scenario where:
+    - compute_mappings (checkpointed)
+    - aggregate (not checkpointed, or checkpointed)
+    - apply_h_res (checkpointed)
+    - regular ops in between (not checkpointed)
+    """
+
+    # Define functions for the computation chain
+    def func_f(x):
+        """First checkpointed function: linear + nonlinear"""
+        return torch.nn.functional.gelu(x * 2 + 1)
+
+    def func_g(x):
+        """Middle function without checkpoint: another transform"""
+        return x * 3 - 2
+
+    def func_h(x):
+        """Second checkpointed function: nonlinear"""
+        return torch.sigmoid(x) + x
+
+    Utils.initialize_model_parallel()
+
+    # ========== Reference: normal forward without any checkpoint ==========
+    input_ref = torch.randn(4, 4, device='cuda', requires_grad=True)
+
+    # a --[f]--> b --[g]--> c --[h]--> d
+    b_ref = func_f(input_ref)  # a = input_ref, b = f(a)
+    c_ref = func_g(b_ref)      # c = g(b)
+    d_ref = func_h(c_ref)      # d = h(c)
+    loss_ref = d_ref.sum()
+    loss_ref.backward()
+    grad_ref = input_ref.grad.clone()
+
+    # ========== With MHCBlockRecomputeManager: partial checkpoint ==========
+    input_ckpt = input_ref.detach().clone().requires_grad_(True)
+
+    manager = MHCBlockRecomputeManager()
+
+    # Step 1: f is checkpointed
+    ckpt_f = CheckpointWithoutOutput()
+    b = ckpt_f.checkpoint(func_f, input_ckpt)
+    manager.add_checkpoint(ckpt_f)
+
+    # Step 2: g is NOT checkpointed (regular operation)
+    c = func_g(b)
+
+    # Step 3: h is checkpointed
+    ckpt_h = CheckpointWithoutOutput()
+    d = ckpt_h.checkpoint(func_h, c)
+    manager.add_checkpoint(ckpt_h)
+
+    # Step 4: Compute loss and register unified recompute
+    loss_ckpt = d.sum()
+    manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+
+    # Verify checkpoint outputs are discarded
+    assert b.untyped_storage().size() == 0, "b storage should be released"
+    assert d.untyped_storage().size() == 0, "d storage should be released"
+    # Note: c is not checkpointed, so its storage is NOT released
+    assert c.untyped_storage().size() > 0, "c storage should NOT be released (not checkpointed)"
+
+    # Backward
+    loss_ckpt.backward()
+    grad_ckpt = input_ckpt.grad.clone()
+
+    # Verify gradients match
+    assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6), (
+        f"Gradients mismatch with partial checkpoint!\n"
+        f"With manager: {grad_ckpt}\n"
+        f"Reference: {grad_ref}"
+    )
+
+    Utils.destroy_model_parallel()
+
+
+def test_mhc_block_recompute_manager_partial_checkpoint_with_tuple_output():
+    """
+    Test MHCBlockRecomputeManager with partial checkpointing and tuple outputs.
+
+    This more closely mimics HyperConnection's actual computation pattern:
+
+    Computation chain:
+        x --[compute_mappings]--> (h_pre, h_post, h_res)
+                                      |         |
+                                      v         |
+        x, h_pre --[aggregate]-------> agg      |
+                                        |       |
+                                        v       v
+                            (some ops)  y  h_res, residual
+                                        |       |
+                                        v       v
+                    y, h_post --[apply_h_post]-> output
+                                                |
+                                h_res, residual --[apply_h_res]--> mixed
+                                                |         |
+                                                v         v
+                                              final computations...
+
+    In this test:
+    - compute_mappings: checkpointed, returns tuple (h_pre, h_post, h_res)
+    - aggregate: NOT checkpointed
+    - apply_h_res: checkpointed
+    - apply_h_post: checkpointed
+    """
+
+    def compute_mappings(x):
+        """Mimics HyperConnection.compute_mappings, returns 3 tensors"""
+        h_pre = torch.sigmoid(x.mean(dim=-1, keepdim=True).expand_as(x))
+        h_post = torch.tanh(x.sum(dim=-1, keepdim=True).expand_as(x))
+        h_res = torch.relu(x)
+        return h_pre, h_post, h_res
+
+    def aggregate(x, h_pre):
+        """Mimics HyperConnection.aggregate"""
+        return x * h_pre
+
+    def apply_h_res(h_res, residual):
+        """Mimics HyperConnection.apply_h_res"""
+        return h_res + residual * 0.5
+
+    def apply_h_post(y, h_post):
+        """Mimics HyperConnection.apply_h_post"""
+        return y * h_post + y
+
+    Utils.initialize_model_parallel()
+
+    # ========== Reference: normal forward ==========
+    x_ref = torch.randn(4, 4, device='cuda', requires_grad=True)
+    residual_ref = torch.randn(4, 4, device='cuda', requires_grad=True)
+
+    h_pre_ref, h_post_ref, h_res_ref = compute_mappings(x_ref)
+    agg_ref = aggregate(x_ref, h_pre_ref)
+    # Simulate some intermediate computation
+    y_ref = torch.nn.functional.gelu(agg_ref)
+    mixed_ref = apply_h_res(h_res_ref, residual_ref)
+    output_ref = apply_h_post(y_ref, h_post_ref)
+    # Final output combines mixed and output
+    final_ref = output_ref + mixed_ref
+    loss_ref = final_ref.sum()
+    loss_ref.backward()
+    grad_x_ref = x_ref.grad.clone()
+    grad_residual_ref = residual_ref.grad.clone()
+
+    # ========== With MHCBlockRecomputeManager ==========
+    x_ckpt = x_ref.detach().clone().requires_grad_(True)
+    residual_ckpt = residual_ref.detach().clone().requires_grad_(True)
+
+    manager = MHCBlockRecomputeManager()
+
+    # Step 1: compute_mappings is checkpointed (returns tuple)
+    ckpt_compute = CheckpointWithoutOutput()
+    h_pre, h_post, h_res = ckpt_compute.checkpoint(compute_mappings, x_ckpt)
+    manager.add_checkpoint(ckpt_compute)
+
+    # Step 2: aggregate is NOT checkpointed
+    agg = aggregate(x_ckpt, h_pre)
+
+    # Step 3: some intermediate computation (not checkpointed)
+    y = torch.nn.functional.gelu(agg)
+
+    # Step 4: apply_h_res is checkpointed
+    ckpt_apply_h_res = CheckpointWithoutOutput()
+    mixed = ckpt_apply_h_res.checkpoint(apply_h_res, h_res, residual_ckpt)
+    manager.add_checkpoint(ckpt_apply_h_res)
+
+    # Step 5: apply_h_post is checkpointed
+    ckpt_apply_h_post = CheckpointWithoutOutput()
+    output = ckpt_apply_h_post.checkpoint(apply_h_post, y, h_post)
+    manager.add_checkpoint(ckpt_apply_h_post)
+
+    # Step 6: Final output
+    final = output + mixed
+    loss_ckpt = final.sum()
+
+    # Register unified recompute
+    manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+
+    # Verify checkpoint outputs are discarded
+    assert h_pre.untyped_storage().size() == 0, "h_pre storage should be released"
+    assert h_post.untyped_storage().size() == 0, "h_post storage should be released"
+    assert h_res.untyped_storage().size() == 0, "h_res storage should be released"
+    assert mixed.untyped_storage().size() == 0, "mixed storage should be released"
+    assert output.untyped_storage().size() == 0, "output storage should be released"
+
+    # Non-checkpointed tensors should still have storage
+    assert agg.untyped_storage().size() > 0, "agg storage should NOT be released"
+    assert y.untyped_storage().size() > 0, "y storage should NOT be released"
+
+    # Backward
+    loss_ckpt.backward()
+    grad_x_ckpt = x_ckpt.grad.clone()
+    grad_residual_ckpt = residual_ckpt.grad.clone()
+
+    # Verify gradients match
+    assert torch.allclose(grad_x_ckpt, grad_x_ref, atol=1e-6), (
+        f"Gradients for x mismatch!\n"
+        f"With manager: {grad_x_ckpt}\n"
+        f"Reference: {grad_x_ref}"
+    )
+    assert torch.allclose(grad_residual_ckpt, grad_residual_ref, atol=1e-6), (
+        f"Gradients for residual mismatch!\n"
+        f"With manager: {grad_residual_ckpt}\n"
+        f"Reference: {grad_residual_ref}"
+    )
 
     Utils.destroy_model_parallel()
