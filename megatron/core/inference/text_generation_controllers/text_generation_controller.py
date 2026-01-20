@@ -27,6 +27,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
+from megatron.core.transformer.moe.moe_utils import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
 
@@ -855,10 +856,22 @@ class TextGenerationController:
         else:
             request_bookkeeping = self._dynamic_step_context_bookkeeping()
 
+        # Collect routing indices if routing replay is enabled
+        routing_indices = None
+        config = self.inference_wrapped_model.model.config
+        if getattr(config, 'enable_routing_replay', False):
+            routing_indices = RouterReplay.get_recorded_data()
+            # Filter out None entries (non-MoE layers)
+            if routing_indices:
+                routing_indices = [r for r in routing_indices if r is not None]
+                if not routing_indices:
+                    routing_indices = None
+
         ret = {
             "sample": self._sampled_tokens_cuda[:active_request_count],
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
+            "routing_indices": routing_indices,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
         ret.update(request_bookkeeping)

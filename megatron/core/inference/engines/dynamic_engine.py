@@ -789,6 +789,7 @@ class DynamicInferenceEngine(AbstractEngine):
         sample: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        routing_indices: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -801,6 +802,8 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
+            routing_indices: (List[Tensor]): MoE routing indices per layer. Each tensor has
+                shape [total_tokens, topk]. Will be split per request.
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -811,6 +814,26 @@ class DynamicInferenceEngine(AbstractEngine):
         self.finished_request_count += len(finished_request_ids)
 
         log_probs_iter = log_probs if log_probs else repeat(None)
+
+        # Split routing indices per request if available
+        routing_indices_per_request = None
+        if routing_indices is not None:
+            # Get the query lengths for splitting per request
+            active_request_slice = slice(
+                self.context.paused_request_count, self.context.total_request_count
+            )
+            active_query_lengths = self.context.request_query_lengths[active_request_slice].tolist()
+
+            # Split each layer's routing tensor by request query lengths
+            routing_indices_per_request = {}
+            for req_idx in range(len(active_query_lengths)):
+                routing_indices_per_request[req_idx] = []
+
+            for layer_routing in routing_indices:
+                # layer_routing has shape [total_tokens, topk]
+                routing_splits = layer_routing.split(active_query_lengths, dim=0)
+                for req_idx, routing_split in enumerate(routing_splits):
+                    routing_indices_per_request[req_idx].append(routing_split)
 
         for req_idx, (request_id, token, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
@@ -915,6 +938,14 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
+
+            # Process routing indices if available
+            if routing_indices_per_request is not None and req_idx in routing_indices_per_request:
+                # Initialize routing_indices list if it doesn't exist
+                if request.routing_indices is None:
+                    request.routing_indices = []
+                # Append this step's routing data (list of tensors, one per MoE layer)
+                request.routing_indices.append(routing_indices_per_request[req_idx])
 
         return active_request_ids, finished_request_records
 
@@ -1101,6 +1132,7 @@ class DynamicInferenceEngine(AbstractEngine):
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
+            routing_indices = step_result.get("routing_indices", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -1118,6 +1150,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 sample,
                 log_probs,
                 top_n_logprobs,
+                routing_indices,
             )
 
         else:

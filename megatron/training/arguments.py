@@ -3256,6 +3256,11 @@ def _add_moe_args(parser):
                        help="some MoE routers have a D2H sync that will break cuda graphs.  If this flag is set the router will switch" \
                        " to dropping and padding during decode time which does not have a D2H sync. The capacity factor is set to the" \
                        " max that an expert could see during inference so no tokens are actually dropped.")
+    group.add_argument('--enable-routing-replay', action='store_true',
+                       help='Enable the routing replay feature for MoE layers. When enabled, each TopKRouter '
+                       'creates a RouterReplay instance that can record or replay routing decisions. '
+                       'Use RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD) to record '
+                       'routing decisions, and RouterReplay.get_recorded_data() to retrieve them.')
     return parser
 
 def _add_mla_args(parser):
