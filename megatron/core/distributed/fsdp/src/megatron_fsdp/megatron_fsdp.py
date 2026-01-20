@@ -616,6 +616,7 @@ class MegatronFSDP(torch.nn.Module):
                     ),
                 )
 
+        @torch.compiler.disable
         def _pre_forward_param_unshard(
             module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
         ):
@@ -647,6 +648,7 @@ class MegatronFSDP(torch.nn.Module):
             )
             return args, kwargs
 
+        @torch.compiler.disable
         def _register_post_backward_hook(
             post_backward_hook: callable,
             module: nn.Module,
@@ -737,6 +739,7 @@ class MegatronFSDP(torch.nn.Module):
             if self.model_auto_sync:
                 self.finish_grad_sync()
 
+        @torch.compiler.disable
         def _pre_backward_param_unshard(module: nn.Module, *unused):
             """
             Sub-module pre-backward hook to all-gather the module parameters
@@ -799,6 +802,7 @@ class MegatronFSDP(torch.nn.Module):
             # the backward pass.
             torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
 
+        @torch.compiler.disable
         def _post_forward(module: nn.Module, input: Any, output: Any):
             # When composed with module-hook-based activation recomputation, the
             # post-backward hook is responsible for resharding the module parameters
@@ -818,6 +822,7 @@ class MegatronFSDP(torch.nn.Module):
 
             return output
 
+        @torch.compiler.disable
         def _release_module_fp8_transpose_cache(module: nn.Module, *unused):
             release_params_fp8_transpose_cache(module.parameters(recurse=False))
 
@@ -827,6 +832,7 @@ class MegatronFSDP(torch.nn.Module):
             to the output tensor(s) of a module during a post-forward hook.
             """
 
+            @torch.compiler.disable
             def forward_hook(_module, inputs, output):
                 # Replace the output to avoid the output tensor being the same as
                 # the input tensor, which makes it impossible to identify which

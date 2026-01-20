@@ -116,6 +116,10 @@ fully_shard(model)
 # Your model is now ready for distributed training!
 ```
 
+### `torch.compile` Compatibility
+
+Megatron-FSDP is compatible with `torch.compile`, but this feature is still experimental and may introduce performance regressions in some workloads.
+
 ## 📖 Megatron-FSDP Comprehensive Walkthrough
 
 ### Import `megatron_fsdp`.
