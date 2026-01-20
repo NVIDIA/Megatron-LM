@@ -286,16 +286,16 @@ def test_block_level_checkpoint_manager():
     y3 = ckpt3.checkpoint(func3, y2)
     manager.add_checkpoint(ckpt3)
 
+    loss_ckpt = y3.sum() 
     # Register unified recompute hook on the final output
-    manager.discard_all_outputs_and_register_unified_recompute(y3)
+    manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
 
     # Verify outputs are discarded (storage size is 0)
     assert y1.untyped_storage().size() == 0, "y1 storage should be released"
     assert y2.untyped_storage().size() == 0, "y2 storage should be released"
     assert y3.untyped_storage().size() == 0, "y3 storage should be released"
 
-    # Compute loss and backward
-    loss_ckpt = y3.sum()
+    # Compute Loss and Backward
     loss_ckpt.backward()
     grad_ckpt = input_ckpt.grad.clone()
 
@@ -341,9 +341,10 @@ def test_block_level_checkpoint_manager():
     y2_2 = ckpt2_2.checkpoint(func2, y1_2)
     manager2.add_checkpoint(ckpt2_2)
 
-    manager2.discard_all_outputs_and_register_unified_recompute(y2_2)
+    loss_ckpt2 = y2_2.sum() 
 
-    loss_ckpt2 = y2_2.sum()
+    manager2.discard_all_outputs_and_register_unified_recompute(loss_ckpt2)
+
     loss_ckpt2.backward()
     grad_ckpt2 = input_ckpt2.grad.clone()
 
@@ -393,9 +394,9 @@ def test_block_level_checkpoint_manager_with_multiple_outputs():
     y2 = ckpt2.checkpoint(func_combine, y1a, y1b)
     manager.add_checkpoint(ckpt2)
 
-    manager.discard_all_outputs_and_register_unified_recompute(y2)
+    loss_ckpt = y2.sum()  
+    manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
 
-    loss_ckpt = y2.sum()
     loss_ckpt.backward()
     grad_ckpt = input_ckpt.grad.clone()
 
