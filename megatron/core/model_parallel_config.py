@@ -374,6 +374,11 @@ class ModelParallelConfig:
     cpu_offloading_double_buffering: bool = False
     """If True, enables double buffering across layers while reloading activations from CPU."""
 
+    cpu_offloading_retain_pinned_cpu_buffers: bool = False
+    """If True, the pinned CPU buffers are retained after offloading and reused for the
+       next iteration. It is useful for cuda graphs capture.
+    """
+
     ###################
     # Timing
     ###################
