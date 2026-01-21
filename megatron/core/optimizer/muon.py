@@ -242,6 +242,31 @@ def get_megatron_muon_optimizer(
 
     linear_param_groups = _get_param_groups(model_chunks, config, config_overrides)
 
+    # if layerwise distributed optimizer is not used, need to handle ep params separately
+    if not layer_wise_distributed_optimizer:
+        expert_param_groups = []
+        for group in linear_param_groups:
+            if group['is_expert_parallel']:
+                expert_param_groups.append(group)
+                linear_param_groups.remove(group)
+        if expert_param_groups:
+            expert_optimizer = TensorParallelMuon(
+                expert_param_groups,
+                lr=config.lr,
+                momentum_beta=config.muon_momentum,
+                use_nesterov=config.muon_use_nesterov,
+                weight_decay=config.weight_decay,
+                fp32_matmul_prec=config.muon_fp32_matmul_prec,
+                num_ns_steps=config.muon_num_ns_steps,
+                scale_mode=config.muon_scale_mode,
+                split_qkv=config.muon_split_qkv,
+                is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+                qkv_split_shapes=qkv_split_shapes,
+                extra_scale_factor=config.muon_extra_scale_factor,
+                pg_collection=pg_collection,
+                mode=config.muon_tp_mode,
+            )
+
     optimizer = TensorParallelMuon(
         linear_param_groups,
         lr=config.lr,
@@ -300,6 +325,17 @@ def get_megatron_muon_optimizer(
         optimizer = FP32Optimizer(optimizer, config, muon_init_state_fn)
 
     optimizers.append(optimizer)
+
+    # expert optimizer exists meaning layerwise distributed optimizer is not used
+    if expert_optimizer:
+        if config.bf16:
+            expert_optimizer = Float16OptimizerWithFloat16Params(
+                expert_optimizer, config, None, muon_init_state_fn
+            )
+        else:
+            expert_optimizer = FP32Optimizer(expert_optimizer, config, muon_init_state_fn)
+        setattr(expert_optimizer, 'grad_stats_parallel_group', pg_collection.tp_ep_pp)
+        optimizers.append(expert_optimizer)
 
     # done with muon, unfreeze nonlinear and freeze linear
     for param in nonlinear_params:
