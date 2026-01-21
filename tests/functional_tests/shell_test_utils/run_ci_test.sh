@@ -8,6 +8,9 @@ ulimit -Sn $(ulimit -Hn)
 # Increase soft limit for number of processes to match hard limit
 ulimit -Su $(ulimit -Hu)
 
+# Set umask to 0002 to allow group read/write permissions
+umask 0002
+
 set +x
 for ARGUMENT in "$@"; do
     # Split on first = only, preserving any subsequent = signs in the value
