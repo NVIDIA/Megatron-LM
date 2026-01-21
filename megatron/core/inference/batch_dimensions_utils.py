@@ -174,6 +174,8 @@ class InferenceBatchDimensions:
                 local_batch_dims.token_count,
                 int(is_non_decode),
                 int(has_explicit_chunked_prefill_req),
+                local_batch_dims.prefill_req_count,
+                local_batch_dims.decode_req_count,
             ],
             dtype=torch.int32,
             device=torch.cuda.current_device(),
@@ -201,10 +203,20 @@ class InferenceBatchDimensions:
             return None  # indicate no match, run in eager mode
 
         assert not has_explicit_chunked_prefill_req
+
+        # If strict matching is enabled, we sync the request counts across EP ranks
+        # to ensure the graph captures the maximum needed capacity.
+        adjusted_prefill_req_count = (
+            int(sync_tensor[3].item()) if strict else local_batch_dims.prefill_req_count
+        )
+        adjusted_decode_req_count = (
+            int(sync_tensor[4].item()) if strict else local_batch_dims.decode_req_count
+        )
+
         adjusted_batch_dim = InferenceBatchDimensions(
             token_count=int(sync_tensor[0].item()),
-            prefill_req_count=local_batch_dims.prefill_req_count,
-            decode_req_count=local_batch_dims.decode_req_count,
+            prefill_req_count=adjusted_prefill_req_count,
+            decode_req_count=adjusted_decode_req_count,
             has_explicit_chunked_prefill_req=False,
         )
         return adjusted_batch_dim
