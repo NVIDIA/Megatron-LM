@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core.utils import get_pg_size
 
 
 @dataclass(order=True, frozen=True)
@@ -171,16 +171,7 @@ class InferenceBatchDimensions:
             (InferenceBatchDimensions) A new InferenceBatchDimensions object with
             adjusted dimensions, or None if eager mode should be used.
         """
-        # Use provided EP group or fall back to global parallel state
-        if ep_group is not None:
-            ep_size = ep_group.size()
-            expert_model_parallel_group = ep_group
-        else:
-            ep_size = parallel_state.get_expert_model_parallel_world_size()
-            if ep_size <= 1:
-                return local_batch_dims
-            expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
-
+        ep_size = get_pg_size(ep_group)
         if ep_size <= 1:
             return local_batch_dims
         # all reduce local work across expert model parallel group
@@ -197,9 +188,7 @@ class InferenceBatchDimensions:
             device=torch.cuda.current_device(),
         )
 
-        torch.distributed.all_reduce(
-            sync_tensor, op=torch.distributed.ReduceOp.MAX, group=expert_model_parallel_group
-        )
+        torch.distributed.all_reduce(sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group)
 
         sync_tensor = sync_tensor.cpu()
         is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1

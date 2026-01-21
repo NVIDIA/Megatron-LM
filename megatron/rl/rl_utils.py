@@ -460,6 +460,11 @@ def get_environment_rollouts(
 
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
+        if args.rl_offload_optimizer_during_inference:
+            with nvtx_range("offload-optimizer-before-refit"):
+                optimizer.offload_to_cpu()
+                torch.cuda.empty_cache()
+
         # If the separate inference model weights were prefetched to CPU while idle, bring them
         # back to GPU before refit/copy and before any CUDA-graph'd inference.
         with nvtx_range("prefetch-inference-model-weights-to-gpu"):

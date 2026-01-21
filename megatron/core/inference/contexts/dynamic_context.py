@@ -340,8 +340,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.pipeline_parallel_group = None
 
-        if pg_collection is not None and hasattr(pg_collection, 'ep'):
+        if pg_collection is not None:
             self.expert_model_parallel_group = pg_collection.ep
+        elif parallel_state.get_expert_model_parallel_world_size() > 1:
+            self.expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
         else:
             self.expert_model_parallel_group = None
 
