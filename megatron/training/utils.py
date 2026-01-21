@@ -282,6 +282,7 @@ def report_memory(name):
     string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
     string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
+    string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
@@ -572,7 +573,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         if args.hybrid_context_parallel:
             seq_len = torch.tensor(batch['tokens'].shape[0], dtype=torch.int32, device=torch.cuda.current_device())
             _broadcast(seq_len)
-            
+
         if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
@@ -624,7 +625,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             shape = (seq_len.item())
         else:
             shape = (args.micro_batch_size, args.seq_length)
-            
+
         tokens = torch.empty(
             shape,
             dtype=torch.int64,
@@ -768,7 +769,7 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
     accidently overwrite buffers with precomputed values during construction. Given the
     goal is to only materialize those tensors on meta device, this function checks the
     device first and only move the tensor to the destination if it is not on meta device.
-   
+
     Args:
         module: The target module to apply this transformation.
         device: The desired device of the parameters
