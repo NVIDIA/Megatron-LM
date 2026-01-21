@@ -243,6 +243,7 @@ def get_megatron_muon_optimizer(
     linear_param_groups = _get_param_groups(model_chunks, config, config_overrides)
 
     # if layerwise distributed optimizer is not used, need to handle ep params separately
+    expert_optimizer = None
     if not layer_wise_distributed_optimizer:
         expert_param_groups = []
         for group in linear_param_groups:
