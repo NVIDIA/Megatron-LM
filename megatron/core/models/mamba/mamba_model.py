@@ -19,6 +19,7 @@ from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank,
     MultiTokenPredictionBlock,
+    process_mtp_loss,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
@@ -320,8 +321,8 @@ class MambaModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.mtp_process:
-            hidden_states = self.mtp.process_loss(
+        if self.config.mtp_num_layers is not None:
+            hidden_states = process_mtp_loss(
                 hidden_states=hidden_states,
                 labels=labels,
                 loss_mask=loss_mask,
@@ -330,6 +331,9 @@ class MambaModel(LanguageModule):
                 runtime_gather_output=runtime_gather_output,
                 is_training=self.training,
                 compute_language_model_loss=self.compute_language_model_loss,
+                config=self.config,
+                cp_group=self.pg_collection.cp,
+                packed_seq_params=packed_seq_params,
             )
 
         sequence_parallel_override = False

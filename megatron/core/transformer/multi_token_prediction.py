@@ -625,6 +625,79 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+def process_mtp_loss(
+    hidden_states: Tensor,
+    labels: Tensor,
+    loss_mask: Optional[Tensor],
+    output_layer: Callable,
+    output_weight: Optional[Tensor],
+    runtime_gather_output: Optional[bool],
+    is_training: bool,
+    compute_language_model_loss: Callable,
+    config: TransformerConfig,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    packed_seq_params: Optional[PackedSeqParams] = None,
+) -> Tensor:
+    """Process Multi-Token Prediction (MTP) loss computation.
+
+    This is a standalone function that handles MTP loss computation. It's used on the
+    post_process rank to split concatenated hidden states and compute MTP losses.
+
+    Args:
+        hidden_states (Tensor): Hidden states tensor (concatenated with MTP outputs).
+        labels (Tensor): Ground truth labels.
+        loss_mask (Optional[Tensor]): Mask for loss computation. If None, uses all ones.
+        output_layer (Callable): Output layer method to compute logits.
+        output_weight (Optional[Tensor]): Optional output weight for shared embeddings.
+        runtime_gather_output (Optional[bool]): Whether to gather output at runtime.
+        is_training (bool): Whether the model is in training mode.
+        compute_language_model_loss (Callable): Method to compute language model loss.
+        config (TransformerConfig): Model configuration containing mtp_num_layers etc.
+        cp_group (Optional[ProcessGroup]): Context parallelism process group.
+        packed_seq_params (Optional[PackedSeqParams]): Packed sequence parameters.
+
+    Returns:
+        Tensor: Updated hidden states after MTP loss processing (first chunk only).
+    """
+    mtp_labels = labels.clone()
+    hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
+    hidden_states = hidden_states_list[0]
+
+    if loss_mask is None:
+        loss_mask = torch.ones_like(mtp_labels)
+
+    for mtp_layer_number in range(config.mtp_num_layers):
+        mtp_logits, _ = output_layer(
+            hidden_states_list[mtp_layer_number + 1],
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        mtp_labels, _ = roll_tensor(
+            mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        loss_mask, num_tokens = roll_tensor(
+            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        mtp_loss = loss_mask * mtp_loss
+        if is_training:
+            MTPLossLoggingHelper.save_loss_to_tracker(
+                torch.sum(mtp_loss) / num_tokens,
+                mtp_layer_number,
+                config.mtp_num_layers,
+                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+            )
+        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+        if config.calculate_per_token_loss:
+            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss)
+        else:
+            hidden_states = MTPLossAutoScaler.apply(
+                hidden_states, mtp_loss_scale * mtp_loss / num_tokens
+            )
+
+    return hidden_states
+
+
 class MultiTokenPredictionLayer(MegatronModule):
     """The implementation for Multi-Token Prediction (MTP) which extends
     the prediction scope to multiple future tokens at each position.
@@ -1276,10 +1349,11 @@ class MultiTokenPredictionBlock(MegatronModule):
                 ])
         elif self.mtp_use_repeated_layer:
             # Legacy repeated layer mode
-            assert len(self.submodules.layer_specs) == 1, (
-                f"Repeated MTP mode requires exactly 1 layer spec, got {len(self.submodules.layer_specs)}. "
-                f"The layer will be applied {self.config.mtp_num_layers} times."
-            )
+            if len(self.submodules.layer_specs) != 1:
+                warnings.warn(
+                    f"Repeated MTP mode expects exactly 1 layer spec, got {len(self.submodules.layer_specs)}. "
+                    f"The first layer will be applied {self.config.mtp_num_layers} times."
+                )
             self.layers = torch.nn.ModuleList([
                 build_layer_legacy(self.submodules.layer_specs[0], layer_number=1)
             ])
@@ -1349,82 +1423,6 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         # concat the hidden states of all mtp layers
         hidden_states = torch.cat(hidden_states_list, dim=0)
-        return hidden_states
-
-    def process_loss(
-        self,
-        hidden_states: Tensor,
-        labels: Tensor,
-        loss_mask: Optional[Tensor],
-        output_layer: Callable,
-        output_weight: Optional[Tensor],
-        runtime_gather_output: Optional[bool],
-        is_training: bool,
-        compute_language_model_loss: Callable,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> Tensor:
-        """Process Multi-Token Prediction (MTP) loss computation.
-
-        This method handles the MTP loss computation for multiple prediction layers.
-        It chunks the hidden states, computes logits and losses for each MTP layer,
-        and applies loss scaling.
-
-        Args:
-            hidden_states (Tensor): Hidden states tensor from the model.
-            labels (Tensor): Ground truth labels.
-            loss_mask (Optional[Tensor]): Mask for loss computation. If None, uses all ones.
-            output_layer (Callable): Output layer method to compute logits.
-            output_weight (Optional[Tensor]): Optional output weight for shared embeddings.
-            runtime_gather_output (Optional[bool]): Whether to gather output at runtime.
-            is_training (bool): Whether the model is in training mode.
-            compute_language_model_loss (Callable): Method to compute language model loss.
-
-        Returns:
-            Tensor: Updated hidden states after MTP loss processing.
-        """
-        mtp_labels = labels.clone()
-        hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
-        hidden_states = hidden_states_list[0]
-
-        if loss_mask is None:
-            # if loss_mask is not provided, use all ones as loss_mask
-            loss_mask = torch.ones_like(mtp_labels)
-
-        for mtp_layer_number in range(self.config.mtp_num_layers):
-            # output
-            mtp_logits, _ = output_layer(
-                hidden_states_list[mtp_layer_number + 1],
-                weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
-            )
-            # Calc loss for the current Multi-Token Prediction (MTP) layers.
-            mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params)
-            loss_mask, num_tokens = roll_tensor(
-                loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params
-            )
-            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-            mtp_loss = loss_mask * mtp_loss
-            if is_training:
-                # TODO(shifangx): remove the use of parallel_state here
-                # after moving loss logging to loss_func in pretrain_gpt.py
-                MTPLossLoggingHelper.save_loss_to_tracker(
-                    torch.sum(mtp_loss) / num_tokens,
-                    mtp_layer_number,
-                    self.config.mtp_num_layers,
-                    avg_group=parallel_state.get_data_parallel_group(
-                        with_context_parallel=True
-                    ),
-                )
-            mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_num_layers
-            if self.config.calculate_per_token_loss:
-                hidden_states = MTPLossAutoScaler.apply(
-                    hidden_states, mtp_loss_scale * mtp_loss
-                )
-            else:
-                hidden_states = MTPLossAutoScaler.apply(
-                    hidden_states, mtp_loss_scale * mtp_loss / num_tokens
-                )
-
         return hidden_states
 
     def sharded_state_dict(

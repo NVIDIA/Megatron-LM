@@ -578,10 +578,13 @@ def validate_args(args, defaults={}):
             if args.mtp_num_layers is None:
                 args.mtp_num_layers = inferred_mtp_num_layers
             elif args.mtp_num_layers != inferred_mtp_num_layers:
-                raise ValueError(
+                warn_rank_0(
                     f"--mtp-num-layers ({args.mtp_num_layers}) conflicts with "
-                    f"MTP depth count ({inferred_mtp_num_layers}) in pattern '{args.hybrid_override_pattern}'"
+                    f"MTP depth count ({inferred_mtp_num_layers}) in pattern '{args.hybrid_override_pattern}'. "
+                    f"Using the inferred value ({inferred_mtp_num_layers}).",
+                    args.rank
                 )
+                args.mtp_num_layers = inferred_mtp_num_layers
 
     # MTP validation
     if args.mtp_num_layers:
