@@ -102,6 +102,7 @@ from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
+from megatron.training.checkpointing import get_loaded_iteration
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
@@ -1899,6 +1900,8 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+
+    # Log MoE metrics.
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -1930,12 +1933,15 @@ def training_log(
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
         )
+
+    # Log MTP metrics.
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
-    # Track sparse attention indexer loss
+
+    # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
         indexer_loss_scale = 1 / get_num_microbatches()
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
@@ -1945,6 +1951,8 @@ def training_log(
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
         )
+
+    # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
@@ -2026,16 +2034,22 @@ def training_log(
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
+        reported_memory_in_this_iteration = False
         if report_memory_flag:
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
-            if iteration > 1:
+            reported_memory_in_this_iteration = True
+            loaded_iteration = max(get_loaded_iteration() or 0, 0)
+            if iteration > (loaded_iteration + 1):
                 # Make sure the memory after the second iteration is reported to include optimizer state memory.
                 report_memory_flag = False
-        # Write timers to wandb, don't reset the counts
+        if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
+            not reported_memory_in_this_iteration:
+            report_memory(f'(after {iteration} iterations)')
+        # Write timers to wandb, don't reset the counts.
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
             timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
@@ -2095,6 +2109,9 @@ def force_param_sync(model_chunks: list[DDP]) -> None:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
 
+# Only report memory for first 3 checkpoint saves.
+num_checkpoints_memory_reported = 0
+MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
 
 def save_checkpoint_and_time(
     iteration,
@@ -2122,6 +2139,14 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
         force_param_sync(model)
+
+    global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+    should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+
+    if should_report_memory:
+        # Track memory before checkpoint save.
+        report_memory(f"(before save_checkpoint for iteration {iteration})")
+    # Save checkpoint.
     save_checkpoint(
         iteration,
         model,
@@ -2133,6 +2158,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    if should_report_memory:
+        # Track memory after checkpoint save.
+        report_memory(f"(after save_checkpoint for iteration {iteration})")
+    num_checkpoints_memory_reported += 1
+
     if args.fp8:
         # Run garbage collection after checkpoint saving to free memory from
         # dequantized bf16 tensors that were temporarily created during fp8
