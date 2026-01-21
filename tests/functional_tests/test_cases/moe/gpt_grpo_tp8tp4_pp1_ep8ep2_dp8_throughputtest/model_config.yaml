@@ -71,8 +71,8 @@ MODEL_ARGS:
   --swiglu: true
   --attention-dropout: 0.0
   --hidden-dropout: 0.0
-  --seq-length: 512
-  --max-position-embeddings: 512
+  --seq-length: 256
+  --max-position-embeddings: 256
   
   # Training settings
   --distributed-backend: nccl
@@ -87,23 +87,24 @@ MODEL_ARGS:
   # RL / GRPO settings
   --mock-data: true
   --max-tokens-to-oom: 3600000
-  --inference-max-seq-length: 512
+  --inference-max-seq-length: 256
   --langrl-inference-server-type: inplace_megatron
   --calculate-per-token-loss: true
   --rl-use-sequence-packing: true
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
+  --rl-parallel-generation-tasks: 1
   --cuda-graph-impl: local
   --micro-batch-size: 1
-  --global-batch-size: 16
+  --global-batch-size: 4
   --grpo-group-size: 2
-  --grpo-prompts-per-step: 8
+  --grpo-prompts-per-step: 2
   --grpo-iterations: 1
   --grpo-clamp-eps-lower: 0.2
   --grpo-clamp-eps-upper: 0.2
   --grpo-kl-beta: 0.0
   --grpo-entropy-term-weight: 0.0
-  --langrl-env-config: tests/functional_tests/test_cases/moe/gpt_grpo_tp4tp2_pp1_ep4ep2_dp8_throughputtest/env_config.yaml
+  --langrl-env-config: tests/functional_tests/test_cases/moe/gpt_grpo_tp8tp4_pp1_ep8ep2_dp8_throughputtest/env_config.yaml
   --rl-partial-rollouts: true
   --perform-rl-step: true
   --moe-pad-experts-for-cuda-graph-inference: true
