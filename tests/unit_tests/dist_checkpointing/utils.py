@@ -203,7 +203,7 @@ def setup_model_and_optimizer(
         # Use layer-wise distributed optimizer with Muon
         optimizer_type = optimizer
         # default lr None feels wrong. only change muon lr to avoid breaking old tests
-        config.lr = 0.
+        config.lr = 0.0
         optimizer = get_megatron_muon_optimizer(
             config, model, layer_wise_distributed_optimizer='dist' in optimizer_type
         )
@@ -300,7 +300,7 @@ def setup_moe_model_and_optimizer(
     if 'muon' in optimizer:
         optimizer_type = optimizer
         # default lr None feels wrong. only change muon lr to avoid breaking old tests
-        config.lr = 0.
+        config.lr = 0.0
         optimizer = get_megatron_muon_optimizer(
             config, model, layer_wise_distributed_optimizer='dist' in optimizer_type
         )
