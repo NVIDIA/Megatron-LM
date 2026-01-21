@@ -1314,6 +1314,20 @@ class TransformerConfig(ModelParallelConfig):
                     "recompute_modules. They use different checkpoint mechanisms that may conflict."
                 )
 
+        # Validation for hyper_connections with tensor parallelism
+        # When hyper connections are enabled with TP > 1, sequence_parallel must be True.
+        # This is because HyperConnectionModule uses non-TP-aware layers (nn.Linear, nn.RMSNorm),
+        # and their gradients need to be synchronized across TP ranks via the sequence_parallel
+        # attribute mechanism.
+        if self.enable_hyper_connections and self.tensor_model_parallel_size > 1:
+            if not self.sequence_parallel:
+                raise ValueError(
+                    "When enable_hyper_connections=True and tensor_model_parallel_size > 1, "
+                    "sequence_parallel must be True. HyperConnectionModule parameters require "
+                    "gradient synchronization across TP ranks, which is handled by the "
+                    "sequence_parallel mechanism."
+                )
+
         if self.fine_grained_activation_offloading:
             assert (
                 not self.cpu_offloading
