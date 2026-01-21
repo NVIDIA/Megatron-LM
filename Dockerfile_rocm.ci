@@ -90,7 +90,7 @@ RUN git clone https://github.com/caaatch22/grouped_gemm.git &&\
     cd grouped_gemm &&\
     git checkout rocm &&\
     git submodule update --init --recursive &&\
-    pip install .
+    pip install --no-build-isolation .
 
 WORKDIR $WORKSPACE_DIR
 COPY . Megatron-LM
