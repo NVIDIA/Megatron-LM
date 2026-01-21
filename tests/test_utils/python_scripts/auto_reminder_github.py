@@ -6,6 +6,7 @@ Requirements: pip install PyGithub slack-sdk requests
 Usage: GH_TOKEN=ghp_... SLACK_TOKEN=xoxb-... SLACK_WEBHOOK_URL=https://... REPO=NVIDIA/Megatron-LM python github_pr_reminder.py
 """
 
+import html
 import logging
 import os
 import sys
@@ -231,10 +232,11 @@ class PRReviewTracker:
         stage_days = self.days_since(self.get_label_date(pr, stage))
         author_email = self.get_user_email(pr.user.login)
         reviewer_emails, action_message = self.get_reviewers(pr)
+        escaped_title = html.escape(pr.title, quote=False)
 
         return Reminder(
             id=pr.number,
-            pr=f"<{pr.html_url}|#{pr.number} - {pr.title}>",
+            pr=f"<{pr.html_url}|#{pr.number} - {escaped_title}>",
             milestone=pr.milestone.title if pr.milestone else "No Milestone",
             author=self.get_slack_user_id(author_email),
             priority="P0" if stage_days > 3 else "P1" if stage_days >= 1 else "P2",
