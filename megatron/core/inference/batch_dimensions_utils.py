@@ -206,6 +206,7 @@ class InferenceBatchDimensions:
 
         # If strict matching is enabled, we sync the request counts across EP ranks
         # to ensure the graph captures the maximum needed capacity.
+        # TODO(ksanthanam): Add functional test for this scenario
         adjusted_prefill_req_count = (
             int(sync_tensor[3].item()) if strict else local_batch_dims.prefill_req_count
         )
