@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
+import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
@@ -578,6 +579,74 @@ class Attention(MegatronModule, ABC):
         )
         return out
 
+    def _flash_attention_3_forward_wrapper(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        max_seqlen_q,
+        max_seqlen_k,
+        cu_seqlens_q,
+        seqlens_k,
+        block_table,
+        softmax_scale,
+    ):
+        """
+        Wrapper for calling the FA3 _flash_attn_forward function.
+        Handles argument conversion for different versions of the _flash_attn_forward API.
+        """
+        candidate_kwargs = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "k_new": None,
+            "v_new": None,
+            "qv": None,
+            "out": None,
+            "out_": None,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": None,
+            "cu_seqlens_k_new": None,
+            "seqused_q": None,
+            "seqused_k": seqlens_k,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_k,
+            "page_table": block_table,
+            "kv_batch_idx": None,
+            "leftpad_k": None,
+            "rotary_cos": None,
+            "rotary_sin": None,
+            "seqlens_rotary": None,
+            "q_descale": None,
+            "k_descale": None,
+            "v_descale": None,
+            "softmax_scale": softmax_scale,
+            "causal": True,
+            "attention_chunk": 0,
+            "softcap": 0.0,
+            "window_size": (-1, -1),
+            "window_size_left": -1,
+            "window_size_right": -1,
+            "rotary_interleaved": True,
+            "scheduler_metadata": None,
+            "num_splits": 0 if not self.batch_invariant_mode else 1,
+            "pack_gqa": None,
+            "sm_margin": 0,
+        }
+
+        # Parse the expect argument names from the function signature
+        if inspect.isfunction(_flash_attn_forward):
+            sig = inspect.signature(_flash_attn_forward)
+        else:
+            assert isinstance(_flash_attn_forward, torch._library.custom_ops.CustomOpDef)
+            sig = inspect.signature(_flash_attn_forward._init_fn)
+        valid_kwargs = set(sig.parameters.keys())
+        final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
+
+        output_total, *unused = _flash_attn_forward(**final_kwargs)
+
+        return output_total
+
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -619,40 +688,16 @@ class Attention(MegatronModule, ABC):
             if HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
-                output_total, *unused = _flash_attn_forward(
-                    q=q,
-                    k=k,
-                    v=v,
-                    k_new=None,
-                    v_new=None,
-                    qv=None,
-                    out=None,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=None,
-                    cu_seqlens_k_new=None,
-                    seqused_q=None,
-                    seqused_k=seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    page_table=block_table,
-                    kv_batch_idx=None,
-                    leftpad_k=None,
-                    rotary_cos=None,
-                    rotary_sin=None,
-                    seqlens_rotary=None,
-                    q_descale=None,
-                    k_descale=None,
-                    v_descale=None,
-                    softmax_scale=softmax_scale,
-                    causal=True,
-                    window_size=(-1, -1),
-                    attention_chunk=0,
-                    softcap=0.0,
-                    rotary_interleaved=True,
-                    scheduler_metadata=None,
-                    num_splits=0 if not self.batch_invariant_mode else 1,
-                    pack_gqa=None,
-                    sm_margin=0,
+                output_total = self._flash_attention_3_forward_wrapper(
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    cu_seqlens_q,
+                    seqlens_k,
+                    block_table,
+                    softmax_scale,
                 )
             else:
                 assert (
