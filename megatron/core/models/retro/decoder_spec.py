@@ -23,6 +23,7 @@ from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
 )
+from megatron.core.typed_torch import not_none
 
 try:
     import apex  # pylint: disable=unused-import
@@ -52,6 +53,12 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    (TEColumnParallelLinear, TEDotProductAttention, TENorm, TERowParallelLinear) = (
+        None,
+        None,
+        None,
+        None,
+    )
     HAVE_TE = False
 
 
@@ -79,9 +86,9 @@ def get_retro_decoder_layer_te_spec(
         module=RetroDecoderCrossAttention,
         params={"encoder_block_spec": encoder_block_spec},
         submodules=CrossAttentionSubmodules(
-            linear_q=TEColumnParallelLinear,
-            linear_kv=TEColumnParallelLinear,
-            core_attention=TEDotProductAttention,
+            linear_q=not_none(TEColumnParallelLinear),
+            linear_kv=not_none(TEColumnParallelLinear),
+            core_attention=not_none(TEDotProductAttention),
             linear_proj=TERowParallelLinear,
         ),
     )
