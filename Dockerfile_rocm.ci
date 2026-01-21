@@ -14,7 +14,6 @@ WORKDIR $WORKSPACE_DIR
 
 RUN pip3 install \
 scipy \
-nltk \
 wheel \
 PyGithub \
 pytest-xdist \
@@ -40,10 +39,6 @@ datasets \
 tiktoken \
 pynvml
 
-RUN python -m pip install -U "nltk>=3.8.2"
-
-RUN pip3 install "huggingface_hub[cli]"
-RUN python3 -m nltk.downloader punkt_tab
 
 
 # Install Causal-Conv1d and its dependencies
