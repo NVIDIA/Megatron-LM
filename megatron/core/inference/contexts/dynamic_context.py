@@ -286,8 +286,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
+        num_moe_layers: Optional[int] = None,
+        moe_router_topk: Optional[int] = None,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
+
+        # MoE routing replay parameters.
+        self.num_moe_layers = num_moe_layers
+        self.moe_router_topk = moe_router_topk
 
         self.cache_mla_latent = cache_mla_latent
         if self.cache_mla_latent:

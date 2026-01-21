@@ -958,6 +958,41 @@ def reduce_aux_losses_tracker_across_ranks(
             )
 
 
+def get_num_moe_layers(
+    num_layers: int,
+    moe_layer_freq: Optional[Union[int, List[int]]] = None,
+    mtp_num_layers: Optional[int] = None,
+) -> int:
+    """Calculate the number of MoE layers based on moe_layer_freq.
+
+    Args:
+        num_layers (int): Total number of transformer layers.
+        moe_layer_freq (Optional[Union[int, List[int]]]): Frequency of MoE layers.
+            If int, every moe_layer_freq-th layer is an MoE layer.
+            If list, it's a binary pattern indicating which layers are MoE.
+            If None, all layers are assumed to be MoE layers.
+        mtp_num_layers (Optional[int]): Number of MTP (multi-token prediction) layers to add.
+
+    Returns:
+        int: The number of MoE layers.
+    """
+    if moe_layer_freq is None:
+        num_moe_layers = num_layers
+    elif isinstance(moe_layer_freq, int):
+        assert isinstance(num_layers, int)
+        moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
+        num_moe_layers = sum(moe_layer_pattern)
+    elif isinstance(moe_layer_freq, list):
+        num_moe_layers = sum(moe_layer_freq)
+    else:
+        raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+
+    if mtp_num_layers is not None:
+        num_moe_layers += mtp_num_layers
+
+    return num_moe_layers
+
+
 def track_moe_metrics(
     loss_scale: float,
     iteration: int,
@@ -987,20 +1022,7 @@ def track_moe_metrics(
                     tracker[key]["reduce_group_has_dp"] = False
     reduce_aux_losses_tracker_across_ranks(track_names, pg_collection=pg_collection)
 
-    # Get number of MoE layers
-    if moe_layer_freq is None:
-        num_moe_layers = num_layers
-    elif isinstance(moe_layer_freq, int):
-        assert isinstance(num_layers, int)
-        moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
-        num_moe_layers = sum(moe_layer_pattern)
-    elif isinstance(moe_layer_freq, list):
-        num_moe_layers = sum(moe_layer_freq)
-    else:
-        raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
-
-    if mtp_num_layers is not None:
-        num_moe_layers += mtp_num_layers
+    num_moe_layers = get_num_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
 
     aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
     for name, loss_list in aux_losses.items():
