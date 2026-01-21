@@ -60,39 +60,47 @@ from .optimizer_config import (
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
+    ParamWithNamePredicate,
     SGDOptimizerConfig,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def get_standard_config_overrides(
-    decoupled_lr: float | None = None, decoupled_min_lr: float | None = None
-) -> Dict[ParamKey, ParamGroupOverride]:
+def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
     """Get standard config overrides for the optimizer, handling decoupled LR and common wd skips.
 
     Args:
-        decoupled_lr (float | None): decoupled learning rate.
-        decoupled_min_lr (float | None): decoupled minimum learning rate.
+        config (OptimizerConfig): optimizer configuration object.
 
     Returns:
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
     """
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
-    if decoupled_lr is not None:
-        decoupled_lr_config: ParamGroupOverride = {"max_lr": decoupled_lr}
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        if decoupled_min_lr is not None:
-            decoupled_lr_config["min_lr"] = decoupled_min_lr
-        config_overrides[decoupled_param_key] = decoupled_lr_config
+    # First, figure out how we are going to do wd skipping. The two main approaches are:
+    #  1. The classic megatron approach of skipping all len 1 and bias parameters.
+    #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
+    if config.apply_wd_to_qk_layernorm:
+        shape_1_not_qkln_param = ParamWithNamePredicate(
+            name="s1_not_qkln",
+            fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
+            and not ("q_layernorm." in name or "k_layernorm." in name),
+        )
+        param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
+    else:
+        param_length_1_match = ParamPredicate(
+            name="param_len_1", fn=lambda param: len(param.shape) == 1
+        )
+        param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
 
-    # Next construct the standard param group overrides for no weight decay on bias parameters
-    #  as well as any length 1 parameters.
-    param_length_1_match = ParamPredicate(
-        name="param_len_1", fn=lambda param: len(param.shape) == 1
-    )
-    param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
     config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+
+    if config.decoupled_lr is not None:
+        decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
+        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
+        if config.decoupled_min_lr is not None:
+            decoupled_lr_config["min_lr"] = config.decoupled_min_lr
+        config_overrides[decoupled_param_key] = decoupled_lr_config
 
     return config_overrides
 
@@ -132,7 +140,7 @@ def _get_param_groups(
         #  the config_overrides argument by default lead to bias parameters and length 1 parameters.
         #  We assume that users of decoupled LR already provide config overrides so will adapt
         #  to the new API.
-        config_overrides = get_standard_config_overrides()
+        config_overrides = get_standard_config_overrides(config=config)
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
