@@ -78,3 +78,7 @@ MODEL_ARGS:
   --inference-logging-step-interval: 1
   --rl-inference-tensor-model-parallel-size: 2
   --refit-method: gloo
+METRICS:
+  - "lm loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"

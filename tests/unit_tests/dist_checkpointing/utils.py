@@ -167,6 +167,7 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.use_megatron_fsdp = False
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
+    args.phase_transition_iterations = None
 
 
 def setup_model_and_optimizer(
