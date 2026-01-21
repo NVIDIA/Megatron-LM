@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert HuggingFace GPT-OSS checkpoint to Megatron format."""
+"""Convert HuggingFace checkpoints to Megatron format."""
 
 import os
 import argparse
@@ -32,6 +32,7 @@ if __name__ == "__main__":
         SAVE_PATH = f"./megatron_checkpoints/{HF_MODEL.replace('/', '_')}"
     
     print(f"Converting {HF_MODEL} to Megatron format...")
+    print(f"Save path: {SAVE_PATH}")
     
     bridge = AutoBridge.from_hf_pretrained(HF_MODEL, trust_remote_code=True)
     provider = bridge.to_megatron_provider()
