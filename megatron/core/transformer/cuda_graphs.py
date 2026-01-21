@@ -14,7 +14,7 @@ from enum import Enum
 from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 from torch.utils._pytree import tree_map
