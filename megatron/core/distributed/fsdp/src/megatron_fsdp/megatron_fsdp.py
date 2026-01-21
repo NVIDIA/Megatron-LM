@@ -272,8 +272,10 @@ class MegatronFSDP(torch.nn.Module):
             "optim",
         ]
         if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-            # Default to overlapped NCCL communication when fully-sharding.
+            # Default to overlapped parameter gather when fully-sharding.
             self.ddp_config.overlap_param_gather = True
+        if self.ddp_config.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
+            # Default to overlapped gradient reduce-scatter when sharding gradients.
             self.ddp_config.overlap_grad_reduce = True
         if not self.is_delay_grad_reduce:
             # Gradient reduce-scatter must be overlapped when using sharding optimizer
@@ -583,11 +585,12 @@ class MegatronFSDP(torch.nn.Module):
             assert self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
 
             # Release parameters for this module after backward.
-            self._release_module_parameters(module, bwd=True)
+            release_module_parameters(module, bwd=True)
 
             # Transition this module back to the IDLE training state.
             module._training_state = TrainingState.IDLE
 
+        @torch.compiler.disable
         def _process_post_backward_gradients(param_list):
             """
             Process gradients for a list of parameters after the backward pass.
@@ -650,7 +653,7 @@ class MegatronFSDP(torch.nn.Module):
 
             # Mark parameters as processed.
             for param in param_list:
-                self._params_require_handle_grad.add(param)
+                self._params_require_handle_grad.discard(param)
 
         @torch.compiler.disable
         def _pre_forward_param_unshard(
@@ -692,8 +695,11 @@ class MegatronFSDP(torch.nn.Module):
             kwargs: Dict[str, Any],
         ):
             """
-            Pre-forward hook utilized to attach a gradient reduction post-backward
-            hook to the module.
+            Register a post-backward hook for the given module by inserting an autograd
+            Function in front of it. Note that a post-backward hook implemented in this
+            way is not compatible with in-place modifications of the module's inputs,
+            since such operations can trigger an autograd error that
+            "the output is a view and is being modified in-place".
             """
             if not torch.is_grad_enabled():
                 # No gradients / backward pass, don't attach the post-backward hook.
@@ -714,11 +720,10 @@ class MegatronFSDP(torch.nn.Module):
                 return args, kwargs
 
             """
-            Bootstrapped identity autograd function that attaches a post-backward
-            "hook" to the module to trigger model compute parameter deallocation
-            and gradient reduce-scatter immediately after the module backward pass
-            has completed to shard this layer's model and gradient memory after
-            the current backward pass stage is complete.
+            Identity autograd Function that attaches a post-backward "hook" to the
+            module, triggering parameter deallocation immediately after the module's
+            backward pass has completed in order to shard this layer's model memory
+            once the current backward stage is done.
             """
             inp_tensors = RegisterFSDPBackwardFunction.apply(
                 functools.partial(post_backward_hook, module), *inp_tensors
@@ -737,7 +742,10 @@ class MegatronFSDP(torch.nn.Module):
 
         def _root_post_backward(*unused):
             # Make sure all the gradients are handled.
-            for param in self._params_require_handle_grad:
+            ordered_params = sorted(
+                list(self._params_require_handle_grad), key=lambda p: self.param_to_name[p]
+            )
+            for param in ordered_params:
                 _grad_acc(param)
 
             # Reduce the remaining gradients.
@@ -752,7 +760,7 @@ class MegatronFSDP(torch.nn.Module):
             is_last_microbatch = getattr(self, "is_last_microbatch", False)
             if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
                 self.grad_reduce_pipeline.reduce_gradients(
-                    list(self._params_require_handle_grad),
+                    ordered_params,
                     suggested_queue_capacity=self.suggested_RS_queue_capacity,
                     outer_fsdp_group_grad_reduce=(
                         self.dist_index.use_hybrid_fsdp

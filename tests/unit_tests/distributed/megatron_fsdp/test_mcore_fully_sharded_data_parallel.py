@@ -648,7 +648,19 @@ class TestMegatronFSDPE2E:
     @pytest.mark.parametrize(
         "fsdp_sharding_strategy", ["optim_grads_params", "optim_grads", "optim"]
     )
-    def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, fsdp_sharding_strategy):
+    @pytest.mark.parametrize("use_double_buffer", [False, True])
+    @pytest.mark.parametrize(
+        ("fsdp_sharding_strategy", "use_double_buffer"),
+        [
+            ("optim_grads_params", False),
+            ("optim_grads_params", True),
+            ("optim_grads", False),
+            ("optim", True),
+        ],
+    )
+    def test_compatible_with_nd_parallel(
+        self, ref_cache, nd_topology, fsdp_sharding_strategy, use_double_buffer
+    ):
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
@@ -663,6 +675,7 @@ class TestMegatronFSDPE2E:
             init_model_with_meta_device=True,
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
+            fsdp_double_buffer=use_double_buffer,
         )
         reference_outputs = ref_cache[nd_topology_str]
 
