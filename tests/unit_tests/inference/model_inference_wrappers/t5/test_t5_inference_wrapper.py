@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from argparse import Namespace
 from copy import deepcopy
 from unittest import mock
