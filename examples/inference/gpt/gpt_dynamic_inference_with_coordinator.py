@@ -137,6 +137,9 @@ async def main(
         
         # While we wait for the requests to complete, the engine runs in the background.
         results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
+        for i, res in enumerate(results):
+            routing_indices = res.requests[0].routing_indices 
+            logging.info(f"Result {i} has routing indices with shape {routing_indices}.")
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.

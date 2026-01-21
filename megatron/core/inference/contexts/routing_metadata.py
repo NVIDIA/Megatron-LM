@@ -25,15 +25,33 @@ class RoutingMetadata:
         context: 'DynamicInferenceContext',
         moe_router_topk: int,
     ):
-        from megatron.core.transformer.moe.moe_utils import RouterReplay
-
         self.context = context
         self.max_tokens = context.max_tokens
-        # Get actual number of MoE layers from RouterReplay instances on this rank.
-        self.num_moe_layers = len(RouterReplay.global_router_replay_instances)
         self.moe_router_topk = moe_router_topk
         self.device = torch.cuda.current_device()
 
+        # Static buffer allocated lazily in _ensure_buffer_allocated().
+        # We defer allocation because RouterReplay instances don't exist yet at init time.
+        self.routing_indices_buffer: Optional[torch.Tensor] = None
+        self.num_moe_layers: Optional[int] = None
+
+    def _ensure_buffer_allocated(self) -> None:
+        """Allocate the static buffer if not already allocated.
+        
+        Gets the actual number of MoE layers from RouterReplay instances.
+        """
+        if self.routing_indices_buffer is not None:
+            return
+        
+        from megatron.core.transformer.moe.moe_utils import RouterReplay
+        
+        self.num_moe_layers = len(RouterReplay.global_router_replay_instances)
+        print(f"[RoutingMetadata] Allocating buffer with num_moe_layers={self.num_moe_layers} "
+              f"(from {len(RouterReplay.global_router_replay_instances)} RouterReplay instances)")
+        
+        if self.num_moe_layers == 0:
+            return
+        
         # Static buffer for CUDA graph compatibility.
         # Shape: [max_tokens, num_moe_layers, moe_router_topk]
         self.routing_indices_buffer = torch.empty(
@@ -53,6 +71,8 @@ class RoutingMetadata:
         """
         if self.context.using_cuda_graph_this_step():
             # Return view of static buffer up to current token count.
+            if self.routing_indices_buffer is None:
+                return None
             return self.routing_indices_buffer[:self.context.active_token_count]
         else:
             # Get from RouterReplay and stack into [num_tokens, num_layers, topk].
@@ -71,10 +91,13 @@ class RoutingMetadata:
         
         This sets up RouterReplay instances to copy routing indices into our
         pre-allocated static buffer instead of creating new tensors.
+        Allocates the buffer lazily on first call.
         """
         from megatron.core.transformer.moe.moe_utils import RouterReplay
 
-        RouterReplay.set_global_static_buffers(self.routing_indices_buffer)
+        self._ensure_buffer_allocated()
+        if self.routing_indices_buffer is not None:
+            RouterReplay.set_global_static_buffers(self.routing_indices_buffer)
 
     def disable_static_buffer_recording(self) -> None:
         """Disable static buffer recording, reverting to normal tensor assignment."""
@@ -85,4 +108,3 @@ class RoutingMetadata:
     def reset(self) -> None:
         """Reset the routing metadata state."""
         pass
-        self.current_token_count = 0
