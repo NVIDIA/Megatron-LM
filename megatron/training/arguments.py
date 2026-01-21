@@ -2373,6 +2373,8 @@ def _add_training_args(parser):
                        help='Report loss and timing interval.')
     group.add_argument('--log-memory-interval', type=int, default=None,
                        help='Report memory interval.')
+    group.add_argument('--log-device-memory-used', action='store_true',
+                       help='Log device memory used (as reported by nvidia-smi).')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
