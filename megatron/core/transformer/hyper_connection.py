@@ -35,11 +35,11 @@ class SinkhornKnopp(torch.autograd.Function):
         """
         # Use no_grad to avoid creating unnecessary computation graph in forward.
         # Gradients are computed explicitly in backward via recomputation.
-        with torch.no_grad():
             # M^{(0)} = exp(H_res_logits) - save initial M for backward recomputation
-            M_init = torch.exp(H_res_logits)
-            M = M_init.clone()
+        M_init = torch.exp(H_res_logits)
+        M = M_init.clone()
             
+        with torch.no_grad():
             for _ in range(num_iterations):
                 # T_r: Row normalization
                 M = M / M.sum(dim=-1, keepdim=True).clamp(min=1e-8)
