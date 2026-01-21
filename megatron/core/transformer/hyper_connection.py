@@ -142,6 +142,18 @@ class HyperConnectionModule(MegatronModule):
     def _init_weights(self):
         """Initialize weights for stable training."""
         nn.init.xavier_uniform_(self.mapping_proj.weight)
+        
+        # Set sequence_parallel attribute on parameters for gradient synchronization
+        # across TP ranks when sequence_parallel is enabled.
+        # This is required because HyperConnectionModule uses non-TP-aware layers
+        # (nn.Linear, nn.RMSNorm) whose gradients need to be all-reduced.
+        if self.config.sequence_parallel:
+            setattr(self.mapping_proj.weight, 'sequence_parallel', True)
+            setattr(self.norm.weight, 'sequence_parallel', True)
+            setattr(self.alpha_pre, 'sequence_parallel', True)
+            setattr(self.alpha_post, 'sequence_parallel', True)
+            setattr(self.alpha_res, 'sequence_parallel', True)
+            setattr(self.bias, 'sequence_parallel', True)
     
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
