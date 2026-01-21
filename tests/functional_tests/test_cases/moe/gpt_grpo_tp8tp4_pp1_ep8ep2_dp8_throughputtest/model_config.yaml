@@ -103,7 +103,7 @@ MODEL_ARGS:
   --grpo-clamp-eps-upper: 0.2
   --grpo-kl-beta: 0.0
   --grpo-entropy-term-weight: 0.0
-  --langrl-env-config: tests/functional_tests/test_cases/moe/gpt_grpo_tp4tp2_pp1_ep4ep2_dp8_throughputtest/env_config.yaml
+  --langrl-env-config: tests/functional_tests/test_cases/moe/gpt_grpo_tp8tp4_pp1_ep8ep2_dp8_throughputtest/env_config.yaml
   --rl-partial-rollouts: true
   --perform-rl-step: true
   --moe-pad-experts-for-cuda-graph-inference: true

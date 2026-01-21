@@ -54,7 +54,7 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [gpt_grpo_tp4tp2_pp1_ep4ep2_dp8_throughputtest]
+  - test_case: [gpt_grpo_tp8tp4_pp1_ep8ep2_dp8_throughputtest]
     products:
       - environment: [dev]
         scope: [mr]
