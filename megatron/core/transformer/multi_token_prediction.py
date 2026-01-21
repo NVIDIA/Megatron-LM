@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     from megatron.core.ssm.mamba_block import MambaStackSubmodules
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.utils import (
     get_pg_rank,
     is_torch_min_version,
@@ -532,8 +531,6 @@ class MTPModelLayerContainer(MegatronModule):
     from a pattern string. It provides proper state dict key structure:
     `mtp_model_layer.layers.{i}.*` for checkpoint compatibility.
 
-    This is used when MTP builds its own layers using the shared layer_builder,
-    instead of receiving a pre-built MambaStack.
     """
 
     def __init__(self, layers: torch.nn.ModuleList, config: TransformerConfig):
@@ -724,10 +721,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             tp_comm_buffer_name="mtp_eh_proj"
         )
 
-        # Build inner layers: three possible paths
+        # Build inner layers: two possible paths
         # 1. New Mamba path: build from pattern using shared layer_builder
-        # 2. Legacy Mamba path: build MambaStack with mtp_layer_pattern
-        # 3. GPT path: single TransformerLayer
+        # 2. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and mamba_submodules is not None:
             # New Mamba path: build inner layers from pattern using shared layer_builder
             from megatron.core.ssm.layer_builder import build_layers_from_pattern
@@ -743,14 +739,14 @@ class MultiTokenPredictionLayer(MegatronModule):
             self.mtp_model_layer = MTPModelLayerContainer(inner_layers, config=config)
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
-            diff_transformer_layer_offset = self.config.num_layers - get_transformer_layer_offset(
-                self.config, vp_stage
-            )
+            # MTP inner layers use their own layer numbering (self.layer_number = 1, 2, etc.)
+            # rather than continuing from decoder layer numbers. This is consistent with the
+            # Mamba path and ensures proper aux loss tracking in router.py.
             self.mtp_model_layer = build_module(
                 self.submodules.mtp_model_layer,
                 config=self.config,
                 vp_stage=self.vp_stage,
-                layer_number=self.layer_number + diff_transformer_layer_offset,
+                layer_number=self.layer_number,
                 is_mtp_layer=True
             )
 

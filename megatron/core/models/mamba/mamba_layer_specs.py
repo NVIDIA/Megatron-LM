@@ -5,6 +5,7 @@ from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TENorm,
     TERowParallelLinear,
+    TEColumnParallelLinear,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec

@@ -277,9 +277,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.tp_group = pg_collection.tp
 
         self.submodules_config = submodules
-        self.layer_number = layer_number + get_transformer_layer_offset(
-            self.config, vp_stage, get_pg_rank(pg_collection.pp)
-        )
+        # MTP inner layers use their own layer numbering (starting from 1 within each MTP depth),
+        # so they should NOT add the decoder layer offset. The router.py handles MTP layer
+        # numbering separately by adding config.num_layers to distinguish MTP layers from decoder
+        # layers in the aux loss tracker.
+        if is_mtp_layer:
+            self.layer_number = layer_number
+        else:
+            self.layer_number = layer_number + get_transformer_layer_offset(
+                self.config, vp_stage, get_pg_rank(pg_collection.pp)
+            )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
 

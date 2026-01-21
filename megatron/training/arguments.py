@@ -542,7 +542,7 @@ def validate_args(args, defaults={}):
     if args.mtp_hybrid_override_pattern is not None:
         warn_rank_0(
             "--mtp-hybrid-override-pattern is deprecated. "
-            "For new Mamba+MTP models, use unified --hybrid-override-pattern instead. "
+            "For new hybrid models with MTP models, use unified --hybrid-override-pattern instead. "
             "Example: 'M*M*/MM/MM' means main='M*M*', MTP pattern='MM' with 2 depths. "
             "This argument is kept only for loading old checkpoints.",
             args.rank,
@@ -550,7 +550,7 @@ def validate_args(args, defaults={}):
     if args.mtp_spec is not None:
         warn_rank_0(
             "--mtp-spec is deprecated. "
-            "For new Mamba+MTP models, use unified --hybrid-override-pattern instead. "
+            "For new hybrid models with MTP models, use unified --hybrid-override-pattern instead. "
             "This argument is kept only for loading old checkpoints.",
             args.rank,
         )
@@ -3505,7 +3505,7 @@ def _add_experimental_args(parser):
                             'of layer in the override pattern must match number in'
                             'the overidden pattern')
     # DEPRECATED: Legacy MTP arguments kept for checkpoint compatibility.
-    # For new Mamba+MTP models, use unified pattern in --hybrid-override-pattern instead.
+    # For new hybrid models with MTP models, use unified pattern in --hybrid-override-pattern instead.
     # Example: "M*M*/MM/MM" means main="M*M*", MTP pattern="MM" with 2 depths.
     group.add_argument("--mtp-hybrid-override-pattern", type=str, default=None,
                        help='DEPRECATED: Use unified --hybrid-override-pattern instead. '
