@@ -677,6 +677,63 @@ class TextGenerationController:
 
         return return_log_probs.any(), top_n_log_probs.any()
 
+    def _router_record_bookkeeping(self) -> Optional[Dict[int, Tensor]]:
+        """Collect and map routing indices per request for MoE router recording.
+
+        This method retrieves recorded routing decisions from RouterReplay and maps
+        them to individual requests using the context's request_ids and query_lengths.
+        Must be called while context attributes are still valid (before request transitions).
+
+        Returns:
+            Optional[Dict[int, Tensor]]: A dictionary mapping request_id to a tensor of
+                shape [num_tokens, num_layers, topk]. Returns None if routing replay is
+                disabled or no routing data was recorded.
+        """
+        config = self.inference_wrapped_model.model.config
+        if not getattr(config, 'enable_routing_replay', False):
+            return None
+
+        raw_routing_indices = RouterReplay.get_recorded_data()
+        if not raw_routing_indices:
+            return None
+
+        # Filter out None entries (non-MoE layers)
+        raw_routing_indices = [r for r in raw_routing_indices if r is not None]
+        if not raw_routing_indices:
+            return None
+
+        # Get active request info from context
+        context = self.inference_wrapped_model.inference_context
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_ids = context.request_ids[active_request_slice].tolist()
+        active_query_lengths = context.request_query_lengths[active_request_slice].tolist()
+
+        # When using CUDA graphs, tokens are padded to padded_active_token_count.
+        # The router records routing for all padded tokens, but we only want the
+        # real tokens (active_token_count). Slice down before splitting by request.
+        active_token_count = context.active_token_count
+
+        # Slice each layer's routing to real tokens and split by request
+        # Each layer_routing has shape [padded_token_count, topk]
+        # After slicing: [active_token_count, topk]
+        # After splitting: list of [num_tokens_for_request, topk] per request
+        per_request_per_layer = {req_id: [] for req_id in active_request_ids}
+        for layer_routing in raw_routing_indices:
+            layer_routing = layer_routing[:active_token_count]
+            routing_splits = layer_routing.split(active_query_lengths, dim=0)
+            for req_id, routing_split in zip(active_request_ids, routing_splits):
+                per_request_per_layer[req_id].append(routing_split)
+
+        # Stack layers to get [num_tokens, num_layers, topk] per request
+        routing_indices_per_request = {}
+        for req_id in active_request_ids:
+            layer_tensors = per_request_per_layer[req_id]  # List of [num_tokens, topk]
+            # Stack along dim=1 to get [num_tokens, num_layers, topk]
+            stacked = torch.stack(layer_tensors, dim=1)
+            routing_indices_per_request[req_id] = stacked
+
+        return routing_indices_per_request
+
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
@@ -891,7 +948,16 @@ class TextGenerationController:
             context.padded_active_request_count if context.is_decode_only() else None
         )
 
+        # Enable routing recording before forward pass if routing replay is enabled
+        config = self.inference_wrapped_model.model.config
+        if getattr(config, 'enable_routing_replay', False):
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+
+         # Collect routing indices per request (must be done before context transitions)
+        routing_indices_per_request = self._router_record_bookkeeping()
+
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -920,22 +986,13 @@ class TextGenerationController:
         else:
             request_bookkeeping = self._dynamic_step_context_bookkeeping()
 
-        # Collect routing indices if routing replay is enabled
-        routing_indices = None
-        config = self.inference_wrapped_model.model.config
-        if getattr(config, 'enable_routing_replay', False):
-            routing_indices = RouterReplay.get_recorded_data()
-            # Filter out None entries (non-MoE layers)
-            if routing_indices:
-                routing_indices = [r for r in routing_indices if r is not None]
-                if not routing_indices:
-                    routing_indices = None
+       
 
         ret = {
             "sample": self._sampled_tokens_cuda[:active_request_count],
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
-            "routing_indices": routing_indices,
+            "routing_indices_per_request": routing_indices_per_request,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
         ret.update(request_bookkeeping)

@@ -248,10 +248,9 @@ class DynamicInferenceRequest(InferenceRequest):
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     latency: Optional[float] = None
     finished_chunk_token_count = 0
-    # routing_indices stores MoE routing decisions per layer for each token.
-    # Structure: List[List[torch.Tensor]] - outer list is per-step, inner list is per-layer,
-    # each tensor has shape [num_tokens_this_step, topk]
-    routing_indices: Optional[List[List[torch.Tensor]]] = None
+    # routing_indices stores MoE routing decisions for all tokens generated so far.
+    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
+    routing_indices: Optional[torch.Tensor] = None
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
     def __post_init__(self):
@@ -288,6 +287,18 @@ class DynamicInferenceRequest(InferenceRequest):
         """
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
+        
+        # Serialize routing_indices: Tensor [total_tokens - 1, num_layers, topk] -> 3D list
+        if self.routing_indices is not None:
+            total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
+            # the last generated token does not undergo a forward pass 
+            # hence we expect routing indices for total_tokens - 1
+            assert self.routing_indices.shape[0] == total_tokens-1, (
+                f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
+                f"total tokens {total_tokens-1}."
+            )
+            obj["routing_indices"] = self.routing_indices.tolist()
+        
         return obj
 
     @classmethod
@@ -302,6 +313,11 @@ class DynamicInferenceRequest(InferenceRequest):
         """
         request = super().deserialize(obj)
         request.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
+        
+        # Deserialize routing_indices: 3D list -> Tensor [total_tokens - 1, num_layers, topk]
+        if obj.get("routing_indices") is not None:
+            request.routing_indices = torch.tensor(obj["routing_indices"], dtype=torch.int64)
+        
         return request
 
     @property
