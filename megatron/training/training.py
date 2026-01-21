@@ -106,7 +106,6 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
@@ -179,7 +178,7 @@ def print_datetime(string):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
-def num_floating_point_operations(args, batch_size):
+def num_floating_point_operations(args, num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch):
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
@@ -195,44 +194,42 @@ def num_floating_point_operations(args, batch_size):
             num_moe_layers = 0
             return num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers
 
-    def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
+    def mlp_layer_flops(num_total_tokens_this_global_batch, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
-        return 4 * expansion * scale_factor * batch_size * seq_len * hidden_size**2
+        return 4 * expansion * scale_factor * num_total_tokens_this_global_batch * hidden_size**2
 
-    def moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+    def moe_layer_flops(num_total_tokens_this_global_batch, hidden_size, moe_ffn_hidden_size,
                         shared_expert_ffn_hidden_size, num_experts_routed_to,
                         moe_latent_size=None, swiglu=False):
         """Calculate FLOPs for an MoE layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
         if moe_latent_size is None:
-            routed_flops = (4 * batch_size * seq_len * hidden_size *
+            routed_flops = (4 * num_total_tokens_this_global_batch * hidden_size *
                             moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
         else:
             # Routed experts run on moe_latent_size.
-            routed_flops = (4 * batch_size * seq_len * moe_latent_size *
+            routed_flops = (4 * num_total_tokens_this_global_batch * moe_latent_size *
                             moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
             # Up proj and down proj.
-            routed_flops += (4 * batch_size * seq_len * hidden_size * moe_latent_size)
-        shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+            routed_flops += (4 * num_total_tokens_this_global_batch * hidden_size * moe_latent_size)
+        shared_flops = 4 * num_total_tokens_this_global_batch * hidden_size * shared_expert_ffn_hidden_size * scale_factor
         return routed_flops + shared_flops
 
     def attn_layer_flops(
-        batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
+        num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
     ):
         """Calculate FLOPs for an attention layer."""
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
         return (
             4
-            * batch_size
-            * seq_len
             * hidden_size
             * p
-            * (hidden_size + (hidden_size * (g / num_heads)) + (seq_len / 2))
+            * (hidden_size * num_total_tokens_this_global_batch + (hidden_size * (g / num_heads)) * num_total_tokens_this_global_batch + (sequence_square_sum_this_global_batch / 2))
         )
 
-    def mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
+    def mamba_layer_flops(num_total_tokens_this_global_batch, hidden_size, state_dim=16,
                           head_dim=64, num_groups=1, num_heads=128):
         """Calculate FLOPs for a Mamba layer."""
         # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
@@ -245,16 +242,15 @@ def num_floating_point_operations(args, batch_size):
         return (
             (
                 2
-                * batch_size
-                * seq_len
+                * num_total_tokens_this_global_batch
                 * hidden_size
                 * (2 * d_in + 2 * num_groups * state_dim + nheads)
             )  # in_proj
-            + (7 * batch_size * seq_len * d_in * state_dim)  # scan
-            + (2 * batch_size * seq_len * d_in * hidden_size)  # out_proj
+            + (7 * num_total_tokens_this_global_batch * d_in * state_dim)  # scan
+            + (2 * num_total_tokens_this_global_batch * d_in * hidden_size)  # out_proj
         )
 
-    def hybrid_flops(batch_size, seq_len, hidden_size,
+    def hybrid_flops(num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
@@ -266,17 +262,17 @@ def num_floating_point_operations(args, batch_size):
                      vocab_size=256000):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
-                num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
+                num_attn_layers * attn_layer_flops(num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch, hidden_size,
                                                    num_attn_heads, gqa, gqa_groups, kv_channels) +
-                num_mlp_layers * mlp_layer_flops(batch_size, seq_len, hidden_size,
+                num_mlp_layers * mlp_layer_flops(num_total_tokens_this_global_batch, hidden_size,
                                                  mlp_expansion, swiglu) +
-                num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
+                num_mamba_layers * mamba_layer_flops(num_total_tokens_this_global_batch, hidden_size,
                                                      mamba_state_dim, mamba_head_dim,
                                                      mamba_num_groups, mamba_num_heads) +
-                num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                num_moe_layers * moe_layer_flops(num_total_tokens_this_global_batch, hidden_size, moe_ffn_hidden_size,
                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
                                                  moe_latent_size, swiglu) +
-                (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
+                (2 * num_total_tokens_this_global_batch * hidden_size * vocab_size)  # logits computation
         )
         return flops_fwd * 3
 
@@ -349,13 +345,18 @@ def num_floating_point_operations(args, batch_size):
             assert not args.group_query_attention
             '''
             Basic arithmetic
-            let B is batch size, s is seq_len, h is embedding dim,
-            for one self_attnetion block (prenorm is not included)
-            qkv projection:  6Bsh^2
-            attn:            2Bs^2h
-            attn over value: 2Bs^2h
-            oproj:           2Bsh^2
+            
+            Let h be the embedding dim.
+            We use two statistics to unify BSHD and THD cases:
+                num_total_tokens_this_global_batch: total number of tokens in this global batch
+                sequence_square_sum_this_global_batch: sum of squared sequence lengths in this global batch
 
+            For one self-attention block (prenorm not included):
+                qkv projection:      6 * num_total_tokens_this_global_batch * h^2
+                attn:    2 * sequence_square_sum_this_global_batch * h
+                attn over value:   2 * sequence_square_sum_this_global_batch * h
+                oproj:   2 * num_total_tokens_this_global_batch * h^2
+            
             references
             https://arxiv.org/abs/2305.10403
             https://arxiv.org/abs/2205.05198
@@ -376,7 +377,7 @@ def num_floating_point_operations(args, batch_size):
             standard_self_attn_term = (
                 3
                 * 2  # fwd(1) + bwd(2) *FMA
-                * (
+                * ( num_total_tokens_this_global_batch * (
                     ## q lora + rope + q norm
                     q_term
                     ## kv lora + rope + kv norm
@@ -388,12 +389,12 @@ def num_floating_point_operations(args, batch_size):
                     )
                     + args.hidden_size * args.qk_pos_emb_head_dim
                     ## o proj
-                    + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                    + (args.num_attention_heads * args.v_head_dim) * args.hidden_size)
                     ## core attn
-                    + args.seq_length
+                    + sequence_square_sum_this_global_batch
                     * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2  # causal mask (only half of the mask is non-zero)
-                    + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
+                    / 2 # causal mask (only half of the mask is non-zero)
+                    + sequence_square_sum_this_global_batch * args.num_attention_heads * args.v_head_dim / 2
                 )
             )
 
@@ -405,17 +406,17 @@ def num_floating_point_operations(args, batch_size):
             standard_self_attn_term = (
                 3
                 * 2  # fwd(1) + bwd(2) *FMA
-                * (
+                * ( num_total_tokens_this_global_batch *(
                     ## qkv proj
                     args.hidden_size
-                    * (query_projection_size + key_projection_size + value_projection_size)
+                    * (query_projection_size + key_projection_size + value_projection_size))
                     ## core attention
                     + query_projection_size
-                    * args.seq_length
+                    * sequence_square_sum_this_global_batch
                     / 2  # causal mask (only half of the mask is non-zero)
                     * 2  # QK^T and (QK^T)V
                     ## out proj
-                    + query_projection_size
+                    + num_total_tokens_this_global_batch * query_projection_size
                     * args.hidden_size
                 )
             )
@@ -488,8 +489,7 @@ def num_floating_point_operations(args, batch_size):
         )
 
         total_floating_point_operations = (
-            batch_size
-            * args.seq_length
+            num_total_tokens_this_global_batch
             * (
                 # MLP
                 expansion_factor
@@ -506,8 +506,6 @@ def num_floating_point_operations(args, batch_size):
                     + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
                     * (num_moe_layers / num_layers)
                 )
-                # Self Attention
-                + self_attn_term
                 # MTP norms and proj
                 + 3
                 * 2
@@ -521,6 +519,10 @@ def num_floating_point_operations(args, batch_size):
                 # Logit.
                 + 3 * 2 * args.hidden_size * args.padded_vocab_size * (mtp_num_layers + 1)
             )
+            +                
+            # Self Attention
+            self_attn_term
+            
         )
         return total_floating_point_operations
 
@@ -531,8 +533,8 @@ def num_floating_point_operations(args, batch_size):
 
         # Compute hybrid model FLOPs.
         return hybrid_flops(
-            batch_size=batch_size,
-            seq_len=args.seq_length,
+            num_total_tokens_this_global_batch=num_total_tokens_this_global_batch, 
+            sequence_square_sum_this_global_batch=sequence_square_sum_this_global_batch,
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
             num_mamba_layers=num_mamba_layers,
@@ -1484,9 +1486,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+
+    if args.sequence_packing:
+        num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch = losses_reduced.pop()
+    else:
+        sequence_square_sum_this_global_batch = args.seq_length ** 2 * args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+        num_total_tokens_this_global_batch = args.seq_length * args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch, 0
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -1566,8 +1575,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            num_total_tokens_this_global_batch,
+            sequence_square_sum_this_global_batch,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit, num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch
 
 
 def training_log(
@@ -1582,6 +1593,8 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    num_total_tokens_this_global_batch,
+    sequence_square_sum_this_global_batch,
     pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
@@ -1804,7 +1817,7 @@ def training_log(
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
-        throughput = num_floating_point_operations(args, batch_size) / (
+        throughput = num_floating_point_operations(args,num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch) / (
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
 
@@ -2250,9 +2263,6 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
-    if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
-
     if args.run_workload_inspector_server:
         try:
             from workload_inspector.utils.webserver import run_server
@@ -2520,6 +2530,8 @@ def train(
 
         # Completely skip iteration if needed.
         if iteration in args.iterations_to_skip:
+            # TODO(tailaim): this need to be modified
+            assert not args.sequence_packing, "Sequence packing is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
@@ -2555,6 +2567,8 @@ def train(
             grad_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            num_total_tokens_this_global_batch, 
+            sequence_square_sum_this_global_batch,
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
@@ -2639,7 +2653,7 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
+        num_floating_point_operations_in_batch = num_floating_point_operations(args, num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch)
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
@@ -2670,6 +2684,8 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            num_total_tokens_this_global_batch, 
+            sequence_square_sum_this_global_batch,
             pg_collection=model_pg_collection,
         )
 
