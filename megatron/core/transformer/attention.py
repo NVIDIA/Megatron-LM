@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
+import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
@@ -22,6 +23,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
@@ -226,6 +230,21 @@ class Attention(MegatronModule, ABC):
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
+        )
+
+        self.offload_qkv_linear = (
+            self.config.fine_grained_activation_offloading
+            and "qkv_linear" in self.config.offload_modules
+        )
+
+        self.offload_core_attention = (
+            self.config.fine_grained_activation_offloading
+            and "core_attn" in self.config.offload_modules
+        )
+
+        self.offload_attn_proj = (
+            self.config.fine_grained_activation_offloading
+            and "attn_proj" in self.config.offload_modules
         )
 
         # Output.
@@ -560,6 +579,74 @@ class Attention(MegatronModule, ABC):
         )
         return out
 
+    def _flash_attention_3_forward_wrapper(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        max_seqlen_q,
+        max_seqlen_k,
+        cu_seqlens_q,
+        seqlens_k,
+        block_table,
+        softmax_scale,
+    ):
+        """
+        Wrapper for calling the FA3 _flash_attn_forward function.
+        Handles argument conversion for different versions of the _flash_attn_forward API.
+        """
+        candidate_kwargs = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "k_new": None,
+            "v_new": None,
+            "qv": None,
+            "out": None,
+            "out_": None,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": None,
+            "cu_seqlens_k_new": None,
+            "seqused_q": None,
+            "seqused_k": seqlens_k,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_k,
+            "page_table": block_table,
+            "kv_batch_idx": None,
+            "leftpad_k": None,
+            "rotary_cos": None,
+            "rotary_sin": None,
+            "seqlens_rotary": None,
+            "q_descale": None,
+            "k_descale": None,
+            "v_descale": None,
+            "softmax_scale": softmax_scale,
+            "causal": True,
+            "attention_chunk": 0,
+            "softcap": 0.0,
+            "window_size": (-1, -1),
+            "window_size_left": -1,
+            "window_size_right": -1,
+            "rotary_interleaved": True,
+            "scheduler_metadata": None,
+            "num_splits": 0 if not self.batch_invariant_mode else 1,
+            "pack_gqa": None,
+            "sm_margin": 0,
+        }
+
+        # Parse the expect argument names from the function signature
+        if inspect.isfunction(_flash_attn_forward):
+            sig = inspect.signature(_flash_attn_forward)
+        else:
+            assert isinstance(_flash_attn_forward, torch._library.custom_ops.CustomOpDef)
+            sig = inspect.signature(_flash_attn_forward._init_fn)
+        valid_kwargs = set(sig.parameters.keys())
+        final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
+
+        output_total, *unused = _flash_attn_forward(**final_kwargs)
+
+        return output_total
+
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -601,18 +688,16 @@ class Attention(MegatronModule, ABC):
             if HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
-                output_total, *unused = _flash_attn_forward(
-                    q=q,
-                    k=k,
-                    v=v,
-                    cu_seqlens_q=cu_seqlens_q,
-                    seqused_k=seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    page_table=block_table,
-                    softmax_scale=softmax_scale,
-                    causal=True,
-                    num_splits=0 if not self.batch_invariant_mode else 1,
+                output_total = self._flash_attention_3_forward_wrapper(
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    cu_seqlens_q,
+                    seqlens_k,
+                    block_table,
+                    softmax_scale,
                 )
             else:
                 assert (
@@ -784,12 +869,18 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
-        qkv_output = self.get_query_key_value_tensors(
-            hidden_states,
-            key_value_states,
-            split_qkv=split_qkv,
-            output_gate=self.config.attention_output_gate,
-        )
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+            qkv_output = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                split_qkv=split_qkv,
+                output_gate=self.config.attention_output_gate,
+            )
+        if self.offload_qkv_linear:
+            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+            qkv_output = off_interface.group_commit(
+                qkv_output, name="qkv_linear", forced_released_tensors=[]
+            )
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
@@ -864,7 +955,7 @@ class Attention(MegatronModule, ABC):
                 )
             )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
@@ -879,7 +970,7 @@ class Attention(MegatronModule, ABC):
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
-            if packed_seq_params is not None:
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 if packed_seq_params.cu_seqlens_q_padded is not None:
                     cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
                 else:
@@ -945,15 +1036,18 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    attn_mask_type=attn_mask_type,
-                    attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
-                )
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                    )
 
             else:
                 # Dynamic batching attention kernel.
@@ -979,6 +1073,10 @@ class Attention(MegatronModule, ABC):
                 if is_using_quantization_scales(self.config):
                     core_attn_out[inference_context.padding_slice] = 0.0
 
+            if self.offload_core_attention and self.training:
+                core_attn_out = off_interface.group_commit(
+                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -997,7 +1095,12 @@ class Attention(MegatronModule, ABC):
         # Output. [sq, b, h]
         # =================
         nvtx_range_push(suffix="linear_proj")
-        output, bias = self.linear_proj(core_attn_out)
+        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
+            output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output = off_interface.group_commit(
+                output, name="attn_proj", forced_released_tensors=[core_attn_out]
+            )
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias

@@ -412,8 +412,11 @@ def get_default_packed_seq_params(seq_length: int, device: torch.device) -> Pack
     Returns:
         PackedSeqParams configured as a single unpacked sequence.
     """
-    # Single sequence spanning the full length = no actual packing
-    cu_seqlens = torch.full((seq_length,), seq_length, dtype=torch.int32, device=device)
+
+    args = get_args()
+
+    # Pad to the maximum number of sequences in the bin for the attention kernel.
+    cu_seqlens = torch.full((args.rl_sequence_packing_max_sequences_per_bin,), seq_length, dtype=torch.int32, device=device)
     cu_seqlens[0] = 0
 
     return PackedSeqParams(
@@ -758,7 +761,7 @@ class SequencePacker:
         # (it depends on the original trajectories passed to pack_sequences)
 
         # Invert attention mask, before inversion: (True = attend, False = mask)
-        attention_mask = ~attention_mask
+        attention_mask.bitwise_not_()
 
         # Create the PackingInfo dataclass
         packing_info = PackingInfo(
