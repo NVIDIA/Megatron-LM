@@ -2460,6 +2460,7 @@ def train(
                     grpo_iterations=args.grpo_iterations,
                     grpo_prompts_per_step=args.grpo_prompts_per_step,
                     grpo_group_size=args.grpo_group_size,
+                    global_batch_size=args.global_batch_size,
                     buffered_rollouts=buffered_rollouts,
                 )
                 # Buffered rollouts are used as a state container for setups when

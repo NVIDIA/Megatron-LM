@@ -66,7 +66,6 @@ from megatron.rl.server.inference.inference_interface_server import InferenceInt
 from megatron.training.global_vars import (
     get_args,
     get_tensorboard_writer,
-    get_timers,
     get_tokenizer,
     get_wandb_writer,
 )
@@ -204,7 +203,8 @@ def verify_model_weights_swap(
         if inf_was_training:
             inf_core.train()
 
-GroupedRollouts = list[list[TokenRollout | Rollout]]
+Rollouts = list[TokenRollout | Rollout]
+GroupedRollouts = list[Rollouts]
 
 
 @dataclass(slots=True)
@@ -237,7 +237,6 @@ class RLRuntimeState:
     def __init__(self):
         self.packing_context = None
         self.last_collection_iteration = 0
-        self.global_batches_per_collection = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
 
@@ -833,10 +832,9 @@ def maybe_log_training_metrics(
 
 
 def prepare_trajectories(
-    rollouts: GroupedRollouts, tokenizer: MegatronLegacyTokenizer, seq_length: int, use_sequence_packing: bool, rl_skip_bos_token: bool
+    rollouts: Rollouts, tokenizer: MegatronLegacyTokenizer, seq_length: int, use_sequence_packing: bool, skip_bos_token: bool
 ):
     """Pad trajectories and extract the generation masks.
-
     Args:
         rollouts: Rollouts to extract trajectories from.
         tokenizer: Tokenizer to get the padding token and potentially tokenize.
@@ -852,6 +850,7 @@ def prepare_trajectories(
     env_id_counts = Counter()
 
     DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>']
+
 
     if isinstance(tokenizer, _HuggingFaceTokenizer):
         if not tokenizer.pad:
@@ -885,43 +884,42 @@ def prepare_trajectories(
     inference_logprobs = []
     # TODO(vitalyk): because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
     # But in sequence packing, batch sizes are shrinking. Here, the batch size increases.
-    for group in rollouts:
-        for rollout in group:
-            # traj, gen mask and logprobs are lists now.
-            # each list entry is a turn, single-turn environments just have a single-element list.
-            # We assume that all lengths of the structs above have the same lengths (number of turns).
+    for rollout in rollouts:
+        # traj, gen mask and logprobs are lists now.
+        # each list entry is a turn, single-turn environments just have a single-element list.
+        # We assume that all lengths of the structs above have the same lengths (number of turns).
 
-            all_turns_trajectories = (
-                rollout.trajectory.copy()
-                if isinstance(rollout, TokenRollout)
-                else tokenizer.tokenize(rollout.trajectory)
-            )
-            assert len(all_turns_trajectories) == 1, "Multiturn support is not implemented yet. WIP."
-            for turn_idx, trajectory in enumerate(all_turns_trajectories):
-                inf_logprobs = rollout.logprobs[turn_idx]
-                generation_mask = rollout.generation_mask[turn_idx] if isinstance(rollout, TokenRollout) else None
-                length = len(trajectory)
-                assert length <= seq_length, "Rollout too long, how did this happen?"
-                if len(trajectory) < seq_length:
-                    assert (
-                        trajectory[-1] == tokenizer.eod
-                    ), "Trajectories under a seq_length limit should have eod token at the end."
+        all_turns_trajectories = (
+            rollout.trajectory.copy()
+            if isinstance(rollout, TokenRollout)
+            else tokenizer.tokenize(rollout.trajectory)
+        )
+        assert len(all_turns_trajectories) == 1, "Multiturn support is not implemented yet. WIP."
+        for turn_idx, trajectory in enumerate(all_turns_trajectories):
+            inf_logprobs = rollout.logprobs[turn_idx]
+            generation_mask = rollout.generation_mask[turn_idx] if isinstance(rollout, TokenRollout) else None
+            length = len(trajectory)
+            assert length <= seq_length, "Rollout too long, how did this happen?"
+            if len(trajectory) < seq_length:
+                assert (
+                    trajectory[-1] == tokenizer.eod
+                ), "Trajectories under a seq_length limit should have eod token at the end."
 
-                if length < seq_length:
-                    trajectory.extend([tokenizer.pad] * (seq_length - length))
-                    if generation_mask:
-                        generation_mask.extend([False] * (seq_length - length))
-                trajs.append(trajectory)
-                generation_masks.append(generation_mask)
+            if length < seq_length:
+                trajectory.extend([tokenizer.pad] * (seq_length - length))
+                if generation_mask:
+                    generation_mask.extend([False] * (seq_length - length))
+            trajs.append(trajectory)
+            generation_masks.append(generation_mask)
 
-                if inf_logprobs is not None:
-                    inf_logprobs_tensor = torch.Tensor(inf_logprobs)
-                    # Don't pad individual logprobs here - padding happens later if needed
-                    inference_logprobs.append(inf_logprobs_tensor)
-                else:
-                    inference_logprobs.append(None)
+            if inf_logprobs is not None:
+                inf_logprobs_tensor = torch.Tensor(inf_logprobs)
+                # Don't pad individual logprobs here - padding happens later if needed
+                inference_logprobs.append(inf_logprobs_tensor)
+            else:
+                inference_logprobs.append(None)
 
-            env_id_counts[rollout.env_id] += 1
+        env_id_counts[rollout.env_id] += 1
 
     logger.info(f"[{dist.get_rank()}] Rollout counts:")
     for env_id, count in env_id_counts.items():
@@ -941,7 +939,7 @@ def prepare_trajectories(
         inference_logprobs = None
 
     # Some sanity checks regarding the tokenization
-    if not rl_skip_bos_token:
+    if not skip_bos_token:
         assert (
             tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
         ), "First token should be bos"
@@ -1010,6 +1008,15 @@ def prepare_data_for_update(
         # This needs to be done at this point because we are about to calculate logprobs
         # Note :- For EP, do not use the expert data parallel group here. Always 
         # use the regular data parallel group. 
+
+        # Use one group as an exampling for logging later.
+        example_group = rollouts[0]
+
+        # Let's expand rollouts getting rid of the groups.
+        # We need this to correctly split the rollouts across dp groups.
+        # And we do not actually need them grouped in anything below anyways.
+        rollouts = [r for g in rollouts for r in g]
+
         if (data_parallel_world_size := mpu.get_data_parallel_world_size()) > 0:
             data_split_size = len(rollouts) // data_parallel_world_size
             data_split_range = (
@@ -1211,16 +1218,14 @@ def prepare_data_for_update(
 
         with nvtx_range("create_dataloader"):
             if args.rl_use_sequence_packing:
-               loader, optimizer_steps = get_microbatch_dataloader(packing_context,
+               loader = get_microbatch_dataloader(packing_context,
                     global_batch_size=args.global_batch_size, 
                     rampup_batch_size=args.rampup_batch_size, 
                     micro_batch_size=args.micro_batch_size, 
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                )
-               runtime_state.global_batches_per_collection = optimizer_steps
             else:
                 runtime_state.packing_context = None
-                runtime_state.global_batches_per_collection = len(group_stats.rewards) / args.global_batch_size
                 dataset_tensors = [
                     compute_trajs,
                     advantages,
@@ -1244,7 +1249,7 @@ def prepare_data_for_update(
                 group_stats=group_stats,
                 current_iteration=args.curr_iteration,
                 tokenizer=tokenizer,
-                example_group=rollouts[0],
+                example_group=example_group,
                 wandb_writer=wandb_writer,
                 tb_writer=tb_writer,
             )
@@ -1261,6 +1266,7 @@ def get_grpo_data_iterator(
     grpo_iterations: int,
     grpo_prompts_per_step: int,
     grpo_group_size: int,
+    global_batch_size: int,
     buffered_rollouts: RerunDataIterator | None = None,
 ) -> RerunDataIterator:
     """
@@ -1274,10 +1280,11 @@ def get_grpo_data_iterator(
         optimizer: The Megatron optimizer
         iteration: Current training iteration
         ref_state_dict: Reference model state dict for GRPO
-        buffered_rollouts: Previously collected rollouts (if any)
         grpo_iterations: How many steps we reuse the sampled data for.
         grpo_prompts_per_step: How many prompts we sample per data collection.
         grpo_group_size: How many samples we do per prompt.
+        global_batch_size: Global batch size.
+        buffered_rollouts: Previously collected rollouts (if any)
 
     Returns:
         RerunDataIterator for the current training step
@@ -1290,10 +1297,11 @@ def get_grpo_data_iterator(
         inference_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
+    global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size 
     if (
         buffered_rollouts is None or
         iteration == runtime_state.last_collection_iteration + 
-        (grpo_iterations * runtime_state.global_batches_per_collection)
+        (grpo_iterations * global_batches_per_collection)
     ):
 
         buffered_rollouts = get_environment_rollouts(

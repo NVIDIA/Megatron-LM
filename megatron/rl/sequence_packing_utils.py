@@ -10,7 +10,6 @@ from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_tokenizer
 from megatron.training.utils import get_nvtx_range
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core import mpu
 import logging
 import typing
@@ -155,9 +154,8 @@ def log_packing_efficiency(packing_context: PackingContext):
     packing_efficiency = my_tokens / total_capacity if total_capacity > 0 else 0
     avg_seq_length = total_tokens / len(packing_info.seq_lengths)
     rank = mpu.get_data_parallel_rank()
-    data_parallel_world_size = mpu.get_data_parallel_world_size()
 
-    log_single_rank(logger, logging.INFO, f"[Sequence Packing] Statistics:")
+    log_single_rank(logger, logging.INFO, "[Sequence Packing] Statistics:")
     log_single_rank(
         logger,
         logging.INFO,
@@ -268,7 +266,7 @@ def log_packing_efficiency(packing_context: PackingContext):
             log_single_rank(
                 logger,
                 logging.INFO,
-                f"[Sequence Packing]  Round-robin distribution quality:",
+                "[Sequence Packing]  Round-robin distribution quality:",
             )
             log_single_rank(
                 logger,
@@ -770,7 +768,7 @@ class SequencePacker:
 
         seq_per_bin = [len(indices) for indices in packing_info.bin_seq_indices]
         log_single_rank(
-            logger, logging.DEBUG, (f"Initial packing output (before distribution):")
+            logger, logging.DEBUG, ("Initial packing output (before distribution):")
         )
         log_single_rank(
             logger,
@@ -1056,43 +1054,51 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
 
     return packing_context
 
-
 def get_microbatch_dataloader(packing_context: PackingContext,
     global_batch_size: int, 
     rampup_batch_size: int, 
     micro_batch_size: int, 
     decrease_batch_size_if_needed: bool,
 ) -> Tuple[DataLoader, int]:
+    """Return a data loader with seqpacked indices with microbatches in bins frame of reference.
+
+    As a side effect, we calculate the global batch size in the bins frame of reference.
+    In sequence packing, our batch dimension shrinks as we move some trajs onto free
+    space in sequence dimension. The resulting batch size is what we return here.
+    """
+
+    samples_ratio_per_step = global_batch_size / len(packing_context.packing_info.seq_lengths)
+    assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
     num_bins_this_rank = len(packing_context.packed_trajs)
     dp_world_size = mpu.get_data_parallel_world_size()
 
-    # Ratio of collected sequences to the global batch size
-    pct_of_sequences_per_batch = len(packing_context.packing_info.seq_lengths) / global_batch_size
-
     # Ceiling division means we will reuse some bins
     # If we did floor we would leave some behind
-    local_bins_per_step = math.ceil(pct_of_sequences_per_batch * num_bins_this_rank)
-    effective_global_batch_size = local_bins_per_step * dp_world_size
+    local_bins_per_step = math.ceil(samples_ratio_per_step * num_bins_this_rank)
 
-    # Store packing plan in runtime state for the training loop to use
-    optimizer_steps = -(-num_bins_this_rank // local_bins_per_step)
+    bins_bs = local_bins_per_step * dp_world_size
 
     old_num_microbatches = get_num_microbatches()
-
     reconfigure_num_microbatches_calculator(
         rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
         rampup_batch_size=rampup_batch_size,
-        global_batch_size=effective_global_batch_size,
+        global_batch_size=bins_bs,
         micro_batch_size=micro_batch_size,
         data_parallel_size=dp_world_size,
         decrease_batch_size_if_needed=decrease_batch_size_if_needed,
     )
-
     new_num_microbatches = get_num_microbatches()
 
     log_single_rank(
-        logger, logging.INFO, f"[Sequence Packing] Multi-step training plan:"
+        logger, logging.INFO, "[Sequence Packing] Multi-step training plan:"
     )
+
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[Sequence Packing]  - Bins per rank per step: {samples_ratio_per_step}*{num_bins_this_rank}={local_bins_per_step}",
+    )
+
     log_single_rank(
         logger,
         logging.INFO,
@@ -1101,21 +1107,14 @@ def get_microbatch_dataloader(packing_context: PackingContext,
     log_single_rank(
         logger,
         logging.INFO,
-        f"[Sequence Packing]  - Bins per rank per step: {pct_of_sequences_per_batch}*{num_bins_this_rank}={local_bins_per_step}",
-    )
-    log_single_rank(
-        logger,
-        logging.INFO,
-        f"[Sequence Packing]  - Total optimizer steps: {optimizer_steps}",
-    )
-    log_single_rank(
-        logger,
-        logging.INFO,
         f"[Sequence Packing]  - Microbatches per step: {new_num_microbatches} (was {old_num_microbatches})",
     )
 
     bin_seq_indices = packing_context.packing_info.bin_seq_indices
-    for step in range(min(3, optimizer_steps)):
+    # Opt steps only depends on how much we sample and how much we consume.
+    # We make sure this is an integer division, check validate_args in arguments.py for details.
+    opt_steps = int(1 / samples_ratio_per_step)
+    for step in range(min(3, opt_steps)):
         start_idx = step * local_bins_per_step
         end_idx = min(start_idx + local_bins_per_step, num_bins_this_rank)
         step_bins = end_idx - start_idx
@@ -1132,13 +1131,12 @@ def get_microbatch_dataloader(packing_context: PackingContext,
             f"[Sequence Packing]  - Step {step + 1}: {step_bins} bins, ~{est_global_seqs} sequences globally",
         )
 
-    if optimizer_steps > 3:
-        log_single_rank(logger, logging.INFO, f"  - ... ({optimizer_steps - 3} more steps)")
+    if opt_steps > 3:
+        log_single_rank(logger, logging.INFO, f"  - ... ({opt_steps - 3} more steps)")
 
     bin_indices = torch.arange(num_bins_this_rank)
     dataset = TensorDataset(bin_indices)
-    loader = DataLoader(dataset, batch_size=micro_batch_size, shuffle=False, collate_fn=lambda x: x[0], drop_last=True)
-    return loader, optimizer_steps
+    return DataLoader(dataset, batch_size=micro_batch_size, shuffle=False, collate_fn=lambda x: x[0])
 
 def get_sequence_packing_log_info(args):
     """Get logging information for sequence packing mode."""

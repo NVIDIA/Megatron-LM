@@ -109,9 +109,7 @@ def test_prepare_trajectories(mock_rank):
 
     # Create minimal args without sequence packing
     args = type('Args', (), {})()
-    args.rl_use_sequence_packing = False
     args.rl_inference_logprobs_is_correction = True
-    args.rl_skip_bos_token = False
     global_vars.set_args(args)
 
     tokenizer = MockTokenizer()
@@ -131,10 +129,12 @@ def test_prepare_trajectories(mock_rank):
         env_id='MEGAENV',
         problem_id="2",
     )
-    rollouts = [[r1, r2]]
+    rollouts = [r1, r2]
     seq_len = 7
 
-    trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(rollouts, tokenizer, seq_len)
+    trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
+        rollouts, tokenizer, seq_len, use_sequence_packing=False, skip_bos_token=False
+    )
 
     # Check that inference logprobs are being returned.
     torch.testing.assert_close(inference_logprobs[0], torch.tensor([0.1, 0.2, 0.3]))
@@ -159,7 +159,6 @@ def test_prepare_trajectories_with_packing(mock_rank):
     args = arguments.parse_args(ignore_unknown_args=True)
     setattr(args, 'micro_batch_size', 1)
     setattr(args, 'global_batch_size', 1)
-    setattr(args, 'rl_use_sequence_packing', True)
     global_vars.set_args(args)
 
     tokenizer = MockTokenizer()
@@ -179,10 +178,12 @@ def test_prepare_trajectories_with_packing(mock_rank):
         env_id='MEGAENV',
         problem_id="2",
     )
-    rollouts = [[r1, r2]]
+    rollouts = [r1, r2]
     seq_len = 7
 
-    trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(rollouts, tokenizer, seq_len)
+    trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
+        rollouts, tokenizer, seq_len, use_sequence_packing=True, skip_bos_token=False
+    )
 
     # With sequence packing, inference logprobs should be padded to same length
     assert isinstance(inference_logprobs, torch.Tensor)
@@ -435,11 +436,13 @@ def test_prepare_trajectories_with_sequence_packing(mock_rank):
         problem_id="3",
     )
 
-    rollouts = [[r1, r2, r3]]
+    rollouts = [r1, r2, r3]
     seq_len = 16
 
     # Call prepare_trajectories with sequence packing
-    trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(rollouts, tokenizer, seq_len)
+    trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
+        rollouts, tokenizer, seq_len, use_sequence_packing=True, skip_bos_token=False
+    )
 
     # With sequence packing enabled but called from prepare_trajectories,
     # it might still return individual sequences (not packed into bins yet)
