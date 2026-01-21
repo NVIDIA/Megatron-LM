@@ -104,7 +104,9 @@ class GatedDeltaNet(MegatronModule):
         """
 
         if not HAVE_FLA:
-            raise ImportError("FLA is not installed. Please install it with `pip install fla`.")
+            raise ImportError(
+                "FLA is not installed. Please install it with `pip install flash-linear-attention`."
+            )
 
         super().__init__(config)
 
