@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
@@ -22,6 +23,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
@@ -34,6 +38,7 @@ from megatron.core.utils import (
     get_pg_size,
     is_fa_min_version,
     is_te_min_version,
+    is_using_quantization_scales,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -41,7 +46,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType
+from .enums import AttnMaskType, CudaGraphScope
 from .transformer_config import TransformerConfig
 
 try:
@@ -174,6 +179,7 @@ class Attention(MegatronModule, ABC):
                 pg_collection, 'cp'
             ), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
 
         # Per attention head and per partition values
         world_size = get_pg_size(self.pg_collection.tp)
@@ -223,6 +229,21 @@ class Attention(MegatronModule, ABC):
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
+        )
+
+        self.offload_qkv_linear = (
+            self.config.fine_grained_activation_offloading
+            and "qkv_linear" in self.config.offload_modules
+        )
+
+        self.offload_core_attention = (
+            self.config.fine_grained_activation_offloading
+            and "core_attn" in self.config.offload_modules
+        )
+
+        self.offload_attn_proj = (
+            self.config.fine_grained_activation_offloading
+            and "attn_proj" in self.config.offload_modules
         )
 
         # Output.
@@ -503,7 +524,9 @@ class Attention(MegatronModule, ABC):
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
     @abstractmethod
-    def get_query_key_value_tensors(self, hidden_states, key_value_states, split_qkv=True):
+    def get_query_key_value_tensors(
+        self, hidden_states, key_value_states, output_gate=False, split_qkv=True
+    ):
         """
         This method needs to be implemented based on whether the derived class
         is "self-attn" or "cross-attn".
@@ -801,14 +824,31 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
-        qkv_output = self.get_query_key_value_tensors(
-            hidden_states, key_value_states, split_qkv=split_qkv
-        )
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+            qkv_output = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                split_qkv=split_qkv,
+                output_gate=self.config.attention_output_gate,
+            )
+        if self.offload_qkv_linear:
+            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+            qkv_output = off_interface.group_commit(
+                qkv_output, name="qkv_linear", forced_released_tensors=[]
+            )
         attn_mask_type = self.attn_mask_type
         block_table = None
+        gate = None
         if split_qkv:
-            query, key, value = qkv_output
+            if self.config.attention_output_gate:
+                query, key, value, gate = qkv_output
+            else:
+                query, key, value = qkv_output
+            mixed_qkv = qkv_split_arg_list = None
         else:
+            assert (
+                not self.config.attention_output_gate
+            ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
             mixed_qkv, qkv_split_arg_list = qkv_output
         nvtx_range_pop(suffix="qkv")
 
@@ -850,7 +890,7 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and self.config.cuda_graph_scope != "full_iteration"
+            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
@@ -870,7 +910,7 @@ class Attention(MegatronModule, ABC):
                 )
             )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
@@ -885,7 +925,7 @@ class Attention(MegatronModule, ABC):
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
-            if packed_seq_params is not None:
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 if packed_seq_params.cu_seqlens_q_padded is not None:
                     cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
                 else:
@@ -951,15 +991,18 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    attn_mask_type=attn_mask_type,
-                    attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
-                )
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                    )
 
             else:
                 # Dynamic batching attention kernel.
@@ -980,6 +1023,15 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
+                # Clear the outputs for padding tokens when using quantization scales
+                # to avoid corrupting amax calculations
+                if is_using_quantization_scales(self.config):
+                    core_attn_out[inference_context.padding_slice] = 0.0
+
+            if self.offload_core_attention and self.training:
+                core_attn_out = off_interface.group_commit(
+                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -988,15 +1040,34 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
+        # Output gate
+        if gate is not None:
+            nvtx_range_push(suffix="output_gate")
+            core_attn_out = self._apply_output_gate(core_attn_out, gate)
+            nvtx_range_pop(suffix="output_gate")
+
         # =================
         # Output. [sq, b, h]
         # =================
-
         nvtx_range_push(suffix="linear_proj")
-        output, bias = self.linear_proj(core_attn_out)
+        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
+            output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output = off_interface.group_commit(
+                output, name="attn_proj", forced_released_tensors=[core_attn_out]
+            )
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
+
+    @jit_fuser
+    def _apply_output_gate(self, x, gate):
+        x_dtype = x.dtype
+        gate = gate.contiguous()
+        gate = gate.view(*x.shape)
+        x = x * torch.sigmoid(gate.float())
+        x = x.to(x_dtype)
+        return x
 
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
@@ -1036,10 +1107,13 @@ class SelfAttention(Attention):
             pg_collection=pg_collection,
         )
 
+        self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
+        if self.config.attention_output_gate:
+            self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
         self.linear_qkv = build_module(
             submodules.linear_qkv,
             self.config.hidden_size,
-            self.query_projection_size + 2 * self.kv_projection_size,
+            self.linear_qkv_out_dim,
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
@@ -1141,13 +1215,23 @@ class SelfAttention(Attention):
                 "TP",
             )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states=None, split_qkv=True):
+    def get_query_key_value_tensors(
+        self, hidden_states, key_value_states=None, output_gate=False, split_qkv=True
+    ):
         """
-        Derives `query`, `key` and `value` tensors from `hidden_states`. If `split_qkv=False`, then
-        the unsplit mixed_qkv tensor is returned.
+        Derives `query`, `key` and `value` tensors from `hidden_states`.
+        If `output_gate` is True, then also derives `gate` tensor.
+        If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
         """
-        # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+        # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+        # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
+        num_query_heads_per_group = (
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+        )
+        num_qkv_heads_per_group = num_query_heads_per_group + 2
+        if output_gate:
+            num_qkv_heads_per_group += num_query_heads_per_group
 
         if self.config.num_query_groups < self.world_size:
             # Note that weights are interleaved in the following manner:
@@ -1169,42 +1253,51 @@ class SelfAttention(Attention):
             size = mixed_qkv.size()[-1] // self.config.num_query_groups
             mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
 
-        # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
+        # If no output gate: [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
+        # If have output gate: [sq, b, hp] --> [sq, b, ng, (2 * np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
-            (
-                (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
-                * self.hidden_size_per_attention_head
-            ),
+            num_qkv_heads_per_group * self.hidden_size_per_attention_head,
         )
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
 
-        split_arg_list = [
-            (
-                self.num_attention_heads_per_partition
-                // self.num_query_groups_per_partition
-                * self.hidden_size_per_attention_head
-            ),
-            self.hidden_size_per_attention_head,
-            self.hidden_size_per_attention_head,
-        ]
+        # Split the tensor into query, gate, key, and value.
+        if output_gate:
+            if not split_qkv:
+                raise ValueError("split_qkv not supported for gated attention yet.")
+            # If have output gate: [sq, b, ng, (2 * np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, np/ng * hn],
+            # [sq, b, ng, hn], [sq, b, ng, hn]
+            split_arg_list = [
+                num_query_heads_per_group * self.hidden_size_per_attention_head,
+                num_query_heads_per_group * self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+            ]
 
-        # Return unsplit mixed_qkv and split_arg_list
-        if not split_qkv:
-            return mixed_qkv, split_arg_list
-
-        if SplitAlongDim is not None:
-
-            # [sq, b, ng, (np/ng + 2) * hn]
-            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
-            (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+            if SplitAlongDim is not None:
+                (query, gate, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+            else:
+                (query, gate, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
         else:
+            # If no output gate: [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], None, [sq, b, ng, hn], [sq, b, ng, hn]
+            split_arg_list = [
+                num_query_heads_per_group * self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+            ]
 
-            # [sq, b, ng, (np/ng + 2) * hn]
-            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
-            (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+            # Return unsplit mixed_qkv and split_arg_list
+            if not split_qkv:
+                return mixed_qkv, split_arg_list
 
-        # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+            if SplitAlongDim is not None:
+                (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+            else:
+                (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+
+        # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.config.num_query_groups < self.world_size:
@@ -1227,6 +1320,11 @@ class SelfAttention(Attention):
 
         if self.config.test_mode:
             self.run_realtime_tests()
+
+        if output_gate:
+            # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+            gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
+            return query, key, value, gate
 
         return query, key, value
 
@@ -1401,12 +1499,16 @@ class CrossAttention(Attention):
             is_expert=False,
         )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states, split_qkv=True):
+    def get_query_key_value_tensors(
+        self, hidden_states, key_value_states, output_gate=False, split_qkv=True
+    ):
         """
         Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
         from `key_value_states`.
         """
         assert split_qkv, "split_qkv must be True for CrossAttention"
+        assert not output_gate, "Output gate is not supported in cross attention for now."
+
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
         mixed_kv, _ = self.linear_kv(key_value_states)
 

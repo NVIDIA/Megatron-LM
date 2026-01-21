@@ -10,13 +10,18 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.utils import WrappedTensor, deprecate_inference_params
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    is_using_quantization_scales,
+)
 
 
 class MambaModel(LanguageModule):
@@ -179,6 +184,7 @@ class MambaModel(LanguageModule):
         runtime_gather_output: Optional[bool] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tensor:
         """Forward function of the Mamba model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -201,6 +207,15 @@ class MambaModel(LanguageModule):
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations
+            if (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and is_using_quantization_scales(self.config)
+            ):
+                decoder_input[inference_context.padding_slice] = 0.0
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -209,9 +224,12 @@ class MambaModel(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            )
 
         # Wrap decoder_input to allow the decoder (MambaBlock) to delete the
         # reference held by this caller function, enabling early garbage collection
@@ -235,6 +253,7 @@ class MambaModel(LanguageModule):
             attention_mask=attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
         )
 
         if not self.post_process:

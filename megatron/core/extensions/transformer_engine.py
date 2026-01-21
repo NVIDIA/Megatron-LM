@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
 import enum
@@ -24,9 +24,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
     get_context_parallel_group,
-    get_expert_data_parallel_rank,
-    get_expert_model_parallel_rank,
-    get_expert_model_parallel_world_size,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
@@ -48,6 +45,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
@@ -522,6 +520,7 @@ class TELinear(te.pytorch.Linear):
                 extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
             else:
                 raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
+
         if (
             self.config.tp_comm_overlap
             and tp_comm_buffer_name
@@ -593,9 +592,10 @@ class TELinear(te.pytorch.Linear):
             extra_kwargs["rng_tracker_name"] = rng_tracker_name
 
         te_parallel_mode = parallel_mode
+        tp_group_for_te = tp_group
         if parallel_mode == "duplicated":
             # Handle non-parallel case
-            tp_group = None
+            tp_group_for_te = None
             tp_size = 1
             explicit_expert_comm = False
             te_parallel_mode = None
@@ -610,7 +610,7 @@ class TELinear(te.pytorch.Linear):
                     input_size = divide(input_size, tp_size)
                 te_parallel_mode = None
                 tp_size = 1
-                tp_group = None
+                tp_group_for_te = None
 
         super().__init__(
             in_features=input_size,
@@ -618,7 +618,7 @@ class TELinear(te.pytorch.Linear):
             sequence_parallel=self.config.sequence_parallel,
             fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
             # Pass None if not initialized for backward compatibility with the ckpt converter.
-            tp_group=tp_group if torch.distributed.is_initialized() else None,
+            tp_group=tp_group_for_te if torch.distributed.is_initialized() else None,
             tp_size=tp_size,
             get_rng_state_tracker=(
                 get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
@@ -642,6 +642,9 @@ class TELinear(te.pytorch.Linear):
                     # Reduce the gradient further on the TP group since the weight is
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
+
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
@@ -683,7 +686,14 @@ class TELinear(te.pytorch.Linear):
             self.parallel_mode is None
         ), "TELinear sharded_state_dict can only be used with duplicated parallel mode"
         state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict,
+            prefix,
+            None,
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
@@ -709,6 +719,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -731,6 +742,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         # TODO: For backward compatibility, remove in v0.15.
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -799,6 +811,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
+        self.stride = stride
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -824,6 +838,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
         self.te_quant_params: Optional[TEQuantizationParams] = None
 
+        # Set proper partition_stride
+        setattr(self.weight, 'partition_stride', stride)
+        if bias and hasattr(self, 'bias') and self.bias is not None:
+            setattr(self.bias, 'partition_stride', stride)
+
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, self.tp_size)
             _ = _initialize_affine_weight_cpu(
@@ -833,7 +852,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 output_size_per_partition,
                 0,
                 init_method=condition_init_method(config, init_method),
-                stride=1,
+                stride=stride,
                 return_master_weight=False,
                 rank=self.tp_rank,
                 world_size=self.tp_size,
@@ -843,7 +862,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 self.bias = Parameter(
                     torch.empty(output_size_per_partition, dtype=config.params_dtype)
                 )
-                set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+                set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
@@ -882,9 +901,15 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0, "bias": 0},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def __repr__(self):
@@ -917,6 +942,7 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -927,8 +953,10 @@ class TEColumnParallelLinear(TELinear):
         if gather_output:
             raise ValueError("Transformer Engine linear layers do not support gather_output = True")
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
+        self.stride = stride
 
         super().__init__(
             input_size=input_size,
@@ -949,6 +977,11 @@ class TEColumnParallelLinear(TELinear):
             tp_group=tp_group,
         )
 
+        # Set proper partition_stride
+        setattr(self.weight, 'partition_stride', stride)
+        if bias and hasattr(self, 'bias') and self.bias is not None:
+            setattr(self.bias, 'partition_stride', stride)
+
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, world_size)
             _ = _initialize_affine_weight_cpu(
@@ -958,7 +991,7 @@ class TEColumnParallelLinear(TELinear):
                 output_size_per_partition,
                 0,
                 init_method=condition_init_method(config, init_method),
-                stride=1,
+                stride=stride,
                 return_master_weight=False,
                 rank=rank,
                 world_size=world_size,
@@ -968,7 +1001,7 @@ class TEColumnParallelLinear(TELinear):
                 self.bias = Parameter(
                     torch.empty(output_size_per_partition, dtype=config.params_dtype)
                 )
-                set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+                set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
@@ -977,7 +1010,12 @@ class TEColumnParallelLinear(TELinear):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0, "bias": 0},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def __repr__(self):
@@ -1021,6 +1059,7 @@ class TERowParallelLinear(TELinear):
                 "Transformer Engine linear layers do not support input_is_parallel = False"
             )
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self._tp_group = tp_group
 
         super().__init__(
             input_size=input_size,
@@ -1071,7 +1110,12 @@ class TERowParallelLinear(TELinear):
         """Sharding along axis 1, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 1}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 1},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def __repr__(self):
@@ -1163,6 +1207,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 assert hasattr(
                     pg_collection, "hcp"
                 ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
+        self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
@@ -1238,6 +1283,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)
         )
+
         if get_te_version() < PkgVersion("1.3.0"):
             # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
             # copies (#555)
@@ -1289,6 +1335,26 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         num_splits: Optional[int] = None,
     ):
         """Forward."""
+        if packed_seq_params is not None:
+            # If Dynamic CP group is provided, update TE DPA CP group
+            if packed_seq_params.cp_group is not None:
+                self.cp_group = packed_seq_params.cp_group
+                super().set_context_parallel_group(
+                    self.cp_group,
+                    torch.distributed.get_process_group_ranks(self.cp_group),
+                    TEDotProductAttention.cp_stream,
+                    self.cp_comm_type,
+                )
+            # If cp_group is None but local_cp_size is provided,
+            # Indicates to turn off CP dynamically
+            elif packed_seq_params.local_cp_size is not None:
+                assert (
+                    packed_seq_params.local_cp_size == 1
+                ), "local_cp_size must be == 1 if provided without cp_group"
+                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            self.kept_packed_seq_params.discard("cp_group")
+            self.kept_packed_seq_params.discard("local_cp_size")
+
         # Default to constructor-provided num_splits unless explicitly overridden
         if num_splits is None:
             num_splits = self.num_splits
@@ -1372,7 +1438,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {'softmax_offset': 0},
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
 
@@ -1400,7 +1471,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             skip_bias_add: bool,
             is_expert: bool = False,
             tp_comm_buffer_name: Optional[str] = None,
-            tp_group: Optional[torch.distributed.ProcessGroup] = None,
+            pg_collection: Optional[ProcessGroupCollection] = None,
         ):
             self.config = config
 
@@ -1431,8 +1502,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
-            tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+            if pg_collection is None:
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            self._pg_collection = pg_collection
+            assert is_expert, "TEGroupedLinear only supports expert parallelism"
+            tp_group = pg_collection.expt_tp
+            self._tp_group = tp_group
             tp_size = get_pg_size(tp_group)
+            tp_group_for_te = tp_group
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
@@ -1443,7 +1520,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     input_size = divide(input_size, tp_size)
                 parallel_mode = None
                 tp_size = 1
-                tp_group = None
+                tp_group_for_te = None
 
             super().__init__(
                 num_gemms=num_gemms,
@@ -1451,7 +1528,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 out_features=output_size,
                 sequence_parallel=self.config.sequence_parallel,
                 fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-                tp_group=tp_group if torch.distributed.is_initialized() else None,
+                tp_group=tp_group_for_te if torch.distributed.is_initialized() else None,
                 tp_size=tp_size,
                 get_rng_state_tracker=(
                     get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
@@ -1660,8 +1737,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
             sharded_state_dict = {}
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
-            num_global_experts = get_expert_model_parallel_world_size() * self.num_gemms
-            local_expert_indices_offset = get_expert_model_parallel_rank() * self.num_gemms
+            num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
+            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
             for gemm_idx in range(self.num_gemms):
@@ -1682,7 +1759,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         (ep_axis, global_expert_idx, num_global_experts),
                     )
                 sub_sd = make_sharded_tensors_for_checkpoint(
-                    state_dict, '', tp_axis_map, new_sharded_offsets
+                    state_dict,
+                    '',
+                    tp_axis_map,
+                    new_sharded_offsets,
+                    tp_group=self._tp_group,
+                    dp_cp_group=metadata["dp_cp_group"],
                 )
                 # Remove expert layers indexing from sharded keys
                 replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
@@ -1705,7 +1787,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 if getattr(sh_ten, "is_data_parallel_fully_shard", False):
                     edp_replica_id = 0
                 else:
-                    edp_replica_id = get_expert_data_parallel_rank()
+                    edp_replica_id = get_pg_rank(self._pg_collection.expt_dp)
                 sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
             return sharded_state_dict
 
@@ -1735,7 +1817,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             skip_bias_add: bool,
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
-            tp_group: Optional[torch.distributed.ProcessGroup] = None,
+            pg_collection: Optional[ProcessGroupCollection] = None,
         ):
             super().__init__(
                 num_gemms=num_gemms,
@@ -1748,7 +1830,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 skip_bias_add=skip_bias_add,
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
-                tp_group=tp_group,
+                pg_collection=pg_collection,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -1781,7 +1863,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             skip_bias_add: bool,
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
-            tp_group: Optional[torch.distributed.ProcessGroup] = None,
+            pg_collection: Optional[ProcessGroupCollection] = None,
         ):
             super().__init__(
                 num_gemms=num_gemms,
@@ -1794,7 +1876,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 skip_bias_add=skip_bias_add,
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
-                tp_group=tp_group,
+                pg_collection=pg_collection,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -2427,3 +2509,18 @@ def set_save_original_input(module):
             "set_save_original_input is only needed on transformer-engine modules that save "
             "quantized tensors by default. It needs transformer-engine>=2.6.0dev0."
         )
+
+
+try:
+    # pylint: disable=unused-import
+    from transformer_engine.pytorch import cpu_offload_v1 as cpu_offload
+except ImportError:
+    try:
+        from transformer_engine.pytorch import cpu_offload
+    except ImportError:
+        cpu_offload = None
+try:
+    # pylint: disable=unused-import
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+except ImportError:
+    Float8Tensor = None
