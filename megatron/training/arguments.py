@@ -1686,8 +1686,12 @@ def _add_inference_args(parser):
     group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
-    group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
-                       help='Disable chunked prefill (chunked prefill is enabled by default).')
+    # TODO(ksanthanam): Clean this up in future PR
+    group.add_argument('--enable-chunked-prefill', dest='disable_chunked_prefill',
+                       action='store_false', default=True,
+                       help="Enable chunked prefill (disabled by default)")
+    group.add_argument('--disable-chunked-prefill', dest='disable_chunked_prefill',
+                       action='store_true', help=argparse.SUPPRESS)
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
