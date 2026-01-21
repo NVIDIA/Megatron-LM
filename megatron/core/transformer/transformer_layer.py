@@ -578,8 +578,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.enable_hyper_connections and self.do_self_attention_hyper_connection:
             nvtx_range_push(suffix="self_attention_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
-            # residual: [s, b, n * C] -> [s, b, n * C]
-            hidden_states, residual, self_attn_hc_h_post = self.self_attention_hyper_connection(
+            # self_attn_h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
+            hidden_states, self_attn_h_res, self_attn_hc_h_post = self.self_attention_hyper_connection(
                 hidden_states, residual, mhc_recompute_manager=mhc_recompute_manager
             )
             nvtx_range_pop(suffix="self_attention_hyper_connection")
@@ -601,7 +601,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             with get_fine_grained_offloading_context(self.offload_attn_norm):
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
-        # Self attention.
+        # Self attention
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
@@ -627,20 +627,29 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         if self.config.enable_hyper_connections and self.do_self_attention_hyper_connection:
-            nvtx_range_push(suffix="self_attention_hyper_connection_post")
-            attention_output_with_bias = self.self_attention_hyper_connection.apply_h_post(
-                attention_output_with_bias, self_attn_hc_h_post, manager=mhc_recompute_manager
-            )
-            nvtx_range_pop(suffix="self_attention_hyper_connection_post")
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        nvtx_range_push(suffix="self_attn_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attn_bda(
-                self.training, self.config.bias_dropout_fusion, mhc_recompute_manager
-            )(attention_output_with_bias, residual, self.hidden_dropout)
-        nvtx_range_pop(suffix="self_attn_bda")
+            # Use fused kernel: apply_h_res + apply_h_post + bda
+            nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.self_attention_hyper_connection.fused_h_res_h_post_bda(
+                    self_attn_h_res,
+                    residual,
+                    self_attn_hc_h_post,
+                    attention_output_with_bias,
+                    self.hidden_dropout,
+                    self.training,
+                    self.config.bias_dropout_fusion,
+                    mhc_recompute_manager,
+                )
+            nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
+        else:
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            nvtx_range_push(suffix="self_attn_bda")
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.self_attn_bda(
+                    self.training, self.config.bias_dropout_fusion, mhc_recompute_manager
+                )(attention_output_with_bias, residual, self.hidden_dropout)
+            nvtx_range_pop(suffix="self_attn_bda")
 
         if self.offload_attn_norm:
             (hidden_states,) = fine_grained_offloading_group_commit(
@@ -653,8 +662,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.enable_hyper_connections and self.do_cross_attention_hyper_connection:
             nvtx_range_push(suffix="cross_attention_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
-            # residual: [s, b, n * C] -> [s, b, n * C]
-            hidden_states, residual, cross_attn_hc_h_post = self.cross_attention_hyper_connection(
+            # cross_attn_h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
+            hidden_states, cross_attn_h_res, cross_attn_hc_h_post = self.cross_attention_hyper_connection(
                 hidden_states, residual, mhc_recompute_manager=mhc_recompute_manager
             )
             nvtx_range_pop(suffix="cross_attention_hyper_connection")
@@ -674,18 +683,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             context = attention_output_with_bias["context"]
 
         if self.config.enable_hyper_connections and self.do_cross_attention_hyper_connection:
-            nvtx_range_push(suffix="cross_attention_hyper_connection_post")
-            attention_output_with_bias = self.cross_attention_hyper_connection.apply_h_post(
-                attention_output_with_bias, cross_attn_hc_h_post, manager=mhc_recompute_manager
-            )
-            nvtx_range_pop(suffix="cross_attention_hyper_connection_post")
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(
-                self.training, self.config.bias_dropout_fusion, mhc_recompute_manager
-            )(attention_output_with_bias, residual, self.hidden_dropout)
+            # Use fused kernel: apply_h_res + apply_h_post + bda
+            nvtx_range_push(suffix="cross_attention_fused_h_res_h_post_bda")
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.cross_attention_hyper_connection.fused_h_res_h_post_bda(
+                    cross_attn_h_res,
+                    residual,
+                    cross_attn_hc_h_post,
+                    attention_output_with_bias,
+                    self.hidden_dropout,
+                    self.training,
+                    self.config.bias_dropout_fusion,
+                    mhc_recompute_manager,
+                )
+            nvtx_range_pop(suffix="cross_attention_fused_h_res_h_post_bda")
+        else:
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.cross_attn_bda(
+                    self.training, self.config.bias_dropout_fusion, mhc_recompute_manager
+                )(attention_output_with_bias, residual, self.hidden_dropout)
 
         return hidden_states, context
 
@@ -727,8 +745,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.enable_hyper_connections and self.do_mlp_hyper_connection:
             nvtx_range_push(suffix="mlp_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
-            # residual: [s, b, n * C] -> [s, b, n * C]
-            hidden_states, residual, mlp_hc_h_post = self.mlp_hyper_connection(
+            # mlp_h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
+            hidden_states, mlp_h_res, mlp_hc_h_post = self.mlp_hyper_connection(
                 hidden_states, residual, mhc_recompute_manager=mhc_recompute_manager
             )
             nvtx_range_pop(suffix="mlp_hyper_connection")
@@ -820,15 +838,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="mlp")
 
         if self.config.enable_hyper_connections and self.do_mlp_hyper_connection:
-            nvtx_range_push(suffix="mlp_hyper_connection_post")
-            mlp_output_with_bias = self.mlp_hyper_connection.apply_h_post(
-                mlp_output_with_bias, mlp_hc_h_post, manager=mhc_recompute_manager
+            # Use fused kernel: apply_h_res + apply_h_post + bda
+            # Note: is_last_layer_in_recompute_block only affects whether we checkpoint the BDA
+            # For the last layer, we don't checkpoint to allow the unified recompute hook
+            return self._forward_post_mlp_with_fused_hyper_connection(
+                mlp_output_with_bias,
+                mlp_h_res,
+                residual,
+                mlp_hc_h_post,
+                mhc_recompute_manager,
+                is_last_layer_in_recompute_block,
             )
-            nvtx_range_pop(suffix="mlp_hyper_connection_post")
-
-        return self._forward_post_mlp(
-            mlp_output_with_bias, residual, mhc_recompute_manager, is_last_layer_in_recompute_block
-        )
+        else:
+            return self._forward_post_mlp(
+                mlp_output_with_bias, residual, mhc_recompute_manager, is_last_layer_in_recompute_block
+            )
 
     def _forward_post_mlp(
         self,
@@ -866,6 +890,76 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self.training, self.config.bias_dropout_fusion, mlp_bda_manager
             )(mlp_output_with_bias, residual, self.hidden_dropout)
         nvtx_range_pop(suffix="mlp_bda")
+        
+        # If this is the last layer in the recompute block, register unified recompute hook
+        # The MLP BDA output serves as the hook_tensor that triggers recomputation during backward
+        if mhc_recompute_manager is not None and is_last_layer_in_recompute_block:
+            mhc_recompute_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+        if self.offload_mlp_norm:
+            (hidden_states,) = fine_grained_offloading_group_commit(
+                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+            )
+
+        # Jit compiled function creates 'view' tensor. This tensor
+        # potentially gets saved in the MPU checkpoint function context,
+        # which rejects view tensors. While making a viewless tensor here
+        # won't result in memory savings (like the data loader, or
+        # p2p_communication), it serves to document the origin of this
+        # 'view' tensor.
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+        return output
+
+    def _forward_post_mlp_with_fused_hyper_connection(
+        self,
+        mlp_output_with_bias,
+        mlp_h_res,
+        residual,
+        mlp_hc_h_post,
+        mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None,
+        is_last_layer_in_recompute_block: bool = False,
+    ):
+        """
+        Perform operations after the MLP computation with fused hyper connection kernel.
+        
+        This method uses the fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
+
+        Args:
+            mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
+            mlp_h_res (Tensor): [s, b, n, n] - residual mixing matrix from hyper connection.
+            residual (Tensor): [s, b, n*C] - original residual (n-stream hidden states).
+            mlp_hc_h_post (Tensor): [s, b, n] - expansion weights from hyper connection.
+            mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
+            is_last_layer_in_recompute_block: If True, this layer is the last in its MHC recompute block.
+                The final MLP BDA will not be checkpointed and will register the unified recompute hook.
+
+        Returns:
+            output (Tensor): Transformed hidden states of shape [s, b, h].
+        """
+
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_group_commit,
+        )
+
+        # Use fused kernel: apply_h_res + apply_h_post + bda
+        # MLP BDA: checkpoint only if NOT the last layer in recompute block
+        # Last layer's MLP BDA output serves as hook_tensor for unified recompute
+        nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
+        fused_manager = mhc_recompute_manager if not is_last_layer_in_recompute_block else None
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
+                mlp_h_res,
+                residual,
+                mlp_hc_h_post,
+                mlp_output_with_bias,
+                self.hidden_dropout,
+                self.training,
+                self.config.bias_dropout_fusion,
+                fused_manager,
+            )
+        nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
         
         # If this is the last layer in the recompute block, register unified recompute hook
         # The MLP BDA output serves as the hook_tensor that triggers recomputation during backward
