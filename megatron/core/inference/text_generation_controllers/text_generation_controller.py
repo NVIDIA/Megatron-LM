@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -32,6 +31,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
@@ -85,15 +85,15 @@ class TextGenerationController:
         )
 
         # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
-        try:
-            self.vocab_size = get_attr_wrapped_model(
-                self.inference_wrapped_model.model, "vocab_size"
-            )
-        except RuntimeError as e:
-            # Handle LlaVa models
+        if isinstance(self.inference_wrapped_model.model, LLaVAModel):
+            # TODO(ksanthanam): Consider deprecating this check if LLaVAModel is no longer used
             self.vocab_size = get_attr_wrapped_model(
                 self.inference_wrapped_model.model, "language_model"
             ).vocab_size
+        else:
+            self.vocab_size = get_attr_wrapped_model(
+                self.inference_wrapped_model.model, "vocab_size"
+            )
 
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
@@ -123,11 +123,8 @@ class TextGenerationController:
             TextGenerationController: The initialized text generation controller.
         """
         tokenizer = build_tokenizer(args)
-        # TODO(ksanthanam): Condition this on model type?
         model = model_inference_wrapper_cls(model, context)
-        model.model_is_pipeline_parallel = not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
-        )
+        model.model_is_pipeline_parallel = model.config.pipeline_parallel_size > 1
         return cls(model, tokenizer)
 
     def set_stop_word_finished_ids_callback(self, callback):

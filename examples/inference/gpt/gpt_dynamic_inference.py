@@ -424,13 +424,7 @@ def main():
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
-<<<<<<< HEAD
-            print(
-                f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}"
-            )
-=======
             print(f"\n{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
->>>>>>> upstream/main
 
             # ---- Group all outputs for this prompt ----
             output_map = defaultdict(list)
@@ -457,13 +451,8 @@ def main():
                     o_hash = "--"
                     o_len = 0
                     escaped_output_text = "--"
-<<<<<<< HEAD
-                print(
-                    f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}"
-                )
-=======
-                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}{', <evicted>' if evicted else ''}] {escaped_output_text}")
->>>>>>> upstream/main
+                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}"
+                f"{', <evicted>' if evicted else ''}] {escaped_output_text}")
                 text_hashes.append(o_hash)
 
         # Write results to JSON. Primarily used for functional testing.

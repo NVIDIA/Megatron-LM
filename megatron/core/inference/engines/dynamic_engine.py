@@ -48,6 +48,7 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    log_single_rank,
     trace_async_exceptions,
 )
 
@@ -146,6 +147,7 @@ class DynamicInferenceEngine(AbstractEngine):
         *,
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
+        metrics_writer: Optional['WandbModule'] = None,
         inference_logging_step_interval: int = 0,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
@@ -182,6 +184,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.metrics_writer = metrics_writer
         self.inference_logging_step_interval = inference_logging_step_interval
         self.unified_memory_level = context.unified_memory_level
         self.persist_cuda_graphs = context.persist_cuda_graphs
@@ -200,12 +203,12 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         # Configure wandb to use separate step counter for inference metrics (only once)
-        if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
+        if self.inference_logging_step_interval > 0 and self.metrics_writer is not None:
             logging.info(
                 f"\033[1;93m[INFERENCE]\033[0m "
                 f"\033[1;95mLogging inference metrics to wandb (rank {self.rank})\033[0m"
             )
-            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
+            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 # Make all inference/* metrics use inference_step as their x-axis
                 # This allows inference and training to have independent step counters
                 context.metrics_writer.define_metric(
@@ -254,14 +257,40 @@ class DynamicInferenceEngine(AbstractEngine):
         if controller is None:
             controller = TextGenerationController.from_model_and_args(model, args, context)
 
+        # The model may have a custom ProcessGroupCollection with a different TP / PP size.
+        pg_collection = get_attr_wrapped_model(model, "pg_collection")
+
+        # Get inference logging configuration from args
+        log_inference_wandb = args.inference_wandb_logging
+        inference_logging_step_interval = args.inference_logging_step_interval
+
+        # Get metrics writer if logging is enabled and on the logging rank
+        # Use the same rank convention as training (last rank logs)
+        metrics_writer = None
+        if (
+            inference_logging_step_interval > 0
+            and log_inference_wandb
+            and args.rank == (args.world_size - 1)
+        ):
+            metrics_writer = get_wandb_writer()
+            if metrics_writer is None:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
+                    "wandb module is available. Inference logging will be disabled.",
+                )
+
         return cls(
             controller,
             context,
-            enable_cuda_graph=args.cuda_graph_impl == "local",
-            random_seed=args.seed,
+            enable_cuda_graph=model.config.cuda_graph_impl == "local",
+            random_seed=amodel.config.seed,
             track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
             enable_chunked_prefill=not args.disable_chunked_prefill,
+            metrics_writer=metrics_writer,
             inference_logging_step_interval=args.inference_logging_step_interval,
+            pg_collection=pg_collection,
         )
 
     def reset(self) -> None:
@@ -1187,7 +1216,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.inference_logging_step_interval > 0
             and self.step_count > 0
             and self.step_count % self.inference_logging_step_interval == 0
-            and self.context.metrics_writer is not None
+            and self.metrics_writer is not None
         ):
             kvcache_util_stats = self.context.get_kvcache_utilization_stats()
         else:
@@ -1312,12 +1341,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     metrics[f'inference/{key}'] = value
 
-            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
-                self.context.metrics_writer.log(metrics, commit=True)
+            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
+                self.metrics_writer.log(metrics, commit=True)
             else:
-                raise ValueError(
-                    f"Unsupported metrics writer type: {type(self.context.metrics_writer)}"
-                )
+                raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
 
         # Print context state.
         if (

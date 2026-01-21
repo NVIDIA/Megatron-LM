@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -59,17 +59,6 @@ try:
     HAVE_FLASHINFER = True
 except ImportError:
     HAVE_FLASHINFER = False
-
-try:
-    import wandb  # pylint: disable=unused-import
-
-    HAVE_WANDB = True
-except ImportError:
-    HAVE_WANDB = False
-    wandb = None
-
-if TYPE_CHECKING:
-    import wandb as WandbModule
 
 
 class ContextOverflowError(Exception):
@@ -244,7 +233,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             levels will be included to control other tensors within the context.
         use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
             If None, defaults to using flash-infer if available.
-        metrics_writer (Optional['WandbModule']): Wandb module for writing metrics.
         request_metadata_types (Optional[List[Tuple[str, torch.dtype, bool]]]): A list of the
             per-request metadata types to track. Each entry is a tuple consisting of the string
             label, the target dtype, and whether to store the data on GPU.
@@ -273,7 +261,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         unified_memory_level: Optional[int] = 0,
         cuda_graph_max_tokens: Optional[int] = None,
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
-        metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
     ):
@@ -295,8 +282,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 "`max_requests`.",
                 DeprecationWarning,
             )
-
-        self.metrics_writer = metrics_writer
 
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads

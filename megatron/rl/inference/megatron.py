@@ -68,32 +68,6 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
         ),
     )
 
-
-def get_dynamic_inference_engine(
-    args: Namespace,
-    model: MegatronModule,
-    inference_logging_step_interval: int = 0,
-    metrics_writer=None,
-) -> DynamicInferenceEngine:
-    """
-    Returns an inference engine.
-    Args:
-        args (Namespace): The user arguments parsed from command line
-        model (MegatronModule): The megatron model.
-        inference_logging_step_interval (int): Step interval for logging inference metrics.
-        metrics_writer: Metrics writer (wandb module) for logging.
-
-    Returns:
-        DynamicInferenceEngine: The inference engine
-    """
-    context = DynamicInferenceContext.from_model_and_args(
-        model, args, overrides={"metrics_writer": metrics_writer}
-    )
-    controller = TextGenerationController.from_model_and_args(model, args, context)
-    engine = DynamicInferenceEngine.from_model_and_args(model, args, controller, context)
-    return engine
-
-
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
 
@@ -156,30 +130,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
             )
 
-        # Get inference logging configuration from args
-        log_inference_wandb = args.inference_wandb_logging
-        inference_logging_step_interval = args.inference_logging_step_interval
-
-        # Get metrics writer if logging is enabled and on the logging rank
-        # Use the same rank convention as training (last rank logs)
-        metrics_writer = None
-        if (
-            inference_logging_step_interval > 0
-            and log_inference_wandb
-            and args.rank == (args.world_size - 1)
-        ):
-            metrics_writer = get_wandb_writer()
-            if metrics_writer is None:
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
-                    "wandb module is available. Inference logging will be disabled.",
-                )
-
-        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(
-            args, model, inference_logging_step_interval, metrics_writer
-        )
+        inference_engine: DynamicInferenceEngine = DynamicInferenceEngine.from_model_and_args(model, args)
         await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True
         )
