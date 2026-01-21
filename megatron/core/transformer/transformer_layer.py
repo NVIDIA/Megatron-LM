@@ -489,8 +489,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         
         Additional kwargs for MHC recompute:
             mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
-            is_last_layer_in_block: If True, the final MLP BDA will not be checkpointed
-                (serves as hook_tensor for unified recompute).
+            is_last_layer_in_recompute_block: If True, this layer is the last in its MHC recompute block.
+                The final MLP BDA will not be checkpointed and will register the unified recompute hook.
         """
         # Remove 'dynamic_inference_decode_only' from kwargs if present
         # this is only used to uniquely identify decode and non-decode cuda graph
@@ -499,7 +499,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         
         # Extract MHC recompute parameters
         mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
-        is_last_layer_in_block = kwargs.pop("is_last_layer_in_block", False)
+        is_last_layer_in_recompute_block = kwargs.pop("is_last_layer_in_recompute_block", False)
         
         hidden_states, context = self._forward_attention(
             *args, 
@@ -512,7 +512,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
             mhc_recompute_manager=mhc_recompute_manager,
-            is_last_layer_in_block=is_last_layer_in_block,
+            is_last_layer_in_recompute_block=is_last_layer_in_recompute_block,
         )
         return output, context
 
@@ -695,7 +695,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context=None,
         padding_mask=None,
         mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None,
-        is_last_layer_in_block: bool = False,
+        is_last_layer_in_recompute_block: bool = False,
     ):
         """
         Perform a forward pass through the feed-forward layer.
@@ -709,8 +709,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 Only used for MoE layers to exclude padding tokens from aux loss computations.
                 The MoELayer will internally transform this to [seq_length, bsz] format.
             mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
-            is_last_layer_in_block: If True, the final MLP BDA will not be checkpointed
-                (serves as hook_tensor for unified recompute).
+            is_last_layer_in_recompute_block: If True, this layer is the last in its MHC recompute block.
+                The final MLP BDA will not be checkpointed and will register the unified recompute hook.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -827,7 +827,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             nvtx_range_pop(suffix="mlp_hyper_connection_post")
 
         return self._forward_post_mlp(
-            mlp_output_with_bias, residual, mhc_recompute_manager, is_last_layer_in_block
+            mlp_output_with_bias, residual, mhc_recompute_manager, is_last_layer_in_recompute_block
         )
 
     def _forward_post_mlp(
@@ -835,7 +835,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         mlp_output_with_bias,
         residual,
         mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None,
-        is_last_layer_in_block: bool = False,
+        is_last_layer_in_recompute_block: bool = False,
     ):
         """
         Perform operations after the MLP computation.
@@ -844,8 +844,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
             mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
-            is_last_layer_in_block: If True, the final MLP BDA will not be checkpointed
-                (serves as hook_tensor for unified recompute).
+            is_last_layer_in_recompute_block: If True, this layer is the last in its MHC recompute block.
+                The final MLP BDA will not be checkpointed and will register the unified recompute hook.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -859,13 +859,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
         with self.bias_dropout_add_exec_handler():
-            # MLP BDA: checkpoint only if NOT the last layer in block
+            # MLP BDA: checkpoint only if NOT the last layer in recompute block
             # Last layer's MLP BDA output serves as hook_tensor for unified recompute
-            mlp_bda_manager = mhc_recompute_manager if not is_last_layer_in_block else None
+            mlp_bda_manager = mhc_recompute_manager if not is_last_layer_in_recompute_block else None
             hidden_states = self.mlp_bda(
                 self.training, self.config.bias_dropout_fusion, mlp_bda_manager
             )(mlp_output_with_bias, residual, self.hidden_dropout)
         nvtx_range_pop(suffix="mlp_bda")
+        
+        # If this is the last layer in the recompute block, register unified recompute hook
+        # The MLP BDA output serves as the hook_tensor that triggers recomputation during backward
+        if mhc_recompute_manager is not None and is_last_layer_in_recompute_block:
+            mhc_recompute_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
         if self.offload_mlp_norm:
             (hidden_states,) = fine_grained_offloading_group_commit(
                 hidden_states, name="mlp_norm", forced_released_tensors=[residual]
