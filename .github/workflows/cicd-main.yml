@@ -20,8 +20,8 @@ on:
     branches:
       - dev
       - main
-      - 'pull-request/[0-9]+'
-      - 'deploy-release/*'
+      - "pull-request/[0-9]+"
+      - "deploy-release/*"
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
@@ -51,6 +51,7 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
+      DISABLE_EXTERNAL_CONTRIBUTOR: ${{ vars.DISABLE_EXTERNAL_CONTRIBUTOR }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -84,6 +85,43 @@ jobs:
 
           # Use SSO membership check result
           IS_MEMBER="${{ steps.check-sso.outputs.is_member }}"
+
+          # If external contributor is disabled, check if user is a repo collaborator or an org collaborator to NVIDIA or NVIDIA-NeMo
+          if [ "${{ env.DISABLE_EXTERNAL_CONTRIBUTOR }}" == "true" ] && [ "${{ steps.check-sso.outputs.is_member }}" != "true" ]; then
+            PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
+
+            echo "Checking if $PR_AUTHOR is a repo collaborator..."
+            API_URL="https://api.github.com/repos/$REPO/collaborators/$PR_AUTHOR"
+            REPO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              $API_URL)
+
+            echo "Checking if $PR_AUTHOR is an org collaborator to NVIDIA-NeMo..."
+            API_URL="https://api.github.com/orgs/NVIDIA-NeMo/members/$PR_AUTHOR"
+            ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              $API_URL)
+
+            echo "Checking if $PR_AUTHOR is an org collaborator to NVIDIA..."
+            API_URL="https://api.github.com/orgs/NVIDIA/members/$PR_AUTHOR"
+            ORG_NVIDIA_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              $API_URL)
+
+            if [ "$REPO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_MEMBERSHIP_RESPONSE" -eq 204 ]; then
+              IS_MEMBER="true"
+            else
+              exit 1
+            fi
+          fi
+
+          # Use SSO membership check result
           if [ "$IS_MEMBER" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
           else
@@ -97,7 +135,7 @@ jobs:
         with:
           issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           repository: ${{ github.repository }}
-          body-includes: '<!--external-contributor-comment-->'
+          body-includes: "<!--external-contributor-comment-->"
 
       - name: Delete comment
         uses: actions/github-script@v7
@@ -343,7 +381,7 @@ jobs:
       - cicd-container-build
       - cicd-parse-unit-tests
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-    name: '${{ matrix.bucket }} - latest'
+    name: "${{ matrix.bucket }} - latest"
     if: |
       (
         success()
@@ -365,9 +403,10 @@ jobs:
           test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: 'true'
+          is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
 
   cicd-parse-integration-tests:
     runs-on: ubuntu-latest
@@ -408,9 +447,11 @@ jobs:
         id: has-run-functional-tests-label
         env:
           GH_TOKEN: ${{ secrets.PAT }}
+          IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "false"
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")')
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL=${HAS_RUN_FUNCTIONAL_TESTS_LABEL:-$IS_CI_WORKLOAD}
           echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
       - name: Parse functional tests
@@ -469,7 +510,7 @@ jobs:
       - cicd-parse-integration-tests
       - cicd-unit-tests-latest
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-    name: '${{ matrix.model }}/${{ matrix.test_case }} - latest'
+    name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
@@ -492,9 +533,10 @@ jobs:
           model: ${{ matrix.model }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: 'false'
+          is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
 
   Nemo_CICD_Test:
     needs:

@@ -79,7 +79,7 @@ class MLP(MegatronModule):
         submodules: MLPSubmodules,
         is_expert: bool = False,
         input_size: Optional[int] = None,
-        ffn_hidden_size: int = None,
+        ffn_hidden_size: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
