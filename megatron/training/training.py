@@ -12,7 +12,7 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import torch.distributed
 
@@ -68,6 +68,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
+from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -331,18 +332,15 @@ def num_floating_point_operations(args, batch_size):
             if args.moe_shared_expert_intermediate_size is None
             else args.moe_shared_expert_intermediate_size
         )
-        # SwiGLU.
-        gated_linear_multiplier = 3 / 2 if args.swiglu else 1
 
-        # The 12x term below comes from the following factors; for more details, see
-        # "APPENDIX: FLOATING-POINT OPERATIONS" in https://arxiv.org/abs/2104.04473.
         # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
         #       backward wgrad [weight gradient], backward dgrad [data gradient]).
-        # - 2x: GEMMs of a particular size are stacked twice in the standard Transformer model
-        #       architectures implemented in this codebase (e.g., h->ffn_h GEMM and ffn_h->h GEMM
-        #       in MLP layer).
+        forward_backward_expansion_factor = 3
         # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
-        expansion_factor = 3 * 2 * 2
+        fma_expansion_factor = 2
+        # - 3x (SwiGLU enabled): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
+        # - 2x (SwiGLU disabled): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
+        ffn_expansion_factor = 3 if args.swiglu else 2
 
         if args.multi_latent_attention:
             assert not args.group_query_attention
@@ -373,8 +371,8 @@ def num_floating_point_operations(args, batch_size):
                     + 1
                 )
             standard_self_attn_term = (
-                3
-                * 2  # fwd(1) + bwd(2) *FMA
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * (
                     ## q lora + rope + q norm
                     q_term
@@ -401,13 +399,19 @@ def num_floating_point_operations(args, batch_size):
             query_projection_size = args.kv_channels * args.num_attention_heads
             key_projection_size = args.kv_channels * args.num_query_groups
             value_projection_size = args.kv_channels * args.num_query_groups
+            gate_projection_size = query_projection_size if args.attention_output_gate else 0
             standard_self_attn_term = (
-                3
-                * 2  # fwd(1) + bwd(2) *FMA
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * (
                     ## qkv proj
                     args.hidden_size
-                    * (query_projection_size + key_projection_size + value_projection_size)
+                    * (
+                        query_projection_size
+                        + key_projection_size
+                        + value_projection_size
+                        + gate_projection_size
+                    )
                     ## core attention
                     + query_projection_size
                     * args.seq_length
@@ -435,7 +439,12 @@ def num_floating_point_operations(args, batch_size):
                     f"current linear attention pattern: {args.linear_attention_freq}"
                 )
             elif args.linear_attention_freq is None:
-                linear_attention_pattern = [1] * num_layers
+                # This should be caught by config validation, but raise here as a safety check
+                raise ValueError(
+                    f"Linear attention type {args.experimental_attention_variant} is specified "
+                    "but linear_attention_freq is None. "
+                    "Please set linear_attention_freq to specify the LA/SDPA layer pattern."
+                )
             else:
                 raise ValueError(
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
@@ -453,8 +462,8 @@ def num_floating_point_operations(args, batch_size):
                 qk_dim = qk_head_dim * num_qk_heads
                 v_dim = v_head_dim * num_v_heads
                 linear_self_attn_term = (
-                    3
-                    * 2  # fwd(1) + bwd(2) *FMA
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
                     * (
                         ## in proj
                         args.hidden_size
@@ -491,25 +500,25 @@ def num_floating_point_operations(args, batch_size):
             * args.seq_length
             * (
                 # MLP
-                expansion_factor
-                * num_layers
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * args.hidden_size
                 * (
                     # dense layer (deepseek v2, v3 style)
-                    (args.ffn_hidden_size * gated_linear_multiplier)
-                    * (num_dense_layers / num_layers)
+                    (args.ffn_hidden_size * ffn_expansion_factor)
+                    * num_dense_layers
                     # routed experts
-                    + (moe_ffn_hidden_size * num_experts_routed_to * gated_linear_multiplier)
-                    * (num_moe_layers / num_layers)
+                    + (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
+                    * num_moe_layers
                     # Shared Experts.
-                    + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
-                    * (num_moe_layers / num_layers)
+                    + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
+                    * num_moe_layers
                 )
                 # Self Attention
                 + self_attn_term
                 # MTP norms and proj
-                + 3
-                * 2
+                + forward_backward_expansion_factor
+                * fma_expansion_factor
                 * mtp_num_layers
                 * (
                     # MTP eh norm + final nrom
@@ -518,7 +527,11 @@ def num_floating_point_operations(args, batch_size):
                     + 2 * args.hidden_size * args.hidden_size
                 )
                 # Logit.
-                + 3 * 2 * args.hidden_size * args.padded_vocab_size * (mtp_num_layers + 1)
+                + forward_backward_expansion_factor
+                * fma_expansion_factor
+                * args.hidden_size
+                * args.padded_vocab_size
+                * (mtp_num_layers + 1)  # MTP + final logit
             )
         )
         return total_floating_point_operations
@@ -1250,17 +1263,9 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     else:
         raise ValueError("Invalid optimizer type!")
 
-    # Construct the appropriate config_overrides object.
-    # TODO: add more logic here as needed down the road.
-    if args.decoupled_lr is not None:
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        decoupled_optimizer_config = copy.deepcopy(config)
-        decoupled_optimizer_config.lr = args.decoupled_lr
-        if args.decoupled_min_lr is not None:
-            decoupled_optimizer_config.min_lr = args.decoupled_min_lr
-        config_overrides = {decoupled_param_key: decoupled_optimizer_config}
-    else:
-        config_overrides = None
+    # Construct the appropriate config_overrides object. This default handles many cases, but
+    #  can be added to as needed by the user, or replaced entirely with a custom override.
+    config_overrides = get_standard_config_overrides(config=config)
 
     return config, config_overrides
 
@@ -1437,6 +1442,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        # Offload optimizer states to CPU if enabled.
+        if args.offload_optimizer_states:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.offload_states()
+
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -1469,6 +1480,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 for optim_instance in optimizer.chained_optimizers:
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
+
+        # Release GPU memory for offloaded optimizer states.
+        # This needs to be done after _copy_main_params_to_param_buffer().
+        # Separate offload and release to allow early D2H transfer to overlap with other operations.
+        if args.offload_optimizer_states:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.release_offloaded_gpu_states()
 
         # Forward pass.
         losses_reduced = forward_backward_func(
@@ -2317,7 +2336,21 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+
+    # Wrap finalize_model_grads to reload offloaded optimizer states before grad finalization.
+    # This allows H2D transfer to overlap with grad all-reduce.
+    if args.offload_optimizer_states:
+
+        def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
+            # Reload offloaded states for all DistributedOptimizer instances
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.reload_offloaded_states()
+            return finalize_model_grads(*fmg_args, **fmg_kwargs)
+
+        config.finalize_model_grads_func = finalize_model_grads_with_state_reload
+    else:
+        config.finalize_model_grads_func = finalize_model_grads
 
     if args.log_energy:
         energy_monitor.setup()

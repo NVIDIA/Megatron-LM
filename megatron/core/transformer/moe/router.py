@@ -10,6 +10,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
+    apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
@@ -21,6 +22,7 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
     z_loss_func,
 )
+from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -200,6 +202,10 @@ class TopKRouter(Router):
         else:
             self.global_tokens_per_expert = None
             self.ga_steps = None
+
+        self.router_replay = None
+        if self.config.enable_routing_replay:
+            self.router_replay = RouterReplay()
 
     def _maintain_float32_expert_bias(self):
         """
@@ -579,6 +585,7 @@ class TopKRouter(Router):
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
+                router_replay=self.router_replay,
             )
 
         # Apply token dropping to probs and routing_map.
@@ -653,6 +660,12 @@ class TopKRouter(Router):
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
+
+        if self.config.moe_router_force_biased is not None:
+            # Apply biased logits with shared random bias across all ranks
+            logits = apply_biased_logits(
+                logits, self.config.moe_router_force_biased, self.layer_number
+            )
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
 
