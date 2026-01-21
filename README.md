@@ -1,7 +1,7 @@
 <div align="center">
 
-Megatron-LM & Megatron Core
-===========================
+Megatron-LM and Megatron Core
+=============================
 
 <h4>GPU-optimized library for training transformer models at scale</h4>
 
