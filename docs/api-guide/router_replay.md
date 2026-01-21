@@ -17,7 +17,7 @@ This feature is designed to enhance determinism and analyzability in MoE model t
 The design follows the principles of being non-intrusive and on-demand, with the core idea of activating the replay logic only when explicitly requested by the user.
 
 *   **Core Components**:
-    *   `RouterReplay` (located in `megatron/core/transformer/moe/moe_utils.py`): A utility class for replaying MoE routing decisions. When enabled via the `enable_routing_replay` flag, a separate instance of `RouterReplay` is created for each MoE layer's router. Each instance is responsible for loading routing data and providing the deterministic routing decisions for its corresponding layer during the forward pass.
+    *   `RouterReplay` (located in `megatron/core/transformer/moe/router_replay.py`): A utility class for replaying MoE routing decisions. When enabled via the `enable_routing_replay` flag, a separate instance of `RouterReplay` is created for each MoE layer's router. Each instance is responsible for loading routing data and providing the deterministic routing decisions for its corresponding layer during the forward pass.
     *   `enable_routing_replay` (located in `megatron/core/transformer/transformer_config.py`): A boolean global configuration flag that serves as the sole entry point for enabling this feature.
 
 *   **Workflow**:
@@ -71,15 +71,14 @@ The implementation cleanly separates the replay logic from the router's core com
     - For training recomputation (activation checkpointing or pipeline recompute), set action: `REPLAY_BACKWARD` during recomputation.
     - Per micro‑batch indices are consumed from `replay_backward_list` in FIFO order.
 5.  **Cleanup**
-    - Use `RouterReplay.clear_global_indices()` and `RouterReplay.clear_global_router_replay_action()` to restore default behavior.
+    - Use `RouterReplay.clear_global_indices()`, `RouterReplay.clear_global_router_replay_action()`, and `RouterReplay.clear_global_router_replay_instances()` to restore default behavior and prevent memory leaks.
 
 #### Quick usage with `topk_routing_with_score_function`
 
 ```python
 import torch
-from megatron.core.transformer.moe.moe_utils import (
-    RouterReplay, RouterReplayAction, topk_routing_with_score_function,
-)
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
 
 rr = RouterReplay()
 
@@ -103,6 +102,7 @@ probs_rep, routing_map_rep = topk_routing_with_score_function(
 
 RouterReplay.clear_global_router_replay_action()
 RouterReplay.clear_global_indices()
+RouterReplay.clear_global_router_replay_instances()
 ```
 
 ### 6. Minimal Demo
@@ -112,9 +112,9 @@ Here is a minimal code example showing how to use RouterReplay for recording and
 ```python
 import torch
 import torch.distributed as dist
-from megatron.core.config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.moe.moe_utils import RouterReplayAction, RouterReplay
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 
 
 # Initialize distributed training
@@ -155,7 +155,7 @@ torch.save(routing_output.top_k_idx, "/tmp/replay.pt")
 
 # Load indices from file and set as target for replay
 replay_indices = torch.load("/tmp/replay.pt")
-for router_instance in RouterReplay.router_instances:
+for router_instance in RouterReplay.global_router_replay_instances:
     router_instance.target_topk_idx = replay_indices
 
 # Set global router replay action to REPLAY_FORWARD
@@ -169,6 +169,8 @@ print(f"Are indices the same? {torch.equal(routing_output.top_k_idx, replay_rout
 
 # Clean up
 RouterReplay.clear_global_router_replay_action()
+RouterReplay.clear_global_indices()
+RouterReplay.clear_global_router_replay_instances()
 if dist.is_initialized():
     dist.destroy_process_group()
 ```
