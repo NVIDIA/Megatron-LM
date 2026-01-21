@@ -276,12 +276,15 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
 
 def report_memory(name):
     """Simple GPU memory report."""
+    args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
-    string += ' | allocated: {}'.format(torch.cuda.memory_allocated() / mega_bytes)
-    string += ' | max allocated: {}'.format(torch.cuda.max_memory_allocated() / mega_bytes)
-    string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
-    string += ' | max reserved: {}'.format(torch.cuda.max_memory_reserved() / mega_bytes)
+    string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
+    string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
+    string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
+    string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
+    if args.log_device_memory_used:
+        string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
