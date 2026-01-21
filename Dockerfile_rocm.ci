@@ -84,7 +84,7 @@ RUN git clone --recursive https://github.com/ROCm/TransformerEngine.git && \
     git checkout ${TE_COMMIT} && \
     git submodule update --init --recursive && \
     echo "TransformerEngine at commit:" $(git rev-parse HEAD) && \
-    pip install .
+    pip install --no-build-isolation .
 
 RUN git clone https://github.com/caaatch22/grouped_gemm.git &&\
     cd grouped_gemm &&\
