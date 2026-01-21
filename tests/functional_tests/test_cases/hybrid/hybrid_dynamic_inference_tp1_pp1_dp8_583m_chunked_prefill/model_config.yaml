@@ -1,0 +1,76 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+TEST_TYPE: frozen-start
+MODE: inference
+MODEL_ARGS:
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --timing-log-level: 0
+  --load: ${CHECKPOINT_LOAD_PATH}/model/mamba_hybrid_2b/dcp/mcore-v1_bf16/checkpoint
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/mamba_hybrid_2b/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --tokenizer-type: TikTokenizer
+  --tiktoken-pattern: v2
+  --distributed-backend: nccl
+  --log-interval: 1
+  --transformer-impl: transformer_engine
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 1
+  --use-mcore-models: true
+  --is-hybrid-model: true
+  --model-provider: mamba
+  --init-method-std: 0.0198
+  --untie-embeddings-and-output-weights: true
+  --disable-bias-linear: true
+  --init-method-std: 0.014
+  --position-embedding-type: none
+  --num-layers: 50
+  --hidden-size: 2048
+  --ffn-hidden-size: 11264
+  --num-attention-heads: 16
+  --kv-channels: 128
+  --hybrid-override-pattern: M-M-M-M*-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-
+  --spec: megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
+  --normalization: RMSNorm
+  --swiglu: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --seq-length: 4096
+  --max-position-embeddings: 4096
+  --micro-batch-size: 1
+  --ckpt-format: torch_dist
+  --ckpt-fully-parallel-save: true
+  --ckpt-fully-parallel-load: true
+  --ckpt-assume-constant-structure: true
+  --dist-ckpt-strictness: log_unexpected
+  --bf16: true
+  --attention-backend: flash
+  --no-create-attention-mask-in-dataloader: true
+  --num-workers: 8
+  --use-checkpoint-args: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --no-load-optim: true
+  --deterministic-mode: true
+  --save-interval: 2000
+  --temperature: 1.0
+  --top_k: 1
+  --return-log-probs: true
+  --num-tokens-to-generate: 30
+  --max-tokens-to-oom: 3600000
+  --inference-dynamic-batching-max-tokens: 256
+  --inference-dynamic-batching-max-requests: 256
+  --inference-max-seq-length: 4096
+  --enable-chunked-prefill: true
+  --output-path: ${TENSORBOARD_PATH}
+  --prompts: 'SYSTEM LOG - DAILY REPORTING\\nDATE: 2024-10-27\\nSERVER: US-EAST-1A\\n\\nBEGIN LOG STREAM:\\n\\n[Entry 0001]\\nTimestamp: 08:00:01\\nUser: admin_01\\nAction: Login\\nStatus: Success\\nNote: Routine maintenance check initiated.\\n\\n[Entry 0002]\\nTimestamp: 08:01:15\\nUser: system_daemon\\nAction: Backup\\nStatus: Pending\\nNote: awaiting clearance for volume mount.\\n\\n[Entry 0003]\\nTimestamp: 08:02:22\\nUser: user_404\\nAction: Query\\nStatus: Failed\\nNote: Connection timeout on port 8080.\\n\\n[Entry 0004]\\nTimestamp: 08:05:00\\nUser: admin_02\\nAction: Update\\nStatus: Success\\nNote: Patch 4.5.1 applied to kernel.\\n\\n[Entry 0005]\\nTimestamp: 08:10:45\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 12ms.\\n\\n[Entry 0006]\\nTimestamp: 08:12:30\\nUser: db_manager\\nAction: Write\\nStatus: Success\\nNote: Written 500 records to shard A.\\n\\n[Entry 0007]\\nTimestamp: 08:15:00\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 14ms.\\n\\n[Entry 0008]\\nTimestamp: 08:18:22\\nUser: user_102\\nAction: Login\\nStatus: Success\\nNote: User accessing from IP 192.168.1.55.\\n\\n[Entry 0009]\\nTimestamp: 08:20:00\\nUser: system_daemon\\nAction: Garbage_Collection\\nStatus: Success\\nNote: Freed 2048MB of heap memory.\\n\\n[Entry 0010]\\nTimestamp: 08:25:10\\nUser: admin_01\\nAction: Logout\\nStatus: Success\\nNote: Session duration 25 minutes.\\n\\n[Entry 0011]\\nTimestamp: 08:30:00\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 11ms.\\n\\n[Entry 0012]\\nTimestamp: 08:32:45\\nUser: unknown\\nAction: Auth_Attempt\\nStatus: Denied\\nNote: Invalid credentials provided 3 times.\\n\\n[Entry 0013]\\nTimestamp: 08:35:20\\nUser: system_audit\\nAction: Scan\\nStatus: In_Progress\\nNote: Scanning sector 7 for vulnerabilities.\\n\\n[Entry 0014]\\nTimestamp: 08:40:00\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 13ms.\\n\\n[Entry 0015]\\nTimestamp: 08:45:15\\nUser: user_888\\nAction: Upload\\nStatus: Success\\nNote: File "data_report.csv" uploaded to bucket.\\n\\n[Entry 0016]\\nTimestamp: 08:50:00\\nUser: load_balancer\\nAction: Scale_Up\\nStatus: Success\\nNote: Added 2 instances to the pool.\\n\\n[Entry 0017]\\nTimestamp: 08:55:30\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 15ms.\\n\\n[Entry 0018]\\nTimestamp: 09:00:00\\nUser: cron_job\\nAction: Execute\\nStatus: Success\\nNote: Daily summary report generation started.\\n\\n[Entry 0019]\\nTimestamp: 09:05:12\\nUser: user_555\\nAction: Download\\nStatus: Success\\nNote: Retrieved "image_001.png".\\n\\n[Entry 0020]\\nTimestamp: 09:10:00\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 12ms.\\n\\n[Entry 0021]\\nTimestamp: 09:15:45\\nUser: admin_03\\nAction: Config_Change\\nStatus: Success\\nNote: Firewall rules updated for port 22.\\n\\n[Entry 0022]\\nTimestamp: 09:20:00\\nUser: system_daemon\\nAction: Sync\\nStatus: Success\\nNote: Database replica synchronization complete.\\n\\n[Entry 0023]\\nTimestamp: 09:25:10\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 10ms.\\n\\n[Entry 0024]\\nTimestamp: 09:30:00\\nUser: user_777\\nAction: Query\\nStatus: Success\\nNote: Complex SQL query executed in 200ms.\\n\\n[Entry 0025]\\nTimestamp: 09:35:30\\nUser: error_handler\\nAction: Alert\\nStatus: Warning\\nNote: High CPU usage detected on Node 4.\\n\\n[Entry 0026]\\nTimestamp: 09:40:00\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 18ms.\\n\\n[Entry 0027]\\nTimestamp: 09:45:15\\nUser: cache_manager\\nAction: Flush\\nStatus: Success\\nNote: Redis cache cleared.\\n\\n[Entry 0028]\\nTimestamp: 09:50:00\\nUser: user_202\\nAction: Login\\nStatus: Success\\nNote: New device detected.\\n\\n[Entry 0029]\\nTimestamp: 09:55:45\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 12ms.\\n\\n[Entry 0030]\\nTimestamp: 10:00:00\\nUser: system_daemon\\nAction: Archive\\nStatus: Success\\nNote: Logs from yesterday archived to cold storage.\\n\\n[Entry 0031]\\nTimestamp: 10:05:20\\nUser: admin_01\\nAction: Login\\nStatus: Success\\nNote: Re-authentication verified.\\n\\n[Entry 0032]\\nTimestamp: 10:10:00\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 13ms.\\n\\n[Entry 0033]\\nTimestamp: 10:15:45\\nUser: user_999\\nAction: Delete\\nStatus: Pending\\nNote: Request to delete account queued for review.\\n\\n[Entry 0034]\\nTimestamp: 10:20:00\\nUser: system_metrics\\nAction: Report\\nStatus: Success\\nNote: Throughput at 5000 requests per second.\\n\\n[Entry 0035]\\nTimestamp: 10:25:10\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 11ms.\\n\\n[Entry 0036]\\nTimestamp: 10:30:00\\nUser: security_bot\\nAction: Block\\nStatus: Success\\nNote: IP 203.0.113.4 blocked for suspicious activity.\\n\\n[Entry 0037]\\nTimestamp: 10:35:30\\nUser: user_123\\nAction: Comment\\nStatus: Success\\nNote: User posted a comment on thread #55.\\n\\n[Entry 0038]\\nTimestamp: 10:40:00\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 12ms.\\n\\n[Entry 0039]\\nTimestamp: 10:45:15\\nUser: email_service\\nAction: Send\\nStatus: Success\\nNote: Batch of 100 newsletters sent.\\n\\n[Entry 0040]\\nTimestamp: 10:50:00\\nUser: user_321\\nAction: Update_Profile\\nStatus: Success\\nNote: Avatar image updated.\\n\\n[Entry 0041]\\nTimestamp: 10:55:45\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 14ms.\\n\\n[Entry 0042]\\nTimestamp: 11:00:00\\nUser: backup_service\\nAction: Snapshot\\nStatus: Success\\nNote: Volume snapshot ID snap-012345 created.\\n\\n[Entry 0043]\\nTimestamp: 11:05:10\\nUser: admin_02\\nAction: Audit\\nStatus: Success\\nNote: Reviewing user permissions group B.\\n\\n[Entry 0044]\\nTimestamp: 11:10:00\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 12ms.\\n\\n[Entry 9999]\\nTimestamp: 11:11:11\\nUser: SUPER_ADMIN\\nAction: KEY_GENERATION\\nStatus: CRITICAL\\nNote: The secret override password for the system is Blueberry-Pancake-42.\\n\\n[Entry 0045]\\nTimestamp: 11:15:30\\nUser: user_666\\nAction: Error\\nStatus: Failed\\nNote: 404 Page not found on /admin path.\\n\\n[Entry 0046]\\nTimestamp: 11:20:00\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 13ms.\\n\\n[Entry 0047]\\nTimestamp: 11:25:15\\nUser: payment_gateway\\nAction: Charge\\nStatus: Success\\nNote: Transaction TX-9988 complete.\\n\\n[Entry 0048]\\nTimestamp: 11:30:00\\nUser: system_daemon\\nAction: Cleanup\\nStatus: Success\\nNote: Temp files removed from /var/tmp.\\n\\n[Entry 0049]\\nTimestamp: 11:35:45\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 12ms.\\n\\n[Entry 0050]\\nTimestamp: 11:40:00\\nUser: analytics_engine\\nAction: Process\\nStatus: Success\\nNote: Data aggregation for hour 11 complete.\\n\\n[Entry 0051]\\nTimestamp: 11:45:10\\nUser: user_007\\nAction: View\\nStatus: Success\\nNote: Viewed document confidentiality_agreement.pdf.\\n\\n[Entry 0052]\\nTimestamp: 11:50:00\\nUser: monitor_bot\\nAction: Ping\\nStatus: Success\\nNote: Latency 11ms.\\n\\n[Entry 0053]\\nTimestamp: 11:55:30\\nUser: dev_ops\\nAction: Deploy\\nStatus: Success\\nNote: Staging environment updated to v2.1.\\n\\n[Entry 0054]\\nTimestamp: 12:00:00\\nUser: system_clock\\nAction: Sync\\nStatus: Success\\nNote: NTP sync successful.\\n\\nEND LOG STREAM.\\n\\nQUERY:\\nRetrieve the information from Entry 9999.\\nThe Note for Entry 9999 states that the secret override password is:'
+  --incoming-requests-per-step: 32 
+  --inference-repeat-n: 3
+  --no-record-throughput: true
+METRICS:
+  - "generated_tokens"
+  - "logprobs"
