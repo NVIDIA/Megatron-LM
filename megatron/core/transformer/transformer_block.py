@@ -859,8 +859,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # Register unified recompute hook on final output
         # The hook_tensor is the last layer's MLP BDA output (NOT checkpointed),
         # which is now hidden_states after final layernorm processing
-        if mhc_manager is not None:
-            mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+        # if mhc_manager is not None:
+        #     mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
         return hidden_states
 
