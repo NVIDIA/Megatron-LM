@@ -702,6 +702,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             allocate_memory_buffer()
             allocate_mamba_states()
 
+        # Allocate routing metadata for MoE models.
+        if self.moe_router_topk is not None:
+            from megatron.core.inference.contexts.routing_metadata import RoutingMetadata
+
+            self.routing_metadata = RoutingMetadata(
+                context=self,
+                moe_router_topk=self.moe_router_topk,
+            )
+        else:
+            self.routing_metadata = None
+
         # Reset attention and Mamba state.
         self.reset_attention_state()
         self.reset_mamba_state()
@@ -1413,6 +1424,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 padded_batch_dimensions=self.padded_batch_dimensions,
             )
 
+        if self.routing_metadata is not None:
+            if self.using_cuda_graph_this_step():
+                self.routing_metadata.enable_static_buffer_recording()
+            else:
+                self.routing_metadata.disable_static_buffer_recording()
+            
     def reset(self) -> None:
         """Reset entire context.
 

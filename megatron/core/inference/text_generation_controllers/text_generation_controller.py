@@ -683,8 +683,9 @@ class TextGenerationController:
     def _router_record_bookkeeping(self) -> Optional[Dict[int, Tensor]]:
         """Collect and map routing indices per request for MoE router recording.
 
-        This method retrieves recorded routing decisions from RouterReplay and maps
-        them to individual requests using the context's request_ids and query_lengths.
+        This method retrieves recorded routing decisions and maps them to individual
+        requests using the context's request_ids and query_lengths. Uses the context's
+        routing_metadata when available (which handles CUDA graph static buffers automatically).
         Must be called while context attributes are still valid (before request transitions).
 
         Returns:
@@ -696,36 +697,28 @@ class TextGenerationController:
         if not getattr(config, 'enable_routing_replay', False):
             return None
 
-        raw_routing_indices = RouterReplay.get_recorded_data()
-        if not raw_routing_indices:
+        # Get routing indices - use routing_metadata if available (handles CUDA graph static buffers)
+        context = self.inference_wrapped_model.inference_context
+        if context.routing_metadata is None:
             return None
+        
+        stacked_routing = context.routing_metadata.get_routing_indices()
 
-        # Filter out None entries (non-MoE layers)
-        raw_routing_indices = [r for r in raw_routing_indices if r is not None]
-        if not raw_routing_indices:
+        if stacked_routing is None:
             return None
-
-        # raw_routing_indices is a list of length num_layers 
-        # each entry is a Tensor of shape [local_token_count, topk]
-        # Now we will try to map these to requests
 
         # Get active request info from context
-        context = self.inference_wrapped_model.inference_context
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
         active_request_ids = context.request_ids[active_request_slice].tolist()
         active_query_lengths = context.request_query_lengths[active_request_slice].tolist()
         active_token_count = context.active_token_count
+
 
         # Get TP group for all-gather if using sequence parallelism
         # With sequence parallelism, each TP rank only sees a portion of the tokens,
         # so we need to gather routing indices across all TP ranks.
         tp_group = self.inference_wrapped_model.tp_group
         tp_size = get_pg_size(tp_group)
-
-        # Stack all layers first to do a single all-gather instead of per-layer all-gathers
-        # Each layer_routing has shape [local_token_count, topk]
-        # After stacking: [local_token_count, num_layers, topk]
-        stacked_routing = torch.stack(raw_routing_indices, dim=1)
 
         # All-gather across TP group if using sequence parallelism (tp_size > 1)
         if tp_size > 1 and get_model_config(self.inference_wrapped_model.model).sequence_parallel:
