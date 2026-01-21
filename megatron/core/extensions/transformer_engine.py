@@ -915,6 +915,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         if self.config.delay_wgrad_compute:
             super().backward_dw()
 
+    def get_backward_dw_params(self):
+        """Get the parameters that need backward wgrad compute."""
+        return [getattr(self, weight_name) for weight_name in self.weight_names]
+
 
 class TEColumnParallelLinear(TELinear):
     """Wrapper for the Transformer-Engine's `Linear` layer

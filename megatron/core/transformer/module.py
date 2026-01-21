@@ -240,7 +240,11 @@ class GraphableMegatronModule(MegatronModule):
                     if not hasattr(module, "register_wgrad_accumulation_and_reduce_hooks"):
                         continue
                     for param in module.parameters(recurse=False):
-                        params[id(param)] = param
+                        if hasattr(module, "get_backward_dw_params"):
+                            for param in module.get_backward_dw_params():
+                                params[id(param)] = param
+                        else:
+                            params[id(param)] = param
 
         # Save forward pre-hooks and backward post-hooks.
         if make_forward_pre_hook_func is not None:
