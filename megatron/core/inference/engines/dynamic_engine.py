@@ -19,6 +19,7 @@ import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
+from torch_memory_saver import torch_memory_saver
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
@@ -336,6 +337,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
+        torch_memory_saver.pause()
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(

@@ -761,9 +761,6 @@ class SequencePacker:
         # (it depends on the original trajectories passed to pack_sequences)
 
         # Invert attention mask, before inversion: (True = attend, False = mask)
-        # print("WTF")
-        # torch.distributed.breakpoint()
-        # attention_mask = ~attention_mask
         attention_mask.bitwise_not_()
 
         # Create the PackingInfo dataclass

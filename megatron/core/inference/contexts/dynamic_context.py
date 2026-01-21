@@ -69,6 +69,8 @@ except ImportError:
 if TYPE_CHECKING:
     import wandb as WandbModule
 
+from torch_memory_saver import torch_memory_saver
+torch_memory_saver.hook_mode = "torch"
 
 class ContextOverflowError(Exception):
     """Base exception for when a new request does not fit.
@@ -650,13 +652,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
             else:
-                # from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
-                # mempool = CudaGraphManager.global_mempool
-                # device = torch.cuda.current_device()
-                # torch._C._cuda_beginAllocateCurrentThreadToPool(device, mempool)
-                from torch_memory_saver import torch_memory_saver
-                torch_memory_saver.hook_mode = "torch"
                 with torch_memory_saver.region(enable_cpu_backup=True):
                     self.memory_buffer = torch.empty(
                         (
@@ -670,8 +665,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                         dtype=self.params_dtype,
                         device=torch.cuda.current_device(),
                     )
-                # print(f"SIZE OF MEMORY BUFFER: {self.memory_buffer.nbytes / (1024 ** 3) }")
-                # torch._C._cuda_endAllocateToPool(device, mempool)
 
         # Optional state tensors for hybrid models
         def allocate_mamba_states():

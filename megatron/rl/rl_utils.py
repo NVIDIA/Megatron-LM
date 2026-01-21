@@ -1615,29 +1615,7 @@ def megatron_rl_inference_mode(
                 #     reset_cuda_graphs
                 # ), "reset_cuda_graphs must be True when offloading kv cache during training"
 
-                # Re-allocate the memory buffer out of the global mempool.
-                # from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
-                # mempool = CudaGraphManager.global_mempool
-                # device = torch.cuda.current_device()
                 torch_memory_saver.resume()
-
-                '''
-                torch._C._cuda_beginAllocateCurrentThreadToPool(device, mempool)
-                inference_interface._inference_engine.context.memory_buffer = torch.empty(
-                    (
-                        2,  # key and value
-                        inference_interface._inference_engine.context.num_attention_layers,
-                        inference_interface._inference_engine.context.block_allocator.total_count,
-                        inference_interface._inference_engine.context.block_size_tokens,
-                        inference_interface._inference_engine.context.num_attention_heads_per_partition,
-                        inference_interface._inference_engine.context.hidden_size_per_attention_head,
-                    ),
-                    dtype=inference_interface._inference_engine.context.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-                torch._C._cuda_endAllocateToPool(device, mempool)
-                '''
 
                 logger.debug(
                     f"[{dist.get_rank()}] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
@@ -1673,13 +1651,6 @@ def megatron_rl_inference_mode(
                 logger.debug(
                     f"[{dist.get_rank()}] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
                 )
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
-
-                # Dereference the memory buffer so it can be reclaimed during training.
-                # TODO(helenn) Can I just raw delete the memory buffer pointer like this?
-                # torch._C._cuda_cudaCachingAllocator_raw_delete(inference_interface._inference_engine.context.memory_buffer.data_ptr())
-                # inference_interface._inference_engine.context.memory_buffer = None
-                # del(inference_interface._inference_engine.context.memory_buffer)
                 torch_memory_saver.pause()
 
             elif remove_kv_cache_during_training:

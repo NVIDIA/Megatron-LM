@@ -228,7 +228,6 @@ class _CudagraphGlobalRecord:
     'record_bwd_graph."""
     cudagraph_record = []
     cudagraph_inference_record = []
-    allocator_saved_states = []  # inference, then training. states of type torch._C._cuda_CUDAAllocator_AllocatorState
 
     @classmethod
     def record_fwd_graph(cls, runner, args, kwargs):
@@ -1373,16 +1372,6 @@ class CudaGraphManager(torch.nn.Module):
                     _CudagraphGlobalRecord.cudagraph_inference_record.append(
                         (runner, "fwd", args, kwargs)
                     )
-
-                    # Snapshot the allocator state here if this is the last layer.
-                    if runner.is_last_layer:
-                        mempool = CudaGraphManager.global_mempool
-                        device = torch.cuda.current_device()
-                        _CudagraphGlobalRecord.allocator_saved_states.append(
-                            torch._C._cuda_getCheckpointState(device, mempool)
-                        )
-                        # torch.distributed.breakpoint()
-
 
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
