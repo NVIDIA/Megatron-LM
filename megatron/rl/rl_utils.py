@@ -2,6 +2,7 @@
 
 import gc
 
+from functools import partial
 # Keep this to make the env registered.
 import itertools
 import logging
@@ -882,8 +883,6 @@ def prepare_trajectories(
     trajs = []
     generation_masks = []
     inference_logprobs = []
-    # TODO(vitalyk): because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
-    # But in sequence packing, batch sizes are shrinking. Here, the batch size increases.
     for rollout in rollouts:
         # traj, gen mask and logprobs are lists now.
         # each list entry is a turn, single-turn environments just have a single-element list.
@@ -958,6 +957,80 @@ def prepare_trajectories(
     # But now the deepseek tokenizer has the pad token set to eod, we need to handle this.
     # assert (tokenizer.pad != tokenizer.eod), "Pad and eod should be different"
     return trajs, generation_masks, inference_logprobs
+
+
+def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None):
+    if packing_context is not None:
+        # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
+        bin_tensor = next(data_iterator)[0]
+        #TODO(jalbericiola): change for named tuple
+        (b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params) = (
+            load_packed_data_by_index(bin_tensor.item(), packing_context, is_correction)
+        )
+    else:
+        b_trajs, b_posids = next(data_iterator)
+        b_packed_seq_params = None
+
+    return (
+        get_logprobs(
+            model,
+            b_trajs.cuda(),
+            b_posids.cuda(),
+            no_grad=True,
+            sequence_packing=b_packed_seq_params is not None, 
+            packed_seq_params=b_packed_seq_params,
+        ),
+        None,
+    )
+
+
+def _compute_logprobs_batch(
+    model,
+    data_loader,
+    forward_backward_func,
+    packing_context,
+    trajs_batch_size, # n_bins for seq packing, and batch_size for non seq packing
+    seq_length,
+    logprobs_batch_size,
+    decoder_seq_length,
+    dtype,
+    is_correction,
+):
+    """Compute logprobs for all batches in the data loader."""
+    logprobs_list = []
+    data_iterator = iter(data_loader)
+    for i in range(len(data_loader)):
+        output_tensor = forward_backward_func(
+            forward_step_func=partial(logprobs_forward_step, is_correction=is_correction, packing_context=packing_context),
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=1,
+            seq_length=seq_length,
+            micro_batch_size=logprobs_batch_size,
+            decoder_seq_length=decoder_seq_length,
+            forward_only=True,
+            adjust_tensor_shapes_fn=None,
+        )
+        if is_pipeline_last_stage():
+            logprobs_list.append(output_tensor[0].detach())
+
+    if is_pipeline_last_stage():
+        logprobs = torch.concat(logprobs_list, dim=0)
+        assert logprobs.dtype == dtype
+    else:
+        logprobs = torch.empty(
+            trajs_batch_size,
+            seq_length-1,
+            dtype=dtype,
+            device=torch.cuda.current_device(),
+        )
+
+    dist.broadcast(
+        logprobs,
+        src=get_pipeline_model_parallel_last_rank(),
+        group=get_pipeline_model_parallel_group(),
+    )
+    return logprobs.cpu()
 
 
 def prepare_data_for_update(
@@ -1036,6 +1109,7 @@ def prepare_data_for_update(
                 rollouts, tokenizer, args.seq_length, args.rl_use_sequence_packing, args.rl_skip_bos_token
             )
 
+        packing_context = None
         # Build trajectories based on sequence packing or standard processing
         if args.rl_use_sequence_packing:
             with nvtx_range("sequence_packing", time=True):
@@ -1087,73 +1161,24 @@ def prepare_data_for_update(
                     forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
                 )
 
-            def logprobs_forward_step(data_iterator, model):
-                if args.rl_use_sequence_packing:
-                    # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
-                    bin_tensor = next(data_iterator)[0]
-                    #TODO(jalbericiola): change for named tuple
-                    (b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params) = (
-                        load_packed_data_by_index(bin_tensor.item(), packing_context, args.rl_inference_logprobs_is_correction)
-                    )
-                else:
-                    b_trajs, b_posids = next(data_iterator)
-                    b_packed_seq_params = None
-
-                return (
-                    get_logprobs(
-                        model,
-                        b_trajs.cuda(),
-                        b_posids.cuda(),
-                        no_grad=True,
-                        sequence_packing=args.rl_use_sequence_packing,                       
-                        packed_seq_params=b_packed_seq_params,
-                    ),
-                    None,
-                )
 
             dtype = (
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
             )
 
-            def _compute_logprobs_batch():
-                """Compute logprobs for all batches in the data loader."""
-                logprobs_list = []
-                data_iterator = iter(data_loader)
-                for i in range(len(data_loader)):
-                    output_tensor = forward_backward_func(
-                        forward_step_func=logprobs_forward_step,
-                        data_iterator=data_iterator,
-                        model=model,
-                        num_microbatches=1,
-                        seq_length=args.seq_length,
-                        micro_batch_size=logprobs_batch_size,
-                        decoder_seq_length=args.decoder_seq_length,
-                        forward_only=True,
-                        adjust_tensor_shapes_fn=None,
-                    )
-                    if is_pipeline_last_stage():
-                        logprobs_list.append(output_tensor[0].detach())
-
-                if is_pipeline_last_stage():
-                    logprobs = torch.concat(logprobs_list, dim=0)
-                    assert logprobs.dtype == dtype
-                else:
-                    logprobs = torch.empty(
-                        len(compute_trajs),
-                        args.seq_length - 1,
-                        dtype=dtype,
-                        device=torch.cuda.current_device(),
-                    )
-
-                dist.broadcast(
-                    logprobs,
-                    src=get_pipeline_model_parallel_last_rank(),
-                    group=get_pipeline_model_parallel_group(),
-                )
-                return logprobs.cpu()
-
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
-                old_logprobs = _compute_logprobs_batch()
+                old_logprobs = _compute_logprobs_batch(
+                    model=model,
+                    data_loader=data_loader,
+                    forward_backward_func=forward_backward_func,
+                    packing_context=packing_context,
+                    trajs_batch_size=len(compute_trajs),
+                    seq_length=args.seq_length,
+                    logprobs_batch_size=logprobs_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    dtype=dtype,
+                    is_correction=args.rl_inference_logprobs_is_correction,
+                )
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
@@ -1161,8 +1186,18 @@ def prepare_data_for_update(
                     k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
                 }
                 model.load_state_dict(ref_state_dict)
-
-                ref_logprobs = _compute_logprobs_batch()
+                ref_logprobs = _compute_logprobs_batch(
+                    model=model,
+                    data_loader=data_loader,
+                    forward_backward_func=forward_backward_func,
+                    packing_context=packing_context,
+                    trajs_batch_size=len(compute_trajs),
+                    seq_length=args.seq_length,
+                    logprobs_batch_size=logprobs_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    dtype=dtype,
+                    is_correction=args.rl_inference_logprobs_is_correction,
+                )
 
                 # logprobs are [b, seq, h] now.
                 model.load_state_dict(cur_st_dict)
@@ -1201,6 +1236,18 @@ def prepare_data_for_update(
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
                     # Only mark as having inference logprobs for IS correction if enabled
                     packing_context.has_inference_logprobs = args.rl_inference_logprobs_is_correction
+            with nvtx_range("create_dataloader"):
+                # @vitalyk: This function also reconfigures the data loader to count the
+                # global_batch_size in the bins frame of reference.
+                # I think it will be a better design if we split the data loader creating and logic
+                # that reconfigures the microbatch calculator.
+
+                loader = get_microbatch_dataloader(packing_context,
+                    global_batch_size=args.global_batch_size, 
+                    rampup_batch_size=args.rampup_batch_size, 
+                    micro_batch_size=args.micro_batch_size, 
+                    decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+               )
         else:
             with nvtx_range("align_inference_logprobs", time=True):
                 if inference_logprobs is not None:
@@ -1215,16 +1262,10 @@ def prepare_data_for_update(
                     # Nullify logprobs if not used in IS correction,
                     if not args.rl_inference_logprobs_is_correction:
                         inference_logprobs = None
-
-        with nvtx_range("create_dataloader"):
-            if args.rl_use_sequence_packing:
-               loader = get_microbatch_dataloader(packing_context,
-                    global_batch_size=args.global_batch_size, 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
-                    decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
-               )
-            else:
+            with nvtx_range("create_dataloader"):
+                # Because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
+                # As in sequence packing above, we need to reconfigure it too.
+                # TODO(vitalyk): debug nans first, reconfigure the global batch size later.
                 runtime_state.packing_context = None
                 dataset_tensors = [
                     compute_trajs,
@@ -1243,6 +1284,7 @@ def prepare_data_for_update(
                 torch.distributed.barrier()
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
+
 
         with nvtx_range("log-wandb-tb"):
             maybe_log_training_metrics(
