@@ -33,15 +33,18 @@ class SinkhornKnopp(torch.autograd.Function):
         Returns:
             H_res: [s, b, n, n] - doubly stochastic matrix
         """
-        # M^{(0)} = exp(H_res_logits) - save initial M for backward recomputation
-        M_init = torch.exp(H_res_logits)
-        M = M_init.clone()
-        
-        for _ in range(num_iterations):
-            # T_r: Row normalization
-            M = M / M.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            # T_c: Column normalization
-            M = M / M.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+        # Use no_grad to avoid creating unnecessary computation graph in forward.
+        # Gradients are computed explicitly in backward via recomputation.
+        with torch.no_grad():
+            # M^{(0)} = exp(H_res_logits) - save initial M for backward recomputation
+            M_init = torch.exp(H_res_logits)
+            M = M_init.clone()
+            
+            for _ in range(num_iterations):
+                # T_r: Row normalization
+                M = M / M.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                # T_c: Column normalization
+                M = M / M.sum(dim=-2, keepdim=True).clamp(min=1e-8)
         
         # Save initial M for backward recomputation
         ctx.save_for_backward(M_init)
