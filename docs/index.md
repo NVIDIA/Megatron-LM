@@ -19,6 +19,7 @@ Megatron Core offers a flexible, reusable foundation for building large-scale tr
 :hidden:
 :caption: Get Started
 
+get-started/overview
 get-started/quickstart
 get-started/install
 ```
