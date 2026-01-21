@@ -155,8 +155,8 @@ def log_packing_efficiency(packing_context: PackingContext):
     total_capacity = packed_trajs.shape[0] * packed_trajs.shape[1]
     packing_efficiency = my_tokens / total_capacity if total_capacity > 0 else 0
     avg_seq_length = total_tokens / len(packing_info.seq_lengths)
-    rank = mpu.get_expert_data_parallel_rank()
-    expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
+    rank = mpu.get_data_parallel_rank()
+    data_parallel_world_size = mpu.get_data_parallel_world_size()
 
     log_single_rank(logger, logging.INFO, f"[Sequence Packing] Statistics:")
     log_single_rank(
@@ -412,8 +412,12 @@ def get_default_packed_seq_params(seq_length: int, device: torch.device) -> Pack
     Returns:
         PackedSeqParams configured as a single unpacked sequence.
     """
-    # Single sequence spanning the full length = no actual packing
-    cu_seqlens = torch.tensor([0, seq_length], dtype=torch.int32, device=device)
+
+    args = get_args()
+
+    # Pad to the maximum number of sequences in the bin for the attention kernel.
+    cu_seqlens = torch.full((args.rl_sequence_packing_max_sequences_per_bin,), seq_length, dtype=torch.int32, device=device)
+    cu_seqlens[0] = 0
 
     return PackedSeqParams(
         qkv_format='thd',
@@ -429,19 +433,25 @@ def create_packed_seq_params(packing_context: PackingContext):
     cached_packed_seq_params = []
     packing_info = packing_context.packing_info
     bin_size = packing_context.bin_size
+    max_sequences_per_bin = packing_context.packer.max_sequences_per_bin
     device = packing_context.packed_trajs.device
     for bin_idx in range(len(packing_context.packed_trajs)):
         params = create_packed_seq_params_for_bin(
             packing_info=packing_info,
             bin_idx=bin_idx,
             bin_size=bin_size,
+            max_sequences_per_bin=max_sequences_per_bin,
             device=device,
         )
         cached_packed_seq_params.append(params)
     return cached_packed_seq_params
 
 def create_packed_seq_params_for_bin(
-    packing_info: PackingInfo, bin_idx: int, bin_size: int, device: torch.device
+    packing_info: PackingInfo,
+    bin_idx: int,
+    bin_size: int,
+    max_sequences_per_bin: int,
+    device: torch.device
 ) -> Optional[PackedSeqParams]:
     """Create PackedSeqParams for a single bin to enable proper attention masking in TE.
 
@@ -453,6 +463,7 @@ def create_packed_seq_params_for_bin(
         packing_info: PackingInfo object containing packing metadata from SequencePacker
         bin_idx: Index of the bin to create params for
         bin_size: Size of the bin (padded sequence length)
+        max_sequences_per_bin: Maximum number of sequences per bin
         device: Device to create tensors on
 
     Returns:
@@ -475,8 +486,8 @@ def create_packed_seq_params_for_bin(
 
     # Pad cu_seqlens to bin_size by repeating the last value (creates zero-length ghost sequences)
     # This ensures a fixed tensor size for CUDA graph compatibility
-    if len(cu_seqlens) < bin_size:
-        out = cu_seqlens.new_full((bin_size,), bin_size)
+    if len(cu_seqlens) < max_sequences_per_bin:
+        out = cu_seqlens.new_full((max_sequences_per_bin,), bin_size)
         out[:len(cu_seqlens)] = cu_seqlens
         cu_seqlens = out
 
@@ -790,8 +801,8 @@ def distribute_packed_bins(
     packing_info: PackingInfo,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
     """Distribute packed bins across the data parallel ranks."""
-    rank = mpu.get_expert_data_parallel_rank()
-    world_size = mpu.get_expert_data_parallel_world_size()
+    rank = mpu.get_data_parallel_rank()
+    world_size = mpu.get_data_parallel_world_size()
     tokenizer = get_tokenizer()
 
     # Distribute packed bins across data parallel ranks
@@ -957,32 +968,32 @@ def distribute_packed_bins(
 
 def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo):
     tokenizer = get_tokenizer()
-    expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
+    data_parallel_world_size = mpu.get_data_parallel_world_size()
     nvtx_range = get_nvtx_range()
 
     with nvtx_range("regather_trajectories", time=True):
         # Regather trajectories from all ranks for packing
         trajs = trajs.cuda()
-        trajs_list = [torch.empty_like(trajs) for _ in range(expert_data_parallel_world_size)]
+        trajs_list = [torch.empty_like(trajs) for _ in range(data_parallel_world_size)]
         torch.distributed.all_gather(
-            trajs_list, trajs, group=mpu.get_expert_data_parallel_group()
+            trajs_list, trajs, group=mpu.get_data_parallel_group()
         )
         trajs = torch.cat(trajs_list, dim=0)
 
         # Gather all generation masks
         generation_masks = generation_masks.cuda()
-        masks_list = [torch.empty_like(generation_masks) for _ in range(expert_data_parallel_world_size)]
+        masks_list = [torch.empty_like(generation_masks) for _ in range(data_parallel_world_size)]
         torch.distributed.all_gather(
-            masks_list, generation_masks, group=mpu.get_expert_data_parallel_group()
+            masks_list, generation_masks, group=mpu.get_data_parallel_group()
         )
         generation_masks = torch.cat(masks_list, dim=0)
 
         # Gather inference logprobs if present
         if inference_logprobs is not None:
             inference_logprobs = inference_logprobs.cuda()
-            logprobs_list = [torch.empty_like(inference_logprobs) for _ in range(expert_data_parallel_world_size)]
+            logprobs_list = [torch.empty_like(inference_logprobs) for _ in range(data_parallel_world_size)]
             torch.distributed.all_gather(
-                logprobs_list, inference_logprobs, group=mpu.get_expert_data_parallel_group()
+                logprobs_list, inference_logprobs, group=mpu.get_data_parallel_group()
             )
             inference_logprobs = torch.cat(logprobs_list, dim=0)
 
@@ -1037,6 +1048,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
                 packing_info=packing_info,
                 bin_idx=bin_idx,
                 bin_size=bin_size,
+                max_sequences_per_bin=max_sequences_per_bin,
                 device=packed_trajs.device,
             ) for bin_idx in range(len(packed_trajs))
     ]

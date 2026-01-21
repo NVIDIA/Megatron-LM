@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -18,7 +18,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import LayerType
+from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -218,7 +218,7 @@ class TransformerBlockSubmodules:
             or instance of the layer normalization to be applied.
     """
 
-    layer_specs: List[ModuleSpec] = None
+    layer_specs: Optional[List[ModuleSpec]] = None
     layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
 
 
@@ -273,7 +273,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config)
@@ -374,7 +374,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
-        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+        if self.has_final_layernorm_in_this_stage():
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
                 config=self.config,
@@ -383,6 +383,62 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )
         else:
             self.final_layernorm = None  # Either this or nn.Identity
+
+        if self.config.inference_fuse_tp_communication:
+            self._setup_fused_tp_communication()
+
+    def has_final_layernorm_in_this_stage(self):
+        """
+        Check if this vpp stage contains the final layernorm.
+
+        Note:
+            Final layernorm now has been moved from the post-process stage to the last decoder
+            layer by using this function.
+            There will be a small numeric difference because of grad norm reduction when final
+            layernorm is placed in different pipeline stages in deterministic mode. It can still
+            be bitwise aligned by disabling grad norm clipping.
+        """
+        if self.config.mtp_num_layers is None:
+            # for model without MTPLayer, the final layernorm is set in the stage which does
+            # post_process
+            return self.submodules.layer_norm and self.post_process and self.post_layer_norm
+        else:
+            # for model with MTPLayer, the final layernorm is set in the stage which has the
+            # last layer of the decoder
+            has_final_layernorm_in_this_stage = False
+            for layer in self.layers:
+                if layer.layer_number == self.config.num_layers:
+                    has_final_layernorm_in_this_stage = True
+                    break
+            return (
+                self.submodules.layer_norm
+                and has_final_layernorm_in_this_stage
+                and self.post_layer_norm
+            )
+
+    def _setup_fused_tp_communication(self):
+        """Setup fused TP communication for all layers.
+        We have a fused reduce-scatter + add + layer-norm + all-gather operation.
+        We call this kernel from within row parallel linear layers.
+        But layer-norm needs the layer norm weights from the
+        successive column parallel linear layer.
+        This function is used to pass those weights to the respective layers.
+        """
+
+        for i in range(len(self.layers)):
+            current_layer = self.layers[i]
+
+            # Get next layer's QKV norm weights (None for last layer)
+            if i < len(self.layers) - 1:
+                next_qkv_norm_weights = self.layers[i + 1].get_qkv_layer_norm_weights()
+            else:
+                next_qkv_norm_weights = None
+
+            # Configure all fused TP communication settings in one call
+            current_layer.configure_fused_tp_inference(
+                skip_qkv_norm_and_all_gather=(i > 0),
+                fc2_next_layer_norm_weights=next_qkv_norm_weights,
+            )
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
@@ -523,7 +579,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and self.config.cuda_graph_scope == 'full_iteration'
+            and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -763,6 +819,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             if self.config.moe_layer_freq > 1:
                 non_homogeneous_layers = True
         elif isinstance(self.config.moe_layer_freq, list):
+            non_homogeneous_layers = True
+
+        if isinstance(self.config.linear_attention_freq, int):
+            if self.config.linear_attention_freq > 1:
+                non_homogeneous_layers = True
+        elif isinstance(self.config.linear_attention_freq, list):
             non_homogeneous_layers = True
 
         if self.config.heterogeneous_block_specs:

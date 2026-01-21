@@ -22,6 +22,7 @@ from megatron.core.rerun_state_machine import (
     RerunMode,
     initialize_rerun_state_machine,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
@@ -114,6 +115,11 @@ def initialize_megatron(
         ),
         result_rejected_tracker_filename=args.result_rejected_tracker_filename,
     )
+    
+    if args.batch_invariant_mode:
+        if args.rank == 0:
+            print("Enabling batch invariant mode globally", flush=True)
+        enable_batch_invariant_mode()
 
     # torch.distributed initialization
     def finish_mpu_init():
@@ -371,6 +377,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 use_sharp=args.use_sharp,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
+                hybrid_context_parallel=args.hybrid_context_parallel,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
