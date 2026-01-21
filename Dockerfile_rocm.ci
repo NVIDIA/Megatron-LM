@@ -14,7 +14,7 @@ WORKDIR $WORKSPACE_DIR
 
 RUN pip3 install \
 scipy \
-nltk
+nltk \
 wheel \
 PyGithub \
 pytest-xdist \
