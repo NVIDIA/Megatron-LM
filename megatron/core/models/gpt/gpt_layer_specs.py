@@ -40,7 +40,7 @@ from megatron.core.transformer.transformer_layer import (
 from megatron.core.utils import is_te_min_version
 
 try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
+    import transformer_engine as te  # type: ignore[import-untyped] # pylint: disable=unused-import
 
     from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -50,7 +50,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import nvidia_kitchen  # type: ignore[import-not-found]  # pylint: disable=unused-import
+    import nvidia_kitchen  # type: ignore[import-not-found] # pylint: disable=unused-import
 
     from megatron.core.extensions.kitchen import KitchenSpecProvider
 
@@ -59,7 +59,7 @@ except ImportError:
     HAVE_KITCHEN = False
 
 try:
-    import apex  # type: ignore[import-untyped]  # pylint: disable=unused-import
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -522,10 +522,13 @@ def get_gpt_decoder_layer_specs(
     use_transformer_engine: bool,
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
-    vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+    assert config.experimental_attention_variant is None, (
+        "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
+        f"but got {config.experimental_attention_variant=}."
+    )
+
     if use_transformer_engine:
         layer_norm_impl = TENorm
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -624,13 +627,16 @@ def get_gpt_decoder_block_spec(
     layer_specs = get_gpt_decoder_layer_specs(
         config, use_transformer_engine, normalization, qk_l2_norm
     )
+
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
 
     if config.pipeline_model_parallel_layout is not None:
         layout = config.pipeline_model_parallel_layout
-        assert isinstance(layout, PipelineParallelLayerLayout)
+        assert isinstance(
+            layout, PipelineParallelLayerLayout
+        ), f"Invalid pipeline model parallel layout: {layout}"
         local_layer_specs = [
             layer_specs[layer_id]
             for layer_id in layout.get_layer_id_list(
