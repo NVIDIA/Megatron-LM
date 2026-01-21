@@ -14,7 +14,10 @@ from functools import partial
 
 import torch
 
-from megatron.core.utils import divide
+from examples.multimodal.layer_scaling import (
+    LayerScalingTransformerLayer,
+    get_bias_dropout_add_layer_scaling,
+)
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
@@ -35,9 +38,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-
-from examples.multimodal.layer_scaling import LayerScalingTransformerLayer, get_bias_dropout_add_layer_scaling
-
+from megatron.core.utils import divide
 
 try:
     import apex
@@ -128,10 +129,14 @@ class InternViTRMSNorm(MegatronModule):
 
         if rank < valid_ranks:  # Ranks without any dummy attention heads.
             var = input_.sum(-1, keepdim=True)
-        elif rank == valid_ranks:  # The only rank which may contain 'residual_heads' dummy attention heads.
+        elif (
+            rank == valid_ranks
+        ):  # The only rank which may contain 'residual_heads' dummy attention heads.
             var = input_[..., :max_dim].sum(-1, keepdim=True)
         else:
-            var = input_.sum(-1, keepdim=True) * 0.0  # All heads in these ranks are dummy heads: Zero-out.
+            var = (
+                input_.sum(-1, keepdim=True) * 0.0
+            )  # All heads in these ranks are dummy heads: Zero-out.
 
         tensor_list = [torch.empty_like(var) for _ in range(world_size)]
         tensor_list[rank] = var
@@ -175,8 +180,7 @@ class InternViTSelfAttention(SelfAttention):
         # Need to override linear_qkv, q_layernorm and k_layernorm.
         qkv_bias = False
 
-        self.linear_qkv = build_module(
-            submodules.linear_qkv,
+        self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
@@ -255,6 +259,7 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
             mlp_bda=get_bias_dropout_add_layer_scaling,
         ),
     )
+
 
 def get_internvit300M_layer_spec(use_te) -> ModuleSpec:
     mlp = get_mlp_module_spec(use_te)  # no norm

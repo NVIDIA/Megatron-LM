@@ -1,9 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
+
 import copy
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Tuple, Union
+from typing import Callable, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -32,6 +34,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
@@ -114,14 +117,107 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+class LinearQkv(Protocol):
+    """Protocol for linear_qkv modules."""
+
+    def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
+        """Applies linear_qkv."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward pass for the linear_qkv module."""
+        ...
+
+
+class LinearQkvBuilder(Protocol):
+    """Protocol for building linear_qkv layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: torch.distributed.ProcessGroup | None = None,
+    ) -> LinearQkv: ...
+
+
+class LinearLayer(Protocol):
+    """Protocol for linear_q and linear_kv modules."""
+
+    def forward(self, input: Tensor, /) -> Tuple[Tensor, object]:
+        """Applies linear_q/linear_kv."""
+        ...
+
+
+class LinearLayerBuilder(Protocol):
+    """Protocol for building linear_q and linear_kv layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+    ) -> LinearLayer: ...
+
+
+class CoreAttention(Protocol):
+    """Protocol for core_attention modules."""
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        /,
+        *,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tensor:
+        """Applies dot product attention."""
+        ...
+
+
+class CoreAttentionBuilder(Protocol):
+    """Protocol for building core_attention layers."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        cp_comm_type: Optional[str],
+        softmax_scale: Optional[float],
+        pg_collection: Optional[ProcessGroupCollection],
+    ) -> CoreAttention: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
     Configuration class for specifying the submodules of a self-attention.
     """
 
-    linear_qkv: Union[ModuleSpec, type] = None
-    core_attention: Union[ModuleSpec, type] = None
+    linear_qkv: LinearQkvBuilder
+    core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
     k_layernorm: Union[ModuleSpec, type] = None
@@ -133,9 +229,9 @@ class CrossAttentionSubmodules:
     Configuration class for specifying the submodules of a cross-attention.
     """
 
-    linear_q: Union[ModuleSpec, type] = None
-    linear_kv: Union[ModuleSpec, type] = None
-    core_attention: Union[ModuleSpec, type] = None
+    linear_q: LinearLayerBuilder
+    linear_kv: LinearLayerBuilder
+    core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -153,8 +249,8 @@ class Attention(MegatronModule, ABC):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: str | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__(config=config)
 
@@ -164,6 +260,9 @@ class Attention(MegatronModule, ABC):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
+
+        assert self.config.kv_channels is not None
+        assert self.config.num_query_groups is not None
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -216,8 +315,7 @@ class Attention(MegatronModule, ABC):
             tmp_config.num_query_groups = world_size
         else:
             tmp_config = self.config
-        self.core_attention = build_module(
-            submodules.core_attention,
+        self.core_attention = submodules.core_attention(
             config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
@@ -300,7 +398,7 @@ class Attention(MegatronModule, ABC):
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
+            output_ = apply_module(self.core_attention)(
                 query,
                 key,
                 value,
@@ -358,7 +456,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, AttnMaskType, Tensor]:
         """
         Saves the generated key and value tensors to the end of the buffers in inference_context.
         Returns the full size keys and values from the provided inference_context, as well as
@@ -526,7 +624,15 @@ class Attention(MegatronModule, ABC):
 
     @abstractmethod
     def get_query_key_value_tensors(
-        self, hidden_states, key_value_states, output_gate=False, split_qkv=True
+        self,
+        hidden_states: Tensor,
+        key_value_states: Tensor | None,
+        output_gate: bool = False,
+        split_qkv: bool = True,
+    ) -> (
+        tuple[Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor]
+        | tuple[Tensor, list[int]]
     ):
         """
         This method needs to be implemented based on whether the derived class
@@ -544,7 +650,7 @@ class Attention(MegatronModule, ABC):
         rotary_cos: Tensor,
         rotary_sin: Tensor,
         rotary_interleaved: bool = False,
-    ) -> (Tensor, Tensor):
+    ) -> tuple[Tensor, Tensor]:
         """
         The flash decoding kernel will do the following in a single execution:
         1. Compute RoPE embedding with precomputed cos & sin tensors
@@ -781,7 +887,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """
         Perform a forward pass through the attention module.
 
@@ -1041,7 +1147,7 @@ class Attention(MegatronModule, ABC):
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
-                    core_attn_out = self.core_attention(
+                    core_attn_out = apply_module(self.core_attention)(
                         query,
                         key,
                         value,
@@ -1141,9 +1247,9 @@ class SelfAttention(Attention):
         config: TransformerConfig,
         submodules: SelfAttentionSubmodules,
         layer_number: int,
-        attn_mask_type=AttnMaskType.padding,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        cp_comm_type: str | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__(
             config=config,
@@ -1158,12 +1264,11 @@ class SelfAttention(Attention):
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
-        self.linear_qkv = build_module(
-            submodules.linear_qkv,
+        self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.linear_qkv_out_dim,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
             skip_bias_add=False,
@@ -1264,7 +1369,15 @@ class SelfAttention(Attention):
             )
 
     def get_query_key_value_tensors(
-        self, hidden_states, key_value_states=None, output_gate=False, split_qkv=True
+        self,
+        hidden_states: Tensor,
+        key_value_states: Tensor | None = None,
+        output_gate: bool = False,
+        split_qkv: bool = True,
+    ) -> (
+        tuple[Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor]
+        | tuple[Tensor, list[int]]
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -1273,7 +1386,7 @@ class SelfAttention(Attention):
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = self.linear_qkv(hidden_states)
+        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
@@ -1281,6 +1394,7 @@ class SelfAttention(Attention):
         if output_gate:
             num_qkv_heads_per_group += num_query_heads_per_group
 
+        assert self.config.num_query_groups is not None
         if self.config.num_query_groups < self.world_size:
             # Note that weights are interleaved in the following manner:
             # q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ...
@@ -1376,7 +1490,7 @@ class SelfAttention(Attention):
 
         return query, key, value
 
-    def backward_dw(self) -> NoReturn:
+    def backward_dw(self) -> None:
         """Execute weight update operations"""
         self._backward_qkv_proj()
         self._backward_output_proj()
@@ -1505,9 +1619,9 @@ class CrossAttention(Attention):
         config: TransformerConfig,
         submodules: CrossAttentionSubmodules,
         layer_number: int,
-        attn_mask_type=AttnMaskType.padding,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        cp_comm_type: str | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__(
             config=config,
@@ -1523,24 +1637,22 @@ class CrossAttention(Attention):
             raise ValueError("Group query attention is not currently supported in cross attention.")
         assert self.query_projection_size == self.kv_projection_size
 
-        self.linear_q = build_module(
-            submodules.linear_q,
+        self.linear_q = submodules.linear_q(
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
         )
 
-        self.linear_kv = build_module(
-            submodules.linear_kv,
+        self.linear_kv = submodules.linear_kv(
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
@@ -1548,8 +1660,12 @@ class CrossAttention(Attention):
         )
 
     def get_query_key_value_tensors(
-        self, hidden_states, key_value_states, output_gate=False, split_qkv=True
-    ):
+        self,
+        hidden_states: Tensor,
+        key_value_states: Optional[Tensor],
+        output_gate: bool = False,
+        split_qkv: bool = True,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
         from `key_value_states`.
@@ -1557,8 +1673,9 @@ class CrossAttention(Attention):
         assert split_qkv, "split_qkv must be True for CrossAttention"
         assert not output_gate, "Output gate is not supported in cross attention for now."
 
+        assert key_value_states is not None, "key_value_states cannot be None for CrossAttention"
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-        mixed_kv, _ = self.linear_kv(key_value_states)
+        mixed_kv, _ = apply_module(self.linear_kv)(key_value_states)
 
         # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
         new_tensor_shape = mixed_kv.size()[:-1] + (
@@ -1571,7 +1688,7 @@ class CrossAttention(Attention):
         (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
-        query, _ = self.linear_q(hidden_states)
+        query, _ = apply_module(self.linear_q)(hidden_states)
 
         # [sq, b, hp] --> [sq, b, np, hn]
         new_tensor_shape = query.size()[:-1] + (
