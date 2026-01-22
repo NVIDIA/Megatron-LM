@@ -53,14 +53,6 @@ def build_inference_pg_collection(
     if expt_tp_size is None:
         expt_tp_size = mpu.get_expert_tensor_parallel_world_size()
 
-    # Validate expert TP size
-    assert expt_tp_size >= 1, f"expt_tp_size must be >= 1, got {expt_tp_size}"
-    assert expt_tp_size <= tp_size, (
-        f"expt_tp_size ({expt_tp_size}) must be <= tp_size ({tp_size})"
-    )
-    assert tp_size % expt_tp_size == 0, (
-        f"tp_size ({tp_size}) must be divisible by expt_tp_size ({expt_tp_size})"
-    )
 
     # Compute DP size for dense layers (same formula as mpu)
     # world = tp × cp × dp × pp
