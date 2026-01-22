@@ -1387,6 +1387,10 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
             Otherwise, we execute the original function and check if we should raise a signal to
             early return in CUDA graph capture.
             """
+
+            if moe_layer.config.cuda_graph_impl != "transformer_engine":
+                return func(moe_layer, *args, **kwargs)
+
             # The non-cudagraph codepath just calls the original function.
             if not is_graph_capturing() and moe_layer.cudagraph_tensor_store.is_empty():
                 return func(moe_layer, *args, **kwargs)
