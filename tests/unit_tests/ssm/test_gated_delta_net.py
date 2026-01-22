@@ -11,7 +11,10 @@ from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_module_spec,
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
@@ -82,10 +85,13 @@ class TestGatedDeltaNet:
             tensor_model_parallel_size=tp_size,
             sequence_parallel=sp,
             context_parallel_size=cp_size,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            transformer_impl="transformer_engine",
         )
-        gdn_submodules = get_gpt_layer_with_transformer_engine_spec(
-            experimental_attention_variant="gated_delta_net", normalization="RMSNorm"
-        ).submodules.self_attention.submodules
+        gdn_submodules = get_experimental_attention_variant_module_spec(
+            config=self.transformer_config
+        ).submodules
 
         self.gdn = GatedDeltaNet(
             self.transformer_config,
@@ -159,10 +165,13 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         num_attention_heads=8,
         activation_func=F.silu,
         bf16=True,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1],
+        transformer_impl="transformer_engine",
     )
 
-    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-        experimental_attention_variant="gated_delta_net", normalization="RMSNorm"
+    transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+        config=transformer_config, vp_stage=None, pp_rank=0
     )
 
     if cp:
@@ -171,5 +180,15 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         atol, rtol = 5e-4, 5e-4
 
     _test_parallel_attention_correctness(
-        transformer_config, transformer_layer_spec, tmp_path_dist_ckpt, tp, sp, cp
+        transformer_config=transformer_config,
+        transformer_layer_spec=transformer_layer_spec,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+        atol=atol,
+        rtol=rtol,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=123,
+        sequence_length=256,
+        micro_batch_size=4,
     )

@@ -89,7 +89,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_resume_torch_dist_attn_cudagraph]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-broken]
         platforms: [dgx_h100] # hang: #513
   # - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental]
   #   products:
@@ -151,7 +151,7 @@ products:
   - test_case: [gpt3_moe_mcore_te_tp2_pp2_ep4_etp1_no_mtp_no_a2a_ovlp_fine_grained_offloading]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr-broken, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt3_moe_mcore_te_tp2_pp2_ep4_etp1_fine_grained_offloading]
     products:
@@ -187,13 +187,13 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_memory_speed]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-broken]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-broken]
         platforms: [dgx_h100] # hang: #513
       - environment: [dev]
-        scope: [mr-slim]
+        scope: [mr-slim-broken]
         platforms: [dgx_h100]

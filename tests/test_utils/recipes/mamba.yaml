@@ -82,7 +82,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp4_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
