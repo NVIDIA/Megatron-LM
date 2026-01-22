@@ -36,6 +36,7 @@ TEAM_TO_USERGROUP = {
     "mixture-of-experts-devtech": "mcore-moe-devtech",
     "core-adlr": "mcore-adlr",
     "core-nemo": "mcore-nemo",
+    "core-devtech": "mcore-devtech",
     "pipeline-parallelism": "mcore-pp",
     "dist-checkpointing": "mcore-dist-ckpt",
     "megatron-fsdp": "mcore-fsdp",
@@ -48,6 +49,8 @@ TEAM_TO_USERGROUP = {
     "dist-optimizer": "mcore-dist-optimizer",
     "quantization-and-inference": "mcore-quantization-inference",
     "multi-modal": "mcore-multi-modal",
+    "ci": "mcore-ci",
+    "reinforcement-learning": "mcore-rl",
 }
 
 # Caches for email and Slack lookups
