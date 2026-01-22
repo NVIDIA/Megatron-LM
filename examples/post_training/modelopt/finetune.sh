@@ -90,6 +90,7 @@ ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/finetune.py \
     --expert-model-parallel-size ${EP} \
     --pipeline-model-parallel-size ${PP} \
     --context-parallel-size ${CP} \
+    --cp-comm-type p2p \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --load ${MLM_MODEL_CKPT} \
     --save ${MLM_MODEL_SAVE} \
