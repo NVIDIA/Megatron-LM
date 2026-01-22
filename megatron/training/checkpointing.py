@@ -10,6 +10,7 @@ import sys
 import threading
 import types
 from argparse import Namespace
+from datetime import datetime
 from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
@@ -460,7 +461,8 @@ def save_grads(state_dict, iteration, grad_label):
         if mpu.get_expert_model_parallel_world_size() > 1:
             checkpoint_name += f"_{ep_rank:03d}"
         full_save_path = os.path.join(save_dir, f"{checkpoint_name}.pth")
-        torch.save(state_dict, full_save_path)
+        # Convert back to dict (e.g., from collections.defaultdict) for easy loading later.
+        torch.save(dict(state_dict), full_save_path)
 
     print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saved {grad_label} "
                  f"from iteration {iteration:7d}")

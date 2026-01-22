@@ -2,6 +2,7 @@
 
 """dgrad logging using backward hooks."""
 
+from collections import defaultdict
 import torch
 import torch.nn as nn
 
@@ -50,18 +51,20 @@ class DataGradLogger:
     """Captures and saves gradients from all linear layers using backward hooks."""
 
     def __init__(self):
-        self._dgrads_state_dict = {}
+        self._dgrads_state_dict = defaultdict(dict)
         self._hooks = []
 
-    def _make_hook(self, name: str):
+    def _make_hook(self, model_chunk_name: str, module_name: str):
         """Create a backward hook for a named module."""
         def hook(_, grad_input, grad_output):
             for idx, grad in enumerate(grad_output):
                 if grad is not None:
-                    self._dgrads_state_dict[f"{name}/output{idx}"] = grad.detach().cpu()
+                    grad_name = f"{module_name}/output{idx}"
+                    self._dgrads_state_dict[model_chunk_name][grad_name] = grad.detach().cpu()
             for idx, grad in enumerate(grad_input):
                 if grad is not None:
-                    self._dgrads_state_dict[f"{name}/input{idx}"] = grad.detach().cpu()
+                    grad_name = f"{module_name}/input{idx}"
+                    self._dgrads_state_dict[model_chunk_name][grad_name] = grad.detach().cpu()
         return hook
 
     def save(self, iteration: int):
@@ -76,10 +79,12 @@ class DataGradLogger:
         assert len(self._hooks) == 0
         for model_chunk_id, model_chunk in enumerate(model):
             unwrapped_model_chunk = unwrap_model(model_chunk)
-            for name, module in unwrapped_model_chunk.named_modules():
+            for module_name, module in unwrapped_model_chunk.named_modules():
                 if isinstance(module, LINEAR_TYPES):
-                    name = f"model_chunk{model_chunk_id}/{name}"
-                    handle = module.register_full_backward_hook(self._make_hook(name))
+                    model_chunk_name = f"model_chunk{model_chunk_id}"
+                    handle = module.register_full_backward_hook(
+                        self._make_hook(model_chunk_name, module_name)
+                    )
                     self._hooks.append(handle)
 
     def remove_hooks(self):

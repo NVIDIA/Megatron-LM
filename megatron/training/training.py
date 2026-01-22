@@ -31,6 +31,7 @@ def set_startup_timestamps(program_start=None, main_entry=None):
         _STARTUP_TIMESTAMPS['main_entry'] = main_entry
 
 
+from collections import defaultdict
 import copy
 import dataclasses
 from datetime import datetime, timedelta
@@ -1668,10 +1669,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Checkpoint main_grads.
     if save_wgrads_in_this_iteration:
         # Collect state_dict of wgrads (each param's .main_grad field).
-        state_dict = {}
+        state_dict = defaultdict(dict)
         for model_chunk_id, model_chunk in enumerate(model):
             model_chunk_name = f"model_chunk{model_chunk_id}"
-            state_dict[model_chunk_name] = {}
             unwrapped_model_chunk = unwrap_model(model_chunk)
             for param_name, param in unwrapped_model_chunk.named_parameters():
                 if getattr(param, "main_grad", None) is not None:
