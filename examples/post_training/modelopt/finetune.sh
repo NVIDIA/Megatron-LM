@@ -38,6 +38,12 @@ if [ -z ${MLM_DATA_ARGS} ]; then
     "
 fi
 
+if [[ -v CP && "$CP" != "1" ]]; then
+  BACKEND="fused"
+else
+  BACKEND="auto"
+fi
+
 if [ -z ${MLM_TRAIN_ARGS} ]; then
     MLM_TRAIN_ARGS=" \
         --no-gradient-accumulation-fusion \
@@ -48,6 +54,7 @@ if [ -z ${MLM_TRAIN_ARGS} ]; then
         --attention-dropout 0.0 \
         --hidden-dropout 0.0 \
         --no-check-for-nan-in-loss-and-grad \
+        --attention-backend ${BACKEND} \
     "
 fi
 
