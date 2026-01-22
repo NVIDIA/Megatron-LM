@@ -410,6 +410,9 @@ class PipelineOffloadManager:
         # allocate streams and events for synchronization
         self._d2h_stream = torch.cuda.Stream()
         self._h2d_stream = torch.cuda.Stream()
+        # CUDA graph stream and event for offloading modules in cuda graph
+        self._cuda_graph_stream = torch.cuda.Stream()
+        self._cuda_graph_event = torch.cuda.Event(external=True)
         # Shared CPU tensor pool for all chunks to improve reuse efficiency
         self._cpu_tensor_pool = GPUTensorPool(device="cpu", pin_memory=True)
 
@@ -442,6 +445,16 @@ class PipelineOffloadManager:
     def h2d_stream(self):
         """Get the host-to-device (CPU to GPU) transfer stream."""
         return self._h2d_stream
+    
+    @property
+    def cuda_graph_stream(self):
+        """Get the CUDA graph stream."""
+        return self._cuda_graph_stream
+    
+    @property
+    def cuda_graph_event(self):
+        """Get the CUDA graph event."""
+        return self._cuda_graph_event
 
     @property
     def cpu_tensor_pool(self):
@@ -751,6 +764,13 @@ class ChunkOffloadHandler:
         """Offload."""
         debug_rank("--------offload")
 
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+        is_mxfp8_tensor = isinstance(src_tensor, MXFP8Tensor)
+        if is_mxfp8_tensor:
+            mxfp8_tensor = src_tensor
+            src_tensor = src_tensor._columnwise_data
+        else:
+            mxfp8_tensor = None
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
 
@@ -762,13 +782,16 @@ class ChunkOffloadHandler:
             )
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
-        state = (src_tensor.device, cpu_backup, use_cpu_pool)
+        state = (src_tensor.device, cpu_backup, use_cpu_pool, mxfp8_tensor)
+        if is_mxfp8_tensor:
+            src_tensor.record_stream(torch.cuda.current_stream())
+            src_tensor.untyped_storage().resize_(0)
         return state
 
     def reload(self, state, non_blocking=None):
         """Reload."""
         debug_rank("------reload")
-        dev, cpu_backup, use_cpu_pool = state
+        dev, cpu_backup, use_cpu_pool, mxfp8_tensor = state
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
         gpu_tensor = torch.empty(
@@ -777,6 +800,9 @@ class ChunkOffloadHandler:
         gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
         if use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup)
+        if mxfp8_tensor is not None:
+            mxfp8_tensor._columnwise_data = gpu_tensor
+            return mxfp8_tensor
         return gpu_tensor
 
     def __init__(self, min_offloaded_tensor_size, cpu_tensor_pool):
@@ -803,6 +829,8 @@ class ChunkOffloadHandler:
         self.cpu_tensor_pool = cpu_tensor_pool
         self.is_warmup = True
 
+        self.mxfp8_tensors = []
+
     def reset(self):
         """Reset the chunk offload handler."""
         self._offloaded_group_index = 0
@@ -810,7 +838,7 @@ class ChunkOffloadHandler:
         self._groups_to_reload = []
         self._tensor_count_current_group = 0
         self._reloading_group = []
-
+        self.mxfp8_tensors = []
     def find_group_with_name(self, groups: list[OffloadTensorGroup], name: str, start_index: int = 0):
         """Find the group with the given name starting from the given index."""
         return next(
@@ -889,6 +917,7 @@ class ChunkOffloadHandler:
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
         torch.cuda.nvtx.range_push("activation offloading " + group_to_offload._name)
+        released_tensors = []
         with torch.cuda.stream(self.d2h_stream):
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
@@ -897,9 +926,14 @@ class ChunkOffloadHandler:
                     )
                     if self.is_warmup:
                         group_to_offload.update_offload_info(tensor_on_device)
-                    tensor_on_device.record_stream(self.d2h_stream)
+                    if state[3] is None:
+                        tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
+                    released_tensors.append(tensor_on_device)
             group_to_offload.record_offload_event(self.d2h_stream)
+        # for tensor in released_tensors:
+        #     tensor.record_stream(torch.cuda.current_stream())
+        #     tensor.untyped_storage().resize_(0)
         torch.cuda.nvtx.range_pop()
 
     def get_max_deduplicated_groups(self):
@@ -1214,6 +1248,16 @@ class FineGrainedActivationOffloadingInterface:
         """Exit context manager to disable activation offloading hooks."""
         if self.offload:
             PipelineOffloadManager.get_instance().__exit__()
+
+    @staticmethod
+    def cuda_graph_stream():
+        """Get the CUDA graph stream."""
+        return PipelineOffloadManager.get_instance().cuda_graph_stream
+    
+    @staticmethod
+    def cuda_graph_event():
+        """Get the CUDA graph event."""
+        return PipelineOffloadManager.get_instance().cuda_graph_event
 
     @staticmethod
     def init_chunk_handler(pp_rank, vp_size, vp_stage, min_offloaded_tensor_size, delta_offload_bytes_across_pp_ranks):

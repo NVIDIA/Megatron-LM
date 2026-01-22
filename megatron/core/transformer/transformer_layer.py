@@ -1133,13 +1133,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self.config.cuda_graph_warmup_steps > 0
             ), "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
         # Set the cuda graph stream and event for the transformer layer.
-        if TransformerLayer.cuda_graph_stream is None:
-            if self.offload_module_in_cuda_graph:
-                TransformerLayer.cuda_graph_stream = torch.cuda.Stream()
-            else:
-                TransformerLayer.cuda_graph_stream = torch.cuda.current_stream()
-        if TransformerLayer.cuda_graph_event is None:
-            if self.offload_module_in_cuda_graph:
-                TransformerLayer.cuda_graph_event = torch.cuda.Event(external=True)
-            else:
-                TransformerLayer.cuda_graph_event = torch.cuda.Event()
+        if self.offload_module_in_cuda_graph:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+            TransformerLayer.cuda_graph_stream = off_interface.cuda_graph_stream()
+            TransformerLayer.cuda_graph_event = off_interface.cuda_graph_event()
+        else:
+            TransformerLayer.cuda_graph_stream = torch.cuda.current_stream()
+            TransformerLayer.cuda_graph_event = torch.cuda.Event()
