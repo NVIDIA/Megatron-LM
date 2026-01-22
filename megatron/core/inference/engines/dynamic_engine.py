@@ -44,6 +44,7 @@ from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import (
     experimental_api,
     get_asyncio_loop,
+    get_attr_wrapped_model,
     get_pg_rank,
     get_pg_size,
     get_pg_src_rank,
@@ -285,7 +286,7 @@ class DynamicInferenceEngine(AbstractEngine):
             controller,
             context,
             enable_cuda_graph=model.config.cuda_graph_impl == "local",
-            random_seed=model.config.seed,
+            random_seed=args.seed,
             track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
             enable_chunked_prefill=not args.disable_chunked_prefill,
             metrics_writer=metrics_writer,

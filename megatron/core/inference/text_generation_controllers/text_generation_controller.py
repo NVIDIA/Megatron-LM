@@ -124,7 +124,7 @@ class TextGenerationController:
         """
         tokenizer = build_tokenizer(args)
         model = model_inference_wrapper_cls(model, context)
-        model.model_is_pipeline_parallel = model.config.pipeline_parallel_size > 1
+        model.model_is_pipeline_parallel = model.config.pipeline_model_parallel_size > 1
         return cls(model, tokenizer)
 
     def set_stop_word_finished_ids_callback(self, callback):
