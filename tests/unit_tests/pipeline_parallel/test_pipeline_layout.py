@@ -84,6 +84,7 @@ def initialize_gpt_model(
             )
         else:
             mtp_block_spec = None
+
         pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
         post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
         this_model = (

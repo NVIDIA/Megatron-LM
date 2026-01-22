@@ -113,7 +113,9 @@ def main(pipeline_id: int, only_failing: bool):
 
                     shutil.move(golden_values_source, golden_values_target)
                 else:
-                    logger.info("Golden values for %s does not exist. Skip.", str(golden_values_source))
+                    logger.info(
+                        "Golden values for %s does not exist. Skip.", str(golden_values_source)
+                    )
 
             shutil.rmtree("tmp")
 
