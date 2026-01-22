@@ -914,6 +914,8 @@ def validate_args(args, defaults={}):
         if args.save_retain_interval is not None:
             assert args.save_retain_interval > 0
             assert args.save_retain_interval % args.save_interval == 0
+    if args.log_memory_interval is not None:
+        assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -1337,13 +1339,14 @@ def validate_args(args, defaults={}):
         ):
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        assert (
-            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
-            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
-        ), (
-            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
-            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
-        )
+        if args.cuda_graph_impl == "transformer_engine":
+            assert (
+                "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+                or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+            ), (
+                "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+                "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
+            )
     if args.cuda_graph_scope == "full" or (
         isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
     ):
@@ -1684,8 +1687,12 @@ def _add_inference_args(parser):
     group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
-    group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
-                       help='Disable chunked prefill (chunked prefill is enabled by default).')
+    # TODO(ksanthanam): Clean this up in future PR
+    group.add_argument('--enable-chunked-prefill', dest='disable_chunked_prefill',
+                       action='store_false', default=True,
+                       help="Enable chunked prefill (disabled by default)")
+    group.add_argument('--disable-chunked-prefill', dest='disable_chunked_prefill',
+                       action='store_true', help=argparse.SUPPRESS)
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
@@ -2369,6 +2376,10 @@ def _add_training_args(parser):
                        'with larger models, sequences, and batch sizes.')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Report loss and timing interval.')
+    group.add_argument('--log-memory-interval', type=int, default=None,
+                       help='Report memory interval.')
+    group.add_argument('--log-device-memory-used', action='store_true',
+                       help='Log device memory used (as reported by nvidia-smi).')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
