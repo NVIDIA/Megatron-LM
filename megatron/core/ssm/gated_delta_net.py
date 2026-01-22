@@ -302,11 +302,15 @@ class GatedDeltaNet(MegatronModule):
             ), "Packed sequence does not support deterministic mode."
 
             # Prefer cu_seqlens_q_padded if available, otherwise use cu_seqlens_q
-            cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded or packed_seq_params.cu_seqlens_q
+            if packed_seq_params.cu_seqlens_q_padded is not None:
+                cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+            else:
+                cu_seqlens_q = packed_seq_params.cu_seqlens_q
             # Prefer cu_seqlens_kv_padded if available, otherwise use cu_seqlens_kv
-            cu_seqlens_kv = (
-                packed_seq_params.cu_seqlens_kv_padded or packed_seq_params.cu_seqlens_kv
-            )
+            if packed_seq_params.cu_seqlens_kv_padded is not None:
+                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+            else:
+                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
@@ -623,7 +627,7 @@ def _unpack_sequence(x, cu_seqlens, dim=1):
         idx_start = cu_seqlens[i].item()
         idx_end = cu_seqlens[i + 1].item()
         chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
-        unpacked_x.append(x[chunked_index])
+        unpacked_x.append(x[tuple(chunked_index)])
     return unpacked_x
 
 
@@ -878,6 +882,7 @@ def torch_chunk_gated_delta_rule(
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
 ):
     # pylint: disable=line-too-long
     '''
@@ -886,6 +891,10 @@ def torch_chunk_gated_delta_rule(
 
     Reference: https://github.com/huggingface/transformers/blob/144c8ce2809a2e21914017652700e1ecb450501e/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L470-L547
     '''
+
+    assert cu_seqlens is None, (
+        "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
+    )
 
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
