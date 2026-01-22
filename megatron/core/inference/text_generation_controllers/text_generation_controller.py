@@ -26,6 +26,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
@@ -91,7 +92,7 @@ class TextGenerationController:
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
-        max_requests = context.max_total_requests
+        max_requests = context.max_requests
 
         # Callback to get request IDs that should be marked as finished due to stop words
         self._get_stop_word_finished_ids_callback = None
@@ -850,12 +851,12 @@ class TextGenerationController:
         new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
 
         # Update requests.
-        newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
+        update_result = context.update_requests(active_request_mask, new_sample_copy)
 
         return {
             "active_request_ids": active_request_ids,
-            "newly_paused_request_ids": newly_paused_request_ids,
             "finished_request_ids": finished_request_ids,
+            **(update_result or {}),
         }
 
     @torch.inference_mode()
@@ -1017,7 +1018,7 @@ class TextGenerationController:
         # Check whether CUDA graphs are enabled
         enable_cuda_graph = (
             model_config.cuda_graph_impl == "local"
-            and model_config.cuda_graph_scope != "full_iteration"
+            and CudaGraphScope.full_iteration not in model_config.cuda_graph_scope
         )
 
         # Pad batch tokens if necessary

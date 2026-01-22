@@ -161,11 +161,6 @@ class SFTTokenizer(MegatronLegacyTokenizer):
         return self._tokenizer.get_added_vocab()
 
     @property
-    def force_eod(self):
-        """To force an EOD at the end of every data sample in SFT."""
-        return self._prompt_format == "nemotron-h-aligned"
-
-    @property
     def pad(self):
         """Pad token ID."""
         return self._prompt_config.pad_token_id

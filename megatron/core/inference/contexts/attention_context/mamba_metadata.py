@@ -154,7 +154,7 @@ class MambaMetadata:
                 active_mamba_indices[:real_decode_count]
             )
             if padded_decode_count > real_decode_count:
-                self._batch_indices_decode_buffer[real_decode_count:padded_decode_count].fill_(-1)
+                self._batch_indices_decode_buffer[real_decode_count:padded_decode_count] = -1
             self.batch_indices_decode = self._batch_indices_decode_buffer[:padded_decode_count]
 
         # Determine if we have a chunked prefill request and adjust counts for regular prefill
@@ -180,9 +180,7 @@ class MambaMetadata:
                 )
 
             if padded_prefill_count > regular_prefill_count:
-                self._batch_indices_prefill_buffer[
-                    regular_prefill_count:padded_prefill_count
-                ].fill_(-1)
+                self._batch_indices_prefill_buffer[regular_prefill_count:padded_prefill_count] = -1
 
             self.batch_indices_prefill = self._batch_indices_prefill_buffer[:padded_prefill_count]
 
@@ -199,7 +197,7 @@ class MambaMetadata:
                 )
 
             if padded_token_count > seq_len:
-                self._seq_idx_buffer[:, seq_len:padded_token_count].fill_(-1)
+                self._seq_idx_buffer[:, seq_len:padded_token_count] = -1
             self.seq_idx = self._seq_idx_buffer[:, :padded_token_count]
 
             # Update cu_seqlens

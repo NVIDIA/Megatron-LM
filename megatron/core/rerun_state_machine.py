@@ -507,7 +507,7 @@ class RerunStateMachine:
         """
 
         # If reruns are disabled, still validate the result and throw a RuntimeError if it is
-        # rejected. This is a backward-compatible behavior.
+        # rejected when fatal. This is a backward-compatible behavior for infs and NaNs.
         if self.mode == RerunMode.DISABLED:
             result_rejected: bool = rejection_func(result)
             if result_rejected:
@@ -522,7 +522,10 @@ class RerunStateMachine:
                     f"iteration {self.current_iteration}: "
                     f"Unexpected result {result} (message='{message}')"
                 )
-                raise RuntimeError(full_message)
+                if fatal:
+                    raise RuntimeError(full_message)
+                else:
+                    logger.warning(full_message)
             return
 
         if comparison_func is None:
