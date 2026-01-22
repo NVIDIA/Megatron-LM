@@ -59,6 +59,14 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 try:
+    from torch_memory_saver import torch_memory_saver
+
+    torch_memory_saver.hook_mode = "torch"
+    HAVE_TORCH_MEMORY_SAVER = True
+except ImportError:
+    HAVE_TORCH_MEMORY_SAVER = False
+
+try:
     import wandb  # pylint: disable=unused-import
 
     HAVE_WANDB = True
@@ -69,8 +77,6 @@ except ImportError:
 if TYPE_CHECKING:
     import wandb as WandbModule
 
-from torch_memory_saver import torch_memory_saver
-torch_memory_saver.hook_mode = "torch"
 
 class ContextOverflowError(Exception):
     """Base exception for when a new request does not fit.
@@ -652,7 +658,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
             else:
-                with torch_memory_saver.region(enable_cpu_backup=True):
+                ctx = (
+                    torch_memory_saver.region(tag="kv_cache", enable_cpu_backup=True)
+                    if HAVE_TORCH_MEMORY_SAVER
+                    else nullcontext()
+                )
+
+                with ctx:
                     self.memory_buffer = torch.empty(
                         (
                             2,  # key and value

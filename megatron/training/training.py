@@ -704,6 +704,8 @@ def pretrain(
     main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
     pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
 
+    # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
+    program_start_global = _TRAIN_START_TIME
     if _STARTUP_TIMESTAMPS['program_start'] is not None:
         program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
         torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
@@ -719,8 +721,8 @@ def pretrain(
     megatron_init_end = time.time()
 
     app_metrics = {}
-    app_metrics['app_start_time'] = 100 #round(program_start_global * 1000.0)
-    app_metrics['app_model_init_start_time'] = 100 #round(program_start_global * 1000.0)
+    app_metrics['app_start_time'] = round(program_start_global * 1000.0)
+    app_metrics['app_model_init_start_time'] = round(program_start_global * 1000.0)
 
     # Print basic megatron init time (using global min start)
     # NOTE(asolergi-nv): This is not entirely accurate, but we keep it for backwards compatibility.
@@ -1939,9 +1941,9 @@ def training_log(
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
-            # if iteration > 1:
+            if iteration > 1:
                 # Make sure the memory after the second iteration is reported to include optimizer state memory.
-                # report_memory_flag = False
+                report_memory_flag = False
         # Write timers to wandb, don't reset the counts
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)

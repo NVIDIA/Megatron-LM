@@ -385,6 +385,13 @@ def validate_args(args, defaults={}):
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
 
+    # Assert that `torch_memory_saver` is installed if offloading KV cache during RL.
+    if args.rl_offload_kv_cache_during_training:
+        try:
+            from torch_memory_saver import torch_memory_saver
+        except ImportError:
+            raise AssertionError("To use offload-kv-cache-during-training, `torch_memory_saver` must be installed. See https://github.com/fzyzcjy/torch_memory_saver.")
+
     # Batch size checks if running RL.
     if args.perform_rl_step:
         assert not (args.rl_remove_kv_cache_during_training and args.rl_offload_kv_cache_during_training), \
@@ -2142,6 +2149,9 @@ def _add_rl_args(parser):
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
+                       default=False,
+                       help='If set, do not call `delete_cuda_graphs` or `toggle_cuda_graphs` when the inference engine is suspended.')
+    group.add_argument('--rl-suspend-kv-cache', action=argparse.BooleanOptionalAction, type=bool,
                        default=False,
                        help='If set, do not call `delete_cuda_graphs` or `toggle_cuda_graphs` when the inference engine is suspended. '
                             'Use only when all training and inference cudagraphs and the KV cache fit on device.')
