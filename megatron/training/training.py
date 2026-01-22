@@ -1645,7 +1645,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
         # Forward pass.
         if save_dgrads_in_this_iteration:
-            enable_dgrad_logging(model)
+            enable_dgrad_logging(model, args.save)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -1679,7 +1679,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     state_dict[model_chunk_name][param_name] = main_grad_on_cpu
 
         # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging.
-        save_grads(state_dict, iteration + 1, "wgrads")
+        save_grads(args.save, state_dict, iteration + 1, "wgrads")
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:

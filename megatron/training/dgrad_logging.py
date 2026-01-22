@@ -50,7 +50,8 @@ LINEAR_TYPES = _get_linear_types()
 class DataGradLogger:
     """Captures and saves gradients from all linear layers using backward hooks."""
 
-    def __init__(self):
+    def __init__(self, save_dir: str):
+        self._save_dir = save_dir
         self._dgrads_state_dict = defaultdict(dict)
         self._hooks = []
 
@@ -71,7 +72,7 @@ class DataGradLogger:
         """Save captured gradients to disk and clear the buffer."""
         if not self._dgrads_state_dict:
             return
-        save_grads(self._dgrads_state_dict, iteration, "dgrads")
+        save_grads(self._save_dir, self._dgrads_state_dict, iteration, "dgrads")
         self._dgrads_state_dict.clear()
 
     def register_hooks(self, model: torch.nn.Module):
@@ -97,11 +98,11 @@ class DataGradLogger:
 _LOGGER = None
 
 
-def enable_dgrad_logging(model: torch.nn.Module):
+def enable_dgrad_logging(model: torch.nn.Module, save_dir: str):
     """Enable dgrad logging on a model."""
     global _LOGGER
     if _LOGGER is None:
-        _LOGGER = DataGradLogger()
+        _LOGGER = DataGradLogger(save_dir)
     _LOGGER.register_hooks(model)
 
 

@@ -434,12 +434,12 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
     return metadata
 
 
-def save_grads(state_dict, iteration, grad_label):
-    args = get_args()
+def save_grads(save_dir, state_dict, iteration, grad_label):
+    """Persist state_dict of grads onto disk. In case of wgrads, this collection should
+    be performed before the grads are cleared but after they are reduced.
 
-    # Persist state_dict of grads onto disk. In case of wgrads, this collection should be
-    # performed before the grads are cleared but after they are reduced.
-    # NOTE: Non-expert layers will be duplicated, but this can be handled in postprocessing.
+    NOTE: wgrads for non-expert layers will be duplicated if using expert parallelism, but
+    this can be handled in postprocessing."""
 
     print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saving {grad_label} "
                  f"from iteration {iteration:7d}")
@@ -449,9 +449,9 @@ def save_grads(state_dict, iteration, grad_label):
         ep_rank = mpu.get_expert_model_parallel_rank()
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         tp_rank = mpu.get_tensor_model_parallel_rank()
-        assert args.save is not None
+        assert save_dir is not None
         assert iteration is not None
-        save_dir = os.path.join(args.save, grad_label, f"iter_{iteration:07d}")
+        save_dir = os.path.join(save_dir, grad_label, f"iter_{iteration:07d}")
         os.makedirs(save_dir, exist_ok=True)
 
         # Save state_dict.
