@@ -209,26 +209,6 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
-        # TODO: This is built twice when using MLA, should be refactored.
-        if self.config.num_query_groups < world_size:
-            # TE throws an assertion error if num_kv_heads / num_query_groups
-            # is not divisible by TP size.
-            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
-            tmp_config = copy.deepcopy(self.config)
-            tmp_config.num_query_groups = world_size
-        else:
-            tmp_config = self.config
-        self.core_attention = build_module(
-            submodules.core_attention,
-            config=tmp_config,
-            layer_number=self.layer_number,
-            attn_mask_type=self.attn_mask_type,
-            attention_type=self.attention_type,
-            cp_comm_type=cp_comm_type,
-            softmax_scale=self.config.softmax_scale,
-            pg_collection=self.pg_collection,
-        )
-
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
@@ -248,39 +228,6 @@ class Attention(MegatronModule, ABC):
             self.config.fine_grained_activation_offloading
             and "attn_proj" in self.config.offload_modules
         )
-
-        # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
-            self.query_projection_size,
-            self.config.hidden_size,
-            config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=self.config.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=False,
-            tp_comm_buffer_name='proj',
-            tp_group=self.pg_collection.tp,
-        )
-
-        if (
-            HAVE_TE
-            and isinstance(self.linear_proj, TELinear)
-            and (
-                (
-                    self.config.fp8
-                    and self.config.fp8_recipe != 'delayed'
-                    and is_te_min_version("2.6.0dev0")
-                )
-                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
-            )
-        ):
-            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
-            # linear_proj also saves the quantized tensor of this output. Here we set the
-            # linear_proj to save the original input tensors to avoid the extra memory usage of
-            # the quantized tensor.
-            set_save_original_input(self.linear_proj)
 
     def _checkpointed_attention_forward(
         self,
@@ -1105,6 +1052,58 @@ class SelfAttention(Attention):
             pg_collection=pg_collection,
         )
 
+        if self.config.num_query_groups < self.world_size:
+            # TE throws an assertion error if num_kv_heads / num_query_groups
+            # is not divisible by TP size.
+            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = self.world_size
+        else:
+            tmp_config = self.config
+        self.core_attention = build_module(
+            submodules.core_attention,
+            config=tmp_config,
+            layer_number=self.layer_number,
+            attn_mask_type=self.attn_mask_type,
+            attention_type=self.attention_type,
+            cp_comm_type=cp_comm_type,
+            softmax_scale=self.config.softmax_scale,
+            pg_collection=self.pg_collection,
+        )
+
+        # Output.
+        self.linear_proj = build_module(
+            submodules.linear_proj,
+            self.query_projection_size,
+            self.config.hidden_size,
+            config=self.config,
+            init_method=self.config.output_layer_init_method,
+            bias=self.config.add_bias_linear,
+            input_is_parallel=True,
+            skip_bias_add=True,
+            is_expert=False,
+            tp_comm_buffer_name='proj',
+            tp_group=self.pg_collection.tp,
+        )
+
+        if (
+            HAVE_TE
+            and isinstance(self.linear_proj, TELinear)
+            and (
+                (
+                    self.config.fp8
+                    and self.config.fp8_recipe != 'delayed'
+                    and is_te_min_version("2.6.0dev0")
+                )
+                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
+            )
+        ):
+            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
+            # linear_proj also saves the quantized tensor of this output. Here we set the
+            # linear_proj to save the original input tensors to avoid the extra memory usage of
+            # the quantized tensor.
+            set_save_original_input(self.linear_proj)
+
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
@@ -1473,6 +1472,58 @@ class CrossAttention(Attention):
         if self.config.num_query_groups != self.config.num_attention_heads:
             raise ValueError("Group query attention is not currently supported in cross attention.")
         assert self.query_projection_size == self.kv_projection_size
+
+        if self.config.num_query_groups < self.world_size:
+            # TE throws an assertion error if num_kv_heads / num_query_groups
+            # is not divisible by TP size.
+            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = self.world_size
+        else:
+            tmp_config = self.config
+        self.core_attention = build_module(
+            submodules.core_attention,
+            config=tmp_config,
+            layer_number=self.layer_number,
+            attn_mask_type=self.attn_mask_type,
+            attention_type=self.attention_type,
+            cp_comm_type=cp_comm_type,
+            softmax_scale=self.config.softmax_scale,
+            pg_collection=self.pg_collection,
+        )
+
+        # Output.
+        self.linear_proj = build_module(
+            submodules.linear_proj,
+            self.query_projection_size,
+            self.config.hidden_size,
+            config=self.config,
+            init_method=self.config.output_layer_init_method,
+            bias=self.config.add_bias_linear,
+            input_is_parallel=True,
+            skip_bias_add=True,
+            is_expert=False,
+            tp_comm_buffer_name='proj',
+            tp_group=self.pg_collection.tp,
+        )
+
+        if (
+            HAVE_TE
+            and isinstance(self.linear_proj, TELinear)
+            and (
+                (
+                    self.config.fp8
+                    and self.config.fp8_recipe != 'delayed'
+                    and is_te_min_version("2.6.0dev0")
+                )
+                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
+            )
+        ):
+            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
+            # linear_proj also saves the quantized tensor of this output. Here we set the
+            # linear_proj to save the original input tensors to avoid the extra memory usage of
+            # the quantized tensor.
+            set_save_original_input(self.linear_proj)
 
         self.linear_q = build_module(
             submodules.linear_q,
