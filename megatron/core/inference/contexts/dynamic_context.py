@@ -540,6 +540,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
+        self.has_explicit_chunked_prefill_req = False
 
         # FlashInfer.
         if use_flashinfer_fused_rope is True:
@@ -1300,15 +1301,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if construct_graph_dimensions is not None:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
-        has_explicit_chunked_prefill_req = (
-            self.chunked_prefill_request_id != -1 and self.is_hybrid_model
-        )
-
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
             decode_req_count=self.num_decode_requests,
-            has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
+            has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
@@ -1342,7 +1339,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
                 decode_req_count=padded_decode_req_count,
-                has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
+                has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
             )
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
@@ -1373,6 +1370,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
+            assert not self.has_explicit_chunked_prefill_req
+
             # Treat some decode requests as prefill requests to fit the cuda graph batch dimension.
             if batch_dimensions.decode_req_count > self.padded_batch_dimensions.decode_req_count:
                 total_req = batch_dimensions.req_count
@@ -1382,7 +1381,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     token_count=batch_dimensions.token_count,
                     prefill_req_count=adjusted_prefill_req_count,
                     decode_req_count=adjusted_decode_req_count,
-                    has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
+                    has_explicit_chunked_prefill_req=False,
                 )
 
         self.active_attn_metadata["mha_metadata"].update(
@@ -1461,6 +1460,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
+        self.has_explicit_chunked_prefill_req = False
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
@@ -1981,6 +1981,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
+        self.has_explicit_chunked_prefill_req = False
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
@@ -2011,7 +2012,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset Mamba state.
             self.reset_mamba_state()
-
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -2070,9 +2070,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if self.chunked_prefill_request_id != -1:
                 # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-                active_requests_requiring_new_block[self.get_index_of_chunked_prefill_request()] = (
-                    0  # chunked prefill should not be paused
-                )
+                active_requests_requiring_new_block[
+                    self.get_index_of_chunked_prefill_request() - self.paused_request_count
+                ] = 0  # chunked prefill should not be paused
 
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()

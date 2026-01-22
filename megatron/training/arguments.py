@@ -1339,13 +1339,14 @@ def validate_args(args, defaults={}):
         ):
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        assert (
-            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
-            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
-        ), (
-            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
-            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
-        )
+        if args.cuda_graph_impl == "transformer_engine":
+            assert (
+                "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+                or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+            ), (
+                "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+                "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
+            )
     if args.cuda_graph_scope == "full" or (
         isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
     ):
@@ -1686,8 +1687,12 @@ def _add_inference_args(parser):
     group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
-    group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
-                       help='Disable chunked prefill (chunked prefill is enabled by default).')
+    # TODO(ksanthanam): Clean this up in future PR
+    group.add_argument('--enable-chunked-prefill', dest='disable_chunked_prefill',
+                       action='store_false', default=True,
+                       help="Enable chunked prefill (disabled by default)")
+    group.add_argument('--disable-chunked-prefill', dest='disable_chunked_prefill',
+                       action='store_true', help=argparse.SUPPRESS)
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
