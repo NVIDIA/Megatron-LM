@@ -340,6 +340,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.pipeline_parallel_group = None
 
+        if pg_collection is not None:
+            self.expert_model_parallel_group = pg_collection.ep
+        elif parallel_state.get_expert_model_parallel_world_size() > 1:
+            self.expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+        else:
+            self.expert_model_parallel_group = None
+
         # Mamba states.
         self.is_hybrid_model = mamba_inference_state_config is not None
         if self.is_hybrid_model:
@@ -522,7 +529,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph config list
-        is_expert_parallel = parallel_state.get_expert_model_parallel_world_size() > 1
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
@@ -1313,6 +1319,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
+            ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 

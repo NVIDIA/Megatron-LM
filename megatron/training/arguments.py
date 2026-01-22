@@ -427,6 +427,19 @@ def validate_args(args, defaults={}):
             "--rl-inference-model-unified-memory-level=1."
         )
 
+        # When using different EP sizes for inference and training (EP refit), the legacy
+        # GroupedMLP is not supported. Only SequentialMLP or TEGroupedMLP can be used.
+        if (
+            args.rl_inference_expert_model_parallel_size is not None
+            and args.rl_inference_expert_model_parallel_size != args.expert_model_parallel_size
+        ):
+            assert not args.moe_use_legacy_grouped_gemm, (
+                "Legacy GroupedMLP (--moe-use-legacy-grouped-gemm) is not supported when using "
+                "different expert parallelism sizes for inference and training. "
+                "Use SequentialMLP (default when --moe-grouped-gemm is not set) or "
+                "TEGroupedMLP (--moe-grouped-gemm without --moe-use-legacy-grouped-gemm)."
+            )
+
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -2223,6 +2236,20 @@ def _add_rl_args(parser):
         type=int,
         default=None,
         help='Degree of pipeline model parallelism for inference for RL.',
+    )
+    group.add_argument(
+        '--rl-inference-expert-model-parallel-size',
+        type=int,
+        default=None,
+        help='Degree of expert model parallelism for inference for RL.',
+    )
+    group.add_argument(
+        '--rl-inference-expert-tensor-model-parallel-size',
+        type=int,
+        default=None,
+        help='Degree of expert tensor model parallelism for inference for RL. '
+             'For MoE models, this controls the TP size for expert layers specifically. '
+             'Defaults to training expert_tensor_parallel_size if not specified.',
     )
     group.add_argument(
         '--rl-inference-model-unified-memory-level',
