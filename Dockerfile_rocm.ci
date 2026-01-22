@@ -39,7 +39,7 @@ datasets \
 tiktoken \
 pynvml
 
-
+pip install "nltk>=3.8.2"
 
 # Install Causal-Conv1d and its dependencies
 WORKDIR ${STAGE_DIR}
