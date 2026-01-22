@@ -3177,7 +3177,7 @@ class GradReducePipeline:
                     # Scale gradients.
                     scaling_factor = gbuf.gradient_scaling_factor
                     reduce_op = gradient_reduce_preprocessing(
-                        gbuf.data, scaling_factor, gbuf.ddp_config
+                        bucket.data, scaling_factor, gbuf.ddp_config
                     )
                     if not gbuf.is_data_distributed:
                         # All-reduce the gradients on every rank. No scattering
