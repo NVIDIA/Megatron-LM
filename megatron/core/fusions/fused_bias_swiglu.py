@@ -311,16 +311,17 @@ def _weighted_swiglu_fwd_kernel(
     # Strided access: each block handles tokens [pid, pid+num_blocks, ...]
     token_idx = pid
     while token_idx < num_tokens:
+        token_idx_i64 = token_idx.to(tl.int64)
         # Load weight for this token
-        weight = tl.load(weights_ptr + token_idx)
+        weight = tl.load(weights_ptr + token_idx_i64)
 
         # Process hidden dimension
         for h_offset in range(0, hidden_size, BLOCK_SIZE):
             h_mask = (h_offset + tl.arange(0, BLOCK_SIZE)) < hidden_size
 
             # Load input chunks (gate and value)
-            input_offset_1 = token_idx * (hidden_size * 2) + h_offset
-            input_offset_2 = token_idx * (hidden_size * 2) + hidden_size + h_offset
+            input_offset_1 = token_idx_i64 * (hidden_size * 2) + h_offset
+            input_offset_2 = token_idx_i64 * (hidden_size * 2) + hidden_size + h_offset
 
             y1 = tl.load(
                 input_ptr + input_offset_1 + tl.arange(0, BLOCK_SIZE), mask=h_mask, other=0.0
@@ -341,7 +342,7 @@ def _weighted_swiglu_fwd_kernel(
             result = silu_y1 * y2_fp32 * weight_fp32
 
             # Store output (cast back to original dtype)
-            output_offset = token_idx * hidden_size + h_offset
+            output_offset = token_idx_i64 * hidden_size + h_offset
             tl.store(
                 output_ptr + output_offset + tl.arange(0, BLOCK_SIZE),
                 result.to(y1.dtype),
@@ -376,8 +377,9 @@ def _weighted_swiglu_bwd_kernel(
     # Strided access
     token_idx = pid
     while token_idx < num_tokens:
+        token_idx_i64 = token_idx.to(tl.int64)
         # Load weight for this token
-        weight = tl.load(weights_ptr + token_idx)
+        weight = tl.load(weights_ptr + token_idx_i64)
 
         # Accumulator for weight gradient (fp32 for precision)
         weight_grad_acc = 0.0
@@ -387,14 +389,14 @@ def _weighted_swiglu_bwd_kernel(
             h_mask = (h_offset + tl.arange(0, BLOCK_SIZE)) < hidden_size
 
             # Load grad_output
-            grad_out_offset = token_idx * hidden_size + h_offset
+            grad_out_offset = token_idx_i64 * hidden_size + h_offset
             grad_out = tl.load(
                 grad_output_ptr + grad_out_offset + tl.arange(0, BLOCK_SIZE), mask=h_mask, other=0.0
             )
 
             # Load input chunks
-            input_offset_1 = token_idx * (hidden_size * 2) + h_offset
-            input_offset_2 = token_idx * (hidden_size * 2) + hidden_size + h_offset
+            input_offset_1 = token_idx_i64 * (hidden_size * 2) + h_offset
+            input_offset_2 = token_idx_i64 * (hidden_size * 2) + hidden_size + h_offset
 
             y1 = tl.load(
                 input_ptr + input_offset_1 + tl.arange(0, BLOCK_SIZE), mask=h_mask, other=0.0
@@ -439,7 +441,7 @@ def _weighted_swiglu_bwd_kernel(
             weight_grad_acc += tl.sum(weight_grad_contribution)
 
         # Store weight gradient after processing all chunks
-        tl.store(grad_weights_ptr + token_idx, weight_grad_acc)
+        tl.store(grad_weights_ptr + token_idx_i64, weight_grad_acc)
 
         # Stride to next token
         token_idx += num_blocks
@@ -471,9 +473,13 @@ def weighted_swiglu_triton(input, weights, num_tokens_tensor):
     grid = (num_blocks,)
 
     _weighted_swiglu_fwd_kernel[grid](
-        input, weights, output, num_tokens_tensor, hidden_size=hidden_size, BLOCK_SIZE=BLOCK_SIZE
+        input,
+        weights,
+        output,
+        num_tokens_tensor,
+        hidden_size=hidden_size,
+        BLOCK_SIZE=BLOCK_SIZE,
     )
-
     return output
 
 

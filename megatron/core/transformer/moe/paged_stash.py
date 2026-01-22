@@ -145,8 +145,11 @@ def _paged_stash_copy_kernel(
         need_mask = (HIDDEN_SIZE % BLOCK_SIZE) != 0
         num_iters = elements_per_thread + (1 if need_mask else 0)
 
-        src_base = src_ptr + token_idx * HIDDEN_SIZE
-        dst_base = dst_ptr + dst_token_idx * HIDDEN_SIZE
+        # Use int64 for address math to avoid int32 overflow when indices get large.
+        token_idx_i64 = token_idx.to(tl.int64)
+        dst_token_idx_i64 = dst_token_idx.to(tl.int64)
+        src_base = src_ptr + token_idx_i64 * HIDDEN_SIZE
+        dst_base = dst_ptr + dst_token_idx_i64 * HIDDEN_SIZE
 
         if need_mask:
             for iter in range(num_iters):
@@ -219,8 +222,11 @@ def _paged_stash_pop_kernel(
         need_mask = (HIDDEN_SIZE % BLOCK_SIZE) != 0
         num_iters = elements_per_thread + (1 if need_mask else 0)
 
-        src_base = src_ptr + src_token_idx * HIDDEN_SIZE
-        dst_base = dst_ptr + token_idx * HIDDEN_SIZE
+        # Use int64 for address math to avoid int32 overflow when indices get large.
+        src_token_idx_i64 = src_token_idx.to(tl.int64)
+        token_idx_i64 = token_idx.to(tl.int64)
+        src_base = src_ptr + src_token_idx_i64 * HIDDEN_SIZE
+        dst_base = dst_ptr + token_idx_i64 * HIDDEN_SIZE
 
         if need_mask:
             for iter in range(num_iters):
@@ -261,6 +267,7 @@ class PagedTensor:
         self,
         tensor,
         num_tokens_tensor=None,
+        avg_num_tokens: int = None,
         vp_stage=None,
         schedule_layer_no=None,
         layer_name=None,
@@ -284,6 +291,7 @@ class PagedTensor:
             and num_tokens_tensor.numel() == 1
         )
         self.num_tokens_tensor = num_tokens_tensor.clone()
+        self.avg_num_tokens = avg_num_tokens
         self.vp_stage = vp_stage
         self.schedule_layer_no = schedule_layer_no
         self.layer_name = layer_name
@@ -517,7 +525,7 @@ class PagedStashManager:
         """Initialize the manager with queues and dedicated CUDA streams."""
         # allocate streams and events for synchronization
         self.enabled = False
-        self._pack_stream = torch.cuda.Stream()
+        self._pack_stream = torch.cuda.current_stream()#torch.cuda.Stream()
         # Currently paged stashing is not stream-safe, so use the same stream for packing
         # and unpacking
         self._unpack_stream = self._pack_stream
@@ -543,9 +551,14 @@ class PagedStashManager:
         # Track max tokens needed across all vp_stages grouped by dtype and hidden_size
         self.max_tokens_across_vp_stages = None
         self.temp_tokens_across_vp_stages = None
+        # Track max tokens computed from avg_num_tokens (heuristic) across all vp_stages
+        self.max_avg_tokens_across_vp_stages = None
+        self.temp_avg_tokens_across_vp_stages = None
 
         self.num_tokens_tensor = None
         self.max_num_tokens = None
+        # Optional hint: expected/average number of tokens (e.g., pre-padding estimate)
+        self.avg_num_tokens = None
         self.stash_buffers = None
         self.overflow = None
         self.device = None
@@ -663,12 +676,28 @@ class PagedStashManager:
         self.stash_buffers = {}
         self.overflow = torch.zeros(1, dtype=torch.int64, device=self.device)
 
-        for dtype, hidden_size in self.max_tokens_across_vp_stages:
+        # stash_buffer_size_factor controls both which sizing signal to use and how much headroom
+        # to allocate:
+        # - positive: size based on avg_num_tokens-derived maxima
+        # - negative: size based on actual num_tokens-derived maxima (legacy behavior)
+        # In both cases we scale by abs(stash_buffer_size_factor).
+        if stash_buffer_size_factor >= 0:
+            max_tokens_dict = self.max_avg_tokens_across_vp_stages
+            scale = stash_buffer_size_factor
+        else:
+            max_tokens_dict = self.max_tokens_across_vp_stages
+            scale = -stash_buffer_size_factor
+
+        # Fallback safety: if avg-based dict is not available/populated yet, use actual-max dict.
+        if not max_tokens_dict:
+            max_tokens_dict = self.max_tokens_across_vp_stages
+
+        for dtype, hidden_size in max_tokens_dict:
             if dtype not in self.stash_buffers:
                 self.stash_buffers[dtype] = {}
             assert hidden_size not in self.stash_buffers[dtype]
             num_tokens = int(
-                self.max_tokens_across_vp_stages[dtype, hidden_size] * stash_buffer_size_factor
+                max_tokens_dict[dtype, hidden_size] * scale
             )
             self.stash_buffers[dtype][hidden_size] = PagedStashBuffer(
                 num_tokens, hidden_size, self.page_size, self.device, self.overflow, dtype
@@ -721,9 +750,13 @@ class PagedStashManager:
                 tensor._rowwise_data is None
             ), f"rowwise_data is not None; Only columnwise data is supported for paged stashing"
 
+        avg_num_tokens = None
         if self.status == 'capture':
 
             self.num_tokens = self.num_tokens_tensor.item()
+            avg_num_tokens = (
+                int(self.avg_num_tokens) if self.avg_num_tokens is not None else None
+            )
 
             dtype = (
                 tensor.dtype
@@ -743,12 +776,22 @@ class PagedStashManager:
             if (dtype, hidden_size) not in self.temp_tokens_across_vp_stages:
                 self.temp_tokens_across_vp_stages[dtype, hidden_size] = 0
                 self.max_tokens_across_vp_stages[dtype, hidden_size] = 0
+                self.temp_avg_tokens_across_vp_stages[dtype, hidden_size] = 0
+                self.max_avg_tokens_across_vp_stages[dtype, hidden_size] = 0
 
             self.temp_tokens_across_vp_stages[dtype, hidden_size] += self.num_tokens
             self.max_tokens_across_vp_stages[dtype, hidden_size] = max(
                 self.max_tokens_across_vp_stages[dtype, hidden_size],
                 self.temp_tokens_across_vp_stages[dtype, hidden_size],
             )
+
+            # Track avg tokens across vp stages (if provided) using the same accumulation model.
+            if avg_num_tokens is not None:
+                self.temp_avg_tokens_across_vp_stages[dtype, hidden_size] += avg_num_tokens
+                self.max_avg_tokens_across_vp_stages[dtype, hidden_size] = max(
+                    self.max_avg_tokens_across_vp_stages[dtype, hidden_size],
+                    self.temp_avg_tokens_across_vp_stages[dtype, hidden_size],
+                )
             # Since capture stage does not use CUDA graph, we can truncate
             # the saved tensor to actual num_tokens
             new_size = (self.num_tokens, *tensor.shape[1:])
@@ -767,6 +810,7 @@ class PagedStashManager:
         paged_tensor = PagedTensor(
             tensor,
             num_tokens_tensor=self.num_tokens_tensor,
+            avg_num_tokens=avg_num_tokens,
             vp_stage=self.current_vp_stage,
             schedule_layer_no=(
                 self._pp_schedule[self.current_schedule_index]
@@ -791,6 +835,14 @@ class PagedStashManager:
         if isinstance(saved_state, (PagedTensor)):
             if self.status == 'capture':
                 num_tokens = saved_state.num_tokens_tensor.item()
+                key = (saved_state.dtype, saved_state.hidden_size)
+                if key in self.temp_tokens_across_vp_stages:
+                    self.temp_tokens_across_vp_stages[key] -= num_tokens
+                if (
+                    saved_state.avg_num_tokens is not None
+                    and key in self.temp_avg_tokens_across_vp_stages
+                ):
+                    self.temp_avg_tokens_across_vp_stages[key] -= int(saved_state.avg_num_tokens)
                 # Pad the tensor to the max number of tokens
                 npad = self.max_num_tokens - num_tokens
                 pad = ()
@@ -811,6 +863,13 @@ class PagedStashManager:
             assert (
                 saved_state._tensor is not None
             ), f"saved_state._tensor is None {saved_state._tensor}"
+
+            # Record cross-stream usage (important when tensor was produced on another stream).
+            if isinstance(saved_state._tensor, MXFP8Tensor):
+                saved_state._tensor._columnwise_data.record_stream(torch.cuda.current_stream())
+            elif isinstance(saved_state._tensor, torch.Tensor) and saved_state._tensor.is_cuda:
+                saved_state._tensor.record_stream(torch.cuda.current_stream())
+
             return saved_state._tensor
 
         return saved_state
@@ -855,12 +914,18 @@ def paged_stash_group_start(tensor):
     return PP_PreScheduleFunction.apply(tensor, stash_manager)
 
 
-def get_paged_stash_context(name=None, max_num_tokens=None, num_tokens_tensor=None):
+def get_paged_stash_context(
+    name=None,
+    max_num_tokens=None,
+    num_tokens_tensor=None,
+    avg_num_tokens=None,
+):
     """Get the paged stash context"""
     stash_manager = PagedStashManager.get_instance()
     if not stash_manager.enabled:
         return nullcontext()
     stash_manager.max_num_tokens = max_num_tokens
+    stash_manager.avg_num_tokens = avg_num_tokens
     assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor)
     stash_manager.num_tokens_tensor = num_tokens_tensor
     stash_manager.set_current_layer_name(name) if name is not None else None
@@ -891,6 +956,8 @@ def paged_stash_init_chunk_handler(vp_size, vp_stage):
     if stash_manager.max_tokens_across_vp_stages is None:
         stash_manager.max_tokens_across_vp_stages = {}
         stash_manager.temp_tokens_across_vp_stages = {}
+        stash_manager.max_avg_tokens_across_vp_stages = {}
+        stash_manager.temp_avg_tokens_across_vp_stages = {}
 
 
 def paged_stash_set_last_layer(is_last_layer=False):
