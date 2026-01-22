@@ -288,8 +288,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         ]
         if any(param is not None for param in deprecated_params):
             raise TypeError(
-                "Passing `TransformerConfig` arguments directly is deprecated. "
-                "Please pass `model_config` instead."
+                "Passing `TransformerConfig` arguments individually is deprecated. "
+                "Please pass the `TransformerConfig` directly to `model_config` instead."
             )
 
         self.cache_mla_latent = (

@@ -285,7 +285,7 @@ class DynamicInferenceEngine(AbstractEngine):
             controller,
             context,
             enable_cuda_graph=model.config.cuda_graph_impl == "local",
-            random_seed=amodel.config.seed,
+            random_seed=model.config.seed,
             track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
             enable_chunked_prefill=not args.disable_chunked_prefill,
             metrics_writer=metrics_writer,

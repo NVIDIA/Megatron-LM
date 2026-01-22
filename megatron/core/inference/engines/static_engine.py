@@ -118,7 +118,6 @@ class StaticInferenceEngine(AbstractEngine):
                     random_seed=self.random_seed,
                 )
         except Exception as e:
-            torch.distributed.breakpoint(0)
             # Get exception details for better debugging
             exception_msg = str(e) if str(e) else f"{type(e).__name__}: {repr(e)}"
             warnings.warn(
