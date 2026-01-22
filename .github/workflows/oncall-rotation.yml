@@ -46,8 +46,7 @@ jobs:
           SLACK_TOKEN: ${{ secrets.ONCALL_SLACK_TOKEN }}
         run: |
           pip install --no-cache-dir uv
-          uv pip install slack-sdk
-          uv run python .github/scripts/oncall_manager.py rotate
+          uv run --with slack-sdk python .github/scripts/oncall_manager.py rotate
 
       - name: Commit and Push changes
         run: |

@@ -21,12 +21,16 @@ from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     MultiTokenPredictionBlockSubmodules,
     MultiTokenPredictionLayer,
     MultiTokenPredictionLayerSubmodules,
+)
+from megatron.core.transformer.transformer_layer import (
+    MoETransformerLayer,
+    TransformerLayer,
+    TransformerLayerSubmodules,
 )
 
 # This should be private and should not be used outside of this file.
@@ -109,8 +113,7 @@ mamba_stack_spec = ModuleSpec(
             ),
         ),
         moe_layer=ModuleSpec(
-            # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
-            module=TransformerLayer,
+            module=MoETransformerLayer,
             submodules=TransformerLayerSubmodules(
                 pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),

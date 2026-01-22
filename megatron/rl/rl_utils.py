@@ -77,7 +77,7 @@ from megatron.training.utils import (
     print_rank_0,
     unwrap_model,
 )
-from megatron.core.utils import get_pg_size, get_attr_wrapped_model
+from megatron.core.utils import get_pg_rank, get_pg_size, get_attr_wrapped_model
 from megatron.core.process_groups_config import ProcessGroupCollection
 from wandb import wandb_run
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
