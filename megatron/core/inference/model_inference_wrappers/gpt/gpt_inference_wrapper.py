@@ -33,7 +33,10 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
         model: GPTModel,
         inference_context: Optional[BaseInferenceContext] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        inference_wrapper_config: Optional[Any] = None,  # Deprecated
     ):
+        if inference_wrapper_config is not None:
+            raise TypeError("Passing `inference_wrapper_config` is deprecated.")
         super().__init__(model, inference_context, pg_collection)
 
     def prep_inference_input(self, prompts_tokens: torch.Tensor) -> Dict[str, Any]:
