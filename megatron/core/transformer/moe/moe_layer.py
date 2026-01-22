@@ -118,11 +118,8 @@ class MoELayer(BaseMoELayer):
         super(MoELayer, self).__init__(
             config=config, layer_number=layer_number, pg_collection=pg_collection
         )
-        # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
-            config.recompute_granularity == 'selective'
-            and "moe" in config.recompute_modules
-            and config.cuda_graph_impl != 'local'
+            config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
         )
         self.shared_experts_recompute = (
             config.recompute_granularity == 'selective'
@@ -209,7 +206,6 @@ class MoELayer(BaseMoELayer):
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
-        self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor):
@@ -295,23 +291,19 @@ class MoELayer(BaseMoELayer):
 
         return output, mlp_bias
 
-    def combine(self, output: torch.Tensor):
+    def combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Combines expert outputs via communication and adds shared expert output.
 
         This method uses the token dispatcher to combine the outputs from different
-        experts (e.g., via an All-to-All communication).
+        experts (e.g., via an All-to-All communication). It then adds the output
+        from the shared expert if it exists.
         """
         output = self.token_dispatcher.token_combine(output)
-        return output
-
-    def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
-        """Project the output back from latent dimension to hidden dimension after combine
-        in latent dimension if needed. Combine expert output with shared_experts if needed."""
-
         output = self.token_dispatcher.combine_postprocess(output)
+        # Project the output back from latent dimension to hidden dimension after combine
+        # in latent dimension.
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
-
         if shared_expert_output is not None:
             output = output + shared_expert_output
         return output
@@ -323,7 +315,7 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
-    def forward(self, hidden_states: torch.Tensor, intermediate_tensors=None):
+    def forward(self, hidden_states: torch.Tensor):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -345,16 +337,11 @@ class MoELayer(BaseMoELayer):
             )
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states, intermediate_tensors):
+        def custom_forward(hidden_states):
             try:
-                if "route" in self.fwd_execution_map:
-                    shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states)
-                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
-
-                    if intermediate_tensors is not None:
-                        return hidden_states, probs, shared_expert_output
-
+                shared_expert_output = self.shared_experts_compute(hidden_states)
+                probs, routing_map = self.route(hidden_states)
+                hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
@@ -363,28 +350,10 @@ class MoELayer(BaseMoELayer):
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
-            if "expert_compute" in self.fwd_execution_map:
-                if intermediate_tensors is not None:
-                    hidden_states, probs = intermediate_tensors
-
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
-                assert (
-                    mlp_bias is None
-                ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                output = self.combine(output)
-
-                if intermediate_tensors is not None:
-                    return output, mlp_bias
-
-            if "postprocess" in self.fwd_execution_map:
-                if intermediate_tensors is not None:
-                    output, shared_expert_output = intermediate_tensors
-
-                output = self.postprocess(output, shared_expert_output)
-
-                if intermediate_tensors is not None:
-                    return output
+            dispatched_input, probs = self.dispatch(hidden_states, probs)
+            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+            assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+            output = self.combine(output, shared_expert_output)
 
             return output, mlp_bias
 
@@ -396,14 +365,11 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
-                    intermediate_tensors,
                 )
             else:
-                outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, intermediate_tensors
-                )
+                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
         else:
-            outputs = custom_forward(hidden_states, intermediate_tensors)
+            outputs = custom_forward(hidden_states)
 
         return outputs
 
