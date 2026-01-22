@@ -1082,17 +1082,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 return True
         return False
 
-    def backward_dw_cudagraph(self, microbatch_idx):
-        """
-        CUDA Graph backward weight gradient computation for this layer.
-        """
-        cg_index = microbatch_idx % len(self.cuda_graphs)
-        if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
-            return
-        self.cuda_graphs[cg_index].backward_dw()
-        for hook in self.cuda_graph_manual_post_hooks:
-            hook()
-
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
             # Inference mode.

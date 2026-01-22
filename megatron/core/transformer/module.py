@@ -188,7 +188,20 @@ class GraphableMegatronModule(MegatronModule):
             # triggered before CUDA Graph running. This is required to ensure the correct param
             # all-gather overlap with forward compute.
             self.cuda_graph_manual_pre_hooks = []
-            self.cuda_graph_manual_post_hooks = []
+            self.cuda_graph_manual_wgrad_post_hooks = []
+
+    def _te_cuda_graph_backward_dw_graph(self, microbatch_idx):
+        """
+        CUDA Graph backward weight gradient computation for current layer.
+        """
+        cg_index = microbatch_idx % len(self.cuda_graphs)
+        if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
+            return
+        self.cuda_graphs[cg_index].backward_dw()
+
+        # Trigger the backward post-hooks.
+        for hook in self.cuda_graph_manual_wgrad_post_hooks:
+            hook()
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
@@ -224,11 +237,11 @@ class GraphableMegatronModule(MegatronModule):
         covered by cudagraphs.
         """
         self.cuda_graph_manual_pre_hooks = []
-        self.cuda_graph_manual_post_hooks = []
+        self.cuda_graph_manual_wgrad_post_hooks = []
 
         # Select the modules who contain direct parameters and are covered by cudagraphs.
         # Add these modules and params to `cuda_graph_manual_pre_hooks` and
-        # `cuda_graph_manual_post_hooks` because their hooks will not be
+        # `cuda_graph_manual_wgrad_post_hooks` because their hooks will not be
         # automatically triggered when they go through the CUDA Graph path.
         param_modules = {}
         params = {}
@@ -254,7 +267,7 @@ class GraphableMegatronModule(MegatronModule):
                 self.cuda_graph_manual_pre_hooks.append((make_forward_pre_hook_func(), (module,)))
         if make_backward_post_hook_func is not None:
             for param in params.values():
-                self.cuda_graph_manual_post_hooks.append(make_backward_post_hook_func(param))
+                self.cuda_graph_manual_wgrad_post_hooks.append(make_backward_post_hook_func(param))
 
     def _get_submodules_under_cudagraphs(self):
         """

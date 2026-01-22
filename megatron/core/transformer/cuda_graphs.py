@@ -2022,7 +2022,7 @@ class TECudaGraphHelper:
                         graphs_not_reset += 1
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_pre_hooks = []
-                layer.cuda_graph_manual_post_hooks = []
+                layer.cuda_graph_manual_wgrad_post_hooks = []
 
         log_on_each_pipeline_stage(
             logger=logger,
