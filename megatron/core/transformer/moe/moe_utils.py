@@ -11,6 +11,7 @@ from megatron.core import parallel_state
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -768,18 +769,29 @@ def clear_aux_losses_tracker():
         tracker[name]["values"].zero_()
 
 
-def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = None):
+def reduce_aux_losses_tracker_across_ranks(
+    track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
+):
     """Collect and reduce the auxiliary losses across ranks."""
     tracker = get_moe_layer_wise_logging_tracker()
     if track_names is None:
         track_names = tracker.keys()
+
+    if pg_collection is None:
+        # Use parallel_state groups
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        dp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=False, partial_data_parallel=False
+        )
+    else:
+        pp_group = pg_collection.pp
+        dp_group = pg_collection.dp
+
     for name in track_names:
         values = tracker[name]["values"]
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Collect aux losses across PP.
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pp_group)
         # Reduce aux losses across ranks.
         if tracker[name].get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
@@ -787,9 +799,7 @@ def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = No
             # does not have 'dp' attribute, do it manually.
             if not tracker[name].get('reduce_group_has_dp', False):
                 torch.distributed.all_reduce(
-                    values,
-                    group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-                    op=torch.distributed.ReduceOp.AVG,
+                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
                 )
         if tracker[name].get('avg_group') is not None:
             torch.distributed.all_reduce(
@@ -809,6 +819,7 @@ def track_moe_metrics(
     num_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Track the MoE metrics for logging."""
     # Aux loss logging
@@ -823,7 +834,7 @@ def track_moe_metrics(
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
                     tracker[key]["reduce_group_has_dp"] = False
-    reduce_aux_losses_tracker_across_ranks(track_names)
+    reduce_aux_losses_tracker_across_ranks(track_names, pg_collection=pg_collection)
 
     # Get number of MoE layers
     if moe_layer_freq is None:
@@ -918,6 +929,7 @@ def get_moe_layer_wise_logging_tracker():
     return _MOE_LAYER_WISE_LOGGING_TRACKER
 
 
+@internal_api
 class RandomSTE(torch.autograd.Function):
     """
     Straight-Through Estimator(STE) function that returns random values
@@ -926,26 +938,14 @@ class RandomSTE(torch.autograd.Function):
     This is used to generate random logits of router for load-balanced benchmark.
     """
 
-    generator = None
-    random_logits = None
-
     @staticmethod
     def forward(ctx, logits):
         """
         Forward pass returns random logits with rank-specific seed.
         """
-        if is_graph_capturing() and RandomSTE.random_logits is not None:
-            return RandomSTE.random_logits
-
-        if RandomSTE.generator is None:
-            global_rank = torch.distributed.get_rank()
-            base_seed = 42
-            seed = base_seed + global_rank
-            RandomSTE.generator = torch.Generator(device=logits.device)
-            RandomSTE.generator.manual_seed(seed)
-
-        RandomSTE.random_logits = logits.clone().normal_(generator=RandomSTE.generator)
-        return RandomSTE.random_logits
+        with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
+            random_logits = logits.clone().normal_()
+        return random_logits
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -1232,6 +1232,10 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
             Otherwise, we execute the original function and check if we should raise a signal to
             early return in CUDA graph capture.
             """
+
+            if moe_layer.config.cuda_graph_impl != "transformer_engine":
+                return func(moe_layer, *args, **kwargs)
+
             # The non-cudagraph codepath just calls the original function.
             if not is_graph_capturing() and moe_layer.cudagraph_tensor_store.is_empty():
                 return func(moe_layer, *args, **kwargs)

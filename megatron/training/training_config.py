@@ -114,3 +114,82 @@ class ValidationConfig:
        separate loss for each dataset in the list. This argument requires that no weights are 
        included in the list.
     """
+
+
+@dataclass(kw_only=True)
+class SchedulerConfig:
+    """Configuration settings for the learning rate scheduler and weight decay."""
+
+    # ---------------- Learning rate config. ----------------
+    lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD"] = "linear"
+    """Learning rate decay function."""
+
+    lr_wsd_decay_style: Literal["exponential", "linear", "cosine", "minus_sqrt"] = "exponential"
+    """Decay style for the annealing phase of WSD"""
+
+    lr_decay_iters: int | None = None
+    """number of iterations to decay learning rate over, If None defaults to train iters"""
+
+    lr_decay_samples: int | None = None
+    """number of samples to decay learning rate over, If None defaults to train samples"""
+
+    lr_wsd_decay_iters: int | None = None
+    """number of iterations for the annealing phase in the wsd schedule"""
+
+    lr_wsd_decay_samples: int | None = None
+    """number of samples for the annealing phase in the wsd schedule"""
+
+    lr_warmup_fraction: float | None = None
+    """fraction of lr-warmup-(iters/samples) to use for warmup (as a float)"""
+
+    lr_warmup_iters: int = 0
+    """number of iterations to linearly warmup learning rate over."""
+
+    lr_warmup_samples: int = 0
+    """number of samples to linearly warmup learning rate over."""
+
+    lr_warmup_init: float = 0.0
+    """Initial value for learning rate warmup. The scheduler starts warmup from this value."""
+
+    lr_decay_steps: int | None = field(init=False, default=None)
+    """number of samples to decay learning rate over. Calculated at runtime from 
+    lr_decay_iters or lr_decay_samples.
+    """
+
+    lr_warmup_steps: int | None = field(init=False, default=None)
+    """number of samples to warmup learning rate over. Calculated at runtime from
+    lr_warmup_fraction, lr_warmup_iters, or lr_warmup_samples.
+    """
+    
+    override_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--override-opt_param-scheduler", "--override-opt-param-scheduler"]}})
+    """Reset the values of the scheduler (learning rate, warmup iterations, minimum learning rate,
+    maximum number of iterations, and decay style) from input arguments and ignore values from
+    checkpoints. Note that all the above values will be reset."""
+
+    use_checkpoint_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--use-checkpoint-opt_param-scheduler", "--use-checkpoint-opt-param-scheduler"]}})
+    """Use checkpoint to set the values of the scheduler (learning rate, warmup iterations,
+    minimum learning rate, maximum number of iterations, and decay style) from checkpoint
+    and ignore input arguments."""
+
+    # ---------------- Regularization config. ----------------
+
+    start_weight_decay: float | None = None
+    """Initial weight decay coefficient for L2 regularization."""
+
+    end_weight_decay: float | None = None
+    """End of run weight decay coefficient for L2 regularization."""
+
+    weight_decay_incr_style: Literal["constant", "linear", "cosine"] = "constant"
+    """Weight decay increment function."""
+
+    no_weight_decay_cond_type: Literal["qwen3_next"] | None = None
+    """Type of no weight decay condition. Choices:
+    None (default): param no weight decay if and only if it is 1D; or it is bias;
+    or it is embedding and embedding_init_method_std is not None.
+    "qwen3_next": In addition to the default rules, apply weight decay to qk layernorm as a special case."""
+
+    wd_incr_steps: int | None = field(init=False, default=None)
+    """Number of samples to increment weight decay over. Calculated at runtime."""
+
+    wsd_decay_steps: int | None = field(init=False, default=None)
+    """Number of samples to decay WSD weight decay. Calculated at runtime."""
