@@ -29,29 +29,7 @@ from slack_sdk.errors import SlackApiError
 
 # Constants
 GITHUB_API_URL = "https://api.github.com"
-
-# Mapping from GitHub team slug to Slack usergroup handle
-TEAM_TO_USERGROUP = {
-    "mixture-of-experts-adlr": "mcore-moe-adlr",
-    "mixture-of-experts-devtech": "mcore-moe-devtech",
-    "core-adlr": "mcore-adlr",
-    "core-nemo": "mcore-nemo",
-    "core-devtech": "mcore-devtech",
-    "pipeline-parallelism": "mcore-pp",
-    "dist-checkpointing": "mcore-dist-ckpt",
-    "megatron-fsdp": "mcore-fsdp",
-    "datasets": "mcore-datasets",
-    "gpt": "mcore-gpt",
-    "hybrid-mamba": "mcore-mamba",
-    "cuda-graphs": "mcore-cuda-graphs",
-    "inference": "mcore-inference",
-    "post-training": "mcore-post-training",
-    "dist-optimizer": "mcore-dist-optimizer",
-    "quantization-and-inference": "mcore-quantization-inference",
-    "multi-modal": "mcore-multi-modal",
-    "ci": "mcore-ci",
-    "reinforcement-learning": "mcore-rl",
-}
+PARENT_TEAM_SLUG = "mcore-reviewers"
 
 # Caches for email and Slack lookups
 _email_cache = {}
@@ -79,6 +57,76 @@ def get_org():
     """Returns the organization from GITHUB_REPOSITORY env var or default."""
     repo_env = os.environ.get("GITHUB_REPOSITORY", "NVIDIA/Megatron-LM")
     return repo_env.split("/")[0]
+
+
+def github_team_to_slack_usergroup(team_slug):
+    """Convert a GitHub team slug to a Slack usergroup handle.
+
+    Rules:
+    - Base pattern: "test" -> "mcore-test"
+    - Remove "core-" prefix: "core-test" -> "mcore-test"
+    - Remove "megatron-" prefix: "megatron-test" -> "mcore-test"
+    - Remove "-and-": "test1-and-test2" -> "mcore-test1-test2"
+    - Shorten "mixture-of-experts" to "moe"
+    - Shorten "pipeline-parallelism" to "pp"
+    - Shorten "reinforcement-learning" to "rl"
+    """
+    name = team_slug
+
+    # Apply shortenings first (before removing prefixes)
+    name = name.replace("mixture-of-experts", "moe")
+    name = name.replace("pipeline-parallelism", "pp")
+    name = name.replace("reinforcement-learning", "rl")
+
+    # Remove prefixes
+    if name.startswith("core-"):
+        name = name[5:]  # Remove "core-"
+    elif name.startswith("megatron-"):
+        name = name[9:]  # Remove "megatron-"
+
+    # Remove "-and-"
+    name = name.replace("-and-", "-")
+
+    return f"mcore-{name}"
+
+
+def get_child_teams(org, parent_team_slug):
+    """Fetches child teams of a parent GitHub team."""
+    # First get the team ID
+    url = f"{GITHUB_API_URL}/orgs/{org}/teams/{parent_team_slug}"
+    headers = get_headers()
+
+    resp = requests.get(url, headers=headers)
+    if resp.status_code != 200:
+        print(f"Error fetching parent team '{parent_team_slug}': {resp.status_code} {resp.text}")
+        return []
+
+    parent_team_id = resp.json().get("id")
+    if not parent_team_id:
+        print(f"Error: Could not get ID for team '{parent_team_slug}'")
+        return []
+
+    # Now fetch child teams
+    url = f"{GITHUB_API_URL}/orgs/{org}/teams/{parent_team_slug}/teams"
+    child_teams = []
+    page = 1
+
+    while True:
+        resp = requests.get(f"{url}?per_page=100&page={page}", headers=headers)
+        if resp.status_code != 200:
+            print(f"Error fetching child teams: {resp.status_code} {resp.text}")
+            return child_teams
+
+        data = resp.json()
+        if not data:
+            break
+
+        child_teams.extend([team["slug"] for team in data])
+        if len(data) < 100:
+            break
+        page += 1
+
+    return child_teams
 
 
 def get_team_members(org, team_slug):
@@ -240,8 +288,62 @@ def get_slack_usergroup_id(slack_client, handle):
     if handle in usergroups:
         return usergroups[handle]["id"], usergroups[handle]["users"]
 
-    print(f"Warning: Slack usergroup '{handle}' not found")
     return None, []
+
+
+def github_team_to_usergroup_name(team_slug):
+    """Convert a GitHub team slug to a Slack usergroup display name.
+
+    Example: "test3" -> "Megatron Core Experts: Test3"
+    """
+    # Title case each word separated by hyphens, then join with spaces
+    words = team_slug.split("-")
+    title_cased = " ".join(word.capitalize() for word in words)
+    return f"Megatron Core Experts: {title_cased}"
+
+
+def create_slack_usergroup(slack_client, handle, team_slug):
+    """Create a new Slack usergroup.
+
+    Args:
+        slack_client: Slack WebClient instance
+        handle: The usergroup handle (e.g., "mcore-test")
+        team_slug: The GitHub team slug (used for name and description)
+
+    Returns:
+        The usergroup ID if created successfully, None otherwise
+    """
+    global _usergroups_cache
+
+    name = github_team_to_usergroup_name(team_slug)
+    description = f'Expert review group "{team_slug}"'
+
+    try:
+        print(f"Creating Slack usergroup '@{handle}' with name '{name}'...")
+        response = slack_client.usergroups_create(
+            name=name,
+            handle=handle,
+            description=description,
+        )
+        usergroup = response.get("usergroup", {})
+        usergroup_id = usergroup.get("id")
+
+        if usergroup_id:
+            # Update cache with new usergroup
+            if _usergroups_cache is not None:
+                _usergroups_cache[handle] = {
+                    "id": usergroup_id,
+                    "users": [],
+                }
+            print(f"Successfully created Slack usergroup '@{handle}'")
+            return usergroup_id
+        else:
+            print(f"Error: Usergroup created but no ID returned")
+            return None
+
+    except SlackApiError as e:
+        print(f"Error creating Slack usergroup '@{handle}': {e.response['error']}")
+        return None
 
 
 def sync_team_to_usergroup(team_slug, usergroup_handle, dry_run=False):
@@ -288,12 +390,20 @@ def sync_team_to_usergroup(team_slug, usergroup_handle, dry_run=False):
         print(f"Error: No Slack users found for team '{team_slug}'")
         return False
 
-    # 3. Get current Slack usergroup membership
+    # 3. Get current Slack usergroup membership (or create if it doesn't exist)
     usergroup_id, current_members = get_slack_usergroup_id(slack_client, usergroup_handle)
 
     if not usergroup_id:
-        print(f"Error: Slack usergroup '@{usergroup_handle}' not found")
-        return False
+        print(f"Slack usergroup '@{usergroup_handle}' not found, creating it...")
+        if dry_run:
+            print(f"Dry run: Would create usergroup '@{usergroup_handle}'")
+            current_members = []
+        else:
+            usergroup_id = create_slack_usergroup(slack_client, usergroup_handle, team_slug)
+            if not usergroup_id:
+                print(f"Error: Failed to create Slack usergroup '@{usergroup_handle}'")
+                return False
+            current_members = []
 
     # 4. Compare and update
     current_set = set(current_members)
@@ -327,14 +437,39 @@ def sync_team_to_usergroup(team_slug, usergroup_handle, dry_run=False):
         return False
 
 
+def get_team_to_usergroup_mapping():
+    """Fetch child teams of mcore-reviewers and generate the mapping."""
+    org = get_org()
+    child_teams = get_child_teams(org, PARENT_TEAM_SLUG)
+
+    if not child_teams:
+        print(f"Error: No child teams found under '{PARENT_TEAM_SLUG}'")
+        return {}
+
+    mapping = {}
+    for team_slug in child_teams:
+        usergroup_handle = github_team_to_slack_usergroup(team_slug)
+        mapping[team_slug] = usergroup_handle
+
+    return mapping
+
+
 def sync_all_teams(dry_run=False):
-    """Sync all configured GitHub teams to their Slack usergroups."""
-    print("Syncing all GitHub teams to Slack usergroups")
-    print(f"Total mappings: {len(TEAM_TO_USERGROUP)}")
+    """Sync all GitHub teams under mcore-reviewers to their Slack usergroups."""
+    print(f"Fetching child teams of '{PARENT_TEAM_SLUG}'...")
+    team_to_usergroup = get_team_to_usergroup_mapping()
+
+    if not team_to_usergroup:
+        return False
+
+    print(f"Found {len(team_to_usergroup)} teams to sync")
+    print("\nTeam to usergroup mapping:")
+    for team, usergroup in sorted(team_to_usergroup.items()):
+        print(f"  {team} -> @{usergroup}")
 
     results = {"success": [], "failed": []}
 
-    for team_slug, usergroup_handle in TEAM_TO_USERGROUP.items():
+    for team_slug, usergroup_handle in team_to_usergroup.items():
         success = sync_team_to_usergroup(team_slug, usergroup_handle, dry_run=dry_run)
         if success:
             results["success"].append(team_slug)
@@ -373,10 +508,14 @@ def main():
     args = parser.parse_args()
 
     if args.list:
-        print("Configured team-to-usergroup mappings:")
+        print(f"Fetching child teams of '{PARENT_TEAM_SLUG}'...")
+        team_to_usergroup = get_team_to_usergroup_mapping()
+        if not team_to_usergroup:
+            sys.exit(1)
+        print("\nTeam-to-usergroup mappings:")
         print(f"{'GitHub Team':<35} {'Slack Usergroup':<30}")
         print("-" * 65)
-        for team, usergroup in sorted(TEAM_TO_USERGROUP.items()):
+        for team, usergroup in sorted(team_to_usergroup.items()):
             print(f"{team:<35} @{usergroup:<29}")
         return
 
