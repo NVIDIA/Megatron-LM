@@ -187,7 +187,8 @@ class GraphableMegatronModule(MegatronModule):
             # graphs. Those hooks and args are collected in this list and should be manually
             # triggered before CUDA Graph running. This is required to ensure the correct param
             # all-gather overlap with forward compute.
-            self.cuda_graph_manual_hooks = []
+            self.cuda_graph_manual_pre_hooks = []
+            self.cuda_graph_manual_post_hooks = []
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
@@ -226,8 +227,9 @@ class GraphableMegatronModule(MegatronModule):
         self.cuda_graph_manual_post_hooks = []
 
         # Select the modules who contain direct parameters and are covered by cudagraphs.
-        # Add these modules to the `cuda_graph_manual_hooks` because their hooks will not
-        # be automatically triggered when they go through the CUDA Graph path.
+        # Add these modules and params to `cuda_graph_manual_pre_hooks` and
+        # `cuda_graph_manual_post_hooks` because their hooks will not be
+        # automatically triggered when they go through the CUDA Graph path.
         param_modules = {}
         params = {}
         for submodule in self._get_submodules_under_cudagraphs():
@@ -285,7 +287,7 @@ class GraphableMegatronModule(MegatronModule):
         cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
 
-        for hook, hook_args in self.cuda_graph_manual_hooks:
+        for hook, hook_args in self.cuda_graph_manual_pre_hooks:
             hook(*hook_args)
         return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
 
