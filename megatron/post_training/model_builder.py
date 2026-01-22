@@ -230,7 +230,7 @@ def modelopt_gpt_mamba_builder(
             if config.context_parallel_size > 1:
                 print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
                 local_core_attention=False
-                print_rank_0("context_parallel_size > 1! Force attention_mask_type to Causal. This can be wrong for EAGLE training!")
+                print_rank_0("context_parallel_size > 1! Force attention_mask_type to Causal. Need ModelOpt > v0.42.0 to train EAGLE models.")
                 use_arbitrary_attention_mask = False
             else:
                 use_arbitrary_attention_mask = True
