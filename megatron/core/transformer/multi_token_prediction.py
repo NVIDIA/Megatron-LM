@@ -524,39 +524,6 @@ def get_mtp_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = No
     return offset
 
 
-class MTPModelLayerContainer(MegatronModule):
-    """Container for MTP inner layers built from a pattern.
-
-    This container wraps the inner layers (e.g., Mamba, Attention layers) built
-    from a pattern string. It provides proper state dict key structure:
-    `mtp_model_layer.layers.{i}.*` for checkpoint compatibility.
-
-    """
-
-    def __init__(self, layers: torch.nn.ModuleList, config: TransformerConfig):
-        super().__init__(config=config)
-        self.layers = layers
-        self._current_microbatch = 0
-
-    @property
-    def current_microbatch(self):
-        """Get current microbatch index for CUDA graph management."""
-        return self._current_microbatch
-
-    @current_microbatch.setter
-    def current_microbatch(self, value):
-        """Set current microbatch and propagate to inner layers for CUDA graphs."""
-        self._current_microbatch = value
-        for layer in self.layers:
-            if hasattr(layer, 'current_microbatch'):
-                layer.current_microbatch = value
-
-    def set_input_tensor(self, input_tensor: Tensor):
-        """Set input tensor for pipeline parallelism compatibility."""
-        # Inner layers handle their own input tensors
-        pass
-
-
 def get_mtp_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
@@ -795,21 +762,22 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
 
         # Build inner layers: two possible paths
-        # 1. New Mamba path: build from pattern using shared layer_builder
+        # 1. Mamba path: use MambaStack for hybrid pattern support (and future PP)
         # 2. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and mamba_submodules is not None:
-            # New Mamba path: build inner layers from pattern using shared layer_builder
-            from megatron.core.ssm.layer_builder import build_layers_from_pattern
+            from megatron.core.ssm.mamba_block import MambaStack
 
-            inner_layers = build_layers_from_pattern(
-                pattern=mtp_layer_pattern,
+            self.mtp_model_layer = MambaStack(
+                config=self.config,
                 submodules=mamba_submodules,
-                config=config,
+                hybrid_override_pattern=mtp_layer_pattern,
+                pre_process=True,       # Always receives input from eh_proj
+                post_layer_norm=False,  # MTP has its own final_layernorm
+                post_process=True,      # MTP layer is self-contained
                 pg_collection=pg_collection,
-                layer_offset=0,
-                is_mtp_layer=True,
+                vp_stage=vp_stage,
+                is_mtp_layer=True,      # Mark as MTP for router aux loss scaling
             )
-            self.mtp_model_layer = MTPModelLayerContainer(inner_layers, config=config)
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
             # MTP inner layers use their own layer numbering (self.layer_number = 1, 2, etc.)
@@ -941,12 +909,11 @@ class MultiTokenPredictionLayer(MegatronModule):
             # True so that the fp8 weight caching can be triggered correctly.
             with transformer_layer_fp8_context:
                 if self.mtp_layer_pattern is not None:
-                    # New Mamba path: run through pattern-based inner layers
-                    hidden_states = self._run_pattern_layers(
+                    hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
                         rotary_pos_emb=rotary_pos_emb,
-                        inference_params=inference_params,
+                        inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
                     )
                 else:
@@ -980,52 +947,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         # deallocate_output_tensor() throwing an error, so a viewless tensor is
         # created to prevent this.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
-
-        return hidden_states
-
-    def _run_pattern_layers(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> torch.Tensor:
-        """Run through pattern-based inner layers (Mamba path).
-
-        This method iterates through the layers in MTPModelLayerContainer,
-        calling each layer with the appropriate interface based on its type.
-
-        Args:
-            hidden_states: Input hidden states [s, b, h]
-            attention_mask: Attention mask tensor
-            rotary_pos_emb: Rotary position embeddings
-            inference_params: Inference parameters
-            packed_seq_params: Packed sequence parameters
-
-        Returns:
-            Output hidden states after processing through all inner layers
-        """
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
-        from megatron.core.transformer.transformer_layer import TransformerLayer
-
-        for layer_type, layer in zip(self.mtp_layer_pattern, self.mtp_model_layer.layers):
-            if layer_type == Symbols.ATTENTION or isinstance(layer, TransformerLayer):
-                # TransformerLayer (attention or MoE) returns tuple (hidden_states, context)
-                hidden_states, _ = layer(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                    inference_params=inference_params,
-                    packed_seq_params=packed_seq_params,
-                )
-            else:
-                # MambaLayer, MLPLayer - return hidden_states directly
-                hidden_states = layer(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_params,
-                )
 
         return hidden_states
 

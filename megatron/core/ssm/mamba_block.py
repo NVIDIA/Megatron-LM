@@ -91,6 +91,7 @@ class MambaStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         vp_stage: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ) -> None:
         super().__init__(config=config)
         self.residual_in_fp32 = residual_in_fp32
@@ -98,6 +99,7 @@ class MambaStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self.is_mtp_layer = is_mtp_layer
 
         assert pg_collection is not None, "pg_collection must be provided for MambaStack"
 
@@ -112,8 +114,17 @@ class MambaStack(MegatronModule):
         self.hybrid_override_pattern = hybrid_override_pattern
         self.pg_collection = pg_collection
 
+        # For MTP layers, always use pattern length (not config.num_layers which is for main decoder)
+        if self.is_mtp_layer:
+            num_layers_for_allocation = len(self.hybrid_override_pattern)
+        else:
+            num_layers_for_allocation = (
+                self.config.num_layers if self.config.num_layers is not None
+                else len(self.hybrid_override_pattern)
+            )
+
         self.layer_type_list = allocate_layers(
-            self.config.num_layers if self.config.num_layers is not None else len(self.hybrid_override_pattern),
+            num_layers_for_allocation,
             self.hybrid_attention_ratio,
             self.hybrid_mlp_ratio,
             self.hybrid_override_pattern,
@@ -134,7 +145,7 @@ class MambaStack(MegatronModule):
             pg_collection=pg_collection,
             layer_offset=pp_layer_offset,
             residual_in_fp32=residual_in_fp32,
-            is_mtp_layer=False,
+            is_mtp_layer=self.is_mtp_layer,
         )
 
         # Required for activation recomputation
@@ -149,7 +160,7 @@ class MambaStack(MegatronModule):
             )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
-        num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
+        num_layers_per_pipeline_rank = len(layer_type_list) // self.pp_group.size()
 
         assert self.config.virtual_pipeline_model_parallel_size is None, (
             "The Mamba hybrid model does not currently support "
