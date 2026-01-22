@@ -1867,6 +1867,12 @@ class TransformerConfig(ModelParallelConfig):
                     'CUDA graph scope on moe and mlp is not '
                     'supported with overlap_moe_expert_parallel_comm'
                 )
+                if self.delay_wgrad_compute:
+                    assert self.gradient_accumulation_fusion, (
+                        'CUDA graph with delay_wgrad_compute is only supported when '
+                        'gradient_accumulation_fusion is enabled, since gradient accumulation '
+                        'implementation does not use static memory.'
+                    )
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
