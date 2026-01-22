@@ -1288,7 +1288,9 @@ class MoETransformerLayer(TransformerLayer):
         residual = hidden_states
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-        router_outputs = self.mlp(pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask)
+        router_outputs = self.mlp(
+            pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
+        )
 
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
             attr = getattr(self.mlp.token_dispatcher, attr_name)
@@ -1344,7 +1346,9 @@ class MoETransformerLayer(TransformerLayer):
                 "alongside inference."
             )
 
-        def _forward_mlp_partial_cudagraphs(hidden_states, inference_context=None, padding_mask=None):
+        def _forward_mlp_partial_cudagraphs(
+            hidden_states, inference_context=None, padding_mask=None
+        ):
             residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
                 hidden_states, padding_mask=padding_mask
             )
@@ -1368,7 +1372,9 @@ class MoETransformerLayer(TransformerLayer):
                     )
                 else:
                     return tensor_parallel.checkpoint(
-                        functools.partial(_forward_mlp_partial_cudagraphs, padding_mask=padding_mask),
+                        functools.partial(
+                            _forward_mlp_partial_cudagraphs, padding_mask=padding_mask
+                        ),
                         False,
                         hidden_states,
                     )
