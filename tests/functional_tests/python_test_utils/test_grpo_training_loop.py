@@ -31,7 +31,7 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
     extra_in_current = set(output_current.keys()) - set(output_groundtruth.keys())
     if extra_in_current:
         logger.info(f"Ignoring extra metrics in current run: {extra_in_current}")
-    
+
     assert set(output_groundtruth.keys()).issubset(
         set(output_current.keys())
     ), f"Some IDs from groundtruth are missing in current: {output_groundtruth.keys()} vs {output_current.keys()}"
