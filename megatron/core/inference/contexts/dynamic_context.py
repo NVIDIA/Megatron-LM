@@ -263,8 +263,34 @@ class DynamicInferenceContext(BaseInferenceContext):
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
+        params_dtype: Optional[Any] = None,  # Deprecated
+        num_layers: Optional[Any] = None,  # Deprecated
+        kv_channels: Optional[Any] = None,  # Deprecated
+        num_attention_heads: Optional[Any] = None,  # Deprecated
+        tensor_model_parallel_size: Optional[Any] = None,  # Deprecated
+        pipeline_model_parallel_size: Optional[Any] = None,  # Deprecated
+        cache_mla_latent: Optional[Any] = None,  # Deprecated
+        kv_lora_rank: Optional[Any] = None,  # Deprecate
+        qk_pos_emb_head_dim: Optional[Any] = None,  # Deprecated
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
+
+        deprecated_params = [
+            params_dtype,
+            num_layers,
+            kv_channels,
+            num_attention_heads,
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            cache_mla_latent,
+            kv_lora_rank,
+            qk_pos_emb_head_dim,
+        ]
+        if any(param is not None for param in deprecated_params):
+            raise TypeError(
+                "Passing `TransformerConfig` arguments directly is deprecated. "
+                "Please pass `model_config` instead."
+            )
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
