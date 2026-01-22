@@ -818,9 +818,7 @@ class TEGroupedMLP(MegatronModule):
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
         if self.offload_moe_act:
             output = off_interface.group_commit(
-                output,
-                name="moe_act",
-                forced_released_tensors=[fc1_output],
+                output, name="moe_act", forced_released_tensors=[fc1_output]
             )
 
         # upad and concat the output
