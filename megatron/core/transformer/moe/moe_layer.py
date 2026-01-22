@@ -24,6 +24,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import internal_api
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -206,13 +207,13 @@ class MoELayer(BaseMoELayer):
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor):
+    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = self.router(hidden_states)
+        probs, routing_map = self.router(hidden_states, padding_mask=padding_mask)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -222,9 +223,8 @@ class MoELayer(BaseMoELayer):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
-        dispatcher. The original hidden states are returned as a residual connection.
+        dispatcher.
         """
-        residual = hidden_states
         # Project the hidden_states from hidden dimension down to latent dimenion.
         if self.config.moe_latent_size:
             assert (
@@ -234,7 +234,7 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
-        return hidden_states, probs, residual
+        return hidden_states, probs
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
@@ -273,9 +273,8 @@ class MoELayer(BaseMoELayer):
 
         return shared_expert_output
 
-    def routed_experts_compute(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, residual: torch.Tensor
-    ):
+    @internal_api
+    def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Computes the output of the routed experts on the dispatched tokens.
 
         This method first post-processes the dispatched input to get permuted tokens
@@ -308,7 +307,7 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -318,7 +317,11 @@ class MoELayer(BaseMoELayer):
         4. Combine: The outputs from the experts are combined and returned.
 
         Args:
-            hidden_states (torch.Tensor): The input tensor to the MoE layer.
+            hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                used for correct auxiliary loss computation for packed sequence.
+                Shape = [bsz, seq_length]. True = padding (exclude), False = valid (include).
+                Defaults to None (all tokens are valid).
 
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
@@ -329,12 +332,16 @@ class MoELayer(BaseMoELayer):
                 "are enabled without also enabling sequence parallelism."
             )
 
+        # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
+
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states):
+        def custom_forward(hidden_states, padding_mask=None):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
-                probs, routing_map = self.route(hidden_states)
-                hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
+                probs, routing_map = self.route(hidden_states, padding_mask=padding_mask)
+                hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
@@ -344,7 +351,7 @@ class MoELayer(BaseMoELayer):
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
             dispatched_input, probs = self.dispatch(hidden_states, probs)
-            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
+            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
             assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
             output = self.combine(output, shared_expert_output)
 
@@ -358,18 +365,22 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
+                    padding_mask,
                 )
             else:
-                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+                outputs = tensor_parallel.checkpoint(
+                    custom_forward, False, hidden_states, padding_mask
+                )
         else:
-            outputs = custom_forward(hidden_states)
+            outputs = custom_forward(hidden_states, padding_mask)
 
         return outputs
 
-    def backward_dw(self):
+    def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
-        self.experts.backward_dw()
-        if self.use_shared_expert and not self.shared_expert_overlap:
+        if routed_experts:
+            self.experts.backward_dw()
+        if shared_experts and self.use_shared_expert and not self.shared_expert_overlap:
             self.shared_experts.backward_dw()
 
     def set_for_recompute_pre_mlp_layernorm(self):

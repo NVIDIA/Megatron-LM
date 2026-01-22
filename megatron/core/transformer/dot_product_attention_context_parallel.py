@@ -185,6 +185,9 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         comm.all_gather(kv_buffer_copy[1], v_0)
 
         # Prepare attention bias
+        assert (
+            attention_mask is not None
+        ), "Attention mask is required for the native attention function with context parallelism"
         attn_bias = to_zz_mask_attn_bias(
             attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype
         )

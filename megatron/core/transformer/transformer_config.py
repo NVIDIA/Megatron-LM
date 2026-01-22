@@ -194,6 +194,9 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    qk_l2_norm: bool = False
+    """Whether to apply llama 4-style qk L2 norm."""
+
     qk_clip: bool = False
     """Whether to clip the query and key weights. Needed for Muon MLA Model training."""
 
@@ -234,7 +237,26 @@ class TransformerConfig(ModelParallelConfig):
     """Type of attention variant to use. Currently support gated_delta_net and dsa."""
 
     ####################
-    # attention variant: gated_delta_net
+    # DSA
+    ####################
+    dsa_indexer_n_heads: Optional[int] = None
+    """Number of DSA indexer heads."""
+
+    dsa_indexer_head_dim: Optional[int] = None
+    """Dimension per DSA indexer head."""
+
+    dsa_indexer_topk: Optional[int] = None
+    """Number of top-k tokens to select in DSA indexer."""
+
+    dsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+
+    dsa_indexer_use_sparse_loss: Optional[bool] = None
+    """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
+    top-k indices."""
+
+    ####################
+    # linear attention
     ####################
     linear_attention_type: Optional[str] = None
     """Type of linear attention to use.
@@ -261,25 +283,6 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = None
     """Number of value and gate heads for the gated delta net."""
-
-    ####################
-    # attention variant: dsa
-    ####################
-    dsa_indexer_n_heads: Optional[int] = None
-    """Number of DSA indexer heads."""
-
-    dsa_indexer_head_dim: Optional[int] = None
-    """Dimension per DSA indexer head."""
-
-    dsa_indexer_topk: Optional[int] = None
-    """Number of top-k tokens to select in DSA indexer."""
-
-    dsa_indexer_loss_coeff: Optional[float] = None
-    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
-
-    dsa_indexer_use_sparse_loss: Optional[bool] = None
-    """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
-    top-k indices."""
 
     ####################
     # initialization
@@ -551,6 +554,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
+    enable_routing_replay: bool = False
+    """Enable routing replay for MoE."""
+
     moe_router_topk_limited_devices: Optional[int] = None
     """Number of EP ranks to consider for each token in group-limited routing,
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
@@ -615,6 +621,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
+
+    moe_router_force_biased: Optional[float] = None
+    """[Experimental] Apply random expert bias in normal distribution with specified std
+    to router logits. Shared seed across all ranks ensures identical bias.
+    If positive, generates new random bias each forward pass.
+    If negative, generates bias once per layer and reuses it (abs value is std).
+    This is an experimental feature for benchmarking purposes."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -723,11 +736,11 @@ class TransformerConfig(ModelParallelConfig):
     determines the scope of graph capture."""
 
     cuda_graph_use_single_mempool: bool = False
-    """When set to true, cudagraphs will be captured inside a single mempool, in which all
-    cudagraphs may only be used once per step. If false, cudagraphs may be reused across
-    microbatches. Enabling may reduce cudagraph memory overheads due to memory fragmentation,
-    however may greatly increase the number of cudagraphs created when the number of microbatches
-    is high."""
+    """[For `local` implementation only] When set to true, cudagraphs will be captured inside a
+    single mempool, in which all cudagraphs may only be used once per step. If false, cudagraphs may
+    be reused across microbatches. Enabling may reduce cudagraph memory overheads due to memory
+    fragmentation, however may greatly increase the number of cudagraphs created when the number of
+    microbatches is high."""
 
     cuda_graph_retain_backward_graph: bool = False
     """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
@@ -1739,64 +1752,46 @@ class TransformerConfig(ModelParallelConfig):
                             )
 
             if self.recompute_granularity:
-                if self.recompute_granularity != "selective" or not self.cuda_graph_scope:
-                    raise ValueError(
-                        "Full-layer CUDA graphs not supported with activation recomputation."
-                    )
-                elif self.cuda_graph_scope != [CudaGraphScope.full_iteration]:
-                    # For scoped CUDA graphs, only the non-graphed parts of the layer can be
-                    # recomputed. So check if there are overlaps between the recomputed parts
-                    # and the graphed parts.
-                    if CudaGraphScope.attn in self.cuda_graph_scope:
-                        for module in self.recompute_modules:
-                            if module in ['core_attn', 'mla_up_proj']:
-                                raise ValueError(
-                                    f'attn cuda graph is not supported with {module} recompute.'
-                                )
+                if self.recompute_granularity != "selective":
+                    assert self.cuda_graph_scope == [
+                        CudaGraphScope.full_iteration
+                    ], "full recompute is only supported with full iteration CUDA graph."
+                else:
+                    # The recompute module should be inside or outside of the graph scope.
+                    # Recompute module coverring graph scope is not allowed.
+                    if "moe" in self.recompute_modules:
+                        assert (
+                            CudaGraphScope.moe_router not in self.cuda_graph_scope
+                        ), "moe recompute is not supported with moe_router CUDA graph."
+                    # Graphed recompute module doesn't accept random number.
                     if (
-                        CudaGraphScope.mlp in self.cuda_graph_scope
-                        and "mlp" in self.recompute_modules
+                        not self.cuda_graph_scope
+                        or CudaGraphScope.full_iteration in self.cuda_graph_scope
                     ):
-                        raise ValueError(f'mlp cuda graph is not supported with mlp recompute.')
-                    if CudaGraphScope.moe in self.cuda_graph_scope:
-                        for module in self.recompute_modules:
-                            if module in ['moe_act', 'moe', 'shared_experts']:
-                                raise ValueError(
-                                    f'moe cuda graph is not supported with {module} recompute.'
-                                )
-                    if CudaGraphScope.moe_router in self.cuda_graph_scope:
-                        for module in self.recompute_modules:
-                            if module in ['moe', 'shared_experts']:
-                                raise ValueError(
-                                    f'moe_router cuda graph is not supported with {module} '
-                                    'recompute.'
-                                )
-                    if "layernorm" in self.recompute_modules:
-                        if (
-                            CudaGraphScope.attn in self.cuda_graph_scope
-                            and CudaGraphScope.mlp in self.cuda_graph_scope
-                            and (
-                                CudaGraphScope.moe in self.cuda_graph_scope
-                                or CudaGraphScope.moe_router in self.cuda_graph_scope
-                            )
-                        ):
-                            raise ValueError(
-                                'cuda graph is not supported with layernorm recompute.'
-                            )
-                        if CudaGraphScope.attn in self.cuda_graph_scope:
-                            warnings.warn(
-                                "input_layernorm recompute is not supported with attention "
-                                "cudagraph. Will only recompute the pre_mlp_layernorm."
-                            )
-                        if (
-                            CudaGraphScope.mlp in self.cuda_graph_scope
-                            or CudaGraphScope.moe in self.cuda_graph_scope
-                            or CudaGraphScope.moe_router in self.cuda_graph_scope
-                        ):
-                            warnings.warn(
-                                "pre_mlp_layernorm recompute is not supported with mlp/moe "
-                                "cudagraph. Will only recompute the input_layernorm."
-                            )
+                        full_cudagraph = True
+                    else:
+                        full_cudagraph = False
+                    if self.attention_dropout != 0.0:
+                        assert (
+                            not full_cudagraph and CudaGraphScope.attn not in self.cuda_graph_scope
+                        ) or "core_attn" not in self.recompute_modules, (
+                            "attention dropout is not supported with graphed attention "
+                            "recomputation."
+                        )
+                    if self.hidden_dropout != 0.0:
+                        assert (
+                            (not full_cudagraph and CudaGraphScope.mlp not in self.cuda_graph_scope)
+                            or "mlp" not in self.recompute_modules
+                        ) and (
+                            (not full_cudagraph and CudaGraphScope.moe not in self.cuda_graph_scope)
+                            or "moe" not in self.recompute_modules
+                        ), "hidden dropout is not supported with graphed MLP/MoE recomputation."
+                    if self.moe_input_jitter_eps is not None:
+                        assert (
+                            not full_cudagraph and CudaGraphScope.moe not in self.cuda_graph_scope
+                        ) or "moe" not in self.recompute_modules, (
+                            "moe_input_jitter_eps is not supported with graphed moe recomputation."
+                        )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
@@ -1869,6 +1864,16 @@ class TransformerConfig(ModelParallelConfig):
                     'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
                 )
 
+            if self.cuda_graph_impl != "none":
+                assert (
+                    self.cuda_graph_impl == "transformer_engine"
+                    and CudaGraphScope.moe not in self.cuda_graph_scope
+                    and CudaGraphScope.mlp not in self.cuda_graph_scope
+                ), (
+                    'CUDA graph scope on moe and mlp is not '
+                    'supported with overlap_moe_expert_parallel_comm'
+                )
+
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
             assert (
@@ -1877,6 +1882,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_use_legacy_grouped_gemm
             ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+            if self.cuda_graph_impl == "transformer_engine":
+                assert is_te_min_version("2.10.0"), (
+                    'TE version >= 2.10.0 is required for delay_wgrad_compute with '
+                    'partial cuda graph'
+                )
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (
