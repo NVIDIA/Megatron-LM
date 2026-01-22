@@ -1135,6 +1135,7 @@ def fine_grained_offloading_group_flush_delayed_groups():
     debug_rank("fine_grained_offloading_group_flush_delayed_groups")
     PipelineOffloadManager.get_instance().flush_delayed_groups()
 
+
 class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
     """
     Identity operation that marks the start of a layer group for offload/reload.
@@ -1174,6 +1175,7 @@ def fine_grained_offloading_forward_record(event: torch.cuda.Event) -> None:
     torch.cuda.current_stream().record_event(event)
     torch.cuda.current_stream().wait_stream(d2h_stream)
 
+
 class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
     """
     Identity operation that marks the end of a layer group for offload synchronization.
@@ -1198,6 +1200,7 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
 def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> torch.Tensor:
     """Record the backward event for cuda graph capture."""
     return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
+
 
 class FineGrainedActivationOffloadingInterface:
     """Interface for fine-grained activation offloading."""

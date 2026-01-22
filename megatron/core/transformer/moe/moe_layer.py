@@ -323,7 +323,12 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
-    def forward(self, hidden_states: torch.Tensor, intermediate_tensors=None, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        intermediate_tensors=None,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -413,7 +418,7 @@ class MoELayer(BaseMoELayer):
                 )
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
-        
+
         return outputs
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):

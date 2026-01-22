@@ -201,12 +201,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         )
 
     def get_cached_cos_sin(
-        self,
-        seq_len,
-        offset=0,
-        dtype=torch.get_default_dtype(),
-        packed_seq=False,
-        cp_group=None,
+        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq=False, cp_group=None
     ):
         """Get cached cos and sin values."""
         if (

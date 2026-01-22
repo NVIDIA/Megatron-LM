@@ -438,6 +438,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 skip_qkv_norm_and_all_gather=(i > 0),
                 fc2_next_layer_norm_weights=next_qkv_norm_weights,
             )
+
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
 

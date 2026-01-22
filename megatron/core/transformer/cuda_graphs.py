@@ -2278,6 +2278,7 @@ class TECudaGraphHelper:
         )
         self._graphs_created = False
 
+
 def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
     """Convert a tunable schedule lookup table to the te.make_graphed_callables() accepted
     order format. For example, the tunable schedule table for PP2 N3M5 with VP2 is as below:
