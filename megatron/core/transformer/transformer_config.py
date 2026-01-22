@@ -1873,7 +1873,7 @@ class TransformerConfig(ModelParallelConfig):
                     'CUDA graph scope on moe and mlp is not '
                     'supported with overlap_moe_expert_parallel_comm'
                 )
-                if self.delay_wgrad_compute:
+                if self.delay_wgrad_compute and CudaGraphScope.attn in self.cuda_graph_scope:
                     assert is_te_min_version(
                         "2.12.0"
                     ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
@@ -1882,6 +1882,9 @@ class TransformerConfig(ModelParallelConfig):
                         'to be enabled. This is because the default gradient accumulation does not '
                         'use static memory addresses, which breaks CUDA graph requirements.'
                     )
+                    assert (
+                        not self.add_bias_linear and not self.add_qkv_bias
+                    ), "CudaGraphScope.attn with delay_wgrad_compute doesn't support bias for now."
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
