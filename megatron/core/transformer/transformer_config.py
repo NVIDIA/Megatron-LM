@@ -1874,6 +1874,9 @@ class TransformerConfig(ModelParallelConfig):
                     'supported with overlap_moe_expert_parallel_comm'
                 )
                 if self.delay_wgrad_compute:
+                    assert is_te_min_version(
+                        "2.12.0"
+                    ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
                     assert self.gradient_accumulation_fusion, (
                         'CUDA graph with delay_wgrad_compute requires gradient_accumulation_fusion '
                         'to be enabled. This is because the default gradient accumulation does not '
