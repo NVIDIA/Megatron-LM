@@ -1875,9 +1875,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 if self.delay_wgrad_compute:
                     assert self.gradient_accumulation_fusion, (
-                        'CUDA graph with delay_wgrad_compute is only supported when '
-                        'gradient_accumulation_fusion is enabled, since gradient accumulation '
-                        'implementation does not use static memory.'
+                        'CUDA graph with delay_wgrad_compute requires gradient_accumulation_fusion '
+                        'to be enabled. This is because the default gradient accumulation does not '
+                        'use static memory addresses, which breaks CUDA graph requirements.'
                     )
 
         # Check delay_wgrad_compute compatibility
