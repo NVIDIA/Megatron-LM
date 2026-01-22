@@ -1613,14 +1613,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     rerun_state_machine = get_rerun_state_machine()
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
-    # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
-            # Set force_all_reduce field for this iteration.
+            # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
 

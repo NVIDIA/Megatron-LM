@@ -125,8 +125,10 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
         respective list of shapes. Thus it is not used in the other forward-backward functions
         which have different shape handling.
 
-    force_all_reduce (bool, optional): Run all-reduce for this iteration instead of maybe
-        reduce-scatter to ensure all ranks have fully reduced gradients.
+    force_all_reduce (bool, optional): If true, force use of all-reduce for gradient reduction
+        instead of reduce-scatter (if using distributed optimizer) in this iteration to ensure all
+        data-parallel ranks have fully reduced gradients. This is useful for easier wgrad saving
+        (can just inspect DP replica 0 to get full set of wgrads for entire model).
 
     Args:
         pp_size (Optional[int]): Pipeline model parallel size to use.
