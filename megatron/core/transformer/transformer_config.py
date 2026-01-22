@@ -194,6 +194,9 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    qk_l2_norm: bool = False
+    """Whether to apply llama 4-style qk L2 norm."""
+
     qk_clip: bool = False
     """Whether to clip the query and key weights. Needed for Muon MLA Model training."""
 
@@ -234,7 +237,26 @@ class TransformerConfig(ModelParallelConfig):
     """Type of attention variant to use. Currently support gated_delta_net and dsa."""
 
     ####################
-    # attention variant: gated_delta_net
+    # DSA
+    ####################
+    dsa_indexer_n_heads: Optional[int] = None
+    """Number of DSA indexer heads."""
+
+    dsa_indexer_head_dim: Optional[int] = None
+    """Dimension per DSA indexer head."""
+
+    dsa_indexer_topk: Optional[int] = None
+    """Number of top-k tokens to select in DSA indexer."""
+
+    dsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+
+    dsa_indexer_use_sparse_loss: Optional[bool] = None
+    """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
+    top-k indices."""
+
+    ####################
+    # linear attention
     ####################
     linear_attention_type: Optional[str] = None
     """Type of linear attention to use.
@@ -261,25 +283,6 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = None
     """Number of value and gate heads for the gated delta net."""
-
-    ####################
-    # attention variant: dsa
-    ####################
-    dsa_indexer_n_heads: Optional[int] = None
-    """Number of DSA indexer heads."""
-
-    dsa_indexer_head_dim: Optional[int] = None
-    """Dimension per DSA indexer head."""
-
-    dsa_indexer_topk: Optional[int] = None
-    """Number of top-k tokens to select in DSA indexer."""
-
-    dsa_indexer_loss_coeff: Optional[float] = None
-    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
-
-    dsa_indexer_use_sparse_loss: Optional[bool] = None
-    """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
-    top-k indices."""
 
     ####################
     # initialization
@@ -550,6 +553,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
+
+    enable_routing_replay: bool = False
+    """Enable routing replay for MoE."""
 
     moe_router_topk_limited_devices: Optional[int] = None
     """Number of EP ranks to consider for each token in group-limited routing,

@@ -46,6 +46,7 @@ def import_module(module_path: Tuple[str]):
     return vars(module)[name]
 
 
+# pylint: disable=missing-function-docstring
 def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
     """Retrieve the module class or function specified by a ModuleSpec or
     return it as is if already provided.
