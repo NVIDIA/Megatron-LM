@@ -184,6 +184,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = enable_chunked_prefill
         self.inference_logging_step_interval = inference_logging_step_interval
         self.unified_memory_level = context.unified_memory_level
+        self.persist_cuda_graphs = context.persist_cuda_graphs
 
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
@@ -234,6 +235,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Request state.
         self.request_counter = Counter()
         self.finished_request_count = 0
+        self.evicted_request_count = 0
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
@@ -566,10 +568,10 @@ class DynamicInferenceEngine(AbstractEngine):
         ):
             self.context.deallocate_all_tensors()
 
-        # Delete cuda graphs when not using unified memory at all (level 0). For
-        # levels 1 and 2, the context's tensors maintain static memory addresses,
-        # so the cuda graphs are re-used.
-        if self.unified_memory_level == 0:
+        # Delete cuda graphs when not using unified memory at all (level 0) and
+        # `--rl-training-cuda-graphs` is not passed. For UVM levels 1 and 2, the context's tensors
+        # maintain static memory addresses, so the cuda graphs are re-used.
+        if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
             delete_cuda_graphs()
 
         # Maintain references to requests before reset.
@@ -580,7 +582,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.requests[request_id].record.suspend()
+            self.requests[request_id].record.checkpoint()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -611,7 +613,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # 0). For levels 1 and 2, the context's tensors maintain static
             # memory addresses, so the cuda graphs are re-used.
             capture_time = time.time()
-            if self.unified_memory_level == 0:
+            if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
@@ -797,6 +799,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self,
         request_ids: torch.Tensor,
         finished_request_ids: torch.Tensor,
+        evict_request_ids: torch.Tensor,
         step_time: float,
         sample: torch.Tensor,
         log_probs: torch.Tensor,
@@ -808,6 +811,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             request_ids (torch.Tensor): A list of request_ids
             finished_request_ids (torch.Tensor): A list of finished request ids
+            evict_request_ids (torch.Tensor): A list of evicted request ids.
             step_time (float): The latency of the last step
             sample: (torch.Tensor): The newly generated tokens for each request
             log_probs: (List): Log probs for each request
@@ -821,6 +825,8 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
         self.finished_request_count += len(finished_request_ids)
+        if evict_request_ids is not None:
+            self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
@@ -940,6 +946,23 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
+        # Handle evicted requests.
+        if evict_request_ids is not None and evict_request_ids.numel() > 0:
+
+            evict_request_ids = evict_request_ids.tolist()
+
+            # Insert into waiting_request_ids after any chunk prefill request.
+            self.waiting_request_ids.extendleft(evict_request_ids)
+            if self.context.chunked_prefill_request_id != -1:
+                chunked_prefill_id = self.waiting_request_ids[len(evict_request_ids)]
+                del self.waiting_request_ids[len(evict_request_ids)]
+                self.waiting_request_ids.appendleft(chunked_prefill_id)
+
+            # Checkpoint requests (i.e., prompt += generations) + add eviction event.
+            for request_id in evict_request_ids:
+                self.requests[request_id].record.checkpoint()
+                self.get_request(request_id).add_event_evict()
+
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
 
@@ -1058,6 +1081,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
+                    # For Mamba models we need to ensure that the last prefill chunk
+                    # is still tagged as a chunked prefill request.
+                    self.context.has_explicit_chunked_prefill_req = (
+                        self.context.is_hybrid_model
+                        and self.context.chunked_prefill_request_id == req.request_id
+                    )
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
@@ -1068,7 +1097,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue
-                    can_schedule = True
+                    # We break early for Mamba models running a final prefill chunk
+                    # so that no additional requests are scheduled beyond the chunked
+                    # prefill request.
+                    can_schedule = not self.context.has_explicit_chunked_prefill_req
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
@@ -1076,6 +1108,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
+                    self.context.has_explicit_chunked_prefill_req = self.context.is_hybrid_model
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
                     req.finished_chunk_token_count += chunk_length
                     # Still have tokens to prefill, so we break and keep the
@@ -1105,7 +1138,7 @@ class DynamicInferenceEngine(AbstractEngine):
         is_decode_only = self.context.is_decode_only()
         pre_step_context_state = {
             "is_decode_only": is_decode_only,
-            "max_active_requests": self.context.max_active_requests,
+            "max_requests": self.context.max_requests,
             "total_request_count": self.context.total_request_count,
             "paused_request_count": self.context.paused_request_count,
             "active_token_count": self.context.active_token_count,
@@ -1138,6 +1171,7 @@ class DynamicInferenceEngine(AbstractEngine):
         post_step_context_state = {
             "waiting_request_count": len(self.waiting_request_ids),
             "finished_request_count": self.finished_request_count,
+            "evicted_request_count": self.evicted_request_count,
             "kv_stats": kvcache_util_stats,
             "padded_active_token_count": self.context.padded_active_token_count,
             "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
@@ -1174,8 +1208,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if step_result is not None:
             active_request_ids = step_result["active_request_ids"]
-            newly_paused_request_ids = step_result["newly_paused_request_ids"]
             finished_request_ids = step_result["finished_request_ids"]
+            newly_paused_request_ids = step_result.get("newly_paused_request_ids")
+            evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
@@ -1192,6 +1227,7 @@ class DynamicInferenceEngine(AbstractEngine):
             (active_request_ids, finished_request_records) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
+                evict_request_ids,
                 step_time,
                 sample,
                 log_probs,
@@ -1267,7 +1303,7 @@ class DynamicInferenceEngine(AbstractEngine):
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f%s ... "
-                "reqs: a %d/%d, p %d, w %d, f %d ... "
+                "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
@@ -1288,10 +1324,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     ),
                     context_state["total_request_count"] - context_state["paused_request_count"],
-                    context_state["max_active_requests"],
+                    context_state["max_requests"],
                     context_state["paused_request_count"],
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
+                    context_state["evicted_request_count"],
                     context_state["total_active_used_blocks"],
                     context_state["total_active_block_count"],
                     context_state["total_paused_used_blocks"],

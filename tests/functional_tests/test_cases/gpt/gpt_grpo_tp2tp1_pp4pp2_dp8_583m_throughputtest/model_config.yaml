@@ -79,3 +79,7 @@ MODEL_ARGS:
   --rl-inference-tensor-model-parallel-size: 1
   --rl-inference-pipeline-model-parallel-size: 2
   --refit-method: gloo
+METRICS:
+  - "lm loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
