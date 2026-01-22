@@ -699,13 +699,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        padding_mask_for_moe = None
-        from megatron.core.transformer.moe.moe_layer import MoELayer
-
-        if isinstance(self.mlp, MoELayer) and padding_mask is not None:
-            # padding_mask from GPTModel: [bsz, seq_length]
-            # MoE layer needs: [seq_length, bsz]
-            padding_mask_for_moe = padding_mask.transpose(0, 1).bool()
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
 
@@ -1284,7 +1277,7 @@ class MoETransformerLayer(TransformerLayer):
                 self.config, self, function_name="_forward_mlp_postprocess"
             )
 
-    def _forward_mlp_router(self, hidden_states):
+    def _forward_mlp_router(self, hidden_states, padding_mask=None):
         """
         Executes the router phase of the MoE block.
 
@@ -1295,7 +1288,7 @@ class MoETransformerLayer(TransformerLayer):
         residual = hidden_states
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-        router_outputs = self.mlp(pre_mlp_layernorm_output, intermediate_tensors=())
+        router_outputs = self.mlp(pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask)
 
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
             attr = getattr(self.mlp.token_dispatcher, attr_name)
@@ -1336,7 +1329,7 @@ class MoETransformerLayer(TransformerLayer):
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
 
-    def _forward_mlp(self, hidden_states, inference_context=None):
+    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
 
@@ -1351,9 +1344,9 @@ class MoETransformerLayer(TransformerLayer):
                 "alongside inference."
             )
 
-        def _forward_mlp_partial_cudagraphs(hidden_states, inference_context=None):
+        def _forward_mlp_partial_cudagraphs(hidden_states, inference_context=None, padding_mask=None):
             residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
-                hidden_states
+                hidden_states, padding_mask=padding_mask
             )
             expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs)
             return self._forward_mlp_postprocess(
@@ -1371,12 +1364,15 @@ class MoETransformerLayer(TransformerLayer):
                         tensor_parallel.random.get_cuda_rng_tracker,
                         parallel_state.get_tensor_model_parallel_group(),
                         hidden_states,
+                        padding_mask=padding_mask,
                     )
                 else:
                     return tensor_parallel.checkpoint(
-                        _forward_mlp_partial_cudagraphs, False, hidden_states
+                        functools.partial(_forward_mlp_partial_cudagraphs, padding_mask=padding_mask),
+                        False,
+                        hidden_states,
                     )
             else:
-                return _forward_mlp_partial_cudagraphs(hidden_states)
+                return _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
         else:
-            return super()._forward_mlp(hidden_states)
+            return super()._forward_mlp(hidden_states, padding_mask=padding_mask)

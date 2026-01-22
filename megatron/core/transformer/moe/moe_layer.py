@@ -326,8 +326,8 @@ class MoELayer(BaseMoELayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
         intermediate_tensors=None,
+        padding_mask: Optional[torch.Tensor] = None,
     ):
         """Forward pass for the MoE layer.
 
