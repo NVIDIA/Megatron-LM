@@ -56,3 +56,33 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
         )
 
         output_groundtruth.pop('iteration-time')
+
+    if "lm-loss" in output_groundtruth.keys():
+
+        # Require exact matching of all lm-loss values.
+        golden_lm_loss_values = output_groundtruth["lm-loss"]['values']
+        current_lm_loss_values = output_current["lm-loss"]['values']
+
+        assert golden_lm_loss_values == current_lm_loss_values, (
+            f"LM loss values do not exactly match.\n"
+            f"Golden: {golden_lm_loss_values}\n"
+            f"Current: {current_lm_loss_values}\n"
+            f"Please update golden values in the functional tests if this is expected."
+        )
+
+        output_groundtruth.pop('lm-loss')
+
+    if "num-zeros" in output_groundtruth.keys():
+
+        # Require exact matching of all lm-loss values.
+        golden_num_zeros_values = output_groundtruth["num-zeros"]['values']
+        current_num_zeros_values = output_current["num-zeros"]['values']
+
+        assert golden_num_zeros_values == current_num_zeros_values, (
+            f"LM loss values do not exactly match.\n"
+            f"Golden: {golden_num_zeros_values}\n"
+            f"Current: {current_num_zeros_values}\n"
+            f"Please update golden values in the functional tests if this is expected."
+        )
+
+        output_groundtruth.pop('num-zeros')
