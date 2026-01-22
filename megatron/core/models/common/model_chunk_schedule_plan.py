@@ -14,7 +14,6 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
-from megatron.core.transformer.enums import CudaGraphScope
 
 
 class ModelChunkState:
@@ -35,7 +34,7 @@ class TransformerLayerSchedulePlan:
     mtp post process nodes.
 
     layer (TransformerLayerSchedulePlan)
-    ├── attn (TransformerLayerNode): attention -> router -> dispatch preprocess
+    ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
@@ -88,9 +87,6 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'attn') and self.attn is not None:
             del self.attn
             self.attn = None
-        if hasattr(self, 'post_attn') and self.post_attn is not None:
-            del self.post_attn
-            self.post_attn = None
         if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
             del self.moe_dispatch
             self.moe_dispatch = None
@@ -355,10 +351,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self.post_process = PostProcessNode(
                 model, self._model_chunk_state, self._event, comp_stream
             )
-
-        # preprocess may receive dgrad from attn, which is managed by cuda graph.
-        if CudaGraphScope.attn in model.config.cuda_graph_scope:
-            self.pre_process.manual_grads_release = False
 
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
         if module is None:

@@ -277,15 +277,16 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
 
 def report_memory(name):
     """Simple GPU memory report."""
+    args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
-    string += ' | allocated: {}'.format(torch.cuda.memory_allocated() / mega_bytes)
-    string += ' | max allocated: {}'.format(torch.cuda.max_memory_allocated() / mega_bytes)
-    string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
-    string += ' | max reserved: {}'.format(torch.cuda.max_memory_reserved() / mega_bytes)
-    if is_torch_min_version("2.6.0"):
+    string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
+    string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
+    string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
+    string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
+    if args.log_device_memory_used and is_torch_min_version("2.6.0"):
         # device usage is not supported in torch < 2.6.0
-        string += ' | device usage: {}'.format(torch.cuda.device_memory_used() / mega_bytes)
+        string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
@@ -639,6 +640,15 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
+        cu_seqlens = None
+        if args.sft:
+            max_seqlen = torch.empty(
+                1,
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            max_seqlen = None
 
         cu_seqlens = None
         max_seqlen = torch.empty(
@@ -698,6 +708,24 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
+
+        def _broadcast_cu_seqlens():
+            dev = torch.cuda.current_device()
+
+            n = torch.empty((), dtype=torch.int64, device=dev)
+            _broadcast(n)
+            n = int(n.item())
+
+            if n == 0:
+                cu_seqlens = torch.empty(0, dtype=torch.int32, device=dev)
+            else:
+                cu_seqlens = torch.empty((args.micro_batch_size, n), dtype=torch.int32, device=dev)
+            _broadcast(cu_seqlens)
+
+            return cu_seqlens if n > 0 else None
+
+        cu_seqlens = _broadcast_cu_seqlens()
+        _broadcast(max_seqlen)
 
         batch = {
             'tokens': tokens,

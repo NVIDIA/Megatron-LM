@@ -251,7 +251,7 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
-    dsa_indexer_use_sparse_loss: Optional[bool] = None
+    dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
@@ -261,7 +261,6 @@ class TransformerConfig(ModelParallelConfig):
     linear_attention_type: Optional[str] = None
     """Type of linear attention to use.
     Deprecated. Use experimental_attention_variant instead."""
-
     linear_attention_freq: Optional[Union[int, List[int]]] = None
     """Frequency between LA (linear attention) layers 
     and SDPA (scaled dot-product attention) layers.
@@ -523,7 +522,8 @@ class TransformerConfig(ModelParallelConfig):
     in the hidden_states gradient."""
 
     moe_shared_expert_gate: bool = False
-    """Enable gate for shared expert."""
+    """Enable gate for shared expert. Only effective when
+    moe-shared-expert-intermediate-size is set."""
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
@@ -762,10 +762,12 @@ class TransformerConfig(ModelParallelConfig):
     excluding optimizer) is enabled.
     "transformer_engine": capture the CUDA graph using TE make_graphed_callables()."""
 
-    cuda_graph_scope: Optional[List[CudaGraphScope]] = None
+    cuda_graph_scope: Union[str, CudaGraphScope, List[str], List[CudaGraphScope]] = "full"
     """Determines the CUDA graphs capturing scope.
     When cuda_graph_impl is set to "transformer_engine", valid values are "attn", "mlp", "moe",
-    "moe_router", "moe_preprocess", "mamba". None means the full layer.
+    "moe_router", "moe_preprocess", "mamba". "full" or an empty list means the full layer. "full"
+    is actually deprecated, but for backward compatibility, we still use "full" as the default
+    value. It will be transformed to an empty list in __post_init__.
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
@@ -809,6 +811,9 @@ class TransformerConfig(ModelParallelConfig):
 
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
+
+    inference_fuse_tp_communication: bool = False
+    """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference. """
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -856,7 +861,6 @@ class TransformerConfig(ModelParallelConfig):
     fallback_to_eager_attn: bool = False
     """Whether to fallback to eager attention in TE implementation.
     Suggested for when desired features are not available in TE implementation."""
-
     #####################################
     # Fine-grained Activation Offloading
     #####################################
@@ -919,56 +923,45 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.linear_attention_type is not None:
-            warnings.warn(
-                "linear_attention_type is deprecated, "
-                "use experimental_attention_variant instead."
-            )
-            self.experimental_attention_variant = self.linear_attention_type
-            self.linear_attention_type = None
-
-        if self.experimental_attention_variant in ["gated_delta_net"]:
+        if self.experimental_attention_variant == "gated_delta_net":
             assert (
                 self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear attention."
+            ), f"linear_attention_freq must be set for linear gated_delta_net."
 
-            if self.experimental_attention_variant == "gated_delta_net":
-                # Check required parameters
-                assert (
-                    self.linear_conv_kernel_dim is not None
-                ), "linear_conv_kernel_dim must be set for gated delta net."
-                assert (
-                    self.linear_key_head_dim is not None
-                ), "linear_key_head_dim must be set for gated delta net."
-                assert (
-                    self.linear_value_head_dim is not None
-                ), "linear_value_head_dim must be set for gated delta net."
-                assert (
-                    self.linear_num_key_heads is not None
-                ), "linear_num_key_heads must be set for gated delta net."
-                assert (
-                    self.linear_num_value_heads is not None
-                ), "linear_num_value_heads must be set for gated delta net."
-                assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
-                    f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
-                    f"linear_num_key_heads ({self.linear_num_key_heads})."
-                )
-
-                # Check tensor parallelism compatibility
-                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-                assert self.linear_num_key_heads % tp_cp_size == 0, (
-                    f"{self.linear_num_key_heads=} must be a multiple of "
-                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
-                )
-                assert self.linear_num_value_heads % tp_cp_size == 0, (
-                    f"{self.linear_num_value_heads=} must be a multiple of "
-                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
-                )
-        elif self.experimental_attention_variant == "dsa":
+            # Check required parameters
             assert (
-                self.context_parallel_size == 1
-            ), "Currently context parallelism is not supported by DSAttention!"
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+                self.linear_conv_kernel_dim is not None
+            ), "linear_conv_kernel_dim must be set for gated delta net."
+            assert (
+                self.linear_key_head_dim is not None
+            ), "linear_key_head_dim must be set for gated delta net."
+            assert (
+                self.linear_value_head_dim is not None
+            ), "linear_value_head_dim must be set for gated delta net."
+            assert (
+                self.linear_num_key_heads is not None
+            ), "linear_num_key_heads must be set for gated delta net."
+            assert (
+                self.linear_num_value_heads is not None
+            ), "linear_num_value_heads must be set for gated delta net."
+            assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                f"linear_num_key_heads ({self.linear_num_key_heads})."
+            )
+
+            # Check tensor parallelism compatibility
+            assert (
+                self.linear_num_key_heads % self.tensor_model_parallel_size == 0
+            ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
+            assert (
+                self.linear_num_value_heads % self.tensor_model_parallel_size == 0
+            ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
+
+            # Do not support yet, but coming soon.
+            assert self.context_parallel_size == 1, (
+                f"Gated delta net does not support context parallel for now,"
+                f" but got {self.context_parallel_size=}."
+            )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1701,55 +1694,59 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
             if self.cuda_graph_impl == "local":
-                assert not self.cuda_graph_scope or self.cuda_graph_scope == [
-                    CudaGraphScope.full_iteration
-                ], (
-                    "For local cuda graph implementation, the only valid value for "
-                    "cuda_graph_scope is full_iteration, or an empty list to denote layerwise "
-                    "graphs. To use other scopes, use cuda_graph_impl=transformer_engine."
-                )
+                # local impl doesn't currently distinguish between moe_preproocess or moe_router
+                # so just set both if either is specified.
+                if (
+                    CudaGraphScope.moe_router in self.cuda_graph_scope
+                    or CudaGraphScope.moe_preprocess in self.cuda_graph_scope
+                ):
+                    if CudaGraphScope.moe_router not in self.cuda_graph_scope:
+                        self.cuda_graph_scope.append(CudaGraphScope.moe_router)
+                    if CudaGraphScope.moe_preprocess not in self.cuda_graph_scope:
+                        self.cuda_graph_scope.append(CudaGraphScope.moe_preprocess)
 
+            # Check cuda graph scopes
             if self.cuda_graph_impl == "transformer_engine":
                 assert CudaGraphScope.full_iteration not in self.cuda_graph_scope, (
                     "To use full iteration cuda graph, please use "
                     "cuda_graph_impl=local instead of cuda_graph_impl=transformer_engine."
                 )
+            assert (
+                CudaGraphScope.moe not in self.cuda_graph_scope
+                or CudaGraphScope.moe_router not in self.cuda_graph_scope
+            ), 'cuda_graph_scope must not contain both moe and moe_router.'
+            if CudaGraphScope.moe_preprocess in self.cuda_graph_scope:
+                assert (
+                    CudaGraphScope.moe_router in self.cuda_graph_scope
+                ), 'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
+            if self.num_moe_experts is None or self.num_moe_experts <= 1:
                 assert (
                     CudaGraphScope.moe not in self.cuda_graph_scope
-                    or CudaGraphScope.moe_router not in self.cuda_graph_scope
-                ), 'cuda_graph_scope must not contain both moe and moe_router.'
-                if CudaGraphScope.moe_preprocess in self.cuda_graph_scope:
-                    assert (
-                        CudaGraphScope.moe_router in self.cuda_graph_scope
-                    ), 'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
-                if self.num_moe_experts is None or self.num_moe_experts <= 1:
+                    and CudaGraphScope.moe_router not in self.cuda_graph_scope
+                ), 'moe cuda graph is only supported for MoE.'
+            else:
+                if self.moe_layer_freq == 1 or (
+                    isinstance(self.moe_layer_freq, list) and 0 not in self.moe_layer_freq
+                ):
+                    assert CudaGraphScope.mlp not in self.cuda_graph_scope, (
+                        'mlp cuda graph is only supported for dense layers, '
+                        'but not found in the model.'
+                    )
+                if (
+                    self.moe_expert_capacity_factor is None
+                    or not self.moe_pad_expert_input_to_capacity
+                ):
                     assert (
                         CudaGraphScope.moe not in self.cuda_graph_scope
-                        and CudaGraphScope.moe_router not in self.cuda_graph_scope
-                    ), 'moe cuda graph is only supported for MoE.'
-                else:
-                    if self.moe_layer_freq == 1 or (
-                        isinstance(self.moe_layer_freq, list) and 0 not in self.moe_layer_freq
+                    ), 'moe cuda graph is only supported with drop-padding MoE.'
+                    if self.moe_token_dispatcher_type == 'alltoall' and (
+                        self.moe_expert_capacity_factor is not None
+                        or self.moe_router_padding_for_fp8
                     ):
-                        assert CudaGraphScope.mlp not in self.cuda_graph_scope, (
-                            'mlp cuda graph is only supported for dense layers, '
-                            'but not found in the model.'
+                        assert CudaGraphScope.moe_preprocess not in self.cuda_graph_scope, (
+                            'moe_preprocess cuda graph is not supported when there are '
+                            'DtoH copies and synchronizations in the preprocess step.'
                         )
-                    if (
-                        self.moe_expert_capacity_factor is None
-                        or not self.moe_pad_expert_input_to_capacity
-                    ):
-                        assert (
-                            CudaGraphScope.moe not in self.cuda_graph_scope
-                        ), 'moe cuda graph is only supported with drop-padding MoE.'
-                        if self.moe_token_dispatcher_type == 'alltoall' and (
-                            self.moe_expert_capacity_factor is not None
-                            or self.moe_router_padding_for_quantization
-                        ):
-                            assert CudaGraphScope.moe_preprocess not in self.cuda_graph_scope, (
-                                'moe_preprocess cuda graph is not supported when there are '
-                                'DtoH copies and synchronizations in the preprocess step.'
-                            )
 
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
@@ -1759,10 +1756,15 @@ class TransformerConfig(ModelParallelConfig):
                 else:
                     # The recompute module should be inside or outside of the graph scope.
                     # Recompute module coverring graph scope is not allowed.
-                    if "moe" in self.recompute_modules:
+                    if (
+                        self.cuda_graph_impl == "transformer_engine"
+                        and "moe" in self.recompute_modules
+                    ):
                         assert (
                             CudaGraphScope.moe_router not in self.cuda_graph_scope
-                        ), "moe recompute is not supported with moe_router CUDA graph."
+                        ), "moe recompute is not supported with moe_router CUDA graph with: "
+                        "--cuda-graph-impl transformer_engine."
+
                     # Graphed recompute module doesn't accept random number.
                     if (
                         not self.cuda_graph_scope
@@ -1971,6 +1973,18 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
+
+        if self.experimental_attention_variant == "dsa":
+            assert (
+                self.context_parallel_size == 1
+            ), "Currently context parallelism is not supported by DSAttention!"
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+
+        if self.inference_fuse_tp_communication:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_fuse_tp_communication is only supported "
+                "for inference_optimized transformer implementation."
+            )
 
         if self.batch_invariant_mode:
             assert (

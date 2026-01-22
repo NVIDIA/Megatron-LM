@@ -479,15 +479,6 @@ def is_causal_conv1d_min_version(version, check_equality=True):
     return get_causal_conv1d_version() > PkgVersion(version)
 
 
-def check_mamba_sequence_packing_support() -> Tuple[bool, Optional[str]]:
-    """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
-    if not is_causal_conv1d_min_version("1.5.3.post1"):
-        return False, "causal_conv1d >= 1.5.3.post1 is required"
-    elif not is_mamba_min_version("2.2.6.post3"):
-        return False, "mamba_ssm >= 2.2.6.post3 is required"
-    return True, None
-
-
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
@@ -2099,7 +2090,8 @@ def get_thd_batch_on_this_cp_rank(
     cu_seqlens: torch.Tensor,
     cu_seqlens_padded: torch.Tensor,
     max_seqlen: torch.Tensor,
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
 ):
     """Slice each sub-sample in a packed sample batch input along
     sequence dimension into multiple chunks, which are parallelized
@@ -2115,12 +2107,8 @@ def get_thd_batch_on_this_cp_rank(
         max_seqlen_kv=int(max_seqlen[0].item()),
     )
 
-    if cp_group is not None:
-        cp_size = get_pg_size(cp_group)
-        cp_rank = get_pg_rank(cp_group)
-    else:
-        cp_size = parallel_state.get_context_parallel_world_size()
-        cp_rank = parallel_state.get_context_parallel_rank()
+    cp_size = get_context_parallel_world_size() if cp_size is None else cp_size
+    cp_rank = get_context_parallel_rank() if cp_rank is None else cp_rank
     if cp_size > 1:  # slice batch along sequence dimension for context parallelism
         assert tex is not None and is_te_min_version("1.10.0"), (
             "Please update Transformer Engine to >= 1.10 to use "
@@ -2186,7 +2174,7 @@ def get_batch_on_this_hybrid_cp_rank(
     if cp_group is not None and cp_group.size() > 1:
         # When using hybrid_context_parallel, each sub-sample of a packed sample is
         # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
-        batch = get_batch_on_this_cp_rank(batch, cp_group)
+        batch = get_batch_on_this_cp_rank(batch, cp_group=cp_group)
 
     return batch, packed_seq_params
 
@@ -2346,16 +2334,6 @@ def unwrap_model(model, module_instances=None):
     return unwrapped_model
 
 
-def maybe_cat(a, b, dim=0, *, required=False):
-    """Concatenates `a` and `b` along `dim` if `a` and `b` exist."""
-    xs = [t for t in (a, b) if t is not None]
-    if not xs:
-        if required:
-            raise ValueError("both tensors are None")
-        return None
-    return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
-
-
 _ASYNC_IO_LOOP: asyncio.AbstractEventLoop | None = None
 
 
@@ -2372,6 +2350,11 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
                 _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
     return loop
+
+
+def is_using_quantization_scales(config):
+    """Returns whether the model is using quantization scales based on the config."""
+    return getattr(config, "fp8", False) or getattr(config, "fp4", False)
 
 
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time

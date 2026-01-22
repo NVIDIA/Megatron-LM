@@ -58,11 +58,13 @@ except ImportError:
 # [ModelOpt]: Import
 try:
     from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
+    from megatron.post_training.utils import print_distributed_quant_summary
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
 
 _CHECKPOINT_VERSION = None
+_LOADED_ITERATION = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
@@ -78,6 +80,22 @@ def set_checkpoint_version(value):
 def get_checkpoint_version():
     global _CHECKPOINT_VERSION
     return _CHECKPOINT_VERSION
+
+
+def set_loaded_iteration(value):
+    """Set the iteration that was loaded from checkpoint.
+
+    This is stored separately from args to avoid polluting the checkpoint
+    with runtime state (args is saved in checkpoints).
+    """
+    global _LOADED_ITERATION
+    _LOADED_ITERATION = value
+
+
+def get_loaded_iteration():
+    """Get the iteration that was loaded from checkpoint, or None if no checkpoint was loaded."""
+    global _LOADED_ITERATION
+    return _LOADED_ITERATION
 
 
 def check_checkpoint_args(checkpoint_args):
@@ -112,6 +130,8 @@ def check_checkpoint_args(checkpoint_args):
         _compare('tokenizer_type')
     if args.data_parallel_random_init:
         _compare('data_parallel_random_init')
+    if args.phase_transition_iterations:
+        _compare('global_batch_size')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size',
                  old_arg_name='model_parallel_size')
@@ -506,6 +526,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         if not optimizer.is_stub_optimizer:
             optimizer.save_parameter_state(optim_checkpoint_name)
     
+    # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
+    if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+        dp_rank = mpu.get_data_parallel_rank()
+        optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
+        ensure_directory_exists(optim_checkpoint_name)
+        if not optimizer.is_stub_optimizer:
+            optimizer.save_state_dict_to_file(optim_checkpoint_name)
+
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
     if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
@@ -1128,6 +1156,10 @@ def _load_base_checkpoint(
     # Allow user to specify the loaded iteration.
     if getattr(args, "ckpt_step", None):
         iteration = args.ckpt_step
+
+    # Record the iteration loaded (stored separately from args to avoid
+    # polluting checkpoints, since args is saved in checkpoints).
+    set_loaded_iteration(iteration)
 
     if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
         if non_persistent_iteration >= iteration:
@@ -1837,7 +1869,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
                  f'p {mpu.get_pipeline_model_parallel_rank() + 1}/{mpu.get_pipeline_model_parallel_world_size()} ] '
                  f'at iteration {iteration}')
-
+                 
+    if has_nvidia_modelopt:
+        print_distributed_quant_summary(model, msg="After loading checkpoint")
+        
     # Additional callback for wandb (last rank)
     if not torch.distributed.is_initialized() \
        or is_last_rank():

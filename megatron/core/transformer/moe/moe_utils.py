@@ -218,7 +218,7 @@ def get_tokens_per_expert_and_token_count(
 class MoEAuxLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
 
-    main_loss_backward_scale: torch.Tensor = None
+    main_loss_backward_scale: Optional[torch.Tensor] = None
 
     @staticmethod
     def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
@@ -359,8 +359,8 @@ def unpermute(
     permuted_tokens: torch.Tensor,
     sorted_indices: torch.Tensor,
     restore_shape: torch.Size,
-    probs: torch.Tensor = None,
-    routing_map: torch.Tensor = None,
+    probs: Optional[torch.Tensor] = None,
+    routing_map: Optional[torch.Tensor] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
 ):
@@ -801,8 +801,8 @@ def save_to_aux_losses_tracker(
     loss: torch.Tensor,
     layer_number: int,
     num_layers: int,
-    reduce_group: torch.distributed.ProcessGroup = None,
-    avg_group: torch.distributed.ProcessGroup = None,
+    reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+    avg_group: Optional[torch.distributed.ProcessGroup] = None,
     reduce_group_has_dp: bool = False,
 ):
     """Save the auxiliary loss for logging.
@@ -868,9 +868,7 @@ def reduce_aux_losses_tracker_across_ranks(
             # does not have 'dp' attribute, do it manually.
             if not tracker[name].get('reduce_group_has_dp', False):
                 torch.distributed.all_reduce(
-                    values,
-                    group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-                    op=torch.distributed.ReduceOp.AVG,
+                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
                 )
         if tracker[name].get('avg_group') is not None:
             torch.distributed.all_reduce(
@@ -910,7 +908,6 @@ def track_moe_metrics(
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
                     tracker[key]["reduce_group_has_dp"] = False
-
     reduce_aux_losses_tracker_across_ranks(track_names, pg_collection=pg_collection)
 
     # Get number of MoE layers
@@ -1357,6 +1354,8 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
             Otherwise, we execute the original function and check if we should raise a signal to
             early return in CUDA graph capture.
             """
+            if moe_layer.config.cuda_graph_impl != "transformer_engine":
+                return func(moe_layer, *args, **kwargs)
             # The non-cudagraph codepath just calls the original function.
             if not is_graph_capturing() and moe_layer.cudagraph_tensor_store.is_empty():
                 return func(moe_layer, *args, **kwargs)

@@ -48,7 +48,7 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecated, internal_api
+from megatron.core.utils import deprecated
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -64,51 +64,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@deprecated(
-    version="0.16",
-    removal_version="0.17",
-    alternative=None,
-    reason="pg_collection is being passed to sub-module",
-)
-def expert_dist_ckpt_decorator(func):
-    """Decorator of shared_state_dict in expert layer for distributed checkpoint.
-    Since !1940, the TP size for Expert layer can be different with Attention.
-    To make distributed checkpoint work in such cases, we use a decorator to
-    replace the default TP parallel states with expert-TP parallel states.
-    """
-
-    logger.warning("expert_dist_ckpt_decorator is deprecated and will be removed in version 0.17.")
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        # Store original states
-        original_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
-        original_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-        original_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
-        try:
-            # Set new states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = (
-                parallel_state.get_expert_tensor_parallel_rank()
-            )
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = (
-                parallel_state.get_expert_tensor_parallel_world_size()
-            )
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = (
-                parallel_state.get_expert_tensor_parallel_group()
-            )
-
-            # Execute the function
-            result = func(*args, **kwargs)
-        finally:
-            # Restore original states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = original_rank
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = original_size
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = original_group
-        return result
-
-    return wrapper
-
-
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
 
@@ -116,7 +71,6 @@ class GroupedMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts: int,
@@ -286,7 +240,7 @@ class GroupedMLP(MegatronModule):
         permuted_probs: torch.Tensor,
     ):
         """Forward step of the GroupedMLP."""
-        assert self.config.bf16, "Currently GroupedGEMM for MoE only supports bf16."
+        assert self.config.bf16, "Currently GroupedMLP for MoE only supports bf16."
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
 
@@ -580,7 +534,6 @@ class TEGroupedMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts,
@@ -820,12 +773,12 @@ class TEGroupedMLP(MegatronModule):
             output = off_interface.group_commit(
                 output, name="moe_act", forced_released_tensors=[fc1_output]
             )
+        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
             output = self.quantization_unpadding(output, actual_tokens_per_expert)
 
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
         output_bias = None
 
         return output, output_bias
@@ -889,7 +842,6 @@ class SequentialMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts,
