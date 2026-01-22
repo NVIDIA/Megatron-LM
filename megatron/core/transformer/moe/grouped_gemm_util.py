@@ -13,9 +13,9 @@ def grouped_gemm_is_available():
 
 def assert_grouped_gemm_is_available():
     """Assert that grouped_gemm is available."""
-    assert grouped_gemm_is_available(), (
-        "Grouped GEMM is not available. To use MoE with grouped GEMM, you need to install "
-        "nv-grouped-gemm.\n\n"
+    error_msg = (
+        "The legacy Grouped GEMM is not available. To use MoE with the legacy grouped GEMM, "
+        "you need to install nv-grouped-gemm.\n\n"
         "Installation options:\n"
         "1. Install from PyPI (requires CUDA toolkit and CUTLASS headers):\n"
         "   pip install 'megatron-core[moe]'\n"
@@ -27,8 +27,10 @@ def assert_grouped_gemm_is_available():
         "- CUDA toolkit (nvcc)\n"
         "- CUTLASS headers (can be installed via 'apt-get install libcutlass-dev' on Ubuntu)\n"
         "- Compatible GPU with compute capability >= 8.0\n\n"
-        "If you don't need MoE functionality, you can continue without this package."
+        "We recommend installing TE (>= 1.9) for more comprehensive grouped gemm support. "
+        "If you don't have TE nor nv-grouped-gemm, please remove '--moe-grouped-gemm'."
     )
+    assert grouped_gemm_is_available(), error_msg
 
 
 ops = grouped_gemm.ops if grouped_gemm_is_available() else None
