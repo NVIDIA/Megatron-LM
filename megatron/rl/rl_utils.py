@@ -2,6 +2,7 @@
 
 import gc
 
+import copy
 from functools import partial
 # Keep this to make the env registered.
 import itertools
@@ -889,7 +890,7 @@ def prepare_trajectories(
         # We assume that all lengths of the structs above have the same lengths (number of turns).
 
         all_turns_trajectories = (
-            rollout.trajectory.copy()
+            copy.deepcopy(rollout.trajectory)
             if isinstance(rollout, TokenRollout)
             else tokenizer.tokenize(rollout.trajectory)
         )
@@ -1287,9 +1288,6 @@ def prepare_data_for_update(
                     dataset_tensors.append(inference_logprobs)
                 else:
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
-                if torch.distributed.get_rank() ==0:
-                    breakpoint()
-                torch.distributed.barrier()
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 

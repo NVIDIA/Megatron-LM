@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from torch.utils.data import DataLoader, TensorDataset
 from dataclasses import dataclass, field
 from megatron.core.utils import log_single_rank
-from megatron.training.global_vars import get_tokenizer
+from megatron.training.global_vars import get_args, get_tokenizer
 from megatron.training.utils import get_nvtx_range
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core import mpu
