@@ -283,8 +283,6 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         for chunk in rolled_chunks:
             # Skip empty chunks that can occur when the sequence slice is very small
             if chunk.size(dims) == 0:
-                empty_shape = list(chunk.shape)
-                empty_shape[dims] = 0
                 tensor_send_list.append(
                     torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
                 )
