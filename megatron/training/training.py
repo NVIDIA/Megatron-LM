@@ -728,10 +728,15 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    if args.fine_grained_activation_offloading:
+        from megatron.core.pipeline_parallel.utils import (
+            set_ideal_affinity_for_current_gpu
+        )
+        set_ideal_affinity_for_current_gpu()
+
     if args.batch_invariant_mode:
         print_rank_0("Enabling batch invariant mode globally",flush=True)
         enable_batch_invariant_mode()
-
 
     if args.log_progress:
         append_to_progress_log("Starting job")

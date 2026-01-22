@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Callable, Optional
@@ -7,7 +8,9 @@ from typing import Callable, Optional
 import torch
 from torch.autograd import Variable
 
-from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
+from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank, make_viewless_tensor
+
+logger = logging.getLogger(__name__)
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -87,19 +90,13 @@ def set_ideal_affinity_for_current_gpu():
     try:
         import cuda.bindings.driver as cuda_driver
         import cuda.bindings.runtime as cuda_runtime
-    except ImportError:
+    except:
         try:
             import cuda.cuda as cuda_driver
             import cuda.cudart as cuda_runtime
-        except ImportError:
-            # print("cuda-python may not be installed, skipping GPU affinity setting")
-            warnings.warn("cuda-python may not be installed, skipping GPU affinity setting")
-            return
-    try:
-        import pynvml
-    except ImportError:
-        warnings.warn("pynvml is not installed, skipping GPU affinity setting")
-        return
+        except:
+            raise RuntimeError("Please install cuda-python to enable GPU affinity setting")
+    import pynvml
 
     # Get current CUDA device ID
     err, device_id = cuda_runtime.cudaGetDevice()
@@ -111,6 +108,12 @@ def set_ideal_affinity_for_current_gpu():
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
     pynvml.nvmlDeviceSetCpuAffinity(handle)
+
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        f"Set CPU affinity for all GPUs for optimal host-device transfer performance",
+    )
 
 
 @contextmanager
