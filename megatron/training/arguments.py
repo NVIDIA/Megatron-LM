@@ -3367,6 +3367,14 @@ def _add_moe_args(parser):
     group.add_argument('--moe-router-padding-for-fp8', action='store_true',
                        help='[Compatibility alias for --moe-router-padding-for-quantization] '
                        'Enabling this will also enable --moe-router-padding-for-quantization.')
+    group.add_argument('--moe-permute-padding-for-quantization', action='store_true',
+                       help='Enable padding during MoE token permutation (and unpadding during unpermutation) '
+                       'so that the number of tokens in each expert permuted block is aligned to a multiple of 16/32 for FP8/FP4 precision. '
+                       'This can remove explicit padding/unpadding around GroupedMLP, which improves throughput and reduces peak memory usage.')
+    group.add_argument('--moe-fp8-flow', action='store_true',
+                       help='Quantize activations to FP8 before deepep token dispatch to reduce communication bandwidth, and then feed FP8 activations '
+                       'directly into expert up-projection (GroupedMLP/GEMM). Requires FP8-enabled expert GEMM kernels and '
+                       'matching FP8 format/granularity; typically used with --moe-permute-padding-for-quantization. Default: disabled.')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,

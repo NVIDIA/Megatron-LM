@@ -8,6 +8,10 @@ import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
+from megatron.core.fusions.fused_weighted_swiglu_quant import (
+    fused_weighted_swiglu_quant,
+    fused_weighted_swiglu_quant_back,
+)
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 
@@ -191,19 +195,38 @@ class SwiGLUFunction(torch.autograd.Function):
 class WeightedSwiGLUFunction(torch.autograd.Function):
     @staticmethod
     # bias is an optional argument
-    def forward(ctx, input, weights, fp8_input_store):
+    def forward(ctx, input, weights, fp8_input_store, config):
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        if config.moe_fp8_flow:
+            out_data, out_scale = fused_weighted_swiglu_quant(input, weights)
+
+            from megatron.core.fp8_utils import make_fp8_tensor
+
+            weighted_swiglu_out = make_fp8_tensor(config.fp8_recipe, out_data, out_scale)
+        else:
+            weighted_swiglu_out = weighted_swiglu(input, weights)
         ctx.save_for_backward(input_for_backward, weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
-        return weighted_swiglu(input, weights)
+        ctx.fp8_recipe = config.fp8_recipe
+        ctx.moe_fp8_flow = config.moe_fp8_flow
+        return weighted_swiglu_out
 
     @staticmethod
     def backward(ctx, grad_output):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
-        return tmp, wgrad, None
+        if ctx.moe_fp8_flow:
+            input_grad_data, input_grad_scale, wgrad = fused_weighted_swiglu_quant_back(
+                grad_output, input, weights
+            )
+
+            from megatron.core.fp8_utils import make_fp8_tensor
+
+            tmp = make_fp8_tensor(ctx.fp8_recipe, input_grad_data, input_grad_scale)
+        else:
+            tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
+        return tmp, wgrad, None, None
 
 
 def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
@@ -236,7 +259,7 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
-def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
+def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False, config=None):
     """
     Token-wise-weighted bias swiglu fusion.
     """
@@ -246,7 +269,7 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
     else:
-        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
+        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store, config)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 

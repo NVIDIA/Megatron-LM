@@ -25,6 +25,7 @@ try:
         fused_moe_aux_loss,
         fused_permute,
         fused_permute_with_probs,
+        fused_permute_and_pad_with_probs,
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
@@ -232,6 +233,8 @@ def permute(
     num_out_tokens: Optional[int] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
+    tokens_per_expert: Optional[torch.Tensor] = None,
+    align_size: int = -1,
 ):
     """Permute the tokens and probs based on the mask.
     Tokens with the same designated expert will be grouped together.
@@ -262,11 +265,14 @@ def permute(
         return permuted_input, None, sorted_indices
 
     if fused and probs is not None:
-        if not HAVE_TE or fused_permute_with_probs is None:
-            raise ValueError(
-                "fused_permute_with_probs is not available. Please install TE >= 2.1.0."
-            )
-        return fused_permute_with_probs(tokens, probs, routing_map, num_out_tokens=num_out_tokens)
+        if tokens_per_expert is not None and align_size > 0:
+            return fused_permute_and_pad_with_probs(tokens, probs, routing_map, tokens_per_expert, align_size)
+        else:
+            if not HAVE_TE or fused_permute_with_probs is None:
+                raise ValueError(
+                    "fused_permute_with_probs is not available. Please install TE >= 2.1.0."
+                )
+            return fused_permute_with_probs(tokens, probs, routing_map, num_out_tokens=num_out_tokens)
 
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
@@ -320,6 +326,7 @@ def unpermute(
     routing_map: Optional[torch.Tensor] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
+    pad_offsets: Optional[torch.Tensor] = None,
 ):
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -349,7 +356,8 @@ def unpermute(
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
         return fused_unpermute(
-            permuted_tokens, sorted_indices, merging_probs=probs, restore_shape=restore_shape
+            permuted_tokens, sorted_indices, merging_probs=probs, restore_shape=restore_shape,
+            pad_offsets=pad_offsets,
         )
 
     _, hidden = restore_shape

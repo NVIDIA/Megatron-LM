@@ -124,6 +124,9 @@ class MoELayer(BaseMoELayer):
             and "moe" in config.recompute_modules
             and config.cuda_graph_impl != 'local'
         )
+        self.moe_expert_recompute = (
+            config.recompute_granularity == 'selective' and "moe_expert" in config.recompute_modules
+        )
         self.shared_experts_recompute = (
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
@@ -289,7 +292,21 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
+        if self.moe_expert_recompute:
+            if self.config.fp8:
+                expert_output, mlp_bias = te_checkpoint(
+                    self.experts,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    dispatched_input, tokens_per_expert, permuted_probs
+                )
+            else:
+                expert_output, mlp_bias = tensor_parallel.checkpoint(
+                    self.experts, False, dispatched_input, tokens_per_expert, permuted_probs
+                )
+        else:
+            expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
