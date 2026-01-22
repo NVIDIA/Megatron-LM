@@ -391,6 +391,7 @@ def validate_args(args, defaults={}):
             from torch_memory_saver import torch_memory_saver
         except ImportError:
             raise AssertionError("To use offload-kv-cache-during-training, `torch_memory_saver` must be installed. See https://github.com/fzyzcjy/torch_memory_saver.")
+        assert not args.inference_dynamic_batching_unified_memory_level, "The KV cache should not be instantiated in unified memory when it is offloaded during training."
 
     # Batch size checks if running RL.
     if args.perform_rl_step:

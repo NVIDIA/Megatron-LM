@@ -294,6 +294,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
+        offload_kv_cache: Optional[bool] = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -544,6 +545,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
+        # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
+        self.offload_kv_cache = offload_kv_cache
+
         self._using_cuda_graph_this_step = False
         self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
         # Deal with chunked prefill
@@ -660,7 +664,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 ctx = (
                     torch_memory_saver.region(tag="kv_cache", enable_cpu_backup=True)
-                    if HAVE_TORCH_MEMORY_SAVER
+                    if HAVE_TORCH_MEMORY_SAVER and self.offload_kv_cache
                     else nullcontext()
                 )
 
