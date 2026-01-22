@@ -51,7 +51,6 @@ class TestInferenceWandbLogging:
         max_sequence_length=512,
         buffer_size_gb=0.03,
         block_size_tokens=128,
-        metrics_writer=None,
     ):
         """Helper to create a DynamicInferenceContext."""
         return DynamicInferenceContext(
@@ -65,7 +64,6 @@ class TestInferenceWandbLogging:
             num_cuda_graphs=None,
             buffer_size_gb=buffer_size_gb,
             block_size_tokens=block_size_tokens,
-            metrics_writer=metrics_writer,
             unified_memory_level=0,  # unit tests currently broken with UVM
         )
 
@@ -203,7 +201,7 @@ class TestInferenceWandbLogging:
         mock_wandb.__name__ = "wandb"
         mock_wandb.log = Mock()
 
-        dynamic_context = self._get_dynamic_context(metrics_writer=mock_wandb)
+        dynamic_context = self._get_dynamic_context()
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
@@ -218,6 +216,7 @@ class TestInferenceWandbLogging:
             context=dynamic_context,
             random_seed=123,
             inference_logging_step_interval=0,  # Disabled
+            metrics_writer=mock_wandb,
         )
 
         # Verify log was never called
@@ -259,7 +258,7 @@ class TestInferenceWandbLogging:
     @pytest.mark.internal
     def test_metrics_writer_none_handling(self):
         """Test that engine handles None metrics_writer gracefully."""
-        dynamic_context = self._get_dynamic_context(metrics_writer=None)
+        dynamic_context = self._get_dynamic_context()
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
@@ -279,4 +278,4 @@ class TestInferenceWandbLogging:
 
         # Verify engine was created successfully
         assert engine.inference_logging_step_interval == 10
-        assert engine.context.metrics_writer is None
+        assert engine.metrics_writer is None
