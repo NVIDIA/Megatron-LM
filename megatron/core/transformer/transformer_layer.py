@@ -1163,9 +1163,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # dynamic_inference_decode_only is not a real argument to forward, it is only used
                 # to differentiate the cuda graph used for decode from the one used for non-decode
                 # inference.
-                kwargs["dynamic_inference_decode_only"] = kwargs[
-                    'inference_context'
-                ].is_decode_only()
+                # Note that for dummy forward passes with EP we may be using mixed
+                # prefill + decode graphs even without any actual requests so we
+                # should not use `inference_context.is_decode_only()`.
+                kwargs["dynamic_inference_decode_only"] = (
+                    kwargs['inference_context'].padded_batch_dimensions.prefill_req_count == 0
+                )
         return super().__call__(*args, **kwargs)
 
     def get_layer_norm_weights(self):
