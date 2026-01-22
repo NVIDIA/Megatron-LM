@@ -308,6 +308,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
                 )
 
+            # Enable routing recording during warmup if routing replay is enabled.
+            # This ensures the record_indices copy operation is captured in the CUDA graph.
+            model_config = controller.inference_wrapped_model.model.config
+            if getattr(model_config, 'enable_routing_replay', False):
+                from megatron.core.transformer.moe.moe_utils import (
+                    RouterReplay,
+                    RouterReplayAction,
+                )
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
             # Forward pass -> logits.
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
@@ -804,6 +814,7 @@ class DynamicInferenceEngine(AbstractEngine):
         sample: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -817,6 +828,9 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
+            routing_indices_per_request: (Dict[int, Tensor]): MoE routing indices
+                pre-mapped by request_id. Each value is a tensor of shape
+                [num_tokens_this_step, num_layers, topk].
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -945,6 +959,38 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
+
+            # Process routing indices if available (keyed by request_id)
+            # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
+            # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
+            if routing_indices_per_request is not None and request_id in routing_indices_per_request:
+                step_routing = routing_indices_per_request[request_id]  # [num_tokens, num_layers, topk]
+                if request.routing_indices is None:
+                    request.routing_indices = step_routing.clone()
+                else:
+                    request.routing_indices = torch.cat(
+                        [request.routing_indices, step_routing], dim=0
+                    )
+
+                # Sanity check logging for routing indices (only log for first request, first few steps)
+                if req_idx == 0 and request.routing_indices.shape[0] <= 15:  # first 15 tokens
+                    rank = torch.distributed.get_rank()
+                    logging.info(
+                        f"[ROUTING DEBUG] rank={rank}, request_id={request_id}, "
+                        f"total_tokens={request.routing_indices.shape[0]}, "
+                        f"num_layers={request.routing_indices.shape[1]}, "
+                        f"topk={request.routing_indices.shape[2]}, "
+                        f"tokens_this_step={step_routing.shape[0]}"
+                    )
+                    # Log first layer's routing for first few tokens
+                    if step_routing.numel() > 0:
+                        num_tokens_to_log = min(3, step_routing.shape[0])
+                        # step_routing is [num_tokens, num_layers, topk], get layer 0
+                        logging.info(
+                            f"[ROUTING DEBUG] rank={rank}, Layer 0 routing (first {num_tokens_to_log} tokens): "
+                            f"{step_routing[:num_tokens_to_log, 0, :].tolist()}"
+                        )
+
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
@@ -1214,6 +1260,7 @@ class DynamicInferenceEngine(AbstractEngine):
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
+            routing_indices_per_request = step_result.get("routing_indices_per_request", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -1232,6 +1279,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 sample,
                 log_probs,
                 top_n_logprobs,
+                routing_indices_per_request,
             )
 
         else:

@@ -286,8 +286,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
+        num_moe_layers: Optional[int] = None,
+        moe_router_topk: Optional[int] = None,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
+
+        # MoE routing replay parameters.
+        self.num_moe_layers = num_moe_layers
+        self.moe_router_topk = moe_router_topk
 
         self.cache_mla_latent = cache_mla_latent
         if self.cache_mla_latent:
@@ -696,6 +702,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         with ctx_manager:
             allocate_memory_buffer()
             allocate_mamba_states()
+
+        # Allocate routing metadata for MoE models.
+        if self.moe_router_topk is not None:
+            from megatron.core.inference.contexts.routing_metadata import RoutingMetadata
+
+            self.routing_metadata = RoutingMetadata(
+                context=self,
+                moe_router_topk=self.moe_router_topk,
+            )
+        else:
+            self.routing_metadata = None
 
         # Reset attention and Mamba state.
         self.reset_attention_state()
@@ -1406,6 +1423,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 padded_batch_dimensions=self.padded_batch_dimensions,
             )
 
+        if self.routing_metadata is not None:
+            if self.using_cuda_graph_this_step():
+                self.routing_metadata.enable_static_buffer_recording()
+            else:
+                self.routing_metadata.disable_static_buffer_recording()
+            
     def reset(self) -> None:
         """Reset entire context.
 

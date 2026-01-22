@@ -44,6 +44,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.moe.moe_utils import get_num_moe_layers
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_mamba_inference_state_config_from_model
 
@@ -159,6 +160,15 @@ def get_inference_context(
     if args.inference_logging_step_interval > 0 and args.inference_wandb_logging:
         metrics_writer = get_wandb_writer()
 
+    # Calculate number of MoE layers from moe_layer_freq.
+    num_moe_layers = None
+    moe_router_topk = None
+    if args.num_experts is not None:
+        num_moe_layers = get_num_moe_layers(
+            args.num_layers, args.moe_layer_freq
+        ) // args.pipeline_model_parallel_size
+        moe_router_topk = args.moe_router_topk
+    
     # Inference context.
     context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
@@ -191,6 +201,8 @@ def get_inference_context(
         cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
+        num_moe_layers=num_moe_layers,
+        moe_router_topk=moe_router_topk,
     )
 
     return context
