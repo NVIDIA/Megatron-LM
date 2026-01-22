@@ -6,9 +6,11 @@ Megatron Core MoE is a production-ready framework for training large-scale Mixtu
 For latest features and architectures, please refer to the [MCore dev roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729).
 
 ### 🔥 [MCore dev] (2026/01)
-- 🚀 Pipeline-aware fine-grained activation offloading 
+- 🚀 Pipeline-aware fine-grained activation offloading
 - 🚀 Qwen3-Next model support
+- 🚀 DeepSeek-V3.2 model support
 - 🚀 Muon and Layer-wise distributed optimizer
+- 🚀 CUDA Graph support with fine-grained scopes
 
 ### 🔥 [MCore v0.15] (2025/11)
 - 🚀 Add HybridEP backend to Flex Dispatcher(GB200, B200, H100 supported)
