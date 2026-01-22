@@ -1219,10 +1219,16 @@ class TEGroupedMLP(MegatronModule):
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
         if self.moe_paged_stash_expert_fc2:
+            max_num_tokens = bias_act_output.shape[0]
+            cap_factor = self.config.moe_expert_rank_capacity_factor
+            avg_num_tokens = (
+                int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
+            )
             offload_context = get_paged_stash_context(
                 name="expert_fc2",
-                max_num_tokens=bias_act_output.shape[0],
+                max_num_tokens=max_num_tokens,
                 num_tokens_tensor=tokens_per_expert.sum(),
+                avg_num_tokens=avg_num_tokens,
             )
         else:
             offload_context = nullcontext()
