@@ -406,6 +406,7 @@ jobs:
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
 
   cicd-parse-integration-tests:
     runs-on: ubuntu-latest
