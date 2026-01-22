@@ -25,11 +25,18 @@ TEST_FILES=$(find tests/unit_tests -type f -name "test_*.py")
 ANY_FAIL=0
 
 for file in $TEST_FILES; do
+    # Create unique filename by replacing slashes with underscores and removing tests/unit_tests/ prefix
+    # E.g., tests/unit_tests/dist_checkpointing/test_optimizer.py -> dist_checkpointing_test_optimizer
+    test_name=$(echo "$file" | sed 's|tests/unit_tests/||' | sed 's|/|_|g' | sed 's|\.py$||')
+    
+    csv_file="$OUT_DIR/test_report_${test_name}.csv"
+    xml_file="$OUT_DIR/junit_report_${test_name}.xml"
+
     echo "Running test file: $file"
     torchrun --standalone --nproc_per_node=$NUM_GPUS -m pytest \
-        --showlocals --tb=long -v -s -m "$PYTEST_MARKERS" \
-        --csv "$OUT_DIR/test_report_$(basename "$file" .py).csv" \
-        --junitxml "$OUT_DIR/junit_report_$(basename "$file" .py).xml" \
+        --showlocals --tb=long -v -s \
+        --csv "$csv_file" \
+        --junitxml "$xml_file" \
         $file
     rc=$?
 
