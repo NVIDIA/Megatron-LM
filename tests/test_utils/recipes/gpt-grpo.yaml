@@ -62,7 +62,7 @@ products:
   - test_case: [gpt_grpo_tp1_pp1_dp8_583m_throughputtest_github]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [mr-github-broken]
         platforms: [dgx_h100]
   - test_case: [gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest]
     products:
@@ -72,7 +72,7 @@ products:
   - test_case: [gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest_github]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [mr-github-broken]
         platforms: [dgx_h100]
   - test_case: [gpt_grpo_tp2tp1_pp4pp2_dp8_583m_throughputtest]
     products:
