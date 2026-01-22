@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -30,6 +31,7 @@ class MockModel(LanguageModule):
         self.batch = batch
         self.seq = seq
         self.vocab = vocab
+        self.pg_collection = SimpleNamespace(pp=None)
         self.config = TransformerConfig(num_attention_heads=1, num_layers=1)
         self.model_type = ModelType.encoder_or_decoder
 
@@ -66,7 +68,7 @@ class MockTokenizer:
 
 @pytest.fixture(scope='module', autouse=True)
 def mock_pipeline_stuff():
-    with patch('megatron.rl.rl_utils.is_pipeline_last_stage', return_value=True):
+    with patch('megatron.rl.rl_utils.is_pp_last_stage', return_value=True):
         yield
 
 
@@ -110,6 +112,7 @@ def test_prepare_trajectories(mock_rank):
     args = type('Args', (), {})()
     args.rl_use_sequence_packing = False
     args.rl_inference_logprobs_is_correction = True
+    args.rl_skip_bos_token = False
     global_vars.set_args(args)
 
     tokenizer = MockTokenizer()

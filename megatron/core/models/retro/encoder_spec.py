@@ -19,6 +19,7 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
+from megatron.core.typed_torch import not_none
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -32,6 +33,12 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    (TEColumnParallelLinear, TEDotProductAttention, TENorm, TERowParallelLinear) = (
+        None,
+        None,
+        None,
+        None,
+    )
     HAVE_TE = False
 
 try:
@@ -68,9 +75,9 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
         module=RetroEncoderCrossAttention,
         params={"attn_mask_type": AttnMaskType.padding},
         submodules=CrossAttentionSubmodules(
-            linear_q=TEColumnParallelLinear,
-            linear_kv=TEColumnParallelLinear,
-            core_attention=TEDotProductAttention,
+            linear_q=not_none(TEColumnParallelLinear),
+            linear_kv=not_none(TEColumnParallelLinear),
+            core_attention=not_none(TEDotProductAttention),
             linear_proj=TERowParallelLinear,
         ),
     )

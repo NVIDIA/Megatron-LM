@@ -43,12 +43,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
-    check_mamba_sequence_packing_support,
     get_mamba_inference_state_config_from_model,
     is_fa_min_version,
     is_te_min_version,
@@ -59,7 +59,7 @@ from tests.unit_tests.test_utilities import Utils
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
     if model_provider == "mamba":
         sequence_packing_available, reason_for_no_sequence_packing = (
-            check_mamba_sequence_packing_support()
+            _check_mamba_sequence_packing_support()
         )
         if not sequence_packing_available:
             pytest.skip(reason_for_no_sequence_packing)
@@ -90,6 +90,7 @@ class DynamicEngineTestConfig:
     num_gap_steps: int = 2
 
     context_buffer_size_gb: float = 0.1  # enough room for all tokens.
+    context_paused_buffer_size_gb: float | None = None
     context_block_size_tokens: int = 256
     context_max_requests: Optional[int] = None
     context_max_tokens: Optional[int] = None
@@ -106,6 +107,7 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
+    enable_chunked_prefill: bool = False
     cuda_graph_scope: List[CudaGraphScope] = field(
         default_factory=lambda: [CudaGraphScope.full_iteration]
     )
@@ -131,6 +133,10 @@ class DynamicEngineTestConfig:
         else:
             assert self.num_tokens_total is not None
             self.max_sequence_length = self.num_tokens_total
+
+        # Default paused buffer size.
+        if self.context_paused_buffer_size_gb is None:
+            self.context_paused_buffer_size_gb = 0.2 * self.context_buffer_size_gb
 
 
 @dataclass
@@ -226,6 +232,7 @@ class TestDynamicInferenceEngine:
             num_cuda_graphs=test_config.num_cuda_graphs,
             use_cuda_graphs_for_non_decode_steps=True,
             buffer_size_gb=test_config.context_buffer_size_gb,
+            paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
             block_size_tokens=test_config.context_block_size_tokens,
             max_requests=test_config.context_max_requests,
             max_tokens=test_config.context_max_tokens,
@@ -422,6 +429,7 @@ class TestDynamicInferenceEngine:
             inference_context,
             random_seed=test_config.random_seed,
             enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
+            enable_chunked_prefill=test_config.enable_chunked_prefill,
         )
 
         # Test env.
@@ -680,12 +688,13 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [40]),
-            (1, [40]),
-            (2, [40, 24]),
-            (4, [40, 32, 16]),
-            (8, [40, 32, 24, 16, 8]),
-            (16, [40, 32, 24, 16, 8]),
+            (0, [80]),
+            (1, [80]),
+            (2, [80, 40]),
+            (4, [80, 72, 48, 24]),
+            (8, [80, 64, 48, 32, 16]),
+            (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (32, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
         ]:
 
             # Build cuda graphs (inside dynamic engine).
@@ -1147,7 +1156,7 @@ class TestDynamicInferenceEngine:
         num_tokens_to_generate = 16
         max_sequence_length = prompt_length + num_tokens_to_generate
 
-        # Configure context to force chunking (chunked prefill is enabled by default)
+        # Configure context to force chunking
         env = self._run_test(
             num_requests=1,
             min_prompt_length=prompt_length,
@@ -1157,6 +1166,7 @@ class TestDynamicInferenceEngine:
             model_provider=model_provider,
             context_block_size_tokens=256,
             context_max_tokens=1000,
+            enable_chunked_prefill=True,
         )
 
     @pytest.mark.internal
@@ -1186,6 +1196,7 @@ class TestDynamicInferenceEngine:
             model_provider="gpt",
             context_block_size_tokens=256,
             context_max_tokens=1000,
+            enable_chunked_prefill=True,
         )
 
         # Validate results
@@ -1366,13 +1377,13 @@ class TestDynamicInferenceEngine:
         step_count = env.engine.step_count
         context = env.engine.context
         if max_requests is None:
-            assert context.max_active_requests == 408
+            assert context.max_requests == 816
             assert step_count == 22
         else:
             assert max_requests < len(env.requests), (
                 f"Test is only useful if max_requests ({max_requests}) < "
                 f"num_requests ({len(env.requests)})."
             )
-            assert context.max_active_requests == 4
+            assert context.max_requests == 4
             assert step_count == 34
-        assert context.block_allocator.active_count == 409
+        assert context.block_allocator.active_count == 655
