@@ -12,6 +12,7 @@ from .utils import (
     ReshardPlan,
     ShardingDescriptor,
     TransferOp,
+    _build_layer_module_prefix_map,
     _get_rank_in_group,
     extract_param_metadata,
     select_src_metadata_balanced,
@@ -225,12 +226,30 @@ def build_centralized_reshard_plan(
     my_src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
     my_dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
 
+    # Build PP layer prefix maps to be used for parameter name rewriting
+    src_layer_prefix_map = _build_layer_module_prefix_map(src_module)
+    dst_layer_prefix_map = _build_layer_module_prefix_map(dst_module)
+
     my_src_metadata = [
-        extract_param_metadata(p, name, my_global_rank, src_pg, num_experts=num_experts)
+        extract_param_metadata(
+            p,
+            name,
+            my_global_rank,
+            src_pg,
+            num_experts=num_experts,
+            layer_module_prefix_map=src_layer_prefix_map,
+        )
         for name, p in my_src_params.items()
     ]
     my_dst_metadata = [
-        extract_param_metadata(p, name, my_global_rank, dst_pg, num_experts=num_experts)
+        extract_param_metadata(
+            p,
+            name,
+            my_global_rank,
+            dst_pg,
+            num_experts=num_experts,
+            layer_module_prefix_map=dst_layer_prefix_map,
+        )
         for name, p in my_dst_params.items()
     ]
 

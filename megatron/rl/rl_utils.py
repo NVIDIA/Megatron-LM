@@ -25,12 +25,8 @@ from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.optimizer import MegatronOptimizer
-from megatron.core.parallel_state import (
-    get_pipeline_model_parallel_group,
-    get_pipeline_model_parallel_last_rank,
-    is_pipeline_last_stage,
-)
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
@@ -77,12 +73,13 @@ from megatron.training.utils import (
     print_rank_0,
     unwrap_model,
 )
-from megatron.core.utils import get_pg_size, get_attr_wrapped_model
+from megatron.core.utils import get_pg_rank, get_pg_size, get_attr_wrapped_model
 from megatron.core.process_groups_config import ProcessGroupCollection
 from wandb import wandb_run
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -630,7 +627,10 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 )
             model.config.flash_decode = flash_decode
 
-        if not is_pipeline_last_stage():
+        pg_collection = get_attr_wrapped_model(model, "pg_collection")
+        pp_group = pg_collection.pp
+
+        if not is_pp_last_stage(pp_group):
             return logits_or_hidden_states
         else:
             logits = logits_or_hidden_states
@@ -960,6 +960,10 @@ def prepare_trajectories(
 
 
 def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None):
+    # Avoid self.training checks which will trigger cudagraph capture; this path reuses
+    # the forward pass from training after it has been captured on the 1st iteration.
+    model.eval()
+
     if packing_context is not None:
         # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
         bin_tensor = next(data_iterator)[0]
@@ -971,7 +975,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         b_trajs, b_posids = next(data_iterator)
         b_packed_seq_params = None
 
-    return (
+    logprobs = (
         get_logprobs(
             model,
             b_trajs.cuda(),
@@ -982,6 +986,8 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         ),
         None,
     )
+    model.train()
+    return logprobs
 
 
 def _compute_logprobs_batch(
@@ -994,6 +1000,7 @@ def _compute_logprobs_batch(
     logprobs_batch_size,
     decoder_seq_length,
     dtype,
+    pp_group,
     is_correction,
 ):
     """Compute logprobs for all batches in the data loader."""
@@ -1011,10 +1018,10 @@ def _compute_logprobs_batch(
             forward_only=True,
             adjust_tensor_shapes_fn=None,
         )
-        if is_pipeline_last_stage():
+        if is_pp_last_stage(pp_group):
             logprobs_list.append(output_tensor[0].detach())
 
-    if is_pipeline_last_stage():
+    if is_pp_last_stage(pp_group):
         logprobs = torch.concat(logprobs_list, dim=0)
         assert logprobs.dtype == dtype
     else:
@@ -1025,11 +1032,13 @@ def _compute_logprobs_batch(
             device=torch.cuda.current_device(),
         )
 
-    dist.broadcast(
-        logprobs,
-        src=get_pipeline_model_parallel_last_rank(),
-        group=get_pipeline_model_parallel_group(),
-    )
+    # Only PP>1 needs a broadcast from the last stage; for PP=1 the output is already local.
+    if get_pg_size(pp_group) > 1:
+        dist.broadcast(
+            logprobs,
+            src=get_pipeline_model_parallel_last_rank(),
+            group=get_pipeline_model_parallel_group(),
+        )
     return logprobs.cpu()
 
 
@@ -1056,13 +1065,7 @@ def prepare_data_for_update(
     nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
 
-    # RL policy updates + logprob computations should run eagerly; only rollout generation
-    # (inference engine) should use CUDA graphs until training cuda-graphs MR goes in. 
-    # In the single-model case this is naturally handled by `megatron_rl_inference_mode` 
-    # toggling graphs on/off around inference. In the refit case (separate inference_model),
-    # we must explicitly keep the training model (this `model`) with CUDA graphs disabled,
-    # otherwise training/logprobs can get cudagraphed.
-    if args.cuda_graph_impl != "none":
+    if args.cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
         lang_module = (
             model[0].module.module if hasattr(model[0].module, "module") else model[0].module
         )
@@ -1166,6 +1169,9 @@ def prepare_data_for_update(
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
             )
 
+            pg_collection = get_attr_wrapped_model(model, "pg_collection")
+            pp_group = pg_collection.pp
+
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
                 old_logprobs = _compute_logprobs_batch(
                     model=model,
@@ -1177,6 +1183,7 @@ def prepare_data_for_update(
                     logprobs_batch_size=logprobs_batch_size,
                     decoder_seq_length=args.decoder_seq_length,
                     dtype=dtype,
+                    pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
 
@@ -1196,6 +1203,7 @@ def prepare_data_for_update(
                     logprobs_batch_size=logprobs_batch_size,
                     decoder_seq_length=args.decoder_seq_length,
                     dtype=dtype,
+                    pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
 
@@ -1616,7 +1624,7 @@ def megatron_rl_inference_mode(
                 optimizer.offload_to_cpu()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
-        if cuda_graph_impl != "none":
+        if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
 
         inference_interface = get_inference_interface(args, loop, model)
@@ -1665,7 +1673,7 @@ def megatron_rl_inference_mode(
                 inference_interface._inference_engine.context.memory_buffer = None
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
-        if cuda_graph_impl != "none":
+        if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
@@ -1686,9 +1694,11 @@ def megatron_rl_inference_mode(
 
 
 def rl_inference_interface_shutdown():
+    global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_INFERENCE_INTERFACE.kill())
+        _INFERENCE_INTERFACE = None
     else:
         logger.warning("No inference interface to shutdown. This should not happen.")
 
