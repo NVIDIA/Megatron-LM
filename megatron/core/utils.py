@@ -17,6 +17,7 @@ import threading
 import time
 import traceback
 import warnings
+from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,7 +26,22 @@ from importlib.metadata import version
 from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
+import numpy
 import torch
+
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+
+    HAVE_TORCH_SYMM_MEM = True
+except ImportError:
+    HAVE_TORCH_SYMM_MEM = False
+
+try:
+    import triton  # pylint: disable=unused-import
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
 
 from megatron.core import config
 from megatron.core.package_info import __version__ as mcore_version
@@ -57,6 +73,15 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn’t installed or the torch wrapper is missing
+    tex = None
 
 try:
     _torch_version = PkgVersion(torch.__version__)
@@ -65,6 +90,8 @@ except Exception:
     _torch_version = PkgVersion("0.0.0") if HAVE_PACKAGING else "0.0.0"
 _te_version = None
 _fa_version = None
+_mamba_ssm_version = None
+_causal_conv1d_version = None
 
 
 @contextmanager
@@ -388,6 +415,70 @@ def is_fa_min_version(version, check_equality=True):
     return get_fa_version() > PkgVersion(version)
 
 
+def get_mamba_version():
+    """Get mamba version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_mamba_version_str():
+        import mamba_ssm
+
+        if hasattr(mamba_ssm, "__version__"):
+            return str(mamba_ssm.__version__)
+        else:
+            return version("mamba_ssm")
+
+    global _mamba_ssm_version
+    if _mamba_ssm_version is None:
+        _mamba_ssm_version = PkgVersion(get_mamba_version_str())
+    return _mamba_ssm_version
+
+
+def is_mamba_min_version(version, check_equality=True):
+    """Check if minimum version of `mamba_ssm` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_mamba_version() >= PkgVersion(version)
+    return get_mamba_version() > PkgVersion(version)
+
+
+def get_causal_conv1d_version():
+    """Get causal_conv1d version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_causal_conv1d_version_str():
+        import causal_conv1d
+
+        if hasattr(causal_conv1d, "__version__"):
+            return str(causal_conv1d.__version__)
+        else:
+            return version("causal_conv1d")
+
+    global _causal_conv1d_version
+    if _causal_conv1d_version is None:
+        _causal_conv1d_version = PkgVersion(get_causal_conv1d_version_str())
+    return _causal_conv1d_version
+
+
+def is_causal_conv1d_min_version(version, check_equality=True):
+    """Check if minimum version of `causal_conv1d` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_causal_conv1d_version() >= PkgVersion(version)
+    return get_causal_conv1d_version() > PkgVersion(version)
+
+
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
@@ -416,6 +507,10 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
     # TODO(zijiey): remove this function later.
     if not torch.distributed.is_initialized():
         return None
+
+    # if parallel_state is not initialized, pass `tp_group` thru
+    if not parallel_state.is_initialized():
+        return tp_group
 
     if tp_group is None:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
@@ -462,6 +557,23 @@ def get_pg_rank(group=None):
     if not torch.distributed.is_initialized() or group is None:
         return 0
     return group.rank()
+
+
+def get_pg_src_rank(group=None):
+    """Calculate the global rank corresponding to the first local rank
+    in the given process group.
+
+    Args:
+        group: Process group to query. If None or distributed is not initialized,
+            returns 0.
+
+    Returns:
+        int: The first (source) global rank in the group.
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 0
+    ranks = torch.distributed.get_process_group_ranks(group)
+    return ranks[0]
 
 
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
@@ -537,6 +649,65 @@ class GlobalMemoryBuffer:
                 )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+
+class GlobalSymmetricMemoryBuffer:
+    """
+    Global symmetric memory buffer used in inference.
+    This buffer is used by mcore-inference's low-latency
+    NVLS all-gather and reduce-scatter collectives.
+    """
+
+    def __init__(self, size_in_mb, process_group):
+        if not HAVE_TORCH_SYMM_MEM or not HAVE_TRITON:
+            # This should be hit if the user is running an older
+            # version of torch, or if they do not have triton
+            # installed.
+            self.symm_buffer = None
+            self.symm_mem_hdl = None
+        else:
+            numel = int(size_in_mb * 1024 * 1024)  # size in bytes
+            try:
+                symm_mem.enable_symm_mem_for_group(process_group.group_name)
+                self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
+                self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
+            except RuntimeError as e:
+                # If symmetric memory initialization fails, set buffer and handle to None
+                # This should happen if the process group is not contained within NVlink
+                self.symm_buffer = None
+                self.symm_mem_hdl = None
+
+    def _can_allocate(self, numel, dtype) -> bool:
+        """
+        Returns whether enough symmetric memory is available
+        for the given tensor shape and dtype.
+        """
+        if self.symm_mem_hdl is None:
+            return False
+        size_of_dtype = torch.tensor([], dtype=dtype).element_size()
+        required_len = numel * size_of_dtype
+        return required_len <= self.symm_buffer.numel()
+
+    def _allocate(self, numel, dtype) -> torch.Tensor:
+        """
+        Allocates a sub-tensor from the self.symm_buffer for the given numel and dtype"""
+        required_bytes = numel * torch.tensor([], dtype=dtype).element_size()
+        return self.symm_buffer[0:required_bytes].view(dtype).view(numel)
+
+    def maybe_get_tensor(self, tensor_shape, dtype):
+        """
+        Returns (potentially) a sub-tensor from the self.symm_buffer for the given shape.
+        If enough symmetric memory is not available, returns None.
+        """
+        if self.symm_mem_hdl is None:
+            return {"tensor": None, "handle": None}
+        numel = reduce(operator.mul, tensor_shape, 1)
+        if not self._can_allocate(numel, dtype):
+            return {"tensor": None, "handle": None}
+        return {
+            "tensor": self._allocate(numel, dtype).view(*tensor_shape),
+            "handle": self.symm_mem_hdl,
+        }
 
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
@@ -793,15 +964,37 @@ def make_tp_sharded_tensor_for_checkpoint(
     is sharded across TP group.
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
+
+    Args:
+        tensor: Tensor to shard
+        key: Key for the sharded tensor
+        tp_axis: Axis to shard across tensor parallel group (default: 0)
+        replica_id: Replica ID for the tensor (default: None)
+        prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
+        **kwargs: Additional arguments. May include:
+            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
+            - dp_cp_group: Data parallel + context parallel group
+              (default: None, falls back to parallel_state)
     """
+    # Pop group parameters from kwargs
+    tp_group = kwargs.pop('tp_group', None)
+    dp_cp_group = kwargs.pop('dp_cp_group', None)
+
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
-    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+    # Get groups with fallback to parallel_state
+    if tp_group is None and dp_cp_group is None:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+    # Use local get_pg_rank and get_pg_size functions
+    tp_rank = get_pg_rank(tp_group)
+    dp_rank = get_pg_rank(dp_cp_group)
+    tp_size = get_pg_size(tp_group)
+    dp_size = get_pg_size(dp_cp_group)
+    dp_replica_id = get_pg_rank(dp_cp_group)
 
     new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
 
@@ -837,14 +1030,34 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     """Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group).
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
+
+    Keyword Args:
+        tensor: Tensor to create sharded tensor for
+        key: Key for the sharded tensor
+        prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
+        replica_id: Replica ID for the tensor (default: None)
+        **kwargs: Additional arguments. May include:
+            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
+            - dp_cp_group: Data parallel + context parallel group
+              (default: None, falls back to parallel_state)
     """
+    # Pop group parameters from kwargs
+    tp_group = kwargs.pop('tp_group', None)
+    dp_cp_group = kwargs.pop('dp_cp_group', None)
 
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
-    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+    # Get groups with fallback to parallel_state
+    if tp_group is None and dp_cp_group is None:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+    # Use local get_pg_rank and get_pg_size functions
+    dp_rank = get_pg_rank(dp_cp_group)
+    dp_size = get_pg_size(dp_cp_group)
+    dp_replica_id = get_pg_rank(dp_cp_group)
 
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
         # FSDP2 sharding
@@ -853,7 +1066,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
-        replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
+        replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
 
     return ShardedTensor.from_rank_offsets(
         key,
@@ -1813,9 +2026,17 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
-def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
+def get_batch_on_this_cp_rank(
+    batch: Dict[str, Any], cp_group: Optional[torch.distributed.ProcessGroup] = None
+):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
+
+    Args:
+        batch (Dict[str, Any]): Input batch tensors.
+        cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel process group.
+            If provided, uses this group's size and rank. Otherwise, falls back to
+            the current context-parallel settings from parallel_state.
     """
 
     # With causal masking, each token only attends to its prior tokens. Simply split
@@ -1824,12 +2045,18 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
     # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
-    cp_size = parallel_state.get_context_parallel_world_size()
-    if cp_size > 1:
+    # Determine CP topology either from provided group or from current context parallel state
+    if cp_group is not None:
+        cp_size = get_pg_size(cp_group)
+        cp_rank = get_pg_rank(cp_group)
+    else:
+        cp_size = parallel_state.get_context_parallel_world_size()
         cp_rank = parallel_state.get_context_parallel_rank()
+
+    if cp_size > 1:
         for key, val in batch.items():
             if val is not None:
-                seq_dim = 1 if key != "attention_mask" else 2
+                seq_dim = 1 if key != 'attention_mask' else 2
                 val = val.view(
                     *val.shape[0:seq_dim],
                     2 * cp_size,
@@ -1844,6 +2071,100 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
                 batch[key] = val
 
     return batch
+
+
+def get_thd_batch_on_this_cp_rank(
+    batch: Dict[str, Any],
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
+):
+    """Slice each sub-sample in a packed sample batch input along
+    sequence dimension into multiple chunks, which are parallelized
+    across GPUs in a context parallel group.
+    """
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=int(max_seqlen[0].item()),
+        max_seqlen_kv=int(max_seqlen[0].item()),
+    )
+
+    cp_size = get_context_parallel_world_size() if cp_size is None else cp_size
+    cp_rank = get_context_parallel_rank() if cp_rank is None else cp_rank
+    if cp_size > 1:  # slice batch along sequence dimension for context parallelism
+        assert tex is not None and is_te_min_version("1.10.0"), (
+            "Please update Transformer Engine to >= 1.10 to use "
+            "Context Parallel with THD format data"
+        )
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
+        )
+        for key, data in batch.items():
+            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
+                continue
+            batch[key] = data.index_select(1, index)
+
+    return batch, packed_seq_params
+
+
+################################
+### hybrid context parallel ###
+################################
+
+
+def get_batch_on_this_hybrid_cp_rank(
+    batch: Dict[str, Any],
+    local_cp_size: int,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Slice batch input along sequence dimension into multiple chunks,
+    which are parallelized across GPUs in a context parallel group.
+    """
+    assert local_cp_size is not None
+    if cp_group is None:
+        # Get the local cp group required for as defined by the HybridCPDataLoaderWrapper
+        if local_cp_size > 1:
+            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(
+                group_size=local_cp_size
+            )
+    else:
+        # If cp group is provided, it must match the local cp size
+        # as defined by the HybridCPDataLoaderWrapper
+        assert cp_group.size() == local_cp_size
+
+    # Convert [seqlen] to [1, seqlen] similar to default collate_fn
+    # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
+    for key, data in batch.items():
+        if key in ['attention_mask']:
+            continue
+        batch[key] = torch.stack([data], 0)
+    sample_length = batch['tokens'].shape[1]
+    # TODO(pmannan): Take care of padding tokens here if not divisible by cp_size*2
+    # Create packed_seq_params for SBHD format with cp group information.
+    packed_seq_params = PackedSeqParams(
+        qkv_format="sbhd",
+        cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        cu_seqlens_kv=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        cu_seqlens_q_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        cu_seqlens_kv_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        max_seqlen_q=sample_length,
+        max_seqlen_kv=sample_length,
+        local_cp_size=local_cp_size,
+        cp_group=cp_group,
+    )
+
+    if cp_group is not None and cp_group.size() > 1:
+        # When using hybrid_context_parallel, each sub-sample of a packed sample is
+        # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
+        batch = get_batch_on_this_cp_rank(batch, cp_group=cp_group)
+
+    return batch, packed_seq_params
 
 
 ######################
@@ -2001,12 +2322,253 @@ def unwrap_model(model, module_instances=None):
     return unwrapped_model
 
 
+_ASYNC_IO_LOOP: asyncio.AbstractEventLoop | None = None
+
+
 def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
     """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
+    global _ASYNC_IO_LOOP
     if loop is None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError as e:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            if _ASYNC_IO_LOOP is not None:
+                return _ASYNC_IO_LOOP
+            else:
+                _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
     return loop
+
+
+def is_using_quantization_scales(config):
+    """Returns whether the model is using quantization scales based on the config."""
+    return getattr(config, "fp8", False) or getattr(config, "fp4", False)
+
+
+_ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
+
+
+def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = False):
+    """Decorator to be applied to every coroutine that runs in a separate task.
+
+    This is needed because asyncio tasks do not propagate exceptions.
+    Coroutines running inside separate tasks will fail silently if not decorated.
+
+    Passing in `verbose=True` will print additional lifetime logging information about the task.
+    Such functionality is relied on by some users, and can be enabled as shown below:
+    ```
+        @trace_async_exceptions(verbose=True)
+        async def my_coroutine(...):
+            ...
+    ```
+    """
+
+    def _log_verbose(name: str, start: float) -> None:
+        elapsed = (time.perf_counter() - start) * 1000.0
+        cnt, tot = _ASYNC_TASK_STATS[name]
+        _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
+        avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
+
+        log10 = numpy.log10(max(cnt, 1))
+        if numpy.isclose(log10, round(log10)):
+            logger.info(
+                f"{name} completed in {elapsed:.3f} ms, "
+                f"lifetime avg: {avg:.3f} ms, "
+                f"lifetime cnt: {cnt + 1}"
+            )
+
+    def _decorate(fn: Callable):
+        if asyncio.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                if verbose:
+                    start = time.perf_counter()
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"Exception in async function {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
+
+        elif inspect.isasyncgenfunction(fn):
+
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                if verbose:
+                    start = time.perf_counter()
+                agen = fn(*args, **kwargs)
+                try:
+                    async for item in agen:
+                        yield item
+                except Exception as e:
+                    logger.error(f"Exception in async generator {fn.__name__}: {e}")
+                    traceback.print_exc()
+                    sys.exit(1)
+                finally:
+                    if verbose:
+                        _log_verbose(fn.__qualname__, start)
+
+        else:
+            raise TypeError("trace_async_exceptions must be used on async functions or generators")
+        return wrapper
+
+    return _decorate if func is None else _decorate(func)
+
+
+def get_mamba_inference_state_config_from_model(model) -> Optional["MambaInferenceStateConfig"]:
+    """Returns Mamba inference state config from the model if it is a hybrid model."""
+    from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+        MambaInferenceStateConfig,
+    )
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+        return MambaInferenceStateConfig(
+            layer_type_list=layer_type_list,
+            mamba_conv_states_shape=mamba_conv_states_shape,
+            mamba_ssm_states_shape=mamba_ssm_states_shape,
+        )
+    return None
+
+
+# ============================================================================
+# Backward Compatibility Decorators
+# ============================================================================
+
+
+def deprecated(
+    version: str,
+    removal_version: Optional[str] = None,
+    alternative: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Callable:
+    """
+    Mark a function as deprecated.
+
+    This decorator:
+    1. Adds deprecation metadata to the function
+    2. Issues a DeprecationWarning when the function is called
+    3. Allows the compatibility checker to track deprecation lifecycle
+
+    Args:
+        version: Version where deprecation starts (e.g., "1.0.0")
+        removal_version: Version where function will be removed (e.g., "2.0.0")
+        alternative: Name of the recommended replacement function
+        reason: Optional explanation for the deprecation
+
+    Returns:
+        Decorator function
+
+    Example:
+        @deprecated(
+            version="1.0.0",
+            removal_version="2.0.0",
+            alternative="new_train_model",
+            reason="Improved performance and cleaner API"
+        )
+        def old_train_model(config):
+            pass
+    """
+
+    def decorator(func: Callable) -> Callable:
+        # Add metadata
+        func._deprecated = True
+        func._deprecated_version = version
+        func._removal_version = removal_version
+        func._alternative = alternative
+        func._deprecation_reason = reason
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Build warning message
+            msg_parts = [f"{func.__name__} is deprecated since version {version}."]
+
+            if alternative:
+                msg_parts.append(f"Use {alternative} instead.")
+
+            if removal_version:
+                msg_parts.append(f"Will be removed in version {removal_version}.")
+
+            if reason:
+                msg_parts.append(f"Reason: {reason}")
+
+            warnings.warn(" ".join(msg_parts), DeprecationWarning, stacklevel=2)
+
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def internal_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as internal API (not for external use).
+
+    Use this decorator for:
+    - Internal APIs not intended for public consumption
+    - Experimental features that may change without notice
+    - Implementation details that are not part of the stable API
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks.
+
+    Args:
+        func: The function or class to mark as internal
+
+    Returns:
+        The original function/class with an internal API marker
+
+    Example:
+        @internal_api
+        def _internal_helper():
+            '''For internal use only'''
+            pass
+
+        @internal_api
+        class ExperimentalFeature:
+            '''This API may change without notice'''
+            pass
+    """
+    func._internal_api = True
+    return func
+
+
+def experimental_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as experimental API.
+
+    Use this decorator for:
+    - Experimental features that may change without notice
+    - New APIs under active development
+    - Features that are not yet stable
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks, allowing rapid iteration during development.
+
+    Args:
+        func: The function or class to mark as experimental
+
+    Returns:
+        The original function/class with an experimental API marker
+
+    Example:
+        @experimental_api
+        def new_experimental_feature():
+            '''This API is experimental and may change'''
+            pass
+
+        @experimental_api
+        class ExperimentalModel:
+            '''This model is under active development'''
+            pass
+    """
+    func._experimental_api = True
+    return func

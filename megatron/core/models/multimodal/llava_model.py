@@ -124,6 +124,7 @@ class LLaVAModel(MegatronModule):
         max_num_tiles: int = 0,
         tokenizer_type: str = "",
         vp_stage: Optional[int] = None,
+        use_vision_backbone_fp8_arch: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -295,7 +296,7 @@ class LLaVAModel(MegatronModule):
                     ln_post_impl = None
                     use_mask_token = False
 
-                if vision_transformer_config.fp8:
+                if vision_transformer_config.fp8 or use_vision_backbone_fp8_arch:
                     # FP8 padding for final sequence length to be a multiple of 16 or 32.
                     class_token_len = 32 if vision_transformer_config.fp8_recipe == "mxfp8" else 16
 
@@ -923,27 +924,16 @@ class LLaVAModel(MegatronModule):
                 )
             )
 
-        if isinstance(self.language_model, MambaModel):
-            output = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                attention_mask=attention_mask,
-                decoder_input=combined_embeddings,
-                labels=new_labels,
-                inference_context=inference_context,
-                runtime_gather_output=runtime_gather_output,
-            )
-        else:
-            output = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                attention_mask=attention_mask,
-                decoder_input=combined_embeddings,
-                labels=new_labels,
-                inference_context=inference_context,
-                runtime_gather_output=runtime_gather_output,
-                packed_seq_params=packed_seq_params,
-            )
+        output = self.language_model(
+            input_ids=None,
+            position_ids=None,
+            attention_mask=attention_mask,
+            decoder_input=combined_embeddings,
+            labels=new_labels,
+            inference_context=inference_context,
+            runtime_gather_output=runtime_gather_output,
+            packed_seq_params=packed_seq_params,
+        )
 
         return output, new_loss_mask
 

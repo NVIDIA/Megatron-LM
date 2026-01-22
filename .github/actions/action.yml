@@ -45,6 +45,9 @@ inputs:
   PAT:
     description: "GitHub Personal Access Token"
     required: true
+  is_ci_workload:
+    description: "Is CI workload"
+    required: true
 
 runs:
   using: "composite"
@@ -77,6 +80,7 @@ runs:
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
+        export NCCL_DEBUG=INFO
         pip install --no-cache-dir uv
         uv sync --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
@@ -114,6 +118,18 @@ runs:
         HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
         echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
+    - name: Has Run functional tests label
+      shell: bash -x -e -u -o pipefail {0}
+      id: has-run-functional-tests-label
+      env:
+        GH_TOKEN: ${{ github.token }}
+        IS_CI_WORKLOAD: ${{ inputs.is_ci_workload }}
+      run: |
+        PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+        HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "$IS_CI_WORKLOAD"
+        HAS_RUN_FUNCTIONAL_TESTS_LABEL=${HAS_RUN_FUNCTIONAL_TESTS_LABEL:-$IS_CI_WORKLOAD}
+        echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
+
     - name: Create run-script (e2e test)
       shell: bash -x -e -u -o pipefail {0}
       if: inputs.is_unit_test == 'false'
@@ -126,16 +142,19 @@ runs:
         set -euxo pipefail
 
         if [ "${{ steps.has-run-tests-label.outputs.main }}" == "true" ]; then
-            ARGS=(
-              --scope mr-github
-              --enable-lightweight-mode
-            )
-          else
-            ARGS=(
-              --scope mr-slim
-              --enable-lightweight-mode
-            )
-          fi
+          ARGS=(
+            --scope mr-github
+            --enable-lightweight-mode
+          )
+        elif [ "${{ steps.has-run-functional-tests-label.outputs.main }}" == "true" ]; then
+          ARGS=(
+            --scope mr-github
+          )
+        else
+          ARGS=(
+            --scope mr-github-slim
+          )
+        fi
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)

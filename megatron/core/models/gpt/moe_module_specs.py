@@ -2,20 +2,12 @@
 
 from typing import Optional
 
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
-
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
 
 
 def get_moe_module_spec(
@@ -65,10 +57,12 @@ def get_moe_module_spec_for_backend(
     experts = ModuleSpec(module=expert_module, submodules=expert_submodule)
 
     # shared experts spec
-    shared_experts = ModuleSpec(module=SharedExpertMLP, params={"gate": False}, submodules=mlp)
+    shared_experts = ModuleSpec(module=SharedExpertMLP, submodules=mlp)
 
     # MoE module spec
     moe_module_spec = ModuleSpec(
-        module=MoELayer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
+        module=MoELayer,
+        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
+        metainfo={"fuse_pre_mlp_layernorm": False},
     )
     return moe_module_spec

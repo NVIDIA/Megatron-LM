@@ -8,6 +8,9 @@ ulimit -Sn $(ulimit -Hn)
 # Increase soft limit for number of processes to match hard limit
 ulimit -Su $(ulimit -Hu)
 
+# Set umask to 0002 to allow group read/write permissions
+umask 0002
+
 set +x
 for ARGUMENT in "$@"; do
     # Split on first = only, preserving any subsequent = signs in the value
@@ -51,6 +54,8 @@ set -exo pipefail
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
+ENABLE_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
+    /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')
 MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.MODE // "pretraining"')
 
@@ -67,6 +72,7 @@ mkdir -p $CHECKPOINT_SAVE_PATH
 mkdir -p $CHECKPOINT_LOAD_PATH || true
 _CHECKPOINT_LOAD_PATH=$CHECKPOINT_LOAD_PATH
 _CHECKPOINT_SAVE_PATH=$CHECKPOINT_SAVE_PATH
+_TENSORBOARD_PATH=$TENSORBOARD_PATH
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
@@ -125,10 +131,16 @@ SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH |
 export RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
 
 for i in $(seq 1 $N_REPEAT); do
+    # Move TB logs into a repeat-specific directory
+    DIR=$(dirname "$_TENSORBOARD_PATH")
+    FILE=$(basename "$_TENSORBOARD_PATH")
+    export TENSORBOARD_PATH=$DIR/$i/$FILE
+    mkdir -p $(dirname $TENSORBOARD_PATH)
+
     if [[ $i -gt 1 ]]; then
-        rm -rf $CHECKPOINT_SAVE_PATH/*
-        rm -rf /tmp/checkpoints/*
-        rm -rf $TENSORBOARD_PATH/*
+        rm -rf $CHECKPOINT_SAVE_PATH/* || true
+        rm -rf /tmp/checkpoints/* || true   
+        rm -rf $TENSORBOARD_PATH/* || true
     fi
 
     # First run never loads from a checkpoint
@@ -195,15 +207,18 @@ for i in $(seq 1 $N_REPEAT); do
         echo "No frozen checkpoint found. Will skip second run."
 
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
-        rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+        if [[ $NODE_RANK -eq 0 ]]; then
+            rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+        fi
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
         break
     fi
 
     if [[ "$TEST_TYPE" == "ckpt-resume" && "$TRAINING_EXIT_CODE" -eq 0 ]]; then
         export CHECKPOINT_LOAD_PATH=$CHECKPOINT_SAVE_PATH
-
-        rm -rf "$CHECKPOINT_LOAD_PATH/iter_$(printf "%07d\n" "$TRAIN_ITERS")"
+        if [[ $NODE_RANK -eq 0 ]]; then
+            rm -rf "$CHECKPOINT_LOAD_PATH/iter_$(printf "%07d\n" "$TRAIN_ITERS")"
+        fi
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_LOAD_PATH/latest_checkpointed_iteration.txt
 
         export RUN_NUMBER=2
@@ -220,7 +235,9 @@ for i in $(seq 1 $N_REPEAT); do
         bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh || TRAINING_EXIT_CODE=$?
 
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
-        rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+        if [[ $NODE_RANK -eq 0 ]]; then
+            rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+        fi
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
     fi
 
@@ -309,6 +326,24 @@ for i in $(seq 1 $N_REPEAT); do
                 uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
                     --golden-values-path $GOLDEN_VALUES_PATH \
                     --test-values-path $TENSORBOARD_PATH \
+                    --model-config-path ${TRAINING_PARAMS_PATH} \
+                    $ALLOW_NONDETERMINISTIC_ALGO_ARG
+            fi
+        fi
+
+        # For rl jobs
+        if [[ "$MODE" == "rl" && ("$TRAINING_EXIT_CODE" -eq 0 || "$TEST_TYPE" == "release") ]]; then
+            if [[ "$TEST_TYPE" == "frozen-start" ]]; then
+                TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+                    /usr/local/bin/yq '.MODEL_ARGS."--exit-interval" // "50"')
+                uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+                    --logs-dir $TENSORBOARD_PATH \
+                    --train-iters $TRAIN_ITERS \
+                    --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+                    "${EXTRACT_ARGS[@]}"
+                uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_grpo_training_loop.py \
+                    --golden-values-path $GOLDEN_VALUES_PATH \
+                    --test-values-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                     --model-config-path ${TRAINING_PARAMS_PATH} \
                     $ALLOW_NONDETERMINISTIC_ALGO_ARG
             fi

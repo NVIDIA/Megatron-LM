@@ -13,60 +13,90 @@ class BlockAllocator:
     - Initializing a pool of block IDs
     - Allocating blocks from the pool
     - Releasing blocks back to the pool
-    - Managing the guaranteed block count for active requests
 
     Args:
-        block_count_total (int): Total number of blocks available in the buffer.
-        gtd_block_count (int): Number of blocks reserved for guaranteed requests.
+        context (DynamicInferenceContext): Dynamic inference context.
+        total_count (int): Total number of blocks in the buffer.
+        paused_count (int): Number of paused blocks in the buffer. Must be less
+            than `total_count`.
     """
 
-    def __init__(self, block_count_total: int, gtd_block_count: int):
-        self.block_count_total = block_count_total
-        self.gtd_block_count = gtd_block_count
+    def __init__(self, context: "DynamicInferenceContext", total_count: int, paused_count: int):
 
-        # Reserve last block ID as dummy block for decode-only inference steps
-        self.block_count_avail = self.block_count_total - 1
-        self.dummy_block_idx = self.block_count_total - 1
+        self.context = context
+
+        self.total_count = total_count
+        self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
+        self.paused_count = paused_count
+        self.active_count = total_count - paused_count - 1  # -1 for dummy_block_idx
+        assert self.active_count >= 1  # ensures paused_count < total_count - 1
+        self.dummy_block_idx = self.total_count - 1
 
         # Initialize block pool as a "stack" data structure
         self.block_bag = torch.arange(
-            self.block_count_total, dtype=torch.int32, device=torch.cuda.current_device()
+            self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
-    def is_memory_available(self, num_blocks: int, safe: bool = False) -> bool:
-        """Check if memory blocks are available.
+    def __str__(self):
+        return (
+            f"using: total {self.get_total_used()}/{self.total_count - 1}"
+            f"; active {self.get_active_used()}/{self.active_count}"
+            f"; paused {self.get_paused_used()}/{self.paused_count}"
+        )
 
-        Use 'safe' to avoid all requests being deadlocked. A fraction of the KV cache
-        memory buffer is reserved to guarantee that a minimum number of active
-        requests can run on any given step.
+    def get_total_used(self):
+        """Compute number of total blocks used."""
+        return self.total_count - self.total_avail - 1
+
+    def get_active_used(self):
+        """Compute number of active blocks used."""
+        return (
+            self.context.request_kv_block_counts[
+                self.context.paused_request_count : self.context.total_request_count
+            ]
+            .sum()
+            .item()
+        )
+
+    def get_paused_used(self):
+        """Compute number of paused blocks used."""
+        return (
+            self.context.request_kv_block_counts[: self.context.paused_request_count].sum().item()
+        )
+
+    def get_active_avail(self):
+        """Compute number of active blocks available."""
+        return self.active_count - self.get_active_used()
+
+    def get_paused_avail(self):
+        """Compute number of paused blocks available."""
+        return self.paused_count - self.get_paused_used()
+
+    def is_memory_available(self, num_blocks: int) -> bool:
+        """Check if memory blocks are available.
 
         Args:
             num_blocks (int): Number of blocks to check.
-            safe (bool): Include extra space for guaranteeing ability to run
-                requests to completion.
 
         Return:
             (bool) Is memory available?
         """
-        if safe:
-            return self.block_count_avail >= num_blocks + self.gtd_block_count
-        else:
-            return self.block_count_avail >= num_blocks
+        return self.total_avail >= num_blocks
 
-    def allocate_memory_blocks(self, num_blocks: int = 1, safe: bool = False) -> Optional[Tensor]:
+    def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
         """Allocate memory blocks if available, else return None.
 
         Args:
             num_blocks (int): Number of blocks to allocate.
-            safe (bool): Include extra space for guaranteeing ability to run
-                requests to completion.
 
         Return:
             (Optional[Tensor]) Allocated block IDs.
         """
-        if self.is_memory_available(num_blocks, safe):
-            self.block_count_avail -= num_blocks
-            return self.block_bag[self.block_count_avail : (self.block_count_avail + num_blocks)]
+        if self.is_memory_available(num_blocks):
+            self.total_avail -= num_blocks
+            block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
+            assert num_blocks == block_ids.numel()
+            return block_ids
         else:
             return None
 
@@ -80,8 +110,8 @@ class BlockAllocator:
             None
         """
         num_blocks = blocks.size(dim=0)
-        self.block_bag[self.block_count_avail : (self.block_count_avail + num_blocks)] = blocks
-        self.block_count_avail += num_blocks
+        self.block_bag[self.total_avail : (self.total_avail + num_blocks)] = blocks
+        self.total_avail += num_blocks
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -89,4 +119,17 @@ class BlockAllocator:
         This resets the available block count to the entire memory pool
         (except for the dummy block).
         """
-        self.block_count_avail = self.block_count_total - 1
+
+        # Reset block bag to so we start consuming from the beginning of the pool
+        # for UVM performance.
+        # *Note*: Resetting the block bag is essential because if engine has been
+        # suspended, then the block bag contains non-unique IDs since the
+        # right-most IDs have been 'popped' off and are owned by the context.
+        # Without resetting the block bag, context request memory will clash and
+        # requests will point to each other's memory blocks, resulting in faulty
+        # generations.
+        self.block_bag = torch.arange(
+            self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+
+        self.total_avail = self.total_count - 1

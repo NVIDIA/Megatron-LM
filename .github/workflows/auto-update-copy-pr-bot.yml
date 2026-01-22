@@ -3,15 +3,19 @@ name: Auto Update Copy PR Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: '0 0 * * *'
 
 jobs:
   auto-update-copy-pr-bot:
     runs-on: ubuntu-latest
     environment: nemo-ci
+    if: github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.PAT }}
+          ref: main
 
       - name: Fetch list of members in mcore-reviewers team
         shell: bash -euxo pipefail {0}
@@ -47,8 +51,10 @@ jobs:
           mv .github/copy-pr-bot.yaml.new .github/copy-pr-bot.yaml
 
       - name: Commit changes
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/NVIDIA/Megatron-LM.git
+          git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/NVIDIA/Megatron-LM.git
           git config --global user.name "GitHub Actions"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add .github/copy-pr-bot.yaml
@@ -57,4 +63,4 @@ jobs:
             exit 0
           fi
           git commit -m "Update copy-pr-bot.yaml [skip ci]"
-          git push
+          git push -u origin main

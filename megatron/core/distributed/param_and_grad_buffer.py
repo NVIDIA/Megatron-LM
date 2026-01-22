@@ -17,7 +17,12 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
-from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
+from ..fp8_utils import (
+    is_float8tensor,
+    is_mxfp8tensor,
+    modify_underlying_storage,
+    post_all_gather_processing,
+)
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
@@ -137,9 +142,7 @@ class _ParamAndGradBucketGroup:
             self.data_parallel_group = collective_group
 
         # State for bookkeeping: params is the set of parameters this bucket group is
-        # responsible for, params_with_grad is the set of parameters with grads
-        # available. When overlap_grad_reduce is True, communication (all-reduce
-        # or reduce-scatter) is issued when params_with_grad equals params.
+        # responsible for, param_to_bucket maps params to the corresponding bucket.
         self.param_to_bucket = {}
         self.params = set()
         for bucket in self.buckets:
@@ -160,7 +163,22 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
             dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
 
-        self.reset()
+        # per_param_grad_ready_counts is a dict mapping parameters to number of times
+        # `register_grad_ready` is called for that parameter *when
+        # self.is_last_microbatch is True*. Should be 1 for most params but could be greater
+        # than 1 if control flow passes through the same parameter multiple times. We lazily
+        # populate this in the first batch, hence the .is_first_batch attribute.
+        # When overlap_grad_reduce is True, communication (all-reduce or reduce-scatter)
+        # is issued when per_param_grad_ready_counts equals golden_per_param_grad_ready_counts.
+        # In other words, communication is dispatched as soon as all gradients in this bucket
+        # are *ready*, as marked by the backward hook.
+        # The set of keys in per_param_grad_ready_counts should be equal to `params`.
+        self.golden_per_param_grad_ready_counts = {}
+        self.per_param_grad_ready_counts = {}
+        self.is_last_microbatch = True
+        self.is_first_batch = True
+
+        # Other metadata to keep track of collectives.
         self.param_gather_handle = None
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
@@ -177,7 +195,12 @@ class _ParamAndGradBucketGroup:
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
         """
-        self.params_with_grad = set()
+        if self.is_first_batch and len(self.per_param_grad_ready_counts) > 0:
+            # Record golden per_param_grad_ready_counts.
+            assert len(self.per_param_grad_ready_counts) == len(self.params)
+            self.golden_per_param_grad_ready_counts = self.per_param_grad_ready_counts
+            self.is_first_batch = False
+        self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
 
     def check_grads(self, check_for_nan_or_inf, check_for_large):
@@ -311,10 +334,7 @@ class _ParamAndGradBucketGroup:
             # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
             # we need to copy the param_data from the shared_param/grad_buffer to param.data
             # after the param all-gather.
-            if (
-                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                and self.ddp_config.overlap_param_gather
-            ):
+            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 for bucket in self.buckets:
                     for param in bucket.params:
                         param_start, param_end = bucket.param_to_index[param]
@@ -326,6 +346,14 @@ class _ParamAndGradBucketGroup:
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
+            else:
+                fp8_params = []
+                for bucket in self.buckets:
+                    for param in bucket.params:
+                        if is_float8tensor(param):
+                            fp8_params.append(param)
+                if len(fp8_params) > 0:
+                    post_all_gather_processing(fp8_params)
 
     def start_grad_sync(self):
         """
@@ -336,6 +364,11 @@ class _ParamAndGradBucketGroup:
         communication call. When ddp_config.overlap_grad_reduce is set to False, makes
         synchronous call.
         """
+        if self.is_first_batch and self.grad_reduce_handle is not None:
+            # Make this start_grad_sync call a no-op if in first batch and collective has
+            # already been dispatched.
+            return
+
         assert (
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
@@ -475,6 +508,11 @@ class _ParamAndGradBucketGroup:
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
             return
+        # If first batch, start asynchronous communication here. register_grad_ready() launches
+        # asynchronous communication only once self.golden_per_param_grad_ready_counts is
+        # populated at the end of this first batch.
+        if self.is_first_batch:
+            self.start_grad_sync()
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
@@ -482,7 +520,8 @@ class _ParamAndGradBucketGroup:
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
-            f"({len(self.params_with_grad)}/{len(self.params)} params have grad available)"
+            f"({len(self.per_param_grad_ready_counts)}/{len(self.params)} "
+            "params have grad available)"
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
@@ -500,11 +539,14 @@ class _ParamAndGradBucketGroup:
         ), "register_grad_ready() should only be called when overlap_grad_reduce is True"
         if self.is_last_microbatch:
             assert param in self.param_to_bucket, "Param is not in the bucket group"
-            assert param not in self.params_with_grad, "Cannot set grad twice"
-            self.params_with_grad.add(param)
+            if param not in self.per_param_grad_ready_counts:
+                self.per_param_grad_ready_counts[param] = 0
+            self.per_param_grad_ready_counts[param] += 1
             # If all params in bucket group have grads available, issue communication call.
-            if len(self.params_with_grad) == len(self.params):
-                self.start_grad_sync()
+            if not self.is_first_batch:
+                if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
+                    assert len(self.per_param_grad_ready_counts) == len(self.params)
+                    self.start_grad_sync()
 
 
 class _ParamAndGradBuffer:
