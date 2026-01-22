@@ -1,0 +1,39 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Sync GitHub Teams to Slack User Groups
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync-usergroups:
+    environment: main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Sync Teams to User Groups
+        env:
+          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+          SLACK_TOKEN: ${{ secrets.ONCALL_SLACK_TOKEN }}
+        run: |
+          pip install --no-cache-dir uv
+          uv run --with slack-sdk python .github/scripts/sync_team_usergroups.py
