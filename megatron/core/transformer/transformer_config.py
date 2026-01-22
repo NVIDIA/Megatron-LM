@@ -1676,59 +1676,55 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
             if self.cuda_graph_impl == "local":
-                # local impl doesn't currently distinguish between moe_preproocess or moe_router
-                # so just set both if either is specified.
-                if (
-                    CudaGraphScope.moe_router in self.cuda_graph_scope
-                    or CudaGraphScope.moe_preprocess in self.cuda_graph_scope
-                ):
-                    if CudaGraphScope.moe_router not in self.cuda_graph_scope:
-                        self.cuda_graph_scope.append(CudaGraphScope.moe_router)
-                    if CudaGraphScope.moe_preprocess not in self.cuda_graph_scope:
-                        self.cuda_graph_scope.append(CudaGraphScope.moe_preprocess)
+                assert not self.cuda_graph_scope or self.cuda_graph_scope == [
+                    CudaGraphScope.full_iteration
+                ], (
+                    "For local cuda graph implementation, the only valid value for "
+                    "cuda_graph_scope is full_iteration, or an empty list to denote layerwise "
+                    "graphs. To use other scopes, use cuda_graph_impl=transformer_engine."
+                )
 
-            # Check cuda graph scopes
             if self.cuda_graph_impl == "transformer_engine":
                 assert CudaGraphScope.full_iteration not in self.cuda_graph_scope, (
                     "To use full iteration cuda graph, please use "
                     "cuda_graph_impl=local instead of cuda_graph_impl=transformer_engine."
                 )
-            assert (
-                CudaGraphScope.moe not in self.cuda_graph_scope
-                or CudaGraphScope.moe_router not in self.cuda_graph_scope
-            ), 'cuda_graph_scope must not contain both moe and moe_router.'
-            if CudaGraphScope.moe_preprocess in self.cuda_graph_scope:
-                assert (
-                    CudaGraphScope.moe_router in self.cuda_graph_scope
-                ), 'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
-            if self.num_moe_experts is None or self.num_moe_experts <= 1:
                 assert (
                     CudaGraphScope.moe not in self.cuda_graph_scope
-                    and CudaGraphScope.moe_router not in self.cuda_graph_scope
-                ), 'moe cuda graph is only supported for MoE.'
-            else:
-                if self.moe_layer_freq == 1 or (
-                    isinstance(self.moe_layer_freq, list) and 0 not in self.moe_layer_freq
-                ):
-                    assert CudaGraphScope.mlp not in self.cuda_graph_scope, (
-                        'mlp cuda graph is only supported for dense layers, '
-                        'but not found in the model.'
-                    )
-                if (
-                    self.moe_expert_capacity_factor is None
-                    or not self.moe_pad_expert_input_to_capacity
-                ):
+                    or CudaGraphScope.moe_router not in self.cuda_graph_scope
+                ), 'cuda_graph_scope must not contain both moe and moe_router.'
+                if CudaGraphScope.moe_preprocess in self.cuda_graph_scope:
+                    assert (
+                        CudaGraphScope.moe_router in self.cuda_graph_scope
+                    ), 'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
+                if self.num_moe_experts is None or self.num_moe_experts <= 1:
                     assert (
                         CudaGraphScope.moe not in self.cuda_graph_scope
-                    ), 'moe cuda graph is only supported with drop-padding MoE.'
-                    if self.moe_token_dispatcher_type == 'alltoall' and (
-                        self.moe_expert_capacity_factor is not None
-                        or self.moe_router_padding_for_fp8
+                        and CudaGraphScope.moe_router not in self.cuda_graph_scope
+                    ), 'moe cuda graph is only supported for MoE.'
+                else:
+                    if self.moe_layer_freq == 1 or (
+                        isinstance(self.moe_layer_freq, list) and 0 not in self.moe_layer_freq
                     ):
-                        assert CudaGraphScope.moe_preprocess not in self.cuda_graph_scope, (
-                            'moe_preprocess cuda graph is not supported when there are '
-                            'DtoH copies and synchronizations in the preprocess step.'
+                        assert CudaGraphScope.mlp not in self.cuda_graph_scope, (
+                            'mlp cuda graph is only supported for dense layers, '
+                            'but not found in the model.'
                         )
+                    if (
+                        self.moe_expert_capacity_factor is None
+                        or not self.moe_pad_expert_input_to_capacity
+                    ):
+                        assert (
+                            CudaGraphScope.moe not in self.cuda_graph_scope
+                        ), 'moe cuda graph is only supported with drop-padding MoE.'
+                        if self.moe_token_dispatcher_type == 'alltoall' and (
+                            self.moe_expert_capacity_factor is not None
+                            or self.moe_router_padding_for_fp8
+                        ):
+                            assert CudaGraphScope.moe_preprocess not in self.cuda_graph_scope, (
+                                'moe_preprocess cuda graph is not supported when there are '
+                                'DtoH copies and synchronizations in the preprocess step.'
+                            )
 
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
@@ -1738,15 +1734,10 @@ class TransformerConfig(ModelParallelConfig):
                 else:
                     # The recompute module should be inside or outside of the graph scope.
                     # Recompute module coverring graph scope is not allowed.
-                    if (
-                        self.cuda_graph_impl == "transformer_engine"
-                        and "moe" in self.recompute_modules
-                    ):
+                    if "moe" in self.recompute_modules:
                         assert (
                             CudaGraphScope.moe_router not in self.cuda_graph_scope
-                        ), "moe recompute is not supported with moe_router CUDA graph with: "
-                        "--cuda-graph-impl transformer_engine."
-
+                        ), "moe recompute is not supported with moe_router CUDA graph."
                     # Graphed recompute module doesn't accept random number.
                     if (
                         not self.cuda_graph_scope
