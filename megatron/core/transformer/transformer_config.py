@@ -1873,7 +1873,12 @@ class TransformerConfig(ModelParallelConfig):
                     'CUDA graph scope on moe and mlp is not '
                     'supported with overlap_moe_expert_parallel_comm'
                 )
-                if self.delay_wgrad_compute and CudaGraphScope.attn in self.cuda_graph_scope:
+                wgrad_in_graph_scope = CudaGraphScope.attn in self.cuda_graph_scope or (
+                    CudaGraphScope.moe_router in self.cuda_graph_scope
+                    and self.moe_shared_expert_intermediate_size is not None
+                    and not self.moe_shared_expert_overlap
+                )
+                if self.delay_wgrad_compute and wgrad_in_graph_scope:
                     assert is_te_min_version(
                         "2.12.0"
                     ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
@@ -1884,7 +1889,7 @@ class TransformerConfig(ModelParallelConfig):
                     )
                     assert (
                         not self.add_bias_linear and not self.add_qkv_bias
-                    ), "CudaGraphScope.attn with delay_wgrad_compute doesn't support bias for now."
+                    ), "CUDA graph with delay_wgrad_compute doesn't support bias for now."
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
