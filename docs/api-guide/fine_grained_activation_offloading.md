@@ -28,4 +28,4 @@ Currently, the supported offloading modules are `"attn_norm", "core_attn", "attn
 - For other modules, use offloading to reduce memory footprint;
 - Make sure the offloading/reloading could be overlapped with computing;
 
-![Fine-grained Activation Offloading and Fine-grained Recomputation](../images/fine_grained_activation_offloading/offloading_and_recomputing.png)
+![Fine-grained Activation Offloading and Fine-grained Recomputation](../../images/fine_grained_activation_offloading/offloading_and_recomputing.png)
