@@ -34,7 +34,7 @@ for file in $TEST_FILES; do
 
     echo "Running test file: $file"
     torchrun --standalone --nproc_per_node=$NUM_GPUS -m pytest \
-        --showlocals --tb=long -v -s \
+        --showlocals --tb=long -v -s -m "$PYTEST_MARKERS" \
         --csv "$csv_file" \
         --junitxml "$xml_file" \
         $file
