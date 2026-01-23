@@ -22,7 +22,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model, log_single_rank
-from megatron.inference import get_dynamic_inference_engine
+from megatron.inference.utils import get_dynamic_inference_engine
 from megatron.training import get_wandb_writer
 from megatron.training.global_vars import get_args, get_tokenizer
 
