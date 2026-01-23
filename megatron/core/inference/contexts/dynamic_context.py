@@ -208,15 +208,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
             tp_size = get_pg_size(pg_collection.tp)
-        else:
-            tp_size = model_config.tensor_model_parallel_size
-        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
-
-        if pg_collection is not None:
             pp_size = get_pg_size(pg_collection.pp)
         else:
+            tp_size = model_config.tensor_model_parallel_size
             pp_size = model_config.pipeline_model_parallel_size
+        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
+        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
@@ -229,6 +226,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.pipeline_parallel_group = parallel_state.get_pipeline_model_parallel_group()
         else:
             self.pipeline_parallel_group = None
+
+        if pg_collection is not None:
+            self.expert_model_parallel_group = pg_collection.ep
+        elif parallel_state.get_expert_model_parallel_world_size() > 1:
+            self.expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+        else:
+            self.expert_model_parallel_group = None
 
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
@@ -1132,6 +1136,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
+            ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
