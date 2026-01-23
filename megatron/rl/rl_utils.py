@@ -6,6 +6,7 @@ import copy
 from functools import partial
 # Keep this to make the env registered.
 import itertools
+import math
 import logging
 import pickle
 from collections import Counter, defaultdict
@@ -25,6 +26,7 @@ from megatron.core import mpu
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
@@ -47,6 +49,7 @@ from megatron.rl.sequence_packing_utils import (
     get_sequence_packing_tensorboard_metrics,
     get_sequence_packing_log_info,
     get_default_packed_seq_params,
+    update_microbatch_calculator,
 )
 from megatron.rl.agent.api import (
     EvaluationRequest,
@@ -834,7 +837,7 @@ def maybe_log_training_metrics(
 
 
 def prepare_trajectories(
-    rollouts: Rollouts, tokenizer: MegatronLegacyTokenizer, seq_length: int, use_sequence_packing: bool, skip_bos_token: bool
+    rollouts: Rollouts, tokenizer: MegatronLegacyTokenizer, seq_length: int, sequence_packing: bool, skip_bos_token: bool
 ):
     """Pad trajectories and extract the generation masks.
     Args:
@@ -933,7 +936,7 @@ def prepare_trajectories(
         # We need to pad all logprobs to the same size for sequence packing.
         # For non-packing mode, keep as list of tensors (unpadded)
         # This preserves the original behavior where each sequence can have different lengths
-        if use_sequence_packing:
+        if sequence_packing:
             inference_logprobs = _pad_nonnull_with_zeros(inference_logprobs, seq_length)
     else:
         inference_logprobs = None
@@ -1035,11 +1038,7 @@ def _compute_logprobs_batch(
 
     # Only PP>1 needs a broadcast from the last stage; for PP=1 the output is already local.
     if get_pg_size(pp_group) > 1:
-        dist.broadcast(
-            logprobs,
-            src=get_pipeline_model_parallel_last_rank(),
-            group=get_pipeline_model_parallel_group(),
-        )
+        dist.broadcast(logprobs, src=get_pp_last_rank(pp_group), group=pp_group)
     return logprobs.cpu()
 
 
@@ -1048,6 +1047,8 @@ def prepare_data_for_update(
     ref_state_dict: Dict[str, Any],
     rollouts: GroupedRollouts,
     tokenizer: MegatronLegacyTokenizer,
+    sequence_packing: bool,
+    is_correction: bool,
 ) -> RerunDataIterator:
     """Extract data for the update from raw rollouts.
 
@@ -1056,6 +1057,8 @@ def prepare_data_for_update(
         ref_state_dict: Reference policy state dict.
         rollouts: Rollouts to extract the data from.
         tokenizer: Tokenizer to pad/tokenize data.
+        sequence_packing: Use sequence packing if True.
+        is_correction: Prepare data for IS correction if True.
 
     Returns:
         Cycled iterator over dataset batches. In GRPO we might want to go over the same data multiple times.
@@ -1093,6 +1096,11 @@ def prepare_data_for_update(
         # We need this to correctly split the rollouts across dp groups.
         # And we do not actually need them grouped in anything below anyways.
         rollouts = [r for g in rollouts for r in g]
+        total_turns_sampled = len(rollouts)
+
+        # We might sample more than we consume in one step.
+        samples_ratio_per_step = args.global_batch_size // (args.grpo_prompts_per_step * args.grpo_group_size)
+        assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
 
         if (data_parallel_world_size := mpu.get_data_parallel_world_size()) > 0:
             data_split_size = len(rollouts) // data_parallel_world_size
@@ -1110,12 +1118,12 @@ def prepare_data_for_update(
 
         with nvtx_range("prepare_trajectories"):
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
-                rollouts, tokenizer, args.seq_length, args.rl_use_sequence_packing, args.rl_skip_bos_token
+                rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
 
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
-        if args.rl_use_sequence_packing:
+        if sequence_packing:
             with nvtx_range("sequence_packing", time=True):
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
                     trajs, 
@@ -1216,7 +1224,7 @@ def prepare_data_for_update(
             torch.cuda.empty_cache()
 
 
-        if args.rl_use_sequence_packing:
+        if sequence_packing:
             with nvtx_range("pack_logprobs", time=True):
                 # Store logprobs on gpu in packing context
                 # Since PackingContext is a dataclass, we add these as new attributes
@@ -1251,12 +1259,16 @@ def prepare_data_for_update(
                 # I think it will be a better design if we split the data loader creating and logic
                 # that reconfigures the microbatch calculator.
 
-                loader = get_microbatch_dataloader(packing_context,
+                update_microbatch_calculator(
+                    samples_ratio_per_step=samples_ratio_per_step,
+                    num_bins_this_rank = len(packing_context.packed_trajs),
+                    bin_seq_indices = packing_context.packing_info.bin_seq_indices,
                     global_batch_size=args.global_batch_size, 
                     rampup_batch_size=args.rampup_batch_size, 
                     micro_batch_size=args.micro_batch_size, 
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                )
+                loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
         else:
             with nvtx_range("align_inference_logprobs", time=True):
                 if inference_logprobs is not None:
@@ -1274,8 +1286,17 @@ def prepare_data_for_update(
             with nvtx_range("create_dataloader"):
                 # Because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
                 # As in sequence packing above, we need to reconfigure it too.
-                # TODO(vitalyk): debug nans first, reconfigure the global batch size later.
                 runtime_state.packing_context = None
+
+                reconfigure_num_microbatches_calculator(
+                    rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled), 
+                    rampup_batch_size=args.rampup_batch_size, 
+                    micro_batch_size=args.micro_batch_size, 
+                    decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+                    data_parallel_size=mpu.get_data_parallel_world_size(),
+                )
+
                 dataset_tensors = [
                     compute_trajs,
                     advantages,
@@ -1284,7 +1305,7 @@ def prepare_data_for_update(
                     original_position_ids,
                     ref_logprobs,
                 ]
-                if args.rl_inference_logprobs_is_correction and inference_logprobs is not None:
+                if is_correction and inference_logprobs is not None:
                     dataset_tensors.append(inference_logprobs)
                 else:
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
@@ -1315,6 +1336,8 @@ def get_grpo_data_iterator(
     grpo_prompts_per_step: int,
     grpo_group_size: int,
     global_batch_size: int,
+    sequence_packing: bool,
+    is_correction: bool,
     buffered_rollouts: RerunDataIterator | None = None,
 ) -> RerunDataIterator:
     """
@@ -1332,17 +1355,14 @@ def get_grpo_data_iterator(
         grpo_prompts_per_step: How many prompts we sample per data collection.
         grpo_group_size: How many samples we do per prompt.
         global_batch_size: Global batch size.
+        sequence_packing: Use sequence packing if True.
+        is_correction: Use IS correction if True.
         buffered_rollouts: Previously collected rollouts (if any)
 
     Returns:
         RerunDataIterator for the current training step
     """
     runtime_state = get_rl_runtime_state()
-
-    if inference_model is not None:
-        inference_pg_collection = unwrap_model(inference_model[0]).pg_collection
-    else:
-        inference_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
     global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size 
@@ -1355,8 +1375,13 @@ def get_grpo_data_iterator(
         buffered_rollouts = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
         )
-        buffered_rollouts = prepare_data_for_update(model, ref_state_dict, buffered_rollouts, get_tokenizer())
-        runtime_state.reset_iteration_counters(iteration)
+        buffered_rollouts = prepare_data_for_update(model=model, 
+            ref_state_dict=ref_state_dict, 
+            rollouts=buffered_rollouts,
+            tokenizer=get_tokenizer(),
+            sequence_packing=sequence_packing,
+            is_correction=is_correction,
+            )
 
     return buffered_rollouts
 

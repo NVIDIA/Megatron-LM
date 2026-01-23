@@ -1057,12 +1057,15 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
 
     return packing_context
 
-def get_microbatch_dataloader(packing_context: PackingContext,
+def update_microbatch_calculator(
+    samples_ratio_per_step: float,
+    num_bins_this_rank: int,
+    bin_seq_indices: List[List[int]],
     global_batch_size: int, 
     rampup_batch_size: int, 
     micro_batch_size: int, 
     decrease_batch_size_if_needed: bool,
-) -> Tuple[DataLoader, int]:
+):
     """Return a data loader with seqpacked indices with microbatches in bins frame of reference.
 
     As a side effect, we calculate the global batch size in the bins frame of reference.
@@ -1070,9 +1073,6 @@ def get_microbatch_dataloader(packing_context: PackingContext,
     space in sequence dimension. The resulting batch size is what we return here.
     """
 
-    samples_ratio_per_step = global_batch_size / len(packing_context.packing_info.seq_lengths)
-    assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
-    num_bins_this_rank = len(packing_context.packed_trajs)
     dp_world_size = mpu.get_data_parallel_world_size()
 
     # Ceiling division means we will reuse some bins
@@ -1113,7 +1113,6 @@ def get_microbatch_dataloader(packing_context: PackingContext,
         f"[Sequence Packing]  - Microbatches per step: {new_num_microbatches} (was {old_num_microbatches})",
     )
 
-    bin_seq_indices = packing_context.packing_info.bin_seq_indices
     # Opt steps only depends on how much we sample and how much we consume.
     # We make sure this is an integer division, check validate_args in arguments.py for details.
     opt_steps = int(1 / samples_ratio_per_step)
@@ -1137,6 +1136,7 @@ def get_microbatch_dataloader(packing_context: PackingContext,
     if opt_steps > 3:
         log_single_rank(logger, logging.INFO, f"  - ... ({opt_steps - 3} more steps)")
 
+def get_microbatch_dataloader(num_bins_this_rank, micro_batch_size):
     bin_indices = torch.arange(num_bins_this_rank)
     dataset = TensorDataset(bin_indices)
     return DataLoader(dataset, batch_size=micro_batch_size, shuffle=False, collate_fn=lambda x: x[0])

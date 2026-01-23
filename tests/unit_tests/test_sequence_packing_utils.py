@@ -413,7 +413,7 @@ def test_compute_packed_inference_logprobs_stats_shape_mismatch():
 
 
 @pytest.mark.parametrize(
-    "ratio,bins,world,expected_bs",
+    "ratio,local_bins,world,expected_bs",
     [
         (1.0, 1, 8, 8),  # no stale data (ratio 1.), everything divides perfectly.
         (1.0, 42, 8, 42 * 8),  # no stale data (ratio 1.), everything divides perfectly, more bins
@@ -426,33 +426,11 @@ def test_compute_packed_inference_logprobs_stats_shape_mismatch():
         (1 / 3, 4, 8, 16),  # third of the data per step, nonint division
     ],
 )
-def test_get_bins_bs_and_steps(ratio, bins, world, expected_bs):
+def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
     # Make a dummy struct to check only the required fields.
     # Divide by ratio to make sure the samples are divisible by global_bs in the test.
     n_seqs = int(world * 7 / ratio)
     global_bs_in_seq = int(n_seqs * ratio)
-    pinfo = sequence_packing_utils.PackingInfo(
-        bin_seq_indices=[],
-        seq_starts=[],
-        seq_lengths=[42] * n_seqs,
-        seq_to_bin_idx=[],
-        packing_algo="fifo",
-    )
-
-    packing_context = sequence_packing_utils.PackingContext(
-        bin_size=128,
-        packer=None,
-        packing_info=pinfo,
-        original_generation_masks=None,
-        original_trajs=None,
-        packed_trajs=[None] * bins,
-        packed_position_ids=None,
-        packed_attention_mask=None,
-        packed_loss_mask=None,
-        original_inference_logprobs=None,
-        bin_advantages=None,
-        cached_packed_seq_params=None,
-    )
 
     def side_eff(
         rank,
@@ -473,8 +451,10 @@ def test_get_bins_bs_and_steps(ratio, bins, world, expected_bs):
             side_effect=side_eff,
         ):
             with patch('megatron.core.mpu.get_data_parallel_world_size', return_value=world):
-                dl = sequence_packing_utils.get_microbatch_dataloader(
-                    packing_context,
+                sequence_packing_utils.update_microbatch_calculator(
+                    samples_ratio_per_step=ratio,
+                    num_bins_this_rank=local_bins,
+                    bin_seq_indices=[],
                     global_batch_size=global_bs_in_seq,
                     rampup_batch_size=1,
                     micro_batch_size=1,

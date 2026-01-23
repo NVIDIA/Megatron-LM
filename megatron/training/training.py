@@ -2722,7 +2722,9 @@ def train(
                     grpo_prompts_per_step=args.grpo_prompts_per_step,
                     grpo_group_size=args.grpo_group_size,
                     global_batch_size=args.global_batch_size,
+                    sequence_packing=sequence_packing,
                     buffered_rollouts=buffered_rollouts,
+                    is_correction=args.rl_inference_logprobs_is_correction,
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
