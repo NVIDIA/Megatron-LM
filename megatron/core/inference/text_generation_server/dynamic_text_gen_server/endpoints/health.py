@@ -2,11 +2,11 @@
 
 import logging
 
-from flask import Blueprint, current_app, jsonify
-
 logger = logging.getLogger(__name__)
 
 try:
+    from flask import Blueprint, current_app, jsonify
+
     bp = Blueprint('health_api', __name__)
 
     @bp.route('/health', methods=['GET'])
