@@ -14,6 +14,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.inference.config import DynamicInferenceConfig
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.inference_request import (
@@ -104,12 +105,14 @@ class TestTextGenerationController:
         else:
             inference_context = DynamicInferenceContext(
                 model_config=transformer_config,
-                max_sequence_length=2048,
-                buffer_size_gb=0.2,
-                materialize_only_last_token_logits=False,
-                use_flashinfer_fused_rope=None,  # default to using flash-infer if available
-                # this is for compatibility with the LTS environment
-                unified_memory_level=0,  # unit tests currently broken with UVM
+                inference_config=DynamicInferenceConfig(
+                    max_sequence_length=2048,
+                    buffer_size_gb=0.2,
+                    materialize_only_last_token_logits=False,
+                    use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+                    # this is for compatibility with the LTS environment
+                    unified_memory_level=0,  # unit tests currently broken with UVM
+                ),
             )
 
         inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_context)

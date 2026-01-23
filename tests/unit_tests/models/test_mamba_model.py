@@ -350,11 +350,13 @@ class TestMambaWithDynamicInference:
 
         inference_context = DynamicInferenceContext(
             model_config=self.model.config,
-            max_sequence_length=self.model.module.max_sequence_length,
-            buffer_size_gb=1.0,
-            block_size_tokens=256,
-            materialize_only_last_token_logits=False,
-            mamba_inference_state_config=mamba_inference_state_config,
+            inference_config=DynamicInferenceConfig(
+                max_sequence_length=self.model.module.max_sequence_length,
+                buffer_size_gb=1.0,
+                block_size_tokens=256,
+                materialize_only_last_token_logits=False,
+                mamba_inference_state_config=mamba_inference_state_config,
+            ),
         )
 
         # Add a request with 10 tokens. Since 10 is not a multiple of 64 (TOKEN_ROUNDER),

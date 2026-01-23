@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock, create_autospec, patch
 import pytest
 import torch
 
+from megatron.core.inference.config import DynamicInferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -60,11 +61,13 @@ class TestInferenceWandbLogging:
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
             ),
-            max_sequence_length=max_sequence_length,
-            num_cuda_graphs=None,
-            buffer_size_gb=buffer_size_gb,
-            block_size_tokens=block_size_tokens,
-            unified_memory_level=0,  # unit tests currently broken with UVM
+            inference_config=DynamicInferenceConfig(
+                max_sequence_length=max_sequence_length,
+                num_cuda_graphs=None,
+                buffer_size_gb=buffer_size_gb,
+                block_size_tokens=block_size_tokens,
+                unified_memory_level=0,  # unit tests currently broken with UVM
+            ),
         )
 
     @pytest.mark.internal

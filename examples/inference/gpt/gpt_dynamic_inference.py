@@ -1,16 +1,15 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+# pylint: disable=bad-builtin
+
 import hashlib
 import io
 import json
-import math
 import os
-import pickle
 import sys
 import warnings
-from argparse import ArgumentParser
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 from tqdm import tqdm
@@ -19,23 +18,14 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-import megatron
 from examples.inference.gpt.utils import (
     Request,
-    add_common_inference_args,
     build_dynamic_engine_setup_prefix,
     build_requests,
     get_curr_time,
     get_global_peak_memory_stats_bytes,
-    get_model,
 )
-from megatron.core.inference.contexts.attention_context.mamba_metadata import (
-    MambaInferenceStateConfig,
-)
-from megatron.core.inference.contexts.dynamic_context import (
-    ContextOverflowError,
-    DynamicInferenceContext,
-)
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, EngineSuspendedError
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -45,86 +35,25 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_mamba_inference_state_config_from_model
+from megatron.inference.utils import (
+    add_inference_args,
+    get_dynamic_inference_config_from_model_and_args,
+    get_model,
+)
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 import logging
 
+import megatron
 from megatron.core.utils import configure_nvtx_profiling
-from megatron.training import get_args
-from megatron.training import get_model as _get_model
-from megatron.training import get_tokenizer, initialize_megatron
+from megatron.training import get_args, get_tokenizer, initialize_megatron
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
-
-def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
-    """Dynamic inference arguments."""
-
-    add_common_inference_args(parser)
-
-    group = parser.add_argument_group(title='Dynamic inference')
-    group.add_argument(
-        "--inference-ckpt-non-strict",
-        action="store_true",
-        help="Load checkpoint with `strict=False`.",
-    )
-    group.add_argument(
-        "--termination-id",
-        type=int,
-        default=None,
-        help="Termination ID that overrides `tokenizer.eod`.",
-    )
-    group.add_argument(
-        "--suspend-resume-interval",
-        type=int,
-        default=None,
-        help="Suspend and resume the dynamic engine every "
-        "`suspend_resume_interval` steps. This is used to tet the suspend/resume "
-        "system.",
-    )
-    group.add_argument(
-        "--inference-repeat-n",
-        type=int,
-        default=1,
-        help="Repeat inference iterations N times for benchmarking.",
-    )
-    group.add_argument(
-        "--throughput-check-only",
-        action='store_true',
-        default=False,
-        help="If true, only run throughput check without verifying outputs.",
-    )
-
-    return parser
-
-
-def get_inference_context(
-    model,
-    requests: List[Request],
-    sampling_params: Optional[SamplingParams] = None,
-    calculate_max_sequence_length_from_requests: bool = True,
-    mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
-):
-    """The inference context manages the KV cache and other inference state."""
-
-    args = get_args()
-
-    overrides = None
-
-    # Max sequence length.
-    if calculate_max_sequence_length_from_requests:
-        max_gen_length = sampling_params.num_tokens_to_generate
-        max_context_length = max(len(r.prompt_tokens) for r in requests)
-        max_sequence_length = max_context_length + max_gen_length
-        overrides = {"max_sequence_length": max_sequence_length}
-
-    return DynamicInferenceContext.from_model_and_args(model, args, overrides)
 
 def run_inference(
     requests: List[Request],
@@ -210,7 +139,8 @@ def run_inference(
             pass  # ignore error in order to call 'engine.resume()' below.
         attempted_step_count += 1
 
-        # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine
+        # After step, we lost track of last iteration's is_decode_only,
+        # so we need to get it from the engine
         is_decode_only = engine.is_decode_only
 
         # Test suspending and resuming engine.
@@ -309,10 +239,10 @@ def run_inference(
 
 @torch.inference_mode()
 def main():
-
+    """Run dynamic inference."""
     # Initialize Megatron.
     initialize_megatron(
-        extra_args_provider=add_dynamic_inference_args,
+        extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
 
@@ -353,11 +283,18 @@ def main():
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
-    context = get_inference_context(model, requests=requests, sampling_params=sampling_params)
-    controller = TextGenerationController.from_model_and_args(model, args, context)
+    inference_config = get_dynamic_inference_config_from_model_and_args(model, args)
+
+    # Calculate max_sequence_length from requests
+    max_gen_length = sampling_params.num_tokens_to_generate
+    max_context_length = max(len(r.prompt_tokens) for r in requests)
+    inference_config.max_sequence_length = max_context_length + max_gen_length
+    context = DynamicInferenceContext(model.config, inference_config)
+    wrapped_model = GPTInferenceWrapper(model, context)
+    controller = TextGenerationController(wrapped_model, tokenizer)
 
     # Validate all context_length's <= max_tokens.
-    if args.disable_chunked_prefill:
+    if not args.enable_chunked_prefill:
         invalid_prompt_length_map = {}
         for request_idx, request in enumerate(requests):
             if len(request.prompt_tokens) > context.max_tokens:
@@ -369,7 +306,7 @@ def main():
         )
 
     # Inference engine.
-    engine = DynamicInferenceEngine.from_model_and_args(model, args, controller, context)
+    engine = DynamicInferenceEngine(controller, context)
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
@@ -424,7 +361,10 @@ def main():
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
-            print(f"\n{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+            print(
+                f"\n{unique_idx+1}/{len(unique_prompt_map)}"
+                f"[n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}"
+            )
 
             # ---- Group all outputs for this prompt ----
             output_map = defaultdict(list)
@@ -451,8 +391,10 @@ def main():
                     o_hash = "--"
                     o_len = 0
                     escaped_output_text = "--"
-                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}"
-                f"{', <evicted>' if evicted else ''}] {escaped_output_text}")
+                print(
+                    f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}"
+                    f"{', <evicted>' if evicted else ''}] {escaped_output_text}"
+                )
                 text_hashes.append(o_hash)
 
         # Write results to JSON. Primarily used for functional testing.

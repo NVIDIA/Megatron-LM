@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.inference.config import DynamicInferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -184,13 +185,15 @@ class TestGPTModelBatchInvariant:
 
         ctx = DynamicInferenceContext(
             model_config=base_model.config,
-            max_sequence_length=seq_len,
-            buffer_size_gb=0.125,
-            block_size_tokens=16,
-            num_cuda_graphs=None,
-            materialize_only_last_token_logits=False,
-            use_cuda_graphs_for_non_decode_steps=False,
-            unified_memory_level=0,
+            inference_config=DynamicInferenceConfig(
+                max_sequence_length=seq_len,
+                buffer_size_gb=0.125,
+                block_size_tokens=16,
+                num_cuda_graphs=None,
+                materialize_only_last_token_logits=False,
+                use_cuda_graphs_for_non_decode_steps=False,
+                unified_memory_level=0,
+            ),
         )
 
         wrapper = GPTInferenceWrapper(inference_model, ctx)
@@ -260,13 +263,15 @@ class TestGPTModelBatchInvariant:
         def _run_engine_with_order(order):
             ctx = DynamicInferenceContext(
                 model_config=based_model.config,
-                max_sequence_length=seq_len,
-                buffer_size_gb=0.125,
-                block_size_tokens=16,
-                num_cuda_graphs=None,
-                materialize_only_last_token_logits=False,
-                use_cuda_graphs_for_non_decode_steps=False,
-                unified_memory_level=0,
+                inference_config=DynamicInferenceConfig(
+                    max_sequence_length=seq_len,
+                    buffer_size_gb=0.125,
+                    block_size_tokens=16,
+                    num_cuda_graphs=None,
+                    materialize_only_last_token_logits=False,
+                    use_cuda_graphs_for_non_decode_steps=False,
+                    unified_memory_level=0,
+                ),
             )
 
             wrapper = GPTInferenceWrapper(inference_model, ctx)

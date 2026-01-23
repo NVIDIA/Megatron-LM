@@ -8,6 +8,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 import torch
 
 from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.config import DynamicInferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
@@ -17,7 +18,7 @@ from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.utils import get_asyncio_loop, get_mamba_inference_state_config_from_model
+from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -91,7 +92,7 @@ class StaticInferenceEngine(AbstractEngine):
 
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
-        mamba_inference_state_config = get_mamba_inference_state_config_from_model(
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(
             self.inference_wrapped_model.model
         )
 
@@ -99,13 +100,15 @@ class StaticInferenceEngine(AbstractEngine):
             if not legacy:
                 dynamic_context = DynamicInferenceContext(
                     model_config=self.config,
-                    max_sequence_length=original_context.max_sequence_length,
-                    buffer_size_gb=buffer_size_gb,
-                    mamba_inference_state_config=mamba_inference_state_config,
-                    max_requests=max_batch_size,
-                    num_cuda_graphs=1,
-                    block_size_tokens=256,
-                    unified_memory_level=0,
+                    inference_config=DynamicInferenceConfig(
+                        max_sequence_length=original_context.max_sequence_length,
+                        buffer_size_gb=buffer_size_gb,
+                        mamba_inference_state_config=mamba_inference_state_config,
+                        max_requests=max_batch_size,
+                        num_cuda_graphs=1,
+                        block_size_tokens=256,
+                        unified_memory_level=0,
+                    ),
                 )
 
                 self.controller.inference_wrapped_model.inference_context = dynamic_context
@@ -113,9 +116,7 @@ class StaticInferenceEngine(AbstractEngine):
                 self.controller._init_dynamic_sampling_tensors()
 
                 self.dynamic_engine = DynamicInferenceEngine(
-                    controller=self.controller,
-                    context=dynamic_context,
-                    random_seed=self.random_seed,
+                    controller=self.controller, context=dynamic_context
                 )
         except Exception as e:
             # Get exception details for better debugging

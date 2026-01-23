@@ -44,12 +44,10 @@ from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import (
     experimental_api,
     get_asyncio_loop,
-    get_attr_wrapped_model,
     get_pg_rank,
     get_pg_size,
     get_pg_src_rank,
     internal_api,
-    log_single_rank,
     trace_async_exceptions,
 )
 
@@ -133,25 +131,9 @@ class DynamicInferenceEngine(AbstractEngine):
             outputs and detokenizer the output tokens.
         inference_context (DynamicInferenceContext): Context for managing in-flight
             batching and a dynamic block-level KV cache (similar to paged attention).
-        random_seed (Optional[int]): Use a random seed if you want deterministic
-            results. Defaults to None.
-        inference_logging_step_interval (int): The step interval at which to log
-        inference metrics to wandb. Defaults to 0, which means no logging.
     """
 
-    def __init__(
-        self,
-        controller: TextGenerationController,
-        context: DynamicInferenceContext,
-        enable_cuda_graph: Optional[bool] = None,
-        random_seed: Optional[int] = None,
-        *,
-        track_paused_request_events: bool = False,
-        enable_chunked_prefill: bool = True,
-        metrics_writer: Optional['WandbModule'] = None,
-        inference_logging_step_interval: int = 0,
-        pg_collection: Optional[ProcessGroupCollection] = None,
-    ):
+    def __init__(self, controller: TextGenerationController, context: DynamicInferenceContext):
 
         assert isinstance(
             controller, TextGenerationController
@@ -159,41 +141,28 @@ class DynamicInferenceEngine(AbstractEngine):
         assert isinstance(
             context, DynamicInferenceContext
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
-        assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        # Deprecate `enable_cuda_graph`.
-        if enable_cuda_graph is not None:
-            warnings.warn(
-                "The `enable_cuda_graph` argument is deprecated and will be "
-                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
-                "read directly from the transformer config object."
-            )
-            self.enable_cuda_graph = enable_cuda_graph
-        else:
-            self.enable_cuda_graph = (
-                controller.inference_wrapped_model.model.config.enable_cuda_graph
-            )
+        model_config = controller.inference_wrapped_model.model.config
+        inference_config = context.inference_config
 
-        if pg_collection is not None:
-            self.pg_collection = pg_collection
+        if inference_config.pg_collection is not None:
+            self.pg_collection = inference_config.pg_collection
         else:
             self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         # Initialization options.
         self.controller = controller
         self.context = context
-        self.random_seed = random_seed
-        self.track_paused_request_events = track_paused_request_events
-        self.enable_chunked_prefill = enable_chunked_prefill
-        self.metrics_writer = metrics_writer
-        self.inference_logging_step_interval = inference_logging_step_interval
-        self.unified_memory_level = context.unified_memory_level
-        self.persist_cuda_graphs = context.persist_cuda_graphs
-
-        if enable_cuda_graph is not None:
-            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
-        else:
-            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
+        self.track_paused_request_events = inference_config.track_paused_request_events
+        self.enable_chunked_prefill = inference_config.enable_chunked_prefill
+        self.metrics_writer = inference_config.metrics_writer
+        self.logging_step_interval = inference_config.logging_step_interval
+        self.unified_memory_level = inference_config.unified_memory_level
+        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
+        self.materialize_only_last_token_logits = (
+            inference_config.materialize_only_last_token_logits
+        )
+        self.cuda_graph_impl = model_config.cuda_graph_impl
 
         # Initialize engine.
         self.reset()
@@ -204,7 +173,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         # Configure wandb to use separate step counter for inference metrics (only once)
-        if self.inference_logging_step_interval > 0 and self.metrics_writer is not None:
+        if self.logging_step_interval > 0 and self.metrics_writer is not None:
             logging.info(
                 f"\033[1;93m[INFERENCE]\033[0m "
                 f"\033[1;95mLogging inference metrics to wandb (rank {self.rank})\033[0m"
@@ -230,69 +199,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Create cuda graphs.
         self.create_cuda_graphs()
-
-    @classmethod
-    def from_model_and_args(
-        cls,
-        model,
-        args,
-        controller: Optional[TextGenerationController] = None,
-        context: Optional[DynamicInferenceContext] = None,
-    ):
-        """
-        Initializes a `DynamicInferenceEngine` from the model and args.
-
-        Args:
-            model: The Megatron model instance.
-            args: The arguments object.
-            controller (Optional[TextGenerationController]): An optional existing
-                controller. If None, one is created from the model and args.
-            context (Optional[DynamicInferenceContext]): An optional existing
-                context. If None, one is created from the model and args.
-
-        Returns:
-            DynamicInferenceEngine: The initialized inference engine.
-        """
-        if context is None:
-            context = DynamicInferenceContext.from_model_and_args(model, args)
-        if controller is None:
-            controller = TextGenerationController.from_model_and_args(model, args, context)
-
-        # The model may have a custom ProcessGroupCollection with a different TP / PP size.
-        pg_collection = get_attr_wrapped_model(model, "pg_collection")
-
-        # Get inference logging configuration from args
-        log_inference_wandb = args.inference_wandb_logging
-        inference_logging_step_interval = args.inference_logging_step_interval
-
-        # Get metrics writer if logging is enabled and on the logging rank
-        # Use the same rank convention as training (last rank logs)
-        metrics_writer = None
-        if (
-            inference_logging_step_interval > 0
-            and log_inference_wandb
-            and args.rank == (args.world_size - 1)
-        ):
-            metrics_writer = get_wandb_writer()
-            if metrics_writer is None:
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
-                    "wandb module is available. Inference logging will be disabled.",
-                )
-
-        return cls(
-            controller,
-            context,
-            enable_cuda_graph=model.config.cuda_graph_impl == "local",
-            random_seed=args.seed,
-            track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
-            enable_chunked_prefill=not args.disable_chunked_prefill,
-            metrics_writer=metrics_writer,
-            inference_logging_step_interval=args.inference_logging_step_interval,
-            pg_collection=pg_collection,
-        )
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -755,7 +661,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.return_log_probs
             and not request.sampling_params.skip_prompt_log_probs
         ):
-            assert not self.context.materialize_only_last_token_logits, (
+            assert not self.materialize_only_last_token_logits, (
                 "Prompt log probs cannot be calculated if only last token logits are materialized. "
                 "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
                 "or skip_prompt_log_probs to True in SamplingParams."
@@ -944,7 +850,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
                 if (
                     request_id == self.context.chunked_prefill_request_id
-                    and self.context.materialize_only_last_token_logits
+                    and self.materialize_only_last_token_logits
                 ):
                     request.prompt_log_probs = []
                     request.generated_log_probs = []
@@ -1224,9 +1130,9 @@ class DynamicInferenceEngine(AbstractEngine):
         range_pop()
 
         if (
-            self.inference_logging_step_interval > 0
+            self.logging_step_interval > 0
             and self.step_count > 0
-            and self.step_count % self.inference_logging_step_interval == 0
+            and self.step_count % self.logging_step_interval == 0
             and self.metrics_writer is not None
         ):
             kvcache_util_stats = self.context.get_kvcache_utilization_stats()
@@ -1358,10 +1264,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
 
         # Print context state.
-        if (
-            self.inference_logging_step_interval > 0
-            and step_count % self.inference_logging_step_interval == 0
-        ):
+        if self.logging_step_interval > 0 and step_count % self.logging_step_interval == 0:
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (

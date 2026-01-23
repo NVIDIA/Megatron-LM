@@ -10,6 +10,7 @@ import torch
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
+from megatron.inference.utils import get_dynamic_inference_engine
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -85,7 +86,8 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         )
         return StaticInferenceEngine(text_generation_controller=text_generation_controller)
     elif args.engine_type == "dynamic":
-        return DynamicInferenceEngine.from_model_and_args(model, args)
+        return get_dynamic_inference_engine(model=model)
+
 
 def get_random_prompt_tokens(tokenizer, num_input_tokens) -> List[int]:
     # Get the set of special token IDs to exclude

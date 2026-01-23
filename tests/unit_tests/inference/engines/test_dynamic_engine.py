@@ -13,9 +13,7 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.contexts.attention_context.mamba_metadata import (
-    MambaInferenceStateConfig,
-)
+from megatron.core.inference.config import DynamicInferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
@@ -45,11 +43,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import (
-    get_mamba_inference_state_config_from_model,
-    is_fa_min_version,
-    is_te_min_version,
-)
+from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -221,19 +215,21 @@ class TestDynamicInferenceEngine:
         # Inference context.
         context = DynamicInferenceContext(
             model_config=transformer_config,
-            max_sequence_length=test_config.max_sequence_length,
-            num_cuda_graphs=test_config.num_cuda_graphs,
-            use_cuda_graphs_for_non_decode_steps=True,
-            buffer_size_gb=test_config.context_buffer_size_gb,
-            paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
-            block_size_tokens=test_config.context_block_size_tokens,
-            max_requests=test_config.context_max_requests,
-            max_tokens=test_config.context_max_tokens,
-            mamba_inference_state_config=mamba_inference_state_config,
-            materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
-            use_flashinfer_fused_rope=None,  # default to using flash-infer if available
-            # this is for compatibility with the LTS environment
-            unified_memory_level=0,  # unit tests currently broken with UVM
+            inference_config=DynamicInferenceConfig(
+                max_sequence_length=test_config.max_sequence_length,
+                num_cuda_graphs=test_config.num_cuda_graphs,
+                use_cuda_graphs_for_non_decode_steps=True,
+                buffer_size_gb=test_config.context_buffer_size_gb,
+                paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
+                block_size_tokens=test_config.context_block_size_tokens,
+                max_requests=test_config.context_max_requests,
+                max_tokens=test_config.context_max_tokens,
+                mamba_inference_state_config=mamba_inference_state_config,
+                materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+                use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+                # this is for compatibility with the LTS environment
+                unified_memory_level=0,  # unit tests currently broken with UVM
+            ),
         )
 
         return context
@@ -373,7 +369,7 @@ class TestDynamicInferenceEngine:
 
         model.eval()
 
-        mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
 
         # Inference context.
         inference_context = cls._build_inference_context(
@@ -405,13 +401,7 @@ class TestDynamicInferenceEngine:
         CudaGraphManager.global_mempool = None
 
         # Inference engine.
-        engine = DynamicInferenceEngine(
-            text_generation_controller,
-            inference_context,
-            random_seed=test_config.random_seed,
-            enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
-            enable_chunked_prefill=test_config.enable_chunked_prefill,
-        )
+        engine = DynamicInferenceEngine(text_generation_controller, inference_context)
 
         # Test env.
         env = DynamicEngineTestEnv(config=test_config, requests=requests, engine=engine)
