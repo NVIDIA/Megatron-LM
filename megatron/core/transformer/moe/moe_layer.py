@@ -403,7 +403,9 @@ class MoELayer(BaseMoELayer):
                     hidden_states,
                 )
             else:
-                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states, padding_mask)
+                outputs = tensor_parallel.checkpoint(
+                    custom_forward, False, hidden_states, padding_mask
+                )
         else:
             outputs = custom_forward(hidden_states)
 
