@@ -1,8 +1,8 @@
 #!/bin/bash
 
 if [ -z ${HF_MODEL_CKPT} ]; then
-    HF_MODEL_CKPT=nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3
-    TOKENIZER_MODEL=nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3
+    HF_MODEL_CKPT=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    TOKENIZER_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 else
     TOKENIZER_MODEL=${HF_MODEL_CKPT}
 fi
