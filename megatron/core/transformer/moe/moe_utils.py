@@ -135,9 +135,7 @@ def switch_load_balancing_loss_func(
 
 
 def z_loss_func(
-    logits: torch.Tensor, 
-    z_loss_coeff: float, 
-    padding_mask: Optional[torch.Tensor] = None
+    logits: torch.Tensor, z_loss_coeff: float, padding_mask: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """Encourages the router's logits to remain small to enhance stability.
     Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
