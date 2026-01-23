@@ -20,8 +20,10 @@ You can install this library using pip or use it within the Megatron-LM GitHub r
 
 **Megatron-Bridge**: a separate repository that is ideal for users who wish to train a Hugging Face model.
 It serves as a powerful bridge, conversion, and verification layer between Hugging Face and Megatron Core.
+For more information, refer to [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge).
 
 **NeMo RL**: library that streamlines and scales reinforcement learning, that leverages Megatron-Core.
+For more information, refer to [NeMo RL](https://github.com/NVIDIA-NeMo/RL).
 
 # Latest News
 
