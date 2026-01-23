@@ -679,17 +679,18 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         ), "Found no FSDP units to use fixed-size buffering"
         self.fsdp_double_buffer_units = fsdp_units_to_double_buffer
 
-        for bucket_id, param_group in enumerate(fsdp_param_groups):
-            if (param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None or 
-                param_group.fsdp_unit_id not in self.fsdp_double_buffer_units):
-                logging.info(f"FSDP unit (id={param_group.fsdp_unit_id}) does not fit in FixedPoolAllcator")
-                if fallback_to_persistent_buffer is False:
-                    logging.info("It will fall back to dynamic memory allocator, NCCL user buffer is not supported")
-                else:
-                    logging.info(
-                        "It will be allocated a persistent buffer. If the memory budget is tight, "
-                        "set trainer.strategy.ddp.fsdp_db_use_persist_buf_on_alloc_fail to False."
-                    )
+        if torch.distributed.get_rank() == 0:
+            for bucket_id, param_group in enumerate(fsdp_param_groups):
+                if (param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None or 
+                    param_group.fsdp_unit_id not in self.fsdp_double_buffer_units):
+                    logging.info(f"FSDP unit (id={param_group.fsdp_unit_id}) does not fit in FixedPoolAllcator")
+                    if fallback_to_persistent_buffer is False:
+                        logging.info("It will fall back to dynamic memory allocator, NCCL user buffer is not supported")
+                    else:
+                        logging.info(
+                            "It will be allocated a persistent buffer. If the memory budget is tight, "
+                            "set trainer.strategy.ddp.fsdp_db_use_persist_buf_on_alloc_fail to False."
+                        )
         
         # Initialize buffer group status.
         # Each buffer group represents a set of buffers associated with an FSDP unit's bucket group.
