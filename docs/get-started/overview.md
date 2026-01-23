@@ -2,8 +2,34 @@
 
 Megatron-Core and Megatron-LM are open-source tools that are typically used together to train LLMs at scale across GPUs. Megatron-Core expands the capability of Megatron-LM. Megatron Bridge connects Megatron-Core and Megatron-LM to other popular training models, such as Hugging Face.
 
+## Megatron Core
 
-## Megatron-LM: 
+NVIDIA Megatron Core is a library of essential building blocks for highly efficient large-scale generative AI training. It can be used to train models with unparalleled speed at scale across thousands of GPUs. It provides an extensive set of tools for multimodal and speech AI. It expands Megatron LM capabilities.
+
+Megatron-Core contains GPU-optimized techniques featuring advanced parallelism strategies, optimizations like FP8 training, and support for the latest LLM, MoE, and multimodal architectures. It abstracts these techniques into composable and modular APIs.
+
+Megatron-Core is compatible with all NVIDIA Tensor Core GPUs and popular LLM architectures such as GPT, BERT, T5, and RETRO.
+
+
+**Composable library** with GPU-optimized building blocks for custom training frameworks.
+
+**Best for:**
+
+- **Framework developers** building on top of modular and optimized components
+- **Research teams** needing custom training loops, optimizers, or data pipelines
+- **ML engineers** requiring fault-tolerant training pipelines
+
+**What you get:**
+
+- Composable transformer building blocks (attention, MLP)
+- Advanced parallelism strategies (TP, PP, DP, EP, CP)
+- Pipeline schedules and distributed optimizers
+- Mixed precision support (FP16, BF16, FP8)
+- GPU-optimized kernels and memory management
+- High-performance dataloaders and dataset utilities
+- Model architectures (LLaMA, Qwen, GPT, Mixtral, Mamba)
+
+## Megatron-LM
 
 Megatron-LM is a reference implementation, with a lightweight large-scale LLM training framework. It offers a customizable native PyTorch training loop with fewer abstraction layers. It was designed for scaling transformer models to the multi-billion and trillion-parameter regimes under realistic memory and compute constraints. **It serves as a straightforward entry point for exploring Megatron-Core.**
 
@@ -25,33 +51,7 @@ It uses advanced parallelization techniques including model parallelism (tensor 
 - End-to-end examples from data prep to evaluation
 - Research-focused tools and utilities
 
-## Megatron Core
 
-NVIDIA Megatron Core is a library of essential building blocks for highly efficient large-scale generative AI training. It can be used to train models with unparalleled speed at scale across thousands of GPUs. It provides an extensive set of tools for multimodal and speech AI. It expands Megatron LM capabilities.
-
-Megatron-Core contains GPU-optimized techniques featuring advanced parallelism strategies, optimizations like FP8 training, and support for the latest LLM, MoE, and multimodal architectures. It abstracts these techniques into composable and modular APIs.
-
-Megatron-Core is compatible with all NVIDIA Tensor Core GPUs and popular LLM architectures such as GPT, BERT, T5, and RETRO.
-
-[![Megatron-Core Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/Megatron-Core/developer-guide/latest/index.html)
-
-**Composable library** with GPU-optimized building blocks for custom training frameworks.
-
-**Best for:**
-
-- **Framework developers** building on top of modular and optimized components
-- **Research teams** needing custom training loops, optimizers, or data pipelines
-- **ML engineers** requiring fault-tolerant training pipelines
-
-**What you get:**
-
-- Composable transformer building blocks (attention, MLP, etc.)
-- Advanced parallelism strategies (TP, PP, DP, EP, CP)
-- Pipeline schedules and distributed optimizers
-- Mixed precision support (FP16, BF16, FP8)
-- GPU-optimized kernels and memory management
-- High-performance dataloaders and dataset utilities
-- Model architectures (LLaMA, Qwen, GPT, Mixtral, Mamba, etc.)
 
 ## Megatron Bridge
 
@@ -81,3 +81,4 @@ After training or modifying a Megatron model, you can convert it again for deplo
 - **[Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer)** - Model optimization toolkit for quantization, pruning, distillation, speculative decoding, and more. Checkout end-to-end examples in [examples/post_training/modelopt](./examples/post_training/modelopt/).
 
 **Compatible with:** [Hugging Face Accelerate](https://github.com/huggingface/accelerate), [Colossal-AI](https://github.com/hpcaitech/ColossalAI), [DeepSpeed](https://github.com/microsoft/DeepSpeed)
+
