@@ -38,7 +38,7 @@ from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
-    get_model,
+    get_model_for_inference,
 )
 
 sys.path.append(
@@ -279,7 +279,7 @@ def main():
         stop_words=args.stop_words,
     )
 
-    model = get_model()
+    model = get_model_for_inference()
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)

@@ -11,24 +11,18 @@ from typing import List
 
 import torch
 import torch.distributed as dist
-from tqdm import tqdm
 
-from examples.inference.gpt.utils import (
-    Request,
-    add_dynamic_inference_args,
-    add_common_inference_args,
-    build_dynamic_engine_setup_prefix,
-    build_requests,
-    get_model
-)
-from megatron.core import parallel_state
+from examples.inference.gpt.utils import Request, build_dynamic_engine_setup_prefix, build_requests
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.utils import get_mamba_inference_state_config_from_model
+from megatron.inference.utils import (
+    add_inference_args,
+    get_dynamic_inference_engine,
+    get_model_for_inference,
+)
 from megatron.training import get_args, get_tokenizer, initialize_megatron
-from megatron.training.arguments import parse_args
 
 # pylint: disable=line-too-long
 
@@ -190,7 +184,7 @@ if __name__ == "__main__":
     # check for it.
     with torch.inference_mode():
         initialize_megatron(
-            extra_args_provider=add_dynamic_inference_args,
+            extra_args_provider=add_inference_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
 
@@ -209,16 +203,16 @@ if __name__ == "__main__":
             ),
         )
 
-        model = get_model()
+        model = get_model_for_inference()
 
         requests = (
             build_requests(args, tokenizer, sampling_params) if dist.get_rank() == 0 else None
         )
 
-        engine = DynamicInferenceEngine.from_model_and_args(model, args)
+        engine = get_dynamic_inference_engine(model=model)
 
         if dist.get_rank() == 0:
-            setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
+            setup_prefix = build_dynamic_engine_setup_prefix(args, model, engine.context, requests)
             print("~~~")
             print(setup_prefix)
             print("~~~")

@@ -18,7 +18,6 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.training import get_args
-from megatron.training import get_model as _get_model
 
 
 def get_default_sampling_params(termination_id: int = None):

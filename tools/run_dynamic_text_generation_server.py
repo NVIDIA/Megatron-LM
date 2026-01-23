@@ -5,14 +5,14 @@ import asyncio
 
 import torch
 
+from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import run_flask_server
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import trace_async_exceptions
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
-from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.training import get_args, get_tokenizer
+from megatron.training import get_args
 from megatron.training.initialize import initialize_megatron
+
 
 def add_text_generation_server_args(parser: argparse.ArgumentParser):
     """Adds the required command line arguments for running the text generation server."""
@@ -75,5 +75,5 @@ if __name__ == "__main__":
         args.return_log_probs = True
 
         engine = get_dynamic_inference_engine()
-        
+
         asyncio.run(run_text_generation_server(engine, args.inference_coordinator_port, args.port))

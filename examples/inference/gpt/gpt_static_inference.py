@@ -1,18 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import os
-from model_provider import model_provider
-from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
-import torch
 import sys
 import time
-import warnings
-from functools import partial
 from argparse import Namespace
 
 import torch
-import tqdm
 
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import StaticInferenceEngine
@@ -26,8 +19,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from pretrain_gpt import model_provider as gpt_model_provider
-from pretrain_mamba import model_provider as mamba_model_provider
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -35,19 +26,18 @@ sys.path.append(
 
 import asyncio
 import json
-from typing import Any, AsyncIterator, List
+from typing import List
 
-from examples.inference.gpt.utils import add_common_inference_args, build_requests
-from megatron.core import mpu
-from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
-from megatron.training.checkpointing import load_checkpoint
+from examples.inference.gpt.utils import build_requests
+from megatron.inference.utils import add_inference_args, get_model_for_inference
+from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.initialize import initialize_megatron
 
 
 def add_static_inference_args(parser):
     """Static inference arguments."""
 
-    add_common_inference_args(parser)
+    add_inference_args(parser)
 
     group = parser.add_argument_group(title='Static inference')
     group.add_argument(
@@ -146,16 +136,7 @@ def main():
 
     args = get_args()
 
-    # Set up model and load checkpoint
-    if args.model_provider == "gpt":
-        model_builder = gpt_builder
-    elif args.model_provider == "mamba":
-        model_builder = mamba_builder
-    else:
-        raise ValueError(f"Invalid model provider {args.model_provider}")
-    model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
-    load_checkpoint(model, None, None, strict=False)
-    model = model[0]
+    model = get_model_for_inference()
 
     inference_engine = get_inference_engine(args, model)
 

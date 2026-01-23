@@ -28,8 +28,8 @@ from model_provider import model_provider
 logger = logging.getLogger(__name__)
 
 
-def get_model() -> MegatronModule:
-    """Initialize model and load checkpoint."""
+def get_model_for_inference() -> MegatronModule:
+    """Initialize model and load checkpoint for inference."""
 
     args = get_args()
 
@@ -305,13 +305,13 @@ def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> Dyna
     """Builds a `DynamicInferenceEngine`."""
     args = get_args()
     if model is None:
-        model = get_model()
+        model = get_model_for_inference()
     if args.legacy_tokenizer:
         tokenizer = get_tokenizer()
     else:
         tokenizer = build_tokenizer(args)
 
-    inference_config = get_dynamic_inference_config_from_model_and_args(model, args)
+    inference_config = get_inference_config_from_model_and_args(model, args)
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = GPTInferenceWrapper(model, context)
     controller = TextGenerationController(inference_wrapped_model, tokenizer)
