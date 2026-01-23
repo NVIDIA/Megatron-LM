@@ -80,6 +80,5 @@ MODEL_ARGS:
   --rl-inference-pipeline-model-parallel-size: 2
   --refit-method: gloo
 METRICS:
-  - "lm loss"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"

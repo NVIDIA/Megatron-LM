@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import concurrent.futures
 import logging
 import multiprocessing
 import os
@@ -719,7 +720,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if (
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
-        ):
+        ) or (request.sampling_params.num_tokens_to_generate < 0):
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
@@ -1368,11 +1369,29 @@ class DynamicInferenceEngine(AbstractEngine):
         # Keep for compatibility with current test suite.
         return ret
 
+    def _run_coroutine_sync(self, coro):
+        """Run a coroutine synchronously, handling the case when already in an event loop.
+
+        This method safely runs an async coroutine from synchronous code, even when
+        called from within an already running event loop (e.g., when used with async
+        frameworks like pytriton).
+        """
+        try:
+            # Check if there's already a running event loop
+            asyncio.get_running_loop()
+            # We're inside a running loop - run in a separate thread
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+        except RuntimeError:
+            # No running loop - safe to use run_until_complete
+            return self._loop.run_until_complete(coro)
+
     def step_modern(
         self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
-        return self._loop.run_until_complete(self.async_step())
+        return self._run_coroutine_sync(self.async_step())
 
     def step_legacy(
         self, sampling_params: SamplingParams
@@ -1383,7 +1402,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "0.16. Please use `step_modern()` going forward, which will eventually "
             "be renamed to `step()`."
         )
-        result = self._loop.run_until_complete(self.async_step())
+        result = self._run_coroutine_sync(self.async_step())
         active_requests = [self.get_request(i) for i in result["active_request_ids"]]
         finished_requests = [r.merge() for r in result["finished_request_records"]]
         return active_requests, finished_requests, result["step_time"]
