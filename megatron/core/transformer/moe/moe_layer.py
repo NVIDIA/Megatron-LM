@@ -376,7 +376,7 @@ class MoELayer(BaseMoELayer):
             padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states):
+        def custom_forward(hidden_states, padding_mask=None):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map = self.route(hidden_states, padding_mask=padding_mask)
