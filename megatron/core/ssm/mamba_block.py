@@ -20,7 +20,6 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.layer_builder import build_layers_from_pattern
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers, parse_hybrid_pattern
 from megatron.core.transformer import TransformerConfig
@@ -135,18 +134,48 @@ class MambaStack(MegatronModule):
             pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
                 self.layer_type_list
             )
-        self._pp_layer_offset = pp_layer_offset
-
         # Build main decoder layers using shared layer builder
-        self.layers = build_layers_from_pattern(
-            pattern=''.join(self.layer_type_list),
-            submodules=submodules,
-            config=self.config,
-            pg_collection=pg_collection,
-            layer_offset=pp_layer_offset,
-            residual_in_fp32=residual_in_fp32,
-            is_mtp_layer=self.is_mtp_layer,
-        )
+        self.layers = nn.ModuleList()
+        for i, layer_type in enumerate(self.layer_type_list):
+            fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
+            with fp8_init_context:
+                if layer_type == LayerSymbols.MAMBA:
+                    layer = build_module(
+                        submodules.mamba_layer,
+                        config=self.config,
+                        residual_in_fp32=residual_in_fp32,
+                        layer_number=i + 1 + pp_layer_offset,
+                        pp_layer_offset=pp_layer_offset,
+                        pg_collection=pg_collection,
+                    )
+                elif layer_type == LayerSymbols.ATTENTION:
+                    # Transformer layers apply their own pp_layer_offset
+                    layer = build_module(
+                        submodules.attention_layer,
+                        config=self.config,
+                        layer_number=i + 1,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                    )
+                elif layer_type == LayerSymbols.MLP:
+                    # MLP layers apply their own pp_layer_offset
+                    layer = build_module(
+                        submodules.mlp_layer,
+                        config=self.config,
+                        layer_number=i + 1,
+                        pg_collection=pg_collection,
+                    )
+                elif layer_type == LayerSymbols.MOE:
+                    # MoE layers apply their own pp_layer_offset
+                    layer = build_module(
+                        submodules.moe_layer,
+                        config=self.config,
+                        layer_number=i + 1,
+                        pg_collection=pg_collection,
+                    )
+                else:
+                    assert False, "unexpected layer_type"
+            self.layers.append(layer)
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
