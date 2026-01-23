@@ -84,37 +84,36 @@ def main(pipeline_id: int, only_failing: bool):
                 ).glob("g*.json")
             )
 
-            if len(golden_values_sources) == 1:
-                golden_values_source = golden_values_sources[0]
-            else:
+            if len(golden_values_sources) < 1:
                 logger.info(
                     "Golden values for %s does not exist. Skip.", str(golden_values_sources)
                 )
                 continue
 
-            golden_values_source_name = golden_values_source.name
-            golden_values_source_name = golden_values_source_name.replace(
-                "generations", "golden_values"
-            )
-
-            golden_values_target = (
-                pathlib.Path("tests")
-                / "functional_tests"
-                / 'test_cases'
-                / job.stage
-                / job.name
-                / golden_values_source_name
-            )
-
-            if golden_values_source.exists():
-                pathlib.Path(golden_values_target.parent).mkdir(parents=True, exist_ok=True)
-                logger.info(
-                    "Move artifacts from %s to %s", golden_values_source, golden_values_target
+            for golden_values_source in golden_values_sources:
+                golden_values_source_name = golden_values_source.name
+                golden_values_source_name = golden_values_source_name.replace(
+                    "generations", "golden_values"
                 )
 
-                shutil.move(golden_values_source, golden_values_target)
-            else:
-                logger.info("Golden values for %s does not exist. Skip.", str(golden_values_source))
+                golden_values_target = (
+                    pathlib.Path("tests")
+                    / "functional_tests"
+                    / 'test_cases'
+                    / job.stage
+                    / job.name
+                    / golden_values_source_name
+                )
+
+                if golden_values_source.exists():
+                    pathlib.Path(golden_values_target.parent).mkdir(parents=True, exist_ok=True)
+                    logger.info(
+                        "Move artifacts from %s to %s", golden_values_source, golden_values_target
+                    )
+
+                    shutil.move(golden_values_source, golden_values_target)
+                else:
+                    logger.info("Golden values for %s does not exist. Skip.", str(golden_values_source))
 
             shutil.rmtree("tmp")
 

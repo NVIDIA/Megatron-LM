@@ -28,10 +28,11 @@ from megatron.core.inference.unified_memory import (
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
-from megatron.core.utils import get_attr_wrapped_model, internal_api
+from megatron.core.utils import get_attr_wrapped_model, get_pg_size, internal_api
 
 from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -270,6 +271,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
         pipeline_model_parallel_size: Optional[int] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         cache_mla_latent: bool = False,
         kv_lora_rank: Optional[int] = None,
         qk_pos_emb_head_dim: Optional[int] = None,
@@ -283,6 +285,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
+        persist_cuda_graphs: Optional[bool] = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -306,16 +309,43 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         if tensor_model_parallel_size is None:
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            tp_size = (
+                get_pg_size(pg_collection.tp)
+                if pg_collection is not None
+                else parallel_state.get_tensor_model_parallel_world_size()
+            )
         else:
             tp_size = tensor_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
         if pipeline_model_parallel_size is None:
-            pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+            pp_size = (
+                get_pg_size(pg_collection.pp)
+                if pg_collection is not None
+                else parallel_state.get_pipeline_model_parallel_world_size()
+            )
         else:
             pp_size = pipeline_model_parallel_size
+
+        # Cache the PP group we should use for PP collectives inside the context.
+        # If the model provides a pg_collection with a pp group, prefer it.
+        # Otherwise:
+        # - for PP=1 we don't need a PP group at all
+        # - for PP>1 we require Megatron parallel_state to be initialized
+        if pg_collection is not None and get_pg_size(pg_collection.pp) > 1:
+            self.pipeline_parallel_group = pg_collection.pp
+        elif pp_size > 1:
+            self.pipeline_parallel_group = parallel_state.get_pipeline_model_parallel_group()
+        else:
+            self.pipeline_parallel_group = None
+
+        if pg_collection is not None:
+            self.expert_model_parallel_group = pg_collection.ep
+        elif parallel_state.get_expert_model_parallel_world_size() > 1:
+            self.expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+        else:
+            self.expert_model_parallel_group = None
 
         # Mamba states.
         self.is_hybrid_model = mamba_inference_state_config is not None
@@ -384,6 +414,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Unified memory.
         self.unified_memory_level = unified_memory_level
+        self.persist_cuda_graphs = persist_cuda_graphs
         if unified_memory_level > 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
@@ -418,7 +449,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             torch.distributed.all_reduce(
                 block_count_tensor,
                 op=torch.distributed.ReduceOp.MIN,
-                group=parallel_state.get_pipeline_model_parallel_group(),
+                group=self.pipeline_parallel_group,
             )
             block_count = block_count_tensor.item()
 
@@ -498,7 +529,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph config list
-        is_expert_parallel = parallel_state.get_expert_model_parallel_world_size() > 1
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
@@ -516,6 +546,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
+        self.has_explicit_chunked_prefill_req = False
 
         # FlashInfer.
         if use_flashinfer_fused_rope is True:
@@ -1276,15 +1307,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if construct_graph_dimensions is not None:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
-        has_explicit_chunked_prefill_req = (
-            self.chunked_prefill_request_id != -1 and self.is_hybrid_model
-        )
-
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
             decode_req_count=self.num_decode_requests,
-            has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
+            has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
@@ -1292,6 +1319,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
+            ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
@@ -1318,7 +1346,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
                 decode_req_count=padded_decode_req_count,
-                has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
+                has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
             )
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
@@ -1349,6 +1377,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
+            assert not self.has_explicit_chunked_prefill_req
+
             # Treat some decode requests as prefill requests to fit the cuda graph batch dimension.
             if batch_dimensions.decode_req_count > self.padded_batch_dimensions.decode_req_count:
                 total_req = batch_dimensions.req_count
@@ -1358,7 +1388,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     token_count=batch_dimensions.token_count,
                     prefill_req_count=adjusted_prefill_req_count,
                     decode_req_count=adjusted_decode_req_count,
-                    has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
+                    has_explicit_chunked_prefill_req=False,
                 )
 
         self.active_attn_metadata["mha_metadata"].update(
@@ -1437,6 +1467,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
+        self.has_explicit_chunked_prefill_req = False
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
@@ -1733,8 +1764,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             next_tokens (torch.Tensor): Sampled tokens.
 
         Returns:
-            (tuple[int, int, torch.Tensor]) active_request_count, resume_request_count,
-            newly_paused_request_ids.
+            (tuple[int, torch.Tensor]) active_request_count, newly_paused_request_ids.
         """
 
         # Assign released blocks to paused requests.
@@ -1764,7 +1794,33 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
-        assert active_request_count > 0, "active_request_count == %d." % active_request_count
+
+        # Resume requests by assigning blocks and updating bookkeeping tensors.
+        if resume_request_count > 0:
+            assert torch.all(
+                self.request_last_kv_block_offset[
+                    self.paused_request_count : (self.paused_request_count + resume_request_count)
+                ]
+                == self.block_size_tokens - 1
+            ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step."
+
+            assert resume_request_count <= self.block_allocator.total_avail
+            block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
+            row_idx = torch.arange(
+                self.paused_request_count,
+                self.paused_request_count + resume_request_count,
+                device=torch.cuda.current_device(),
+            )
+            col_idx = self.request_kv_block_counts[
+                self.paused_request_count : (self.paused_request_count + resume_request_count)
+            ]
+            self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
+            self.request_kv_block_counts[
+                self.paused_request_count : (self.paused_request_count + resume_request_count)
+            ] += 1
+            self.request_last_kv_block_id[
+                self.paused_request_count : (self.paused_request_count + resume_request_count)
+            ] = block_ids
 
         # Remove resumed requests from newly_paused_request_ids. We do this by
         # truncating the end of newly_paused_request_ids, which works because we
@@ -1774,7 +1830,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if newly_paused_request_ids is not None and resume_request_count > 0:
             newly_paused_request_ids = newly_paused_request_ids[:-resume_request_count]
 
-        return active_request_count, resume_request_count, newly_paused_request_ids
+        return active_request_count, newly_paused_request_ids
 
     def evict_overflow_paused_requests(
         self, active_request_count: int, next_tokens: torch.Tensor
@@ -1869,15 +1925,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
         )
 
-        # Swap the chunked prefill request to the end of the active requests to
-        # obey the invariance.
-        if self.chunked_prefill_request_id != -1:
-            self._swap_book_keeping_tensors(
-                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
-                dst_idxs=torch.tensor([self.total_request_count - evict_request_count - 1]),
-                next_tokens=next_tokens,
-            )
-
         # Update tracking vars.
         self.paused_request_count -= evict_request_count
         self.total_request_count -= evict_request_count
@@ -1922,8 +1969,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         5. We identify requests that require a new block and add them to the paused requests (i.e move them left)
         6. Resume paused requests & evict overflowing paused requests.
         7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        8. We resume those requests by assigning blocks and updating bookkeeping tensors
-        9. We make relevant changes to the token bookkeeping tensors
+        8. We make relevant changes to the token bookkeeping tensors
 
         Args:
             active_requests_mask (Tensor): 1D Mask tensor marking active requests.
@@ -1942,6 +1988,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
+        self.has_explicit_chunked_prefill_req = False
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
@@ -1972,7 +2019,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset Mamba state.
             self.reset_mamba_state()
-
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -2031,9 +2077,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if self.chunked_prefill_request_id != -1:
                 # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-                active_requests_requiring_new_block[self.get_index_of_chunked_prefill_request()] = (
-                    0  # chunked prefill should not be paused
-                )
+                active_requests_requiring_new_block[
+                    self.get_index_of_chunked_prefill_request() - self.paused_request_count
+                ] = 0  # chunked prefill should not be paused
 
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()
@@ -2084,20 +2130,31 @@ class DynamicInferenceContext(BaseInferenceContext):
         # We determine how many requests we can resume and resume them
 
         # 6.a. First, resume temporarily paused requests.
-        active_request_count, resume_request_count, newly_paused_request_ids = (
-            self.resume_paused_requests(active_request_count, newly_paused_request_ids, next_tokens)
+        active_request_count, newly_paused_request_ids = self.resume_paused_requests(
+            active_request_count, newly_paused_request_ids, next_tokens
         )
 
         # 6.b. Evict requests that overflow the paused buffer.
         evict_request_ids = self.evict_overflow_paused_requests(active_request_count, next_tokens)
 
         # 6.c. Resume any additional requests.
-        active_request_count, resume_request_count, newly_paused_request_ids = (
-            self.resume_paused_requests(active_request_count, newly_paused_request_ids, next_tokens)
+        active_request_count, newly_paused_request_ids = self.resume_paused_requests(
+            active_request_count, newly_paused_request_ids, next_tokens
         )
 
+        assert active_request_count > 0, "active_request_count == %d." % active_request_count
+
+        # 6.d. Swap the chunked prefill request to the end of the active requests
+        # to obey the invariance.
+        if self.chunked_prefill_request_id != -1:
+            self._swap_book_keeping_tensors(
+                src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
+                dst_idxs=torch.tensor([self.total_request_count - 1]),
+                next_tokens=next_tokens,
+            )
+
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        self.total_request_count = active_request_count + self.paused_request_count
+        assert self.total_request_count == active_request_count + self.paused_request_count
 
         # All these active requests are in decode phase, so they need only 1 token per request
         self.active_token_count = active_request_count
@@ -2124,34 +2181,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             + 1
         ) % self.block_size_tokens
 
-        # 8. We resume those requests by assigning blocks and updating bookkeeping tensors
-        if resume_request_count > 0:
-            assert torch.all(
-                self.request_last_kv_block_offset[
-                    self.paused_request_count : (self.paused_request_count + resume_request_count)
-                ]
-                == 0
-            ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step. "
-
-            assert resume_request_count <= self.block_allocator.total_avail
-            block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
-            row_idx = torch.arange(
-                self.paused_request_count,
-                self.paused_request_count + resume_request_count,
-                device=torch.cuda.current_device(),
-            )
-            col_idx = self.request_kv_block_counts[
-                self.paused_request_count : (self.paused_request_count + resume_request_count)
-            ]
-            self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
-            self.request_kv_block_counts[
-                self.paused_request_count : (self.paused_request_count + resume_request_count)
-            ] += 1
-            self.request_last_kv_block_id[
-                self.paused_request_count : (self.paused_request_count + resume_request_count)
-            ] = block_ids
-
-        # 9. We make relevant changes to the token bookkeeping tensors
+        # 8. We make relevant changes to the token bookkeeping tensors
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
             self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
         )
