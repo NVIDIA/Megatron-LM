@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+
 from flask import Blueprint, current_app, jsonify
 
 logger = logging.getLogger(__name__)
@@ -15,15 +16,11 @@ try:
         Handles GET requests for service health.
         Checks if the inference client is initialized and reachable.
         """
-        status_response = {
-            "status": "ok",
-            "service": "Megatron Inference Server",
-            "ready": False
-        }
+        status_response = {"status": "ok", "service": "Megatron Inference Server", "ready": False}
 
         try:
             client = current_app.config.get('client')
-            
+
             if client is not None:
                 status_response["ready"] = True
                 return jsonify(status_response), 200
