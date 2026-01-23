@@ -3,7 +3,7 @@
 import functools
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -12,6 +12,7 @@ from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -38,7 +39,7 @@ except ImportError:
 
 
 # MOE logging
-_MOE_LAYER_WISE_LOGGING_TRACKER = {}
+_MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
 
 def switch_load_balancing_loss_func(
@@ -49,7 +50,8 @@ def switch_load_balancing_loss_func(
     num_experts: int,
     moe_aux_loss_coeff: float,
     fused: bool = False,
-):
+    padding_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Calculate the auxiliary loss for load balancing.
     Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
     and Global Load Balancing Loss(https://arxiv.org/abs/2501.11873) for details.
@@ -99,9 +101,20 @@ def switch_load_balancing_loss_func(
         topk (int): The number of experts selected for each token.
         num_experts (int): The number of experts.
         moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
+        fused (bool): Whether to use the fused version of the auxiliary loss.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+                                               Shape in [num_tokens]. True for valid tokens,
+                                               False for padding tokens. Defaults to None.
+
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
     """
+    # Apply padding mask to probs if provided
+    if padding_mask is not None:
+        # padding_mask: [num_tokens], probs: [num_tokens, num_experts]
+        mask_expanded = padding_mask.unsqueeze(-1)
+        probs = probs * mask_expanded
+
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
@@ -121,23 +134,48 @@ def switch_load_balancing_loss_func(
     return aux_loss
 
 
-def z_loss_func(logits, z_loss_coeff):
+def z_loss_func(
+    logits: torch.Tensor, z_loss_coeff: float, padding_mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """Encourages the router's logits to remain small to enhance stability.
     Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
 
     Args:
         logits (torch.Tensor): The logits of the router.
+        z_loss_coeff (float): The coefficient for the z-loss.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
 
     Returns:
         torch.Tensor: The logits after applying the z-loss.
     """
+    logsum = torch.logsumexp(logits, dim=-1)
+    z_loss_values = torch.square(logsum)
 
-    z_loss = torch.mean(torch.square(torch.logsumexp(logits, dim=-1))) * z_loss_coeff
+    if padding_mask is not None:
+        # Invert padding_mask: True (padding) -> 0, False (valid) -> 1
+        valid_mask = ~padding_mask
+        # Only compute z_loss for valid (non-padding) tokens
+        z_loss_values = z_loss_values * valid_mask
+        # Compute mean over valid tokens only
+        num_valid_tokens = valid_mask.sum()
+        z_loss = z_loss_values.sum() / torch.clamp(num_valid_tokens, min=1.0) * z_loss_coeff
+    else:
+        z_loss = torch.mean(z_loss_values) * z_loss_coeff
     return z_loss
 
 
-def sinkhorn(cost: torch.Tensor, tol: float = 0.0001):
-    """Sinkhorn based MoE routing function"""
+def sinkhorn(cost: torch.Tensor, tol: float = 0.0001) -> torch.Tensor:
+    """Sinkhorn based MoE routing function.
+
+    Args:
+        cost (torch.Tensor): The cost tensor.
+        tol (float): The tolerance for the Sinkhorn algorithm.
+
+    Returns:
+        torch.Tensor: The routing probabilities.
+    """
     cost = torch.exp(cost)
     d0 = torch.ones(cost.size(0), device=cost.device, dtype=cost.dtype)
     d1 = torch.ones(cost.size(1), device=cost.device, dtype=cost.dtype)
@@ -153,7 +191,9 @@ def sinkhorn(cost: torch.Tensor, tol: float = 0.0001):
     return d1 * cost * d0.unsqueeze(1)
 
 
-def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_capacity=None):
+def get_capacity(
+    num_tokens: int, num_experts: int, capacity_factor: float, min_capacity: Optional[int] = None
+) -> int:
     """
     Calculate the capacity of each expert.
 
@@ -164,12 +204,34 @@ def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_
         min_capacity (int, optional): Minimum capacity. Defaults to None.
 
     Returns:
-        Tensor: Capacity of each expert.
+        int: Capacity of each expert.
     """
     capacity = math.ceil((num_tokens / num_experts) * capacity_factor)
     if min_capacity is not None and capacity < min_capacity:
         capacity = min_capacity
     return capacity
+
+
+def get_tokens_per_expert_and_token_count(
+    routing_map: torch.Tensor,
+    reduce_group: torch.distributed.ProcessGroup,
+    topk: int = None,
+    with_padding_mask: bool = False,
+) -> torch.Tensor:
+    """
+    Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
+    """
+    local_tokens_per_expert = routing_map.sum(dim=0)
+    global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+        local_tokens_per_expert, reduce_group
+    )
+    if with_padding_mask:
+        local_num_tokens = local_tokens_per_expert.sum() / topk
+        total_num_tokens = global_tokens_per_expert.sum() / topk
+    else:
+        local_num_tokens = routing_map.shape[0]
+        total_num_tokens = local_num_tokens * reduce_group.size()
+    return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
 
 class MoEAuxLossAutoScaler(torch.autograd.Function):
@@ -178,7 +240,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
     main_loss_backward_scale: Optional[torch.Tensor] = None
 
     @staticmethod
-    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
+    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
         """Preserve the aux_loss by storing it in the context to avoid garbage collection.
 
         Args:
@@ -192,7 +254,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute and scale the gradient for auxiliary loss..
 
         Args:
@@ -212,7 +274,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         return grad_output, scaled_aux_loss_grad
 
     @staticmethod
-    def set_loss_scale(scale: torch.Tensor):
+    def set_loss_scale(scale: torch.Tensor) -> None:
         """set the scale of the aux loss.
 
         Args:
@@ -226,13 +288,13 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
 
 
 def permute(
-    tokens,
-    routing_map,
+    tokens: torch.Tensor,
+    routing_map: torch.Tensor,
     probs: Optional[torch.Tensor] = None,
     num_out_tokens: Optional[int] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
-):
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """Permute the tokens and probs based on the mask.
     Tokens with the same designated expert will be grouped together.
     The shape of mask is [tokens, num_experts], it indicates which experts were selected
@@ -252,6 +314,10 @@ def permute(
                                        and pads the number of tokens to the expert capacity.
                                        If set to true, routing_map has a fixed number of non-zeros
                                        in each column.
+
+    Returns:
+        Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+            The permuted tokens, permuted probs, and sorted indices.
     """
     if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
@@ -320,7 +386,7 @@ def unpermute(
     routing_map: Optional[torch.Tensor] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
-):
+) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
     will also apply them to the tokens before restoring the order.
@@ -408,8 +474,20 @@ def sort_chunks_by_idxs(
     sorted_idxs: torch.Tensor,
     probs: Optional[torch.Tensor] = None,
     fused: bool = False,
-):
-    """Split and sort the input tensor based on the split_sizes and sorted indices."""
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Split and sort the input tensor based on the split_sizes and sorted indices.
+
+    Args:
+        input (torch.Tensor): The input tensor.
+        split_sizes (torch.Tensor): The split sizes.
+        sorted_idxs (torch.Tensor): The sorted indices.
+        probs (torch.Tensor, optional): The probs tensor. Defaults to None.
+        fused (bool, optional): Whether to use the fused version of the sort_chunks_by_idxs
+                                function. Defaults to False.
+
+    Returns:
+        Tuple[torch.Tensor, Optional[torch.Tensor]]: The sorted output tensor and permuted probs.
+    """
     if fused and probs is None:
         if not HAVE_TE or fused_sort_chunks_by_index is None:
             raise ValueError(
@@ -442,7 +520,7 @@ def group_limited_topk(
     num_experts: int,
     num_groups: int,
     group_topk: int,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Perform top-k routing on a subset of expert groups.
 
     When using group-limited routing:
@@ -538,19 +616,26 @@ def topk_routing_with_score_function(
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
+
     Args:
         logits (torch.Tensor): Logits tensor.
         topk (int): The number of experts to select for each token.
-        use_pre_softmax (bool): Whether to apply softmax or sigmoid before top-k selection.
-        num_groups (int): Number of groups for routed experts.
-        group_topk (int): Number of selected groups for each token.
-        scaling_factor (float): Scaling factor of routing score in top-k selection.
-        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
-        expert_bias (torch.Tensor): The bias added to logits for expert routing.
+        use_pre_softmax (bool, optional): Whether to apply softmax or sigmoid before top-k
+                                          selection. Defaults to False.
+        num_groups (int, optional): Number of groups for routed experts. Defaults to None.
+        group_topk (int, optional): Number of selected groups for each token. Defaults to None.
+        scaling_factor (float, optional): Scaling factor of routing score in top-k selection.
+                                         Defaults to None.
+        score_function (str, optional): The score function to use. Can be either "softmax" or
+                                        "sigmoid". Defaults to "softmax".
+        expert_bias (torch.Tensor, optional): The bias added to logits for expert routing.
+                                              Defaults to None.
+        fused (bool, optional): Whether to use the fused version. Defaults to False.
+
     Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        Tuple[torch.Tensor, torch.Tensor]:
             - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
               the routing probabilities for each token to each expert.
             - routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
@@ -575,7 +660,25 @@ def topk_routing_with_score_function(
             expert_bias=expert_bias,
         )
 
-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+    def compute_topk(
+        scores: torch.Tensor,
+        topk: int,
+        num_groups: Optional[int] = None,
+        group_topk: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the top-k indices for the given scores.
+
+        Args:
+            scores (torch.Tensor): The scores tensor.
+            topk (int): The number of top-k indices to compute.
+            num_groups (int, optional): The number of groups to compute the top-k indices for.
+                                        Defaults to None.
+            group_topk (int, optional): The number of top-k indices to compute for each group.
+                                        Defaults to None.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: The top-k indices and the top-k scores.
+        """
         if group_topk:
             return group_limited_topk(
                 scores=scores,
@@ -630,35 +733,52 @@ def topk_routing_with_score_function(
 
 
 def compute_routing_scores_for_aux_loss(
-    logits: torch.Tensor, topk: int, score_function: str, fused: bool = False
-):
+    logits: torch.Tensor,
+    topk: int,
+    score_function: str,
+    fused: bool = False,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute routing scores based on the score function.
 
     Args:
         logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
+        topk (int): The number of top-k indices to compute.
+        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
+        fused (bool, optional): Whether to use the fused version. Defaults to False.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+                                               Shape in [num_tokens]. True for valid tokens,
+                                               False for padding tokens. Defaults to None.
 
     Returns:
-        torch.Tensor: The normalized routing scores.
+        Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
     """
     if fused:
         if not HAVE_TE or fused_compute_score_for_moe_aux_loss is None:
             raise ValueError(
                 "fused_compute_score_for_moe_aux_loss is not available. Please install TE >= 2.6.0."
             )
-        return fused_compute_score_for_moe_aux_loss(
+        routing_map, scores = fused_compute_score_for_moe_aux_loss(
             logits=logits, topk=topk, score_function=score_function
         )
-
-    if score_function == "softmax":
-        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-    elif score_function == "sigmoid":
-        scores = torch.sigmoid(logits)
-        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
     else:
-        raise ValueError(f"Invalid score_function: {score_function}")
+        if score_function == "softmax":
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        elif score_function == "sigmoid":
+            scores = torch.sigmoid(logits)
+            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        else:
+            raise ValueError(f"Invalid score_function: {score_function}")
 
-    _, top_indices = torch.topk(scores, k=topk, dim=1)
-    routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+        _, top_indices = torch.topk(scores, k=topk, dim=1)
+        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+    # Apply padding mask to scores if provided
+    if padding_mask is not None:
+        # Invert padding_mask and make True indicates valid tokens
+        valid_mask = (~padding_mask).unsqueeze(-1)
+        routing_map = routing_map * valid_mask
+        scores = scores * valid_mask
     return routing_map, scores
 
 
@@ -669,7 +789,7 @@ def apply_router_token_dropping(
     capacity_factor: float,
     drop_policy: str = "probs",
     pad_to_capacity: bool = False,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply token dropping to top-k expert selection.
 
     This function enforces expert capacity limits by dropping tokens that exceed
@@ -682,8 +802,9 @@ def apply_router_token_dropping(
             indicating which experts were selected for each token.
         router_topk (int): Number of experts selected per token.
         capacity_factor (float): The capacity factor of each expert.
-        drop_policy (str): Policy to drop tokens - "probs" or "position".
-        pad_to_capacity (bool): Whether to pad to capacity.
+        drop_policy (str, optional): Policy to drop tokens - "probs" or "position".
+                                     Defaults to "probs".
+        pad_to_capacity (bool, optional): Whether to pad to capacity. Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -735,18 +856,20 @@ def save_to_aux_losses_tracker(
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
     avg_group: Optional[torch.distributed.ProcessGroup] = None,
     reduce_group_has_dp: bool = False,
-):
+) -> None:
     """Save the auxiliary loss for logging.
     Args:
         name (str): The name of the loss.
         loss (torch.Tensor): The loss tensor.
         layer_number (int): Layer index of the loss.
         num_layers (int): The number of total layers.
-        reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
-        avg_group (torch.distributed.ProcessGroup): The group for averaging the loss.
-        reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
+        reduce_group (torch.distributed.ProcessGroup, optional): The group for reducing the loss.
+                                                                 Defaults to None.
+        avg_group (torch.distributed.ProcessGroup, optional): The group for averaging the loss.
+                                                              Defaults to None.
+        reduce_group_has_dp (bool, optional): Whether the reduce group has data parallel ranks.
             Set this to True if the reduce group has data parallel ranks. This flag is used to
-            ensure the correct reduction in aux loss tracking.
+            ensure the correct reduction in aux loss tracking. Defaults to False.
     """
     # Skip aux loss logging if layer_number is None.
     if layer_number is None:
@@ -762,7 +885,7 @@ def save_to_aux_losses_tracker(
     tracker[name]["reduce_group_has_dp"] = reduce_group_has_dp
 
 
-def clear_aux_losses_tracker():
+def clear_aux_losses_tracker() -> None:
     """Clear the auxiliary losses."""
     tracker = get_moe_layer_wise_logging_tracker()
     for name in tracker:
@@ -771,8 +894,15 @@ def clear_aux_losses_tracker():
 
 def reduce_aux_losses_tracker_across_ranks(
     track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
-):
-    """Collect and reduce the auxiliary losses across ranks."""
+) -> None:
+    """Collect and reduce the auxiliary losses across ranks.
+
+    Args:
+        track_names (Optional[List[str]], optional):
+            The names of the losses to track. Defaults to None.
+        pg_collection (Optional[ProcessGroupCollection], optional):
+            The process group collection. Defaults to None.
+    """
     tracker = get_moe_layer_wise_logging_tracker()
     if track_names is None:
         track_names = tracker.keys()
@@ -810,18 +940,38 @@ def reduce_aux_losses_tracker_across_ranks(
 def track_moe_metrics(
     loss_scale: float,
     iteration: int,
-    writer,
-    wandb_writer=None,
-    total_loss_dict=None,
-    per_layer_logging=False,
+    writer: Optional["SummaryWriter"] = None,
+    wandb_writer: Optional["wandb.Run"] = None,
+    total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
+    per_layer_logging: bool = False,
     force_initialize: bool = False,
     track_names: Optional[List[str]] = None,
     num_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
-):
-    """Track the MoE metrics for logging."""
+) -> None:
+    """Track the MoE metrics for logging.
+
+    Args:
+        loss_scale (float): The loss scale.
+        iteration (int): The iteration.
+        writer (SummaryWriter, optional): The tensorboard writer. Defaults to None.
+        wandb_writer (wandb.Run, optional): The wandb writer. Defaults to None.
+        total_loss_dict (dict[str, torch.Tensor], optional): The total loss dictionary.
+                                                             Defaults to None.
+        per_layer_logging (bool, optional): Whether to log per layer. Defaults to False.
+        force_initialize (bool, optional): Whether to force initialize the tracker.
+                                           Defaults to False.
+        track_names (List[str], optional): The names of the losses to track. Defaults to None.
+        num_layers (int, optional): The number of layers. Defaults to None.
+        moe_layer_freq (Union[int, List[int]], optional): The frequency of the MoE layers.
+                                                          Defaults to None.
+        mtp_num_layers (int, optional): The number of layers in the model parallel group.
+                                        Defaults to None.
+        pg_collection (ProcessGroupCollection, optional): The process group collection.
+                                                          Defaults to None.
+    """
     # Aux loss logging
     tracker = get_moe_layer_wise_logging_tracker()
     # Initialize the tracker if force_initialize is True
@@ -884,13 +1034,18 @@ def track_moe_metrics(
     clear_aux_losses_tracker()
 
 
-def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_rate):
+def get_updated_expert_bias(
+    tokens_per_expert: torch.Tensor, expert_bias: torch.Tensor, expert_bias_update_rate: float
+) -> torch.Tensor:
     """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
 
     Args:
         tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
         expert_bias (torch.Tensor): The bias for each expert.
         expert_bias_udpate_rate (float): The update rate for the expert bias.
+
+    Returns:
+        torch.Tensor: The updated expert bias.
     """
     with torch.no_grad():
         # All Reduce Across TPxCPxDP group
@@ -905,13 +1060,20 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
         return updated_expert_bias
 
 
-def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
+def maybe_move_tensor_to_cpu(
+    tensor: torch.Tensor, as_numpy: bool = False, record_stream: bool = False
+) -> torch.Tensor:
     """Move a tensor to CPU if it is on GPU.
     Args:
-        tensor (torch.Tensor or None): The tensor to move to CPU.
-        as_numpy (bool): Whether to convert the tensor to a numpy array.
-        record_stream (bool): Whether to record the stream of the tensor, to prevent memory leak
-                              when the DtoH data transfer is on a side stream.
+        tensor (torch.Tensor): The tensor to move to CPU.
+        as_numpy (bool, optional): Whether to convert the tensor to a numpy array.
+                                   Defaults to False.
+        record_stream (bool, optional): Whether to record the stream of the tensor, to prevent
+                                        memory leak when the DtoH data transfer is on a side
+                                        stream. Defaults to False.
+
+    Returns:
+        torch.Tensor: The tensor moved to CPU.
     """
     if torch.is_tensor(tensor) and tensor.is_cuda:
         cpu_tensor = tensor.to(torch.device("cpu"), non_blocking=True)
@@ -923,7 +1085,7 @@ def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
     return tensor
 
 
-def get_moe_layer_wise_logging_tracker():
+def get_moe_layer_wise_logging_tracker() -> dict:
     """Return the moe layer wise tracker."""
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     return _MOE_LAYER_WISE_LOGGING_TRACKER
@@ -939,25 +1101,43 @@ class RandomSTE(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, logits):
+    def forward(ctx, logits: torch.Tensor) -> torch.Tensor:
         """
         Forward pass returns random logits with rank-specific seed.
+
+        Args:
+            logits (torch.Tensor): The logits.
+
+        Returns:
+            torch.Tensor: The random logits.
         """
         with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
             random_logits = logits.clone().normal_()
         return random_logits
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
         """
         Backward pass propagates the gradient for logits.
+
+        Args:
+            grad_output (torch.Tensor): The gradient output.
+
+        Returns:
+            torch.Tensor: The gradient input.
         """
         return grad_output
 
 
-def apply_random_logits(logits):
+def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
     """
     Apply the RandomSTE function to the logits.
+
+    Args:
+        logits (torch.Tensor): The logits.
+
+    Returns:
+        torch.Tensor: The random logits.
     """
     return RandomSTE.apply(logits)
 
@@ -969,10 +1149,23 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype
-    ):
+        ctx,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        router_dtype: torch.dtype,
+    ) -> torch.Tensor:
         """
         Forward pass of the RouterGatingLinearFunction function.
+
+        Args:
+            inp (torch.Tensor): The input tensor.
+            weight (torch.Tensor): The weight tensor.
+            bias (torch.Tensor): The bias tensor. Could be None.
+            router_dtype (torch.dtype): The router dtype.
+
+        Returns:
+            torch.Tensor: The output tensor.
         """
         ctx.save_for_backward(inp, weight, bias)
         ctx.router_dtype = router_dtype
@@ -995,9 +1188,18 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
         """
         Backward pass of the RouterGatingLinearFunction function.
+
+        Args:
+            grad_output (torch.Tensor): The gradient output.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
+                The gradient input, gradient weight, gradient bias, and None.
         """
         inp, weight, bias = ctx.saved_tensors
         inp_shape = inp.shape
@@ -1024,18 +1226,34 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 
 
 def router_gating_linear(
-    inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype
-):
+    inp: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], router_dtype: torch.dtype
+) -> torch.Tensor:
     """
     Customized linear layer for router gating.
     This linear layer accepts bfloat16 input and weight, and can return output with router_dtype.
     It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
+
+    Args:
+        inp (torch.Tensor): The input tensor.
+        weight (torch.Tensor): The weight tensor.
+        bias (torch.Tensor): The bias tensor. Could be None.
+        router_dtype (torch.dtype): The router dtype.
+
+    Returns:
+        torch.Tensor: The output tensor.
     """
     return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
 
 
-def get_align_size_for_quantization(config: TransformerConfig):
-    """Get the alignment size for quantization."""
+def get_align_size_for_quantization(config: TransformerConfig) -> int:
+    """Get the alignment size for quantization.
+
+    Args:
+        config (TransformerConfig): The configuration.
+
+    Returns:
+        int: The alignment size for quantization.
+    """
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
     elif config.fp4:
@@ -1045,7 +1263,7 @@ def get_align_size_for_quantization(config: TransformerConfig):
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
 # Initialize process groups with the global parallel_state.
-def get_default_pg_collection():
+def get_default_pg_collection() -> ProcessGroupCollection:
     """Get the default process groups for MoE.
 
     Returns:
@@ -1080,7 +1298,7 @@ class MoECudaGraphPartialCaptureSignal(Exception):
 
     def get_early_return_outputs(
         self, hidden_states: torch.Tensor, shared_expert_output: torch.Tensor
-    ):
+    ) -> List[torch.Tensor]:
         """
         Get the CUDA graph early return outputs for the MoE layer, including the intermediate
         tensors and the intermediate attributes of the token dispatcher.
@@ -1232,10 +1450,6 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
             Otherwise, we execute the original function and check if we should raise a signal to
             early return in CUDA graph capture.
             """
-
-            if moe_layer.config.cuda_graph_impl != "transformer_engine":
-                return func(moe_layer, *args, **kwargs)
-
             # The non-cudagraph codepath just calls the original function.
             if not is_graph_capturing() and moe_layer.cudagraph_tensor_store.is_empty():
                 return func(moe_layer, *args, **kwargs)

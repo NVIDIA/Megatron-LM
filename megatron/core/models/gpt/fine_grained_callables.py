@@ -131,13 +131,19 @@ class PreProcessNode(ScheduleNode):
         if not self.gpt_model.pre_process:
             self.chunk_state.decoder_input = self.gpt_model.decoder.input_tensor
         # Run GPTModel._preprocess
-        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
-            self.gpt_model._preprocess(
-                input_ids=self.chunk_state.input_ids,
-                position_ids=self.chunk_state.position_ids,
-                decoder_input=self.chunk_state.decoder_input,
-                packed_seq_params=self.chunk_state.packed_seq_params,
-            )
+        (
+            decoder_input,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+            padding_mask,
+        ) = self.gpt_model._preprocess(
+            input_ids=self.chunk_state.input_ids,
+            position_ids=self.chunk_state.position_ids,
+            decoder_input=self.chunk_state.decoder_input,
+            packed_seq_params=self.chunk_state.packed_seq_params,
+            padding_mask=self.chunk_state.padding_mask,
         )
 
         # Saved for later use
@@ -146,6 +152,7 @@ class PreProcessNode(ScheduleNode):
         self.chunk_state.rotary_pos_cos = rotary_pos_cos
         self.chunk_state.rotary_pos_sin = rotary_pos_sin
         self.chunk_state.sequence_len_offset = sequence_len_offset
+        self.chunk_state.padding_mask = padding_mask
         return decoder_input
 
 
@@ -545,9 +552,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
-        output = layer.mlp.combine(output)
-        output = layer.mlp.postprocess(output, shared_expert_output)
-
+        output = layer.mlp.combine(output, shared_expert_output)
         mlp_output_with_bias = (output, None)
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()
