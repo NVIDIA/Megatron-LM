@@ -1,14 +1,18 @@
 # GPT-OSS Training Tutorial
 
-## Setup
-
 ## Step 0: Install Dependencies
+
+### Using Megatron Bridge
+
+[Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)
+
+Megatron bridge provides a quick and convenient way to convert HuggingFace checkpoints to the Megatron format used by Megatron-LM. Follow the instructions in the [Megatron-Bridge Installation](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/README.md#-installation) to run the nemo docker container and convert checkpoints (via mounted volumes - make sure that the huggingface cache location AND the megatron checkpoint locations are properly mounted, otherwise you may not be saving the converted model to disk correctly).
+
+Below is an example of how to use Megatron-Bridge inside the pytorch container to convert a HuggingFace model checkpoint to Megatron format.
 
 Reference: [Megatron-Bridge Dockerfile](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/docker/Dockerfile.ci)
 
-### Install megatron bridge
-
-Inside the pytorch container,
+Inside the [pytorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) run the following commands to install Megatron-Bridge:
 ```bash
 cd /opt
 git clone --recursive https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
