@@ -10,6 +10,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -21,12 +22,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import (
-    divide,
-    get_mamba_inference_state_config_from_model,
-    is_fa_min_version,
-    is_torch_min_version,
-)
+from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -344,9 +340,7 @@ class TestMambaWithDynamicInference:
         self.model.eval()
         config = self.model.config
 
-        mamba_inference_state_config = get_mamba_inference_state_config_from_model(
-            self.model.module
-        )
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model.module)
 
         inference_context = DynamicInferenceContext(
             model_config=self.model.config,
