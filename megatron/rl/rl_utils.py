@@ -897,7 +897,6 @@ def prepare_trajectories(
             if isinstance(rollout, TokenRollout)
             else tokenizer.tokenize(rollout.trajectory)
         )
-        assert len(all_turns_trajectories) == 1, "Multiturn support is not implemented yet. WIP."
         for turn_idx, trajectory in enumerate(all_turns_trajectories):
             inf_logprobs = rollout.logprobs[turn_idx]
             generation_mask = rollout.generation_mask[turn_idx] if isinstance(rollout, TokenRollout) else None

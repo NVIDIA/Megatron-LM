@@ -155,6 +155,66 @@ def test_prepare_trajectories(mock_rank):
 
 
 @patch('torch.distributed.get_rank', return_value=0)
+def test_prepare_multiturn_trajectories(mock_rank):
+    # Make sure sequence packing is disabled for this test
+    import megatron.training.global_vars as global_vars
+
+    args = type('Args', (), {})()
+    args.rl_inference_logprobs_is_correction = True
+    global_vars.set_args(args)
+
+    tokenizer = MockTokenizer()
+    r1 = TokenRollout(
+        trajectory=[[1, 2, tokenizer.eod], [1, 2, 3, tokenizer.eod]],
+        reward=3.14,
+        generation_mask=[[False, True, True], [False, False, True, True]],
+        logprobs=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6, 0.7]],
+        env_id='MEGAENV',
+        problem_id="2",
+    )
+    r2 = TokenRollout(
+        trajectory=[[1, 2, tokenizer.eod], [1, 2, 3, tokenizer.eod]],
+        reward=3.14,
+        generation_mask=[[False, True, True], [False, False, True, True]],
+        logprobs=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6, 0.7]],
+        env_id='MEGAENV',
+        problem_id="2",
+    )
+    rollouts = [r1, r2]
+    seq_len = 7
+
+    trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
+        rollouts, tokenizer, seq_len, sequence_packing=False, skip_bos_token=False
+    )
+
+    # Check that inference logprobs are being returned.
+    torch.testing.assert_close(inference_logprobs[0], torch.tensor([0.1, 0.2, 0.3]))
+    torch.testing.assert_close(inference_logprobs[1], torch.tensor([0.4, 0.5, 0.6, 0.7]))
+    torch.testing.assert_close(inference_logprobs[2], torch.tensor([0.1, 0.2, 0.3]))
+    torch.testing.assert_close(inference_logprobs[3], torch.tensor([0.4, 0.5, 0.6, 0.7]))
+
+    expected_mask = torch.tensor(
+        [
+            [False, True, True, False, False, False, False],
+            [False, False, True, True, False, False, False],
+            [False, True, True, False, False, False, False],
+            [False, False, True, True, False, False, False],
+        ]
+    )
+    torch.testing.assert_close(genmask, expected_mask)
+
+    expected_trajs = torch.tensor(
+        [
+            [1, 2, 43, 42, 42, 42, 42],
+            [1, 2, 3, 43, 42, 42, 42],
+            [1, 2, 43, 42, 42, 42, 42],
+            [1, 2, 3, 43, 42, 42, 42],
+        ]
+    )
+    torch.testing.assert_close(trajs, expected_trajs)
+
+
+@patch('torch.distributed.get_rank', return_value=0)
 def test_prepare_trajectories_with_packing(mock_rank):
     """Test that rollouts data is properly prepared with sequence packing enabled."""
     # Initialize args for sequence packing
