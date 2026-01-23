@@ -1616,6 +1616,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         metadata_types = req.get_metadata_types()
         for m, m_type in zip(metadata, metadata_types):
             label, _, _ = m_type
+            if not isinstance(m, torch.Tensor):
+                m = torch.as_tensor(
+                    m,
+                    device=self.request_metadata[label].device,
+                    dtype=self.request_metadata[label].dtype,
+                )
+
             self.request_metadata[label][current_id] = m
 
         # Handle length and block assignments.
