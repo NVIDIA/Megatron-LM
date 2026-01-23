@@ -836,12 +836,13 @@ def get_reformulation_metadata(
     """
     fs_reader = _get_filesystem_reader(checkpoint_dir)
     ckpt_metadata = fs_reader.read_metadata()
+    mcore_data = getattr(ckpt_metadata, 'mcore_data', {})
     reformulation_metadata = {}
     for sh_ten in nested_values(sharded_state_dict):
         if not is_nd_flattened_tensor(sh_ten):
             continue
         try:
-            ckpt_global_shape = ckpt_metadata.mcore_data[sh_ten.key][
+            ckpt_global_shape = mcore_data[sh_ten.key][
                 'nd_reformulated_orig_global_shape'
             ]
         except KeyError as e:
@@ -853,7 +854,7 @@ def get_reformulation_metadata(
                 continue
             raise CheckpointingException(
                 f'Cannot find global shape metadata for N-D flattened tensor {sh_ten} '
-                f'in checkpoint metadata: {ckpt_metadata.mcore_data}'
+                f'in checkpoint metadata: {mcore_data}'
             ) from e
 
         reformulation_metadata[sh_ten.key] = TensorReformulationMetadata(
