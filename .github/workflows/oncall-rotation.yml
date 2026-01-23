@@ -1,0 +1,54 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Oncall Rotation
+
+on:
+  schedule:
+    # Runs at 09:00 UTC every Wednesday
+    - cron: '0 9 * * 3'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rotate-schedule:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Rotate Schedule
+        env:
+          # Token to read org team members. Needs read:org scope.
+          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          uv run python .github/scripts/oncall_manager.py rotate
+
+      - name: Commit and Push changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/oncall_schedule.json
+          git commit -m "chore: rotate oncall schedule" || echo "No changes to commit"
+          git push origin HEAD:main
+

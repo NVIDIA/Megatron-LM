@@ -40,6 +40,8 @@ jobs:
   build-test-publish-wheels:
     needs: [pre-flight]
     uses: ./.github/workflows/_build_test_publish_wheel.yml
+    with:
+      no-publish: true
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}

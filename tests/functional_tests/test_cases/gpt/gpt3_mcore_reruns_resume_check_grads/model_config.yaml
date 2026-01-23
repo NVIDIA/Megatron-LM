@@ -85,6 +85,7 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --eval-interval: 1000
   --ckpt-format: torch_dist
   --dist-ckpt-strictness: log_all # backward compatibility for TE changes
+  --dist-ckpt-optim-fully-reshardable: true
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-enabled_v2
   # data settings
@@ -101,8 +102,6 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
-  # Needed for easy access to optimizer states
-  --dist-ckpt-save-pre-mcore-014: true
   # rerun settings
   --rerun-mode: validate_results
 MODEL_ARGS:

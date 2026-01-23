@@ -44,7 +44,7 @@ def run_mcore_engine(
         return_log_probs=return_output_log_probs,
         num_tokens_to_generate=tokens_to_generate,
         top_n_logprobs=top_n_logprobs,
-        return_prompt_top_n_logprobs=True,
+        skip_prompt_log_probs=False,
     )
 
     tokenizer = engine.controller.tokenizer
@@ -101,8 +101,10 @@ def run_mcore_engine(
         if sampling_params.return_segments:
             response_dict["segments"] = [x.segments for x in result]
         if sampling_params.top_n_logprobs > 0:
-            # TODO(ksanthanam): Support disabling `return_prompt_top_n_logprobs`
-            assert sampling_params.return_prompt_top_n_logprobs
+            # TODO(ksanthanam): Support enabling `skip_prompt_log_probs`
+            assert (
+                sampling_params.return_prompt_top_n_logprobs
+            ), "skip_prompt_log_probs must be False"
             response_dict["top_n_logprobs"] = [
                 x.prompt_top_n_logprobs + x.generated_top_n_logprobs for x in result
             ]
