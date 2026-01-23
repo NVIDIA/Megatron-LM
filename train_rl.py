@@ -25,6 +25,8 @@ from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
 
+from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
+
 stimer = StragglerDetector()
 
 import logging
@@ -254,6 +256,12 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
+
+    if packed_seq_params is None:
+        packed_seq_params = get_default_packed_seq_params(
+            seq_length=tokens.shape[1],
+            device=tokens.device,
+        )
 
     # Clear RoPE cache to avoid inference tensor errors
     try:

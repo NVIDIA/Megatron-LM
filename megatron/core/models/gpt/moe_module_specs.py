@@ -88,6 +88,8 @@ def get_moe_module_spec_for_backend(
 
     # MoE module spec
     moe_module_spec = ModuleSpec(
-        module=moe_layer_class, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
+        module=moe_layer_class
+        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
+        metainfo={"fuse_pre_mlp_layernorm": False},
     )
     return moe_module_spec
