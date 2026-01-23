@@ -395,7 +395,7 @@ def create_empty_bins(
         empty_packing_info_entries,
     )
 
-def get_default_packed_seq_params(seq_length: int, max_sequences_permbin: int, device: torch.device) -> PackedSeqParams:
+def get_default_packed_seq_params(seq_length: int, max_sequences_per_bin: int, device: torch.device) -> PackedSeqParams:
     """Create a default PackedSeqParams that acts as no-op for a single sequence.
 
     This ensures CUDA graph signature consistency when packed_seq_params
@@ -414,7 +414,7 @@ def get_default_packed_seq_params(seq_length: int, max_sequences_permbin: int, d
     args = get_args()
 
     # Pad to the maximum number of sequences in the bin for the attention kernel.
-    cu_seqlens = torch.full((max_sequences_per_bin), seq_length, dtype=torch.int32, device=device)
+    cu_seqlens = torch.full((max_sequences_per_bin,), seq_length, dtype=torch.int32, device=device)
     cu_seqlens[0] = 0
 
     return PackedSeqParams(
