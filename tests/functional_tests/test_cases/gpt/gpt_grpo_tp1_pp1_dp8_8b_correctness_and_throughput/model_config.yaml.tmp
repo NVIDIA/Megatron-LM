@@ -3,14 +3,15 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
-TEST_TYPE: frozen-start
+  N_REPEAT: 1
+TEST_TYPE: regular
 MODE: rl
 MODEL_ARGS:
   --ckpt-format: torch_dist
   --seq-length: 1024
   --inference-max-seq-length: 1024
   --inference-max-batch-size: 256
-  --load: ${CHECKPOINT_LOAD_PATH}/model/gpt/qwen3-8b-dist
+  --load: /tmp/checkpoints//model/gpt/qwen3-8b-dist
   --untie-embeddings-and-output-weights: true
   --num-layers: 36
   --hidden-size: 4096
@@ -34,9 +35,9 @@ MODEL_ARGS:
   --no-masked-softmax-fusion: true
   --attention-softmax-in-fp32: true
   --tokenizer-type: HuggingFaceTokenizer
-  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/gpt/qwen3-8b-dist/tokenizer
+  --tokenizer-model: /tmp/checkpoints//model/gpt/qwen3-8b-dist/tokenizer
   --langrl-inference-server-type: inplace_megatron_chat
-  --langrl-inference-server-conversation-template: ${CHECKPOINT_LOAD_PATH}/model/gpt/qwen3-8b-dist/tokenizer
+  --langrl-inference-server-conversation-template: /tmp/checkpoints//model/gpt/qwen3-8b-dist/tokenizer
   --vocab-size: 151936
   --make-vocab-size-divisible-by: 128
   --optimizer: adam
@@ -85,7 +86,7 @@ MODEL_ARGS:
   --perform-rl-step: true
   --train-samples: 48828125
   --exit-interval: 50
-  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --tensorboard-dir: /opt/megatron-lm/runs/3f2c97af-b18d-4095-a115-a5f8c3129504/1/generations_dev_dgx_h100.json
   --save-interval: 1000000
   --eval-interval: 1000000
   --finetune: true
