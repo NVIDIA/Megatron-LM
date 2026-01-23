@@ -36,6 +36,9 @@ Usage:
     # Load a trained MoELayer checkpoint directly:
     inference_layer = InferenceMoELayer(config, submodules, layer_number, pg_collection)
     inference_layer.load_state_dict(trained_moe_layer.state_dict())
+
+TODO: Add unit test to verify that InferenceMoELayer.forward() and MoELayer.forward()
+      have aligned argument signatures (use inspect.signature to compare).
 """
 
 from typing import Optional
@@ -111,7 +114,7 @@ class InferenceMoELayer(MoELayer):
             ).T.ravel()
 
     # ==================== Simplified Forward Pass ====================
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """
         Simplified forward pass optimized for inference.
         
@@ -122,19 +125,22 @@ class InferenceMoELayer(MoELayer):
         
         Args:
             hidden_states: [S, B, H] input tensor
+            padding_mask: Optional [B, S] boolean mask. True for valid tokens, False for padding.
             
         Returns:
             Tuple of (output, None) for compatibility with MoELayer interface
         """
-        print("USED INFERENCE MOE LAYER....")
         # Store original shape for restoration
         hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_shape[-1])
-        num_tokens = hidden_states.shape[0]
+        
+        # Transpose padding_mask from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
         
         # ===== Step 1: Routing (using inherited router) =====
         # The router returns probs and routing_map
-        probs, routing_map = self.router(hidden_states)
+        probs, routing_map = self.router(hidden_states, padding_mask)
         
         # ===== Step 2: Dispatch Preprocess =====
         # Compute metadata and permute tokens by expert assignment
