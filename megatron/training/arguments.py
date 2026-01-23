@@ -3364,7 +3364,7 @@ def _add_moe_args(parser):
                        help='Score function for MoE TopK routing. Can be "softmax" or "sigmoid".')
     group.add_argument('--moe-router-topk', type=int, default=2,
                        help='Number of experts to route to for each token. The default is 2.')
-    group.add_argument('--enable-routing-replay', action='store_true',
+    group.add_argument('--moe-enable-routing-replay', action='store_true',
                        help='Enable routing replay for MoE routers. When enabled, the router will '
                             'use a pre-defined routing table instead of computing it on the fly.')
     group.add_argument('--moe-router-pre-softmax', action='store_true',

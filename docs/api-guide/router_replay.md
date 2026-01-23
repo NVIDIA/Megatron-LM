@@ -17,14 +17,14 @@ This feature is designed to enhance determinism and analyzability in MoE model t
 The design follows the principles of being non-intrusive and on-demand, with the core idea of activating the replay logic only when explicitly requested by the user.
 
 *   **Core Components**:
-    *   `RouterReplay` (located in `megatron/core/transformer/moe/router_replay.py`): A utility class for replaying MoE routing decisions. When enabled via the `enable_routing_replay` flag, a separate instance of `RouterReplay` is created for each MoE layer's router. Each instance is responsible for loading routing data and providing the deterministic routing decisions for its corresponding layer during the forward pass.
-    *   `enable_routing_replay` (located in `megatron/core/transformer/transformer_config.py`): A boolean global configuration flag that serves as the sole entry point for enabling this feature.
+    *   `RouterReplay` (located in `megatron/core/transformer/moe/router_replay.py`): A utility class for replaying MoE routing decisions. When enabled via the `moe_enable_routing_replay` flag, a separate instance of `RouterReplay` is created for each MoE layer's router. Each instance is responsible for loading routing data and providing the deterministic routing decisions for its corresponding layer during the forward pass.
+    *   `moe_enable_routing_replay` (located in `megatron/core/transformer/transformer_config.py`): A boolean global configuration flag that serves as the sole entry point for enabling this feature.
 
 *   **Workflow**:
     The feature supports different modes, such as recording and replaying, controlled by a `RouterReplayAction`.
 
-    1.  **Enabling the Feature**: The user sets `enable_routing_replay` to `True` in the model configuration.
-    2.  **Initialization**: When `enable_routing_replay` is true, each `TopKRouter` creates its own `RouterReplay` instance.
+    1.  **Enabling the Feature**: The user sets `moe_enable_routing_replay` to `True` in the model configuration.
+    2.  **Initialization**: When `moe_enable_routing_replay` is true, each `TopKRouter` creates its own `RouterReplay` instance.
     3.  **Mode Configuration**: The user must programmatically set the desired router replay action (e.g., `record`, `forward_replay`, `backward_replay`) on the `RouterReplay` instances.
     4.  **Execution Flow (within a mini-batch)**:
         *   **Forward Pass**:
@@ -40,7 +40,7 @@ The design follows the principles of being non-intrusive and on-demand, with the
 The implementation cleanly separates the replay logic from the router's core computation.
 
 *   **`megatron/core/transformer/transformer_config.py`**:
-    *   Adds the configuration option `enable_routing_replay: bool = False`.
+    *   Adds the configuration option `moe_enable_routing_replay: bool = False`.
 
 *   **`megatron/core/transformer/moe/moe_utils.py`**:
     *   Introduces the `RouterReplay` class to manage the state for recording and replaying routing decisions for a single MoE layer.
@@ -126,7 +126,7 @@ config = TransformerConfig(
     num_experts=8,
     expert_model_parallel_size=1,
     num_top_k=2,
-    enable_routing_replay=True
+    moe_enable_routing_replay=True
 )
 
 # Create a TopKRouter instance
