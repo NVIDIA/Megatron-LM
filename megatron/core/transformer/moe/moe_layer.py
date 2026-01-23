@@ -1,8 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Protocol, Union
 
 import torch
 
@@ -24,6 +26,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
 
 try:
@@ -36,12 +39,40 @@ except ImportError:
     HAVE_TE = False
 
 
+class RouterInterface(Protocol):
+    """Interface for the router used in an MoELayer."""
+
+    def forward(self, input: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass of the router.
+
+        Returns:
+            A tuple of (probabilities, routing_map).
+        """
+        ...
+
+    def set_layer_number(self, layer_number: int) -> None:
+        """Set the layer number for the router.
+
+        Called from transformer_layer during initialization.
+        """
+        ...
+
+
+class RouterBuilder(Protocol):
+    """Protocol for building a Router."""
+
+    def __call__(
+        self, /, *, config: TransformerConfig, pg_collection: ProcessGroupCollection | None
+    ) -> RouterInterface: ...
+
+
 @dataclass
 class MoESubmodules:
     """MoE Layer Submodule spec"""
 
     experts: Union[ModuleSpec, type] = None
     shared_experts: Union[ModuleSpec, type] = None
+    router: RouterBuilder = TopKRouter
 
 
 class BaseMoELayer(MegatronModule, ABC):
@@ -78,7 +109,7 @@ class BaseMoELayer(MegatronModule, ABC):
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
         assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
-        self.router: TopKRouter = None
+        self.router: RouterInterface = None
         self.experts = None
         self.shared_experts = None
         self.token_dispatcher: Optional[MoETokenDispatcher] = None
@@ -129,7 +160,7 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+        self.router = submodules.router(config=self.config, pg_collection=pg_collection)
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
@@ -214,7 +245,7 @@ class MoELayer(BaseMoELayer):
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = self.router(hidden_states)
+        probs, routing_map = apply_module(self.router)(hidden_states)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
