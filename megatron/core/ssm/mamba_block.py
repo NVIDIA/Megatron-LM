@@ -21,7 +21,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers, parse_hybrid_pattern
+from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
@@ -127,10 +127,11 @@ class MambaStack(MegatronModule):
             self.hybrid_attention_ratio,
             self.hybrid_mlp_ratio,
             self.hybrid_override_pattern,
+            silent=self.is_mtp_layer,
         )
 
         pp_layer_offset = 0
-        if self.pp_group.size() > 1:
+        if self.pp_group.size() > 1 and not self.is_mtp_layer:
             pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
                 self.layer_type_list
             )
@@ -189,7 +190,7 @@ class MambaStack(MegatronModule):
             )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
-        num_layers_per_pipeline_rank = len(layer_type_list) // self.pp_group.size()
+        num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
 
         assert self.config.virtual_pipeline_model_parallel_size is None, (
             "The Mamba hybrid model does not currently support "

@@ -762,7 +762,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
 
         # Build inner layers: two possible paths
-        # 1. Mamba path: use MambaStack for hybrid pattern support (and future PP)
+        # 1. Mamba path: use MambaStack for hybrid pattern support
         # 2. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and mamba_submodules is not None:
             from megatron.core.ssm.mamba_block import MambaStack
@@ -776,7 +776,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_process=True,      # MTP layer is self-contained
                 pg_collection=pg_collection,
                 vp_stage=vp_stage,
-                is_mtp_layer=True,      # Mark as MTP for router aux loss scaling
+                is_mtp_layer=True,
             )
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer

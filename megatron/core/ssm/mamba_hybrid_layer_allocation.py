@@ -218,19 +218,21 @@ def allocate_layers(
     target_attention_ratio: float,
     target_mlp_ratio: float,
     override_pattern: str = None,
+    silent: bool = False,
 ) -> list:
     """Allocates layers according to the requested distribution of layer types."""
     assert total_layers_count > 0
     assert target_attention_ratio >= 0.0 and target_attention_ratio <= 1.0
     assert target_mlp_ratio >= 0.0 and target_mlp_ratio <= 1.0
     assert target_attention_ratio + target_mlp_ratio <= 1.0
+    maybe_log_single_rank = (lambda *args, **kwargs: None) if silent else log_single_rank
     # Note: target_mamba_ratio = 1.0 - target_attention_ratio - target_mlp_ratio
 
     layer_type_list = _allocate_auto(total_layers_count, target_attention_ratio, target_mlp_ratio)
 
     if override_pattern is not None:
         layer_type_list_override = _allocate_override(total_layers_count, override_pattern)
-        log_single_rank(logger, logging.INFO, "Using hybrid override pattern")
+        maybe_log_single_rank(logger, logging.INFO, "Using hybrid override pattern")
         if (target_attention_ratio > 0.0 or target_mlp_ratio > 0.0) and not _layer_counts_match(
             layer_type_list_override, layer_type_list
         ):
@@ -240,13 +242,13 @@ def allocate_layers(
                 "pattern."
             )
         if layer_type_list_override == layer_type_list:
-            log_single_rank(
+            maybe_log_single_rank(
                 logger, logging.INFO, "The override pattern matches the overridden pattern"
             )
         else:
-            log_single_rank(logger, logging.INFO, "Warning: overriding pattern A with pattern B")
-            log_single_rank(logger, logging.INFO, f"A: {''.join(layer_type_list)}")
-            log_single_rank(logger, logging.INFO, f"B: {''.join(layer_type_list_override)}")
+            maybe_log_single_rank(logger, logging.INFO, "Warning: overriding pattern A with pattern B")
+            maybe_log_single_rank(logger, logging.INFO, f"A: {''.join(layer_type_list)}")
+            maybe_log_single_rank(logger, logging.INFO, f"B: {''.join(layer_type_list_override)}")
         layer_type_list = layer_type_list_override
 
     if target_attention_ratio > 0.0 or target_mlp_ratio > 0.0 or override_pattern is not None:
@@ -255,32 +257,32 @@ def allocate_layers(
         actual_mlp_layers_count = layer_type_list.count(Symbols.MLP)
         actual_mlp_ratio = actual_mlp_layers_count / total_layers_count
         allocation_string = "".join(layer_type_list)
-        log_single_rank(
+        maybe_log_single_rank(
             logger,
             logging.INFO,
             f"Hybrid allocation ({Symbols.MAMBA} is mamba, "
             f"{Symbols.ATTENTION} is attention, "
             f"{Symbols.MLP} is mlp):",
         )
-        log_single_rank(logger, logging.INFO, allocation_string)
-        log_single_rank(
+        maybe_log_single_rank(logger, logging.INFO, allocation_string)
+        maybe_log_single_rank(
             logger,
             logging.INFO,
             f"{actual_attention_layers_count} attention layers in "
             f"{total_layers_count} total layers.",
         )
-        log_single_rank(
+        maybe_log_single_rank(
             logger,
             logging.INFO,
             f"Target attention ratio: {target_attention_ratio:.2f}. "
             f"Actual attention ratio: {actual_attention_ratio:.2f}.",
         )
-        log_single_rank(
+        maybe_log_single_rank(
             logger,
             logging.INFO,
             f"{actual_mlp_layers_count} mlp layers in " f"{total_layers_count} total layers.",
         )
-        log_single_rank(
+        maybe_log_single_rank(
             logger,
             logging.INFO,
             f"Target mlp ratio: {target_mlp_ratio:.2f}. "

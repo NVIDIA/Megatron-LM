@@ -20,6 +20,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -38,8 +39,7 @@ moe = get_moe_module_spec(
 
 
 # MTP block spec for Mamba - provides norms and projection only.
-# Inner layers are built by MultiTokenPredictionLayer using the shared
-# layer_builder with mtp_layer_pattern and mamba_submodules.
+# Inner layers are built by MultiTokenPredictionLayer using nested MambaStack
 _mamba_mtp_block_spec = ModuleSpec(
     module=MultiTokenPredictionBlock,
     submodules=MultiTokenPredictionBlockSubmodules(
