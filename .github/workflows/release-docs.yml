@@ -61,7 +61,7 @@ jobs:
           emails-csv: ${{ inputs.notify-emails && format('{0},{1}', vars.docs_release_emails, inputs.notify-emails) || vars.docs_release_emails }}
           overwrite-latest-on-tag: false
           run-on-version-tag-only: ${{ github.ref_name != 'main' }}
-          request-name: megatron-bridge-publish-docs-${{ github.run_id }}
+          request-name: megatron-core-publish-docs-${{ github.run_id }}
           aws-region: ${{ inputs.aws-region }}
           aws-role-to-assume: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
