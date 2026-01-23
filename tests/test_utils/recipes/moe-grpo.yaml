@@ -3,8 +3,8 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}_{platforms}'
-  model: hybrid
+  name: "{test_case}_{environment}_{platforms}"
+  model: moe
   build: mcore-pyt-{environment}
   nodes: 1
   gpus: 1
@@ -39,9 +39,9 @@ spec:
     ARGUMENTS=(
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "CHECKPOINT_SAVE_PATH=/tmp/checkpoints"
-        "DATA_PATH=null"
+        "DATA_PATH=/mnt/artifacts/"
         "DATA_CACHE_PATH=/workspace/data/cache"
-        "TRAINING_SCRIPT_PATH=examples/inference/gpt/gpt_dynamic_inference.py"
+        "TRAINING_SCRIPT_PATH=train_rl.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "OUTPUT_PATH={assets_dir}"
@@ -54,13 +54,8 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m]
+  - test_case: [gpt_grpo_tp8tp4_pp1_ep8ep2_dp8_throughputtest]
     products:
       - environment: [dev]
-        scope: [mr-github]
-        platforms: [dgx_h100]
-  - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m_chunked_prefill]
-    products:
-      - environment: [dev]
-        scope: [mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
