@@ -481,7 +481,7 @@ class DynamicInferenceRequestRecord:
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
-            sampling_params=new_sampling_params,
+            sampling_params=new_sampling_params
         )
         self.requests.append(new_request)
 
@@ -503,6 +503,8 @@ class DynamicInferenceRequestRecord:
 
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
+        if self.requests[0].routing_indices is not None:
+            routing_indices = torch.cat([r.routing_indices for r in self.requests])
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
@@ -526,6 +528,7 @@ class DynamicInferenceRequestRecord:
             status=self.requests[-1].status,
             latency=self.latency,
             events=merge_lists("events"),
+            routing_indices=routing_indices,
         )
 
         return request

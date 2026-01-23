@@ -139,7 +139,7 @@ async def main(
         results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
         for i, res in enumerate(results):
             routing_indices = res.requests[0].routing_indices 
-            logging.info(f"Result {i} has routing indices with shape {routing_indices}.")
+            logging.info(f"Result {i} has routing indices with shape {routing_indices.shape}.")
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
@@ -159,6 +159,8 @@ async def main(
                     result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
                 throughput = len(req.generated_tokens) / req.latency
                 throughputs.append(throughput)
+                if req.routing_indices is not None:
+                    result_dict["routing_indices"] = req.routing_indices.tolist()
                 json_results[req.request_id] = result_dict
             throughput_dict = {"throughput": throughputs}
             if args.throughput_check_only:
