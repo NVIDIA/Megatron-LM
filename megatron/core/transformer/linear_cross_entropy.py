@@ -86,6 +86,7 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
         else:
             logits, _ = super().forward(hidden, weight, runtime_gather_output)
             loss = self._compute_cross_entropy_loss(labels, logits)
+
         return loss
 
     def _compute_cross_entropy_loss(
@@ -127,4 +128,6 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
 
+        # [s b] => [b, s]
+        loss = loss.transpose(0, 1).contiguous()
         return loss
