@@ -52,6 +52,8 @@ class TestInferenceWandbLogging:
         max_sequence_length=512,
         buffer_size_gb=0.03,
         block_size_tokens=128,
+        logging_step_interval=0,
+        metrics_writer=None,
     ):
         """Helper to create a DynamicInferenceContext."""
         return DynamicInferenceContext(
@@ -67,6 +69,8 @@ class TestInferenceWandbLogging:
                 buffer_size_gb=buffer_size_gb,
                 block_size_tokens=block_size_tokens,
                 unified_memory_level=0,  # unit tests currently broken with UVM
+                logging_step_interval=logging_step_interval,
+                metrics_writer=metrics_writer,
             ),
         )
 
@@ -199,12 +203,14 @@ class TestInferenceWandbLogging:
     @pytest.mark.internal
     @patch('megatron.core.inference.engines.dynamic_engine.HAVE_WANDB', True)
     def test_engine_logging_step_interval_zero(self):
-        """Test that no logging occurs when inference_logging_step_interval is 0."""
+        """Test that no logging occurs when logging_step_interval is 0."""
         mock_wandb = Mock()
         mock_wandb.__name__ = "wandb"
         mock_wandb.log = Mock()
 
-        dynamic_context = self._get_dynamic_context()
+        dynamic_context = self._get_dynamic_context(
+            logging_step_interval=0, metrics_writer=mock_wandb
+        )
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
@@ -214,13 +220,7 @@ class TestInferenceWandbLogging:
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
 
-        engine = DynamicInferenceEngine(
-            controller=mock_controller,
-            context=dynamic_context,
-            random_seed=123,
-            inference_logging_step_interval=0,  # Disabled
-            metrics_writer=mock_wandb,
-        )
+        engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)
 
         # Verify log was never called
         mock_wandb.log.assert_not_called()
@@ -233,11 +233,13 @@ class TestInferenceWandbLogging:
             model_config=TransformerConfig(
                 params_dtype=torch.float32, num_layers=2, kv_channels=64, num_attention_heads=8
             ),
-            max_sequence_length=128,
-            num_cuda_graphs=None,
-            buffer_size_gb=0.01,  # Small buffer to force pausing
-            block_size_tokens=32,
-            unified_memory_level=0,  # unit tests currently broken with UVM
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                num_cuda_graphs=None,
+                buffer_size_gb=0.01,  # Small buffer to force pausing
+                block_size_tokens=32,
+                unified_memory_level=0,  # unit tests currently broken with UVM
+            ),
         )
 
         # Add multiple requests to potentially trigger pausing
@@ -261,7 +263,7 @@ class TestInferenceWandbLogging:
     @pytest.mark.internal
     def test_metrics_writer_none_handling(self):
         """Test that engine handles None metrics_writer gracefully."""
-        dynamic_context = self._get_dynamic_context()
+        dynamic_context = self._get_dynamic_context(logging_step_interval=10, metrics_writer=None)
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
@@ -272,13 +274,8 @@ class TestInferenceWandbLogging:
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
 
         # Should not raise error even with logging interval set
-        engine = DynamicInferenceEngine(
-            controller=mock_controller,
-            context=dynamic_context,
-            random_seed=123,
-            inference_logging_step_interval=10,
-        )
+        engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)
 
         # Verify engine was created successfully
-        assert engine.inference_logging_step_interval == 10
+        assert engine.logging_step_interval == 10
         assert engine.metrics_writer is None
