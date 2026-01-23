@@ -144,7 +144,7 @@ class DynamicInferenceEngine(AbstractEngine):
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
 
         model_config = controller.inference_wrapped_model.model.config
-        inference_config = context.inference_config
+        inference_config = context.config
 
         if inference_config.pg_collection is not None:
             self.pg_collection = inference_config.pg_collection

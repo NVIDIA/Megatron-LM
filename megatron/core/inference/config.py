@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import abc
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -53,19 +52,9 @@ class MambaInferenceStateConfig:
 
 
 @dataclass
-class BaseInferenceConfig(abc.ABC):
-    """Base inference config."""
-
-    pass
-
-
-@dataclass
-class DynamicInferenceConfig(BaseInferenceConfig):
+class InferenceConfig:
     """
-    Config for dynamic inference.
-
-    Used to initialize `DynamicInferenceContext`, `TextGenerationController`, and
-    `DynamicInferenceEngine`.
+    Config for inference.
 
     NOTE: Must remain mutually exclusive with the `TransformerConfig`.
     """
@@ -189,17 +178,6 @@ class DynamicInferenceConfig(BaseInferenceConfig):
 
     request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
     """
-    A list of the per-request metadata types to track. Each entry is a tuple consisting of the string
-    label, the target dtype, and whether to store the data on GPU.
+    A list of the per-request metadata types to track. Each entry is a tuple
+    consisting of the string label, the target dtype, and whether to store the data on GPU.
     """
-
-
-@dataclass
-class StaticInferenceConfig(DynamicInferenceConfig):
-    """
-    Static inference config. For now, exactly mimic the dynamic config.
-
-    TODO(ksanthanam): Remove when deprecating static inference.
-    """
-
-    pass

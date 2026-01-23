@@ -1,27 +1,31 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
-from megatron.core.inference.config import DynamicInferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model
-from megatron.training import get_args, get_tokenizer
+from megatron.core.utils import get_attr_wrapped_model, log_single_rank
+from megatron.training import get_args
 from megatron.training import get_model as _get_model
+from megatron.training import get_tokenizer, get_wandb_writer
 from megatron.training.checkpointing import load_checkpoint
 from model_provider import model_provider
+
+logger = logging.getLogger(__name__)
 
 
 def get_model() -> MegatronModule:
@@ -105,7 +109,10 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "--top-n-logprobs",
         type=int,
         default=0,
-        help='Return the top n logprobs for the generated tokens and their corresponding token as a dictionary',
+        help=(
+            "Return the top n logprobs for the generated tokens and their "
+            "corresponding token as a dictionary"
+        ),
     )
     group.add_argument(
         "--incoming-requests-per-step",
@@ -218,13 +225,14 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
-def get_dynamic_inference_config_from_model_and_args(model: MegatronModule, args):
-    """Returns a `DynamicInferenceConfig` constructed from the model and command line arguments."""
+def get_inference_config_from_model_and_args(model: MegatronModule, args):
+    """Returns a `InferenceConfig` constructed from the model and command line arguments."""
 
     # Max sequence length.
     position_embedding_type = get_attr_wrapped_model(model, "position_embedding_type")
     model_max_seq_len = get_attr_wrapped_model(model, "max_sequence_length")
     inf_max_seq_len = args.inference_max_seq_length
+    max_batch_size = args.inference_dynamic_batching_max_requests
 
     if position_embedding_type == "learned_absolute":
         # When using absolute position embeddings, it is critical that the
@@ -236,11 +244,11 @@ def get_dynamic_inference_config_from_model_and_args(model: MegatronModule, args
             max_sequence_length = min(model_max_seq_len, inf_max_seq_len)
         else:
             max_sequence_length = model_max_seq_len
-        assert max_batch_size <= model_max_seq_len
+        assert max_batch_size is None or max_batch_size <= model_max_seq_len
     else:
         max_sequence_length = inf_max_seq_len
     if args.inference_dynamic_batching_max_requests is not None:
-        max_sequence_length = max(max_sequence_length, args.inference_dynamic_batching_max_requests)
+        max_sequence_length = max(max_sequence_length, max_batch_size)
 
     mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
@@ -266,7 +274,7 @@ def get_dynamic_inference_config_from_model_and_args(model: MegatronModule, args
                 "wandb module is available. Inference logging will be disabled.",
             )
 
-    return DynamicInferenceConfig(
+    return InferenceConfig(
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
@@ -278,7 +286,7 @@ def get_dynamic_inference_config_from_model_and_args(model: MegatronModule, args
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
-        cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
+        cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         persist_cuda_graphs=args.rl_training_cuda_graphs,
         max_sequence_length=max_sequence_length,

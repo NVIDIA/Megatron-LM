@@ -14,7 +14,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import DynamicInferenceConfig
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.inference_request import (
@@ -105,7 +105,7 @@ class TestTextGenerationController:
         else:
             inference_context = DynamicInferenceContext(
                 model_config=transformer_config,
-                inference_config=DynamicInferenceConfig(
+                inference_config=InferenceConfig(
                     max_sequence_length=2048,
                     buffer_size_gb=0.2,
                     materialize_only_last_token_logits=False,

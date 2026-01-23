@@ -58,10 +58,10 @@ class TextGenerationController:
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
-        self.inference_config = self.inference_wrapped_model.inference_context.inference_config
+        inference_config = self.inference_wrapped_model.inference_context.config
         self.tokenizer = tokenizer
 
-        pg_collection = self.inference_config.pg_collection
+        pg_collection = inference_config.pg_collection
         if pg_collection is not None:
             self.pp_group = pg_collection.pp
         else:
@@ -582,7 +582,7 @@ class TextGenerationController:
         if self.model_is_pipeline_parallel:
             logits_seq_len = (
                 active_request_count
-                if context.inference_config.materialize_only_last_token_logits
+                if context.config.materialize_only_last_token_logits
                 else input_ids.shape[1]
             )
             logits_shape = [1, logits_seq_len, self.vocab_size]
@@ -638,7 +638,7 @@ class TextGenerationController:
 
         # Last token logits.
         context = self.inference_wrapped_model.inference_context
-        if context.inference_config.materialize_only_last_token_logits:
+        if context.config.materialize_only_last_token_logits:
             # When materialize_only_last_token_logits is true, last_token_logits is
             # already called in the forward pass of GPT.
             last_token_logits = logits.squeeze(0)
@@ -683,7 +683,7 @@ class TextGenerationController:
         return context.calculate_log_probs(
             logits,
             self._sampled_tokens_cuda[:active_request_count],
-            only_last_token_logits=context.inference_config.materialize_only_last_token_logits,
+            only_last_token_logits=context.config.materialize_only_last_token_logits,
         )
 
     def _dynamic_step_calculate_top_n_logprobs(
@@ -711,7 +711,7 @@ class TextGenerationController:
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         # Handle decode-only mode (only last token)
-        if context.inference_config.materialize_only_last_token_logits or context.is_decode_only():
+        if context.config.materialize_only_last_token_logits or context.is_decode_only():
             # In decode mode or when only last token logits are materialized,
             # logits already represent only the last tokens
             log_probs = log_probs_tensor[:active_request_count]
@@ -1187,7 +1187,7 @@ class TextGenerationController:
                     or not (sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0)
                 )
                 inference_context = self.inference_wrapped_model.inference_context
-                inference_context.inference_config.materialize_only_last_token_logits = (
+                inference_context.config.materialize_only_last_token_logits = (
                     materialize_only_last_token_logits
                 )
 

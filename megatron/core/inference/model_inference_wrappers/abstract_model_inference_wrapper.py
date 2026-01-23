@@ -81,6 +81,18 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.inference_context.reset()
 
     @abc.abstractmethod
+    def prep_inference_input(self, prompt_tokens) -> Dict[str, Any]:
+        """Prepares the inference input data.
+
+        Args:
+            prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
+
+        Returns:
+            A dict with all the inference input needed for the batch.
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
     def get_batch_for_context_window(self, *args, **kwargs) -> Dict[str, Any]:
         """Returns the input data for inference
 

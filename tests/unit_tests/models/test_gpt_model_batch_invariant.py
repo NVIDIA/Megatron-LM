@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.inference.config import DynamicInferenceConfig
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -185,7 +185,7 @@ class TestGPTModelBatchInvariant:
 
         ctx = DynamicInferenceContext(
             model_config=base_model.config,
-            inference_config=DynamicInferenceConfig(
+            inference_config=InferenceConfig(
                 max_sequence_length=seq_len,
                 buffer_size_gb=0.125,
                 block_size_tokens=16,
@@ -263,7 +263,7 @@ class TestGPTModelBatchInvariant:
         def _run_engine_with_order(order):
             ctx = DynamicInferenceContext(
                 model_config=based_model.config,
-                inference_config=DynamicInferenceConfig(
+                inference_config=InferenceConfig(
                     max_sequence_length=seq_len,
                     buffer_size_gb=0.125,
                     block_size_tokens=16,

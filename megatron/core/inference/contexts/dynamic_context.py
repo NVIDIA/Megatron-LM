@@ -15,7 +15,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import DynamicInferenceConfig
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
@@ -184,14 +184,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     Args:
         model_config (TransformerConfig): Model config.
-        inference_config (DynamicInferenceConfig): Inference config.
+        inference_config (InferenceConfig): Inference config.
     """
 
     DEFAULT_MAX_TOKENS = 16384
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
 
-    def __init__(self, model_config: TransformerConfig, inference_config: DynamicInferenceConfig):
+    def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
 
         self.cache_mla_latent = (

@@ -350,7 +350,7 @@ class TestMambaWithDynamicInference:
 
         inference_context = DynamicInferenceContext(
             model_config=self.model.config,
-            inference_config=DynamicInferenceConfig(
+            inference_config=InferenceConfig(
                 max_sequence_length=self.model.module.max_sequence_length,
                 buffer_size_gb=1.0,
                 block_size_tokens=256,

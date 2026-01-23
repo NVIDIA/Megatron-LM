@@ -2,7 +2,7 @@
 
 import abc
 
-from megatron.core.inference.config import BaseInferenceConfig
+from megatron.core.inference.config import InferenceConfig
 
 
 class BaseInferenceContext(abc.ABC):
@@ -12,11 +12,11 @@ class BaseInferenceContext(abc.ABC):
     Extend this class for any future contexts types.
     """
 
-    def __init__(self, inference_config: BaseInferenceConfig):
+    def __init__(self, inference_config: InferenceConfig):
         """
         Args:
         """
-        self.inference_config = inference_config
+        self.config = inference_config
 
     @abc.abstractmethod
     def is_static_batching(self) -> bool:

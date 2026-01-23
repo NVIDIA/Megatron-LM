@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import DynamicInferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -78,7 +78,7 @@ class TestDynamicContext:
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
             ),
-            inference_config=DynamicInferenceConfig(
+            inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
                 num_cuda_graphs=None,
                 use_cuda_graphs_for_non_decode_steps=True,
@@ -1261,7 +1261,7 @@ class TestDynamicContext:
                 tensor_model_parallel_size=1,
                 pipeline_dtype=torch.float32,
             ),
-            inference_config=DynamicInferenceConfig(
+            inference_config=InferenceConfig(
                 max_sequence_length=128,
                 buffer_size_gb=0.1,
                 block_size_tokens=16,

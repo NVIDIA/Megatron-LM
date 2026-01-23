@@ -13,7 +13,7 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import DynamicInferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
@@ -215,7 +215,7 @@ class TestDynamicInferenceEngine:
         # Inference context.
         context = DynamicInferenceContext(
             model_config=transformer_config,
-            inference_config=DynamicInferenceConfig(
+            inference_config=InferenceConfig(
                 max_sequence_length=test_config.max_sequence_length,
                 num_cuda_graphs=test_config.num_cuda_graphs,
                 use_cuda_graphs_for_non_decode_steps=True,

@@ -67,7 +67,7 @@ class TestGPTInferenceWrapper:
             .cuda()
         )
         self.inference_wrapped_model.prep_model_for_inference()
-        self.inference_wrapped_model.inference_context.inference_config.materialize_only_last_token_logits = (
+        self.inference_wrapped_model.inference_context.config.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
 
@@ -102,7 +102,7 @@ class TestGPTInferenceWrapper:
             .cuda()
         )
         self.inference_wrapped_model.prep_model_for_inference()
-        self.inference_wrapped_model.inference_context.inference_config.materialize_only_last_token_logits = (
+        self.inference_wrapped_model.inference_context.config.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
 

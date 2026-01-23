@@ -8,7 +8,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 import torch
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.config import DynamicInferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
@@ -100,7 +100,7 @@ class StaticInferenceEngine(AbstractEngine):
             if not legacy:
                 dynamic_context = DynamicInferenceContext(
                     model_config=self.config,
-                    inference_config=DynamicInferenceConfig(
+                    inference_config=InferenceConfig(
                         max_sequence_length=original_context.max_sequence_length,
                         buffer_size_gb=buffer_size_gb,
                         mamba_inference_state_config=mamba_inference_state_config,

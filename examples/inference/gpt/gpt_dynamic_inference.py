@@ -37,7 +37,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.inference.utils import (
     add_inference_args,
-    get_dynamic_inference_config_from_model_and_args,
+    get_inference_config_from_model_and_args,
     get_model,
 )
 
@@ -283,7 +283,7 @@ def main():
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
-    inference_config = get_dynamic_inference_config_from_model_and_args(model, args)
+    inference_config = get_inference_config_from_model_and_args(model, args)
 
     # Calculate max_sequence_length from requests
     max_gen_length = sampling_params.num_tokens_to_generate
