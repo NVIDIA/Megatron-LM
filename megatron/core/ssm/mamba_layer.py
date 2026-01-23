@@ -86,13 +86,6 @@ class MambaLayer(GraphableMegatronModule):
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
-    def create_mcore_cudagraph_manager(self, config):
-        """Register the mamba layer for cudagraphs."""
-        from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
-        if not self.config.cuda_graph_scope or CudaGraphScope.mamba in self.config.cuda_graph_scope:
-            self.cudagraph_manager = CudaGraphManager(config)
-
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""
         return self.mixer.mamba_state_shapes_per_request()
@@ -192,6 +185,7 @@ class MambaLayer(GraphableMegatronModule):
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
             and kwargs.get('inference_context') is not None
+            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
         ):
             using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
             return using_cuda_graph
