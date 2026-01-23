@@ -525,7 +525,7 @@ class PagedStashManager:
         """Initialize the manager with queues and dedicated CUDA streams."""
         # allocate streams and events for synchronization
         self.enabled = False
-        self._pack_stream = torch.cuda.current_stream()#torch.cuda.Stream()
+        self._pack_stream = torch.cuda.Stream()
         # Currently paged stashing is not stream-safe, so use the same stream for packing
         # and unpacking
         self._unpack_stream = self._pack_stream
