@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import concurrent.futures
 import logging
 import multiprocessing
 import os
@@ -719,7 +720,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if (
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
-        ):
+        ) or (request.sampling_params.num_tokens_to_generate < 0):
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
@@ -1081,6 +1082,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
+                    # For Mamba models we need to ensure that the last prefill chunk
+                    # is still tagged as a chunked prefill request.
+                    self.context.has_explicit_chunked_prefill_req = (
+                        self.context.is_hybrid_model
+                        and self.context.chunked_prefill_request_id == req.request_id
+                    )
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
@@ -1091,7 +1098,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue
-                    can_schedule = True
+                    # We break early for Mamba models running a final prefill chunk
+                    # so that no additional requests are scheduled beyond the chunked
+                    # prefill request.
+                    can_schedule = not self.context.has_explicit_chunked_prefill_req
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
@@ -1099,6 +1109,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
+                    self.context.has_explicit_chunked_prefill_req = self.context.is_hybrid_model
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
                     req.finished_chunk_token_count += chunk_length
                     # Still have tokens to prefill, so we break and keep the
@@ -1358,11 +1369,29 @@ class DynamicInferenceEngine(AbstractEngine):
         # Keep for compatibility with current test suite.
         return ret
 
+    def _run_coroutine_sync(self, coro):
+        """Run a coroutine synchronously, handling the case when already in an event loop.
+
+        This method safely runs an async coroutine from synchronous code, even when
+        called from within an already running event loop (e.g., when used with async
+        frameworks like pytriton).
+        """
+        try:
+            # Check if there's already a running event loop
+            asyncio.get_running_loop()
+            # We're inside a running loop - run in a separate thread
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+        except RuntimeError:
+            # No running loop - safe to use run_until_complete
+            return self._loop.run_until_complete(coro)
+
     def step_modern(
         self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
-        return self._loop.run_until_complete(self.async_step())
+        return self._run_coroutine_sync(self.async_step())
 
     def step_legacy(
         self, sampling_params: SamplingParams
@@ -1373,7 +1402,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "0.16. Please use `step_modern()` going forward, which will eventually "
             "be renamed to `step()`."
         )
-        result = self._loop.run_until_complete(self.async_step())
+        result = self._run_coroutine_sync(self.async_step())
         active_requests = [self.get_request(i) for i in result["active_request_ids"]]
         finished_requests = [r.merge() for r in result["finished_request_records"]]
         return active_requests, finished_requests, result["step_time"]

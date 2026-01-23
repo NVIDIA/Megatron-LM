@@ -911,16 +911,22 @@ def pretrain(
         if (
             args.rl_inference_tensor_model_parallel_size is not None
             or args.rl_inference_pipeline_model_parallel_size is not None
+            or args.rl_inference_expert_model_parallel_size is not None
+            or args.rl_inference_expert_tensor_model_parallel_size is not None
         ):
             print_rank_0(
                 "Building separate RL inference model with custom parallelism: "
                 f"TP={args.rl_inference_tensor_model_parallel_size}, "
-                f"PP={args.rl_inference_pipeline_model_parallel_size}"
+                f"PP={args.rl_inference_pipeline_model_parallel_size}, "
+                f"EP={args.rl_inference_expert_model_parallel_size}, "
+                f"ExptTP={args.rl_inference_expert_tensor_model_parallel_size}"
             )
             inference_pg_collection = build_inference_pg_collection(
                 args.world_size,
                 tp_size=args.rl_inference_tensor_model_parallel_size,
                 pp_size=args.rl_inference_pipeline_model_parallel_size,
+                ep_size=args.rl_inference_expert_model_parallel_size,
+                expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
                 use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
             )
 
@@ -931,6 +937,14 @@ def pretrain(
             if args.rl_inference_pipeline_model_parallel_size is not None:
                 inference_config.pipeline_model_parallel_size = (
                     args.rl_inference_pipeline_model_parallel_size
+                )
+            if args.rl_inference_expert_model_parallel_size is not None:
+                inference_config.expert_model_parallel_size = (
+                    args.rl_inference_expert_model_parallel_size
+                )
+            if args.rl_inference_expert_tensor_model_parallel_size is not None:
+                inference_config.expert_tensor_parallel_size = (
+                    args.rl_inference_expert_tensor_model_parallel_size
                 )
 
             # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
