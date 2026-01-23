@@ -135,7 +135,7 @@ def test_prepare_trajectories(mock_rank):
     seq_len = 7
 
     trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
-        rollouts, tokenizer, seq_len, use_sequence_packing=False, skip_bos_token=False
+        rollouts, tokenizer, seq_len, sequence_packing=False, skip_bos_token=False
     )
 
     # Check that inference logprobs are being returned.
@@ -184,7 +184,7 @@ def test_prepare_trajectories_with_packing(mock_rank):
     seq_len = 7
 
     trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
-        rollouts, tokenizer, seq_len, use_sequence_packing=True, skip_bos_token=False
+        rollouts, tokenizer, seq_len, sequence_packing=True, skip_bos_token=False
     )
 
     # With sequence packing, inference logprobs should be padded to same length
@@ -443,7 +443,7 @@ def test_prepare_trajectories_with_sequence_packing(mock_rank):
 
     # Call prepare_trajectories with sequence packing
     trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
-        rollouts, tokenizer, seq_len, use_sequence_packing=True, skip_bos_token=False
+        rollouts, tokenizer, seq_len, sequence_packing=True, skip_bos_token=False
     )
 
     # With sequence packing enabled but called from prepare_trajectories,

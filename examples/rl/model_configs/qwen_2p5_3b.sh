@@ -90,7 +90,6 @@ MODEL_OPTIONS="\
   --lr 0.000001 \
   --lr-warmup-samples 0 \
   --make-vocab-size-divisible-by 64 \
-  --clip-grad 1.0"
-#  \
-#  --rl-use-sequence-packing \
-#  --rl-sequence-packing-algo fifo"
+  --clip-grad 1.0 \
+  --rl-use-sequence-packing \
+  --rl-sequence-packing-algo fifo"

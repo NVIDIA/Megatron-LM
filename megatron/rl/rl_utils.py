@@ -599,20 +599,20 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
     """
 
+    args = get_args()
     # Ensure packed_seq_params is always provided for CUDA graph signature consistency
     if packed_seq_params is None and sequence_packing:
         packed_seq_params = get_default_packed_seq_params(
             seq_length=tokens.shape[1],
+            max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
             device=tokens.device,
         )
 
     nvtx_range = get_nvtx_range()
 
     with nvtx_range("get-logprobs", time=False):
-
         with nvtx_range("forward-pass", time=False):
             # TODO(vitalyk): use fp16/bf16 as a function argument. Do not use args.
-            args = get_args()
 
             attention_mask_for_forward = None
 
