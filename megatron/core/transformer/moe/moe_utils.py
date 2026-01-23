@@ -633,6 +633,7 @@ def topk_routing_with_score_function(
         score_function (str, optional): The score function to use. Can be either "softmax" or
                                         "sigmoid". Defaults to "softmax".
         expert_bias (torch.Tensor, optional): The bias added to logits for expert routing.
+                                              Defaults to None.
         fused (bool, optional): Whether to use the fused version. Defaults to False.
         router_replay (Optional['RouterReplay']): For debugging and development, allows for
                                              deterministic routing by replaying a previously
