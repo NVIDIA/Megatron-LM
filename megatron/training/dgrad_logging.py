@@ -48,7 +48,10 @@ LINEAR_TYPES = _get_linear_types()
 
 
 class DataGradLogger:
-    """Captures and saves gradients from all linear layers using backward hooks."""
+    """Captures and saves gradients from all linear layers using backward hooks.
+    
+    NOTE: Right now, we only save the dgrads for the last microbatch in a batch on DP replica 0.
+    The code below would need to be extended to save dgrads for all microbatches in a batch."""
 
     def __init__(self, save_dir: str):
         self._save_dir = save_dir
