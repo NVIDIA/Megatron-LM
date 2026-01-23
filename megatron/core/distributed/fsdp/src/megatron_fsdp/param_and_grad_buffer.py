@@ -646,7 +646,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
     """
 
     def __init__(self, name: str, fsdp_param_groups: List["ParameterGroup"], size: int = 2, 
-                 fallback_to_dynamic_alloc: bool = True):
+                 fallback_to_persistent_buffer: bool = False):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
         self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
@@ -683,12 +683,12 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             if (param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None or 
                 param_group.fsdp_unit_id not in self.fsdp_double_buffer_units):
                 logging.info(f"FSDP unit (id={param_group.fsdp_unit_id}) does not fit in FixedPoolAllcator")
-                if fallback_to_dynamic_alloc is True:
+                if fallback_to_persistent_buffer is False:
                     logging.info("It will fall back to dynamic memory allocator, NCCL user buffer is not supported")
                 else:
                     logging.info(
                         "It will be allocated a persistent buffer. If the memory budget is tight, "
-                        "set trainer.strategy.ddp.fsdp_db_fallback_dynamic_alloc to True."
+                        "set trainer.strategy.ddp.fsdp_db_use_persist_buf_on_alloc_fail to False."
                     )
         
         # Initialize buffer group status.
@@ -703,7 +703,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 self.idle_buffer.append((buf_group_id, bucket_offset))
 
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
-        self.fallback_to_dynamic_alloc = fallback_to_dynamic_alloc
+        self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
         self.backup_allocator = TemporaryBucketAllocator()
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
@@ -756,7 +756,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 f"current using_buffer: {self.using_buffer} \n"
                 f"current idle_buffer: {self.idle_buffer}"
             )
-        elif self.fallback_to_dynamic_alloc is False:
+        elif self.fallback_to_persistent_buffer is True:
             buffer_name = f"{self.name}_not_fit_in_fixed_pool_{bucket_id}_{size}_{dtype}_{device}"
         else:
             # If the bucket is not eligible for fixed pool buffering, or no buffer is available,
@@ -799,7 +799,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             self.idle_buffer.append(self.using_buffer[bucket_id])
             del self.using_buffer[bucket_id]
             return
-        if self.fallback_to_dynamic_alloc is True:
+        if self.fallback_to_persistent_buffer is False:
             # If not managed by fixed pool allocator, delegate to the backup allocator.
             logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
             self.backup_allocator.free(bucket_id)
@@ -1854,11 +1854,11 @@ class ParamAndGradBuffer:
             UB_BUFFER_NUM = 2
             self.weight_alloc = FixedPoolAllocator(
                 name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM, 
-                fallback_to_dynamic_alloc = self.ddp_config.fsdp_db_fallback_dynamic_alloc
+                fallback_to_persistent_buffer = self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM,
-                fallback_to_dynamic_alloc = self.ddp_config.fsdp_db_fallback_dynamic_alloc
+                fallback_to_persistent_buffer = self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
             )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
